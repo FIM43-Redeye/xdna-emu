@@ -105,17 +105,42 @@ def summarize(res):
     return groups, bad
 
 
+def thresholds(points):
+    res = analyze_pair(points)
+    if "error" in res:
+        return None
+    return {i: w["t"] for i, w in res["words"].items()}
+
+
+def compare(left, right, left_tag, right_tag):
+    """Pairs whose per-word thresholds differ between two runs (single-point hazards ignored)."""
+    differing = []
+    for key in sorted(left):
+        a, b = thresholds(left[key]), thresholds(right[key])
+        if a is None or b is None:
+            continue
+        if a != b:
+            differing.append((key, sorted(set(a.values()), key=str), sorted(set(b.values()), key=str)))
+    for (p, c), ta, tb in differing:
+        print(f"{p:18s} {c:24s} {left_tag} t={ta}  {right_tag} t={tb}")
+    print(f"pairs with different thresholds: {len(differing)} of {len(left)}")
+    return 1 if differing else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
     ap.add_argument("tag")
     ap.add_argument("--json")
     ap.add_argument("-v", action="store_true")
+    ap.add_argument("--compare", metavar="TAG", help="compare the thresholds with another run, e.g. the emulator")
     args = ap.parse_args(argv)
     d = os.path.abspath(args.dir)
     with open(os.path.join(d, "manifest.json")) as f:
         m = json.load(f)
     pairs = group_pairs(m["kernels"], args.tag, d)
+    if args.compare:
+        return compare(pairs, group_pairs(m["kernels"], args.compare, d), args.tag, args.compare)
     out = {}
     for (p, c), pts in pairs.items():
         res = analyze_pair(pts)

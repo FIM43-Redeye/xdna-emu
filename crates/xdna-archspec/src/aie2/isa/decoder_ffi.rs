@@ -868,6 +868,27 @@ mod tests {
         }
     }
 
+    /// The forwarding ids of the two named bypass classes, against instructions whose itinerary
+    /// declares them (AIE2Schedule.td: II_VMUL's result is `VEC_Bypass`, the MOV_Bypass anchor is
+    /// the VEXTRACT source in `test_vector_source_operand_index_mapping`).
+    #[test]
+    fn test_bypass_ids_match_the_named_classes() {
+        let infos = query_all_instr_info();
+        let by_name = |wanted: &str| {
+            infos
+                .iter()
+                .enumerate()
+                .find(|(i, _)| opcode_name(*i as u32).as_deref() == Some(wanted))
+                .map(|(_, info)| info)
+                .unwrap_or_else(|| panic!("opcode {wanted} not found"))
+        };
+        assert_eq!(by_name("VMUL_vmac_cm_core_dense").operand_bypass[0], crate::aie2::Bypass::VEC_ID);
+        // The float MUL itinerary (II_VMULf) has no bypass list at all.
+        assert_eq!(by_name("VMUL_F_vmac_bm_core_dense").operand_bypass[0], 0);
+        let vext = decode_slot(Slot::Mv, 0x35).expect("VEXTRACT_D8 should decode");
+        assert_eq!(infos[vext.opcode as usize].use_bypass_raw(0), crate::aie2::Bypass::MOV_ID);
+    }
+
     #[test]
     fn test_instr_info_latency_cross_check() {
         // Cross-validate LLVM itinerary latencies against AM020 constants.

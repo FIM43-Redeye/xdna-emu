@@ -493,10 +493,11 @@ impl VectorAlu {
         }
     }
 
-    /// Write a 1024-bit result to the accumulator destination.
+    /// Write a 1024-bit result to the accumulator destination, timed by the instruction's
+    /// itinerary result latency and bypass class.
     pub(super) fn write_wide_acc_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Acc1024) {
         let reg = Self::get_acc_dest(op);
-        ctx.accumulator.write_wide(reg, value);
+        ctx.queue_acc_write(Operand::AccumReg(reg), value, false);
     }
 
     // ========== Wide Dispatch Bridges ==========

@@ -693,19 +693,53 @@ impl fmt::Debug for VectorRegisterFile {
     }
 }
 
+/// An accumulator write in flight: issued at `issue_bundle`, produced by an instruction whose
+/// itinerary result operand cycle is `l_def` and whose result bypass class is `def_bypass`.
+#[derive(Clone, Debug)]
+struct PendingAccWrite {
+    reg: u8,
+    value: [u64; 8],
+    issue_bundle: u64,
+    l_def: u8,
+    def_bypass: Bypass,
+}
+
+/// Use cycle of the accumulator source of the stores, SRS, moves and converts
+/// (II_VST_AM, II_VSRS, II_VMOV_*, II_VCONV: operand cycle 1, no bypass). The MAC family reads
+/// its accumulator sources at cycle 3 and says so through its own `source_forward`.
+pub const ACC_STORE_USE_CYCLE: u8 = 1;
+
 /// Accumulator register file.
 ///
 /// 18 × 512-bit registers for multiply-accumulate operations (9 cm-register
 /// pairs: cm0-cm8, each split into bml and bmh halves).
 /// Each 512-bit register holds 8 × 64-bit or 16 × 32-bit accumulators.
+///
+/// Results of the MAC family, the moves, `vclr`, `vups` and the converts are
+/// queued with their itinerary latency and bypass class and resolved per read, like the vector
+/// file (`VectorRegisterFile`). The probe `tools/gen_acc_timing_probe.py` swept 22 producers
+/// against 28 consumers on silicon; every threshold follows one rule, with `def` the producer's
+/// result operand cycle and `use` the consumer's accumulator source cycle:
+///
+/// ```text
+///   a consumer issued at bundle b sees a write issued at bundle p  iff
+///       b + use >= p + def + 1 - [def bypass == use bypass != NoBypass]
+/// ```
+///
+/// Dense and sparse forms are not distinguished anywhere: they share their itineraries.
 #[derive(Clone)]
 pub struct AccumulatorRegisterFile {
-    /// Each register is 512 bits = 8 × u64
+    /// Each register is 512 bits = 8 × u64. Holds *committed* (fully-landed) values; in-flight
+    /// writes live in `pending` until they land.
     regs: [[u64; 8]; NUM_ACCUMULATOR_REGS],
     /// VLIW bundle snapshot (see `VectorRegisterFile::snapshot`). Reads return
     /// pre-bundle values; writes go live. `accumulate` is a live read-modify-
     /// write (MAC accumulation crosses bundles, one accumulate per cm/bundle).
     snapshot: Option<[[u64; 8]; NUM_ACCUMULATOR_REGS]>,
+    /// In-flight writes in issue order.
+    pending: Vec<PendingAccWrite>,
+    /// Issued-bundle clock; set at bundle start.
+    cur_bundle: u64,
 }
 
 impl Default for AccumulatorRegisterFile {
@@ -717,7 +751,12 @@ impl Default for AccumulatorRegisterFile {
 impl AccumulatorRegisterFile {
     /// Create a new zeroed register file.
     pub const fn new() -> Self {
-        Self { regs: [[0; 8]; NUM_ACCUMULATOR_REGS], snapshot: None }
+        Self {
+            regs: [[0; 8]; NUM_ACCUMULATOR_REGS],
+            snapshot: None,
+            pending: Vec::new(),
+            cur_bundle: 0,
+        }
     }
 
     /// The array reads see: the bundle snapshot if active, else live registers.
@@ -741,9 +780,128 @@ impl AccumulatorRegisterFile {
         self.snapshot = None;
     }
 
-    /// Read an accumulator register as 8 × u64.
+    /// Advance the issued-bundle clock and commit the in-flight writes that every reader sees
+    /// (`issue + l_def + 1 <= bundle`; a forwarded reader saw them one bundle earlier). Call at
+    /// the start of each bundle, BEFORE `begin_bundle`, so landed values are in the snapshot.
+    /// Writes are applied in issue order: the latest-issued write to a register wins.
+    pub fn advance_bundle(&mut self, bundle: u64) {
+        self.cur_bundle = bundle;
+        if self.pending.is_empty() {
+            return;
+        }
+        for w in &self.pending {
+            if w.issue_bundle + w.l_def as u64 + 1 <= bundle {
+                self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS] = w.value;
+            }
+        }
+        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 + 1 > bundle);
+    }
+
+    /// The bundle clock (the bundle being issued).
+    #[inline]
+    pub fn current_bundle(&self) -> u64 {
+        self.cur_bundle
+    }
+
+    /// First bundle at which a reader with `use_bypass` sees `w`. Never the producer's own issue
+    /// bundle: a bundle reads the state from before it.
+    #[inline]
+    fn visible_from(w: &PendingAccWrite, use_bypass: Bypass) -> u64 {
+        let forwarded = w.def_bypass == use_bypass && w.def_bypass != Bypass::No;
+        (w.issue_bundle + w.l_def as u64 + 1 - u64::from(forwarded)).max(w.issue_bundle + 1)
+    }
+
+    /// Value of `reg` for a reader whose accumulator source is read at `read_bundle`.
+    fn resolve(&self, reg: u8, read_bundle: u64, use_bypass: Bypass) -> [u64; 8] {
+        let idx = (reg as usize) % NUM_ACCUMULATOR_REGS;
+        let mut val = self.active()[idx];
+        for w in &self.pending {
+            if (w.reg as usize) % NUM_ACCUMULATOR_REGS == idx
+                && Self::visible_from(w, use_bypass) <= read_bundle
+            {
+                val = w.value;
+            }
+        }
+        val
+    }
+
+    /// Read `reg` as a consumer of the accumulator operand `(use_cycle, use_bypass)` issued in
+    /// the current bundle.
+    #[inline]
+    pub fn read_with(&self, reg: u8, use_cycle: u8, use_bypass: Bypass) -> [u64; 8] {
+        self.resolve(reg, self.cur_bundle + use_cycle as u64, use_bypass)
+    }
+
+    /// Read a 1024-bit cm pair as a consumer of `(use_cycle, use_bypass)`.
+    pub fn read_wide_with(&self, base_reg: u8, use_cycle: u8, use_bypass: Bypass) -> Acc1024 {
+        debug_assert!(base_reg % 2 == 0, "wide accum read from odd base register {}", base_reg);
+        let lo = self.read_with(base_reg, use_cycle, use_bypass);
+        let hi = self.read_with(base_reg + 1, use_cycle, use_bypass);
+        let mut result = [0u64; 16];
+        result[..8].copy_from_slice(&lo);
+        result[8..].copy_from_slice(&hi);
+        result
+    }
+
+    /// Queue a 512-bit write issued in the current bundle. `l_def == 0` writes immediately
+    /// (tests and helpers that bypass the latency plumbing).
+    pub fn queue_write(&mut self, reg: u8, value: [u64; 8], l_def: u8, def_bypass: Bypass) {
+        self.queue_write_issued_at(self.cur_bundle, reg, value, l_def, def_bypass);
+    }
+
+    /// Queue a 512-bit write issued at `issue_bundle` (a result computed later than its issue,
+    /// such as a MAC whose accumulator sources are read at their use cycle).
+    pub fn queue_write_issued_at(
+        &mut self,
+        issue_bundle: u64,
+        reg: u8,
+        value: [u64; 8],
+        l_def: u8,
+        def_bypass: Bypass,
+    ) {
+        if l_def == 0 {
+            self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = value;
+            return;
+        }
+        self.pending
+            .push(PendingAccWrite { reg, value, issue_bundle, l_def, def_bypass });
+    }
+
+    /// Queue a 1024-bit cm write (two bm halves with the same timing).
+    pub fn queue_write_wide_issued_at(
+        &mut self,
+        issue_bundle: u64,
+        base_reg: u8,
+        data: Acc1024,
+        l_def: u8,
+        def_bypass: Bypass,
+    ) {
+        debug_assert!(base_reg % 2 == 0, "wide accum write to odd base register {}", base_reg);
+        let mut lo = [0u64; 8];
+        let mut hi = [0u64; 8];
+        lo.copy_from_slice(&data[..8]);
+        hi.copy_from_slice(&data[8..]);
+        self.queue_write_issued_at(issue_bundle, base_reg, lo, l_def, def_bypass);
+        self.queue_write_issued_at(issue_bundle, base_reg + 1, hi, l_def, def_bypass);
+    }
+
+    /// Land every in-flight write now, in issue order (flush paths and tests).
+    pub fn land_all_pending(&mut self) {
+        for w in std::mem::take(&mut self.pending) {
+            self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS] = w.value;
+        }
+    }
+
+    /// Read an accumulator register as a store/SRS/move consumer ([`ACC_STORE_USE_CYCLE`], no
+    /// bypass): the value a `vst am`, `vsrs`, `vmov` or `vconv` issued now reads.
     #[inline]
     pub fn read(&self, reg: u8) -> [u64; 8] {
+        self.read_with(reg, ACC_STORE_USE_CYCLE, Bypass::No)
+    }
+
+    /// Committed value only, ignoring writes in flight (read-modify-write of a landed register).
+    #[inline]
+    pub fn read_committed(&self, reg: u8) -> [u64; 8] {
         self.active()[(reg as usize) % NUM_ACCUMULATOR_REGS]
     }
 

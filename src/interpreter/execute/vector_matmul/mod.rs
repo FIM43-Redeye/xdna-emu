@@ -39,24 +39,13 @@ use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use xdna_archspec::aie2::isa::SemanticOp;
 
-/// VMAC accumulator-source read latency in issued bundles.
-///
-/// II_VMAC / II_VMACf (AIE2Schedule.td) read their accumulator source at
-/// operand cycle 3 ([5,3,1,1,1] / [6,3,1,1,1]): vector sources at issue,
-/// acc source three cycles later. Peano chains VMUL -> VMAC at distance 2
-/// (seed 5039 silicon: `vmul cm0` then `vmac cm0, cm0` two bundles later),
-/// so the VMAC's acc read at +3 lands exactly on the VMUL's stage-5 write --
-/// hardware forwards the fresh value. Sampling at issue read the poison
-/// accumulator. Process AFTER commit_pending_writes (the producer's write
-/// commits first), mirroring the forwarding behavior.
-const VMAC_ACC_SRC_READ_LATENCY: u64 = 3;
-
-/// A MAC-family instruction awaiting its stage-3 accumulator source read.
+/// A MAC-family instruction awaiting its accumulator source read.
 ///
 /// Vector sources, config word, and all control flags are sampled at issue
-/// (operand cycle 1); only the accumulator sources are read at +3. The result
-/// then carries the remaining write latency so the destination still commits
-/// at the full MAC latency from issue.
+/// (operand cycle 1); the accumulator sources are read at their itinerary use cycle
+/// (II_VMAC/II_VMACf/II_VADDMAC `operand_cycles[1..]`, 3 for the whole family). The result is
+/// timed from the issue: it carries the issue bundle, the itinerary result operand cycle and the
+/// result bypass class, and `AccumulatorRegisterFile` decides per reader when it is visible.
 #[derive(Debug, Clone)]
 pub struct PendingMatmul {
     /// A and B vector images sampled at issue (a dense operand fills the low 512 bits; a
@@ -74,8 +63,12 @@ pub struct PendingMatmul {
     acc2_reg: u8,
     acc_dest: u8,
     is_half: bool,
-    /// Remaining destination write latency (cycles) after the source read.
-    write_latency: u64,
+    /// Bundle the instruction issued in, its result operand cycle and its result bypass class.
+    issue_bundle: u64,
+    l_def: u8,
+    def_bypass: crate::interpreter::state::Bypass,
+    /// Bypass class of the accumulator sources (acc1, acc2).
+    acc_use_bypass: [crate::interpreter::state::Bypass; 2],
     /// Issued-bundle count at which the accumulator sources are read.
     pub ready_bundle: u64,
 }
@@ -283,41 +276,26 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         }
     };
 
-    // Total result latency from issue: LATENCY_VECTOR_MAC = 5 (llvm-aie
-    // II_VMAC/II_VMUL operand_cycles[0]=5). Deferring the write models the
-    // AIE2 MAC pipeline: in a software-pipelined batch loop, the stores
-    // draining a tile read the previous tile's accumulator while the next
-    // tile's VMUL is still in flight. The acc sources are read at +3
-    // (VMAC_ACC_SRC_READ_LATENCY); the write carries the remaining latency so
-    // it still lands at issue+5.
-    // Float MAC/MUL carries one extra float-normalization stage:
-    // II_VMULf/II_VMACf operand_cycles[0] = 6 (LATENCY_VECTOR_MAC_F).
-    // The float add* forms land one cycle later (7), although II_VADDMACf lists
-    // 6: Chess's vec_mac_bf16_forms schedule reuses the destination of a
-    // VADDMAC.f as the accumulator source of a VMSC.f issued three bundles later
-    // and silicon shows that VMSC reading the OLD value, which needs the write to
-    // land after the +3 source read (issue+6). 7 is the smallest latency
-    // consistent with that capture; no kernel pins it exactly.
-    // The sparse float add forms land at 6, the itinerary value: a Chess prologue
-    // reads `vmov x3, bml0` six bundles behind a sparse `vaddmac.f bml0` and
-    // silicon shows the new value (vec_macsparse_4x16_16x4_ops). One latency that
-    // serves both this reader and the dense MAC-chain reader is an open question.
-    let latency = if config.bfloat {
+    // Timing (docs/fidelity-gaps/vector-compute.md, "Accumulator read/write timing"): the
+    // result is visible from issue + def + 1 (def: the itinerary result operand cycle, 5 for the
+    // integer MAC family and 6 for the float one), one bundle earlier to a reader on the same
+    // bypass class; the accumulator sources are read at their itinerary use cycle. Dense and
+    // sparse forms share their itineraries and so their timing. An op without itinerary data
+    // (hand-built) falls back to the AM020 MAC latencies.
+    let l_def = if ctx.result_latency > 0 {
+        ctx.result_latency
+    } else if config.bfloat {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F
-            + u8::from(acc2_sub.is_some() && !config.sparse)
     } else {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC
-    } as u64;
-
-    // The sparse float MACs read their accumulator inputs at issue: a Chess schedule overwrites the
-    // accumulator of a sparse `vaddmac.f` and then issues later `vmac.f` instructions that still
-    // read the old value three bundles after the overwriting add, which a read at +3 would miss
-    // (vec_macsparse_4x16_16x4_conf). The integer and dense float MACs read at +3.
-    let acc_read_delay = if config.bfloat && config.sparse {
-        0
-    } else {
-        VMAC_ACC_SRC_READ_LATENCY
     };
+    let (use1, bypass1) = op.acc_source_timing(0);
+    let (use2, bypass2) = if acc2_sub.is_some() {
+        op.acc_source_timing(1)
+    } else {
+        (use1, bypass1)
+    };
+
     let pending = PendingMatmul {
         operands,
         sparse_integer,
@@ -330,39 +308,58 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         acc2_reg: if acc2_sub.is_some() { get_acc_source(op) } else { 0 },
         acc_dest,
         is_half,
-        write_latency: latency.saturating_sub(acc_read_delay),
-        ready_bundle: ctx.bundle_seq + acc_read_delay,
+        issue_bundle: ctx.bundle_seq,
+        l_def,
+        def_bypass: ctx.result_bypass,
+        acc_use_bypass: [bypass1, bypass2],
+        ready_bundle: ctx.bundle_seq + use1.max(use2) as u64,
     };
-    if acc_read_delay == 0 {
-        complete_matmul(ctx, &pending);
-    } else {
-        ctx.queue_pending_matmul(pending);
-    }
+    ctx.queue_pending_matmul(pending);
 
     true
 }
 
 /// Read a full 1024-bit working accumulator from `reg` (bm half padded high).
-fn read_acc_full(ctx: &ExecutionContext, reg: u8, is_half: bool) -> Acc1024 {
+fn read_acc_full(
+    ctx: &ExecutionContext,
+    reg: u8,
+    is_half: bool,
+    bypass: crate::interpreter::state::Bypass,
+) -> Acc1024 {
+    // The use cycle has elapsed since issue: read at the current bundle.
     if is_half {
-        let half = ctx.accumulator.read(reg);
+        let half = ctx.accumulator.read_with(reg, 0, bypass);
         let mut buf = [0u64; 16];
         buf[..8].copy_from_slice(&half);
         buf
     } else {
-        ctx.accumulator.read_wide(reg & !1)
+        ctx.accumulator.read_wide_with(reg & !1, 0, bypass)
     }
 }
 
+/// Queue the destination write of a completed MAC, timed from its issue.
+fn queue_result(ctx: &mut ExecutionContext, p: &PendingMatmul, value: Acc1024) {
+    ctx.queue_acc_write_timed(
+        p.issue_bundle,
+        Operand::AccumReg(p.acc_dest),
+        value,
+        p.is_half,
+        p.l_def,
+        p.def_bypass,
+    );
+}
+
 /// Complete a deferred MAC-family instruction: read its accumulator sources
-/// (operand cycle 3), perform the multiply, and queue the destination write
-/// with the remaining latency.
+/// (at their use cycle), perform the multiply, and queue the destination write
+/// timed from the issue.
 fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
-    let mut acc = read_acc_full(ctx, p.acc_src, p.is_half);
+    let mut acc = read_acc_full(ctx, p.acc_src, p.is_half, p.acc_use_bypass[0]);
 
     // For AddMac/SubMac: read the second accumulator source. Integer acc2 is a
     // post-multiply add/sub.
-    let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
+    let acc2 = p
+        .acc2_sub
+        .map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half, p.acc_use_bypass[1]));
 
     let (a, b) = &p.operands;
     if let Some(combine) = &p.sparse_integer {
@@ -373,8 +370,10 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         product_config.accumulate = false;
         product_config.subtract = false;
         matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
-        let acc1 = read_acc_full(ctx, p.acc_src, p.is_half);
-        let acc2 = p.acc2_sub.map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half));
+        let acc1 = read_acc_full(ctx, p.acc_src, p.is_half, p.acc_use_bypass[0]);
+        let acc2 = p
+            .acc2_sub
+            .map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half, p.acc_use_bypass[1]));
         let result = sparse::combine_integer(
             &acc1,
             acc2.as_ref(),
@@ -383,14 +382,14 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
             p.config.acc_width,
             combine,
         );
-        ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), result, p.is_half, p.write_latency);
+        queue_result(ctx, p, result);
         return;
     }
     if p.config.bfloat {
         // The float accumulators join the product sum (one aligned sum, one
         // rounding), so acc2 is an input here rather than a post-add.
         matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config, p.b_present);
-        ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
+        queue_result(ctx, p, acc);
         return;
     }
     matmul_config_driven(&mut acc, &a[..], &b[..], &p.config);
@@ -427,7 +426,7 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         }
     }
 
-    ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
+    queue_result(ctx, p, acc);
 }
 
 /// Complete deferred MAC-family instructions whose stage-3 accumulator read
@@ -1714,7 +1713,10 @@ mod tests {
     }
 
     #[test]
-    fn test_vaddmac_f_result_lands_one_cycle_after_vmul_f() {
+    fn test_vaddmac_f_result_is_visible_with_the_float_latency() {
+        // II_VADDMACf has the float result operand cycle 6 like II_VMULf: no extra cycle for the
+        // add forms (the accumulator timing probe, tools/gen_acc_timing_probe.py). A vmsc.f
+        // issued three bundles later still reads the old value, since it reads at cycle 3.
         let mut ctx = ExecutionContext::new();
         ctx.accumulator.write(0, [0u64; 8]);
         ctx.accumulator.write(2, [0u64; 8]);
@@ -1727,12 +1729,12 @@ mod tests {
         op.sources.push(Operand::AccumReg(0));
         op.sources.push(Operand::AccumReg(2));
         assert!(execute_matmul(&op, &mut ctx));
-        for _ in 0..6 {
+        for _ in 0..5 {
             step_bundle(&mut ctx);
         }
-        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 0.0, "not yet visible at +6");
+        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 0.0, "not yet visible at +5");
         step_bundle(&mut ctx);
-        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 8.0, "visible at +7");
+        assert_eq!(fp32_lane(&ctx.accumulator.read(4), 0), 8.0, "visible at +6");
     }
 
     /// Execute one bf16 form through `execute_matmul` for a whole silicon tile and
@@ -1878,11 +1880,13 @@ mod tests {
     }
 
     /// Step the context the way the cycle-accurate loop does: advance both
-    /// clocks, commit pending writes, then complete ready deferred matmuls.
+    /// clocks, commit pending writes and land the register files' in-flight writes, then
+    /// complete ready deferred matmuls.
     fn step_bundle(ctx: &mut ExecutionContext) {
         ctx.cycles += 1;
         ctx.bundle_seq += 1;
         ctx.commit_pending_writes();
+        ctx.advance_vector_bundle();
         process_pending_matmuls(ctx);
     }
 
@@ -1902,6 +1906,12 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_i8xi8_accumulate());
 
+        // The itinerary data a decoded op carries: II_VMUL/II_VMAC results are 5 bundles, VEC_Bypass;
+        // II_VMAC reads its accumulator source at cycle 3 on the same bypass class.
+        use crate::interpreter::state::Bypass;
+        ctx.result_latency = 5;
+        ctx.result_bypass = Bypass::Vec;
+
         // Bundle 0: vmul (fresh multiply, zeroes acc).
         let mul = make_mac_op(SemanticOp::MatMul, 0, 2, 5, 0, Some("VMUL_vmac_cm_core_dense"));
         assert!(execute_matmul(&mul, &mut ctx));
@@ -1910,7 +1920,10 @@ mod tests {
         step_bundle(&mut ctx);
 
         // Bundle 2: vmac chained on the same accumulator.
-        let mac = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_vmac_cm_core_dense"));
+        let mut mac = make_mac_op(SemanticOp::Mac, 0, 2, 5, 0, Some("VMAC_vmac_cm_core_dense"));
+        mac.sources.push(Operand::AccumReg(0));
+        mac.source_forward =
+            smallvec::smallvec![(1, Bypass::No), (1, Bypass::No), (1, Bypass::No), (3, Bypass::Vec)];
         assert!(execute_matmul(&mac, &mut ctx));
 
         for _ in 0..8 {

@@ -107,6 +107,51 @@ def is_censored(consumer):
     return consumer.startswith("vaddmac") and consumer.endswith(TIED_CONSUMER_SUFFIX)
 
 
+# probe instruction -> LLVM opcode name (the name `decoder_ffi::opcode_name` returns)
+PRODUCER_OPCODE = {
+    "vmul_i_dense": "VMUL_vmac_cm_core_dense", "vmul_i_sparse": "VMUL_vmac_cm_core_sparse_narrow",
+    "vmul_f_dense": "VMUL_F_vmac_bm_core_dense", "vmul_f_sparse": "VMUL_F_vmac_bm_core_sparse_wide",
+    "vmac_i_dense": "VMAC_vmac_cm_core_dense", "vmac_i_sparse": "VMAC_vmac_cm_core_sparse_narrow",
+    "vmac_f_dense": "VMAC_F_vmac_bm_core_dense", "vmac_f_sparse": "VMAC_F_vmac_bm_core_sparse_wide",
+    "vaddmac_i_dense": "VADDMAC_vmac_bm_core_dense", "vaddmac_i_sparse": "VADDMAC_vmac_cm_core_sparse_narrow",
+    "vaddmac_f_dense": "VADDMAC_F_vmac_bm_core_dense", "vaddmac_f_sparse": "VADDMAC_F_vmac_bm_core_sparse_wide",
+    "vaddmsc_f_dense": "VADDMSC_F_vmac_bm_core_dense", "vaddmsc_f_sparse": "VADDMSC_F_vmac_bm_core_sparse_wide",
+    "vmov_cm_cm": "VMOV_mv_cm", "vmov_bm_bm": "VMOV_mv_cm", "vmov_bm_x": "VMOV_mv_x",
+    "vclr_cm": "VCLR_vclr", "vadd_f": "VADD_F", "vadd_i": "VADD",
+    "vups": "VUPS_S32_S16_mv_ups_w2b", "vlda_ups": "VLDA_UPS_S32_S16_ag_idx_imm",
+}
+# probe instruction -> (LLVM opcode name, index of the accumulator among the instruction's uses)
+CONSUMER_OPCODE = {
+    "vmac_i_dense_acc1": ("VMAC_vmac_cm_core_dense", 0), "vmac_i_sparse_acc1": ("VMAC_vmac_cm_core_sparse_narrow", 0),
+    "vmac_f_dense_acc1": ("VMAC_F_vmac_bm_core_dense", 0), "vmac_f_sparse_acc1": ("VMAC_F_vmac_bm_core_sparse_wide", 0),
+    "vaddmac_i_dense_acc1": ("VADDMAC_vmac_bm_core_dense", 0), "vaddmac_i_sparse_acc1": ("VADDMAC_vmac_cm_core_sparse_narrow", 0),
+    "vaddmac_i_dense_acc2": ("VADDMAC_vmac_bm_core_dense", 1), "vaddmac_i_sparse_acc2": ("VADDMAC_vmac_cm_core_sparse_narrow", 1),
+    "vaddmac_f_dense_acc1": ("VADDMAC_F_vmac_bm_core_dense", 0), "vaddmac_f_sparse_acc1": ("VADDMAC_F_vmac_bm_core_sparse_wide", 0),
+    "vaddmac_f_dense_acc2": ("VADDMAC_F_vmac_bm_core_dense", 1), "vaddmac_f_sparse_acc2": ("VADDMAC_F_vmac_bm_core_sparse_wide", 1),
+    "vsrs_s16_s32": ("VSRS_S16_S32_mv_w_srs", 0), "vsrs_s32_s64": ("VSRS_S32_S64_mv_w_srs", 0),
+    "vsrs_d16_s32": ("VSRS_D16_S32_mv_w_srs", 0), "vsrsm_s16_s32": ("VSRSM_S16_S32", 0),
+    "vmov_x_bm": ("VMOV_mv_x", 0), "vmov_cm_cm": ("VMOV_mv_cm", 0), "vmov_bm_bm": ("VMOV_mv_cm", 0),
+    "vst_amll": ("VST_dmw_sts_am_ag_idx_imm", 0), "vst_srs_s16_s32": ("VST_SRS_S16_S32_ag_idx_imm", 0),
+    "vadd_f_acc1": ("VADD_F", 0), "vadd_f_acc2": ("VADD_F", 1),
+    "vadd_i_acc1": ("VADD", 0), "vadd_i_acc2": ("VADD", 1),
+    "vconv_bf16_fp32": ("VCONV_BF16_FP32", 0),
+}
+
+
+def rust_rows(pairs):
+    """The silicon thresholds as rows for the Rust golden test (one row per opcode pair)."""
+    rows = {}
+    for (p, c), t in sorted(pairs.items()):
+        if p not in PRODUCER_OPCODE or c not in CONSUMER_OPCODE:
+            continue
+        if is_censored(c) and t == MIN_RAW_DISTANCE:
+            continue
+        key = (PRODUCER_OPCODE[p], *CONSUMER_OPCODE[c])
+        if rows.setdefault(key, t) != t:
+            raise SystemExit(f"opcode pair {key} has two thresholds: {rows[key]} and {t} ({p}, {c})")
+    return [f'    ("{p}", "{c}", {idx}, {t}),' for (p, c, idx), t in sorted(rows.items())]
+
+
 def load_pairs(path):
     data = json.load(open(path))
     pairs = {}
@@ -153,9 +198,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("thresholds")
     ap.add_argument("--md")
+    ap.add_argument("--rust", action="store_true", help="print the golden rows for the Rust test")
     args = ap.parse_args(argv)
     pairs = {k: v for k, v in load_pairs(args.thresholds).items()
              if k[0] in PRODUCER_CLASS and k[1] in CONSUMER_CLASS}
+    if args.rust:
+        print("\n".join(rust_rows(load_pairs(args.thresholds))))
+        return 0
     itins = parse_itineraries()
 
     # forwarding set from TableGen (bypass classes), used to split the free fit.

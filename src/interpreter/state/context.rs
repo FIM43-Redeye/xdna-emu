@@ -75,25 +75,6 @@ pub struct PendingWrite {
     /// vs writes from the current bundle (not forwardable -- VLIW semantics
     /// require same-bundle reads to see pre-execution values).
     pub issued_cycle: u64,
-    /// Full-width (up to 1024-bit) accumulator result for a deferred matmul
-    /// write. When set, the AccumReg write uses this wide value instead of
-    /// `vec_value`/`accum_width` (which only cover <=512-bit chunks). Boxed so
-    /// the common scalar/vector/pointer pending writes stay small.
-    pub wide_accum: Option<Box<DeferredAccum>>,
-}
-
-/// A deferred full-width matmul accumulator result.
-///
-/// The AIE2 matrix-multiply (VMUL/VMAC) writes a 1024-bit `cm` register (or a
-/// 512-bit `bm` half) with the MAC result latency. This carries the computed
-/// accumulator so `commit_pending_writes` can apply it at `ready_cycle`.
-#[derive(Debug, Clone)]
-pub struct DeferredAccum {
-    /// The computed accumulator lanes ([u64; 16] = 1024 bits).
-    pub value: [u64; 16],
-    /// True for a 512-bit `bm` half write (low 8 lanes); false for the full
-    /// 1024-bit `cm` wide-pair write.
-    pub is_half: bool,
 }
 
 /// A deferred partial-word store awaiting its data register read.
@@ -173,7 +154,7 @@ const VUNPACK_SRC_READ_LATENCY: u64 = 6;
 
 /// A deferred accumulator add/sub awaiting its stage-3 source read.
 ///
-/// II_VADDMAC / II_VADDMACf (AIE2Schedule.td) read their accumulator
+/// II_VACC / II_VACCf (AIE2Schedule.td) read their accumulator
 /// sources at operand cycle 3, not at issue. The compiler relies on this:
 /// Peano bundles `vconv.fp32.bf16 bmh2, wl2` (result latency 2) WITH the
 /// `vadd.f bmh0, bmh0, bmh2` that consumes it, and the slot order executes
@@ -196,23 +177,18 @@ pub struct PendingAccAdd {
     pub is_float: bool,
     /// One-operand form (`vneg.f`): acc2 does not take part.
     pub unary: bool,
-    /// Cycles from the source read to the destination write; 0 writes at the
-    /// read (the integer forms). The float forms carry the rest of their
-    /// result latency (II_VACCf / II_VNEGf: sources at operand cycle 3,
-    /// result at 6), because Chess reuses a destination while a result is
-    /// still in flight.
-    pub write_latency: u64,
-    /// Issued-bundle count at which the accumulator sources are read.
+    /// Bundle the instruction issued in, its result operand cycle and its result bypass class
+    /// (itinerary `operand_cycles[0]` and the def bypass): the destination is queued with them
+    /// once the sources are read.
+    pub issue_bundle: u64,
+    pub l_def: u8,
+    pub def_bypass: Bypass,
+    /// Bypass class of each accumulator source operand (acc1, acc2).
+    pub use_bypass: [Bypass; 2],
+    /// Issued-bundle count at which the accumulator sources are read (issue + the sources' use
+    /// cycle).
     pub ready_bundle: u64,
 }
-
-/// Accumulator add/sub source read latency in issued bundles (operand
-/// cycle 3, sampled one bundle before the boundary; see PendingAccAdd).
-const VACC_SRC_READ_LATENCY: u64 = 2;
-
-/// Issue-to-result latency of the fp32 accumulator add/sub/neg forms
-/// (II_VACCf / II_VNEGf operand cycle 0 = 6; the same figure as the float MAC).
-const FLOAT_ACC_RESULT_LATENCY: u64 = crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F as u64;
 
 /// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
 ///
@@ -241,6 +217,11 @@ pub struct PendingUpsLoad {
     pub to: xdna_archspec::aie2::isa::ElementType,
     /// Half (bml/bmh, 512-bit) vs full cm (1024-bit) destination.
     pub is_half: bool,
+    /// Issue bundle, accumulator result operand cycle and result bypass class of the instruction:
+    /// the converted accumulator is timed from the issue, not from the shift read.
+    pub issue_bundle: u64,
+    pub l_def: u8,
+    pub def_bypass: Bypass,
     /// Issued-bundle count at which the shift register is read.
     pub ready_bundle: u64,
 }
@@ -861,7 +842,6 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            wide_accum: None,
         });
     }
 
@@ -874,7 +854,6 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            wide_accum: None,
         });
     }
 
@@ -893,42 +872,43 @@ impl ExecutionContext {
             accum_width: Some(width),
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            wide_accum: None,
         });
     }
 
-    /// Queue a deferred full-width matmul accumulator write.
-    ///
-    /// The AIE2 matrix-multiply (VMUL/VMAC) result is not visible in the `cm`
-    /// accumulator until the MAC result latency (5 cycles, II_VMAC
-    /// operand_cycles[0]=5) elapses. Deferring the write models that pipeline:
-    /// in a software-pipelined batch loop, the stores that drain a tile read
-    /// the previous tile's accumulator while the next tile's VMUL is still in
-    /// flight. `is_half` selects a 512-bit `bm` half write vs a 1024-bit `cm`
-    /// wide-pair write.
-    ///
-    /// FIXME(bypass-model): the accumulator file is NOT yet part of the AIE2
-    /// bypass/forwarding network that the vector register file now models
-    /// (`VectorRegisterFile::resolve`). This path applies a single flat
-    /// result-latency deferral and does not distinguish `VEC_Bypass` (MAC->MAC
-    /// accumulator forwarding, effective latency L-1) from `NoBypass`
-    /// consumers (e.g. accumulator stores). If a kernel surfaces a tight
-    /// MAC->MAC vs MAC->store accumulator-visibility split, fold the
-    /// accumulator file into the same `(l_def, def_bypass)` resolution rule:
-    /// extract the `VEC_Bypass` id (see `Bypass::from_forwarding_id`, the live
-    /// mapping, which today collapses any nonzero id to `Mov` because only
-    /// vector-register results consume it) and give `AccumulatorRegisterFile`
-    /// the same in-flight overlay.
-    pub fn queue_matmul_accum_write(&mut self, dest: Operand, value: [u64; 16], is_half: bool, latency: u64) {
-        self.pending_writes.push(PendingWrite {
-            dest,
-            scalar_value: 0,
-            vec_value: None,
-            accum_width: None,
-            ready_cycle: self.cycles + latency,
-            issued_cycle: self.cycles,
-            wide_accum: Some(Box::new(DeferredAccum { value, is_half })),
-        });
+    /// Queue an accumulator result of the instruction being executed: a `bm` half (`is_half`,
+    /// the low 8 lanes of `value`) or a 1024-bit `cm` pair. It carries the instruction's
+    /// itinerary result latency and bypass class and is resolved per reader by
+    /// [`AccumulatorRegisterFile`](super::registers::AccumulatorRegisterFile).
+    pub fn queue_acc_write(&mut self, dest: Operand, value: [u64; 16], is_half: bool) {
+        let (l_def, def_bypass) = (self.result_latency, self.result_bypass);
+        let issue = self.accumulator.current_bundle();
+        self.queue_acc_write_timed(issue, dest, value, is_half, l_def, def_bypass);
+    }
+
+    /// Like [`queue_acc_write`](Self::queue_acc_write) for a result computed after its issue (a
+    /// MAC whose accumulator sources are read at their use cycle): the write is timed from the
+    /// original issue bundle and carries the latency and bypass class captured then.
+    pub fn queue_acc_write_timed(
+        &mut self,
+        issue_bundle: u64,
+        dest: Operand,
+        value: [u64; 16],
+        is_half: bool,
+        l_def: u8,
+        def_bypass: crate::interpreter::state::registers::Bypass,
+    ) {
+        let Operand::AccumReg(reg) = dest else {
+            panic!("accumulator write to {dest:?}");
+        };
+        if is_half {
+            let mut half = [0u64; 8];
+            half.copy_from_slice(&value[..8]);
+            self.accumulator
+                .queue_write_issued_at(issue_bundle, reg, half, l_def, def_bypass);
+        } else {
+            self.accumulator
+                .queue_write_wide_issued_at(issue_bundle, reg, value, l_def, def_bypass);
+        }
     }
 
     /// Land vector-register writes that have reached visibility and advance the
@@ -939,6 +919,7 @@ impl ExecutionContext {
     /// `VectorRegisterFile` (see its `resolve`).
     pub fn advance_vector_bundle(&mut self) {
         self.vector.advance_bundle(self.bundle_seq);
+        self.accumulator.advance_bundle(self.bundle_seq);
     }
 
     /// Queue a pointer register write with pipeline latency.
@@ -966,7 +947,6 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            wide_accum: None,
         });
     }
 
@@ -1007,6 +987,7 @@ impl ExecutionContext {
         for pw in &writes {
             self.apply_pending_write(pw);
         }
+        self.accumulator.land_all_pending();
     }
 
     /// Commit all pending writes whose ready_cycle has been reached.
@@ -1069,17 +1050,7 @@ impl ExecutionContext {
                 }
             }
             Operand::AccumReg(r) => {
-                if let Some(wide) = &pw.wide_accum {
-                    // Deferred matmul result: full 1024-bit cm pair, or 512-bit
-                    // bm half.
-                    if wide.is_half {
-                        let mut half = [0u64; 8];
-                        half.copy_from_slice(&wide.value[..8]);
-                        self.accumulator.write(*r, half);
-                    } else {
-                        self.accumulator.write_wide(*r, wide.value);
-                    }
-                } else if let Some(vec) = &pw.vec_value {
+                if let Some(vec) = &pw.vec_value {
                     self.apply_accum_write(*r, vec, pw.accum_width);
                 }
             }
@@ -1136,7 +1107,7 @@ impl ExecutionContext {
         match width {
             Some(AccumWidth::QuarterLow) => {
                 // Write to lanes 0-3 of the 512-bit register, preserve 4-7.
-                let mut current = self.accumulator.read(reg);
+                let mut current = self.accumulator.read_committed(reg);
                 let lanes = to_u64_lanes(vec);
                 current[0] = lanes[0];
                 current[1] = lanes[1];
@@ -1146,7 +1117,7 @@ impl ExecutionContext {
             }
             Some(AccumWidth::QuarterHigh) => {
                 // Write to lanes 4-7 of the 512-bit register, preserve 0-3.
-                let mut current = self.accumulator.read(reg);
+                let mut current = self.accumulator.read_committed(reg);
                 let lanes = to_u64_lanes(vec);
                 current[4] = lanes[0];
                 current[5] = lanes[1];
@@ -1265,8 +1236,9 @@ impl ExecutionContext {
         }
     }
 
-    /// Queue an accumulator add/sub for its stage-3 source read (see
-    /// [`PendingAccAdd`]). Control bits are resolved by the caller at issue.
+    /// Queue an accumulator add/sub for its source read (see [`PendingAccAdd`]). Control bits are
+    /// resolved by the caller at issue; `acc_use` is the (use cycle, use bypass) of each of the two
+    /// accumulator sources, from the instruction's itinerary.
     #[allow(clippy::too_many_arguments)]
     pub fn queue_pending_acc_add(
         &mut self,
@@ -1280,7 +1252,9 @@ impl ExecutionContext {
         is_wide: bool,
         is_float: bool,
         unary: bool,
+        acc_use: [(u8, Bypass); 2],
     ) {
+        let use_cycle = acc_use[0].0.max(acc_use[1].0);
         self.pending_acc_adds.push(PendingAccAdd {
             acc1_reg,
             acc2_reg,
@@ -1292,19 +1266,17 @@ impl ExecutionContext {
             is_wide,
             is_float,
             unary,
-            write_latency: if is_float {
-                FLOAT_ACC_RESULT_LATENCY - VACC_SRC_READ_LATENCY
-            } else {
-                0
-            },
-            ready_bundle: self.bundle_seq + VACC_SRC_READ_LATENCY,
+            issue_bundle: self.bundle_seq,
+            l_def: self.result_latency,
+            def_bypass: self.result_bypass,
+            use_bypass: [acc_use[0].1, acc_use[1].1],
+            ready_bundle: self.bundle_seq + use_cycle as u64,
         });
     }
 
-    /// Sample sources for pending accumulator add/subs that reached their
-    /// read bundle and write their results. Call once per issued bundle,
-    /// after `commit_pending_writes()` (so MAC results that land this cycle
-    /// are visible) and before slot execution.
+    /// Read the sources of the accumulator add/subs that reached their read bundle and queue
+    /// their results. Call once per issued bundle, after the register-file clocks advanced (so
+    /// writes visible this bundle count) and before slot execution.
     pub fn process_pending_acc_adds(&mut self) {
         if self.pending_acc_adds.is_empty() {
             return;
@@ -1321,43 +1293,30 @@ impl ExecutionContext {
         });
         ready.sort_by_key(|pa| pa.ready_bundle);
         for pa in ready {
+            // The use cycle has elapsed since issue: read at the current bundle.
+            let [ub1, ub2] = pa.use_bypass;
+            let mut result = [0u64; 16];
             if pa.is_wide {
-                let a1 = self.accumulator.read_wide(pa.acc1_reg);
-                let a2 = self.accumulator.read_wide(pa.acc2_reg);
-                let mut result = [0u64; 16];
+                let a1 = self.accumulator.read_wide_with(pa.acc1_reg, 0, ub1);
+                let a2 = self.accumulator.read_wide_with(pa.acc2_reg, 0, ub2);
                 for i in 0..16 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
-                if pa.write_latency > 0 {
-                    self.queue_matmul_accum_write(
-                        Operand::AccumReg(pa.dst_reg),
-                        result,
-                        false,
-                        pa.write_latency,
-                    );
-                } else {
-                    self.accumulator.write_wide(pa.dst_reg, result);
-                }
             } else {
-                let a1 = self.accumulator.read(pa.acc1_reg);
-                let a2 = self.accumulator.read(pa.acc2_reg);
-                let mut result = [0u64; 8];
+                let a1 = self.accumulator.read_with(pa.acc1_reg, 0, ub1);
+                let a2 = self.accumulator.read_with(pa.acc2_reg, 0, ub2);
                 for i in 0..8 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
-                if pa.write_latency > 0 {
-                    let mut wide = [0u64; 16];
-                    wide[..8].copy_from_slice(&result);
-                    self.queue_matmul_accum_write(
-                        Operand::AccumReg(pa.dst_reg),
-                        wide,
-                        true,
-                        pa.write_latency,
-                    );
-                } else {
-                    self.accumulator.write(pa.dst_reg, result);
-                }
             }
+            self.queue_acc_write_timed(
+                pa.issue_bundle,
+                Operand::AccumReg(pa.dst_reg),
+                result,
+                !pa.is_wide,
+                pa.l_def,
+                pa.def_bypass,
+            );
         }
     }
 
@@ -1416,6 +1375,9 @@ impl ExecutionContext {
             from,
             to,
             is_half,
+            issue_bundle: self.bundle_seq,
+            l_def: self.result_latency,
+            def_bypass: self.result_bypass,
             ready_bundle: self.bundle_seq + VLDA_UPS_SHIFT_READ_LATENCY,
         });
     }
@@ -1442,13 +1404,20 @@ impl ExecutionContext {
         for pu in ready {
             use crate::interpreter::execute::vector_ups::{ups_vector_to_acc, ups_vector_to_acc_wide};
             let shift = self.scalar_read(pu.shift_reg);
+            let mut acc = [0u64; 16];
             if pu.is_half {
-                let acc = ups_vector_to_acc(&pu.vec_data, shift, pu.from, pu.to);
-                self.accumulator.write(pu.dest_reg, acc);
+                acc[..8].copy_from_slice(&ups_vector_to_acc(&pu.vec_data, shift, pu.from, pu.to));
             } else {
-                let acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
-                self.accumulator.write_wide(pu.dest_reg, acc);
+                acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
             }
+            self.queue_acc_write_timed(
+                pu.issue_bundle,
+                Operand::AccumReg(pu.dest_reg),
+                acc,
+                pu.is_half,
+                pu.l_def,
+                pu.def_bypass,
+            );
         }
     }
 
@@ -2259,35 +2228,34 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_matmul_accum_write_defers() {
-        // A matmul (VMUL/VMAC) accumulator write has MAC result latency (5
-        // cycles): the result is not visible in the accumulator until
-        // ready_cycle, so in-flight stores in a software-pipelined loop read
-        // the previous tile's value. Models AIE2 II_VMAC operand_cycles[0]=5.
+    fn test_queue_acc_write_defers_by_the_itinerary_latency() {
+        // A matmul (VMUL/VMAC) accumulator write has the MAC result operand cycle (5, II_VMAC
+        // operand_cycles[0]): a store-class reader (use cycle 1) sees it from issue + 5, so the
+        // stores of a software-pipelined loop read the previous tile's value until then.
         let mut ctx = ExecutionContext::new();
         ctx.accumulator.write_wide(0, [0xAAAA_AAAA_AAAA_AAAAu64; 16]);
+        ctx.result_latency = 5;
+        ctx.result_bypass = Bypass::Vec;
 
-        ctx.cycles = 10;
-        let result = [0x1111_1111_1111_1111u64; 16];
-        ctx.queue_matmul_accum_write(Operand::AccumReg(0), result, false, 5); // ready=15
+        ctx.bundle_seq = 10;
+        ctx.advance_vector_bundle();
+        ctx.queue_acc_write(Operand::AccumReg(0), [0x1111_1111_1111_1111u64; 16], false);
 
-        // Immediately and before ready_cycle: accumulator holds the OLD value.
-        assert_eq!(ctx.accumulator.read_wide(0)[0], 0xAAAA_AAAA_AAAA_AAAA);
-        ctx.cycles = 14;
-        ctx.commit_pending_writes();
-        assert_eq!(
-            ctx.accumulator.read_wide(0)[0],
-            0xAAAA_AAAA_AAAA_AAAA,
-            "before ready_cycle the matmul result must not be visible",
-        );
-
-        // At ready_cycle (15): committed, new value visible.
-        ctx.cycles = 15;
-        ctx.commit_pending_writes();
+        for bundle in 11..=14 {
+            ctx.bundle_seq = bundle;
+            ctx.advance_vector_bundle();
+            assert_eq!(
+                ctx.accumulator.read_wide(0)[0],
+                0xAAAA_AAAA_AAAA_AAAA,
+                "bundle {bundle}: before issue + 5 the matmul result must not be visible",
+            );
+        }
+        ctx.bundle_seq = 15;
+        ctx.advance_vector_bundle();
         assert_eq!(
             ctx.accumulator.read_wide(0)[0],
             0x1111_1111_1111_1111,
-            "at ready_cycle the matmul result becomes visible",
+            "from issue + 5 the matmul result is visible to a store",
         );
     }
 

@@ -94,9 +94,9 @@ pub mod memory_map;
 /// register file), `VEC_Bypass` (accumulator/CM domain: MAC/MUL), and
 /// `NoBypass` (loads, stores, cross-domain moves, flags -- no forwarding).
 ///
-/// Vector-*register* writes only ever carry `Mov` or `No` def bypass
-/// (`Vec` is accumulator-domain), so the vector-file visibility model needs
-/// only those two; `Vec` is represented for the future accumulator extension.
+/// The id the LLVM scheduling model gives each class is the position of its `Bypass` record in
+/// `AIE2Schedule.td` (`NoBypass` 0, `MOV_Bypass` 1, `VEC_Bypass` 2); `decoder_ffi` tests pin the
+/// two ids against the itinerary class names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Bypass {
     /// No forwarding (id 0). Consumers always wait the full result latency.
@@ -109,15 +109,16 @@ pub enum Bypass {
 }
 
 impl Bypass {
-    /// Map an itinerary forwarding id to a bypass class for a VECTOR-REGISTER
-    /// result/operand: 0 -> No (NoBypass); nonzero -> Mov (MOV_Bypass). This
-    /// mapping is exact only for vector-register reads/writes (W/X file);
-    /// accumulator/CM-domain (VEC_Bypass) results go through the separate MAC
-    /// path -- see the FIXME(bypass-model) at queue_matmul_accum_write. When
-    /// that file joins this model, distinguish the Vec case here.
+    /// Itinerary forwarding id of `MOV_Bypass` (see the type docs).
+    pub const MOV_ID: u16 = 1;
+    /// Itinerary forwarding id of `VEC_Bypass`.
+    pub const VEC_ID: u16 = 2;
+
+    /// Map an itinerary forwarding id to its bypass class.
     pub fn from_forwarding_id(id: u16) -> Bypass {
         match id {
             0 => Bypass::No,
+            Self::VEC_ID => Bypass::Vec,
             _ => Bypass::Mov,
         }
     }

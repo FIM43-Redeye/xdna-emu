@@ -1649,6 +1649,7 @@ impl VectorAlu {
             is_wide,
             is_float,
             false,
+            [op.acc_source_timing(0), op.acc_source_timing(if acc_sources.len() >= 2 { 1 } else { 0 })],
         );
     }
 
@@ -1693,8 +1694,19 @@ impl VectorAlu {
             // the adds it reads its source at operand cycle 3 and lands its
             // result at 6. Config bit 12 (dynAcc0Neg) un-negates it.
             let sub_acc1 = (conf >> 12) & 1 != 0;
+            let timing = op.acc_source_timing(0);
             ctx.queue_pending_acc_add(
-                acc_reg, acc_reg, dst_reg, !sub_acc1, false, zero_acc, false, is_wide, true, true,
+                acc_reg,
+                acc_reg,
+                dst_reg,
+                !sub_acc1,
+                false,
+                zero_acc,
+                false,
+                is_wide,
+                true,
+                true,
+                [timing, timing],
             );
             return;
         }
@@ -1708,11 +1720,12 @@ impl VectorAlu {
         if is_wide {
             let mut result = ctx.accumulator.read_wide(acc_reg);
             result.iter_mut().for_each(|w| *w = neg_pair(*w));
-            ctx.accumulator.write_wide(dst_reg, result);
+            ctx.queue_acc_write(Operand::AccumReg(dst_reg), result, false);
         } else {
-            let mut result = ctx.accumulator.read(acc_reg);
-            result.iter_mut().for_each(|w| *w = neg_pair(*w));
-            ctx.accumulator.write(dst_reg, result);
+            let mut result = [0u64; 16];
+            result[..8].copy_from_slice(&ctx.accumulator.read(acc_reg));
+            result[..8].iter_mut().for_each(|w| *w = neg_pair(*w));
+            ctx.queue_acc_write(Operand::AccumReg(dst_reg), result, true);
         }
     }
 }
@@ -2346,11 +2359,13 @@ mod tests {
                 .with_source(Operand::AccumReg(4))
                 .with_source(Operand::ScalarReg(0));
             op.accum_width = Some(AccumWidth::Half);
+            ctx.result_latency = 5; // II_VACC
             assert!(VectorAlu::execute(&op, &mut ctx));
-            ctx.bundle_seq += 4;
+            ctx.bundle_seq += 3;
+            ctx.advance_vector_bundle();
             ctx.process_pending_acc_adds();
-            ctx.cycles += 10;
-            ctx.commit_pending_writes();
+            ctx.bundle_seq += 5;
+            ctx.advance_vector_bundle();
             ctx.accumulator.read(6)[0] as u32 as i32
         };
         assert_eq!(run(0), 8);
@@ -2378,13 +2393,17 @@ mod tests {
             .with_source(Operand::ScalarReg(0));
         op.accum_width = Some(AccumWidth::Half);
         let before = ctx.accumulator.read(6);
+        // II_VACCf: result operand cycle 6, accumulator sources read at cycle 3.
+        ctx.result_latency = 6;
         assert!(VectorAlu::execute(&op, &mut ctx));
-        ctx.bundle_seq += 4;
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
         ctx.process_pending_acc_adds();
-        // The result lands six cycles after issue, not at the source read.
+        // The result is visible six bundles after issue (plus the write-visibility bundle), not
+        // at the source read.
         assert_eq!(ctx.accumulator.read(6), before, "result must not be visible at the source read");
-        ctx.cycles += 10;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq += 5;
+        ctx.advance_vector_bundle();
         let out = ctx.accumulator.read(6);
         std::array::from_fn(|i| (out[i / 2] >> (32 * (i % 2))) as u32)
     }
@@ -2434,11 +2453,13 @@ mod tests {
             .with_source(Operand::AccumReg(2))
             .with_source(Operand::ScalarReg(0));
         op.accum_width = Some(AccumWidth::Half);
+        ctx.result_latency = 6;
         assert!(VectorAlu::execute(&op, &mut ctx));
-        ctx.bundle_seq += 4;
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
         ctx.process_pending_acc_adds();
-        ctx.cycles += 10;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq += 5;
+        ctx.advance_vector_bundle();
         let out = ctx.accumulator.read(4);
         let lane = |i: usize| (out[i / 2] >> (32 * (i % 2))) as u32;
         assert_eq!(lane(0), 0x8000_0000, "a denormal flushes to -0");

@@ -31,6 +31,8 @@ mod event_trace;
 mod timing_context;
 mod context;
 mod sparse_load;
+#[cfg(test)]
+mod acc_timing_golden;
 
 pub use registers::{
     ScalarRegisterFile,

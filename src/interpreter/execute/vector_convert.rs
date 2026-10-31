@@ -232,7 +232,7 @@ impl VectorAlu {
                     // schedule the compiler intended: a conv issued AFTER the
                     // vadd must not retroactively replace the vadd's source
                     // (silicon-verified, fuzzer seed 4 high half).
-                    ctx.queue_matmul_accum_write(Operand::AccumReg(dst_reg), acc, true, 2);
+                    ctx.queue_acc_write(Operand::AccumReg(dst_reg), acc, true);
                 } else {
                     let mut result = [0u32; 16];
                     result[..8].copy_from_slice(&res_lo);

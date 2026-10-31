@@ -713,24 +713,22 @@ impl VectorAlu {
             let is_half =
                 matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half))
                     || src_reg % 2 == 1;
-            // The destination lands after the move's def latency, not at issue:
-            // II_VMOV_W_CM_CM (and the bm form) has accumulator def operand cycle 2
-            // in AIE2Schedule.td, and the Chess schedules rely on it. A store of the
-            // destination's quarter issued the bundle after the move reads the OLD
-            // value (`vst amhh7; vmov cm7, cm1; vst amhl7` stores cm7 before the
-            // move; found as a wrong amhl quarter in the sparse MAC `ops` kernels).
-            let latency = ctx.result_latency.max(1) as u64;
+            // The destination lands after the move's def latency, not at issue
+            // (II_VMOV_CM, def operand cycle 2; the Chess schedules rely on it: `vst amhh7; vmov
+            // cm7, cm1; vst amhl7` stores cm7 before the move). The source is read at the
+            // move's use cycle.
+            let (use_cycle, use_bypass) = op.acc_source_timing(0);
             let dst = Self::get_acc_dest(op);
             if !is_half {
                 // Accumulator move: vmov cm_dst, cm_src
-                let data = ctx.accumulator.read_wide(src_reg);
-                ctx.queue_matmul_accum_write(Operand::AccumReg(dst), data, false, latency);
+                let data = ctx.accumulator.read_wide_with(src_reg, use_cycle, use_bypass);
+                ctx.queue_acc_write(Operand::AccumReg(dst), data, false);
             } else {
                 // Half-accum move: vmov bm_dst, bm_src
-                let data = ctx.accumulator.read(src_reg);
+                let data = ctx.accumulator.read_with(src_reg, use_cycle, use_bypass);
                 let mut wide16 = [0u64; 16];
                 wide16[..8].copy_from_slice(&data);
-                ctx.queue_matmul_accum_write(Operand::AccumReg(dst), wide16, true, latency);
+                ctx.queue_acc_write(Operand::AccumReg(dst), wide16, true);
             }
         } else if has_acc_source || has_acc_dest {
             if op.is_wide_vector {
@@ -764,22 +762,14 @@ impl VectorAlu {
                         acc[j] = wide[2 * j] as u64 | ((wide[2 * j + 1] as u64) << 32);
                     }
                     let dst = Self::get_acc_dest(op);
-                    // Defer the accumulator write by this VMOV's def latency rather
-                    // than applying it immediately. II_VMOV_X_BM_XM (vmov bm,x) has
-                    // accumulator def operand cycle 2 (NoBypass) in llvm-aie
-                    // AIE2Schedule.td, so a fused VST.CONV/VST.SRS draining the
-                    // accumulator in a software-pipelined loop must read the value
-                    // as of two cycles earlier -- one VMOV behind the live register.
-                    // An immediate write let each store read the freshly-overwritten
-                    // accumulator (observed as one-group-shifted Inf/NaN garbage in
-                    // the vec_conv_bf16_edge silicon kernels, whose store-converts
-                    // are packed into a RET's delay slots). The pending-write queue
-                    // models the latency; reuse the half-accumulator path
-                    // (queue_matmul_accum_write with is_half) since bm is 512-bit.
-                    let latency = ctx.result_latency.max(1) as u64;
+                    // The accumulator write lands after this VMOV's def latency
+                    // (II_VMOV_X_BM_XM, accumulator def operand cycle 2, NoBypass): a fused
+                    // VST.CONV/VST.SRS draining the accumulator in a software-pipelined loop reads
+                    // the value as of two cycles earlier, one VMOV behind the live register
+                    // (vec_conv_bf16_edge silicon kernels).
                     let mut wide16 = [0u64; 16];
                     wide16[..8].copy_from_slice(&acc);
-                    ctx.queue_matmul_accum_write(Operand::AccumReg(dst), wide16, true, latency);
+                    ctx.queue_acc_write(Operand::AccumReg(dst), wide16, true);
                 }
             } else if let Some(quarter_base) = Self::quarter_lane_base(op) {
                 // 256-bit move between a w register and an accumulator quarter
@@ -849,7 +839,7 @@ impl VectorAlu {
                     Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
                 } else {
                     let dst = Self::get_acc_dest(op);
-                    ctx.accumulator.clear(dst);
+                    ctx.queue_acc_write(Operand::AccumReg(dst), [0u64; 16], true);
                 }
             } else {
                 Self::write_wide_vec_dest(op, ctx, [0u32; 16]);
@@ -1295,11 +1285,11 @@ mod tests {
         op.accum_width = Some(AccumWidth::Full);
         VectorAlu::execute(&op, &mut ctx);
         ctx.accumulator.write_wide(2, [9u64; 16]); // the source changes after issue
-        ctx.cycles += 1;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq += 1;
+        ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read_wide(0), [1u64; 16], "not yet landed one cycle later");
-        ctx.cycles += 1;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq += 1;
+        ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read_wide(0), [7u64; 16], "landed with the value sampled at issue");
     }
 
@@ -1315,8 +1305,8 @@ mod tests {
             .with_dest(Operand::AccumReg(1))
             .with_source(Operand::AccumReg(3));
         VectorAlu::execute(&op, &mut ctx);
-        ctx.cycles += 2;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq += 2;
+        ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read(1), [5u64; 8]);
     }
 }

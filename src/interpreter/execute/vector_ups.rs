@@ -380,10 +380,9 @@ impl VectorAlu {
     /// (Peano schedules the next tile's VUPS one bundle before the stores)
     /// read the freshly-converted value (seed 5048 silicon).
     fn queue_ups_acc_write(ctx: &mut ExecutionContext, reg: u8, acc: &[u64; 8]) {
-        let latency = ctx.result_latency.max(1) as u64;
         let mut wide16 = [0u64; 16];
         wide16[..8].copy_from_slice(acc);
-        ctx.queue_matmul_accum_write(Operand::AccumReg(reg), wide16, true, latency);
+        ctx.queue_acc_write(Operand::AccumReg(reg), wide16, true);
     }
 
     /// Wide UPS path: widen to 1024-bit accumulator (w2c or x2c).
@@ -415,8 +414,7 @@ impl VectorAlu {
             match &op.dest {
                 Some(Operand::AccumReg(r)) => {
                     // Defer by the II_VUPS def latency (see queue_ups_acc_write).
-                    let latency = ctx.result_latency.max(1) as u64;
-                    ctx.queue_matmul_accum_write(Operand::AccumReg(*r), acc_wide, false, latency);
+                    ctx.queue_acc_write(Operand::AccumReg(*r), acc_wide, false);
                 }
                 other => {
                     panic!(
@@ -932,23 +930,24 @@ mod integration_tests {
         op.from_type = Some(ElementType::Int32);
         op.is_wide_vector = true;
 
-        ctx.cycles = 100;
+        ctx.bundle_seq = 100;
+        ctx.advance_vector_bundle();
         ctx.result_latency = 3;
         VectorAlu::execute(&op, &mut ctx);
 
         // Still the old value through issue+2 (a vst am one bundle later
         // drains the previous accumulator).
-        ctx.cycles = 102;
-        ctx.commit_pending_writes();
+        ctx.bundle_seq = 102;
+        ctx.advance_vector_bundle();
         assert_eq!(
             ctx.accumulator.read(0)[0],
             0xAAAA_AAAA_AAAA_AAAA,
             "UPS result must NOT be visible before issue+3"
         );
 
-        // Commits at issue+3.
-        ctx.cycles = 103;
-        ctx.commit_pending_writes();
+        // A store issued at issue+3 reads it.
+        ctx.bundle_seq = 103;
+        ctx.advance_vector_bundle();
         assert_eq!(ctx.accumulator.read(0)[0], 1, "UPS result must be visible at issue+3");
     }
 

@@ -320,6 +320,10 @@ pub struct SlotOp {
     pub result_bypass: Bypass,
 }
 
+/// Accumulator source use cycle of the MAC family (II_VMAC/II_VACC `operand_cycles[1]`), assumed
+/// for an op that carries no itinerary data.
+pub const FALLBACK_ACC_SOURCE_USE_CYCLE: u8 = 3;
+
 // Core methods on SlotOp.
 impl SlotOp {
     /// Get the natural execution slot for this operation based on SemanticOp + metadata.
@@ -525,6 +529,21 @@ impl SlotOp {
             source_forward: SmallVec::new(),
             result_bypass: Bypass::No,
         }
+    }
+
+    /// Forwarding pair `(use_cycle, use_bypass)` of the `k`-th accumulator source, from the
+    /// itinerary-resolved `source_forward`. An op without itinerary data (a hand-built or legacy
+    /// op) reads at the MAC family's accumulator source cycle with no forwarding.
+    pub fn acc_source_timing(&self, k: usize) -> (u8, Bypass) {
+        let pos = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, Operand::AccumReg(_)))
+            .nth(k)
+            .map(|(pos, _)| pos);
+        pos.and_then(|pos| self.source_forward.get(pos).copied())
+            .unwrap_or((FALLBACK_ACC_SOURCE_USE_CYCLE, Bypass::No))
     }
 
     /// Check if this slot operation is a NOP.

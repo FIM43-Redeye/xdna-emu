@@ -969,13 +969,15 @@ impl MemoryUnit {
                     ctx.queue_pending_ups_load(vec_data, s, *r, from, to, is_half);
                 } else {
                     let shift = Self::get_shift_amount(op, ctx);
+                    let mut acc = [0u64; 16];
                     if is_half {
-                        let acc = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
-                        ctx.accumulator.write(*r, acc);
+                        acc[..8].copy_from_slice(&super::vector_ups::ups_vector_to_acc(
+                            &vec_data, shift, from, to,
+                        ));
                     } else {
-                        let acc_wide = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
-                        ctx.accumulator.write_wide(*r, acc_wide);
+                        acc = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
                     }
+                    ctx.queue_acc_write(Operand::AccumReg(*r), acc, is_half);
                 }
             }
             other => {
