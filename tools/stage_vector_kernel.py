@@ -94,7 +94,7 @@ def data_sources():
             assert name not in sources, name
             sources[name] = (lambda mode=mode, kind=kind: gen_mac_modes.kernel_data(mode, kind))
     for mode in gen_mac_sparse.MODES:
-        for kind in gen_mac_sparse.KINDS:
+        for kind in gen_mac_sparse.kinds_of(mode):
             name = gen_mac_sparse.kernel_name(mode, kind)
             assert name not in sources, name
             sources[name] = (lambda mode=mode, kind=kind: gen_mac_sparse.kernel_data(mode, kind))

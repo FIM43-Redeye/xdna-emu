@@ -92,6 +92,22 @@ pub(super) fn logical_b(layout: &SparseLayout, bits_y: u32, data: &Vec512, mask:
     image
 }
 
+/// The logical B elements the mask keeps, bit `k * cols + c` set for each: the other elements
+/// are absent from the multiplier (see [`super::matmul_bf16`]), which is not the same as
+/// holding a zero.
+pub(super) fn present_elements(layout: &SparseLayout, mask: u128) -> u128 {
+    let cols = layout.unit_cols * layout.elements_per_unit;
+    let mut present = 0u128;
+    for k in 0..layout.inner {
+        for c in 0..cols {
+            if layout.stored_unit(mask, k, c / layout.elements_per_unit).is_some() {
+                present |= 1 << (k * cols + c);
+            }
+        }
+    }
+    present
+}
+
 /// Combine the product sum `product` (a zero-accumulator multiply) with the accumulator inputs
 /// into the result, lane by lane, wrapping at the accumulator width.
 pub(super) fn combine_integer(

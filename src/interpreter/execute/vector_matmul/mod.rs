@@ -64,6 +64,9 @@ pub struct PendingMatmul {
     operands: (Image, Image),
     /// Present for sparse integer MACs, whose terms are combined by [`sparse::combine_integer`].
     sparse_integer: Option<SparseCombine>,
+    /// For a sparse float MAC, the B elements the mask keeps (bit `k * cols + c`); the products
+    /// of the others do not take part at all.
+    b_present: Option<u128>,
     config: MatMulConfig,
     /// Second accumulator merge: None, Some(false)=AddMac, Some(true)=SubMac.
     acc2_sub: Option<bool>,
@@ -267,10 +270,10 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
     // Sample the vector sources and control flags at issue (operand cycle 1);
     // defer the accumulator source read and the multiply to +3.
-    let (operands, sparse_integer) = match qx {
+    let (operands, sparse_integer, b_present) = match qx {
         None => {
             let (a, b) = get_two_vec512(op, ctx);
-            ((widen(&a), widen(&b)), None)
+            ((widen(&a), widen(&b)), None, None)
         }
         Some((qx_pos, qx_index)) => {
             match sample_sparse(op, ctx, &config, conf_val, is_bf16, qx_pos, qx_index) {
@@ -304,6 +307,7 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     ctx.queue_pending_matmul(PendingMatmul {
         operands,
         sparse_integer,
+        b_present,
         config,
         acc2_sub,
         acc_src,
@@ -366,7 +370,7 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
     if p.config.bfloat {
         // The float accumulators join the product sum (one aligned sum, one
         // rounding), so acc2 is an input here rather than a post-add.
-        matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config);
+        matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config, p.b_present);
         ctx.queue_matmul_accum_write(Operand::AccumReg(p.acc_dest), acc, p.is_half, p.write_latency);
         return;
     }
@@ -452,7 +456,7 @@ fn sample_sparse(
     is_bf16: bool,
     qx_pos: usize,
     qx_index: u8,
-) -> Option<((Image, Image), Option<SparseCombine>)> {
+) -> Option<((Image, Image), Option<SparseCombine>, Option<u128>)> {
     let layout = sparse::layout_of(conf_val, is_bf16)?;
     let name = op.encoding_name.as_deref().unwrap_or("");
     let wide = name.ends_with("sparse_wide") || (op.is_quad_vector && !name.ends_with("sparse_narrow"));
@@ -477,13 +481,14 @@ fn sample_sparse(
     let mask = ctx.mask.read_u128(qx_index);
     let b = sparse::logical_b(&layout, config.bits_y, &data, mask);
 
+    let present = config.bfloat.then(|| sparse::present_elements(&layout, mask));
     let combine = if config.bfloat {
         None
     } else {
         let kind = sparse::op_kind_of(name)?;
         Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
     };
-    Some(((a, b), combine))
+    Some(((a, b), combine, present))
 }
 
 /// Scan sources for the last ScalarReg operand (the config register).
@@ -623,7 +628,7 @@ fn element_offset(index: u32, bits: u32) -> usize {
 /// Float (`config.bfloat`) configs take the bf16 datapath.
 pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &MatMulConfig) {
     if config.bfloat {
-        matmul_bf16(acc, None, a, b, config);
+        matmul_bf16(acc, None, a, b, config, None);
         return;
     }
     let shape = config.shape;
@@ -660,16 +665,26 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &Ma
 /// acc1 on entry when the config accumulates and is overwritten with the result; `acc2` is the second accumulator of the add*
 /// forms. `config.subtract` is the effective product negation (instruction
 /// family folded in by the caller); `sub_acc1`/`sub_acc2` negate the accumulators.
-fn matmul_bf16(acc: &mut Acc1024, acc2: Option<&Acc1024>, a: &[u32], b: &[u32], config: &MatMulConfig) {
+fn matmul_bf16(
+    acc: &mut Acc1024,
+    acc2: Option<&Acc1024>,
+    a: &[u32],
+    b: &[u32],
+    config: &MatMulConfig,
+    b_present: Option<u128>,
+) {
     let bf16 = |v: &[u32], i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
     let lane32 = |v: &Acc1024, i: usize| (v[i / 2] >> (32 * (i % 2))) as u32;
     let shape = config.shape;
     let mut out: Acc1024 = [0u64; 16];
     for lane in 0..shape.lanes() {
+        // A B element the sparse mask drops is absent from the multiplier: its product is not a
+        // zero term (which would turn an Inf or NaN in A into a NaN) but not a term at all.
         let products: Vec<(u16, u16)> = (0..shape.terms())
-            .map(|term| {
+            .filter_map(|term| {
                 let (ia, ib) = shape.operand_indices(lane, term);
-                (bf16(a, ia as usize), bf16(b, ib as usize))
+                let kept = b_present.map_or(true, |p| p >> ib & 1 != 0);
+                kept.then(|| (bf16(a, ia as usize), bf16(b, ib as usize)))
             })
             .collect();
         let lane = lane as usize;

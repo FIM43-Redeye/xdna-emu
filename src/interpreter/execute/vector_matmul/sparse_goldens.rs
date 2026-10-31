@@ -291,7 +291,7 @@ fn replay(kernel: &str) -> (usize, Vec<String>) {
                 // Which operand set and accumulator inputs the stage reads.
                 let (set, acc1_from, acc2_from) = match g.kind.as_str() {
                     "probe" => (0, None, None),
-                    "rand" => (stage, stage.checked_sub(1), None),
+                    "rand" | "spec" => (stage, stage.checked_sub(1), None),
                     _ => match stage {
                         0 | 1 => (stage, None, None),
                         _ => (2, Some(0), Some(1)),
@@ -375,6 +375,16 @@ fn matches_silicon_on_every_config_word_variant() {
 #[test]
 fn matches_silicon_on_every_held_out_lane() {
     run_kind("rand", 150_000);
+}
+
+/// Held-out bfloat16 tiles with zeros, Inf, NaNs, denormals and overflowing exponents among the
+/// normal numbers, against absent and present units of the mask.
+#[test]
+fn matches_silicon_on_special_values() {
+    let kernel = "vec_macsparse_4x16_16x4_spec";
+    let (checked, bad) = replay(kernel);
+    assert!(checked >= 3_000, "only {checked} special-value words replayed");
+    assert_clean(kernel, checked, &bad);
 }
 
 /// The other encoding of every mode: the wide form of a narrow mode reads the low 512 bits

@@ -7,6 +7,8 @@ import analyze_mac_sparse as analyze
 import gen_mac_sparse as gen
 import pytest
 
+MODE_KINDS = [(m, k) for m in gen.MODES for k in gen.kinds_of(m)]
+
 L1_BUDGET_WORDS = 12 * 1024    # in + out chunk buffers, well inside the 64 KiB data memory
 
 
@@ -31,8 +33,7 @@ class TestDesign:
                 covered |= {b for b in range(gen.MASK_BITS) if m >> b & 1}
         assert covered == set(range(gen.MASK_BITS))
 
-    @pytest.mark.parametrize("mode", gen.MODES, ids=lambda m: m.stem)
-    @pytest.mark.parametrize("kind", list(gen.KINDS))
+    @pytest.mark.parametrize("mode,kind", MODE_KINDS, ids=lambda x: getattr(x, "stem", x))
     def test_tiles_fill_whole_chunks_inside_the_budget(self, mode, kind):
         tiles = gen.tiles_of(mode, kind)
         t = gen.tiles_per_chunk(mode, kind)
@@ -47,7 +48,7 @@ class TestDesign:
 
     @pytest.mark.parametrize("mode", gen.MODES, ids=lambda m: m.stem)
     def test_input_words_match_the_declared_chunk_size(self, mode):
-        for kind in gen.KINDS:
+        for kind in gen.kinds_of(mode):
             tiles = gen.tiles_of(mode, kind)
             words = gen.pack_input(mode, kind, tiles)
             chunks = len(tiles) // gen.tiles_per_chunk(mode, kind)
@@ -83,7 +84,7 @@ class TestDesign:
 
     def test_kernel_names_are_unique(self):
         names = gen.kernel_names()
-        assert len(names) == len(set(names)) == len(gen.MODES) * len(gen.KINDS)
+        assert len(names) == len(set(names)) == len(MODE_KINDS)
 
     def test_wide_modes_are_the_ones_with_a_1024_bit_operand(self):
         assert {m.stem for m in gen.MODES if m.wide} == {"4x32_32x8", "4x16_16x4"}
@@ -134,11 +135,21 @@ class TestRule:
         assert sum(1 for v in b.values() if v) == 2
 
 
-@pytest.mark.parametrize("mode", gen.MODES, ids=lambda m: m.stem)
-@pytest.mark.parametrize("kind", list(gen.KINDS))
+@pytest.mark.parametrize("mode,kind", MODE_KINDS, ids=lambda x: getattr(x, "stem", x))
 def test_silicon_goldens_match_the_model(mode, kind):
     if not golden_exists(mode, kind):
         pytest.skip("not captured")
+    if kind == "spec":
+        pytest.skip("Inf/NaN/denormal lanes are not in the float-tolerance model; "
+                    "sparse_goldens.rs replays them bit for bit")
     gold = analyze.golden(gen.kernel_name(mode, kind))
     checked, bad, first = analyze.check_capture(mode, gold)
     assert checked > 0 and bad == 0, first
+
+
+def test_special_value_tiles_carry_specials_and_only_for_the_float_mode():
+    assert [m.stem for m in gen.MODES if "spec" in gen.kinds_of(m)] == ["4x16_16x4"]
+    mode = next(m for m in gen.MODES if m.bf16)
+    tiles = gen.tiles_of(mode, "spec")
+    specials = {v for t in tiles for s in t for v in s.a + s.d if v in gen.BF16_SPECIALS}
+    assert len(specials) >= len(gen.BF16_SPECIALS) // 2

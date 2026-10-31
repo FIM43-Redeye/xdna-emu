@@ -643,9 +643,10 @@ are deleted; a non-wide pack now logs an error and does nothing.
 
 ## Sparse MAC and sparse loads (`*_sparse_{narrow,wide}`, `vldb.sparse.*`)
 
-**RESOLVED 2026-10-31 for NPU1 (AIE2).** The sparse MAC is pinned with 25 capture kernels from
-`tools/gen_mac_sparse.py` (`vec_macsparse_<mode>_{probe,ops,rand,conf,alt}`; the held-out `rand`
-tiles never entered the derivation) and replayed lane for lane by
+**RESOLVED 2026-10-31 for NPU1 (AIE2).** The sparse MAC is pinned with 26 capture kernels from
+`tools/gen_mac_sparse.py` (`vec_macsparse_<mode>_{probe,ops,rand,conf,alt}`, plus
+`vec_macsparse_4x16_16x4_spec` for the float mode; the held-out `rand` and `spec` tiles never
+entered the derivation) and replayed lane for lane by
 `vector_matmul/sparse_goldens.rs`. The sparse loads are pinned with six capture kernels from
 `tools/gen_vldb_sparse.py` (`vec_sparseload_{proto,ring}_w{4,8,16}`, bit-identical across two
 runs once the register halves a `*_lo` step leaves undefined are zeroed), replayed record for
@@ -682,6 +683,18 @@ present.
 
 Both signedness flavours of the integer modes follow the same rule. bf16 follows the same mask
 rule (two bits per element); its float combine is the bf16 datapath's own.
+
+**Absent is not zero (float mode).** A B element the mask drops takes no part in the multiplier:
+its product is not a term at all, so an Inf or NaN in A that meets only dropped elements does
+not make the lane NaN, and no Inf*0 arises from them (this includes the elements of a group with
+three or four selected units). A kept element that holds a stored zero is an ordinary zero and
+still makes Inf*0 a NaN. Found when the ISA suite's random bf16 inputs (which include Inf and
+NaN patterns) disagreed with an emulator that expanded dropped elements to zero: six test points,
+every one a NaN lane. `vec_macsparse_4x16_16x4_spec` (112 tiles, zeros, Inf, NaNs of several
+payloads, denormals and overflowing exponents at three densities, random and structured masks,
+mul -> mac -> msc, 5 376 words) is bit-exact with the rule; two runs on silicon were
+bit-identical. The integer modes cannot observe the difference (a dropped element is a zero
+product either way).
 
 ### Sparse load model
 

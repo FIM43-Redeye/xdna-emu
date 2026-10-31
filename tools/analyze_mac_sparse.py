@@ -230,7 +230,7 @@ def main(argv=None):
     chk.add_argument("stems", nargs="*")
     args = ap.parse_args(argv)
     for mode in [g.BY_STEM[s] for s in args.stems] if args.stems else g.MODES:
-        for kind in g.KINDS:
+        for kind in g.kinds_of(mode):
             kernel = g.kernel_name(mode, kind)
             if not os.path.exists(os.path.join(g.GOLDEN_DIR, kernel + ".json")):
                 print(f"{kernel}: no golden")

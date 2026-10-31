@@ -314,6 +314,38 @@ def rand_sets(mode, n_tiles, rng, stages, a_lanes=None):
     return tiles
 
 
+# bfloat16 patterns for the special-value kind: signed zeros, Inf, NaNs of several payloads and
+# quiet bits, denormals, and exponents that overflow when multiplied.
+BF16_SPECIALS = (0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC0, 0xFFC1, 0x7F81, 0x7FA5, 0xFF93, 0x7FFF,
+                 0x0001, 0x007F, 0x8040, 0x7F7F, 0xFF7F, 0x7E00, 0xFE00, 0x0080, 0x8080)
+SPEC_DENSITIES = (0.01, 0.03, 0.08)
+
+
+def spec_sets(mode, n_tiles, rng, stages, a_lanes=None):
+    """Seeded random bfloat16 tiles with special values sprinkled over A and the stored data.
+
+    Each tile picks one density, so some tiles have a lone special among normal numbers and some
+    have many. Masks are the same mix as `rand`, so a special meets absent and present units.
+    """
+    assert mode.bf16
+    tiles = []
+    for _ in range(n_tiles):
+        density = rng.choice(SPEC_DENSITIES)
+
+        def pick(rng=rng, density=density):
+            if rng.random() < density:
+                return rng.choice(BF16_SPECIALS)
+            return bf16_bits(rng.uniform(-8, 8))
+
+        sets = []
+        for _ in range(stages):
+            a = tuple(pick() for _ in range(a_lanes or mode.a_lanes))
+            d = tuple(pick() for _ in range(mode.b_stored))
+            sets.append(Set(a, d, random_mask(mode, rng)))
+        tiles.append(sets)
+    return tiles
+
+
 # --- Kernel kinds ----------------------------------------------------------------
 
 # Stages of the config-word variants (`*_conf` intrinsics): zero_acc1, shift16 (integer modes
@@ -344,6 +376,7 @@ def conf_rows(mode):
 class Kind:
     suffix: str
     sets: int           # operand sets per tile
+    bf16_only: bool = False
 
     def ops(self, mode):
         """Output stages per signedness flavour, in order."""
@@ -356,7 +389,7 @@ class Kind:
                                                   if o not in ("mul", "negmul")])
         if self.suffix == "conf":
             return ["mul", "mul"] + [row[0] for row in conf_rows(mode)]
-        if self.suffix == "rand":
+        if self.suffix in ("rand", "spec"):
             return ["mul", "mac", "msc"]
         return ["mul"]
 
@@ -370,7 +403,16 @@ OPS = Kind("ops", 3)
 RAND = Kind("rand", 3)
 CONF = Kind("conf", 3)
 ALT = Kind("alt", 3)
-KINDS = {k.suffix: k for k in (PROBE, OPS, RAND, CONF, ALT)}
+SPEC = Kind("spec", 3, bf16_only=True)
+KINDS = {k.suffix: k for k in (PROBE, OPS, RAND, CONF, ALT, SPEC)}
+
+
+def kinds_of(mode):
+    """The kernel kinds a mode has (the special-value kind exists for the float mode only)."""
+    return [k for k in KINDS if mode.bf16 or not KINDS[k].bf16_only]
+
+
+
 OPS_TILES = 40
 RAND_TILES = 112
 
@@ -395,7 +437,9 @@ def seed_of(mode, kind):
 def plan_of(mode, kind):
     if kind == "probe":
         return probe_plan(mode)
-    n = RAND_TILES if kind == "rand" else OPS_TILES
+    n = RAND_TILES if kind in ("rand", "spec") else OPS_TILES
+    if kind == "spec":
+        return spec_sets(mode, n, random.Random(seed_of(mode, kind)), KINDS[kind].sets, a_lanes_of(mode, kind))
     return rand_sets(mode, n, random.Random(seed_of(mode, kind)), KINDS[kind].sets, a_lanes_of(mode, kind))
 
 
@@ -519,7 +563,7 @@ def stage_lines(mode, kind, sname, xs, ys):
                 lines.append(f"      {rt} r{idx} = {conf_call(mode, name, op, nacc, args, 2)};")
     else:
         lines.append(f"      {rt} r0 = mul_{mode.stem}(a0, b0);")
-        if k.suffix == "rand":
+        if k.suffix in ("rand", "spec"):
             lines.append(f"      {rt} r1 = mac_{mode.stem}(a1, b1, r0);")
             lines.append(f"      {rt} r2 = msc_{mode.stem}(a2, b2, r1);")
     return lines
@@ -783,7 +827,7 @@ def proof(elf):
 
 
 def kernel_names():
-    return [kernel_name(m, k) for m in MODES for k in KINDS]
+    return [kernel_name(m, k) for m in MODES for k in kinds_of(m)]
 
 
 def main(argv=None):
@@ -801,7 +845,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.cmd == "generate":
         for mode in [BY_STEM[s] for s in args.stems] if args.stems else MODES:
-            for kind in KINDS:
+            for kind in kinds_of(mode):
                 name, n = generate_one(mode, kind)
                 print(f"wrote {name} ({n} tiles)")
     elif args.cmd == "proof":
@@ -809,7 +853,7 @@ def main(argv=None):
             print(f"{mn:10s} {enc:7s} x{e['count']:<3d} {e['bytes']:34s} {e['bundle']}")
     else:
         for mode in MODES:
-            for kind in KINDS:
+            for kind in kinds_of(mode):
                 if kernel_name(mode, kind) == args.kernel:
                     print("wrote", capture(mode, kind, args.out_txt, args.date, args.elf))
                     return
