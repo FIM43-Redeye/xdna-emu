@@ -69,6 +69,32 @@ pub struct SparseLoadForm {
 
 include!(concat!(env!("OUT_DIR"), "/gen_sparse_load_forms.rs"));
 
+/// Issue-to-visible latency of the `qwl`/`qwh` destination of a `peek` or `pop`: the `dst`
+/// operand cycle of its itinerary (`II_VLDB_SPARSE_PEEK` / `II_VLDB_SPARSE_POP`, operand 1 after
+/// the pointer result), read from the generated scheduling model.
+pub fn dst_latency(op: SparseLoadOp) -> u8 {
+    use std::sync::OnceLock;
+    /// Position of the `dst` operand in both itineraries (`ptr_out`, `dst`, ...).
+    const DST_OPERAND: usize = 1;
+    static CYCLES: OnceLock<[u8; 2]> = OnceLock::new();
+    let cycles = CYCLES.get_or_init(|| {
+        let model = super::isa::load_from_generated();
+        let cycle_of = |class: &str| {
+            model
+                .itineraries
+                .get(class)
+                .and_then(|i| i.operand_cycles.get(DST_OPERAND).copied())
+                .unwrap_or_else(|| panic!("itinerary {class} has no dst operand cycle"))
+        };
+        [cycle_of("II_VLDB_SPARSE_PEEK"), cycle_of("II_VLDB_SPARSE_POP")]
+    });
+    match op {
+        SparseLoadOp::Peek => cycles[0],
+        SparseLoadOp::Pop => cycles[1],
+        SparseLoadOp::Reset | SparseLoadOp::Fill => panic!("{op:?} has no destination operand"),
+    }
+}
+
 /// Lines the ring may hold beyond the read position before a `pop` or `peek` stops fetching.
 pub const FETCH_AHEAD_LINES: usize = 9;
 
@@ -169,6 +195,12 @@ mod tests {
     fn expand(unit_bytes: u8, mask: [u8; 8], data: &[u8]) -> ([u8; 32], bool) {
         let mut it = data.iter().copied();
         expand_half(unit_bytes, &mask, || it.next().expect("data exhausted"))
+    }
+
+    #[test]
+    fn destination_latency_is_the_itinerary_dst_cycle() {
+        assert_eq!(dst_latency(SparseLoadOp::Peek), 7);
+        assert_eq!(dst_latency(SparseLoadOp::Pop), 7);
     }
 
     #[test]

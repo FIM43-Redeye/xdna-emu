@@ -757,9 +757,6 @@ impl MemoryUnit {
         use crate::interpreter::state::{COMPR_UF_REG_INDEX, DP_REG_INDEX, SPARSE_OF_REG_INDEX};
         use xdna_archspec::aie2::sparse_load::{SparseLoadOp, LINE_BYTES};
 
-        /// II_VLDB_SPARSE_{PEEK,POP} operand cycle of `dst` (AIE2Schedule.td).
-        const SPARSE_DST_LATENCY: u64 = 7;
-
         let Some(form) = op.encoding_name.as_deref().and_then(sparse_load_form) else {
             log::error!("[VLDB_SPARSE] {:?} is not a sparse load mnemonic", op.encoding_name);
             return;
@@ -828,11 +825,13 @@ impl MemoryUnit {
                     } else {
                         (2 * n, 28 + n)
                     };
-                    ctx.queue_vector_load(Operand::VectorReg(vector_reg), words, SPARSE_DST_LATENCY);
+                    // II_VLDB_SPARSE_{PEEK,POP} operand cycle of `dst`.
+                    let dst_latency = xdna_archspec::aie2::sparse_load::dst_latency(form.op) as u64;
+                    ctx.queue_vector_load(Operand::VectorReg(vector_reg), words, dst_latency);
                     ctx.queue_vector_load(
                         Operand::ControlReg(mask_reg),
                         [mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0],
-                        SPARSE_DST_LATENCY,
+                        dst_latency,
                     );
                 } else {
                     log::error!("[VLDB_SPARSE] {:?}: no qwl/qwh destination", op.encoding_name);
