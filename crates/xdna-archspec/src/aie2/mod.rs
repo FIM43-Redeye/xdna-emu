@@ -274,9 +274,17 @@ pub mod permute;
 /// records that take one, extracted from TableGen.
 pub mod descriptors;
 
+/// Where a form's signedness comes from (encoding or a control register), shared by the
+/// unpack and pack form tables.
+pub mod sign;
+
 /// Unpack instruction forms (fused `vldb.unpack.*` and standalone `vunpack.*`):
 /// lane widths, sign source and addressing flavour, extracted from TableGen.
 pub mod unpack;
+
+/// Pack instruction forms (fused `vst.pack.*` and standalone `vpack.*`): lane widths, sign
+/// source and addressing flavour, extracted from TableGen.
+pub mod pack;
 
 /// MAC geometry tables for the AIE2 vector multiply array.
 ///

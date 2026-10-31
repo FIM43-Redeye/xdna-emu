@@ -11,7 +11,7 @@ use tblgen::TableGenParser;
 
 use super::records::{
     BuildDescriptor2D, BuildDescriptor3D, BuildDescriptorLayout, BuildEncodingBit, BuildInstrEncoding,
-    BuildInstrRecord, BuildModifierKind, BuildSlotEncoding, BuildSubRegister, BuildUnpackForm,
+    BuildInstrRecord, BuildModifierKind, BuildPackForm, BuildSlotEncoding, BuildSubRegister, BuildUnpackForm,
 };
 
 // ============================================================================
@@ -97,6 +97,7 @@ pub struct BuildTblgenOutput {
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
     pub unpack_forms: Vec<BuildUnpackForm>,
+    pub pack_forms: Vec<BuildPackForm>,
     pub descriptor_layout: BuildDescriptorLayout,
 }
 
@@ -1311,6 +1312,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
     let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
+    let pack_forms = load_pack_forms(&td_file, &inc_refs, &register_model)?;
     let descriptor_layout = load_descriptor_layout(&td_file, &inc_refs, &access_records)?;
 
     Ok(BuildTblgenOutput {
@@ -1320,8 +1322,125 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         register_model,
         composite_formats,
         unpack_forms,
+        pack_forms,
         descriptor_layout,
     })
+}
+
+/// Every pack instruction: the fused stores (`AIE2_dmw_sts_pack_inst_st`) and the standalone
+/// `vpack` (`AIE2_mv_pack_inst_st`), with the `sgn` and `sz` bits their encoding classes take
+/// and the sign control register named in `Uses`.
+///
+/// The extraction is checked against the record names: every instruction record that is named
+/// like a pack (`VPACK_*`, `VST_PACK_*`, `VST_2D_PACK_*`, `VST_3D_PACK_*`) must be reached
+/// through one of the two encoding classes, and the reverse. A record the classes miss, or a
+/// class member with another name, fails the build instead of silently dropping out of the
+/// table.
+fn load_pack_forms(
+    td_file: &Path,
+    include_paths: &[&Path],
+    registers: &BuildRegisterModel,
+) -> Result<Vec<BuildPackForm>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let mut forms = Vec::new();
+    let mut named_like_pack = std::collections::BTreeSet::new();
+    for record in keeper.all_derived_definitions("Instruction") {
+        let name = record_name(&record);
+        let is_pack_name = ["VPACK_", "VST_PACK_", "VST_2D_PACK_", "VST_3D_PACK_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        if is_pack_name {
+            named_like_pack.insert(name.clone());
+        }
+        let fused = record.subclass_of("AIE2_dmw_sts_pack_inst_st");
+        if !fused && !record.subclass_of("AIE2_mv_pack_inst_st") {
+            continue;
+        }
+        if !is_pack_name {
+            return Err(format!("{name}: a pack encoding class member that is not named like a pack"));
+        }
+        let asm = record.string_value("AsmString").unwrap_or_default();
+        let mnemonic = asm.split_whitespace().next().unwrap_or("").trim_end_matches('.').to_string();
+        let addressing = if !fused {
+            ""
+        } else if record.subclass_of("AIE2_ag_nospill__ag_idx_imm") {
+            "idx_imm"
+        } else if record.subclass_of("AIE2_ag_nospill__ag_idx") {
+            "idx"
+        } else if record.subclass_of("AIE2_ag_nospill__ag_pstm_nrm") {
+            "pstm_nrm"
+        } else if record.subclass_of("AIE2_ag_nospill__ag_pstm_nrm_imm") {
+            "pstm_nrm_imm"
+        } else if record.subclass_of("AIE2_ag_nospill__ag_pstm_2d") {
+            "2d"
+        } else if record.subclass_of("AIE2_ag_nospill__ag_pstm_3d") {
+            "3d"
+        } else {
+            return Err(format!("{name}: pack store with an addressing class this extractor does not know"));
+        };
+        // `sgn` and `sz` are template arguments, not record fields. Both encoding classes put
+        // them at bits 11 and 10 of the store slot word `st`: the standalone class as
+        // `{dst, 0b1111, sgn, sz, 0b00, src, 0b101, 0b0}`, the fused one through
+        // `mv_pack_src = {sgn, sz, 0b00, src}` at `st[11:4]` (AIE2GenInstrFormats.td,
+        // AIE2GenFixupInstrInfo.td).
+        let (sgn, sz) = if fused {
+            (literal_bit(&record, "mv_pack_src", 7)?, literal_bit(&record, "mv_pack_src", 6)?)
+        } else {
+            (literal_bit(&record, "st", 11)?, literal_bit(&record, "st", 10)?)
+        };
+        let uses = extract_def_list(&record, "Uses");
+        if !uses.iter().any(|u| u == "crSat") {
+            return Err(format!("{name}: a pack that does not use crSat: {uses:?}"));
+        }
+        let sign_regs: Vec<&String> = uses.iter().filter(|u| u.ends_with("PackSign")).collect();
+        if sign_regs.len() > 1 {
+            return Err(format!("{name}: several pack sign registers in Uses: {sign_regs:?}"));
+        }
+        let sign_register = match sign_regs.first() {
+            Some(reg) => {
+                let def = registers
+                    .registers
+                    .get(reg.as_str())
+                    .ok_or_else(|| format!("{name}: register {reg} has no hardware encoding"))?;
+                Some(((*reg).clone(), def.hw_encoding))
+            }
+            None => None,
+        };
+        forms.push(BuildPackForm {
+            record: name,
+            mnemonic,
+            fused,
+            addressing: addressing.to_string(),
+            sgn,
+            sz,
+            sign_register,
+        });
+    }
+    forms.sort_by(|a, b| a.record.cmp(&b.record));
+    let reached: std::collections::BTreeSet<String> = forms.iter().map(|f| f.record.clone()).collect();
+    // `X_split` records are compiler pseudos that split a 2D / 3D descriptor register pair
+    // (AIE2InstrInfo.td, `Split2DInstr` / `Split3DInstr`); they carry no encoding of their own
+    // and stand for the base record `X`, which must be in the table.
+    let splits: Vec<String> = named_like_pack.iter().filter(|n| n.ends_with("_split")).cloned().collect();
+    for split in &splits {
+        let base = split.trim_end_matches("_split");
+        if !reached.contains(base) {
+            return Err(format!("{split}: its base record {base} is not a pack encoding"));
+        }
+        named_like_pack.remove(split);
+    }
+    if reached != named_like_pack {
+        return Err(format!(
+            "pack records reached through the encoding classes differ from those named like a pack: \
+             only by name {:?}, only by class {:?}",
+            named_like_pack.difference(&reached).collect::<Vec<_>>(),
+            reached.difference(&named_like_pack).collect::<Vec<_>>()
+        ));
+    }
+    if forms.is_empty() {
+        return Err("no pack instruction records found in the AIE2 TableGen".to_string());
+    }
+    Ok(forms)
 }
 
 // ============================================================================

@@ -1,21 +1,25 @@
 //! Vector pack/unpack operations for AIE2.
 //!
-//! Pack narrows vector lanes from a wider type to a narrower type (e.g. 32-bit
-//! to 16-bit). Unpack widens lanes (e.g. 16-bit to 32-bit). Both operate on
-//! 512-bit vector registers.
+//! Pack narrows vector lanes by half (int16 to int8, int8 to int4); unpack widens them. Both
+//! operate on 512-bit vector registers (the narrow side is 256 bits).
 //!
-//! Pack supports three modes:
-//! - **Truncate**: simply discard upper bits (no saturation).
-//! - **Saturate**: clamp to the destination type range before truncating.
-//!   For signed destinations: [-2^(n-1), 2^(n-1)-1].
-//!   For unsigned destinations: [0, 2^n - 1].
-//! - **SymmetricSaturate**: signed saturation with symmetric bounds:
-//!   [-(2^(n-1) - 1), 2^(n-1) - 1].
+//! [`pack_lanes`] is the one lane map behind both the standalone `vpack` and the fused
+//! `vst.pack`; the per-form facts (widths, sign source) come from `xdna_archspec::aie2::pack`
+//! and the live `crSat` / `crPackSign` registers. Observed on NPU1 silicon for all four forms
+//! (`s8.s16`, `d8.d16`, `s4.s8`, `d4.d8`), fused and standalone (`vec_pack_lane_probe`,
+//! `vec_pack_lane_rand`, `vec_pack_addr`, `vec_pack_crtiming`):
 //!
-//! Unpack is always a widening operation: sign-extend (signed) or zero-extend
-//! (unsigned) from the source width to the destination width. [`unpack_lanes`] is the
-//! one lane map behind both the standalone `vunpack` and the fused `vldb.unpack`; the
-//! per-form facts (widths, sign source) come from `xdna_archspec::aie2::unpack`.
+//! - lane `i` of the result is lane `i` of the source; the two 256-bit halves of the source
+//!   continue the order, and 4-bit results are packed low nibble first;
+//! - a signed lane is read two's complement and clamps to the signed output range; an
+//!   unsigned lane is read as an unsigned number and clamps to `[0, 2^bits_out - 1]`;
+//! - the `s` forms are signed; a `d` form is signed when `crPackSign` is 1, unsigned when 0;
+//! - `crSat` selects truncation or saturation per [`PackMode::for_pack`].
+//!
+//! Unpack is always a widening operation: sign-extend (signed) or zero-extend (unsigned) from
+//! the source width to the destination width. [`unpack_lanes`] is the one lane map behind
+//! both the standalone `vunpack` and the fused `vldb.unpack`; the per-form facts (widths,
+//! sign source) come from `xdna_archspec::aie2::unpack`.
 
 /// Pack mode controlling how wider values are narrowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,20 +37,37 @@ pub enum PackMode {
 }
 
 impl PackMode {
-    /// Select the narrow mode from the live crSat saturation flags
-    /// (Core_CR [1:0]): bit 0 = saturate, bit 1 = symmetric saturate.
-    /// The hardware narrowing pack reads crSat (`VPACK_* Uses = [crSat]`, llvm-aie
-    /// TableGen) and SRS does the same, so the emulator derives the mode from the
-    /// live saturation register rather than assuming truncation. Confirmed on real
-    /// NPU1 silicon: a saturating crSat clamps int16->int8 (200 -> 127), it does
-    /// not take the low byte.
+    /// Select the narrow mode from saturation flags: bit 0 = saturate, bit 1 = symmetric.
     ///
-    /// 0 -> Truncate, 1 -> Saturate, 3 -> SymmetricSaturate.
+    /// This is the flag reading the model-validation harness uses; it is NOT what the pack
+    /// instructions do (see [`PackMode::for_pack`]): it reads crSat 2 as truncation for
+    /// both signednesses.
     pub fn from_sat_flags(saturate: bool, symmetric: bool) -> PackMode {
         match (saturate, symmetric) {
             (false, _) => PackMode::Truncate,
             (true, false) => PackMode::Saturate,
             (true, true) => PackMode::SymmetricSaturate,
+        }
+    }
+
+    /// The narrowing the pack instructions (`vpack`, `vst.pack`) perform for a `crSat` value,
+    /// as observed on NPU1 silicon for every form and both signednesses:
+    ///
+    /// | crSat | signed lanes                  | unsigned lanes          |
+    /// |-------|-------------------------------|-------------------------|
+    /// | 0     | truncate                      | truncate                |
+    /// | 1     | saturate to [-2^(n-1), 2^(n-1)-1] | saturate to [0, 2^n-1] |
+    /// | 2     | truncate                      | saturate to [0, 2^n-1]  |
+    /// | 3     | symmetric: [-(2^(n-1)-1), 2^(n-1)-1] | saturate to [0, 2^n-1] |
+    ///
+    /// Only the low two bits of the register matter (Core_CR [1:0]). The unsigned column
+    /// saturates at every non-zero value, including 2, which the signed column truncates.
+    pub fn for_pack(crsat: u8, signed: bool) -> PackMode {
+        match (crsat & 0x3, signed) {
+            (0, _) | (2, true) => PackMode::Truncate,
+            (1, _) | (_, false) => PackMode::Saturate,
+            (3, true) => PackMode::SymmetricSaturate,
+            _ => unreachable!("crsat is masked to two bits"),
         }
     }
 }
@@ -115,78 +136,44 @@ pub fn pack_lane(value: i64, _bits_i: u32, bits_o: u32, signed: bool, mode: Pack
     truncate(clamped, signed, bits_o)
 }
 
-/// Pack a full 512-bit vector: narrow each lane from `bits_i` to `bits_o`.
+/// Narrow a 512-bit source register into 256 bits.
 ///
-/// The input is treated as 512/bits_i lanes of `bits_i`-bit values packed
-/// into the 256-bit (8 x u32) register representation. The output contains
-/// 512/bits_i lanes of `bits_o`-bit values, repacked into 8 x u32.
-pub fn pack_vector(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode: PackMode) -> [u32; 8] {
-    let lanes = (512 / bits_i) as usize;
-    let mut narrowed = vec![0i64; lanes];
-
-    // Extract each lane at input width, pack it.
-    for i in 0..lanes {
-        let val = extract_lane(src, i, bits_i, signed);
-        narrowed[i] = pack_lane(val, bits_i, bits_o, signed, mode);
-    }
-
-    // Repack narrowed lanes at output width into the result register.
+/// Lane `i` of the result is source lane `i`, `bits_in` wide with lane 0 in the
+/// least-significant bits, read as signed or unsigned and narrowed to `bits_out` per `mode`.
+/// There are `512 / bits_in` lanes and the result holds all of them, `bits_out` wide.
+///
+/// This is the one lane map of every pack form, standalone and fused alike; callers resolve
+/// `signed` from the form's sign source and the live `crPackSign`, and `mode` from the live
+/// `crSat` through [`PackMode::for_pack`].
+pub fn pack_lanes(src: &[u32; 16], bits_in: u32, bits_out: u32, signed: bool, mode: PackMode) -> [u32; 8] {
+    assert!(
+        matches!(bits_in, 8 | 16) && bits_in == 2 * bits_out,
+        "pack halves the lane width from 8 or 16 bits"
+    );
+    let lanes = (512 / bits_in) as usize;
+    debug_assert_eq!(lanes * bits_out as usize, 256);
+    let narrowed: Vec<i64> = (0..lanes)
+        .map(|i| pack_lane(extract_lane(src, i, bits_in, signed), bits_in, bits_out, signed, mode))
+        .collect();
     let mut result = [0u32; 8];
-    insert_lanes(&mut result, &narrowed, bits_o);
+    insert_lanes(&mut result, &narrowed, bits_out);
     result
 }
 
-/// Check if a token is a type token (D4, S8, D16, S32, etc.).
-fn is_type_token(token: &str) -> bool {
-    (token.starts_with('D') || token.starts_with('S'))
-        && token.len() >= 2
-        && token[1..].parse::<u32>().is_ok()
-}
-
-/// Find consecutive type token pair in parts, returning their indices.
-fn find_type_pair(parts: &[&str]) -> Option<(usize, usize)> {
-    for i in 0..parts.len().saturating_sub(1) {
-        if is_type_token(parts[i]) && is_type_token(parts[i + 1]) {
-            return Some((i, i + 1));
-        }
-    }
-    None
-}
-
-/// Parse VPACK bit widths from encoding name.
+/// Narrow a source register as the pack form `form` does with the live control registers.
 ///
-/// Handles standalone `VPACK_{OUT}_{IN}` and fused `VST_PACK_{OUT}_{IN}_*`.
-/// Type tokens are {D|S}{bits} (e.g., D4, S8, D16, S32).
-/// Returns (bits_in, bits_out, signed).
-pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
-    let upper = name.to_uppercase();
-    // Split on both '_' and '.' to handle encoding names ("VPACK_D4_D8")
-    // and mnemonics ("vpack.d4.d8").
-    let parts: Vec<&str> = upper.split(|c| c == '_' || c == '.').collect();
-    if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
-        let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
-        let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(8);
-        let in_bits: u32 = parts[in_idx][1..].parse().unwrap_or(16);
-        (in_bits, out_bits, signed)
-    } else {
-        (16, 8, false)
-    }
-}
-
-/// Pack a 256-bit half: narrow 256/bits_i lanes from bits_i to bits_o.
-///
-/// Processes one 256-bit register, treating it as 256/bits_i lanes of
-/// bits_i-width values, and packs each down to bits_o width.
-pub fn pack_half(src: &[u32; 8], bits_i: u32, bits_o: u32, signed: bool, mode: PackMode) -> [u32; 8] {
-    let lanes = (256 / bits_i) as usize;
-    let mut narrowed = vec![0i64; lanes];
-    for i in 0..lanes {
-        let val = extract_lane(src, i, bits_i, signed);
-        narrowed[i] = pack_lane(val, bits_i, bits_o, signed, mode);
-    }
-    let mut result = [0u32; 8];
-    insert_lanes(&mut result, &narrowed, bits_o);
-    result
+/// `read_control` returns a control register's raw value by hardware id (the sign register the
+/// form names); `crsat` is the live `crSat` value. Both pack registers are read at issue (the
+/// itineraries read them at pipeline stage 1 and 2, no deferred read): the caller passes the
+/// values as of the issuing bundle.
+pub fn pack_register(
+    src: &[u32; 16],
+    form: &PackForm,
+    crsat: u8,
+    read_control: impl FnOnce(u8) -> u32,
+) -> [u32; 8] {
+    let signed = form.sign.is_signed(read_control);
+    pack_lanes(src, form.bits_in as u32, form.bits_out as u32, signed, PackMode::for_pack(crsat, signed))
 }
 
 /// Widen a 256-bit packed source into the 512-bit result of an unpack.
@@ -221,21 +208,21 @@ pub fn unpack_lanes(src: &[u32; 8], bits_in: u32, bits_out: u32, signed: bool) -
     out
 }
 
-/// Extract lane `idx` from a 256-bit (8 x u32) register at `bits` width.
+/// Extract lane `idx` from a register (a slice of u32 words) at `bits` width.
 ///
 /// Handles arbitrary bit widths including those that cross u32 boundaries.
-fn extract_lane(reg: &[u32; 8], idx: usize, bits: u32, signed: bool) -> i64 {
+fn extract_lane(reg: &[u32], idx: usize, bits: u32, signed: bool) -> i64 {
     let bit_offset = idx as u32 * bits;
     let word_idx = (bit_offset / 32) as usize;
     let bit_idx = bit_offset % 32;
 
     // Gather enough bits -- may span two u32 words.
-    if word_idx >= 8 {
-        return 0; // Lane extends beyond the 256-bit register
+    if word_idx >= reg.len() {
+        return 0; // Lane extends beyond the register
     }
     let mut raw: u64 = reg[word_idx] as u64 >> bit_idx;
     let bits_from_first = 32 - bit_idx;
-    if bits > bits_from_first && word_idx + 1 < 8 {
+    if bits > bits_from_first && word_idx + 1 < reg.len() {
         raw |= (reg[word_idx + 1] as u64) << bits_from_first;
     }
 
@@ -283,47 +270,34 @@ fn insert_lanes(reg: &mut [u32; 8], lanes: &[i64], bits: u32) {
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::{ExecutionContext, UnpackSource};
+use xdna_archspec::aie2::pack::{pack_form, PackForm};
 use xdna_archspec::aie2::unpack::unpack_form;
 
 use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
-    /// Pack: narrow vector lanes.
+    /// Standalone `vpack`: narrow a 512-bit x-register source into a 256-bit w register.
     ///
-    /// Narrow path: 2-source pack (legacy vector_pack helper).
-    /// Wide path: 512->256, split source halves, pack each, combine.
+    /// One lane map ([`pack_register`]) driven by the form table and the live `crSat` and
+    /// `crPackSign`; the fused `vst.pack` goes through the same function. II_VPACK reads
+    /// `crSat` and `crPackSign` at pipeline stage 1 and the source at stage 2, so unlike
+    /// `vunpack` nothing is deferred: the narrowing happens at issue. A control register
+    /// written in the same bundle is not yet visible (silicon, `vec_pack_crtiming`).
     pub(super) fn execute_pack(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        if op.is_wide_vector {
-            // VPACK: 512-bit x-reg source -> 256-bit w-reg dest.
-            // Each 256-bit half is packed independently, then the two
-            // packed halves are concatenated into one 256-bit result.
-            let name = op.encoding_name.as_deref().unwrap_or("");
-            let (bits_i, bits_o, signed) = pack_widths_from_name(name);
-            let src = Self::get_wide_vec_source(op, ctx, 0);
-            let src_lo: [u32; 8] = src[..8].try_into().unwrap();
-            let src_hi: [u32; 8] = src[8..].try_into().unwrap();
-
-            // VPACK reads crSat (Uses = [crSat]); derive the narrow mode from
-            // the live saturation register instead of assuming truncation.
-            let mode =
-                PackMode::from_sat_flags(ctx.srs_config.saturate(), ctx.srs_config.symmetric_saturate());
-            let packed_lo = pack_half(&src_lo, bits_i, bits_o, signed, mode);
-            let packed_hi = pack_half(&src_hi, bits_i, bits_o, signed, mode);
-
-            // Each half produces (256/bits_i * bits_o) bits of packed data.
-            // Concatenate the two halves into a single 256-bit w-register.
-            let words_per_half = ((256 / bits_i) * bits_o / 32) as usize;
-            let mut result = [0u32; 8];
-            result[..words_per_half].copy_from_slice(&packed_lo[..words_per_half]);
-            result[words_per_half..words_per_half * 2].copy_from_slice(&packed_hi[..words_per_half]);
-
-            // Write to 256-bit w-register dest (NOT write_wide_vec_dest).
-            Self::write_vector_dest(op, ctx, result);
-        } else {
-            let (a, b) = Self::get_two_vector_sources(op, ctx);
-            let result = Self::vector_pack(&a, &b);
-            Self::write_vector_dest(op, ctx, result);
+        let Some(form) = op.encoding_name.as_deref().and_then(pack_form) else {
+            log::error!("[VECTOR] execute_pack: {:?} is not a pack mnemonic", op.encoding_name);
+            return true;
+        };
+        if !op.is_wide_vector {
+            // Every VPACK record's source is an x register (`mXs`), which the decoder marks
+            // wide; a pack that is not has no AIE2 meaning.
+            log::error!("[VECTOR] execute_pack: {} without a 512-bit source", form.mnemonic);
+            return true;
         }
+        let src = Self::get_wide_vec_source(op, ctx, 0);
+        let result = pack_register(&src, form, ctx.srs_config.saturation_mode, |id| ctx.control_reg_raw(id));
+        // The destination is a 256-bit w register (NOT write_wide_vec_dest).
+        Self::write_vector_dest(op, ctx, result);
         true
     }
 
@@ -638,79 +612,6 @@ mod tests {
         }
     }
 
-    // -- pack_vector --
-
-    #[test]
-    fn pack_vector_32_to_16_truncate() {
-        // 8 lanes of 32-bit -> 8 lanes of 16-bit (lower half of result).
-        // Input: [0x10001, 0x20002, 0x30003, 0x40004, 0x50005, 0x60006, 0x70007, 0x80008]
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![0x10001, 0x20002, 0x30003, 0x40004, 0x50005, 0x60006, 0x70007, 0x80008];
-        insert_lanes(&mut src, &vals, 32);
-
-        let result = pack_vector(&src, 32, 16, false, PackMode::Truncate);
-
-        // Verify: each lane should be the low 16 bits
-        for (i, &v) in vals.iter().enumerate() {
-            let got = extract_lane(&result, i, 16, false);
-            assert_eq!(got, v & 0xFFFF, "lane {} mismatch", i);
-        }
-    }
-
-    #[test]
-    fn pack_vector_16_to_8_saturate_signed() {
-        // 16 lanes of 16-bit -> 16 lanes of 8-bit, signed saturate.
-        // 256-bit register holds 16 lanes at 16-bit.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![
-            50, -50, 127, -128, // in range for s8
-            200, -200, 0, 1, // overflow positive and negative
-            -1, 100, -100, 64, -64, 32, -32, 16,
-        ];
-        insert_lanes(&mut src, &vals, 16);
-
-        let result = pack_vector(&src, 16, 8, true, PackMode::Saturate);
-
-        let expected: Vec<i64> = vals.iter().map(|&v| v.clamp(-128, 127)).collect();
-        for (i, &exp) in expected.iter().enumerate() {
-            let got = extract_lane(&result, i, 8, true);
-            assert_eq!(got, exp, "lane {} mismatch: expected {}, got {}", i, exp, got);
-        }
-    }
-
-    // -- pack then unpack roundtrip --
-
-    #[test]
-    fn test_pack_widths_from_name() {
-        // Standalone: VPACK_{OUT}_{IN}
-        assert_eq!(pack_widths_from_name("VPACK_D4_D8"), (8, 4, false));
-        assert_eq!(pack_widths_from_name("VPACK_S8_S16"), (16, 8, true));
-        assert_eq!(pack_widths_from_name("VPACK_D8_D16"), (16, 8, false));
-        // Fused: VST_PACK_{OUT}_{IN}_*
-        assert_eq!(pack_widths_from_name("VST_PACK_D4_D8_ag_idx"), (8, 4, false));
-        assert_eq!(pack_widths_from_name("VST_PACK_S4_S8_ag_pstm_nrm"), (8, 4, true));
-        assert_eq!(pack_widths_from_name("VST_2D_PACK_S8_S16"), (16, 8, true));
-        // Fallback for unrecognized format
-        assert_eq!(pack_widths_from_name("VPACK"), (16, 8, false));
-    }
-
-    #[test]
-    fn test_pack_half_d16_to_d8() {
-        // 16 lanes of 16-bit values in a 256-bit register, pack to 8-bit.
-        // Output: 16 lanes of 8-bit = 128 bits = 4 words.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = (0..16).map(|i| (i * 10) as i64).collect();
-        insert_lanes(&mut src, &vals, 16);
-
-        let result = pack_half(&src, 16, 8, false, PackMode::Truncate);
-
-        // Verify each output lane has the low 8 bits of the input.
-        for (i, &expected) in vals.iter().enumerate() {
-            let got = extract_lane(&result, i, 8, false);
-            assert_eq!(got, expected & 0xFF, "lane {} mismatch", i);
-        }
-    }
-
     // -- truncate edge cases --
 
     #[test]
@@ -812,101 +713,74 @@ mod tests {
         assert_eq!(reg[1] & 0x0000_FFFF, 0x0000_ABCD);
     }
 
-    // -- is_type_token --
+    // -- pack: one lane map for every form --
 
-    #[test]
-    fn is_type_token_valid() {
-        assert!(is_type_token("D4"));
-        assert!(is_type_token("D8"));
-        assert!(is_type_token("D16"));
-        assert!(is_type_token("D32"));
-        assert!(is_type_token("S8"));
-        assert!(is_type_token("S16"));
-        assert!(is_type_token("S32"));
+    fn lanes16(vals: &[u16]) -> [u32; 16] {
+        let mut src = [0u32; 16];
+        for (i, v) in vals.iter().enumerate() {
+            src[i / 2] |= (*v as u32) << (16 * (i % 2));
+        }
+        src
     }
 
-    #[test]
-    fn is_type_token_invalid() {
-        assert!(!is_type_token("D")); // too short
-        assert!(!is_type_token("VPACK")); // wrong prefix
-        assert!(!is_type_token("DX")); // not a number
-        assert!(!is_type_token("8")); // no prefix
-        assert!(!is_type_token("")); // empty
-        assert!(!is_type_token("AG")); // wrong prefix
+    fn result_bytes(r: &[u32; 8]) -> Vec<u8> {
+        r.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
-    // -- find_type_pair --
-
-    #[test]
-    fn find_type_pair_finds_consecutive() {
-        let parts = vec!["VPACK", "D8", "D16", "ag"];
-        assert_eq!(find_type_pair(&parts), Some((1, 2)));
+    fn form(mnemonic: &str) -> &'static PackForm {
+        pack_form(mnemonic).unwrap_or_else(|| panic!("{mnemonic}"))
     }
 
-    #[test]
-    fn find_type_pair_none_when_no_consecutive() {
-        let parts = vec!["VPACK", "D8", "ag", "D16"];
-        assert_eq!(find_type_pair(&parts), None);
-    }
+    const CR_PACK_SIGN: u8 = 5;
 
     #[test]
-    fn find_type_pair_empty() {
-        let parts: Vec<&str> = vec![];
-        assert_eq!(find_type_pair(&parts), None);
-    }
-
-    #[test]
-    fn find_type_pair_single_element() {
-        let parts = vec!["D8"];
-        assert_eq!(find_type_pair(&parts), None);
-    }
-
-    // -- name parsing: dot-separated mnemonics --
-
-    #[test]
-    fn pack_widths_from_name_dot_separated() {
-        // Mnemonic format: vpack.d4.d8
-        assert_eq!(pack_widths_from_name("vpack.d4.d8"), (8, 4, false));
-        assert_eq!(pack_widths_from_name("vpack.s8.s16"), (16, 8, true));
-    }
-
-    // -- pack_half with saturation --
-
-    #[test]
-    fn pack_half_saturate_signed() {
-        // 8 lanes of 32-bit, pack to 16-bit with signed saturation.
-        // 256-bit / 32 = 8 input lanes.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = vec![50000, -50000, 100, -100, 32767, -32768, 0, 1];
-        insert_lanes(&mut src, &vals, 32);
-
-        let result = pack_half(&src, 32, 16, true, PackMode::Saturate);
-
-        let expected: Vec<i64> = vals.iter().map(|&v| v.clamp(-32768, 32767)).collect();
-        for (i, &exp) in expected.iter().enumerate() {
-            let got = extract_lane(&result, i, 16, true);
-            assert_eq!(got, exp, "lane {} mismatch", i);
+    fn for_pack_follows_the_silicon_table() {
+        use PackMode::*;
+        // (crSat, signed) -> mode, as captured: crSat 2 saturates unsigned lanes only.
+        for (crsat, signed, want) in [
+            (0, true, Truncate),
+            (1, true, Saturate),
+            (2, true, Truncate),
+            (3, true, SymmetricSaturate),
+            (0, false, Truncate),
+            (1, false, Saturate),
+            (2, false, Saturate),
+            (3, false, Saturate),
+            (4 + 3, true, SymmetricSaturate), // only the low two bits matter
+        ] {
+            assert_eq!(PackMode::for_pack(crsat, signed), want, "crSat {crsat} signed {signed}");
         }
     }
 
-    // -- pack_vector 4-bit --
+    #[test]
+    fn crpacksign_decides_how_a_d_form_reads_the_input() {
+        // int16 -1 under d8.d16 with saturation: unsigned reads 65535 and clamps to 255,
+        // signed reads -1 and keeps it.
+        let src = lanes16(&[0xFFFF, 300, 0x8000]);
+        let f = form("vpack.d8.d16");
+        let run = |sign: u32| {
+            result_bytes(&pack_register(&src, f, 1, |id| {
+                assert_eq!(id, CR_PACK_SIGN);
+                sign
+            }))
+        };
+        assert_eq!(&run(0)[..3], &[255, 255, 255]);
+        assert_eq!(&run(1)[..3], &[0xFF, 127, 0x80]);
+    }
 
     #[test]
-    fn pack_vector_8_to_4_truncate() {
-        // 512/8 = 64 lanes at 8-bit, but our 256-bit reg holds 32 lanes.
-        // pack_vector uses 512/bits_i lanes -> this is a 512-bit semantic.
-        // With [u32; 8] = 256 bits, 256/8 = 32 lanes. pack_vector divides
-        // 512/bits_i which for 8-bit = 64 lanes, exceeding the 8-word register.
-        // So pack_vector is for conceptual 512-bit. Let's use pack_half instead.
-        let mut src = [0u32; 8];
-        let vals: Vec<i64> = (0..32).map(|i| (i * 3 % 256) as i64).collect();
-        insert_lanes(&mut src, &vals, 8);
+    fn s_forms_do_not_read_the_sign_register() {
+        let src = lanes16(&[0xFFFF, 200]);
+        let f = form("vst.pack.s8.s16");
+        let r = pack_register(&src, f, 1, |_| panic!("an s form must not read crPackSign"));
+        assert_eq!(&result_bytes(&r)[..2], &[0xFF, 127]);
+    }
 
-        let result = pack_half(&src, 8, 4, false, PackMode::Truncate);
-
-        for (i, &v) in vals.iter().enumerate() {
-            let got = extract_lane(&result, i, 4, false);
-            assert_eq!(got, v & 0xF, "lane {} mismatch", i);
-        }
+    #[test]
+    fn four_bit_results_are_packed_low_nibble_first() {
+        let mut src = [0u32; 16];
+        src[0] = 0x0000_0201; // byte lanes 0, 1 = 1, 2
+        let r = pack_register(&src, form("vpack.s4.s8"), 0, |_| 0);
+        assert_eq!(r[0] & 0xFF, 0x21);
     }
 }

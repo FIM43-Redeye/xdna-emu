@@ -21,7 +21,7 @@ use crate::interpreter::state::{
     ExecutionContext, MOD_BASE_D2D, MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M,
 };
 use xdna_archspec::aie2::isa::SemanticOp;
-use xdna_archspec::aie2::unpack::UnpackSign;
+use xdna_archspec::aie2::sign::SignSource;
 
 /// `crUnpackSign` (AIE2GenRegisterInfo.td): the id the form table names.
 const CR_UNPACK_SIGN: u8 = 11;
@@ -176,7 +176,7 @@ fn form_table_agrees_with_the_silicon_sign_rule() {
             assert_eq!(signed, expected, "{mnemonic} with crUnpackSign={reg}");
         }
         if suffix.starts_with('s') {
-            assert_eq!(form.sign, UnpackSign::Fixed(true));
+            assert_eq!(form.sign, SignSource::Fixed(true));
         }
     }
 }

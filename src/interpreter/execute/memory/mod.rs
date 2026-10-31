@@ -38,6 +38,7 @@ use crate::device::state::NeighborView;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::{ExecutionContext, UnpackSource};
+use xdna_archspec::aie2::pack::pack_form;
 use xdna_archspec::aie2::unpack::unpack_form;
 use crate::interpreter::timing::{LATENCY_MEMORY, MemoryQuadrant};
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -1003,11 +1004,13 @@ impl MemoryUnit {
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
-    /// Execute `vst.pack`: pack vector, store narrowed data to memory.
+    /// Execute `vst.pack` (every addressing flavour): narrow a 512-bit x register and store the
+    /// 256-bit result.
     ///
-    /// The source is a 512-bit x-register. Each 256-bit half is packed
-    /// independently, then the two packed halves are concatenated into
-    /// a single 256-bit (32-byte) store.
+    /// The narrowing is [`super::vector_pack::pack_register`], the same function as the
+    /// standalone `vpack`, driven by the form table in archspec and the live `crSat` and
+    /// `crPackSign`. The store address and the pointer update are those of every other store.
+    /// II_VST_PACK reads all its operands at pipeline stage 1: nothing is deferred.
     fn execute_fused_store_pack(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -1016,12 +1019,14 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
         view: Option<&NeighborView>,
     ) {
-        let enc_name = op.encoding_name.as_deref().unwrap_or("");
-        let (bits_i, bits_o, signed) = super::vector_pack::pack_widths_from_name(enc_name);
+        let Some(form) = op.encoding_name.as_deref().and_then(pack_form) else {
+            log::error!("[FUSED] vst.pack: {:?} is not a pack mnemonic", op.encoding_name);
+            return;
+        };
 
-        // Read 512-bit x-register source (wl + wh).
+        // The 512-bit x-register source: the low half is the named register, the high half
+        // the next one.
         let src_lo = Self::get_vector_source(op, ctx);
-        // Read the high half by incrementing the register index.
         let src_hi = {
             let mut hi = [0u32; 8];
             for src in &op.sources {
@@ -1032,27 +1037,16 @@ impl MemoryUnit {
             }
             hi
         };
+        let mut src = [0u32; 16];
+        src[..8].copy_from_slice(&src_lo);
+        src[8..].copy_from_slice(&src_hi);
 
-        // vst.pack reads crSat (Uses = [crSat]); derive the narrow mode from the
-        // live saturation register instead of assuming truncation. Matches the
-        // standalone execute_pack path and real NPU1 silicon (saturating crSat
-        // clamps int16->int8 rather than taking the low byte).
-        let mode = super::vector_pack::PackMode::from_sat_flags(
-            ctx.srs_config.saturate(),
-            ctx.srs_config.symmetric_saturate(),
-        );
-        let packed_lo = super::vector_pack::pack_half(&src_lo, bits_i, bits_o, signed, mode);
-        let packed_hi = super::vector_pack::pack_half(&src_hi, bits_i, bits_o, signed, mode);
-
-        // Each half produces (256/bits_i * bits_o) bits of packed data.
-        let words_per_half = ((256 / bits_i as usize) * bits_o as usize / 32).max(1);
-        let mut result = [0u32; 8];
-        let n = words_per_half.min(4); // Each half fits in at most 4 words
-        result[..n].copy_from_slice(&packed_lo[..n]);
-        result[n..n + n].copy_from_slice(&packed_hi[..n]);
+        let result = super::vector_pack::pack_register(&src, form, ctx.srs_config.saturation_mode, |id| {
+            ctx.control_reg_raw(id)
+        });
 
         let addr = Self::get_store_address(op, ctx);
-        log::debug!("[FUSED] vst.pack: addr=0x{:X} ({}-bit -> {}-bit)", addr, bits_i, bits_o,);
+        log::debug!("[FUSED] {}: addr=0x{:X}", form.mnemonic, addr);
 
         Self::write_vector_to_memory(tile, addr, result, neighbors, view);
         Self::apply_post_modify(op, ctx, post_modify);

@@ -13,9 +13,7 @@
 //!   register takes its signedness from that register at run time (the `d` forms,
 //!   `sgn = 0`); every other form has it fixed by the encoding (the `s` forms, `sgn = 1`).
 //!
-//! The control register is data, not an assumption: AIE2P splits it into `unpackSign0`
-//! and `unpackSign1`, so [`UnpackSign::Register`] names the register a form reads and
-//! callers resolve its value through their own control-register file.
+//! The control register is data, not an assumption (see [`SignSource`]).
 //!
 //! What a sign value means, observed on NPU1 silicon (`vec_unpack_lane_*`,
 //! `vec_unpack_crtiming`): the `s` forms always sign-extend whatever the register holds
@@ -46,27 +44,6 @@ pub enum UnpackAddressing {
     ThreeDim,
 }
 
-/// Where a form's signedness comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnpackSign {
-    /// Fixed by the encoding.
-    Fixed(bool),
-    /// Read at run time from a control register: its TableGen name and hardware id.
-    Register { name: &'static str, id: u8 },
-}
-
-impl UnpackSign {
-    /// Resolve the signedness, reading the control register through `read` when the form
-    /// takes it from one. A register value of 1 is signed, 0 unsigned (silicon: values 0
-    /// and 1 only; higher bits are unobserved and ignored).
-    pub fn is_signed(self, read: impl FnOnce(u8) -> u32) -> bool {
-        match self {
-            UnpackSign::Fixed(signed) => signed,
-            UnpackSign::Register { id, .. } => read(id) & 1 != 0,
-        }
-    }
-}
-
 /// One unpack mnemonic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnpackForm {
@@ -78,8 +55,10 @@ pub struct UnpackForm {
     pub bits_in: u8,
     /// Widened (destination) lane width in bits.
     pub bits_out: u8,
-    pub sign: UnpackSign,
+    pub sign: SignSource,
 }
+
+pub use super::sign::SignSource;
 
 include!(concat!(env!("OUT_DIR"), "/gen_unpack_forms.rs"));
 
@@ -113,10 +92,10 @@ mod tests {
     fn s_forms_are_fixed_signed_and_d_forms_read_crunpacksign() {
         for f in UNPACK_FORMS {
             if f.mnemonic.contains(".s") {
-                assert_eq!(f.sign, UnpackSign::Fixed(true), "{}", f.mnemonic);
+                assert_eq!(f.sign, SignSource::Fixed(true), "{}", f.mnemonic);
             } else {
                 // crUnpackSign is control register 11 (AIE2GenRegisterInfo.td).
-                assert_eq!(f.sign, UnpackSign::Register { name: "crUnpackSign", id: 11 }, "{}", f.mnemonic);
+                assert_eq!(f.sign, SignSource::Register { name: "crUnpackSign", id: 11 }, "{}", f.mnemonic);
             }
         }
     }
@@ -127,24 +106,6 @@ mod tests {
         assert_eq!(form("vldb.2d.unpack.s8.s4").addressing, UnpackAddressing::TwoDim);
         assert_eq!(form("vldb.3d.unpack.d16.d8").addressing, UnpackAddressing::ThreeDim);
         assert_eq!(form("vunpack.d8.d4").addressing, UnpackAddressing::Register);
-    }
-
-    #[test]
-    fn sign_resolution_reads_the_register_only_for_register_forms() {
-        let reads = std::cell::Cell::new(0);
-        let read = |v: u32| {
-            let reads = &reads;
-            move |_id: u8| {
-                reads.set(reads.get() + 1);
-                v
-            }
-        };
-        assert!(UnpackSign::Fixed(true).is_signed(read(0)));
-        assert_eq!(reads.get(), 0, "a fixed-sign form must not read the register");
-        let reg = UnpackSign::Register { name: "crUnpackSign", id: 11 };
-        assert!(reg.is_signed(read(1)));
-        assert!(!reg.is_signed(read(0)));
-        assert_eq!(reads.get(), 2);
     }
 
     #[test]

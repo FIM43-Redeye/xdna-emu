@@ -12,7 +12,6 @@ use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::{Bypass, ExecutionContext, Vec512, Acc1024};
 
 use super::vector_dispatch::VectorAlu;
-use super::vector_pack;
 
 impl VectorAlu {
     // ========== Operand Access ==========
@@ -315,22 +314,6 @@ impl VectorAlu {
     #[inline]
     pub(super) fn f32_to_bf16(val: f32) -> u16 {
         (val.to_bits() >> 16) as u16
-    }
-
-    // ========== Pack Wrappers ==========
-
-    /// Pack: narrow 32-bit lanes to 16-bit (truncation mode).
-    ///
-    /// Delegates to the `vector_pack` module. Takes two 256-bit vectors
-    /// of 32-bit elements and produces one 256-bit vector of 16-bit elements.
-    /// Uses truncation mode (no saturation) since the SlotOp does not
-    /// currently carry pack saturation information.
-    pub(super) fn vector_pack(a: &[u32; 8], _b: &[u32; 8]) -> [u32; 8] {
-        // The vector_pack module operates on a single register at a time,
-        // narrowing from bits_i to bits_o. Pack the first source; the second
-        // source would go into the upper half for a full 512-bit result,
-        // but our register model is 256-bit so we pack just the first.
-        vector_pack::pack_vector(a, 32, 16, false, vector_pack::PackMode::Truncate)
     }
 
     // ========== Lane / Scalar Helpers ==========

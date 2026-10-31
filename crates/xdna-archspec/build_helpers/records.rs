@@ -293,6 +293,31 @@ pub struct BuildUnpackForm {
 }
 
 // ---------------------------------------------------------------------------
+// Pack forms (build-time version of aie2::pack::PackForm)
+// ---------------------------------------------------------------------------
+
+/// One `vpack.*` / `vst.*pack.*` record, with the `sgn` / `sz` template arguments of its
+/// encoding class and the control registers it uses.
+#[derive(Debug, Clone)]
+pub struct BuildPackForm {
+    /// Record name (`VST_PACK_D8_D16_ag_idx`).
+    pub record: String,
+    /// Assembly mnemonic (`vst.pack.d8.d16`).
+    pub mnemonic: String,
+    /// True for the fused store, false for the register-to-register `vpack`.
+    pub fused: bool,
+    /// Addressing class of the fused store: `idx_imm`, `idx`, `pstm_nrm`, `pstm_nrm_imm`,
+    /// `2d`, `3d`; empty for `vpack`.
+    pub addressing: String,
+    /// `sgn` encoding bit.
+    pub sgn: u8,
+    /// `sz` encoding bit.
+    pub sz: u8,
+    /// Control register in `Uses` that supplies the sign: (name, hardware encoding).
+    pub sign_register: Option<(String, u16)>,
+}
+
+// ---------------------------------------------------------------------------
 // Descriptor layout (build-time data of aie2::descriptors)
 // ---------------------------------------------------------------------------
 

@@ -527,3 +527,116 @@ spills) exposed:
 | negative or very large counts and sizes | compared unsigned | open; only 0..7 observed |
 | cross-tile fused unpack loads | go through the shared vector read, not captured | open |
 | AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred |
+
+## Pack: fused `vst.pack.*` and standalone `vpack.*`
+
+**RESOLVED 2026-10-30.** Pinned on NPU1 silicon with four capture kernels from
+`tools/gen_pack.py` (goldens `tools/golden/silicon/vec_pack_*.json`, each bit-identical across
+two runs and passing against its own capture), replayed lane for lane by
+`execute/pack_goldens.rs`. Both families have four forms, `s8.s16`, `d8.d16`, `s4.s8` and
+`d4.d8`; the fused store also has the index, post-modify, 2D and 3D flavours (16 distinct
+mnemonics, 28 TableGen records). Before this only `vpack.s8.s16` under `crSat` 0, 1 and 3
+had been checked (`vec_pack_i16*`).
+
+**Disassembly proof** (Chess compile of the capture kernels, `gen_pack.py proof`, recorded in
+each golden): all four `vpack.*` forms with an x-register source and a w-register destination;
+all four `vst.pack.*` forms with `[p, dj]` and `[p], m` (`vec_pack_addr`), `[p], #imm` and `[p,
+#imm]` (the lane and timing kernels). The 2D / 3D flavours are not in these kernels; the
+`vec_agu_pack` capture covers `vst.2d.pack.*` and `vst.3d.pack.*` for the same forms. No
+TableGen form was unreachable. A standalone `vpack` needs a consumer other than a store (the
+kernels add a zero vector), or Chess fuses it into a `vst.pack`.
+
+**Lane map (all eight instructions, all four forms).** Result lane `i` is source lane `i`; the
+512-bit source holds `512/bits_in` lanes and the 256-bit result all of them, `bits_out` wide,
+lane 0 in the least-significant bits (low nibble first for the 4-bit forms). The two 256-bit
+halves of the source continue the order. The fused store and the standalone instruction agree
+for every form, value and register setting (nothing differs between them in the 48,640
+vectors of the lane captures).
+
+**Signedness.** The `s` forms are signed and do not read `crPackSign`. A `d` form
+(`Uses = [crSat, crPackSign]`) behaves exactly like its `s` twin when `crPackSign` is 1, and
+unsigned when it is 0: the input lane is read as an unsigned number (int16 -1 is 65535) and
+clamps to `[0, 2^bits_out - 1]`. The archspec table derives this from `Uses`, not from the
+`d` / `s` letter (`SignSource`, shared with unpack).
+
+**`crSat`** (low two bits; `PackMode::for_pack`), where `n` is `bits_out`:
+
+| crSat | signed lanes | unsigned lanes |
+|---|---|---|
+| 0 | truncate (low `n` bits) | truncate |
+| 1 | saturate to `[-2^(n-1), 2^(n-1)-1]` | saturate to `[0, 2^n-1]` |
+| 2 | **truncate** | **saturate** to `[0, 2^n-1]` |
+| 3 | symmetric: `[-(2^(n-1)-1), 2^(n-1)-1]`, so -128 becomes -127 (int8), -8 becomes -7 (int4) | saturate to `[0, 2^n-1]` |
+
+The crSat 2 row is asymmetric and was a surprise: the signed path truncates, the unsigned path
+saturates. crSat 2 is reachable from C++ with a run-time value
+(`set_saturation(static_cast<saturation_mode>(2))`; Chess emits `mov crSat, #2`). The
+unsigned columns of crSat 1 and 3 are identical (no unsigned symmetric mode).
+
+**Register timing.** The itineraries read `crSat` and `crPackSign` at stage 1 and the source
+at stage 2, unlike `vunpack` (stage 7), and nothing in the captures contradicts a read at
+issue. `vec_pack_crtiming` drives the sign from a run-time table inside software-pipelined
+loops; Chess writes `crPackSign` in the same bundle as the `d` form (`vst.pack.d4.d8 ...;
+movx crPackSign, r0` in the fused loop, `vpack.d4.d8 ...; movx crPackSign, r24` in the
+standalone loop), and silicon used the value written before that bundle in all 1,536 vectors
+(6 sign patterns x 64 blocks x 4 vectors). So a pack sees a control register as of the start of
+its own bundle. Not pinned: how early a write must precede a pack to be seen (only Chess's own
+schedules were observed).
+
+**Fused-store addressing** (`vec_pack_addr`: 2,048 stores, 4 forms x 8 register passes x 32
+blocks x 2 groups): the data lands where the index offset (`[p, dj]` with dj = -64, -32, 0,
++32 bytes) or the post-modify chain (`[p], m` with m = -32, starting at the last slot) says,
+and the pointer after four post-modifies is `start + 4m`. The post-modify is applied to the
+last store of a chain too (the kernel keeps the pointer live; Chess otherwise turns the last
+store into an index store).
+
+**Replay counts.** Probe: 32,256 vectors; held-out random set: 16,384
+vectors; 2,048 addressing stores; 1,536 timing
+vectors; all equal to silicon. (Each vector is 256 bits of result: 32 or 64 lanes.)
+
+**Rejected alternatives** (exact vectors out of 32,256 on the probe, 16,384 on the held-out
+set, all forms, all `crSat` values and both `crPackSign` values):
+
+| Hypothesis | Probe | Held-out |
+|---|---|---|
+| adopted | 32,256 | 16,384 |
+| `d` forms always unsigned, `crPackSign` ignored (the old `pack_widths_from_name`) | 27,070 | 13,312 |
+| `d` forms always signed | 27,070 | 13,312 |
+| `s` forms follow the register | 27,070 | 13,312 |
+| crSat 2 truncates for both signs (the old `from_sat_flags`) | 30,542 | 15,360 |
+| crSat 2 saturates for both signs | 27,108 | 13,312 |
+| the two halves of the source swapped | 7,618 | 1,386 |
+| even and odd lanes interleaved | 3,626 | 1,404 |
+| reversed order | 3,390 | 1,386 |
+
+(The surviving matches of the wrong rules are the vectors they happen to agree on: blocks of
+zeros, in-range values, and the crSat 0 truncation passes.)
+
+**What was wrong in the emulator** (fixed): `pack_widths_from_name` parsed the mnemonic and
+read every `d` form as unsigned, so `crPackSign` was never consulted and a `d` form under
+`crPackSign = 1` was wrong; `crSat` 2 was read as truncation for every form, wrong for
+unsigned lanes; the standalone and fused paths each carried a copy of the same lane code; and
+a second, two-source branch of the standalone handler did a 32-to-16 truncation that no AIE2
+pack instruction does. One lane map (`pack_lanes`, behind `pack_register`) now serves both
+paths, per-form widths and the sign source come from the archspec form table
+(`aie2::pack`, extracted from TableGen, with a build-time check that it covers every pack
+record), and the clamp rule is `PackMode::for_pack`. `PackMode::from_sat_flags` is unchanged
+(the model-validation harness uses it; SRS and UPS do not go through `PackMode`).
+
+**The legacy two-source branch was dead.** `execute_pack` dispatched to it when
+`is_wide_vector` was false. The decoder sets that flag from the TableGen operand types, and
+every `VPACK_*` record's source is `mXs`, an x register (512 bit): the recorded Chess
+bundles of all four forms decode to wide ops
+(`recorded_chess_bundles_decode_to_wide_pack_ops`). The branch and its `vector_pack` helper
+are deleted; a non-wide pack now logs an error and does nothing.
+
+**Open questions.**
+
+| Gap | Model vs hardware | Status |
+|---|---|---|
+| `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `pack(v, int)` as used, needs a raw register write |
+| `crSat` values above 3 | only the low two bits are used | open; not captured |
+| how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | open; only Chess's own schedules observed |
+| unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation |
+| 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only |
+| AIE2P | `vpack` there has `packSign0` / `packSign1` and a `crPackSize` register, a different layout; the AIE2 table does not describe it | deferred |

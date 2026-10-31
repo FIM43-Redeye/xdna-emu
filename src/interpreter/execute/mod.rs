@@ -112,6 +112,9 @@ mod silicon_golden;
 mod agu_goldens;
 
 #[cfg(test)]
+mod pack_goldens;
+
+#[cfg(test)]
 mod unpack_goldens;
 
 #[cfg(test)]
