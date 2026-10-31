@@ -708,17 +708,29 @@ impl VectorAlu {
                     _ => None,
                 })
                 .unwrap_or(0);
+            // A cm register is an even/odd pair, so an odd register can only be a bm half (bmh):
+            // the decoder leaves the width unset for some Peano forms.
             let is_half =
-                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
+                matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half))
+                    || src_reg % 2 == 1;
+            // The destination lands after the move's def latency, not at issue:
+            // II_VMOV_W_CM_CM (and the bm form) has accumulator def operand cycle 2
+            // in AIE2Schedule.td, and the Chess schedules rely on it. A store of the
+            // destination's quarter issued the bundle after the move reads the OLD
+            // value (`vst amhh7; vmov cm7, cm1; vst amhl7` stores cm7 before the
+            // move; found as a wrong amhl quarter in the sparse MAC `ops` kernels).
+            let latency = ctx.result_latency.max(1) as u64;
+            let dst = Self::get_acc_dest(op);
             if !is_half {
                 // Accumulator move: vmov cm_dst, cm_src
                 let data = ctx.accumulator.read_wide(src_reg);
-                Self::write_wide_acc_dest(op, ctx, data);
+                ctx.queue_matmul_accum_write(Operand::AccumReg(dst), data, false, latency);
             } else {
                 // Half-accum move: vmov bm_dst, bm_src
                 let data = ctx.accumulator.read(src_reg);
-                let dst = Self::get_acc_dest(op);
-                ctx.accumulator.write(dst, data);
+                let mut wide16 = [0u64; 16];
+                wide16[..8].copy_from_slice(&data);
+                ctx.queue_matmul_accum_write(Operand::AccumReg(dst), wide16, true, latency);
             }
         } else if has_acc_source || has_acc_dest {
             if op.is_wide_vector {
@@ -1264,5 +1276,47 @@ mod tests {
         assert_eq!(after[..4], acc[..4]);
         assert_eq!(after[4], 100 | (101u64 << 32));
         assert_eq!(after[7], 106 | (107u64 << 32));
+    }
+
+    /// `vmov cm_dst, cm_src` lands after its def latency (II_VMOV_W_CM_CM, operand cycle 2): a
+    /// reader the bundle after the move still sees the old destination, and the source is
+    /// sampled at issue. Chess relies on both (`vst amhh7; vmov cm7, cm1; vst amhl7`).
+    #[test]
+    fn test_vmov_cm_cm_lands_after_its_latency() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.accumulator.write_wide(2, [7u64; 16]);
+        ctx.accumulator.write_wide(0, [1u64; 16]);
+        ctx.result_latency = 2;
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::AccumReg(2));
+        op.accum_width = Some(AccumWidth::Full);
+        VectorAlu::execute(&op, &mut ctx);
+        ctx.accumulator.write_wide(2, [9u64; 16]); // the source changes after issue
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.accumulator.read_wide(0), [1u64; 16], "not yet landed one cycle later");
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.accumulator.read_wide(0), [7u64; 16], "landed with the value sampled at issue");
+    }
+
+    /// An odd accumulator register is a bm half (bmh): a move from it must not take the
+    /// 1024-bit pair path (which panics on an odd base).
+    #[test]
+    fn test_vmov_from_an_odd_accumulator_is_a_half_move() {
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(3, [5u64; 8]);
+        ctx.result_latency = 2;
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(1))
+            .with_source(Operand::AccumReg(3));
+        VectorAlu::execute(&op, &mut ctx);
+        ctx.cycles += 2;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.accumulator.read(1), [5u64; 8]);
     }
 }

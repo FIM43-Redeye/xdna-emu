@@ -197,9 +197,13 @@ def render_kernel(width):
         body.append("    v = update(v, *(volatile DT *)marker_data);")
         body.append("    v = update(v, *(volatile sparsity_t *)marker_mask);")
         body.append("    int32_t last_dp = 0;")
+        undefined = False    # the high half of v after a lo step, until a hi step fills it in
         for step in steps_of(script):
             body.append(f"    {STEP_CODE[step].replace('pt *', pt + ' *')}")
             body.append(f"    RECORD(o, last_dp, v, {STEPS[step]}, {int(step in READS_DP)});")
+            undefined = step in ("peek_lo", "pop_lo") or (undefined and step not in ("peek_hi", "pop_hi"))
+            if undefined:
+                body.append("    ZERO_UNDEFINED_HALF(o);")
             body.append("    o += REC;")
         body.append("  }")
     # The ring keeps whatever it held, so every chunk first writes all ten of its lines: the
@@ -235,6 +239,16 @@ def render_kernel(width):
     (o)[3] = (id) | ((fresh) << 8);                                              \\
     *(DT *)((o) + 16) = extract_sparse_data(v);                                  \\
     *(sparsity_t *)((o) + 8) = extract_sparsity(v);                              \\
+  }} while (0)
+
+// A lo step returns a register of which only the low half is written: the high halves of data and
+// mask hold whatever the register held before, which differs from run to run. The record gets
+// zeros there instead, so a capture is reproducible and an emulator can match it exactly.
+#define ZERO_UNDEFINED_HALF(o)                                                   \\
+  do {{                                                                           \\
+    (o)[10] = 0;                                                                 \\
+    (o)[11] = 0;                                                                 \\
+    aie::store_v((int32_t *)((o) + 24), aie::zeros<int32_t, 8>());               \\
   }} while (0)
 
 // Marker sources read from memory: Chess cannot materialize a 128-bit constant.

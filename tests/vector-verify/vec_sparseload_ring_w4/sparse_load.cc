@@ -26,6 +26,16 @@
     *(sparsity_t *)((o) + 8) = extract_sparsity(v);                              \
   } while (0)
 
+// A lo step returns a register of which only the low half is written: the high halves of data and
+// mask hold whatever the register held before, which differs from run to run. The record gets
+// zeros there instead, so a capture is reproducible and an emulator can match it exactly.
+#define ZERO_UNDEFINED_HALF(o)                                                   \
+  do {                                                                           \
+    (o)[10] = 0;                                                                 \
+    (o)[11] = 0;                                                                 \
+    aie::store_v((int32_t *)((o) + 24), aie::zeros<int32_t, 8>());               \
+  } while (0)
+
 // Marker sources read from memory: Chess cannot materialize a 128-bit constant.
 static uint8_t marker_data[64] __attribute__((aligned(64))) = {0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5};
 static uint8_t marker_mask[16] __attribute__((aligned(16))) = {0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A};
@@ -66,9 +76,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -78,9 +90,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -90,9 +104,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -102,9 +118,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -114,9 +132,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -126,9 +146,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -158,9 +180,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -170,9 +194,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -182,9 +208,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -194,9 +222,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -206,9 +236,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -218,9 +250,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -253,9 +287,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -265,9 +301,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -277,9 +315,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -289,9 +329,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -301,9 +343,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -313,9 +357,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -351,9 +397,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -363,9 +411,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -375,9 +425,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -387,9 +439,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -399,9 +453,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);
@@ -411,9 +467,11 @@ void sparse_load(uint8_t *restrict in, int32_t *restrict out) {
     o += REC;
     v = sparse_pop_set_lo(P);
     RECORD(o, last_dp, v, 5, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     clr_sparse_of(); clr_compr_uf();
     RECORD(o, last_dp, v, 0, 0);
+    ZERO_UNDEFINED_HALF(o);
     o += REC;
     v = sparse_pop_insert_hi(v, P);
     RECORD(o, last_dp, v, 6, 0);

@@ -298,13 +298,27 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // and silicon shows that VMSC reading the OLD value, which needs the write to
     // land after the +3 source read (issue+6). 7 is the smallest latency
     // consistent with that capture; no kernel pins it exactly.
+    // The sparse float add forms land at 6, the itinerary value: a Chess prologue
+    // reads `vmov x3, bml0` six bundles behind a sparse `vaddmac.f bml0` and
+    // silicon shows the new value (vec_macsparse_4x16_16x4_ops). One latency that
+    // serves both this reader and the dense MAC-chain reader is an open question.
     let latency = if config.bfloat {
-        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F + u8::from(acc2_sub.is_some())
+        crate::interpreter::timing::latency::LATENCY_VECTOR_MAC_F
+            + u8::from(acc2_sub.is_some() && !config.sparse)
     } else {
         crate::interpreter::timing::latency::LATENCY_VECTOR_MAC
     } as u64;
 
-    ctx.queue_pending_matmul(PendingMatmul {
+    // The sparse float MACs read their accumulator inputs at issue: a Chess schedule overwrites the
+    // accumulator of a sparse `vaddmac.f` and then issues later `vmac.f` instructions that still
+    // read the old value three bundles after the overwriting add, which a read at +3 would miss
+    // (vec_macsparse_4x16_16x4_conf). The integer and dense float MACs read at +3.
+    let acc_read_delay = if config.bfloat && config.sparse {
+        0
+    } else {
+        VMAC_ACC_SRC_READ_LATENCY
+    };
+    let pending = PendingMatmul {
         operands,
         sparse_integer,
         b_present,
@@ -316,9 +330,14 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         acc2_reg: if acc2_sub.is_some() { get_acc_source(op) } else { 0 },
         acc_dest,
         is_half,
-        write_latency: latency.saturating_sub(VMAC_ACC_SRC_READ_LATENCY),
-        ready_bundle: ctx.bundle_seq + VMAC_ACC_SRC_READ_LATENCY,
-    });
+        write_latency: latency.saturating_sub(acc_read_delay),
+        ready_bundle: ctx.bundle_seq + acc_read_delay,
+    };
+    if acc_read_delay == 0 {
+        complete_matmul(ctx, &pending);
+    } else {
+        ctx.queue_pending_matmul(pending);
+    }
 
     true
 }
