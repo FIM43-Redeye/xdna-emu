@@ -168,10 +168,10 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // stale/poison contents into the result. Mac/MatMulSub/NegMatMul/AddMac/
     // SubMac (the VMAC family) keep the config-driven accumulate behavior.
     //
-    // vnegmac and vnegmsc share the NegMul semantic but do take an accumulator: dense integer
-    // silicon gives -(acc + A*B) and -(acc - A*B) (collisions/neg), so the accumulator input is
-    // negated and only the fresh vnegmul zeroes it. The float and sparse forms keep the old rule.
-    let negate_acc = semantic == SemanticOp::NegMul
+    // vnegmac (NegMatMul) and vnegmsc (NegMul) do take an accumulator: dense integer silicon gives
+    // -(acc + A*B) and -(acc - A*B) (collisions/neg), so the accumulator input is negated and only
+    // the fresh vnegmul zeroes it. The float and sparse forms keep the old rule.
+    let negate_acc = matches!(semantic, SemanticOp::NegMul | SemanticOp::NegMatMul)
         && qx.is_none()
         && !config.bfloat
         && op.encoding_name.as_deref().is_some_and(|n| {

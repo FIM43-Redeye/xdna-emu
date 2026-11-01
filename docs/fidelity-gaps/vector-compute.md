@@ -72,23 +72,121 @@ with the itineraries. Silicon was run twice and is bit-identical (165 kernels, 9
 `src/interpreter/state/acc_timing_golden.rs` replays the ~370 measured thresholds against the
 register file.
 
-**Resource collisions (OPEN, next derivation).** The emulator reproduces 9666 of the 9690 probe
-points byte for byte (controller rerun `e3` on the final code). The other 24 are schedules that the
-TableGen resource model forbids, so no compiler emits them; silicon is deterministic on each (r1 =
-r2), and the emulator applies the rule as if the collision were not there:
+**Resource collisions (MODELLED 2026-11-01; open items listed at the end).** Compilers never
+emit a schedule that holds one TableGen unit twice in a cycle, but a hand-written schedule can, and
+silicon is deterministic about what happens (every probe run twice, byte-identical). The first probe
+(`probe-v2`) saw 24 such points among 9690; the collision probes (`tools/gen_collision_probe.py`,
+`build/experiments/collisions/probe` .. `probe12`, 12 directories, 11200 points) take every pair of
+instructions whose resolved reservations overlap on an accumulator-datapath unit and run it at the
+colliding issue distance plus the neighbouring distances as controls. The emulator now matches silicon
+on all of them (counts below). Nothing here changes a schedule the resource model allows: the
+resolver only acts when two tagged writes share a register file and a landing cycle, and the ISA
+suite and the bridge suite did not move.
 
-| Collision (itinerary stages) | Points | Silicon |
-|------------------------------|--------|---------|
-| `CM_RM_PORT` read: a `vmov cm,cm` / `vmov bm,bm` source read (stage 0) in the cycle a `vadd`/`vaddmac` reads an accumulator source (stage 2); WAR `s = -2` | 16 (both `vadd` sources, `vaddmac` `acc2`; int and float, dense and sparse) | the consumer reads a different value than OLD or NEW; a constant per-lane offset suggests it gets the move's source register (inferred, unconfirmed) |
-| `CM_WA_PORT` write: a `vclr` (stage 4) in the cycle a float MAC/add writes its destination (stage 5); WAR `s = -1` | 6 (`vmac.f`, `vaddmac.f` `acc2`, `vadd.f`) | the result looks like the consumer's accumulator source read zero (inferred from one pattern, unconfirmed) |
-| Same-register write in the same cycle: `vlda.ups` (def 9) and `vaddmac.f` (def 6) landing on one `bm` at once; RAW `d = 3` | 2 (dense and sparse) | the MAC result is kept; the emulator keeps the load |
+*Where the model gets its facts.* No unit name, stage number or instruction name is in the emulator.
+`SlotOp.ports` (`PortUse`, built in `decode/ports.rs` from the decoder FFI's resolved stages) carries
+unit indices:
 
-Each behaviour is pinned by a handful of points, which is not enough to model it: the next step is
-a dedicated collision probe per port and pair class, and an itinerary-driven checker that reports
-any bundle sequence breaking the TableGen resource reservation. Evidence:
-`build/experiments/sparse/acc-timing/probe-v2/` (`r1`, `e3`, kernels `k094`-`k111`, `k123`,
-`k124`, `k129`, `k158`). Tied consumers (`vaddmac*` `acc1`, destination equals source) have no WAR
-points of their own and are censored at `t = 1`.
+- **Write port**: the unit the resolved itinerary holds in the cycle before the result lands
+  (`operand_cycles[0] - 1`) that writes the destination's register file. Which units write which
+  file is derived from the itineraries and the destination register classes of their instructions
+  (`TblgenOutput::itinerary_output_classes`, from the instruction records): the vector file has
+  three write ports and the accumulator file two. A class that reserves ports of both files
+  (`vshuffle`, `vbcstshfl`: TableGen over-reserves, silicon collides only on the unit of the file it
+  writes) is resolved by the destination register. Priority between two ports is unit-index order.
+- **Accumulator read port**: the units held (not merely reserved) in the cycle of the first
+  accumulator source's use (`use_cycle - 1`). Instructions the tables hold nothing for there
+  (`vmac`, `vmsc.f`, `vneg*`) have none and, as silicon showed, never collide on a read.
+- A write is stamped at issue with its port, an issue sequence number and its landing bundle
+  (`issue + result operand cycle`); the stamp is carried through every deferred path (`PendingAccAdd`,
+  `PendingMatmul`, `PendingUpsLoad`, `PendingUnpack`) and the cycle-based load commits (a stand-in
+  entry in the register file takes part in the resolution; the commit applies its verdict).
+
+*Write side* (`state/write_collision.rs`, a pure function from chunks to chunks). The accumulator
+file has four 256-bit banks (quarter `q` of half `h` of any `cm` is bank `2h + q`), the vector file
+two (`wl`, `wh`); a write is a list of 256-bit chunks numbered in the order the instruction produces
+them.
+
+1. *Same port, same landing cycle.* The port has one data lane per chunk ordinal; lane `k` carries
+   ordinal `k` of the latest-issued writer that has one. Bank `p` takes lane `p` (lane 0 when no writer
+   drives lane `p`) and goes to the register of the latest-issued writer that targets `p`; earlier
+   writers' chunks on that bank are dropped. Banks nobody targets are untouched; registers do not
+   matter, the bank is the resource. A port with one writer passes through.
+2. *Different ports, same landing cycle.* Only chunks on the same register and bank conflict; the
+   lower-indexed port wins with its own data. Different registers both land.
+
+*Read side.*
+
+3. *Accumulator read-port steal* (`CM_RM` in the tables). A reader that reads its accumulator late
+   (`vadd`/`vaddmac` family: cycle `issue + 2`) gets, for its **last accumulator source** and for the banks
+   the mover reads, the source of a **mover** that read through the same port in that cycle. A mover is
+   an instruction that reads an accumulator and writes through the last write port of a file: the
+   `vmov` family out of an accumulator and `vsrsm`, and exactly those (pinned by
+   `decode/ports_goldens.rs`). Later-issued movers win a bank. `vsrs`, `vconv`, `vst*`, `vfloor` read
+   through the same port but do not steal.
+4. *SRS shifter wired OR* (`UPPER_SRS`). Two instructions that hold the shifter's second read unit in
+   the same bundle - a mover with a 512-bit source (`vsrsm`) and an instruction with a full 1024-bit
+   `cm` source (`vsrs` of an `s64` accumulator, `vst.srs`, `vsrs.s8.s32`) - share the shifter's upper
+   half: the mover's source is OR-ed with the partner's high half and the partner's high half with the
+   mover's source, per reader (a shared source register is not OR-ed into the partner's low half).
+   Instructions with a 512-bit source (`vsrs bm`) do not take part.
+5. *s8 partner.* `vsrs.s8.s32` / `vst.srs.s8.s32` do not convert the OR-ed upper bus: their upper
+   16 bytes are the low halfword of each of the first eight 32-bit words of the mover's result.
+6. *Mixed lane modes.* With a nonzero shift the shifter takes the lane mode of the wider of the
+   pair: a 32-bit-lane `vsrsm` beside a 64-bit-lane partner shifts the OR-ed bus as 64-bit lanes
+   (carrying across the two words of a lane) and returns the low 32 bits of each shifted lane, whatever
+   its own element type. A 64-bit-lane `vsrsm` beside a 32-bit-lane partner is its own normal case.
+   Pinned at two shifts (4 and 9) over all pairs.
+
+Producers that were written at issue are timed now: `vlda.conv` lands at its itinerary cycle (6)
+like every other accumulator producer.
+
+*Inferred, not read off the tables* (silicon-derived predicates, each pinned by a test to exactly the
+observed set): the mover predicate; the "secondary read unit" (highest-indexed unit held in the read
+cycle when two are); the steal victim being the last accumulator source and a late reader (offset > 0);
+the steal covering the banks the mover reads; the OR needing a full-source partner and a half-source
+mover; the s8 partner selected by its output element type; the wider-lane-mode rule; the lane
+data model of rule 1 (ordinal vs bank). All of them reproduce every silicon point; the cases the
+probes could not reach (a `bmh` mover, three writers in one cycle) follow the same rules by
+construction and are unconfirmed.
+
+*Evidence and exact counts* (EMU vs silicon run r1, differing points / points; `before` is the
+emulator at the start of this work, `after` the model):
+
+| Probe (dir under `build/experiments/collisions/`) | Content | before | after |
+|---|---|---|---|
+@@COUNTS@@
+
+Replays: `src/interpreter/execute/collision_goldens.rs` runs 95 silicon pair points (one per port group,
+configuration and outcome signature) through the cycle-accurate executor; the resolver has unit tests
+for each rule and `tools/mutation_check_collisions.py` breaks each rule and confirms a test fails
+(`build/experiments/collisions/mutation_check.txt`).
+
+*Chess scalar-port finding.* The checker (`collision-check elf`) over compiled code finds no violation
+of the accumulator or vector register-file ports in either compiler. It does find 666 over the 98
+Chess bridge ELFs (all scalar-side: `P_RM_PORT` 471, `P_WM_PORT` 159, and the `M`/`DN`/`DJ`/`DC` write
+ports 9 each) against 0 over the 108 Peano ELFs, and 496 `PART_WORD_STORE` hits in the ISA-suite
+kernels: TableGen is more conservative than Chess on the pointer and modifier ports (and on the
+part-word store unit), so Chess legitimately schedules through reservations the model says are held.
+Those are real silicon schedules, and silicon is fine with them; they are not collisions in the
+sense of this section.
+
+**Open (not modelled), each with its reason.**
+
+- `VMOV_CASCADE_READ` collisions: the cascade read writes the accumulator file through a port the
+  tables share (`CM_WM`), but its data arrives from a neighbouring tile, so a collision needs a
+  two-tile harness. Deferred, required for 100%.
+- `UPS_UNIT` cannot be separated from `CM_WM_PORT`: every instruction that holds the UPS unit also
+  holds the write port in the cycle the result lands, so no probe can collide on one without the other.
+  The model treats the pair as the write-port collision it is.
+- Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
+  (`W_RS`, the third write port) and `vlda.am` quarters (via the load commit).
+- Unconfirmed extrapolations listed under "Inferred" above.
+- Collisions the tables forbid on units that are not an accumulator or vector register-file port
+  (pointer, modifier and scalar ports, the part-word store unit) are not modelled; Chess uses them
+  on purpose (above).
+- Tied consumers (`vaddmac*` `acc1`, destination equals source) have no WAR points of their own and
+  are censored at `t = 1` (unchanged).
 
 ## Special-value NaN payload (`vadd.f`/`vsub.f`, bf16 + fp32)
 

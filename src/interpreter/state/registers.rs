@@ -651,10 +651,12 @@ impl VectorRegisterFile {
         Some(id)
     }
 
-    /// What the resolver decided for a phantom: the data to write, or `None` when another
-    /// writer took its bank. An unknown handle (expired) means "write as computed".
-    pub fn phantom_verdict(&self, id: u32) -> Option<Option<[u32; 8]>> {
-        let w = self.pending.iter().find(|w| w.phantom == Some(id))?;
+    /// Take the resolver's verdict for a phantom (and drop the phantom): the data to write, or
+    /// `None` when another writer took its bank. An unknown handle (expired) means "write as
+    /// computed".
+    pub fn take_phantom_verdict(&mut self, id: u32) -> Option<Option<[u32; 8]>> {
+        let at = self.pending.iter().position(|w| w.phantom == Some(id))?;
+        let w = self.pending.swap_remove(at);
         Some((!w.dropped).then_some(w.value))
     }
 
@@ -1188,10 +1190,11 @@ impl AccumulatorRegisterFile {
         Some(id)
     }
 
-    /// What the resolver decided for a phantom: the lanes that still land and their values.
-    /// `None` for an unknown (expired) handle: write as computed.
-    pub fn phantom_verdict(&self, id: u32) -> Option<([u64; 8], u8)> {
-        let w = self.pending.iter().find(|w| w.phantom == Some(id))?;
+    /// Take the resolver's verdict for a phantom (and drop the phantom): the lanes that still land
+    /// and their values. `None` for an unknown (expired) handle: write as computed.
+    pub fn take_phantom_verdict(&mut self, id: u32) -> Option<([u64; 8], u8)> {
+        let at = self.pending.iter().position(|w| w.phantom == Some(id))?;
+        let w = self.pending.swap_remove(at);
         Some((w.value, w.lanes))
     }
 
@@ -1990,5 +1993,96 @@ mod tests {
         r.advance_bundle(5);
         r.queue_write(2, [0xAAAA_AAAA; 8], 0, Bypass::Mov);
         assert_eq!(r.read(2), [0xAAAA_AAAA; 8], "l_def=0 writes immediately (test/legacy path)");
+    }
+
+    // --- same-cycle write collisions (see `write_collision`) ---
+
+    fn tag(port: u16, seq: u64, land: u64) -> Option<WriteTag> {
+        Some(WriteTag { port, seq, land })
+    }
+
+    #[test]
+    fn untagged_writes_to_one_bank_both_land() {
+        let mut v = VectorRegisterFile::new();
+        v.advance_bundle(0);
+        v.queue_write(8, [1; 8], 3, Bypass::No);
+        v.queue_write(4, [2; 8], 3, Bypass::No);
+        v.advance_bundle(3);
+        assert_eq!((v.read_store(8), v.read_store(4)), ([1; 8], [2; 8]));
+    }
+
+    #[test]
+    fn vector_file_later_writer_on_a_bank_drops_the_earlier_one() {
+        let mut v = VectorRegisterFile::new();
+        v.write(8, [9; 8]);
+        v.advance_bundle(0);
+        v.set_write_tag(tag(0, 1, 3));
+        v.queue_write(8, [1; 8], 3, Bypass::No);
+        v.advance_bundle(1);
+        v.set_write_tag(tag(0, 2, 3));
+        v.queue_write(4, [2; 8], 2, Bypass::No);
+        v.set_write_tag(None);
+        v.advance_bundle(3);
+        // same port, same landing bundle, both on bank 0 (even registers): the later-issued wins
+        assert_eq!(v.read_store(8), [9; 8], "the earlier write is dropped");
+        assert_eq!(v.read_store(4), [2; 8]);
+    }
+
+    #[test]
+    fn vector_file_writers_in_different_landing_cycles_do_not_collide() {
+        let mut v = VectorRegisterFile::new();
+        v.advance_bundle(0);
+        v.set_write_tag(tag(0, 1, 3));
+        v.queue_write(8, [1; 8], 3, Bypass::No);
+        v.set_write_tag(tag(0, 2, 4));
+        v.queue_write(4, [2; 8], 4, Bypass::No);
+        v.advance_bundle(4);
+        assert_eq!((v.read_store(8), v.read_store(4)), ([1; 8], [2; 8]));
+    }
+
+    #[test]
+    fn accumulator_file_cm_write_loses_only_the_banks_a_later_bm_write_takes() {
+        let mut a = AccumulatorRegisterFile::new();
+        a.write(4, [7; 8]);
+        a.write(5, [7; 8]);
+        a.advance_bundle(0);
+        // A: cm2 (registers 4 and 5, banks 0..3), data tag 0xA; B: bml0 (register 0, banks 0 and 1)
+        a.set_write_tag(tag(0, 1, 4));
+        a.queue_write_wide_issued_at(0, 4, [0xA; 16], 4, Bypass::No);
+        a.set_write_tag(tag(0, 2, 4));
+        a.queue_write_issued_at(0, 0, [0xB; 8], 4, Bypass::No);
+        a.set_write_tag(None);
+        a.advance_bundle(5);
+        assert_eq!(a.read_committed(4), [7; 8], "banks 0 and 1 went to the later writer's register");
+        assert_eq!(a.read_committed(5), [0xA; 8], "banks 2 and 3 are only A's");
+        assert_eq!(a.read_committed(0), [0xB; 8]);
+    }
+
+    #[test]
+    fn accumulator_file_cross_port_same_register_lower_port_wins() {
+        let mut a = AccumulatorRegisterFile::new();
+        a.write(4, [7; 8]);
+        a.advance_bundle(0);
+        a.set_write_tag(tag(1, 1, 4));
+        a.queue_write_issued_at(0, 4, [0xA; 8], 4, Bypass::No);
+        a.set_write_tag(tag(0, 2, 4));
+        a.queue_write_issued_at(0, 4, [0xB; 8], 4, Bypass::No);
+        a.set_write_tag(None);
+        a.advance_bundle(5);
+        assert_eq!(a.read_committed(4), [0xB; 8], "port 0 wins whichever issued last");
+    }
+
+    #[test]
+    fn a_phantom_takes_part_and_reports_the_verdict() {
+        let mut v = VectorRegisterFile::new();
+        v.advance_bundle(0);
+        v.set_write_tag(tag(0, 1, 5));
+        let load = v.register_phantom(8, [0x11; 8]).unwrap();
+        v.advance_bundle(2);
+        v.set_write_tag(tag(0, 2, 5));
+        v.queue_write(4, [0x22; 8], 3, Bypass::No);
+        v.set_write_tag(None);
+        assert_eq!(v.take_phantom_verdict(load), Some(None), "the later writer took the bank");
+        assert_eq!(v.take_phantom_verdict(load), None, "a verdict is taken once");
     }
 }

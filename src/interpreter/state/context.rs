@@ -1280,7 +1280,7 @@ impl ExecutionContext {
             Operand::VectorReg(r) => {
                 if let Some(vec) = &pw.vec_value {
                     // a collision may have dropped the load or replaced its data
-                    match pw.phantom.and_then(|id| self.vector.phantom_verdict(id)) {
+                    match pw.phantom.and_then(|id| self.vector.take_phantom_verdict(id)) {
                         None => self.vector.write(*r, *vec),
                         Some(Some(data)) => self.vector.write(*r, data),
                         Some(None) => {}
@@ -1289,7 +1289,7 @@ impl ExecutionContext {
             }
             Operand::AccumReg(r) => {
                 if let Some(vec) = &pw.vec_value {
-                    match pw.phantom.and_then(|id| self.accumulator.phantom_verdict(id)) {
+                    match pw.phantom.and_then(|id| self.accumulator.take_phantom_verdict(id)) {
                         None => self.apply_accum_write(*r, vec, pw.accum_width),
                         Some((value, lanes)) => self.accumulator.write_lanes(*r, &value, lanes),
                     }

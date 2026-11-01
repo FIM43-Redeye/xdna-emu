@@ -121,6 +121,9 @@ def main():
     ap.add_argument("out")
     ap.add_argument("sources", nargs="+")
     ap.add_argument("--per-group", type=int, default=1)
+    ap.add_argument("--extra", action="append", default=[],
+                    help="KEY_A:KEY_B - also take the first colliding point of this pair even when its "
+                         "outcome signature is already covered (reaches every deferred write path)")
     args = ap.parse_args()
     variants, goldens, states = [], [], {}
     seen = collections.Counter()
@@ -142,9 +145,12 @@ def main():
             if sa is None or sb is None:
                 continue
             sig = (shift, row["units"], row["cfg"], rules.normalise(row["A"]), rules.normalise(row["B"]))
-            if seen[sig] >= args.per_group:
+            extra = (p["a"], p["b"], row["cfg"]) if f"{p['a']}:{p['b']}" in args.extra else None
+            if seen[sig] >= args.per_group and (extra is None or seen[extra]):
                 continue
             seen[sig] += 1
+            if extra is not None:
+                seen[extra] += 1
             key = (table, dom, shift)
             if key not in states:
                 states[key] = len(variants)
