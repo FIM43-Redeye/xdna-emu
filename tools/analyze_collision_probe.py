@@ -119,7 +119,7 @@ def words(b):
 
 
 def used_bytes(ins):
-    return {"cm": 128, "bml": 64, "x": 64, "wl": 32, "mem": 32}[ins.dst]
+    return {"cm": 128, "bml": 64, "x": 64, "wl": 32, "mem": 64, "am": 32, "q": 16}[ins.dst]
 
 
 def ref_key(kind, ins_key, r, dom):

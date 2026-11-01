@@ -183,7 +183,8 @@ def prologue(dom):
         lines.append(f"  lda {q}, [p0, #{TABLE_OFFSETS[name]}]")
     lines += nops(LOAD_NOPS)
     shift = 0 if dom == "i" else 16
-    lines += [f"  mov r14, #{shift}", "  mov s3, r14", "  mov s1, r14", "  nop", "  nop"]
+    lines += [f"  mov r14, #{shift}", "  mov s3, r14", "  mov s1, r14", "  movxm r12, #9320",
+              "  mov r29, #0", "  nop", "  nop"]
     lines += load_vec("wl10", f"NEWX_{dom}", 0) + load_vec("wh10", f"NEWX_{dom}", 1)
     lines += ["  mov p4, p0", f"  padda [p4], #{TABLE_OFFSETS[f'NEWX_{dom}']}"]
     lines += nops(LOAD_NOPS)
@@ -244,8 +245,54 @@ CATALOGUE = [
     Ins("vconv_fp32_bf16", "vconv.fp32.bf16 bml{D}, wl10", "f", (), "bml"),
     Ins("vmov_bm_x", "vmov bml{D}, x10", None, (), "bml"),
 ]
+# Phase 2b: the accumulator-side classes and shapes probe2 did not cover. Sources that are not
+# accumulators (x0/x1 vectors, the scalar r12, the q1 mask register, memory) are fixed in the text.
+CATALOGUE_2B = [
+    # UPPER_SRS holders: every vsrs / vsrsm / vst.srs shape (they differ in source and output width)
+    Ins("vsrs_s8_s32", "vsrs.s8.s32 {DW}, cm{S1}, s1", None, ("cm",), "wl"),
+    Ins("vsrs_d32_s64", "vsrs.d32.s64 {DW}, cm{S1}, s1", "i", ("cm",), "x"),
+    Ins("vsrs_s16_s64", "vsrs.s16.s64 {DW}, cm{S1}, s1", "i", ("cm",), "wl"),
+    Ins("vsrs_d16_s64", "vsrs.d16.s64 {DW}, cm{S1}, s1", "i", ("cm",), "wl"),
+    Ins("vsrsm_d16_s32", "vsrsm.d16.s32 {DW}, bml{S1}, s1", None, ("bml",), "wl"),
+    Ins("vsrsm_s32_s64", "vsrsm.s32.s64 {DW}, bml{S1}, s1", "i", ("bml",), "wl"),
+    Ins("vsrsm_d32_s64", "vsrsm.d32.s64 {DW}, bml{S1}, s1", "i", ("bml",), "wl"),
+    Ins("vst_srs_d16_s32", "vst.srs.d16.s32 bml{S1}, s1, [p1, #{M}]", None, ("bml",), "mem"),
+    Ins("vst_srs_s8_s32", "vst.srs.s8.s32 cm{S1}, s1, [p1, #{M}]", None, ("cm",), "mem"),
+    Ins("vst_srs_s16_s64", "vst.srs.s16.s64 cm{S1}, s1, [p1, #{M}]", "i", ("cm",), "mem"),
+    Ins("vst_srs_d16_s64", "vst.srs.d16.s64 cm{S1}, s1, [p1, #{M}]", "i", ("cm",), "mem"),
+    Ins("vst_srs_s32_s64", "vst.srs.s32.s64 bml{S1}, s1, [p1, #{M}]", "i", ("bml",), "mem"),
+    Ins("vst_srs_d32_s64", "vst.srs.d32.s64 bml{S1}, s1, [p1, #{M}]", "i", ("bml",), "mem"),
+    # W_WA_PORT holders
+    Ins("vpack_s8_s16", "vpack.s8.s16 {DW}, x0", None, (), "wl"),
+    Ins("vpack_d8_d16", "vpack.d8.d16 {DW}, x0", None, (), "wl"),
+    Ins("vpack_s4_s8", "vpack.s4.s8 {DW}, x0", None, (), "wl"),
+    Ins("vlda_w", "vlda {DW}, [p0, #32]", None, (), "wl"),
+    Ins("vlda_128", "vlda.128 {DW}, [p0]", None, (), "wl"),
+    Ins("vfloor_am", "vfloor.s32.bf16 {DW}, amll{S1}, s1", "f", ("bml",), "x"),
+    Ins("vfloor_w", "vfloor.s32.bf16 {DW}, wl0, s1", "f", (), "x"),
+    # W_WM_PORT holders (vector ALU writes)
+    Ins("vband", "vband {DW}, x0, x1", None, (), "x"),
+    Ins("vbor", "vbor {DW}, x0, x1", None, (), "x"),
+    Ins("vadd_32", "vadd.32 {DW}, x0, x1", None, (), "x"),
+    Ins("vsub_32", "vsub.32 {DW}, x0, x1", None, (), "x"),
+    Ins("vshift_align", "vshift.align {DW}, x0, s0, x1, r1", None, (), "x"),
+    Ins("vbcst_32", "vbcst.32 {DW}, r12", None, (), "x"),
+    Ins("vmov_w_w", "vmov {DW}, wl0", None, (), "wl"),
+    Ins("vmov_x_x", "vmov {DW}, x0", None, (), "x"),
+    # CM_WM_PORT holders that hold CM_WM and W_WM both
+    Ins("vshuffle_x", "vshuffle {DW}, x0, x1, r1", None, (), "x"),
+    Ins("vshuffle_bm", "vshuffle bml{D}, x0, x1, r1", None, (), "bml"),
+    Ins("vbcstshfl_x", "vbcstshfl.32 {DW}, r12, r29", None, (), "x"),
+    Ins("vbcstshfl_bm", "vbcstshfl.32 bml{D}, r12, r29", None, (), "bml"),
+    # the static VMOV_W class: an accumulator quarter and a q register
+    Ins("vmov_am_q", "vmov amll{D}, q1", None, (), "am"),
+    Ins("vmov_q_am", "vmov {DQ}, amll{S1}", None, ("bml",), "q"),
+]
+NEW_KEYS = {i.key for i in CATALOGUE_2B}
+CATALOGUE = CATALOGUE + CATALOGUE_2B
 BY_KEY = {i.key: i for i in CATALOGUE}
 W_DEST = {"A": ("x8", "wl8"), "B": ("x4", "wl4")}      # (x name, wl name) per role
+Q_DEST = {"A": "q0", "B": "q2"}                          # q1 and q3 hold the masks
 
 
 @dataclass(frozen=True)
@@ -261,6 +308,8 @@ def render(ins: Ins, r: Regs) -> str:
     kw = {"D": r.d, "M": A_OFF if r.role == "A" else B_OFF}
     for i, s in enumerate(r.s):
         kw[f"S{i + 1}"] = s
+    if ins.dst == "q":
+        kw["DQ"] = Q_DEST[r.wsel]
     if ins.dst in ("x", "wl"):
         kw["DW"] = W_DEST[r.wsel][0 if ins.dst == "x" else 1]
     return ins.asm.format(**kw)
@@ -270,8 +319,11 @@ def render(ins: Ins, r: Regs) -> str:
 # Reservations of every catalogue instruction, from the decoder
 # --------------------------------------------------------------------------
 
+ACC_DST = ("cm", "bml", "am")
+
+
 def sample_regs(ins: Ins, role: str = "A") -> Regs:
-    return Regs(s=tuple(range(len(ins.srcs))), d=len(ins.srcs) if ins.dst in ("cm", "bml") else None,
+    return Regs(s=tuple(range(len(ins.srcs))), d=len(ins.srcs) if ins.dst in ACC_DST else None,
                 role=role)
 
 
@@ -318,7 +370,7 @@ def same_resource(ua: str, ub: str) -> bool:
     return ua in ACC_WRITE_UNITS and ub in ACC_WRITE_UNITS
 
 
-def derive_collisions(res) -> list[dict]:
+def derive_collisions(res, only_new: bool = False) -> list[dict]:
     """Every (A, B, g) where A holds a unit at cycle a and B holds the same resource at b, with
     g = a - b >= 0 (A issued g bundles before B), merged over the units that collide there."""
     merged: dict[tuple, dict] = {}
@@ -332,6 +384,8 @@ def derive_collisions(res) -> list[dict]:
                     if not same_resource(ua, ub) or not (g > 0 or (g == 0 and ia <= ib)):
                         continue
                     if ua.endswith("*") and ub.endswith("*"):
+                        continue
+                    if only_new and a.key not in NEW_KEYS and b.key not in NEW_KEYS:
                         continue
                     k = (a.key, b.key, g)
                     m = merged.setdefault(k, {"a": a.key, "b": b.key, "g": g, "units": [],
@@ -349,18 +403,18 @@ def derive_collisions(res) -> list[dict]:
 
 def allocate(a: Ins, b: Ins, cfg: str) -> Optional[tuple[Regs, Regs]]:
     """Accumulator indices for A and B under a configuration, or None if it does not apply."""
-    ra = Regs(s=tuple(range(len(a.srcs))), d=2 if a.dst in ("cm", "bml") else None, role="A")
+    ra = Regs(s=tuple(range(len(a.srcs))), d=2 if a.dst in ACC_DST else None, role="A")
     sb = [3 + i for i in range(len(b.srcs))]
-    db = 5 if b.dst in ("cm", "bml") else None
+    db = 5 if b.dst in ACC_DST else None
     wsel = "B"
     if cfg == "srcshare":
         if not a.srcs or not b.srcs:
             return None
         sb[0] = ra.s[0]
     elif cfg == "dstshare":
-        if a.dst in ("cm", "bml") and b.dst in ("cm", "bml"):
+        if a.dst in ACC_DST and b.dst in ACC_DST:
             db = ra.d
-        elif a.dst == b.dst and a.dst in ("x", "wl"):
+        elif a.dst == b.dst and a.dst in ("x", "wl", "q"):
             wsel = "A"
         else:
             return None
@@ -385,8 +439,10 @@ def configs_for(coll: dict, a: Ins, b: Ins) -> list[str]:
 # --------------------------------------------------------------------------
 
 def dst_init_lines(ins: Ins, r: Regs, dom: str) -> list[str]:
-    if ins.dst in ("cm", "bml"):
+    if ins.dst in ACC_DST:
         return load_acc(r.d, dom)
+    if ins.dst == "q":
+        return [f"  lda {Q_DEST[r.wsel]}, [p0, #{TABLE_OFFSETS['Q3']}]"]
     if ins.dst == "x":
         n = W_DEST[r.wsel][0][1:]
         return load_w(f"wl{n}", f"wh{n}", "WINIT")
@@ -403,6 +459,10 @@ def observe_lines(ins: Ins, r: Regs, off: int) -> list[str]:
     elif ins.dst == "bml":
         for j, q in enumerate(("amll", "amlh")):
             out.append(f"  vst {q}{r.d}, [p1, #{off + 32 * j}]")
+    elif ins.dst == "am":
+        out.append(f"  vst amll{r.d}, [p1, #{off}]")
+    elif ins.dst == "q":
+        out.append(f"  st {Q_DEST[r.wsel]}, [p1, #{off}]")
     elif ins.dst == "x":
         x = W_DEST[r.wsel][0][1:]
         out += [f"  vst wl{x}, [p1, #{off}]", f"  vst wh{x}, [p1, #{off + 32}]"]
@@ -471,10 +531,10 @@ def point_lines(point: dict, dom: str) -> list[str]:
     return lines
 
 
-def make_points(res, limit: Optional[int] = None) -> list[dict]:
+def make_points(res, limit: Optional[int] = None, only_new: bool = False) -> list[dict]:
     """All collision, control and reference points, in generation order."""
     points: list[dict] = []
-    colls = derive_collisions(res)
+    colls = derive_collisions(res, only_new)
     if limit:
         colls = colls[:limit]
     ref_specs = []
@@ -560,14 +620,14 @@ def text_size(text: str) -> int:
         return int(sz)
 
 
-def generate(out_dir: str, limit: Optional[int] = None) -> dict:
+def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "input.bin"), "wb") as f:
         f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
     res = reservations_of_catalogue()
     with open(os.path.join(out_dir, "reservations.json"), "w") as f:
         json.dump(res, f, indent=1)
-    points = make_points(res, limit)
+    points = make_points(res, limit, only_new)
     manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": [],
                 "catalogue": {i.key: i.asm for i in CATALOGUE}}
     for dom in ("i", "f"):
@@ -682,6 +742,8 @@ def main(argv=None):
     g = sub.add_parser("generate")
     g.add_argument("out_dir")
     g.add_argument("--limit", type=int)
+    g.add_argument("--only-new", action="store_true",
+                   help="only pairs with an instruction from CATALOGUE_2B (phase 2b)")
     n = sub.add_parser("negate")
     n.add_argument("out_dir")
     c = sub.add_parser("calibrate")
@@ -701,7 +763,7 @@ def main(argv=None):
     if args.cmd == "calibrate":
         generate_calibration(args.out_dir)
         return 0
-    m = generate(args.out_dir, args.limit)
+    m = generate(args.out_dir, args.limit, args.only_new)
     pts = [p for k in m["kernels"] for p in k["points"]]
     print(f"{len(m['kernels'])} kernels, {len(pts)} points")
     return 0
