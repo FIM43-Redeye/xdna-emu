@@ -147,6 +147,9 @@ DEVICES = {
     "npu2_5col": 13,
     "npu2_6col": 14,
     "npu2_7col": 15,
+    # Versal AIE-ML part, not an NPU: archspec's runtime models and the
+    # aiesimulator VCD mapping (src/vcd/) use its geometry.
+    "xcve2802":  3,
 }
 
 DRIVER_DEVICES = {
@@ -156,8 +159,14 @@ DRIVER_DEVICES = {
 
 
 def driver_physical_column_start(device_name, xdna_driver_path):
-    """Read the physical origin of an mlir-aie NPU model from xdna-driver."""
+    """Read the physical origin of an mlir-aie NPU model from xdna-driver.
+
+    Non-NPU devices (Versal) have no xdna-driver entry: the model's columns
+    are the physical columns, so the origin is 0.
+    """
     family = device_name.split("_", 1)[0]
+    if family not in DRIVER_DEVICES:
+        return 0
     filename, symbol = DRIVER_DEVICES[family]
     source = (
         Path(xdna_driver_path)
@@ -408,6 +417,16 @@ def dump_device(model, device_id, physical_column_start):
     return device
 
 
+def workspace_relative(path):
+    """`path` from its last mlir-aie* directory on, so the checked-in JSON
+    names the binding without leaking the generating machine's layout."""
+    parts = Path(path).parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i].startswith("mlir-aie"):
+            return str(Path(*parts[i:]))
+    return Path(path).name
+
+
 def cmd_device_model(args):
     """device-model subcommand: dump device topology and parameters."""
     python_path, binding_path = setup_mlir_aie(args.mlir_aie_path)
@@ -430,7 +449,7 @@ def cmd_device_model(args):
     result = {
         "generator": "mlir-aie-bridge.py device-model",
         "mlir_aie_python_path": python_path or "(on PYTHONPATH)",
-        "mlir_aie_binding_path": binding_path,
+        "mlir_aie_binding_path": workspace_relative(binding_path),
         "devices": {},
     }
 

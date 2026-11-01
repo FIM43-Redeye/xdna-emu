@@ -78,7 +78,7 @@ pub fn extract_device_models(path: &Path) -> Result<HashMap<String, ArchModel>, 
         field: "(expected object)".into(),
     })?;
 
-    check_keys(root_obj, &["generator", "mlir_aie_python_path", "devices"], "root")?;
+    check_keys(root_obj, &["generator", "mlir_aie_python_path", "mlir_aie_binding_path", "devices"], "root")?;
 
     let devices_val = require_field(root_obj, "devices", "root")?;
     let devices_obj = devices_val.as_object().ok_or_else(|| ExtractError::MissingField {
