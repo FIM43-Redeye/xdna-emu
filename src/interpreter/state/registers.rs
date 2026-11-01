@@ -903,7 +903,9 @@ pub struct AccumulatorRegisterFile {
     next_phantom: u32,
     /// Wired-OR patches for the bundle being issued: a read of `reg` sees `value` OR-ed in.
     /// Armed per bundle by the executor, cleared by `end_bundle`.
-    wired_or: Vec<(u8, [u64; 8])>,
+    wired_or: Vec<(u8, u8, [u64; 8])>,
+    /// Slot of the instruction whose reads are being resolved (selects its wired-OR patches).
+    reader_slot: Option<u8>,
 }
 
 impl Default for AccumulatorRegisterFile {
@@ -924,13 +926,20 @@ impl AccumulatorRegisterFile {
             ordinals: (0, 0),
             next_phantom: 0,
             wired_or: Vec::new(),
+            reader_slot: None,
         }
     }
 
-    /// OR `value` into every read of `reg` for the rest of this bundle (two SRS units sharing
-    /// the upper half of the shifter; see `ExecutionContext::arm_srs_wired_or`).
-    pub fn arm_wired_or(&mut self, reg: u8, value: [u64; 8]) {
-        self.wired_or.push((reg, value));
+    /// OR `value` into the reads of `reg` by the instruction in `slot` for the rest of this
+    /// bundle (two SRS units sharing the upper half of the shifter; see
+    /// `VectorAlu::arm_srs_wired_or`).
+    pub fn arm_wired_or(&mut self, slot: u8, reg: u8, value: [u64; 8]) {
+        self.wired_or.push((slot, reg, value));
+    }
+
+    /// Name the slot whose instruction reads from here on (`None`: any other reader).
+    pub fn set_reader_slot(&mut self, slot: Option<u8>) {
+        self.reader_slot = slot;
     }
 
     /// The array reads see: the bundle snapshot if active, else live registers.
@@ -1001,8 +1010,8 @@ impl AccumulatorRegisterFile {
                 Self::merge_lanes(&mut val, &w.value, w.lanes);
             }
         }
-        for (patched, or) in &self.wired_or {
-            if (*patched as usize) % NUM_ACCUMULATOR_REGS == idx {
+        for (slot, patched, or) in &self.wired_or {
+            if Some(*slot) == self.reader_slot && (*patched as usize) % NUM_ACCUMULATOR_REGS == idx {
                 for (lane, bits) in val.iter_mut().zip(or) {
                     *lane |= bits;
                 }

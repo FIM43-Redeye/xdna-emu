@@ -152,6 +152,96 @@ fn bytes(hex: &str) -> Vec<u8> {
     hex.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()
 }
 
+/// `key -> "write port | accumulator read port@offset+secondary | mover"` for every catalogue
+/// instruction, as decoded; `-` means none.
+const EXPECTED: &[(&str, &str)] = &[
+    ("vmov_cm", "CM_WM_PORT | CM_RM_PORT@0+- | true"),
+    ("vmov_bm", "CM_WM_PORT | CM_RM_PORT@0+- | true"),
+    ("vmov_x_bm", "W_WM_PORT | CM_RM_PORT@0+- | true"),
+    ("vsrs_s16_s32", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrs_s32_s64", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrsm_s16_s32", "W_WM_PORT | CM_RM_PORT@0+UPPER_SRS | true"),
+    ("vsrs_d16_s32", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vconv_bf16_fp32", "W_WA_PORT | CM_RM_PORT@0+- | false"),
+    ("vst_amll", "- | CM_RM_PORT@0+- | false"),
+    ("vst_amhh", "- | CM_RM_PORT@0+- | false"),
+    ("vst_srs_s16_s32", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_conv_bf16_fp32", "- | CM_RM_PORT@0+- | false"),
+    ("vadd_i", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vadd_f", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vaddmac_i", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vaddmac_f", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vaddmsc_f", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vaddmac_i_sparse", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vaddmac_f_sparse", "CM_WA_PORT | CM_RM_PORT@2+- | false"),
+    ("vmul_i", "CM_WA_PORT | - | false"),
+    ("vmul_f", "CM_WA_PORT | - | false"),
+    ("vmac_i", "CM_WA_PORT | - | false"),
+    ("vmac_f", "CM_WA_PORT | - | false"),
+    ("vmac_i_sparse", "CM_WA_PORT | - | false"),
+    ("vmac_f_sparse", "CM_WA_PORT | - | false"),
+    ("vmsc_f", "CM_WA_PORT | - | false"),
+    ("vclr_cm", "CM_WA_PORT | - | false"),
+    ("vclr_bm", "CM_WA_PORT | - | false"),
+    ("vneg_i", "CM_WA_PORT | - | false"),
+    ("vneg_f", "CM_WA_PORT | - | false"),
+    ("vups", "CM_WM_PORT | - | false"),
+    ("vlda_ups", "CM_WM_PORT | - | false"),
+    ("vlda_conv", "CM_WM_PORT | - | false"),
+    ("vconv_fp32_bf16", "CM_WM_PORT | - | false"),
+    ("vmov_bm_x", "CM_WM_PORT | - | false"),
+    ("vsrs_s8_s32", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrs_d32_s64", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrs_s16_s64", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrs_d16_s64", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrsm_d16_s32", "W_WM_PORT | CM_RM_PORT@0+UPPER_SRS | true"),
+    ("vsrsm_s32_s64", "W_WM_PORT | CM_RM_PORT@0+UPPER_SRS | true"),
+    ("vsrsm_d32_s64", "W_WM_PORT | CM_RM_PORT@0+UPPER_SRS | true"),
+    ("vst_srs_d16_s32", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_srs_s8_s32", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_srs_s16_s64", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_srs_d16_s64", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_srs_s32_s64", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vst_srs_d32_s64", "- | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vpack_s8_s16", "W_WA_PORT | - | false"),
+    ("vpack_d8_d16", "W_WA_PORT | - | false"),
+    ("vpack_s4_s8", "W_WA_PORT | - | false"),
+    ("vlda_w", "W_WA_PORT | - | false"),
+    ("vlda_128", "W_WA_PORT | - | false"),
+    ("vfloor_am", "W_WA_PORT | CM_RM_PORT@0+- | false"),
+    ("vfloor_w", "W_WA_PORT | - | false"),
+    ("vband", "W_WM_PORT | - | false"),
+    ("vbor", "W_WM_PORT | - | false"),
+    ("vadd_32", "W_WM_PORT | - | false"),
+    ("vsub_32", "W_WM_PORT | - | false"),
+    ("vshift_align", "W_WM_PORT | - | false"),
+    ("vbcst_32", "W_WM_PORT | - | false"),
+    ("vmov_w_w", "W_WM_PORT | - | false"),
+    ("vmov_x_x", "W_WM_PORT | - | false"),
+    ("vshuffle_x", "W_WM_PORT | - | false"),
+    ("vshuffle_bm", "CM_WM_PORT | - | false"),
+    ("vbcstshfl_x", "W_WM_PORT | - | false"),
+    ("vbcstshfl_bm", "CM_WM_PORT | - | false"),
+    ("vmov_am_q", "CM_WM_PORT | - | false"),
+    ("vmov_q_am", "- | CM_RM_PORT@0+- | true"),
+    ("vlda_wh", "W_WA_PORT | - | false"),
+    ("vpack_s8_s16_wh", "W_WA_PORT | - | false"),
+    ("vsrs_s16_s32_wh", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vsrs_s16_s64_wh", "W_WA_PORT | CM_RM_PORT@0+UPPER_SRS | false"),
+    ("vconv_bf16_fp32_wh", "W_WA_PORT | CM_RM_PORT@0+- | false"),
+    ("vmov_w_wh", "W_WM_PORT | - | false"),
+    ("vsrsm_s16_s32_wh", "W_WM_PORT | CM_RM_PORT@0+UPPER_SRS | true"),
+    ("vmov_amlh_q", "CM_WM_PORT | - | false"),
+    ("vmov_amhl_q", "CM_WM_PORT | - | false"),
+    ("vmov_amhh_q", "CM_WM_PORT | - | false"),
+    ("vshuffle_bmh", "CM_WM_PORT | - | false"),
+    ("vbcstshfl_bmh", "CM_WM_PORT | - | false"),
+    ("vbcstshfl8_bm", "CM_WM_PORT | - | false"),
+    ("vbcstshfl16_bm", "CM_WM_PORT | - | false"),
+    ("vbcstshfl8_x", "W_WM_PORT | - | false"),
+    ("vbcstshfl16_x", "W_WM_PORT | - | false"),
+];
+
 /// Decode one catalogue instruction and describe its ports with unit names.
 fn describe(key: &str) -> String {
     let units = xdna_archspec::aie2::isa::load_from_generated().functional_units;
@@ -170,61 +260,86 @@ fn describe(key: &str) -> String {
         Some(r) => format!("{}@{}+{}", name(r.primary), r.offset, r.secondary.map(name).unwrap_or("-")),
         None => "-".into(),
     };
-    let _ = Operand::Immediate(0);
-    format!("{key}: write={write} read={read} mover={}", op.ports.mover)
+    format!("{write} | {read} | {}", op.ports.mover)
 }
 
 #[test]
-#[ignore]
-fn dump_catalogue_ports() {
-    for (k, _, _) in CATALOGUE_BYTES {
-        println!("{}", describe(k));
+fn every_catalogue_instruction_has_the_pinned_ports() {
+    assert_eq!(EXPECTED.len(), CATALOGUE_BYTES.len());
+    for (key, want) in EXPECTED {
+        assert_eq!(&describe(key), want, "{key}");
     }
 }
 
+/// The instructions that steal a late reader's accumulator read port on silicon (CM_RM steal,
+/// probe2/probe3): the moves out of an accumulator and `vsrsm`. The `mover` predicate is
+/// derived from the tables (reads an accumulator, writes through the last port of a file); it
+/// must select exactly these and none of the non-stealing readers (`vsrs`, `vconv`, `vst*`,
+/// `vfloor`), which silicon showed to leave a late reader alone.
 #[test]
-#[ignore]
-fn dump_output_classes() {
-    let t = xdna_archspec::aie2::isa::load_from_generated();
-    for (i, c) in t
-        .itinerary_output_classes
+fn the_mover_predicate_selects_exactly_the_observed_set() {
+    let movers: Vec<&str> = EXPECTED
         .iter()
-        .filter(|(i, _)| i.starts_with("II_V"))
-        .take(400)
+        .filter(|(_, d)| d.ends_with("| true"))
+        .map(|(k, _)| *k)
+        .collect();
+    assert_eq!(
+        movers,
+        [
+            "vmov_cm",
+            "vmov_bm",
+            "vmov_x_bm",
+            "vsrsm_s16_s32",
+            "vsrsm_d16_s32",
+            "vsrsm_s32_s64",
+            "vsrsm_d32_s64",
+            "vmov_q_am",
+            "vsrsm_s16_s32_wh"
+        ]
+    );
+}
+
+/// The instructions that hold the shifter's second read unit (the wired-OR candidates of
+/// probe4/probe10/probe11): every `vsrs`, `vsrsm` and `vst.srs` shape and nothing else.
+#[test]
+fn the_secondary_read_unit_is_held_by_exactly_the_srs_family() {
+    for (key, d) in EXPECTED {
+        let has_secondary = !d.split(" | ").nth(1).unwrap().ends_with("+-") && d.contains('@');
+        let is_srs = key.starts_with("vsrs") || key.starts_with("vst_srs");
+        assert_eq!(has_secondary, is_srs, "{key}: {d}");
+    }
+}
+
+/// The write-port classification resolves the shuffle family's over-reservation (both a vector
+/// and an accumulator port are listed) by the destination register file.
+#[test]
+fn shuffle_and_broadcast_writes_use_the_port_of_their_destination_file() {
+    let get = |k: &str| {
+        EXPECTED
+            .iter()
+            .find(|(key, _)| *key == k)
+            .unwrap()
+            .1
+            .split(" | ")
+            .next()
+            .unwrap()
+    };
+    for k in ["vshuffle_x", "vbcstshfl_x", "vbcstshfl8_x", "vbcstshfl16_x"] {
+        assert_eq!(get(k), "W_WM_PORT", "{k}");
+    }
+    for k in
+        ["vshuffle_bm", "vshuffle_bmh", "vbcstshfl_bm", "vbcstshfl_bmh", "vbcstshfl8_bm", "vbcstshfl16_bm"]
     {
-        let members = t.register_model.classes.get(c).map(|k| k.members.first().cloned());
-        println!("{i} -> {c} {:?}", members);
+        assert_eq!(get(k), "CM_WM_PORT", "{k}");
     }
 }
 
+/// The write ports derived for each register file, in unit-index order (priority order).
 #[test]
-#[ignore]
-fn dump_write_ports() {
+fn derived_write_ports_per_register_file() {
     let t = xdna_archspec::aie2::isa::load_from_generated();
-    let m = super::ports::PortModel::derive(&t);
-    let (v, a) = m.write_ports();
+    let (vector, accum) = super::ports::PortModel::derive(&t).write_ports();
     let names = |l: Vec<u16>| l.iter().map(|u| t.functional_units[*u as usize].clone()).collect::<Vec<_>>();
-    println!("WP vector {:?} accum {:?}", names(v), names(a));
-}
-
-#[test]
-#[ignore]
-fn dump_rs_users() {
-    let t = xdna_archspec::aie2::isa::load_from_generated();
-    for (class, rc) in &t.itinerary_output_classes {
-        let Some(itin) = t.itineraries.get(class) else {
-            continue;
-        };
-        let Some(&def) = itin.operand_cycles.first() else {
-            continue;
-        };
-        let at: Vec<_> = xdna_archspec::aie2::isa::reservation::reservations(itin)
-            .into_iter()
-            .filter(|r| r.offset + 1 == def as u32)
-            .map(|r| r.unit)
-            .collect();
-        if at.iter().any(|u| u == "W_RS_PORT") {
-            println!("RS {class} {rc} def={def} at={at:?} {:?}", itin.stages);
-        }
-    }
+    assert_eq!(names(vector), ["W_RS_PORT", "W_WA_PORT", "W_WM_PORT"]);
+    assert_eq!(names(accum), ["CM_WA_PORT", "CM_WM_PORT"]);
 }

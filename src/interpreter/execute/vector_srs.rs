@@ -144,8 +144,8 @@ impl VectorAlu {
                 let (pu, pb) = p.acc_source_timing(0);
                 let v_src = ctx.accumulator.read_with(rv, vu, vb);
                 let p_high = ctx.accumulator.read_with(high, pu, pb);
-                ctx.accumulator.arm_wired_or(rv, p_high);
-                ctx.accumulator.arm_wired_or(high, v_src);
+                ctx.accumulator.arm_wired_or(v.slot as u8, rv, p_high);
+                ctx.accumulator.arm_wired_or(p.slot as u8, high, v_src);
                 if p.element_type == Some(ElementType::Int8) {
                     let bus: [u64; 8] = std::array::from_fn(|i| v_src[i] | p_high[i]);
                     let shift = Self::get_shift_amount(v, ctx);

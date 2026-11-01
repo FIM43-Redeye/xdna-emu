@@ -859,6 +859,7 @@ impl CycleAccurateExecutor {
                 ctx.result_bypass = op.result_bypass;
                 ctx.begin_slot_writes(op.ports.write_port);
                 ctx.set_slot_acc_read(op.ports.acc_read);
+                ctx.accumulator.set_reader_slot(Some(op.slot as u8));
                 ctx.record_read_claim(op);
 
                 // Reborrow neighbors for each slot operation
@@ -917,6 +918,7 @@ impl CycleAccurateExecutor {
         ctx.set_write_tag(None);
         ctx.set_slot_acc_read(None);
         ctx.set_srs_partner_units(None);
+        ctx.accumulator.set_reader_slot(None);
 
         ctx.end_bundle();
 
