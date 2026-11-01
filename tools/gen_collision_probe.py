@@ -117,6 +117,9 @@ def build_table():
     items.append(("ZERO", bytes(64)))
     for k in range(NUM_PAT):
         items.append((f"PAT_f{k}", _pat_f(k)))
+    # 64-bit accumulator lanes pair two 32-bit words: A = 0x00000000_FFFFFFFF, B = 1
+    items.append(("CARRY_A", base._u16s([0xFFFF if k % 2 == 0 else 0 for k in range(32)])))
+    items.append(("CARRY_B", base._u16s([1 if k % 2 == 0 else 0 for k in range(32)])))
     items.append(("WINIT", base._u16s([0x7000 + k for k in range(32)])))
     items.append(("WOLD", base._u16s([0x1111 + k for k in range(16)]) * 2))
     items.append(("WNEW", base._u16s([0x2222 + k for k in range(16)]) * 2))
@@ -153,9 +156,9 @@ def load_vec(reg, name, half=0):
     return [f"  vlda {reg}, [{ptr}, #{off}]"]
 
 
-def load_acc(k, dom):
+def load_acc(k, dom, name=None):
     """cm<k> := its pattern (zeros for the zero register), via vups through wl11/wh11."""
-    name = "ZERO" if k == ZERO_REG else f"PAT_{dom}{k}"
+    name = name or ("ZERO" if k == ZERO_REG else f"PAT_{dom}{k}")
     lines = load_vec("wl11", name, 0) + load_vec("wh11", name, 1) + nops(LOAD_NOPS)
     lines += [f"  vups.s32.s16 bml{k}, wl11, s3", f"  vups.s32.s16 bmh{k}, wh11, s3"]
     return lines + nops(4)
@@ -619,12 +622,68 @@ def generate_calibration(out_dir: str) -> dict:
     return manifest
 
 
+ADDSUB_OPS = [("vneg", "vneg cm5, cm3, {c}"), ("vadd", "vadd cm5, cm3, cm4, {c}"),
+              ("vsub", "vsub cm5, cm3, cm4, {c}"), ("vnegadd", "vnegadd cm5, cm3, cm4, {c}"),
+              ("vnegsub", "vnegsub cm5, cm3, cm4, {c}")]
+MAC_OPS = [("vnegmul", "vnegmul cm5, x0, x1, {c}"), ("vnegmac", "vnegmac cm5, cm3, x0, x1, {c}"),
+           ("vnegmsc", "vnegmsc cm5, cm3, x0, x1, {c}"), ("vmul", "vmul cm5, x0, x1, {c}"),
+           ("vmac", "vmac cm5, cm3, x0, x1, {c}"), ("vmsc", "vmsc cm5, cm3, x0, x1, {c}")]
+
+
+def generate_negate_probe(out_dir: str) -> dict:
+    """Integer accumulator negate/add/MAC family, one instruction alone per point (cm3, cm4
+    sources, cm5 destination). Add/sub/neg run under an acc64 config (r1) and an acc32-style one
+    (r3), on ordinary patterns and on carry operands, with and without the shift16 bit (a
+    per-point config word in r5). MACs run under the dense integer config r1."""
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "input.bin"), "wb") as f:
+        f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
+    kernels = []
+    specs = []
+    for name, tmpl in ADDSUB_OPS:
+        specs.append((name, [(tmpl, cfg, data, sh) for cfg in ("r1", "r3") for data in ("pat", "carry")
+                             for sh in (0, 1)]))
+    for name, tmpl in MAC_OPS:
+        specs.append((name, [(tmpl, "r1", "pat", 0)]))
+    for ki, (name, cases) in enumerate(specs):       # one kernel per op: an unsupported one fails alone
+        chunks = ["\n".join(prologue("i"))]
+        pts = []
+        for tmpl, cfg, data, sh in cases:
+            reg = cfg
+            lines = []
+            if sh:
+                word = base.config_word(cfg) | (1 << 10)
+                lines += [f"  movxm r5, #{word}"] + nops(2)
+                reg = "r5"
+            asm = tmpl.format(c=reg)
+            lines += [f"  // ---- point {len(pts)}: {asm} cfg={cfg} data={data} shift16={sh} ----"]
+            n3, n4 = ("CARRY_A", "CARRY_B") if data == "carry" else (None, None)
+            lines += load_acc(3, "i", n3) + load_acc(4, "i", n4) + load_acc(5, "i") + nops(SETTLE_BEFORE)
+            lines += [f"  {asm}"] + nops(SETTLE_AFTER)
+            lines += observe_lines(BY_KEY["vmov_cm"], Regs(s=(0,), d=5, role="A"), A_OFF)
+            lines += nops(4) + [f"  padda [p1], #{RECORD_BYTES}"] + nops(4)
+            chunks.append("\n".join(lines))
+            pts.append({"kind": "neg", "id": len(pts), "op": name, "cfg": cfg, "data": data,
+                        "shift16": sh, "asm": asm})
+        stem = f"k{ki:03d}"
+        with open(os.path.join(out_dir, stem + ".s"), "w") as f:
+            f.write(isa_gen.build_mega_program(chunks, len(pts) * RECORD_BYTES))
+        kernels.append({"name": stem, "dom": "i", "points": pts, "in_size": IN_SIZE,
+                        "out_size": len(pts) * RECORD_BYTES})
+    manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": kernels}
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    return manifest
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate")
     g.add_argument("out_dir")
     g.add_argument("--limit", type=int)
+    n = sub.add_parser("negate")
+    n.add_argument("out_dir")
     c = sub.add_parser("calibrate")
     c.add_argument("out_dir")
     sub.add_parser("list")
@@ -635,6 +694,9 @@ def main(argv=None):
         print(f"{len(CATALOGUE)} instructions, {len(colls)} (A, B, g) collisions")
         for c_ in colls:
             print(c_["a"], c_["b"], c_["g"], ",".join(c_["units"]))
+        return 0
+    if args.cmd == "negate":
+        generate_negate_probe(args.out_dir)
         return 0
     if args.cmd == "calibrate":
         generate_calibration(args.out_dir)

@@ -258,6 +258,15 @@ impl VectorAlu {
         None
     }
 
+    /// Whether an integer accumulator-only op (vadd/vsub/vneg/vnegadd/vnegsub) works on 64-bit
+    /// lanes: the config word's (amode, bmode, variant) geometry is an acc64 mode. A word with no
+    /// integer geometry (the bf16 amode) keeps two independent 32-bit lanes per u64 word. Both are
+    /// silicon-observed (`build/experiments/collisions/neg`).
+    pub(super) fn int_acc_is_64(conf: u32) -> bool {
+        use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
+        MatMulConfig::from_config_word(conf, false).is_some_and(|c| c.acc_width == AccWidth::Acc64)
+    }
+
     /// Get accumulator destination register.
     pub(super) fn get_acc_dest(op: &SlotOp) -> u8 {
         match &op.dest {

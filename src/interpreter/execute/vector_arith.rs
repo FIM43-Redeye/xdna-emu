@@ -1648,6 +1648,7 @@ impl VectorAlu {
             shift16,
             is_wide,
             is_float,
+            !is_float && Self::int_acc_is_64(conf),
             false,
             [op.acc_source_timing(0), op.acc_source_timing(if acc_sources.len() >= 2 { 1 } else { 0 })],
         );
@@ -1705,14 +1706,24 @@ impl VectorAlu {
                 false,
                 is_wide,
                 true,
+                false,
                 true,
                 [timing, timing],
             );
             return;
         }
 
-        // Integer acc32 mode: independent 32-bit negation per lane half.
+        // Integer acc64 mode (silicon: the sign extends through the high word); acc32 mode:
+        // independent 32-bit negation per lane half.
+        let acc64 = Self::int_acc_is_64(conf);
         let neg_pair = |word: u64| -> u64 {
+            if acc64 {
+                return if zero_acc {
+                    0
+                } else {
+                    (word as i64).wrapping_neg() as u64
+                };
+            }
             let lo = if zero_acc { 0i32 } else { word as i32 };
             let hi = if zero_acc { 0i32 } else { (word >> 32) as i32 };
             (lo.wrapping_neg() as u32 as u64) | ((hi.wrapping_neg() as u32 as u64) << 32)
@@ -2466,5 +2477,141 @@ mod tests {
         assert_eq!(lane(1), 0, "+0 stays +0");
         assert_eq!(lane(2), 0xbf80_0000);
         assert_eq!(lane(3), 0xff80_0001, "NaN is re-encoded with its sign flipped");
+    }
+
+    /// Silicon records of the integer accumulator add/sub/neg family
+    /// (`gen_collision_probe.py negate`, NPU1, runs r1 == r2; evidence in
+    /// build/experiments/collisions/neg). Config words are the dense i16xi16 acc64 one (0x31a:
+    /// amode 1) and the bf16-geometry one (0x31c: amode 2, which has no integer geometry, so
+    /// 32-bit lanes). Operands are 16 u64 words each: `pat` acc1 = 2200 + j, acc2 = 2900 + j;
+    /// `carry` acc1 = 0xFFFF_FFFF, acc2 = 1. Expected: the first eight u32 words of the result.
+    fn run_int_acc_op(sem: SemanticOp, conf: u32, carry: bool) -> [u32; 8] {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        let word = |base: u64, j: usize| if carry { base } else { base + j as u64 };
+        let acc1: [u64; 16] = std::array::from_fn(|j| word(if carry { 0xFFFF_FFFF } else { 2200 }, j));
+        let acc2: [u64; 16] = std::array::from_fn(|j| word(if carry { 1 } else { 2900 }, j));
+        ctx.accumulator.write_wide(2, acc1);
+        ctx.accumulator.write_wide(4, acc2);
+        ctx.scalar.write(0, conf);
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, sem)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(6))
+            .with_source(Operand::AccumReg(2));
+        if sem != SemanticOp::Neg {
+            op = op.with_source(Operand::AccumReg(4));
+        }
+        op = op.with_source(Operand::ScalarReg(0));
+        op.accum_width = Some(AccumWidth::Full);
+        ctx.result_latency = 5;
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
+        ctx.process_pending_acc_adds();
+        ctx.bundle_seq += 8;
+        ctx.advance_vector_bundle();
+        let out = ctx.accumulator.read_wide(6);
+        std::array::from_fn(|i| (out[i / 2] >> (32 * (i % 2))) as u32)
+    }
+
+    fn check_int_acc_rows(rows: &[(SemanticOp, u32, bool, [u32; 8])]) {
+        let mut bad = Vec::new();
+        for (sem, conf, carry, want) in rows {
+            let got = run_int_acc_op(*sem, *conf, *carry);
+            if got != *want {
+                bad.push(format!("{sem:?} conf {conf:#x} carry {carry}: silicon {want:x?}, emu {got:x?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{} of {} rows differ:\n{}", bad.len(), rows.len(), bad.join("\n"));
+    }
+
+    #[test]
+    fn int_acc_add_sub_neg_match_silicon_lane_width() {
+        check_int_acc_rows(&[
+            (
+                SemanticOp::Neg,
+                0x31a,
+                false,
+                [
+                    0xfffff768, 0xffffffff, 0xfffff767, 0xffffffff, 0xfffff766, 0xffffffff, 0xfffff765,
+                    0xffffffff,
+                ],
+            ), // vneg r1 pat shift16=0
+            (
+                SemanticOp::Neg,
+                0x31a,
+                true,
+                [0x1, 0xffffffff, 0x1, 0xffffffff, 0x1, 0xffffffff, 0x1, 0xffffffff],
+            ), // vneg r1 carry shift16=0
+            (
+                SemanticOp::Neg,
+                0x31c,
+                false,
+                [0xfffff768, 0x0, 0xfffff767, 0x0, 0xfffff766, 0x0, 0xfffff765, 0x0],
+            ), // vneg r3 pat shift16=0
+            (SemanticOp::Neg, 0x31c, true, [0x1, 0x0, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0]), // vneg r3 carry shift16=0
+            (SemanticOp::Accumulate, 0x31a, false, [0x13ec, 0x0, 0x13ee, 0x0, 0x13f0, 0x0, 0x13f2, 0x0]), // vadd r1 pat shift16=0
+            (SemanticOp::Accumulate, 0x31a, true, [0x0, 0x1, 0x0, 0x1, 0x0, 0x1, 0x0, 0x1]), // vadd r1 carry shift16=0
+            (SemanticOp::Accumulate, 0x31c, false, [0x13ec, 0x0, 0x13ee, 0x0, 0x13f0, 0x0, 0x13f2, 0x0]), // vadd r3 pat shift16=0
+            (SemanticOp::Accumulate, 0x31c, true, [0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0]), // vadd r3 carry shift16=0
+            (
+                SemanticOp::AccumSub,
+                0x31a,
+                false,
+                [
+                    0xfffffd44, 0xffffffff, 0xfffffd44, 0xffffffff, 0xfffffd44, 0xffffffff, 0xfffffd44,
+                    0xffffffff,
+                ],
+            ), // vsub r1 pat shift16=0
+            (
+                SemanticOp::AccumSub,
+                0x31a,
+                true,
+                [0xfffffffe, 0x0, 0xfffffffe, 0x0, 0xfffffffe, 0x0, 0xfffffffe, 0x0],
+            ), // vsub r1 carry shift16=0
+            (
+                SemanticOp::AccumSub,
+                0x31c,
+                false,
+                [0xfffffd44, 0x0, 0xfffffd44, 0x0, 0xfffffd44, 0x0, 0xfffffd44, 0x0],
+            ), // vsub r3 pat shift16=0
+            (
+                SemanticOp::AccumSub,
+                0x31c,
+                true,
+                [0xfffffffe, 0x0, 0xfffffffe, 0x0, 0xfffffffe, 0x0, 0xfffffffe, 0x0],
+            ), // vsub r3 carry shift16=0
+            (
+                SemanticOp::AccumNegAdd,
+                0x31a,
+                false,
+                [
+                    0xffffec14, 0xffffffff, 0xffffec12, 0xffffffff, 0xffffec10, 0xffffffff, 0xffffec0e,
+                    0xffffffff,
+                ],
+            ), // vnegadd r1 pat shift16=0
+            (
+                SemanticOp::AccumNegAdd,
+                0x31a,
+                true,
+                [0x0, 0xffffffff, 0x0, 0xffffffff, 0x0, 0xffffffff, 0x0, 0xffffffff],
+            ), // vnegadd r1 carry shift16=0
+            (
+                SemanticOp::AccumNegAdd,
+                0x31c,
+                false,
+                [0xffffec14, 0x0, 0xffffec12, 0x0, 0xffffec10, 0x0, 0xffffec0e, 0x0],
+            ), // vnegadd r3 pat shift16=0
+            (SemanticOp::AccumNegAdd, 0x31c, true, [0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0]), // vnegadd r3 carry shift16=0
+            (SemanticOp::AccumNegSub, 0x31a, false, [0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0]), // vnegsub r1 pat shift16=0
+            (
+                SemanticOp::AccumNegSub,
+                0x31a,
+                true,
+                [0x2, 0xffffffff, 0x2, 0xffffffff, 0x2, 0xffffffff, 0x2, 0xffffffff],
+            ), // vnegsub r1 carry shift16=0
+            (SemanticOp::AccumNegSub, 0x31c, false, [0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0]), // vnegsub r3 pat shift16=0
+            (SemanticOp::AccumNegSub, 0x31c, true, [0x2, 0x0, 0x2, 0x0, 0x2, 0x0, 0x2, 0x0]), // vnegsub r3 carry shift16=0
+        ]);
     }
 }

@@ -175,6 +175,9 @@ pub struct PendingAccAdd {
     pub is_wide: bool,
     /// fp32 (`vadd.f` family): each u64 word holds two fp32 lanes.
     pub is_float: bool,
+    /// Integer forms only: the accumulator lanes are 64 bits wide (the config word's geometry is
+    /// an acc64 mode), so negation and the add carry across the two 32-bit halves of a u64 word.
+    pub acc64: bool,
     /// One-operand form (`vneg.f`): acc2 does not take part.
     pub unary: bool,
     /// Bundle the instruction issued in, its result operand cycle and its result bypass class
@@ -1265,6 +1268,7 @@ impl ExecutionContext {
         shift16: bool,
         is_wide: bool,
         is_float: bool,
+        acc64: bool,
         unary: bool,
         acc_use: [(u8, Bypass); 2],
     ) {
@@ -1279,6 +1283,7 @@ impl ExecutionContext {
             shift16,
             is_wide,
             is_float,
+            acc64,
             unary,
             issue_bundle: self.bundle_seq,
             l_def: self.result_latency,
@@ -1448,6 +1453,18 @@ impl ExecutionContext {
             };
             return lane(a1 as u32, a2 as u32) as u64
                 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32);
+        }
+        if pa.acc64 {
+            // Acc64 mode: one 64-bit lane per word, so the sign extends and the add carries.
+            let v1 = if pa.zero_acc1 { 0i64 } else { a1 as i64 };
+            let v1 = if pa.negate_acc1 { v1.wrapping_neg() } else { v1 };
+            let v2 = if pa.negate_acc2 {
+                (a2 as i64).wrapping_neg()
+            } else {
+                a2 as i64
+            };
+            let r = v1.wrapping_add(v2);
+            return if pa.shift16 { r >> 16 } else { r } as u64;
         }
         // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
         let v1_lo = if pa.zero_acc1 { 0i32 } else { a1 as i32 };
