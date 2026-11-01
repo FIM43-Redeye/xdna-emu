@@ -57,6 +57,34 @@ pub struct RawDecodeResult {
     pub res_num_operand_cycles: u8,
     pub res_operand_cycle: [i16; AIE2_MAX_OPERANDS],
     pub res_operand_bypass: [u16; AIE2_MAX_OPERANDS],
+    pub res_num_stages: u8,
+    pub res_stages: [RawStage; AIE2_MAX_STAGES],
+}
+
+/// Longest resolved itinerary the C side reports (`AIE2_MAX_STAGES`).
+pub const AIE2_MAX_STAGES: usize = 16;
+
+/// Mirrors `struct Aie2Stage` in the C header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RawStage {
+    pub unit: u64,
+    pub cycles: u8,
+    pub next_cycles: u8,
+    pub reserved: u8,
+}
+
+/// One pipeline stage of a register-aware resolved itinerary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedStage {
+    /// Index of the functional unit in the processor itinerary list
+    /// (`TblgenOutput::functional_units`). The AIE target defines `FUNCUNIT_REPRESENTATION(x)`
+    /// as `(x)`, so this is an index, not a one-hot mask.
+    pub unit: u64,
+    pub cycles: u8,
+    /// Cycles from the start of this stage to the start of the next.
+    pub next_cycles: u8,
+    pub reserved: bool,
 }
 
 /// Slot identifiers (mirrors Aie2Slot in C header).
@@ -144,6 +172,8 @@ pub struct DecodeResult {
     /// Resolved per-operand forwarding ids (MI operand order). 0 = NoBypass.
     /// Valid only for indices `i < res_num_operand_cycles`.
     pub res_operand_bypass: [u16; AIE2_MAX_OPERANDS],
+    /// Pipeline stages of the resolved class (the instruction's resource reservations).
+    pub res_stages: Vec<ResolvedStage>,
 }
 
 impl DecodeResult {
@@ -263,6 +293,15 @@ pub fn decode_slot(slot: Slot, insn_bits: u64) -> Option<DecodeResult> {
         res_num_operand_cycles: raw.res_num_operand_cycles,
         res_operand_cycle: raw.res_operand_cycle,
         res_operand_bypass: raw.res_operand_bypass,
+        res_stages: raw.res_stages[..raw.res_num_stages as usize]
+            .iter()
+            .map(|s| ResolvedStage {
+                unit: s.unit,
+                cycles: s.cycles,
+                next_cycles: s.next_cycles,
+                reserved: s.reserved != 0,
+            })
+            .collect(),
     })
 }
 

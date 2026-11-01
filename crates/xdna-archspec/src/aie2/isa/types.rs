@@ -824,6 +824,9 @@ pub struct TblgenOutput {
     pub processor_model: Option<ProcessorModel>,
     /// Per-itinerary-class scheduling info, keyed by class name (e.g., "II_ADD").
     pub itineraries: HashMap<String, ItineraryInfo>,
+    /// Functional units in processor-itinerary order; the decoder's resolved stages name their
+    /// unit by index into this list.
+    pub functional_units: Vec<String>,
     /// Register definitions and classes.
     pub register_model: RegisterModel,
     /// Composite VLIW bundle formats.

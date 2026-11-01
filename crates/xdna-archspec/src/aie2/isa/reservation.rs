@@ -16,7 +16,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::types::ItineraryInfo;
+use super::decoder_ffi::ResolvedStage;
+use super::types::{ItineraryInfo, PipelineStage};
 
 /// One unit held in one cycle, relative to the issue cycle of the instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,22 +29,17 @@ pub struct Reservation {
     pub reserved: bool,
 }
 
-/// The reservations of one itinerary, in stage order.
+/// The reservations of a stage list, in stage order.
 ///
 /// A stage that lists several units means "any one of them". Every stage the AIE2 model
 /// defines names exactly one unit (asserted by `no_stage_offers_a_choice_of_units`), so a
 /// stage with a choice is rejected rather than approximated.
-pub fn reservations(itin: &ItineraryInfo) -> Vec<Reservation> {
+pub fn reservations_of(stages: &[PipelineStage]) -> Vec<Reservation> {
     let mut out = Vec::new();
     let mut start: i32 = 0;
-    for stage in &itin.stages {
+    for stage in stages {
         if stage.cycles > 0 {
-            assert!(
-                stage.units.len() == 1,
-                "{}: stage with a choice of units {:?} is not modelled",
-                itin.class_name,
-                stage.units
-            );
+            assert!(stage.units.len() == 1, "stage with a choice of units {:?} is not modelled", stage.units);
             for c in 0..stage.cycles as i32 {
                 out.push(Reservation {
                     unit: stage.units[0].clone(),
@@ -61,6 +57,32 @@ pub fn reservations(itin: &ItineraryInfo) -> Vec<Reservation> {
     out
 }
 
+/// The reservations of a named itinerary class (its static, register-independent form).
+pub fn reservations(itin: &ItineraryInfo) -> Vec<Reservation> {
+    reservations_of(&itin.stages)
+}
+
+/// Name the units of the decoder's register-aware resolved stages. `units` is
+/// `TblgenOutput::functional_units`; a resolved stage's `unit` indexes it.
+pub fn stages_from_resolved(units: &[String], resolved: &[ResolvedStage]) -> Vec<PipelineStage> {
+    resolved
+        .iter()
+        .map(|r| PipelineStage {
+            cycles: r.cycles,
+            units: vec![units[r.unit as usize].clone()],
+            time_inc: r.next_cycles as i8,
+            reserved: r.reserved,
+        })
+        .collect()
+}
+
+/// One instruction of the checked sequence: a label for reports and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issued {
+    pub label: String,
+    pub reservations: Vec<Reservation>,
+}
+
 /// Where an instruction sits in the checked sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpRef {
@@ -68,7 +90,7 @@ pub struct OpRef {
     pub bundle: usize,
     /// Position inside the bundle.
     pub op: usize,
-    pub class: String,
+    pub label: String,
     /// Cycles after this instruction's issue at which it holds the unit.
     pub offset: u32,
 }
@@ -84,34 +106,23 @@ pub struct Collision {
     pub second: OpRef,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct CheckReport {
-    pub collisions: Vec<Collision>,
-    /// Instructions whose itinerary class has no record, so they reserve nothing.
-    pub unmodelled: Vec<(usize, usize, String)>,
-}
-
-/// Report every cycle in which two instructions of `bundles` (itinerary class names, one list
-/// per bundle) hold the same unit. Two `Reserved` stages never collide with each other.
-pub fn find_collisions(itineraries: &HashMap<String, ItineraryInfo>, bundles: &[Vec<String>]) -> CheckReport {
-    let mut report = CheckReport::default();
-    let mut cache: HashMap<&str, Vec<Reservation>> = HashMap::new();
+/// Report every cycle in which two instructions of `bundles` hold the same unit. Two
+/// `Reserved` stages never collide with each other.
+pub fn find_collisions(bundles: &[Vec<Issued>]) -> Vec<Collision> {
     // (unit, absolute cycle) -> holders in issue order, with their stage kind.
-    let mut holders: BTreeMap<(String, u32), Vec<(OpRef, bool)>> = BTreeMap::new();
+    let mut holders: BTreeMap<(&str, u32), Vec<(OpRef, bool)>> = BTreeMap::new();
     for (b, bundle) in bundles.iter().enumerate() {
-        for (o, class) in bundle.iter().enumerate() {
-            let Some(itin) = itineraries.get(class) else {
-                report.unmodelled.push((b, o, class.clone()));
-                continue;
-            };
-            let res = cache.entry(class.as_str()).or_insert_with(|| reservations(itin));
-            for r in res.iter() {
-                let cycle = b as u32 + r.offset;
-                let who = OpRef { bundle: b, op: o, class: class.clone(), offset: r.offset };
-                holders.entry((r.unit.clone(), cycle)).or_default().push((who, r.reserved));
+        for (o, op) in bundle.iter().enumerate() {
+            for r in &op.reservations {
+                let who = OpRef { bundle: b, op: o, label: op.label.clone(), offset: r.offset };
+                holders
+                    .entry((r.unit.as_str(), b as u32 + r.offset))
+                    .or_default()
+                    .push((who, r.reserved));
             }
         }
     }
+    let mut out = Vec::new();
     for ((unit, cycle), hs) in holders {
         for (i, (a, a_res)) in hs.iter().enumerate() {
             for (b, b_res) in &hs[i + 1..] {
@@ -119,16 +130,11 @@ pub fn find_collisions(itineraries: &HashMap<String, ItineraryInfo>, bundles: &[
                 if same_op || (*a_res && *b_res) {
                     continue;
                 }
-                report.collisions.push(Collision {
-                    unit: unit.clone(),
-                    cycle,
-                    first: a.clone(),
-                    second: b.clone(),
-                });
+                out.push(Collision { unit: unit.to_string(), cycle, first: a.clone(), second: b.clone() });
             }
         }
     }
-    report.collisions.sort_by(|x, y| {
+    out.sort_by(|x, y| {
         (x.cycle, &x.unit, x.first.bundle, x.second.bundle).cmp(&(
             y.cycle,
             &y.unit,
@@ -136,7 +142,7 @@ pub fn find_collisions(itineraries: &HashMap<String, ItineraryInfo>, bundles: &[
             y.second.bundle,
         ))
     });
-    report
+    out
 }
 
 /// For every unit, the classes that hold it and at which stage offsets, from the full model.
@@ -155,61 +161,67 @@ pub fn unit_users(
 #[cfg(test)]
 mod tests {
     use super::super::load_from_generated;
-    use super::super::types::PipelineStage;
     use super::*;
 
     fn stage(cycles: u8, unit: &str, time_inc: i8) -> PipelineStage {
         PipelineStage { cycles, units: vec![unit.to_string()], time_inc, reserved: false }
     }
 
-    fn itin(class: &str, stages: Vec<PipelineStage>) -> ItineraryInfo {
-        ItineraryInfo {
-            class_name: class.to_string(),
-            total_latency: 0,
-            operand_cycles: vec![],
-            stages,
-            bypasses: vec![],
-        }
-    }
-
-    fn offsets(i: &ItineraryInfo) -> Vec<(String, u32)> {
-        reservations(i).into_iter().map(|r| (r.unit, r.offset)).collect()
+    fn offsets(stages: &[PipelineStage]) -> Vec<(String, u32)> {
+        reservations_of(stages).into_iter().map(|r| (r.unit, r.offset)).collect()
     }
 
     #[test]
     fn stage_arithmetic_follows_llvm_instr_stage() {
         // SimpleCycle advances by cycles, EmptyCycles<n> is 0 cycles advancing n,
         // PrefixCycle advances 0 (the next stage shares its cycle).
-        let i = itin(
-            "T",
-            vec![
-                stage(1, "A", -1),
-                stage(0, "EMPTY_FU", 2),
-                stage(2, "B", -1),
-                stage(1, "C", 0),
-                stage(1, "D", -1),
-            ],
-        );
+        let stages = vec![
+            stage(1, "A", -1),
+            stage(0, "EMPTY_FU", 2),
+            stage(2, "B", -1),
+            stage(1, "C", 0),
+            stage(1, "D", -1),
+        ];
         assert_eq!(
-            offsets(&i),
+            offsets(&stages),
             vec![("A".into(), 0), ("B".into(), 3), ("B".into(), 4), ("C".into(), 5), ("D".into(), 5)]
         );
     }
 
-    fn two(model: &HashMap<String, ItineraryInfo>, a: &str, b: &str, gap: usize) -> CheckReport {
-        let mut bundles = vec![vec![]; gap + 1];
-        bundles[0].push(a.to_string());
-        bundles[gap].push(b.to_string());
-        find_collisions(model, &bundles)
+    #[test]
+    fn multi_cycle_stage_holds_every_cycle() {
+        assert_eq!(offsets(&[stage(3, "S", -1)]), vec![("S".into(), 0), ("S".into(), 1), ("S".into(), 2)]);
+    }
+
+    #[test]
+    fn resolved_unit_indices_are_named_by_list_position() {
+        let units: Vec<String> = ["EMPTY_FU", "P", "Q"].iter().map(|s| s.to_string()).collect();
+        let resolved = [
+            ResolvedStage { unit: 1, cycles: 1, next_cycles: 1, reserved: false },
+            ResolvedStage { unit: 0, cycles: 0, next_cycles: 3, reserved: false },
+            ResolvedStage { unit: 2, cycles: 1, next_cycles: 1, reserved: true },
+        ];
+        let stages = stages_from_resolved(&units, &resolved);
+        assert_eq!(offsets(&stages), vec![("P".into(), 0), ("Q".into(), 4)]);
+        assert!(reservations_of(&stages)[1].reserved);
     }
 
     fn model() -> HashMap<String, ItineraryInfo> {
         load_from_generated().itineraries
     }
 
-    fn only(r: &CheckReport) -> &Collision {
-        assert_eq!(r.collisions.len(), 1, "{:?}", r.collisions);
-        &r.collisions[0]
+    /// Two classes of the real model, `gap` bundles apart.
+    fn two(model: &HashMap<String, ItineraryInfo>, a: &str, b: &str, gap: usize) -> Vec<Collision> {
+        let issue = |c: &str| Issued { label: c.into(), reservations: reservations(&model[c]) };
+        let mut bundles = vec![vec![]; gap + 1];
+        bundles[0].push(issue(a));
+        bundles[gap].push(issue(b));
+        find_collisions(&bundles)
+    }
+
+    fn only(r: &[Collision]) -> &Collision {
+        assert_eq!(r.len(), 1, "{r:?}");
+        &r[0]
     }
 
     #[test]
@@ -220,11 +232,11 @@ mod tests {
         let r = two(&m, "II_VACC", "II_VMOV_CM", 2);
         let c = only(&r);
         assert_eq!((c.unit.as_str(), c.cycle), ("CM_RM_PORT", 2));
-        assert_eq!((c.first.class.as_str(), c.first.offset), ("II_VACC", 2));
-        assert_eq!((c.second.class.as_str(), c.second.offset), ("II_VMOV_CM", 0));
+        assert_eq!((c.first.label.as_str(), c.first.offset), ("II_VACC", 2));
+        assert_eq!((c.second.label.as_str(), c.second.offset), ("II_VMOV_CM", 0));
         // One cycle either side is clean.
-        assert!(two(&m, "II_VACC", "II_VMOV_CM", 1).collisions.is_empty());
-        assert!(two(&m, "II_VACC", "II_VMOV_CM", 3).collisions.is_empty());
+        assert!(two(&m, "II_VACC", "II_VMOV_CM", 1).is_empty());
+        assert!(two(&m, "II_VACC", "II_VMOV_CM", 3).is_empty());
     }
 
     #[test]
@@ -234,8 +246,8 @@ mod tests {
         let r = two(&m, "II_VADDMACf", "II_VCLR", 1);
         let c = only(&r);
         assert_eq!((c.unit.as_str(), c.cycle), ("CM_WA_PORT", 5));
-        assert!(two(&m, "II_VADDMACf", "II_VCLR", 0).collisions.is_empty());
-        assert!(two(&m, "II_VADDMACf", "II_VCLR", 2).collisions.is_empty());
+        assert!(two(&m, "II_VADDMACf", "II_VCLR", 0).is_empty());
+        assert!(two(&m, "II_VADDMACf", "II_VCLR", 2).is_empty());
     }
 
     #[test]
@@ -243,27 +255,30 @@ mod tests {
         // vlda.ups (def 9) and vaddmac.f (def 6) land on one register in the same cycle when
         // the load is issued three bundles before the MAC, but they write through different
         // ports (CM_WM_PORT vs CM_WA_PORT): the reservation tables do not see this.
-        let m = model();
-        assert!(two(&m, "II_VLDA_UPS", "II_VADDMACf", 3).collisions.is_empty());
+        assert!(two(&model(), "II_VLDA_UPS", "II_VADDMACf", 3).is_empty());
     }
 
     #[test]
     fn reserved_stages_do_not_collide_with_each_other() {
-        let mut m = HashMap::new();
-        let mut s = stage(1, "U", -1);
-        s.reserved = true;
-        m.insert("R".to_string(), itin("R", vec![s]));
-        m.insert("Q".to_string(), itin("Q", vec![stage(1, "U", -1)]));
-        let rr = find_collisions(&m, &[vec!["R".into(), "R".into()]]);
-        assert!(rr.collisions.is_empty());
-        let rq = find_collisions(&m, &[vec!["R".into(), "Q".into()]]);
-        assert_eq!(rq.collisions.len(), 1);
+        let res = |reserved| Issued {
+            label: "x".into(),
+            reservations: vec![Reservation { unit: "U".into(), offset: 0, reserved }],
+        };
+        assert!(find_collisions(&[vec![res(true), res(true)]]).is_empty());
+        assert_eq!(find_collisions(&[vec![res(true), res(false)]]).len(), 1);
+        assert_eq!(find_collisions(&[vec![res(false), res(false)]]).len(), 1);
     }
 
     #[test]
-    fn unknown_class_is_reported_not_ignored() {
-        let r = find_collisions(&model(), &[vec!["II_NOT_A_CLASS".into()]]);
-        assert_eq!(r.unmodelled, vec![(0, 0, "II_NOT_A_CLASS".to_string())]);
+    fn an_instruction_never_collides_with_itself() {
+        let two_cycles = Issued {
+            label: "x".into(),
+            reservations: vec![
+                Reservation { unit: "U".into(), offset: 0, reserved: false },
+                Reservation { unit: "U".into(), offset: 0, reserved: false },
+            ],
+        };
+        assert!(find_collisions(&[vec![two_cycles]]).is_empty());
     }
 
     #[test]
@@ -276,8 +291,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_cycle_stage_holds_every_cycle() {
-        let i = itin("M", vec![stage(3, "S", -1)]);
-        assert_eq!(offsets(&i), vec![("S".into(), 0), ("S".into(), 1), ("S".into(), 2)]);
+    fn functional_unit_list_names_every_unit_the_itineraries_use() {
+        let out = load_from_generated();
+        for (class, i) in &out.itineraries {
+            for s in &i.stages {
+                for u in &s.units {
+                    assert!(out.functional_units.contains(u), "{class}: {u}");
+                }
+            }
+        }
     }
 }

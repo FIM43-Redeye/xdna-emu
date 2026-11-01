@@ -103,3 +103,7 @@ path = "src/bin/extract_perf_ctrl.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 8
+
+[[bin]]
+name = "collision-check"
+path = "src/bin/collision_check.rs"

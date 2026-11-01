@@ -187,6 +187,19 @@ static void fill_resolved_itinerary(const MCInst &mi, Aie2DecodeResult &result) 
     const InstrItinerary &itin = g_iid.Itineraries[resolved_class];
     result.res_num_operand_cycles =
         fill_operand_arrays(itin, result.res_operand_cycle, result.res_operand_bypass);
+
+    // Pipeline stages of the resolved class: the resource reservations.
+    unsigned n = 0;
+    for (const InstrStage *s = g_iid.beginStage(resolved_class),
+                          *e = g_iid.endStage(resolved_class);
+         s != e && n < AIE2_MAX_STAGES; ++s, ++n) {
+        result.res_stages[n].unit = (uint64_t)s->getUnits();
+        result.res_stages[n].cycles = (uint8_t)s->getCycles();
+        result.res_stages[n].next_cycles = (uint8_t)s->getNextCycles();
+        result.res_stages[n].reserved =
+            s->getReservationKind() == InstrStage::Reserved ? 1 : 0;
+    }
+    result.res_num_stages = (uint8_t)n;
 }
 
 // Extract the slot-level MCInst from a bundle-level decode result.

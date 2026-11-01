@@ -29,6 +29,20 @@ struct Aie2Operand {
     const char *reg_name;    // For REG: e.g. "r0", "bm0", "cm0", "x4".  NULL otherwise.
 };
 
+// Maximum pipeline stages of one resolved itinerary (the longest AIE2 itinerary has 7).
+#define AIE2_MAX_STAGES 16
+
+// One InstrStage of a resolved itinerary: `cycles` cycles holding one functional unit, then the
+// next stage starts `next_cycles` cycles after this one started. The AIE target defines
+// FUNCUNIT_REPRESENTATION(x) as (x) (AIEMCTargetDesc.cpp), so `unit` is the unit's INDEX in the
+// processor itinerary's FU list, not a one-hot mask; a stage cannot offer a choice of units.
+struct Aie2Stage {
+    uint64_t unit;
+    uint8_t cycles;
+    uint8_t next_cycles;
+    uint8_t reserved;        // 1 = ReservationKind::Reserved, 0 = Required
+};
+
 // Result of decoding one slot.
 struct Aie2DecodeResult {
     int success;             // 1 = decoded, 0 = failed
@@ -48,6 +62,9 @@ struct Aie2DecodeResult {
     uint8_t res_num_operand_cycles;                // valid entries below
     int16_t res_operand_cycle[AIE2_MAX_OPERANDS];  // resolved operand cycles
     uint16_t res_operand_bypass[AIE2_MAX_OPERANDS]; // resolved forwarding ids
+    // The resolved class's pipeline stages (resource reservations), valid for i < res_num_stages.
+    uint8_t res_num_stages;
+    struct Aie2Stage res_stages[AIE2_MAX_STAGES];
 };
 
 // Slot identifiers (matching our slot table order).

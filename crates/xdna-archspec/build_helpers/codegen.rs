@@ -157,6 +157,18 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
     )
     .unwrap();
 
+    writeln!(
+        code,
+        "    let functional_units: Vec<String> = vec![{}];",
+        output
+            .functional_units
+            .iter()
+            .map(|u| format!("{:?}.to_string()", u))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .unwrap();
+
     // Composite formats
     writeln!(code).unwrap();
     writeln!(code, "    let composite_formats = vec![").unwrap();
@@ -171,6 +183,7 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
     writeln!(code, "        encodings_by_slot,").unwrap();
     writeln!(code, "        processor_model,").unwrap();
     writeln!(code, "        itineraries,").unwrap();
+    writeln!(code, "        functional_units,").unwrap();
     writeln!(code, "        register_model,").unwrap();
     writeln!(code, "        composite_formats,").unwrap();
     writeln!(code, "    }}").unwrap();

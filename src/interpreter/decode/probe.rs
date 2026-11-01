@@ -100,3 +100,28 @@ impl InstructionDecoder {
         SlotOutcome::Decoded(DecodedSlot { llvm_name: result.name, regs, imms })
     }
 }
+
+/// An instruction of a bundle with the pipeline stages LLVM resolves for its actual operands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedOp {
+    /// LLVM instruction name, e.g. `VMOV_mv_cm`.
+    pub llvm_name: String,
+    pub stages: Vec<decoder_ffi::ResolvedStage>,
+}
+
+impl InstructionDecoder {
+    /// The instructions of the bundle starting at `bytes`, each with its register-aware resolved
+    /// pipeline stages (its resource reservations). NOP-marker slots and slots the LLVM
+    /// disassembler rejects are omitted.
+    pub fn resolved_ops(&self, bytes: &[u8]) -> Vec<ResolvedOp> {
+        self.extract_bundle_slots(bytes)
+            .slots
+            .iter()
+            .filter_map(|s| {
+                let slot = Self::slot_type_to_ffi(s.slot_type)?;
+                let r = decoder_ffi::decode_slot(slot, s.bits)?;
+                Some(ResolvedOp { llvm_name: r.name, stages: r.res_stages })
+            })
+            .collect()
+    }
+}

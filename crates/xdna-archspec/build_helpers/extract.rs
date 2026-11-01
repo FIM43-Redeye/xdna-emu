@@ -97,6 +97,8 @@ pub struct BuildTblgenOutput {
     pub encodings_by_slot: HashMap<String, Vec<BuildInstrEncoding>>,
     pub processor_model: Option<BuildProcessorModel>,
     pub itineraries: HashMap<String, BuildItineraryInfo>,
+    /// Functional units in processor-itinerary order; the decoder reports a stage's unit by index.
+    pub functional_units: Vec<String>,
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
     pub unpack_forms: Vec<BuildUnpackForm>,
@@ -924,6 +926,29 @@ fn load_itinerary_data(
     Ok(result)
 }
 
+/// The functional units of the processor model's `ProcessorItineraries` record, in list order. LLVM
+/// numbers them by position: unit `i` is bit `i` of every `InstrStage` unit mask.
+fn load_functional_units(
+    td_file: &Path,
+    include_paths: &[&Path],
+    itinerary_name: &str,
+) -> Result<Vec<String>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let record = keeper
+        .all_derived_definitions("ProcessorItineraries")
+        .find(|r| r.name().map(|n| n == itinerary_name).unwrap_or(false))
+        .ok_or_else(|| format!("no ProcessorItineraries record {itinerary_name}"))?;
+    let list = record.value("FU").map_err(|e| format!("FU: {e:?}"))?;
+    let list = list.init.as_list().map_err(|e| format!("FU list: {e:?}"))?;
+    let mut units = Vec::new();
+    for item in list.iter() {
+        let def = item.as_def().map_err(|e| format!("FU item: {e:?}"))?;
+        let rec: tblgen::Record = def.into();
+        units.push(rec.name().map_err(|e| format!("FU name: {e:?}"))?.to_string());
+    }
+    Ok(units)
+}
+
 // ============================================================================
 // Register model
 // ============================================================================
@@ -1314,6 +1339,11 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     // Extended data
     let processor_model = load_processor_model(&td_file, &inc_refs).unwrap_or(None);
     let itineraries = load_itinerary_data(&td_file, &inc_refs).unwrap_or_default();
+    let itinerary_name = processor_model
+        .as_ref()
+        .map(|m| m.itinerary_name.clone())
+        .ok_or("no processor model, so no itinerary record to take the functional units from")?;
+    let functional_units = load_functional_units(&td_file, &inc_refs, &itinerary_name)?;
     let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
     let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
@@ -1325,6 +1355,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         encodings_by_slot: by_slot,
         processor_model,
         itineraries,
+        functional_units,
         register_model,
         composite_formats,
         unpack_forms,
