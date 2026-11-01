@@ -5,6 +5,7 @@
                                    points must collide on exactly the designed units at the
                                    designed cycle, controls must not, and no collision may touch
                                    a setup, witness or observation instruction.
+  summary <dir> <hw-tag>           per resource group counts from report_<hw-tag>.tsv
   report  <dir> <hw-tag> [<emu-tag>]   classify every point's observation against the reference
                                    points and write <dir>/report_<hw-tag>.tsv
 
@@ -84,7 +85,15 @@ def check(d):
                 if any(("wl5" in t or "vldb" in t) for t in texts):
                     bad.append((k["name"], p["id"], "collision involves the witness", c))
             if p["kind"] == "pair":
-                ok = set(p["units"]) <= units
+                # units named A~B (two write ports) or ending in * (a read the tables do not
+                # reserve) are collisions the tables are silent about: the checker cannot flag them.
+                table = {u for u in p["units"] if "~" not in u and "*" not in u}
+                ok = table <= units
+                stats.setdefault("pair_table_silent", [0, 0])
+                if not table:
+                    stats["pair_table_silent"][0] += 1
+                    ok = ok and not units & set(p["units"])
+                    stats["pair_table_silent"][1] += ok
                 flagged_units[(p["a"], p["b"], p["g"], p["cfg"])] = sorted(units)
             elif p["kind"] == "control":
                 ok = not (set(p["units"]) & units) or any(
@@ -101,21 +110,12 @@ def check(d):
 
 
 REC = gen.RECORD_BYTES
-W = 4
 
 
 def words(b):
     import struct
     return struct.unpack(f"<{len(b) // 4}I", b)
 
-
-def region(rec, ins, role):
-    """The bytes a point recorded for one instruction: A's half or B's half of the record."""
-    if ins.dst == "mem":
-        lo = 0 if role == "A" else 128
-    else:
-        lo = 0 if role == "A" else 128      # set by the caller via `slot`
-    return rec[lo:lo + 128]
 
 
 def used_bytes(ins):
@@ -146,11 +146,6 @@ def own_output(p, ins, r, rec, slot):
     return rec[lo:lo + used_bytes(ins)]
 
 
-def witness(rec):
-    wlo, whi = rec[256:288], rec[288:320]
-    old = bytes(x for k in range(16) for x in (0x11 + k & 0xFF, 0x11)) if False else None
-    return wlo, whi
-
 
 def classify(d, hw_tag, emu_tag=None):
     manifest, hw = load_points(d, hw_tag)
@@ -160,7 +155,6 @@ def classify(d, hw_tag, emu_tag=None):
         if p["kind"].startswith("ref"):
             ins = gen.BY_KEY[p["a"]]
             refs[ref_key(p["kind"][4:], p["a"], p["ra"], dom)] = (ins, own_output(p, ins, p["ra"], rec, "A"))
-    old_w = hw_witness_pattern(d, hw_tag)
     rows = []
     for pid in sorted(hw):
         p, rec, dom = hw[pid]
@@ -189,24 +183,44 @@ def classify(d, hw_tag, emu_tag=None):
                     ref = refs.get(ref_key("alone", ins.key, {**r, "s": sw}, dom))
                     if ref and osrc != r["s"][j]:
                         cands[f"src{j + 1}<-{other_ins.key}.s{oi + 1}"] = ref[1]
+                        if alone and len(ref[1]) == 128:       # a 1024-bit result: low half only
+                            cands[f"src{j + 1}.lo512<-{other_ins.key}.s{oi + 1}"] = (
+                                ref[1][:64] + alone[1][64:])
+            cands["zeros"] = bytes(len(out))
             oalone = refs.get(ref_key("alone", other_ins.key, other_r, dom))
-            if oalone and len(oalone[1]) == len(out):
-                cands["other_result"] = oalone[1]
+            if oalone and alone:
+                o = oalone[1]
+                for at in range(0, max(0, len(out) - len(o)) + 1, 32):
+                    for opname, fn in (("or", lambda x, y: x | y), ("and", lambda x, y: x & y)):
+                        mix = bytearray(alone[1])
+                        for i in range(min(len(o), len(mix) - at)):
+                            mix[at + i] = fn(mix[at + i], o[i])
+                        cands[f"{opname}_other@{at}"] = bytes(mix)
+            if oalone:
+                o = oalone[1]
+                if len(o) == len(out):
+                    cands["other_result"] = o
+                elif len(o) > len(out):
+                    cands["other_result_low"] = o[:len(out)]
+                else:
+                    if "init" in cands:
+                        cands["other_result_low+init"] = o + cands["init"][len(o):]
+                    if alone:
+                        cands["other_result_low+own_high"] = o + alone[1][len(o):]
+            # plain explanations first: a bitwise OR/AND only gets the label when nothing simpler fits
+            cands = dict(sorted(cands.items(), key=lambda kv: kv[0].startswith(("or_", "and_"))))
             row[name] = describe(out, cands)
             row[name + "_hex"] = out[:16].hex()
         wl, wh = rec[256:288], rec[288:320]
         row["wit"] = ("n/a" if p["c0"] is None else
-                      f"lo={wit_label(wl, old_w)} hi={wit_label(wh, old_w)}")
+                      f"lo={wit_label(wl)} hi={wit_label(wh)}")
         row["emu_equal"] = "" if emu is None else ("same" if emu[pid][1] == rec else "DIFF")
         rows.append(row)
     return rows
 
 
-def hw_witness_pattern(d, tag):
-    return None
 
-
-def wit_label(b, _):
+def wit_label(b):
     old = b"".join(bytes([0x11 + k, 0x11]) for k in range(16))
     new = b"".join(bytes([0x22 + k, 0x22]) for k in range(16))
     return "OLD" if b == old else "NEW" if b == new else "other"
@@ -230,9 +244,38 @@ def describe(out, cands):
     return "mixed(" + ",".join(f"{k}:{v}/{nw}" for k, v in sorted(tally.items())) + ")"
 
 
+def summary(d, tag):
+    import csv
+    import collections
+    rows = list(csv.DictReader(open(os.path.join(d, f"report_{tag}.tsv")), delimiter="\t"))
+    lab = lambda x: re.sub(r"\(.*", "", x)
+    out = []
+    pairs = [r for r in rows if r["kind"] == "pair"]
+    ctrl = [r for r in rows if r["kind"] == "control"]
+    out.append(f"pair points {len(pairs)}, control points {len(ctrl)}")
+    out.append(f"witness: " + ", ".join(f"{k}: {v}" for k, v in
+                                        collections.Counter(r["wit"] for r in rows).items()))
+    emu = [r for r in rows if r["emu_equal"]]
+    if emu:
+        out.append("EMU equals silicon: " + ", ".join(
+            f"{k} {kind}: {sum(1 for r in emu if r['kind'] == kind and r['emu_equal'] == k)}"
+            for kind in ("pair", "control") for k in ("same", "DIFF")))
+    grp = collections.defaultdict(collections.Counter)
+    for r in pairs:
+        eff = (lab(r["A"]), lab(r["B"])) != ("alone", "alone")
+        grp[(r["units"], r["cfg"])]["effect" if eff else "invisible"] += 1
+        if emu:
+            grp[(r["units"], r["cfg"])]["emu_diff" if r["emu_equal"] == "DIFF" else "emu_same"] += 1
+    out.append("\nunits | cfg | points | effect | invisible | EMU differs from silicon")
+    for (u, c), v in sorted(grp.items()):
+        out.append(f"{u} | {c} | {v['effect'] + v['invisible']} | {v['effect']} | {v['invisible']} | {v['emu_diff']}")
+    print("\n".join(out))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["check", "report"])
+    ap.add_argument("cmd", choices=["check", "report", "summary"])
     ap.add_argument("dir")
     ap.add_argument("hw", nargs="?")
     ap.add_argument("emu", nargs="?")
@@ -244,6 +287,8 @@ def main(argv=None):
         for b in bad:
             print("BAD", *b)
         return 1 if bad else 0
+    if args.cmd == "summary":
+        return summary(d, args.hw)
     rows = classify(d, args.hw, args.emu)
     cols = ["id", "kind", "a", "b", "g", "cfg", "delta", "units", "A", "B", "wit", "emu_equal"]
     with open(os.path.join(d, f"report_{args.hw}.tsv"), "w") as f:
