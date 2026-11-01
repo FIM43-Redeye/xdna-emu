@@ -59,6 +59,9 @@ pub struct PendingMatmul {
     config: MatMulConfig,
     /// Second accumulator merge: None, Some(false)=AddMac, Some(true)=SubMac.
     acc2_sub: Option<bool>,
+    /// Dense integer vnegmac/vnegmsc: the whole result is negated, so the accumulator input
+    /// enters negated (silicon: -(acc + A*B) and -(acc - A*B)).
+    negate_acc: bool,
     acc_src: u8,
     acc2_reg: u8,
     acc_dest: u8,
@@ -160,7 +163,18 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // so honoring only the config word would leak the destination accumulator's
     // stale/poison contents into the result. Mac/MatMulSub/NegMatMul/AddMac/
     // SubMac (the VMAC family) keep the config-driven accumulate behavior.
-    if matches!(semantic, SemanticOp::MatMul | SemanticOp::NegMul) {
+    //
+    // vnegmac and vnegmsc share the NegMul semantic but do take an accumulator: dense integer
+    // silicon gives -(acc + A*B) and -(acc - A*B) (collisions/neg), so the accumulator input is
+    // negated and only the fresh vnegmul zeroes it. The float and sparse forms keep the old rule.
+    let negate_acc = semantic == SemanticOp::NegMul
+        && qx.is_none()
+        && !config.bfloat
+        && op.encoding_name.as_deref().is_some_and(|n| {
+            let n = n.to_ascii_lowercase();
+            n.contains("negmac") || n.contains("negmsc")
+        });
+    if matches!(semantic, SemanticOp::MatMul | SemanticOp::NegMul) && !negate_acc {
         config.accumulate = false;
     }
 
@@ -302,6 +316,7 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         b_present,
         config,
         acc2_sub,
+        negate_acc,
         acc_src,
         // acc2 register only exists for AddMac/SubMac; resolving it on other
         // forms would log a spurious missing-AccumReg error (VMUL has none).
@@ -391,6 +406,15 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config, p.b_present);
         queue_result(ctx, p, acc);
         return;
+    }
+    if p.negate_acc {
+        match p.config.acc_width {
+            AccWidth::Acc32 => acc.iter_mut().for_each(|w| {
+                *w = ((*w as u32 as i32).wrapping_neg() as u32 as u64)
+                    | (((*w >> 32) as u32 as i32).wrapping_neg() as u32 as u64) << 32
+            }),
+            AccWidth::Acc64 => acc.iter_mut().for_each(|w| *w = (*w as i64).wrapping_neg() as u64),
+        }
     }
     matmul_config_driven(&mut acc, &a[..], &b[..], &p.config);
 
@@ -2066,5 +2090,72 @@ mod tests {
         assert!(!execute_matmul(&op, &mut ctx));
         ctx.force_commit_all_pending();
         assert_eq!(ctx.accumulator.read_wide(0), [0x55u64; 16]);
+    }
+
+    /// Dense integer MACs against silicon (`gen_collision_probe.py negate`, NPU1, r1 == r2):
+    /// x0 = 1 + k % 7, x1 = 2 + k % 5 (int16), acc = 2200 + j in 64-bit lanes, config 0x31a.
+    /// vnegmac is -(acc + A*B) and vnegmsc is -(acc - A*B): the whole result is negated, not
+    /// just the product.
+    #[test]
+    fn dense_int_mac_family_matches_silicon() {
+        let x0: Vec<u32> = [
+            131073, 262147, 393221, 65543, 196610, 327684, 458758, 131073, 262147, 393221, 65543, 196610,
+            327684, 458758, 131073, 262147,
+        ]
+        .to_vec();
+        let x1: Vec<u32> = [
+            196610, 327684, 131078, 262147, 393221, 196610, 327684, 131078, 262147, 393221, 196610, 327684,
+            131078, 262147, 393221, 196610,
+        ]
+        .to_vec();
+        let rows: &[(SemanticOp, &str, [u32; 8])] = &[
+            (SemanticOp::Mac, "VMAC_vmac_cm_core_dense", [0x8c5, 0x0, 0x8bc, 0x0, 0x8bd, 0x0, 0x8c8, 0x0]), // vmac
+            (
+                SemanticOp::MatMulSub,
+                "VMSC_vmac_cm_core_dense",
+                [0x86b, 0x0, 0x876, 0x0, 0x877, 0x0, 0x86e, 0x0],
+            ), // vmsc
+            (
+                SemanticOp::NegMul,
+                "VNEGMUL_vmac_cm_core_dense",
+                [
+                    0xffffffd3, 0xffffffff, 0xffffffdd, 0xffffffff, 0xffffffdd, 0xffffffff, 0xffffffd3,
+                    0xffffffff,
+                ],
+            ), // vnegmul
+            (
+                SemanticOp::NegMul,
+                "VNEGMAC_vmac_cm_core_dense",
+                [
+                    0xfffff73b, 0xffffffff, 0xfffff744, 0xffffffff, 0xfffff743, 0xffffffff, 0xfffff738,
+                    0xffffffff,
+                ],
+            ), // vnegmac
+            (
+                SemanticOp::NegMul,
+                "VNEGMSC_vmac_cm_core_dense",
+                [
+                    0xfffff795, 0xffffffff, 0xfffff78a, 0xffffffff, 0xfffff789, 0xffffffff, 0xfffff792,
+                    0xffffffff,
+                ],
+            ), // vnegmsc
+        ];
+        let mut bad = Vec::new();
+        for (sem, enc, want) in rows {
+            let mut ctx = ExecutionContext::new();
+            ctx.accumulator.write_wide(0, std::array::from_fn(|j| 2200 + j as u64));
+            ctx.vector.write_wide(0, x0.clone().try_into().unwrap());
+            ctx.vector.write_wide(2, x1.clone().try_into().unwrap());
+            ctx.scalar.write(5, 0x31a);
+            let op = make_mac_op(*sem, 0, 2, 5, 0, Some(enc));
+            assert!(execute_matmul(&op, &mut ctx), "{enc}");
+            ctx.force_commit_all_pending();
+            let acc = ctx.accumulator.read_wide(0);
+            let got: [u32; 8] = std::array::from_fn(|i| (acc[i / 2] >> (32 * (i % 2))) as u32);
+            if got != *want {
+                bad.push(format!("{enc}: silicon {want:x?}, emu {got:x?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 }
