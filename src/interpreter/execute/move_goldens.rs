@@ -150,3 +150,18 @@ fn vshuffle_into_a_bm_half_is_a_raw_512_bit_write() {
         assert_eq!(words(&got), SHUFFLE_BM, "{hex}");
     }
 }
+
+#[test]
+fn vbcstshfl_into_a_bm_half_matches_silicon() {
+    // r12 = 0x2468, r29 = 0: the broadcast copies are grouped by the implicit transpose
+    let w32: [u32; 16] = std::array::from_fn(|i| if i < 8 { 0x0068_0068 } else { 0 });
+    let w8: [u32; 16] = std::array::from_fn(|i| if i < 8 { 0x6868_6868 } else { 0 });
+    for (hex, want) in [
+        ("b9 67 46 18 37 88 03 00 00 00 00 00 00 00 00 00", w32), // vbcstshfl.32 bml0
+        ("b9 67 06 18 37 88 03 00 00 00 00 00 00 00 00 00", w8),  // vbcstshfl.8 bml0
+        ("b9 67 26 18 37 88 03 00 00 00 00 00 00 00 00 00", w8),  // vbcstshfl.16 bml0
+    ] {
+        let (_, got) = run(hex);
+        assert_eq!(words(&got), want, "{hex}");
+    }
+}

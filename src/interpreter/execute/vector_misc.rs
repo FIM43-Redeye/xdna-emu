@@ -492,7 +492,7 @@ impl VectorAlu {
                     }
                 }
 
-                Self::write_wide_vec_dest(op, ctx, result);
+                Self::write_wide_vec_or_acc_dest(op, ctx, result);
             }
         } else {
             // Narrow path
