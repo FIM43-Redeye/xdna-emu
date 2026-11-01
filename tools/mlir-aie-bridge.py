@@ -18,8 +18,8 @@ Usage:
     python3 tools/mlir-aie-bridge.py trace-events [--arch aie2]
     python3 tools/mlir-aie-bridge.py build-manifest --dir PATH [--chess]
 
-If --mlir-aie-path is not specified, tries ../mlir-aie relative to this
-script's location (matching the standard npu-work layout). Looks for the
+If --mlir-aie-path is not specified, resolves mlir-aie via toolchain_paths.py
+(MLIR_AIE_PATH, NPU_WORK_DIR, then ancestor discovery). Looks for the
 Python bindings in build/python/ and install/python/ underneath.
 """
 
@@ -41,12 +41,17 @@ def resolve_mlir_aie_python_path(mlir_aie_path=None):
     Search order:
       1. Explicit --mlir-aie-path argument (looks for build/python/ underneath)
       2. PYTHONPATH already containing aie modules (ironenv activated)
-      3. ../mlir-aie/build/python relative to the repo root
-      4. ../mlir-aie/install/python relative to the repo root
+      3. build/python under the resolved mlir-aie (MLIR_AIE_PATH, then
+         NPU_WORK_DIR, then ancestor discovery; see toolchain_paths.py)
+      4. install/python under the same
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(script_dir)
-    mlir_aie_root = os.path.join(os.path.dirname(repo_root), "mlir-aie")
+    sys.path.insert(0, script_dir)
+    import toolchain_paths
+    try:
+        mlir_aie_root = str(toolchain_paths.resolve_mlir_aie(script_dir))
+    except toolchain_paths.ToolchainPathError:
+        mlir_aie_root = None
 
     if mlir_aie_path:
         for path in (
@@ -64,6 +69,8 @@ def resolve_mlir_aie_python_path(mlir_aie_path=None):
     except ImportError:
         pass
 
+    if mlir_aie_root is None:
+        return None
     for path in (
         os.path.join(mlir_aie_root, "build", "python"),
         os.path.join(mlir_aie_root, "install", "python"),

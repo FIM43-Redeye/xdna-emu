@@ -17,13 +17,19 @@ from pathlib import Path
 from shlex import quote
 from typing import Dict, List, Optional, Tuple
 
+import toolchain_paths
+
 
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MLIR_AIE_ROOT = REPO_ROOT.parent / "mlir-aie"
+try:
+    MLIR_AIE_ROOT = toolchain_paths.resolve_mlir_aie(REPO_ROOT)
+except toolchain_paths.ToolchainPathError:
+    # Surfaces as a missing-file error where the tree is first used.
+    MLIR_AIE_ROOT = REPO_ROOT.parent / "mlir-aie"
 EVENTS_HEADER = (
     MLIR_AIE_ROOT / "build" / "include" / "xaienginecdo_static"
     / "xaiengine" / "xaie_events_aieml.h"

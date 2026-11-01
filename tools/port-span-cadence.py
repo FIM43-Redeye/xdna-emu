@@ -39,8 +39,13 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import toolchain_paths
+
 REPO = Path(__file__).resolve().parent.parent
-MLIR_AIE = REPO.parent / "mlir-aie"
+try:
+    MLIR_AIE = toolchain_paths.resolve_mlir_aie(REPO)
+except toolchain_paths.ToolchainPathError:
+    MLIR_AIE = REPO.parent / "mlir-aie"  # fails at first use, not at import
 PORT_KINDS = ("PORT_RUNNING_", "PORT_STALLED_", "PORT_IDLE_", "STREAM_STARVATION")
 
 
