@@ -3,6 +3,7 @@
 //! ```text
 //! collision-check resources                 # every unit, the classes that hold it, stage offsets
 //! collision-check elf FILE...               # decode .text linearly and report unit collisions
+//! collision-check ops FILE...               # print every decoded instruction with its reservations
 //! ```
 //! `elf` walks `.text` as straight-line code, one bundle per cycle, so a taken branch or a loop
 //! back-edge is not modelled; each hit is therefore a candidate to read, not a verdict.
@@ -56,7 +57,7 @@ fn main() {
                 }
             }
         }
-        Some("elf") if args.len() > 1 => {
+        Some(mode @ ("elf" | "ops")) if args.len() > 1 => {
             let decoder = InstructionDecoder::load_default();
             let units = load_from_generated().functional_units;
             for path in &args[1..] {
@@ -73,6 +74,22 @@ fn main() {
                     continue;
                 };
                 let (bundles, end) = decode_text(&decoder, &units, text);
+                if mode == "ops" {
+                    println!("{path}: bundles {}", bundles.len());
+                    for (b, ops) in bundles.iter().enumerate() {
+                        for op in ops {
+                            let held: Vec<String> = op
+                                .reservations
+                                .iter()
+                                .map(|r| {
+                                    format!("{}:{}{}", r.unit, r.offset, if r.reserved { "r" } else { "" })
+                                })
+                                .collect();
+                            println!("  OP {b} {} {}", op.label, held.join(","));
+                        }
+                    }
+                    continue;
+                }
                 let collisions = find_collisions(&bundles);
                 println!(
                     "{path}: bundles {} ops {} stopped_at {}/{} collisions {}",
