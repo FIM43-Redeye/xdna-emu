@@ -162,11 +162,12 @@ mod tests {
 
     #[test]
     fn same_port_a_narrow_later_writer_on_the_high_bank_takes_the_other_writers_lane() {
-        // B writes only wh (bank 1, ordinal 0); A is a 512-bit writer driving lane 1. Bank 1
-        // is B's register but carries lane 1, which only A drives.
+        // B writes only wh (bank 1, ordinal 0); A is a 512-bit writer. Bank 1 goes to B's
+        // register but carries lane 1, which only A drives; bank 0 stays A's register but
+        // carries lane 0, whose latest driver is B (ordinal 0), so A's low half gets B's data.
         let all = [chunk(1, 0, 0, 0, 8, 0xA0), chunk(1, 0, 1, 1, 9, 0xA1), chunk(2, 0, 0, 1, 5, 0xB0)];
         let r = resolve(&all);
-        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xA0), None, Some(0xA1)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), None, Some(0xA1)]);
     }
 
     #[test]

@@ -67,6 +67,12 @@ def run(cmd):
 def main():
     wanted = set(sys.argv[1:])
     survived = []
+    # the unmutated tests must pass, or every mutation would look killed
+    for flt in sorted({m[4] for m in MUTATIONS if not wanted or m[0] in wanted}):
+        base = run(["cargo", "test", "--lib", flt])
+        if base.returncode != 0:
+            print(f"baseline `{flt}` FAILS unmutated:\n{base.stdout[-2000:]}")
+            return 2
     for name, path, old, new, flt in MUTATIONS:
         if wanted and name not in wanted:
             continue
