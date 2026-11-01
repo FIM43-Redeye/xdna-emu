@@ -94,7 +94,6 @@ pub fn override_registry(arch: Architecture) -> Vec<BehavioralUnit> {
                 dma_ops_verified(),
                 vector_ops_verified(),
                 lane_goldens_verified(),
-                gated_not_modeled(),
             ]
         }
         _ => Vec::new(),
@@ -230,49 +229,25 @@ const LANE_GOLDEN_VARIANTS: &[(SemanticOp, OpVariant)] = &[
     (SemanticOp::Pack, converted(ElementType::UInt8, ElementType::UInt16)),
 ];
 
-/// Variants the emulator deliberately declines ("[NOT MODELED] ... awaiting
-/// clean-room derivation"): the implementation was removed in the re-root and
-/// the executor reports the op unhandled. The toolchain describes them and we
-/// assert no model, so they are comprehension gaps, not perishable models.
-///
-/// - Sparse MAC, every MAC-family variant in a mode whose geometry is sparse:
-///   gated on the sparse-operand source in `vector_matmul/mod.rs`.
-///
-/// Wide VSHIFT and the fp32 accumulator add/sub were gated here too until they
-/// were derived from silicon (2026-10-29, `lane_goldens_verified`).
-fn gated_not_modeled() -> BehavioralUnit {
+/// Every MAC-family variant in a sparse mode (geometry `sparse` in `CONFIG_GEOMETRY_TABLE`):
+/// the four integer modes and bf16 4x16x4. The `vec_macsparse_*` captures execute each of
+/// them (Chess and Peano disassembly recorded per golden). These were declined ("[NOT
+/// MODELED]") from the re-root until the 2026-10-31 derivation; that unit is gone, as are the
+/// wide VSHIFT and fp32 accumulator gates before it.
+fn sparse_mac_golden_variants() -> Vec<(SemanticOp, OpVariant)> {
     use crate::aie2::matmul::CONFIG_GEOMETRY_TABLE;
     use crate::coverage::all_semantic_ops;
-    use crate::coverage::verdict::Provenance;
     let arch = Architecture::Aie2;
     let sparse = |k: (u8, u8, u8)| {
         CONFIG_GEOMETRY_TABLE
             .iter()
             .any(|(a, b, v, g)| g.sparse && (*a as u8, *b as u8, *v as u8) == k)
     };
-    let gated = |_op: SemanticOp, v: &OpVariant| match *v {
-        OpVariant::MacMode { .. } => v.mode_key().is_some_and(sparse),
-        _ => false,
-    };
-    let nodes = all_semantic_ops()
+    all_semantic_ops()
         .into_iter()
         .flat_map(|op| variants_of(arch, op).into_iter().map(move |variant| (op, variant)))
-        .filter(|(op, v)| gated(*op, v))
-        .map(|(op, variant)| CoverageNode::Semantic { arch, op, variant })
-        .collect();
-    BehavioralUnit {
-        id: "aie2.gated.not_modeled".into(),
-        arch,
-        claims: Claims::Nodes(nodes),
-        verdict: Verdict { provenance: Provenance::Unspecified, verification: Verification::Unverified },
-        shadows_derived: Some(
-            "These variants otherwise derive to the Vector default (ModelInformed/Unverified -> \
-             perishable), but the emulator declines them: sparse MAC modes are gated \
-             \"[NOT MODELED] awaiting clean-room derivation\" since the re-root."
-                .into(),
-        ),
-        shared_from: None,
-    }
+        .filter(|(_, v)| matches!(v, OpVariant::MacMode { .. }) && v.mode_key().is_some_and(sparse))
+        .collect()
 }
 
 /// Flip the silicon-verified Vector-category variants to Verified (#126, #127),
@@ -396,6 +371,7 @@ fn lane_goldens_verified() -> BehavioralUnit {
     let nodes = listed_variants(Architecture::Aie2, LANE_GOLDEN_VARIANTS)
         .into_iter()
         .chain(listed_variants(Architecture::Aie2, &mac_mode_golden_variants()))
+        .chain(listed_variants(Architecture::Aie2, &sparse_mac_golden_variants()))
         .filter(|n| !listed_variants(Architecture::Aie2, VECTOR_VERIFIED_VARIANTS).contains(n))
         .collect();
     BehavioralUnit {
@@ -458,8 +434,23 @@ fn lane_goldens_verified() -> BehavioralUnit {
                     hardware runs, disassembly recorded in each golden. Not covered there: 2D/3D \
                     vst.pack data (addressing only, vec_agu_pack), crSat above 3, crPackSign \
                     values above 1. \
+                    Sparse MAC (2026-10-31): tools/golden/silicon/vec_macsparse_<mode>_{probe,ops,\
+                    rand,conf,alt}.json for 2x16_16x8, 2x8_8x8, 4x16_16x8 and 4x32_32x8 (all ten \
+                    forms vmul, vnegmul, vmac, vmsc, vnegmac, vnegmsc, vaddmac, vaddmsc, vsubmac, \
+                    vsubmsc, narrow and wide encodings, every signedness flavour, config zero_acc1, \
+                    shift16, sub_mul, sub_acc1, sub_acc2; int4 through Peano) and 4x16_16x4 bf16 \
+                    (vmul.f narrow and wide, vnegmul.f, vmac.f, vmsc.f, vaddmac.f, vaddmsc.f wide, \
+                    plus the held-out special-value vec_macsparse_4x16_16x4_spec); designed mask \
+                    probes and held-out random tiles predicted exactly, also by an independent \
+                    controller model (872,448 of 872,448 integer words; bf16 dropped elements \
+                    absent, not zero); checked by vector_matmul/sparse_goldens.rs through \
+                    execute_matmul and the record tests in aie2/matmul.rs; two bit-identical \
+                    hardware runs, disassembly recorded in each golden. Not covered there: bf16 \
+                    narrow forms other than vmul.f (no toolchain route), the end-to-end Peano \
+                    vec_macsparse_4x16_16x4_alt kernel (fails on pointer or q-register timing, \
+                    not the sparse rule). \
                     Not covered: vnegmac.f, \
-                    vsubmac.f, vsubmsc.f (no capture, gated), sparse bf16, elementwise \
+                    vsubmac.f, vsubmsc.f (no capture, gated), elementwise \
                     vaddmac.f/vaddmsc.f (not in the forms kernel)."
                     .into(),
             },
@@ -926,17 +917,18 @@ mod tests {
     }
 
     #[test]
-    fn gated_variants_are_comprehension_gaps() {
+    fn sparse_mac_variants_are_claimed_by_the_lane_goldens() {
         use crate::aie2::isa::SemanticOp::*;
         let m = crate::coverage::CoverageModel::build(Architecture::Aie2);
-        let gap = |op, v: OpVariant| {
+        let verified = |op, v: OpVariant| {
             let r = m.semantic_ledger().into_iter().find(|r| r.op == op && r.variant == v).unwrap();
-            assert!(r.verdict.is_comprehension_gap(), "{op:?} {v}");
-            assert_eq!(r.claimed_by.as_deref(), Some("aie2.gated.not_modeled"), "{op:?} {v}");
+            assert!(is_verified(&r.verdict), "{op:?} {v}");
+            assert_eq!(r.claimed_by.as_deref(), Some("aie2.lane_goldens.verified"), "{op:?} {v}");
         };
         // int8 x int4 sparse 4x32x8, and bf16 sparse 4x16x4.
-        gap(Mac, OpVariant::MacMode { amode: 0, bmode: 0, variant: 1, sgn_x: true, sgn_y: true });
-        gap(MatMul, OpVariant::MacMode { amode: 2, bmode: 3, variant: 2, sgn_x: false, sgn_y: false });
+        verified(Mac, OpVariant::MacMode { amode: 0, bmode: 0, variant: 1, sgn_x: true, sgn_y: true });
+        verified(MatMul, OpVariant::MacMode { amode: 2, bmode: 3, variant: 2, sgn_x: false, sgn_y: false });
+        assert_eq!(sparse_mac_golden_variants().len(), 117, "4 integer modes x 7 ops x 4 flavours + 5 bf16");
         // Derived from silicon since: no longer gated.
         let owner = |op, v: OpVariant| {
             m.semantic_ledger()

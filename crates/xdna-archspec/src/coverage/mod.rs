@@ -415,22 +415,15 @@ mod tests {
         // gate honestly red until silicon verifies them -- Accept does NOT
         // falsely green it.
         assert!(!m.perishable_queue().is_empty(), "vector ops perishable until silicon verification");
-        // The comprehension set is exactly the variants the emulator declines (gated).
+        // No variant is declined any more: the last gated forms (sparse MAC) were derived from
+        // silicon on 2026-10-31, so the semantic comprehension set is empty.
         let gaps: Vec<_> = m
             .semantic_ledger()
             .into_iter()
             .filter(|r| r.verdict.is_comprehension_gap())
+            .map(|r| (r.op, r.variant))
             .collect();
-        assert!(!gaps.is_empty());
-        for r in &gaps {
-            assert!(
-                matches!(r.claimed_by.as_deref(), Some("aie2.gated.not_modeled")),
-                "{:?} {} claimed by {:?}",
-                r.op,
-                r.variant,
-                r.claimed_by
-            );
-        }
+        assert!(gaps.is_empty(), "comprehension gaps: {gaps:?}");
         assert!(!m.semantic_provenance_clean(), "gate stays red via the perishable queue (spec S5)");
     }
 
