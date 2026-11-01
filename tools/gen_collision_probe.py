@@ -87,6 +87,14 @@ WITNESS_C = "vldb wl5, [p5, #0]"      # p5 addresses WNEW
 ACC_UNITS = ("CM_RM_PORT", "CM_WA_PORT", "CM_WM_PORT", "UPS_UNIT", "UPPER_SRS",
              "W_WA_PORT", "W_WM_PORT")
 READ_UNITS = ("CM_RM_PORT", "UPPER_SRS")
+# The two ports that write the accumulator register file (names: CM = accumulator, W = write).
+# Two instructions that write one register in one cycle collide whichever port each uses.
+ACC_WRITE_UNITS = tuple(u for u in ACC_UNITS if re.match(r"^CM_W", u))
+# Instructions whose accumulator source read the tables do not reserve: their fitted use cycle is
+# 3 (FIT.md), i.e. a read in cycle 2, like the CM_RM_PORT readers that do reserve it. They are
+# paired with the CM_RM_PORT cycle-0 readers to see whether the tables miss a collision.
+UNRESERVED_READS = {"vmac_i": 2, "vmac_f": 2, "vmsc_f": 2, "vmac_i_sparse": 2, "vmac_f_sparse": 2,
+                    "vneg_i": 2, "vneg_f": 2}
 
 # --------------------------------------------------------------------------
 # Input table: base items plus eight int and eight float patterns, zeros and a destination init
@@ -286,37 +294,49 @@ def reservations_of_catalogue() -> dict[str, list[tuple[str, int]]]:
                                      (x.split(":") for x in m.group(3).split(",") if x)]
     # the assembler may append a padding bundle
     assert len(held) >= len(CATALOGUE), (len(held), len(CATALOGUE))
-    return {ins.key: held[i] for i, ins in enumerate(CATALOGUE)}
+    out = {ins.key: held[i] for i, ins in enumerate(CATALOGUE)}
+    for key, off in UNRESERVED_READS.items():
+        out[key] = out[key] + [("CM_RM_PORT*", off)]       # * = not in the tables
+    return out
 
 
-def pair_dom(a: Ins, b: Ins) -> Optional[str]:
-    if a.dom and b.dom and a.dom != b.dom:
-        return None
-    return a.dom or b.dom or "i"
+def pair_dom(a: Ins, b: Ins) -> str:
+    """Data domain of a pair. A float instruction needs float patterns; an integer instruction
+    only needs distinct bit patterns, which float patterns also are, so mixing is allowed."""
+    return "f" if "f" in (a.dom, b.dom) else "i"
+
+
+def same_resource(ua: str, ub: str) -> bool:
+    """Whether holding ua and ub in one cycle is a collision: the same unit, a starred unit
+    (an extension the tables do not make) against its unstarred name, or two accumulator write
+    ports."""
+    if ua.rstrip("*") == ub.rstrip("*"):
+        return True
+    return ua in ACC_WRITE_UNITS and ub in ACC_WRITE_UNITS
 
 
 def derive_collisions(res) -> list[dict]:
-    """Every (A, B, g, unit) with A holding `unit` at cycle a, B at b, g = a - b >= 0."""
-    out = []
+    """Every (A, B, g) where A holds a unit at cycle a and B holds the same resource at b, with
+    g = a - b >= 0 (A issued g bundles before B), merged over the units that collide there."""
+    merged: dict[tuple, dict] = {}
     for ia, a in enumerate(CATALOGUE):
         for ib, b in enumerate(CATALOGUE):
-            if not pair_dom(a, b):
-                continue
             for ua, oa in res[a.key]:
-                if ua not in ACC_UNITS:
+                if ua.rstrip("*") not in ACC_UNITS:
                     continue
                 for ub, ob in res[b.key]:
                     g = oa - ob
-                    if ua == ub and (g > 0 or (g == 0 and ia <= ib)):
-                        out.append({"a": a.key, "b": b.key, "g": g, "unit": ua, "cycle": oa})
-    # one record per (A, B, g) naming every unit that collides there
-    merged: dict[tuple, dict] = {}
-    for c in out:
-        k = (c["a"], c["b"], c["g"])
-        m = merged.setdefault(k, {"a": c["a"], "b": c["b"], "g": c["g"], "units": [], "cycles": []})
-        if c["unit"] not in m["units"]:
-            m["units"].append(c["unit"])
-            m["cycles"].append(c["cycle"])
+                    if not same_resource(ua, ub) or not (g > 0 or (g == 0 and ia <= ib)):
+                        continue
+                    if ua.endswith("*") and ub.endswith("*"):
+                        continue
+                    k = (a.key, b.key, g)
+                    m = merged.setdefault(k, {"a": a.key, "b": b.key, "g": g, "units": [],
+                                              "cycles": []})
+                    name = ua if ua == ub else f"{ua}~{ub}"
+                    if name not in m["units"]:
+                        m["units"].append(name)
+                        m["cycles"].append(oa)
     return list(merged.values())
 
 
@@ -348,9 +368,10 @@ def allocate(a: Ins, b: Ins, cfg: str) -> Optional[tuple[Regs, Regs]]:
 
 def configs_for(coll: dict, a: Ins, b: Ins) -> list[str]:
     cfgs = ["sep"]
-    if any(u in READ_UNITS for u in coll["units"]) and a.srcs and b.srcs:
+    if any(u.rstrip("*") in READ_UNITS for u in coll["units"]) and a.srcs and b.srcs:
         cfgs.append("srcshare")
-    if any(u in ("CM_WA_PORT", "CM_WM_PORT", "W_WA_PORT", "W_WM_PORT", "UPS_UNIT") for u in coll["units"]):
+    if any(u.split("~")[0] in ("CM_WA_PORT", "CM_WM_PORT", "W_WA_PORT", "W_WM_PORT", "UPS_UNIT")
+           for u in coll["units"]):
         if allocate(a, b, "dstshare"):
             cfgs.append("dstshare")
     return cfgs
@@ -482,7 +503,7 @@ def make_points(res, limit: Optional[int] = None) -> list[dict]:
     # references
     seen = set()
     for a, ra, b, rb, coll, dom in ref_specs:
-        read_pair = any(u in READ_UNITS for u in coll["units"])
+        read_pair = any(u.rstrip("*") in READ_UNITS for u in coll["units"])
         want = [("alone", a, ra, dom), ("alone", b, rb, dom), ("none", a, ra, dom), ("none", b, rb, dom)]
         for ins, r in ((a, ra), (b, rb)):
             for j in range(len(r.s)):
