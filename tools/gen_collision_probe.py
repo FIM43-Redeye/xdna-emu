@@ -114,6 +114,9 @@ BITPAT = os.environ.get("COLLISION_BITPAT") in ("1", "2")
 BITPAT_ODD = os.environ.get("COLLISION_BITPAT") == "2"
 # COLLISION_KEYS=a,b,c restricts the collision list to pairs of these catalogue instructions.
 KEYS_ONLY = set(filter(None, os.environ.get("COLLISION_KEYS", "").split(",")))
+# COLLISION_SOLO=a,b,c adds the alone / initial references of these instructions even when they
+# cannot collide with anything (a check of one instruction against silicon).
+SOLO_KEYS = [k for k in os.environ.get("COLLISION_SOLO", "").split(",") if k]
 
 
 def _pat_i(k):
@@ -318,8 +321,22 @@ CATALOGUE_2C = [
     Ins("vmov_w_wh", "vmov {DW}, wl0", None, (), "wh"),
     Ins("vsrsm_s16_s32_wh", "vsrsm.s16.s32 {DW}, bml{S1}, s1", None, ("bml",), "wh"),
 ]
+# Siblings of the three instructions the phase-2b alone references showed the emulator getting
+# wrong (vmov am,q ; vshuffle bm ; vbcstshfl bm): the other am quarters, the high bm half, the
+# other broadcast widths and their x forms.
+CATALOGUE_2D = [
+    Ins("vmov_amlh_q", "vmov amlh{D}, q1", None, (), "amlh"),
+    Ins("vmov_amhl_q", "vmov amhl{D}, q1", None, (), "amhl"),
+    Ins("vmov_amhh_q", "vmov amhh{D}, q1", None, (), "amhh"),
+    Ins("vshuffle_bmh", "vshuffle bmh{D}, x0, x1, r1", None, (), "bmh"),
+    Ins("vbcstshfl_bmh", "vbcstshfl.32 bmh{D}, r12, r29", None, (), "bmh"),
+    Ins("vbcstshfl8_bm", "vbcstshfl.8 bml{D}, r12, r29", None, (), "bml"),
+    Ins("vbcstshfl16_bm", "vbcstshfl.16 bml{D}, r12, r29", None, (), "bml"),
+    Ins("vbcstshfl8_x", "vbcstshfl.8 {DW}, r12, r29", None, (), "x"),
+    Ins("vbcstshfl16_x", "vbcstshfl.16 {DW}, r12, r29", None, (), "x"),
+]
 NEW_KEYS = {i.key for i in CATALOGUE_2B}
-CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C
+CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D
 BY_KEY = {i.key: i for i in CATALOGUE}
 W_DEST = {"A": ("x8", "wl8", "wh8"), "B": ("x4", "wl4", "wh4")}     # (x, wl, wh name) per role
 W_FAMILY = ("x", "wl", "wh")        # destinations that live in the W register file
@@ -350,7 +367,11 @@ def render(ins: Ins, r: Regs) -> str:
 # Reservations of every catalogue instruction, from the decoder
 # --------------------------------------------------------------------------
 
-ACC_DST = ("cm", "bml", "am")
+# destination kinds that name an accumulator register; each is observed through its own quarters
+ACC_QUARTERS = {"cm": ("amll", "amlh", "amhl", "amhh"), "bml": ("amll", "amlh"),
+                "bmh": ("amhl", "amhh"), "am": ("amll",), "amlh": ("amlh",), "amhl": ("amhl",),
+                "amhh": ("amhh",)}
+ACC_DST = tuple(ACC_QUARTERS)
 
 
 def sample_regs(ins: Ins, role: str = "A") -> Regs:
@@ -491,14 +512,9 @@ def dst_init_lines(ins: Ins, r: Regs, dom: str) -> list[str]:
 
 def observe_lines(ins: Ins, r: Regs, off: int) -> list[str]:
     out = []
-    if ins.dst == "cm":
-        for j, q in enumerate(("amll", "amlh", "amhl", "amhh")):
+    if ins.dst in ACC_QUARTERS:
+        for j, q in enumerate(ACC_QUARTERS[ins.dst]):
             out.append(f"  vst {q}{r.d}, [p1, #{off + 32 * j}]")
-    elif ins.dst == "bml":
-        for j, q in enumerate(("amll", "amlh")):
-            out.append(f"  vst {q}{r.d}, [p1, #{off + 32 * j}]")
-    elif ins.dst == "am":
-        out.append(f"  vst amll{r.d}, [p1, #{off}]")
     elif ins.dst == "q":
         out.append(f"  st {Q_DEST[r.wsel]}, [p1, #{off}]")
     elif ins.dst == "x":
@@ -602,6 +618,11 @@ def make_points(res, limit: Optional[int] = None, only_new: bool = False,
                 continue                 # the two cannot issue in one bundle (same slot)
             points += group
             ref_specs.append((a, ra, b, rb, coll, dom))
+    for key in SOLO_KEYS:
+        ins = BY_KEY[key]
+        r = Regs(s=tuple(3 + i for i in range(len(ins.srcs))), d=5 if ins.dst in ACC_DST else None,
+                 role="B", wsel="B")
+        ref_specs.append((ins, r, ins, r, {"units": []}, "f" if ins.dom == "f" else "i"))
     # references
     seen = set()
     for a, ra, b, rb, coll, dom in ref_specs:

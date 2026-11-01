@@ -30,6 +30,9 @@ fn decode_text(decoder: &InstructionDecoder, units: &[String], text: &[u8]) -> (
             .resolved_ops(&text[pc..pc + size])
             .into_iter()
             .inspect(|op| {
+                if std::env::var_os("COLLISION_CHECK_DEF").is_some() {
+                    eprintln!("DEF {} {:?}", op.llvm_name, op.def_cycle);
+                }
                 if std::env::var_os("COLLISION_CHECK_DEBUG").is_some() {
                     eprintln!("{} {:?}", op.llvm_name, op.stages);
                 }

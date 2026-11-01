@@ -107,6 +107,8 @@ pub struct ResolvedOp {
     /// LLVM instruction name, e.g. `VMOV_mv_cm`.
     pub llvm_name: String,
     pub stages: Vec<decoder_ffi::ResolvedStage>,
+    /// Itinerary cycle of the first result operand (when the instruction has a result).
+    pub def_cycle: Option<i16>,
 }
 
 impl InstructionDecoder {
@@ -120,7 +122,9 @@ impl InstructionDecoder {
             .filter_map(|s| {
                 let slot = Self::slot_type_to_ffi(s.slot_type)?;
                 let r = decoder_ffi::decode_slot(slot, s.bits)?;
-                Some(ResolvedOp { llvm_name: r.name, stages: r.res_stages })
+                let def_cycle =
+                    (r.res_num_defs >= 1 && r.res_num_operand_cycles >= 1).then(|| r.res_operand_cycle[0]);
+                Some(ResolvedOp { llvm_name: r.name, stages: r.res_stages, def_cycle })
             })
             .collect()
     }

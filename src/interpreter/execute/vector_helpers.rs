@@ -66,6 +66,12 @@ impl VectorAlu {
                 }
                 v
             }
+            Operand::ControlReg(id) if (16..=19).contains(id) => {
+                // q0-q3: the 128-bit mask registers (`ctx.mask`), zero-extended to 256 bits
+                // (`vmov amll0, q1` on silicon: q in the low 128 bits, zeros above).
+                let q = ctx.mask.read(*id - 16);
+                [q[0], q[1], q[2], q[3], 0, 0, 0, 0]
+            }
             Operand::Immediate(val) => {
                 // Scalar broadcast into all lanes (for immediate vector operands).
                 [*val as u32; 8]
