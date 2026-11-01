@@ -715,6 +715,9 @@ pub struct PipelineStage {
     pub units: Vec<String>,
     /// Time increment to next stage (-1 = blocking until done).
     pub time_inc: i8,
+    /// TableGen `ReservationKind::Reserved`: the stage holds its unit for later instructions but
+    /// does not itself require the unit to be free (LLVM's scoreboard hazard check skips it).
+    pub reserved: bool,
 }
 
 // ============================================================================

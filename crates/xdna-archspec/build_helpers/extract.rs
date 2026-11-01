@@ -34,6 +34,8 @@ pub struct BuildPipelineStage {
     pub cycles: u8,
     pub units: Vec<String>,
     pub time_inc: i8,
+    /// TableGen `ReservationKind`: `Reserved` (1) holds the unit without requiring it free.
+    pub reserved: bool,
 }
 
 /// Itinerary info (build-time version).
@@ -836,7 +838,8 @@ fn load_itinerary_data(
             },
             Err(_) => Vec::new(),
         };
-        stages_map.insert(name, BuildPipelineStage { cycles, units, time_inc });
+        let reserved = record.int_value("Kind").unwrap_or(0) == 1;
+        stages_map.insert(name, BuildPipelineStage { cycles, units, time_inc, reserved });
     }
 
     let mut result: HashMap<String, BuildItineraryInfo> = HashMap::new();

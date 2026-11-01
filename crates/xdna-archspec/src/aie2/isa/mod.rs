@@ -14,6 +14,7 @@ pub mod types;
 pub mod resolver;
 pub mod decoder_ffi;
 pub mod element_type_logic;
+pub mod reservation;
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));

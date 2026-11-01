@@ -324,7 +324,7 @@ fn format_itinerary(code: &mut String, info: &BuildItineraryInfo) {
     for stage in &info.stages {
         writeln!(
             code,
-            "            PipelineStage {{ cycles: {}, units: vec![{}], time_inc: {} }},",
+            "            PipelineStage {{ cycles: {}, units: vec![{}], time_inc: {}, reserved: {} }},",
             stage.cycles,
             stage
                 .units
@@ -332,7 +332,8 @@ fn format_itinerary(code: &mut String, info: &BuildItineraryInfo) {
                 .map(|u| format!("{:?}.to_string()", u))
                 .collect::<Vec<_>>()
                 .join(", "),
-            stage.time_inc
+            stage.time_inc,
+            stage.reserved
         )
         .unwrap();
     }
