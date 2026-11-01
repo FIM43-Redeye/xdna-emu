@@ -116,6 +116,9 @@ BITPAT_ODD = os.environ.get("COLLISION_BITPAT") == "2"
 KEYS_ONLY = set(filter(None, os.environ.get("COLLISION_KEYS", "").split(",")))
 # COLLISION_SOLO=a,b,c adds the alone / initial references of these instructions even when they
 # cannot collide with anything (a check of one instruction against silicon).
+# COLLISION_SRS_SHIFT=n sets the shift register of the srs family (s1) to n while the pattern
+# loads keep s3 = 0, to tell a converted result from raw data bits.
+SRS_SHIFT = int(os.environ.get("COLLISION_SRS_SHIFT", "0"))
 SOLO_KEYS = [k for k in os.environ.get("COLLISION_SOLO", "").split(",") if k]
 
 
@@ -207,6 +210,8 @@ def prologue(dom):
     shift = 0 if dom == "i" else 16
     lines += [f"  mov r14, #{shift}", "  mov s3, r14", "  mov s1, r14", "  movxm r12, #9320",
               "  mov r29, #0", "  nop", "  nop"]
+    if SRS_SHIFT:
+        lines += [f"  mov r15, #{SRS_SHIFT}", "  nop", "  mov s1, r15", "  nop", "  nop"]
     lines += load_vec("wl10", f"NEWX_{dom}", 0) + load_vec("wh10", f"NEWX_{dom}", 1)
     lines += ["  mov p4, p0", f"  padda [p4], #{TABLE_OFFSETS[f'NEWX_{dom}']}"]
     lines += nops(LOAD_NOPS)
