@@ -124,6 +124,12 @@ mod sparse_load_goldens;
 mod move_goldens;
 
 #[cfg(test)]
+mod collision_goldens;
+
+#[cfg(test)]
+mod collision_goldens_data;
+
+#[cfg(test)]
 mod vector_validate;
 
 #[cfg(test)]

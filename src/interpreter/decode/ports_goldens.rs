@@ -6,7 +6,6 @@
 //! behaving differently in the collision probes (`build/experiments/collisions`, r1 == r2). The
 //! tests may name units: the emulator code never does.
 
-use crate::interpreter::bundle::Operand;
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::traits::Decoder;
 

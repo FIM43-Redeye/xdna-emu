@@ -918,6 +918,7 @@ impl CycleAccurateExecutor {
         ctx.set_write_tag(None);
         ctx.set_slot_acc_read(None);
         ctx.set_srs_partner_units(None);
+        ctx.set_srs_mode_override(0, None);
         ctx.accumulator.set_reader_slot(None);
 
         ctx.end_bundle();

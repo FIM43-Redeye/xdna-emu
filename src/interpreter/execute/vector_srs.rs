@@ -146,11 +146,23 @@ impl VectorAlu {
                 let p_high = ctx.accumulator.read_with(high, pu, pb);
                 ctx.accumulator.arm_wired_or(v.slot as u8, rv, p_high);
                 ctx.accumulator.arm_wired_or(p.slot as u8, high, v_src);
+                // The shifter takes the lane mode of the wider of the two: a 32-bit-lane mover
+                // beside a 64-bit-lane partner shifts the OR-ed bus as 64-bit lanes and returns
+                // the low 32 bits of each, whatever its own element type (probe9/probe11).
+                let mut from = v.from_type.unwrap_or(ElementType::Int32);
+                let mut to = v.element_type.unwrap_or(ElementType::Int16);
+                if from.bits() < 64 && p.from_type.is_some_and(|t| t.bits() == 64) {
+                    from = ElementType::Int64;
+                    to = if to.is_signed() {
+                        ElementType::Int32
+                    } else {
+                        ElementType::UInt32
+                    };
+                    ctx.set_srs_mode_override(v.slot as u8, Some((from, to)));
+                }
                 if p.element_type == Some(ElementType::Int8) {
                     let bus: [u64; 8] = std::array::from_fn(|i| v_src[i] | p_high[i]);
                     let shift = Self::get_shift_amount(v, ctx);
-                    let from = v.from_type.unwrap_or(ElementType::Int32);
-                    let to = v.element_type.unwrap_or(ElementType::Int16);
                     let result = Self::vector_srs_from_acc(&bus, shift, from, to, &ctx.srs_config);
                     ctx.set_srs_partner_units(Some(std::array::from_fn(|m| result[m] as u16)));
                 }
@@ -238,6 +250,7 @@ impl VectorAlu {
         } else {
             // Half SRS (bml/bmh): read single 512-bit accum register,
             // SRS 8 lanes, write to 256-bit w-register.
+            let (from, et) = ctx.srs_mode_override(op.slot as u8).unwrap_or((from, et));
             let acc = ctx.accumulator.read(acc_reg);
             let result = Self::vector_srs_from_acc(&acc, shift, from, et, &ctx.srs_config);
             Self::write_vector_dest(op, ctx, result);

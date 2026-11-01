@@ -1000,6 +1000,15 @@ impl MemoryUnit {
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
+    /// Queue the converted `bm` half of a `vlda.conv` at the instruction's itinerary result
+    /// latency (II_VLDA_CONV: operand cycle 6), like every other accumulator producer, so that a
+    /// reader sees the old value until then and a colliding write lands in its own cycle.
+    fn queue_conv_acc_write(ctx: &mut ExecutionContext, reg: u8, acc: [u64; 8]) {
+        let mut wide = [0u64; 16];
+        wide[..8].copy_from_slice(&acc);
+        ctx.queue_acc_write(Operand::AccumReg(reg), wide, true);
+    }
+
     /// Execute `vlda.conv`: load from memory, convert type (e.g., bf16 -> f32).
     ///
     /// Loads a 256-bit vector from memory, then applies type conversion.
@@ -1029,7 +1038,7 @@ impl MemoryUnit {
                         let hi_fp32 = hi_bf16 << 16;
                         acc[i] = lo_fp32 | (hi_fp32 << 32);
                     }
-                    ctx.accumulator.write(*r, acc);
+                    Self::queue_conv_acc_write(ctx, *r, acc);
                 } else {
                     // Generic path: use vector_convert (256-bit result)
                     let mode = super::VectorAlu::ctx_rounding(ctx);
@@ -1039,7 +1048,7 @@ impl MemoryUnit {
                     for i in 0..4 {
                         acc[i] = result[i * 2] as u64 | ((result[i * 2 + 1] as u64) << 32);
                     }
-                    ctx.accumulator.write(*r, acc);
+                    Self::queue_conv_acc_write(ctx, *r, acc);
                 }
             }
             Some(dest) => {

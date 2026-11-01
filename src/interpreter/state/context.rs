@@ -22,7 +22,7 @@ use super::registers::{
     ScalarRegisterFile, VectorRegisterFile,
 };
 use super::write_collision::WriteTag;
-use crate::interpreter::bundle::Operand;
+use crate::interpreter::bundle::{ElementType, Operand};
 use crate::interpreter::traits::{Flags, StateAccess};
 
 // Re-export types that were previously defined in this file. Downstream code
@@ -412,6 +412,8 @@ pub struct ExecutionContext {
     read_claims: Vec<ReadClaim>,
     /// See [`set_srs_partner_units`](Self::set_srs_partner_units).
     srs_partner_units: Option<[u16; 8]>,
+    /// `(slot, (source lane type, output type))`: see [`set_srs_mode_override`](Self::set_srs_mode_override).
+    srs_mode_override: Option<(u8, (ElementType, ElementType))>,
     /// Issue sequence counter: one number per executed slot op, in issue order.
     write_seq: u64,
 
@@ -595,6 +597,7 @@ impl ExecutionContext {
             slot_acc_read: None,
             read_claims: Vec::new(),
             srs_partner_units: None,
+            srs_mode_override: None,
             write_seq: 0,
             bundle_seq: 0,
             pending_stores: Vec::new(),
@@ -1008,6 +1011,17 @@ impl ExecutionContext {
             land: self.bundle_seq + self.result_latency as u64,
         });
         self.set_write_tag(tag);
+    }
+
+    /// Make the SRS instruction in `slot` run in another lane mode this bundle: `(source lane
+    /// type, output element type)`.
+    pub fn set_srs_mode_override(&mut self, slot: u8, mode: Option<(ElementType, ElementType)>) {
+        self.srs_mode_override = mode.map(|m| (slot, m));
+    }
+
+    /// The lane-mode override of the SRS instruction in `slot`, if one is armed.
+    pub fn srs_mode_override(&self, slot: u8) -> Option<(ElementType, ElementType)> {
+        self.srs_mode_override.filter(|(s, _)| *s == slot).map(|(_, m)| m)
     }
 
     /// Stash the halfwords an s8-output SRS partner takes from the other SRS unit's result
