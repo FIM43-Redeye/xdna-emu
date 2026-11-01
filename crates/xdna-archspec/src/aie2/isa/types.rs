@@ -827,6 +827,9 @@ pub struct TblgenOutput {
     /// Functional units in processor-itinerary order; the decoder's resolved stages name their
     /// unit by index into this list.
     pub functional_units: Vec<String>,
+    /// Distinct `(itinerary class, register class of the first output operand)` pairs: the
+    /// register classes the instructions of one scheduling class write.
+    pub itinerary_output_classes: Vec<(String, String)>,
     /// Register definitions and classes.
     pub register_model: RegisterModel,
     /// Composite VLIW bundle formats.

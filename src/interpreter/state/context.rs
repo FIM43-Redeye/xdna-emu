@@ -21,6 +21,7 @@ use super::registers::{
     AccumulatorRegisterFile, Bypass, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile,
     ScalarRegisterFile, VectorRegisterFile,
 };
+use super::write_collision::WriteTag;
 use crate::interpreter::bundle::Operand;
 use crate::interpreter::traits::{Flags, StateAccess};
 
@@ -75,6 +76,9 @@ pub struct PendingWrite {
     /// vs writes from the current bundle (not forwardable -- VLIW semantics
     /// require same-bundle reads to see pre-execution values).
     pub issued_cycle: u64,
+    /// Handle of this load's stand-in in the register file's collision resolver, when the load
+    /// has a collision-modelled write port (see `VectorRegisterFile::register_phantom`).
+    pub phantom: Option<u32>,
 }
 
 /// A deferred partial-word store awaiting its data register read.
@@ -101,6 +105,22 @@ pub struct PendingStore {
     /// while stores issued earlier in the body have already entered the
     /// decoupled store pipeline and still commit. See `check_hardware_loop`.
     pub issue_pc: u32,
+}
+
+/// An accumulator read port taken in one cycle by a mover (see `PortUse::mover`): a late reader
+/// of the same port in that cycle receives the mover's source instead of its own.
+#[derive(Debug, Clone)]
+struct ReadClaim {
+    /// The read port (unit index) the mover read through.
+    unit: u16,
+    /// Bundle in which the mover read.
+    cycle: u64,
+    /// Issue sequence of the mover; the later-issued claim wins a bank.
+    seq: u64,
+    /// Banks (bit p = bank p of the cm layout) the mover's source covers.
+    banks: u8,
+    /// The mover's source in the cm layout: lanes `4p..4p+4` hold bank `p`.
+    data: [u64; 16],
 }
 
 /// Latency for partial-word store data register read (II_STHB operand 0).
@@ -146,6 +166,8 @@ pub struct PendingUnpack {
     pub form: &'static xdna_archspec::aie2::unpack::UnpackForm,
     /// Issued-bundle count (`bundle_seq`) at which the source and sign are read.
     pub ready_bundle: u64,
+    /// Write tag of the instruction, restored when the destination is queued.
+    pub tag: Option<WriteTag>,
 }
 
 /// VUNPACK source-register read latency in issued bundles (II_VUNPACK
@@ -191,6 +213,10 @@ pub struct PendingAccAdd {
     /// Issued-bundle count at which the accumulator sources are read (issue + the sources' use
     /// cycle).
     pub ready_bundle: u64,
+    /// Write tag of the instruction, restored when the destination is queued.
+    pub tag: Option<WriteTag>,
+    /// Read port of the second accumulator source (see `AccReadPort`), for the late-read steal.
+    pub acc_read: Option<crate::interpreter::bundle::AccReadPort>,
 }
 
 /// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
@@ -227,6 +253,8 @@ pub struct PendingUpsLoad {
     pub def_bypass: Bypass,
     /// Issued-bundle count at which the shift register is read.
     pub ready_bundle: u64,
+    /// Write tag of the instruction, restored when the destination is queued.
+    pub tag: Option<WriteTag>,
 }
 
 /// VLDA.UPS shift-register read latency in issued bundles (operand cycle 7,
@@ -374,6 +402,18 @@ pub struct ExecutionContext {
     /// ALU consumers at issue+1 (`Mov`) or is visible only at full latency
     /// (`No`). See `VectorRegisterFile::resolve`.
     pub result_bypass: Bypass,
+
+    /// Write tag of the slot op being executed (`None`: no collision-modelled write port or no
+    /// result latency). Mirrored into both register files by [`set_write_tag`](Self::set_write_tag).
+    write_tag: Option<WriteTag>,
+    /// Accumulator read port of the slot op being executed, for deferred readers to remember.
+    slot_acc_read: Option<crate::interpreter::bundle::AccReadPort>,
+    /// Read ports taken by movers in recent bundles.
+    read_claims: Vec<ReadClaim>,
+    /// See [`set_srs_partner_units`](Self::set_srs_partner_units).
+    srs_partner_units: Option<[u16; 8]>,
+    /// Issue sequence counter: one number per executed slot op, in issue order.
+    write_seq: u64,
 
     /// Monotonic counter of issued bundles, incremented once per executed
     /// bundle by the cycle-accurate executor. This is the issue-slot-relative
@@ -551,6 +591,11 @@ impl ExecutionContext {
             pending_writes: Vec::new(),
             result_latency: 0,
             result_bypass: Bypass::No,
+            write_tag: None,
+            slot_acc_read: None,
+            read_claims: Vec::new(),
+            srs_partner_units: None,
+            write_seq: 0,
             bundle_seq: 0,
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
@@ -845,11 +890,16 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            phantom: None,
         });
     }
 
     /// Queue a vector load result for deferred register write.
     pub fn queue_vector_load(&mut self, dest: Operand, value: [u32; 8], latency: u64) {
+        let phantom = match dest {
+            Operand::VectorReg(r) => self.vector.register_phantom(r, value),
+            _ => None,
+        };
         self.pending_writes.push(PendingWrite {
             dest,
             scalar_value: 0,
@@ -857,6 +907,7 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            phantom,
         });
     }
 
@@ -868,6 +919,24 @@ impl ExecutionContext {
         width: crate::interpreter::decode::register_map::AccumWidth,
         latency: u64,
     ) {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let phantom = match dest {
+            Operand::AccumReg(r) => {
+                let (lanes, mask) = match width {
+                    AccumWidth::QuarterLow => (0, 0x0F),
+                    AccumWidth::QuarterHigh => (4, 0xF0),
+                    // a 256-bit load into a bm half writes the low quarter and zeroes the rest
+                    _ => (0, 0xFF),
+                };
+                let mut lanes_u64 = [0u64; 8];
+                for k in 0..4 {
+                    lanes_u64[lanes + k] = value[2 * k] as u64 | (value[2 * k + 1] as u64) << 32;
+                }
+                let l_def = self.write_tag.map_or(1, |t| (t.land - self.bundle_seq).clamp(1, 255) as u8);
+                self.accumulator.register_phantom(r, lanes_u64, mask, l_def)
+            }
+            _ => None,
+        };
         self.pending_writes.push(PendingWrite {
             dest,
             scalar_value: 0,
@@ -875,6 +944,7 @@ impl ExecutionContext {
             accum_width: Some(width),
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            phantom,
         });
     }
 
@@ -927,6 +997,138 @@ impl ExecutionContext {
         }
     }
 
+    /// Start a slot op's writes: number the op in issue order and tag its register writes with its
+    /// write port and landing bundle (`bundle_seq + result_latency`). Call after setting
+    /// `result_latency`. An op without a write port, or without a result latency, is untagged.
+    pub fn begin_slot_writes(&mut self, write_port: Option<u16>) {
+        self.write_seq += 1;
+        let tag = write_port.filter(|_| self.result_latency > 0).map(|port| WriteTag {
+            port,
+            seq: self.write_seq,
+            land: self.bundle_seq + self.result_latency as u64,
+        });
+        self.set_write_tag(tag);
+    }
+
+    /// Stash the halfwords an s8-output SRS partner takes from the other SRS unit's result
+    /// (see `VectorAlu::arm_srs_wired_or`), for the bundle being executed.
+    pub fn set_srs_partner_units(&mut self, units: Option<[u16; 8]>) {
+        self.srs_partner_units = units;
+    }
+
+    /// Replace the upper 16 bytes of an s8-output SRS partner's 32-byte result `words` with the
+    /// stashed halfwords, if a wired-OR pair armed them this bundle.
+    pub fn apply_srs_partner_units(&mut self, words: &mut [u32; 8]) {
+        if let Some(units) = self.srs_partner_units.take() {
+            for j in 0..4 {
+                words[4 + j] = units[2 * j] as u32 | (units[2 * j + 1] as u32) << 16;
+            }
+        }
+    }
+
+    /// Set (or clear) the accumulator read port of the slot op about to execute.
+    pub fn set_slot_acc_read(&mut self, port: Option<crate::interpreter::bundle::AccReadPort>) {
+        self.slot_acc_read = port;
+    }
+
+    /// The accumulator read port of the slot op being executed.
+    pub fn slot_acc_read(&self) -> Option<crate::interpreter::bundle::AccReadPort> {
+        self.slot_acc_read
+    }
+
+    /// If `op` is a mover, note that it took its accumulator read port in this bundle, together
+    /// with the source it read. Call before the op executes.
+    pub fn record_read_claim(&mut self, op: &crate::interpreter::bundle::SlotOp) {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let Some(port) = op.ports.acc_read.filter(|_| op.ports.mover) else {
+            return;
+        };
+        let Some(&Operand::AccumReg(reg)) = op.sources.iter().find(|s| matches!(s, Operand::AccumReg(_)))
+        else {
+            return;
+        };
+        let (use_cycle, bypass) = op.acc_source_timing(0);
+        let mut data = [0u64; 16];
+        let half = (reg & 1) as usize;
+        let banks = match op.src_accum_width {
+            Some(AccumWidth::Full) => {
+                data = self.accumulator.read_wide_with(reg & !1, use_cycle, bypass);
+                0b1111
+            }
+            Some(AccumWidth::QuarterLow) | Some(AccumWidth::QuarterHigh) => {
+                let q = usize::from(op.src_accum_width == Some(AccumWidth::QuarterHigh));
+                let bank = 2 * half + q;
+                let r = self.accumulator.read_with(reg, use_cycle, bypass);
+                data[4 * bank..4 * bank + 4].copy_from_slice(&r[4 * q..4 * q + 4]);
+                1 << bank
+            }
+            _ => {
+                let r = self.accumulator.read_with(reg, use_cycle, bypass);
+                data[8 * half..8 * half + 8].copy_from_slice(&r);
+                0b11 << (2 * half)
+            }
+        };
+        self.read_claims.retain(|c| c.cycle + 16 >= self.bundle_seq);
+        self.read_claims.push(ReadClaim {
+            unit: port.primary,
+            cycle: self.bundle_seq,
+            seq: self.write_seq,
+            banks,
+            data,
+        });
+    }
+
+    /// Apply the read-port steal to a late reader's accumulator source. The reader issued at
+    /// `issue` read `reg` (`wide`: the cm pair, else the bm half) through `port` in cycle
+    /// `issue + port.offset`; a mover that read through the same port in that cycle puts its
+    /// source on the banks it covers. `buf` is the reader's value in the layout of
+    /// `read_acc_full` (half: lanes 0..8).
+    pub fn steal_acc_read(
+        &self,
+        port: crate::interpreter::bundle::AccReadPort,
+        issue: u64,
+        reg: u8,
+        wide: bool,
+        buf: &mut [u64; 16],
+    ) {
+        let cycle = issue + port.offset as u64;
+        let mut claims: Vec<&ReadClaim> = self
+            .read_claims
+            .iter()
+            .filter(|c| c.unit == port.primary && c.cycle == cycle)
+            .collect();
+        claims.sort_by_key(|c| c.seq);
+        let half = (reg & 1) as usize;
+        for c in claims {
+            for bank in 0..4usize {
+                if c.banks & (1 << bank) == 0 {
+                    continue;
+                }
+                // lane offset of this bank in the reader's buffer; a half covers two banks
+                let at = if wide {
+                    4 * bank
+                } else if bank / 2 == half {
+                    4 * (bank % 2)
+                } else {
+                    continue;
+                };
+                buf[at..at + 4].copy_from_slice(&c.data[4 * bank..4 * bank + 4]);
+            }
+        }
+    }
+
+    /// The tag of the slot op being executed, to carry through a deferred completion.
+    pub fn write_tag(&self) -> Option<WriteTag> {
+        self.write_tag
+    }
+
+    /// Stamp `tag` on the register writes queued from here on (both files).
+    pub fn set_write_tag(&mut self, tag: Option<WriteTag>) {
+        self.write_tag = tag;
+        self.vector.set_write_tag(tag);
+        self.accumulator.set_write_tag(tag);
+    }
+
     /// Land vector-register writes that have reached visibility and advance the
     /// register file's issued-bundle clock. Call once per issued bundle, at the
     /// start, before snapshotting. Vector writes themselves go through
@@ -963,6 +1165,7 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
+            phantom: None,
         });
     }
 
@@ -1062,12 +1265,20 @@ impl ExecutionContext {
             Operand::ModifierReg(r) => self.modifier.write(*r, pw.scalar_value),
             Operand::VectorReg(r) => {
                 if let Some(vec) = &pw.vec_value {
-                    self.vector.write(*r, *vec);
+                    // a collision may have dropped the load or replaced its data
+                    match pw.phantom.and_then(|id| self.vector.phantom_verdict(id)) {
+                        None => self.vector.write(*r, *vec),
+                        Some(Some(data)) => self.vector.write(*r, data),
+                        Some(None) => {}
+                    }
                 }
             }
             Operand::AccumReg(r) => {
                 if let Some(vec) = &pw.vec_value {
-                    self.apply_accum_write(*r, vec, pw.accum_width);
+                    match pw.phantom.and_then(|id| self.accumulator.phantom_verdict(id)) {
+                        None => self.apply_accum_write(*r, vec, pw.accum_width),
+                        Some((value, lanes)) => self.accumulator.write_lanes(*r, &value, lanes),
+                    }
                 }
             }
             Operand::ControlReg(id) => {
@@ -1218,6 +1429,7 @@ impl ExecutionContext {
             dest_reg,
             form,
             ready_bundle: self.bundle_seq + VUNPACK_SRC_READ_LATENCY,
+            tag: self.write_tag,
         });
     }
 
@@ -1249,7 +1461,9 @@ impl ExecutionContext {
             let signed = pu.form.sign.is_signed(|id| self.control_reg_raw(id));
             let result = unpack_lanes(&src, pu.form.bits_in as u32, pu.form.bits_out as u32, signed);
             // Source read at issue+6, write-back at issue+7: one more bundle.
+            self.set_write_tag(pu.tag);
             self.vector.queue_write_wide(pu.dest_reg, result, 1, Bypass::No);
+            self.set_write_tag(None);
         }
     }
 
@@ -1290,6 +1504,8 @@ impl ExecutionContext {
             def_bypass: self.result_bypass,
             use_bypass: [acc_use[0].1, acc_use[1].1],
             ready_bundle: self.bundle_seq + use_cycle as u64,
+            tag: self.write_tag,
+            acc_read: self.slot_acc_read,
         });
     }
 
@@ -1317,17 +1533,26 @@ impl ExecutionContext {
             let mut result = [0u64; 16];
             if pa.is_wide {
                 let a1 = self.accumulator.read_wide_with(pa.acc1_reg, 0, ub1);
-                let a2 = self.accumulator.read_wide_with(pa.acc2_reg, 0, ub2);
+                let mut a2 = self.accumulator.read_wide_with(pa.acc2_reg, 0, ub2);
+                if let Some(port) = pa.acc_read.filter(|_| !pa.unary) {
+                    self.steal_acc_read(port, pa.issue_bundle, pa.acc2_reg, true, &mut a2);
+                }
                 for i in 0..16 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
             } else {
                 let a1 = self.accumulator.read_with(pa.acc1_reg, 0, ub1);
-                let a2 = self.accumulator.read_with(pa.acc2_reg, 0, ub2);
+                let a2h = self.accumulator.read_with(pa.acc2_reg, 0, ub2);
+                let mut a2 = [0u64; 16];
+                a2[..8].copy_from_slice(&a2h);
+                if let Some(port) = pa.acc_read.filter(|_| !pa.unary) {
+                    self.steal_acc_read(port, pa.issue_bundle, pa.acc2_reg, false, &mut a2);
+                }
                 for i in 0..8 {
                     result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
                 }
             }
+            self.set_write_tag(pa.tag);
             self.queue_acc_write_timed(
                 pa.issue_bundle,
                 Operand::AccumReg(pa.dst_reg),
@@ -1336,6 +1561,7 @@ impl ExecutionContext {
                 pa.l_def,
                 pa.def_bypass,
             );
+            self.set_write_tag(None);
         }
     }
 
@@ -1398,6 +1624,7 @@ impl ExecutionContext {
             l_def: self.result_latency,
             def_bypass: self.result_bypass,
             ready_bundle: self.bundle_seq + VLDA_UPS_SHIFT_READ_LATENCY,
+            tag: self.write_tag,
         });
     }
 
@@ -1429,6 +1656,7 @@ impl ExecutionContext {
             } else {
                 acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
             }
+            self.set_write_tag(pu.tag);
             self.queue_acc_write_timed(
                 pu.issue_bundle,
                 Operand::AccumReg(pu.dest_reg),
@@ -1437,6 +1665,7 @@ impl ExecutionContext {
                 pu.l_def,
                 pu.def_bypass,
             );
+            self.set_write_tag(None);
         }
     }
 

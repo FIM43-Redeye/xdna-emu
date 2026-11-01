@@ -39,6 +39,9 @@
 mod decoder;
 mod loader;
 mod operand_extraction;
+pub mod ports;
+#[cfg(test)]
+mod ports_goldens;
 mod slot_builder;
 pub(crate) mod composite;
 pub mod crossref;

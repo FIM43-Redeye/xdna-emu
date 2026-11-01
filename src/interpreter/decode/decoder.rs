@@ -90,6 +90,9 @@ pub struct InstructionDecoder {
     /// Indexed by LLVM opcode ID for O(1) lookups. Populated once at init.
     pub(super) instr_info: Vec<decoder_ffi::InstrInfo>,
 
+    /// Register-file write ports derived from the itineraries (see `decode::ports`).
+    pub(super) port_model: super::ports::PortModel,
+
     /// Statistics: successful decodes.
     pub(super) decode_count: u64,
     /// Statistics: unknown patterns.
@@ -385,6 +388,7 @@ impl Decoder for InstructionDecoder {
                     accum_width,
                     source_forward,
                     result_bypass,
+                    ports,
                 )) = self.try_decode_via_ffi(slot.bits, slot.slot_type)
                 {
                     // LLVM FFI is the sole production decoder for both instruction
@@ -399,6 +403,7 @@ impl Decoder for InstructionDecoder {
                         result_bypass,
                     );
                     slot_op.llvm_opcode = ffi_opcode;
+                    slot_op.ports = ports;
                     (slot_op.accum_width, slot_op.src_accum_width) = accum_width;
                     // Attach secondary destinations (e.g., cmp register for
                     // dual-result instructions like VSUB_LT, VABS_GTZ).
@@ -1822,7 +1827,7 @@ mod tests {
 
         // Try FFI decoder
         let ffi_result = decoder.try_decode_via_ffi(mv_bits, SlotType::Mv);
-        if let Some((decoded, dest, sources, _, _, _, _, _, _)) = &ffi_result {
+        if let Some((decoded, dest, sources, _, _, _, _, _, _, _)) = &ffi_result {
             eprintln!(
                 "FFI decode: name={:?} mnemonic={:?} dest={:?} sources={:?}",
                 decoded.encoding.name, decoded.encoding.mnemonic, dest, sources

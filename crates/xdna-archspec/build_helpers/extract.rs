@@ -99,6 +99,9 @@ pub struct BuildTblgenOutput {
     pub itineraries: HashMap<String, BuildItineraryInfo>,
     /// Functional units in processor-itinerary order; the decoder reports a stage's unit by index.
     pub functional_units: Vec<String>,
+    /// Distinct `(itinerary class, register class of the first output)` pairs of the instruction
+    /// records: which register files the instructions of a scheduling class write.
+    pub itinerary_output_classes: Vec<(String, String)>,
     pub register_model: BuildRegisterModel,
     pub composite_formats: Vec<BuildCompositeFormat>,
     pub unpack_forms: Vec<BuildUnpackForm>,
@@ -1198,6 +1201,13 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         .filter_map(|r| r.descriptor_class.map(|d| (r.name.clone(), d)))
         .collect();
 
+    let itinerary_output_classes: Vec<(String, String)> = records
+        .iter()
+        .filter_map(|r| Some((r.itinerary_class.clone()?, r.outputs.first()?.0.clone())))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     // Convert to encodings grouped by slot
     let mut by_slot: HashMap<String, Vec<BuildInstrEncoding>> = HashMap::new();
     for record in records {
@@ -1356,6 +1366,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         processor_model,
         itineraries,
         functional_units,
+        itinerary_output_classes,
         register_model,
         composite_formats,
         unpack_forms,

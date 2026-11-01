@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+use super::write_collision::{self, Chunk, WriteTag};
+
 pub use xdna_archspec::aie2::Bypass;
 
 /// 512-bit vector data: two consecutive 256-bit w-registers.
@@ -390,11 +392,28 @@ impl fmt::Debug for ModifierRegisterFile {
 #[derive(Clone, Copy, Debug)]
 struct PendingVecWrite {
     reg: u8,
+    /// The value that lands: `orig`, or what the collision resolver left of it.
     value: [u32; 8],
     issue_bundle: u64,
     l_def: u8,
     def_bypass: Bypass,
+    /// Port, issue sequence and landing bundle of the writing instruction, when it has a
+    /// collision-modelled write port (see `write_collision`).
+    tag: Option<WriteTag>,
+    /// Position of this chunk within its instruction's write (`wl` 0, `wh` 1 of an x write).
+    ordinal: u8,
+    /// What the instruction computed, before collision resolution.
+    orig: [u32; 8],
+    /// The resolver dropped this write: another writer took its bank.
+    dropped: bool,
+    /// A stand-in for a write that is applied elsewhere (a load commit): it takes part in
+    /// collision resolution but is never visible and never lands here. See `register_phantom`.
+    phantom: Option<u32>,
 }
+
+/// How many bundles past their landing bundle phantom writes stay, for the owner to read the
+/// resolver's verdict.
+const PHANTOM_KEEP_BUNDLES: u64 = 64;
 
 /// Vector register file.
 ///
@@ -417,6 +436,11 @@ pub struct VectorRegisterFile {
     /// Current issued-bundle counter (the issue-slot-relative clock the
     /// compiler's latencies are expressed in). Set at bundle start.
     cur_bundle: u64,
+    /// Write tag of the instruction being executed; stamped on every write queued meanwhile.
+    cur_tag: Option<WriteTag>,
+    /// `(issue sequence, next ordinal)`: numbers the chunks one instruction queues.
+    ordinals: (u64, u8),
+    next_phantom: u32,
 }
 
 impl Default for VectorRegisterFile {
@@ -433,6 +457,9 @@ impl VectorRegisterFile {
             snapshot: None,
             pending: Vec::new(),
             cur_bundle: 0,
+            cur_tag: None,
+            ordinals: (0, 0),
+            next_phantom: 0,
         }
     }
 
@@ -459,11 +486,14 @@ impl VectorRegisterFile {
         }
         // Apply landed writes in issue order (Vec is push/issue-ordered).
         for w in &self.pending {
-            if w.issue_bundle + w.l_def as u64 <= bundle {
+            if w.phantom.is_none() && !w.dropped && w.issue_bundle + w.l_def as u64 <= bundle {
                 self.regs[(w.reg & 0x1F) as usize] = w.value;
             }
         }
-        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 > bundle);
+        self.pending.retain(|w| match (w.phantom, w.tag) {
+            (Some(_), Some(t)) => t.land + PHANTOM_KEEP_BUNDLES > bundle,
+            _ => w.issue_bundle + w.l_def as u64 > bundle,
+        });
     }
 
     /// Effective visibility bundle of an in-flight write to a consumer reading
@@ -489,7 +519,10 @@ impl VectorRegisterFile {
         let idx = (reg & 0x1F) as usize;
         let mut val = self.active()[idx];
         for w in &self.pending {
-            if (w.reg & 0x1F) as usize == idx && Self::visible_at(w, use_cycle, use_bypass) <= self.cur_bundle
+            if (w.reg & 0x1F) as usize == idx
+                && w.phantom.is_none()
+                && !w.dropped
+                && Self::visible_at(w, use_cycle, use_bypass) <= self.cur_bundle
             {
                 val = w.value;
             }
@@ -525,13 +558,104 @@ impl VectorRegisterFile {
             self.regs[(reg & 0x1F) as usize] = value;
             return;
         }
+        let ordinal = self.next_ordinal();
         self.pending.push(PendingVecWrite {
             reg: reg & 0x1F,
             value,
             issue_bundle: self.cur_bundle,
             l_def,
             def_bypass,
+            tag: self.cur_tag,
+            ordinal,
+            orig: value,
+            dropped: false,
+            phantom: None,
         });
+        self.settle_collisions();
+    }
+
+    /// Set the write tag stamped on the writes the instruction about to execute queues (`None`:
+    /// untagged, never collides).
+    pub fn set_write_tag(&mut self, tag: Option<WriteTag>) {
+        self.cur_tag = tag;
+    }
+
+    /// Ordinal of the next chunk the current instruction queues.
+    fn next_ordinal(&mut self) -> u8 {
+        let Some(tag) = self.cur_tag else { return 0 };
+        if self.ordinals.0 != tag.seq {
+            self.ordinals = (tag.seq, 0);
+        }
+        let ord = self.ordinals.1;
+        self.ordinals.1 += 1;
+        ord
+    }
+
+    /// Resolve the collisions among the writes that land in the cycle of the newest one. The
+    /// resolver is a pure function of what each instruction computed, so it re-runs on the
+    /// originals whenever another writer joins the cycle.
+    fn settle_collisions(&mut self) {
+        let Some(land) = self.pending.last().and_then(|w| w.tag).map(|t| t.land) else {
+            return;
+        };
+        let members: Vec<usize> = (0..self.pending.len())
+            .filter(|&i| self.pending[i].tag.is_some_and(|t| t.land == land))
+            .collect();
+        let mut writers: Vec<u64> = members.iter().map(|&i| self.pending[i].tag.unwrap().seq).collect();
+        writers.sort_unstable();
+        writers.dedup();
+        if writers.len() < 2 {
+            return;
+        }
+        let chunks: Vec<Chunk> = members
+            .iter()
+            .map(|&i| {
+                let w = &self.pending[i];
+                let tag = w.tag.unwrap();
+                Chunk {
+                    writer: tag.seq,
+                    port: tag.port,
+                    ordinal: w.ordinal,
+                    bank: w.reg & 1,
+                    reg: w.reg as u16,
+                    data: w.orig,
+                }
+            })
+            .collect();
+        for (&i, landing) in members.iter().zip(write_collision::resolve(&chunks)) {
+            self.pending[i].dropped = !landing.lands;
+            self.pending[i].value = landing.data;
+        }
+    }
+
+    /// Enter a stand-in for a write that is applied outside this file (a load commit) so that it
+    /// takes part in collision resolution. Returns the handle for [`phantom_verdict`].
+    pub fn register_phantom(&mut self, reg: u8, value: [u32; 8]) -> Option<u32> {
+        let tag = self.cur_tag?;
+        let id = self.next_phantom;
+        self.next_phantom += 1;
+        let ordinal = self.next_ordinal();
+        self.pending.push(PendingVecWrite {
+            reg: reg & 0x1F,
+            value,
+            issue_bundle: self.cur_bundle,
+            l_def: 1,
+            def_bypass: Bypass::No,
+            tag: Some(tag),
+            ordinal,
+            orig: value,
+            dropped: false,
+            phantom: Some(id),
+        });
+        self.settle_collisions();
+        Some(id)
+    }
+
+    /// What the resolver decided for a phantom: the data to write, or `None` when another
+    /// writer took its bank. An unknown handle (expired) means "write as computed".
+    pub fn phantom_verdict(&self, id: u32) -> Option<Option<[u32; 8]>> {
+        let w = self.pending.iter().find(|w| w.phantom == Some(id))?;
+        Some((!w.dropped).then_some(w.value))
     }
 
     /// Queue a 512-bit wide write (two consecutive w-registers) through the
@@ -713,6 +837,7 @@ impl fmt::Debug for VectorRegisterFile {
 #[derive(Clone, Debug)]
 struct PendingAccWrite {
     reg: u8,
+    /// The value that lands: `orig`, or what the collision resolver left of it.
     value: [u64; 8],
     /// Lanes of `value` the write replaces (bit i = u64 lane i): all eight for a bm half, four for
     /// an `am` quarter. The other lanes keep whatever the register holds when the write lands.
@@ -720,6 +845,16 @@ struct PendingAccWrite {
     issue_bundle: u64,
     l_def: u8,
     def_bypass: Bypass,
+    /// Port, issue sequence and landing bundle of the writing instruction (see
+    /// `write_collision`), when it has a collision-modelled write port.
+    tag: Option<WriteTag>,
+    /// Ordinal of this entry's first 256-bit chunk within its instruction's write.
+    ordinal: u8,
+    /// What the instruction computed, before collision resolution.
+    orig_value: [u64; 8],
+    orig_lanes: u8,
+    /// A stand-in for a write applied elsewhere (a load commit); see `register_phantom`.
+    phantom: Option<u32>,
 }
 
 /// Use cycle of the accumulator source of the stores, SRS, moves and converts
@@ -761,6 +896,14 @@ pub struct AccumulatorRegisterFile {
     pending: Vec<PendingAccWrite>,
     /// Issued-bundle clock; set at bundle start.
     cur_bundle: u64,
+    /// Write tag of the instruction being executed; stamped on every write queued meanwhile.
+    cur_tag: Option<WriteTag>,
+    /// `(issue sequence, next ordinal)`: numbers the chunks one instruction queues.
+    ordinals: (u64, u8),
+    next_phantom: u32,
+    /// Wired-OR patches for the bundle being issued: a read of `reg` sees `value` OR-ed in.
+    /// Armed per bundle by the executor, cleared by `end_bundle`.
+    wired_or: Vec<(u8, [u64; 8])>,
 }
 
 impl Default for AccumulatorRegisterFile {
@@ -777,7 +920,17 @@ impl AccumulatorRegisterFile {
             snapshot: None,
             pending: Vec::new(),
             cur_bundle: 0,
+            cur_tag: None,
+            ordinals: (0, 0),
+            next_phantom: 0,
+            wired_or: Vec::new(),
         }
+    }
+
+    /// OR `value` into every read of `reg` for the rest of this bundle (two SRS units sharing
+    /// the upper half of the shifter; see `ExecutionContext::arm_srs_wired_or`).
+    pub fn arm_wired_or(&mut self, reg: u8, value: [u64; 8]) {
+        self.wired_or.push((reg, value));
     }
 
     /// The array reads see: the bundle snapshot if active, else live registers.
@@ -799,6 +952,7 @@ impl AccumulatorRegisterFile {
     #[inline]
     pub fn end_bundle(&mut self) {
         self.snapshot = None;
+        self.wired_or.clear();
     }
 
     /// Advance the issued-bundle clock and commit the in-flight writes that every reader sees
@@ -811,11 +965,14 @@ impl AccumulatorRegisterFile {
             return;
         }
         for w in &self.pending {
-            if w.issue_bundle + w.l_def as u64 + 1 <= bundle {
+            if w.phantom.is_none() && w.issue_bundle + w.l_def as u64 + 1 <= bundle {
                 Self::merge_lanes(&mut self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS], &w.value, w.lanes);
             }
         }
-        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 + 1 > bundle);
+        self.pending.retain(|w| match (w.phantom, w.tag) {
+            (Some(_), Some(t)) => t.land + PHANTOM_KEEP_BUNDLES > bundle,
+            _ => w.issue_bundle + w.l_def as u64 + 1 > bundle,
+        });
     }
 
     /// The bundle clock (the bundle being issued).
@@ -838,9 +995,17 @@ impl AccumulatorRegisterFile {
         let mut val = self.active()[idx];
         for w in &self.pending {
             if (w.reg as usize) % NUM_ACCUMULATOR_REGS == idx
+                && w.phantom.is_none()
                 && Self::visible_from(w, use_bypass) <= read_bundle
             {
                 Self::merge_lanes(&mut val, &w.value, w.lanes);
+            }
+        }
+        for (patched, or) in &self.wired_or {
+            if (*patched as usize) % NUM_ACCUMULATOR_REGS == idx {
+                for (lane, bits) in val.iter_mut().zip(or) {
+                    *lane |= bits;
+                }
             }
         }
         val
@@ -884,8 +1049,7 @@ impl AccumulatorRegisterFile {
             self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = value;
             return;
         }
-        self.pending
-            .push(PendingAccWrite { reg, value, lanes: ALL_LANES, issue_bundle, l_def, def_bypass });
+        self.push_pending(reg, value, ALL_LANES, issue_bundle, l_def, def_bypass, None);
     }
 
     /// Queue a write of the lanes in `lanes` only (an `am` quarter move), issued in the current
@@ -897,8 +1061,129 @@ impl AccumulatorRegisterFile {
             return;
         }
         let issue_bundle = self.cur_bundle;
-        self.pending
-            .push(PendingAccWrite { reg, value, lanes, issue_bundle, l_def, def_bypass });
+        self.push_pending(reg, value, lanes, issue_bundle, l_def, def_bypass, None);
+    }
+
+    /// Set the write tag stamped on the writes the instruction about to execute queues (`None`:
+    /// untagged, never collides).
+    pub fn set_write_tag(&mut self, tag: Option<WriteTag>) {
+        self.cur_tag = tag;
+    }
+
+    fn quarters(lanes: u8) -> impl Iterator<Item = u8> {
+        (0..2u8).filter(move |q| lanes & (0x0F << (4 * q)) != 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_pending(
+        &mut self,
+        reg: u8,
+        value: [u64; 8],
+        lanes: u8,
+        issue_bundle: u64,
+        l_def: u8,
+        def_bypass: Bypass,
+        phantom: Option<u32>,
+    ) {
+        let ordinal = match self.cur_tag {
+            Some(tag) => {
+                if self.ordinals.0 != tag.seq {
+                    self.ordinals = (tag.seq, 0);
+                }
+                let ord = self.ordinals.1;
+                self.ordinals.1 += Self::quarters(lanes).count() as u8;
+                ord
+            }
+            None => 0,
+        };
+        self.pending.push(PendingAccWrite {
+            reg,
+            value,
+            lanes,
+            issue_bundle,
+            l_def,
+            def_bypass,
+            tag: self.cur_tag,
+            ordinal,
+            orig_value: value,
+            orig_lanes: lanes,
+            phantom,
+        });
+        self.settle_collisions();
+    }
+
+    /// Resolve the collisions among the writes that land in the cycle of the newest one (see
+    /// `VectorRegisterFile::settle_collisions`). An entry's chunks are its 256-bit quarters;
+    /// quarter `q` of register `reg` goes to bank `2 * (reg & 1) + q`.
+    fn settle_collisions(&mut self) {
+        let Some(land) = self.pending.last().and_then(|w| w.tag).map(|t| t.land) else {
+            return;
+        };
+        let members: Vec<usize> = (0..self.pending.len())
+            .filter(|&i| self.pending[i].tag.is_some_and(|t| t.land == land))
+            .collect();
+        let mut writers: Vec<u64> = members.iter().map(|&i| self.pending[i].tag.unwrap().seq).collect();
+        writers.sort_unstable();
+        writers.dedup();
+        if writers.len() < 2 {
+            return;
+        }
+        let mut chunks = Vec::new();
+        let mut owner = Vec::new(); // (pending index, quarter) per chunk
+        for &i in &members {
+            let w = &self.pending[i];
+            let tag = w.tag.unwrap();
+            for (n, q) in Self::quarters(w.orig_lanes).enumerate() {
+                let lanes = &w.orig_value[4 * q as usize..4 * q as usize + 4];
+                let mut data = [0u32; 8];
+                for (k, l) in lanes.iter().enumerate() {
+                    data[2 * k] = *l as u32;
+                    data[2 * k + 1] = (*l >> 32) as u32;
+                }
+                chunks.push(Chunk {
+                    writer: tag.seq,
+                    port: tag.port,
+                    ordinal: w.ordinal + n as u8,
+                    bank: 2 * (w.reg & 1) + q,
+                    reg: w.reg as u16,
+                    data,
+                });
+                owner.push((i, q));
+            }
+        }
+        for &i in &members {
+            self.pending[i].lanes = 0;
+        }
+        for ((i, q), landing) in owner.into_iter().zip(write_collision::resolve(&chunks)) {
+            if !landing.lands {
+                continue;
+            }
+            let w = &mut self.pending[i];
+            w.lanes |= 0x0F << (4 * q);
+            for k in 0..4 {
+                w.value[4 * q as usize + k] =
+                    landing.data[2 * k] as u64 | (landing.data[2 * k + 1] as u64) << 32;
+            }
+        }
+    }
+
+    /// Enter a stand-in for a write applied outside this file (a load commit) so that it takes
+    /// part in collision resolution: `lanes` selects the quarters of `reg` it writes. Returns the
+    /// handle for [`phantom_verdict`](Self::phantom_verdict).
+    pub fn register_phantom(&mut self, reg: u8, value: [u64; 8], lanes: u8, l_def: u8) -> Option<u32> {
+        self.cur_tag?;
+        let id = self.next_phantom;
+        self.next_phantom += 1;
+        let issue = self.cur_bundle;
+        self.push_pending(reg, value, lanes, issue, l_def, Bypass::No, Some(id));
+        Some(id)
+    }
+
+    /// What the resolver decided for a phantom: the lanes that still land and their values.
+    /// `None` for an unknown (expired) handle: write as computed.
+    pub fn phantom_verdict(&self, id: u32) -> Option<([u64; 8], u8)> {
+        let w = self.pending.iter().find(|w| w.phantom == Some(id))?;
+        Some((w.value, w.lanes))
     }
 
     fn merge_lanes(dst: &mut [u64; 8], src: &[u64; 8], lanes: u8) {
@@ -951,6 +1236,11 @@ impl AccumulatorRegisterFile {
     #[inline]
     pub fn write(&mut self, reg: u8, value: [u64; 8]) {
         self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = value;
+    }
+
+    /// Write the lanes of `value` selected by `lanes` straight into the committed register.
+    pub fn write_lanes(&mut self, reg: u8, value: &[u64; 8], lanes: u8) {
+        Self::merge_lanes(&mut self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS], value, lanes);
     }
 
     /// Read a single lane (0-7) as u64.

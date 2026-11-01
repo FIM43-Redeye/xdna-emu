@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use smallvec::SmallVec;
 
-use crate::interpreter::bundle::{Operand, PostModify};
+use crate::interpreter::bundle::{Operand, PortUse, PostModify};
 use crate::interpreter::state::SP_PTR_INDEX;
 #[cfg(test)]
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
@@ -121,6 +121,7 @@ impl InstructionDecoder {
         (Option<AccumWidth>, Option<AccumWidth>),
         SmallVec<[(u8, Bypass); 4]>,
         Bypass,
+        PortUse,
     )> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
@@ -174,6 +175,16 @@ impl InstructionDecoder {
             source_forward.push((uc, ub));
         }
 
+        let def_cycle = (ffi_result.res_num_defs >= 1 && ffi_result.res_num_operand_cycles >= 1)
+            .then(|| ffi_result.res_operand_cycle[0]);
+        let ports = self.port_model.port_use(
+            &ffi_result.res_stages,
+            def_cycle,
+            dest.as_ref(),
+            &sources,
+            &source_forward,
+        );
+
         // Build a minimal DecodedInstr with empty raw operands (we don't need
         // them since we're using LLVM's operands, but build_slot_op reads
         // encoding metadata from it).
@@ -189,6 +200,7 @@ impl InstructionDecoder {
             accum_width,
             source_forward,
             result_bypass,
+            ports,
         ))
     }
 

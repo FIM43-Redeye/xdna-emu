@@ -322,6 +322,36 @@ pub struct SlotOp {
     /// itinerary. Drives this op's vector-write forwarding visibility. No for
     /// ops without a forwarding def.
     pub result_bypass: Bypass,
+    /// Register-file port facts from the resolved itinerary; empty for synthetic ops.
+    pub ports: PortUse,
+}
+
+/// The cycle in which an instruction reads its accumulator source, as the units the itinerary
+/// holds then (indices into the processor's functional-unit list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccReadPort {
+    /// Cycle offset from issue of the read.
+    pub offset: u8,
+    /// The lowest-indexed unit held in the read cycle: the main accumulator read port.
+    pub primary: u16,
+    /// The highest-indexed unit when two or more are held (the SRS shifter), else `None`.
+    pub secondary: Option<u16>,
+}
+
+/// Register-file port facts of an instruction, from its resolved itinerary (see
+/// `decode::ports`). Everything is a unit index or a property derived from unit indices: the
+/// emulator names no unit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortUse {
+    /// The unit through which the result enters the vector or accumulator register file.
+    /// Lower index = higher priority when two ports write one register position in one cycle.
+    pub write_port: Option<u16>,
+    /// The accumulator read, when the itinerary holds a unit in that cycle (instructions the
+    /// tables are silent about have none).
+    pub acc_read: Option<AccReadPort>,
+    /// Reads an accumulator and writes through a non-primary write port of its file. Inferred
+    /// from silicon: such an instruction steals the accumulator read port of a late reader.
+    pub mover: bool,
 }
 
 /// Accumulator source use cycle of the MAC family (II_VMAC/II_VACC `operand_cycles[1]`), assumed
@@ -533,6 +563,7 @@ impl SlotOp {
             src_accum_width: None,
             source_forward: SmallVec::new(),
             result_bypass: Bypass::No,
+            ports: PortUse::default(),
         }
     }
 
@@ -630,6 +661,7 @@ impl SlotOp {
             src_accum_width: None,
             source_forward: SmallVec::new(),
             result_bypass: Bypass::No,
+            ports: PortUse::default(),
         }
     }
 }

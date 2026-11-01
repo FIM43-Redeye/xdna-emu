@@ -169,6 +169,19 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
     )
     .unwrap();
 
+    writeln!(code).unwrap();
+    writeln!(
+        code,
+        "    let itinerary_output_classes: Vec<(String, String)> = vec![{}];",
+        output
+            .itinerary_output_classes
+            .iter()
+            .map(|(i, c)| format!("({:?}.to_string(), {:?}.to_string())", i, c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .unwrap();
+
     // Composite formats
     writeln!(code).unwrap();
     writeln!(code, "    let composite_formats = vec![").unwrap();
@@ -184,6 +197,7 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
     writeln!(code, "        processor_model,").unwrap();
     writeln!(code, "        itineraries,").unwrap();
     writeln!(code, "        functional_units,").unwrap();
+    writeln!(code, "        itinerary_output_classes,").unwrap();
     writeln!(code, "        register_model,").unwrap();
     writeln!(code, "        composite_formats,").unwrap();
     writeln!(code, "    }}").unwrap();

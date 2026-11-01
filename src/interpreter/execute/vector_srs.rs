@@ -99,6 +99,65 @@ use crate::interpreter::state::{ExecutionContext, SrsConfig};
 use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
+    /// Arm the SRS shifter wired OR for the bundle about to execute (call after `begin_bundle`).
+    ///
+    /// Two instructions that hold the same secondary accumulator read unit in their read cycle
+    /// (the shifter the SRS family adds to the read port) are a **mover** that reads the low 512
+    /// bits of its register (`vsrsm`) and an instruction with a full 1024-bit source. They share
+    /// the upper half of the shifter bus, so each sees the other's half OR-ed into its own
+    /// source: the mover's source gets the partner's high half, the partner's high half gets the
+    /// mover's source. Instructions with a 512-bit source do not take part (silicon, probe10 and
+    /// probe11). Both rules are inferred from silicon; the predicates are derived from the
+    /// resolved itineraries (`PortUse`) and the register widths.
+    ///
+    /// An s8-output partner does not convert the OR-ed upper bus itself: its upper 16 bytes are
+    /// the low halfwords of the first eight 32-bit words of the mover's result (probe8/probe9).
+    pub(crate) fn arm_srs_wired_or(ctx: &mut ExecutionContext, ops: &[&SlotOp]) {
+        use crate::interpreter::bundle::Operand;
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let secondary = |op: &SlotOp| op.ports.acc_read.and_then(|p| p.secondary);
+        let acc_src = |op: &SlotOp| {
+            op.sources.iter().find_map(|s| {
+                if let Operand::AccumReg(r) = s {
+                    Some(*r)
+                } else {
+                    None
+                }
+            })
+        };
+        for v in ops
+            .iter()
+            .copied()
+            .filter(|o| o.ports.mover && o.src_accum_width == Some(AccumWidth::Half))
+        {
+            let Some(unit) = secondary(v) else { continue };
+            for p in ops
+                .iter()
+                .copied()
+                .filter(|o| o.src_accum_width == Some(AccumWidth::Full) && secondary(o) == Some(unit))
+            {
+                let (Some(rv), Some(rp)) = (acc_src(v), acc_src(p)) else {
+                    continue;
+                };
+                let high = (rp & !1) | 1;
+                let (vu, vb) = v.acc_source_timing(0);
+                let (pu, pb) = p.acc_source_timing(0);
+                let v_src = ctx.accumulator.read_with(rv, vu, vb);
+                let p_high = ctx.accumulator.read_with(high, pu, pb);
+                ctx.accumulator.arm_wired_or(rv, p_high);
+                ctx.accumulator.arm_wired_or(high, v_src);
+                if p.element_type == Some(ElementType::Int8) {
+                    let bus: [u64; 8] = std::array::from_fn(|i| v_src[i] | p_high[i]);
+                    let shift = Self::get_shift_amount(v, ctx);
+                    let from = v.from_type.unwrap_or(ElementType::Int32);
+                    let to = v.element_type.unwrap_or(ElementType::Int16);
+                    let result = Self::vector_srs_from_acc(&bus, shift, from, to, &ctx.srs_config);
+                    ctx.set_srs_partner_units(Some(std::array::from_fn(|m| result[m] as u16)));
+                }
+            }
+        }
+    }
+
     /// Dispatch entry point for SRS (Shift-Round-Saturate) operations.
     ///
     /// Handles both narrow (256-bit) and wide (512-bit / 1024-bit) paths,
@@ -158,6 +217,11 @@ impl VectorAlu {
             let n = words_per_half.min(8);
             result[..n].copy_from_slice(&result_lo[..n]);
             result[n..n + n].copy_from_slice(&result_hi[..n]);
+            if et == ElementType::Int8 {
+                let mut lo: [u32; 8] = result[..8].try_into().unwrap();
+                ctx.apply_srs_partner_units(&mut lo);
+                result[..8].copy_from_slice(&lo);
+            }
 
             // A wide accumulator SOURCE (1024-bit cm) does NOT imply a wide
             // vector DEST. SRS reduces each acc lane to one output element, so

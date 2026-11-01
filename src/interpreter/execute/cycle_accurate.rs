@@ -813,6 +813,15 @@ impl CycleAccurateExecutor {
         ctx.process_pending_ups_loads();
 
         ctx.begin_bundle();
+        if bundle
+            .active_slots()
+            .filter(|o| o.ports.acc_read.is_some_and(|p| p.secondary.is_some()))
+            .count()
+            >= 2
+        {
+            let ops: smallvec::SmallVec<[&SlotOp; 8]> = bundle.active_slots().collect();
+            super::VectorAlu::arm_srs_wired_or(ctx, &ops);
+        }
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
         // pipeline stage E1 but UPS/SRS sample their shift operand at E7
@@ -848,6 +857,9 @@ impl CycleAccurateExecutor {
                 // lookup on the base class would return No).
                 ctx.result_latency = self.operation_cycles(op);
                 ctx.result_bypass = op.result_bypass;
+                ctx.begin_slot_writes(op.ports.write_port);
+                ctx.set_slot_acc_read(op.ports.acc_read);
+                ctx.record_read_claim(op);
 
                 // Reborrow neighbors for each slot operation
                 let slot_neighbors = neighbors.as_mut().map(|n| &mut **n);
@@ -902,6 +914,9 @@ impl CycleAccurateExecutor {
         // dispatch (e.g. pipeline drain) defaults to an immediate write.
         ctx.result_latency = 0;
         ctx.result_bypass = Bypass::No;
+        ctx.set_write_tag(None);
+        ctx.set_slot_acc_read(None);
+        ctx.set_srs_partner_units(None);
 
         ctx.end_bundle();
 

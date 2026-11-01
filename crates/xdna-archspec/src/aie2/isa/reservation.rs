@@ -35,26 +35,45 @@ pub struct Reservation {
 /// defines names exactly one unit (asserted by `no_stage_offers_a_choice_of_units`), so a
 /// stage with a choice is rejected rather than approximated.
 pub fn reservations_of(stages: &[PipelineStage]) -> Vec<Reservation> {
+    let timing: Vec<(u8, i8)> = stages.iter().map(|s| (s.cycles, s.time_inc)).collect();
+    stage_offsets(&timing)
+        .into_iter()
+        .map(|(stage, offset)| {
+            let s = &stages[stage];
+            assert!(s.units.len() == 1, "stage with a choice of units {:?} is not modelled", s.units);
+            Reservation { unit: s.units[0].clone(), offset, reserved: s.reserved }
+        })
+        .collect()
+}
+
+/// `(stage index, cycle offset)` of every cycle a stage list holds its unit, from each stage's
+/// `(cycles, time_inc)`. This is LLVM's `InstrStage` arithmetic, shared by the named form
+/// ([`reservations_of`]) and the decoder's index form ([`held_units`]).
+pub fn stage_offsets(timing: &[(u8, i8)]) -> Vec<(usize, u32)> {
     let mut out = Vec::new();
     let mut start: i32 = 0;
-    for stage in stages {
-        if stage.cycles > 0 {
-            assert!(stage.units.len() == 1, "stage with a choice of units {:?} is not modelled", stage.units);
-            for c in 0..stage.cycles as i32 {
-                out.push(Reservation {
-                    unit: stage.units[0].clone(),
-                    offset: (start + c) as u32,
-                    reserved: stage.reserved,
-                });
-            }
+    for (stage, &(cycles, time_inc)) in timing.iter().enumerate() {
+        for c in 0..cycles as i32 {
+            out.push((stage, (start + c) as u32));
         }
-        start += if stage.time_inc >= 0 {
-            stage.time_inc as i32
+        start += if time_inc >= 0 {
+            time_inc as i32
         } else {
-            stage.cycles as i32
+            cycles as i32
         };
     }
     out
+}
+
+/// One unit held in one cycle by a register-aware resolved stage list: the unit's index in
+/// `TblgenOutput::functional_units`, the cycle offset from issue, and whether the stage is of
+/// kind `Reserved`.
+pub fn held_units(resolved: &[ResolvedStage]) -> Vec<(u16, u32, bool)> {
+    let timing: Vec<(u8, i8)> = resolved.iter().map(|r| (r.cycles, r.next_cycles as i8)).collect();
+    stage_offsets(&timing)
+        .into_iter()
+        .map(|(stage, offset)| (resolved[stage].unit as u16, offset, resolved[stage].reserved))
+        .collect()
 }
 
 /// The reservations of a named itinerary class (its static, register-independent form).

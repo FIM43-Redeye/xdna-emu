@@ -74,6 +74,10 @@ pub struct PendingMatmul {
     acc_use_bypass: [crate::interpreter::state::Bypass; 2],
     /// Issued-bundle count at which the accumulator sources are read.
     pub ready_bundle: u64,
+    /// Write tag of the instruction, restored when the destination is queued.
+    tag: Option<crate::interpreter::state::write_collision::WriteTag>,
+    /// Accumulator read port of the instruction, for the late-read steal of acc2.
+    acc_read: Option<crate::interpreter::bundle::AccReadPort>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +332,8 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         def_bypass: ctx.result_bypass,
         acc_use_bypass: [bypass1, bypass2],
         ready_bundle: ctx.bundle_seq + use1.max(use2) as u64,
+        tag: ctx.write_tag(),
+        acc_read: ctx.slot_acc_read(),
     };
     ctx.queue_pending_matmul(pending);
 
@@ -352,8 +358,19 @@ fn read_acc_full(
     }
 }
 
+/// Read the second accumulator source of a deferred AddMac/SubMac. It goes through the
+/// accumulator read port, which a mover reading in the same cycle takes over.
+fn read_acc2(ctx: &ExecutionContext, p: &PendingMatmul) -> Acc1024 {
+    let mut acc2 = read_acc_full(ctx, p.acc2_reg, p.is_half, p.acc_use_bypass[1]);
+    if let Some(port) = p.acc_read {
+        ctx.steal_acc_read(port, p.issue_bundle, p.acc2_reg, !p.is_half, &mut acc2);
+    }
+    acc2
+}
+
 /// Queue the destination write of a completed MAC, timed from its issue.
 fn queue_result(ctx: &mut ExecutionContext, p: &PendingMatmul, value: Acc1024) {
+    ctx.set_write_tag(p.tag);
     ctx.queue_acc_write_timed(
         p.issue_bundle,
         Operand::AccumReg(p.acc_dest),
@@ -362,6 +379,7 @@ fn queue_result(ctx: &mut ExecutionContext, p: &PendingMatmul, value: Acc1024) {
         p.l_def,
         p.def_bypass,
     );
+    ctx.set_write_tag(None);
 }
 
 /// Complete a deferred MAC-family instruction: read its accumulator sources
@@ -372,9 +390,7 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
 
     // For AddMac/SubMac: read the second accumulator source. Integer acc2 is a
     // post-multiply add/sub.
-    let acc2 = p
-        .acc2_sub
-        .map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half, p.acc_use_bypass[1]));
+    let acc2 = p.acc2_sub.map(|_| read_acc2(ctx, p));
 
     let (a, b) = &p.operands;
     if let Some(combine) = &p.sparse_integer {
@@ -386,9 +402,7 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         product_config.subtract = false;
         matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
         let acc1 = read_acc_full(ctx, p.acc_src, p.is_half, p.acc_use_bypass[0]);
-        let acc2 = p
-            .acc2_sub
-            .map(|_| read_acc_full(ctx, p.acc2_reg, p.is_half, p.acc_use_bypass[1]));
+        let acc2 = p.acc2_sub.map(|_| read_acc2(ctx, p));
         let result = sparse::combine_integer(
             &acc1,
             acc2.as_ref(),

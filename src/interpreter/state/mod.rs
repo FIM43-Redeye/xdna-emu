@@ -27,6 +27,7 @@
 //! ```
 
 mod registers;
+pub mod write_collision;
 mod event_trace;
 mod timing_context;
 mod context;

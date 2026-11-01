@@ -22,6 +22,7 @@ impl InstructionDecoder {
             index: DecoderIndex::default(),
             format_table: None,
             instr_info: Vec::new(),
+            port_model: Default::default(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -70,8 +71,10 @@ impl InstructionDecoder {
             None
         };
 
+        let port_model = super::ports::PortModel::derive(&output);
         let mut decoder = Self::from_tables(output.encodings_by_slot);
         decoder.format_table = format_table;
+        decoder.port_model = port_model;
 
         // Populate per-opcode metadata from LLVM's MCInstrDesc + itinerary model.
         decoder.instr_info = decoder_ffi::query_all_instr_info();
@@ -124,6 +127,7 @@ impl InstructionDecoder {
             index,
             format_table: None,
             instr_info: Vec::new(),
+            port_model: Default::default(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -135,6 +139,7 @@ impl InstructionDecoder {
             index,
             format_table: None,
             instr_info: Vec::new(),
+            port_model: Default::default(),
             decode_count: 0,
             unknown_count: 0,
         }

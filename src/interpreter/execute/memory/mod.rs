@@ -1123,6 +1123,10 @@ impl MemoryUnit {
                 packed[n..n + n].copy_from_slice(&result_hi[..n]);
             }
 
+            if to == ElementType::Int8 {
+                ctx.apply_srs_partner_units(&mut packed);
+            }
+
             let store_bytes = n * 2 * 4; // Both halves, 4 bytes per u32 word
 
             log::debug!(
