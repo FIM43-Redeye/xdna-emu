@@ -76,12 +76,16 @@ register file.
 emit a schedule that holds one TableGen unit twice in a cycle, but a hand-written schedule can, and
 silicon is deterministic about what happens (every probe run twice, byte-identical). The first probe
 (`probe-v2`) saw 24 such points among 9690; the collision probes (`tools/gen_collision_probe.py`,
-`build/experiments/collisions/probe` .. `probe12`, 12 directories, 11200 points) take every pair of
+`build/experiments/collisions/probe` .. `probe12`, 12 directories, 11394 points) take every pair of
 instructions whose resolved reservations overlap on an accumulator-datapath unit and run it at the
 colliding issue distance plus the neighbouring distances as controls. The emulator now matches silicon
-on all of them (counts below). Nothing here changes a schedule the resource model allows: the
+on all of them (counts below). The 24 `probe-v2` points were three cases: a `vmov` source read in
+the cycle a `vadd`/`vaddmac` reads its second accumulator (16 points: rule 3), a `vclr` landing in the
+same cycle as a float MAC/add result (6: rule 1 or 2 by port) and a `vlda.ups` landing with a
+`vaddmac.f` on one `bm` (2: rule 2, the `vaddmac.f` port wins). Nothing here changes a schedule the resource model allows: the
 resolver only acts when two tagged writes share a register file and a landing cycle, and the ISA
-suite and the bridge suite did not move.
+suite (426 PASS, 0 FAIL) and the bridge suite (`--no-hw`: Chess 90 pass, 0 fail; Peano 105 pass, 1 fail,
+the known `dynamic_chain_passthrough/8`) did not move.
 
 *Where the model gets its facts.* No unit name, stage number or instruction name is in the emulator.
 `SlotOp.ports` (`PortUse`, built in `decode/ports.rs` from the decoder FFI's resolved stages) carries
@@ -155,9 +159,22 @@ emulator at the start of this work, `after` the model):
 
 | Probe (dir under `build/experiments/collisions/`) | Content | before | after |
 |---|---|---|---|
-@@COUNTS@@
+| `probe` | v1: every pair of accumulator-datapath units, 20 kernels (1122 points) | 85 | 0 |
+| `probe2` | v2: cross-domain pairs, cross-port write pairs, reads the tables leave out (2601 points) | 294 | 0 |
+| `probe3` | 34 more instructions (every SRS shape, `W_*`/`CM_WM` holders, shuffles, `vmov am,q`) (3356 points) | 275 | 0 |
+| `probe4` | `UPPER_SRS`, one-hot bit patterns that tell halves apart (464 points) | 64 | 0 |
+| `probe5` | same with odd accumulator lanes nonzero (131 points) | 8 | 0 |
+| `probe6` | vector-file family incl. `wh` destinations and cross-port pairs (1541 points) | 208 | 0 |
+| `probe7` | 28 single-instruction references (sibling encodings) (28 points) | 0 | 0 |
+| `probe8` | s8 partners x the four `vsrsm` shapes, shift 0 (93 points) | 16 | 0 |
+| `probe9` | same pairs, SRS shift 4 (93 points) | 16 | 0 |
+| `probe10` | all `UPPER_SRS` pairs, one-hot patterns, shift 4 (655 points) | 90 | 0 |
+| `probe11` | same pairs, odd lanes nonzero, shift 4 (655 points) | 90 | 0 |
+| `probe12` | same pairs, odd lanes nonzero, shift 9 (confirms the lane-mode rule; made after the baseline) (655 points) | n/a | 0 |
+| `neg` | `vneg*` / `vnegmac` family (46 points) | 1 (`vnegmac`, fixed here) | 0 |
+| `sparse/acc-timing/probe-v2` | the accumulator timing probe the 24 points came from (9690 points) | 24 | 0 |
 
-Replays: `src/interpreter/execute/collision_goldens.rs` runs 95 silicon pair points (one per port group,
+Replays: `src/interpreter/execute/collision_goldens.rs` runs 99 silicon pair points (one per port group,
 configuration and outcome signature) through the cycle-accurate executor; the resolver has unit tests
 for each rule and `tools/mutation_check_collisions.py` breaks each rule and confirms a test fails
 (`build/experiments/collisions/mutation_check.txt`).
@@ -176,9 +193,10 @@ sense of this section.
 - `VMOV_CASCADE_READ` collisions: the cascade read writes the accumulator file through a port the
   tables share (`CM_WM`), but its data arrives from a neighbouring tile, so a collision needs a
   two-tile harness. Deferred, required for 100%.
-- `UPS_UNIT` cannot be separated from `CM_WM_PORT`: every instruction that holds the UPS unit also
-  holds the write port in the cycle the result lands, so no probe can collide on one without the other.
-  The model treats the pair as the write-port collision it is.
+- `UPS_UNIT` cannot be separated from `CM_WM_PORT`: every instruction that holds the UPS unit holds
+  the write port exactly two cycles later (`vups` 0 and 2, `vlda.ups` 6 and 8), so two instructions
+  colliding on the UPS unit collide on the write port at the same instant and no probe can tell which
+  one silicon arbitrates on. The model treats the pair as the write-port collision it is.
 - Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
   (`W_RS`, the third write port) and `vlda.am` quarters (via the load commit).
 - Unconfirmed extrapolations listed under "Inferred" above.
