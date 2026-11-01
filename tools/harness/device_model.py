@@ -54,6 +54,7 @@ class DeviceModel:
     local_memory_size: int
     mem_tile_size: int
     default_core_stack_size: int
+    address_gen_granularity_bits: int   # mlir-aie getAddressGenGranularity(): BITS
     cascade: CascadeRule
     _tile_types: dict[TileCoord, str]
     _type_configs: dict[str, dict]
@@ -64,6 +65,22 @@ class DeviceModel:
 
     def data_memory_bytes(self, tile_type: str) -> int:
         return self.mem_tile_size if tile_type == "mem_tile" else self.local_memory_size
+
+    def num_locks(self, tile_type: str) -> int:
+        return self._type_config(tile_type)["num_locks"]
+
+    def num_bds(self, tile_type: str) -> int:
+        return self._type_config(tile_type)["num_bds"]
+
+    @property
+    def dma_alignment_bytes(self) -> int:
+        """Granule of DMA addressing and transfer length, in bytes.
+
+        mlir-aie's AIEXDialect.cpp reports "Transfer sizes must be multiples
+        of (addressGranularity / 8) bytes", so the stored bit width is divided
+        by 8 (32 bits -> 4 bytes on AIE2).
+        """
+        return self.address_gen_granularity_bits // 8
 
     @property
     def program_memory_bytes(self) -> int:
@@ -122,6 +139,7 @@ def load_device_model(name: str, path: Path = DEFAULT_MODELS_PATH) -> DeviceMode
             local_memory_size=d["local_memory_size"],
             mem_tile_size=d["mem_tile_size"],
             default_core_stack_size=d["default_core_stack_size"],
+            address_gen_granularity_bits=d["address_gen_granularity"],
             cascade=rule,
             _tile_types={(t["col"], t["row"]): t["type"] for t in d["tile_map"]},
             _type_configs=d["tile_types"],

@@ -78,3 +78,17 @@ def test_cascade_direction_rule(npu1):
     assert c.direction((0, 3), (1, 2)) is None   # diagonal
     assert c.direction((1, 4), (1, 2)) is None   # not adjacent
     assert c.direction((1, 2), (1, 2)) is None
+
+
+# -- facts the channel planner needs ----------------------------------------
+
+def test_tile_resource_counts(npu1):
+    assert (npu1.num_locks("mem_tile"), npu1.num_bds("mem_tile")) == (64, 48)
+    assert (npu1.num_locks("core"), npu1.num_bds("core")) == (16, 16)
+
+
+def test_dma_alignment_is_granularity_in_bytes(npu1):
+    # The JSON carries mlir-aie getAddressGenGranularity(), which is in BITS
+    # (32 on AIE2); the 4-byte alignment is derived, not stored.
+    assert npu1.address_gen_granularity_bits == 32
+    assert npu1.dma_alignment_bytes == 4
