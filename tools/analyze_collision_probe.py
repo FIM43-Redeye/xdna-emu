@@ -119,7 +119,7 @@ def words(b):
 
 
 def used_bytes(ins):
-    return {"cm": 128, "bml": 64, "x": 64, "wl": 32, "mem": 64, "am": 32, "q": 16}[ins.dst]
+    return {"cm": 128, "bml": 64, "x": 64, "wl": 32, "wh": 32, "mem": 64, "am": 32, "q": 16}[ins.dst]
 
 
 def ref_key(kind, ins_key, r, dom):
@@ -183,9 +183,12 @@ def classify(d, hw_tag, emu_tag=None):
                     ref = refs.get(ref_key("alone", ins.key, {**r, "s": sw}, dom))
                     if ref and osrc != r["s"][j]:
                         cands[f"src{j + 1}<-{other_ins.key}.s{oi + 1}"] = ref[1]
-                        if alone and len(ref[1]) == 128:       # a 1024-bit result: low half only
-                            cands[f"src{j + 1}.lo512<-{other_ins.key}.s{oi + 1}"] = (
-                                ref[1][:64] + alone[1][64:])
+                        if alone and len(ref[1]) in (64, 128):   # a wide result: low part only
+                            for bits, nbytes in (("lo512", 64), ("lo256", 32)):
+                                if nbytes >= len(ref[1]):
+                                    continue
+                                cands[f"src{j + 1}.{bits}<-{other_ins.key}.s{oi + 1}"] = (
+                                    ref[1][:nbytes] + alone[1][nbytes:])
             cands["zeros"] = bytes(len(out))
             oalone = refs.get(ref_key("alone", other_ins.key, other_r, dom))
             if oalone and alone:

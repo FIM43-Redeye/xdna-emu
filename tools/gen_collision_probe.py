@@ -90,6 +90,8 @@ READ_UNITS = ("CM_RM_PORT", "UPPER_SRS")
 # The two ports that write the accumulator register file (names: CM = accumulator, W = write).
 # Two instructions that write one register in one cycle collide whichever port each uses.
 ACC_WRITE_UNITS = tuple(u for u in ACC_UNITS if re.match(r"^CM_W", u))
+# The same holds for the two ports that write the W register file.
+W_WRITE_UNITS = tuple(u for u in ACC_UNITS if re.match(r"^W_W", u))
 # Instructions whose accumulator source read the tables do not reserve: their fitted use cycle is
 # 3 (FIT.md), i.e. a read in cycle 2, like the CM_RM_PORT readers that do reserve it. They are
 # paired with the CM_RM_PORT cycle-0 readers to see whether the tables miss a collision.
@@ -101,7 +103,24 @@ UNRESERVED_READS = {"vmac_i": 2, "vmac_f": 2, "vmsc_f": 2, "vmac_i_sparse": 2, "
 # --------------------------------------------------------------------------
 
 
+# COLLISION_BITPAT=1 swaps the consecutive-integer patterns for one-hot ones (lane j of register
+# k is (1 << k) | (j << 8) plus a half marker, 0x1000 for the low 512 bits of the register and
+# 0x2000 for the high 512), so that an OR, a sum, an XOR or an AND of two registers' lanes are
+# different, readable words and a lane from the low half is told from one from the high half.
+# Used by the phase-2b UPPER_SRS follow-up probe.
+BITPAT = os.environ.get("COLLISION_BITPAT") in ("1", "2")
+# COLLISION_BITPAT=2 additionally makes the odd lanes nonzero (flag 0x4000): only for 32-bit
+# accumulator lanes, since for 64-bit lanes the odd words are the high words and would saturate.
+BITPAT_ODD = os.environ.get("COLLISION_BITPAT") == "2"
+# COLLISION_KEYS=a,b,c restricts the collision list to pairs of these catalogue instructions.
+KEYS_ONLY = set(filter(None, os.environ.get("COLLISION_KEYS", "").split(",")))
+
+
 def _pat_i(k):
+    if BITPAT:
+        return base._u16s([((1 << k) | ((i // 2) << 8) | (0x1000 if i < 16 else 0x2000)
+                            | (0x4000 if i % 2 else 0))
+                           if (i % 2 == 0 or BITPAT_ODD) else 0 for i in range(32)])
     return base._int_pattern(100 + 700 * k)
 
 
@@ -288,10 +307,22 @@ CATALOGUE_2B = [
     Ins("vmov_am_q", "vmov amll{D}, q1", None, (), "am"),
     Ins("vmov_q_am", "vmov {DQ}, amll{S1}", None, ("bml",), "q"),
 ]
+# Writers that target the high half of a W register, to tell a write lane fixed by the port from
+# one chosen by the destination half.
+CATALOGUE_2C = [
+    Ins("vlda_wh", "vlda {DW}, [p0, #32]", None, (), "wh"),
+    Ins("vpack_s8_s16_wh", "vpack.s8.s16 {DW}, x0", None, (), "wh"),
+    Ins("vsrs_s16_s32_wh", "vsrs.s16.s32 {DW}, bml{S1}, s1", None, ("bml",), "wh"),
+    Ins("vsrs_s16_s64_wh", "vsrs.s16.s64 {DW}, cm{S1}, s1", "i", ("cm",), "wh"),
+    Ins("vconv_bf16_fp32_wh", "vconv.bf16.fp32 {DW}, bml{S1}", "f", ("bml",), "wh"),
+    Ins("vmov_w_wh", "vmov {DW}, wl0", None, (), "wh"),
+    Ins("vsrsm_s16_s32_wh", "vsrsm.s16.s32 {DW}, bml{S1}, s1", None, ("bml",), "wh"),
+]
 NEW_KEYS = {i.key for i in CATALOGUE_2B}
-CATALOGUE = CATALOGUE + CATALOGUE_2B
+CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C
 BY_KEY = {i.key: i for i in CATALOGUE}
-W_DEST = {"A": ("x8", "wl8"), "B": ("x4", "wl4")}      # (x name, wl name) per role
+W_DEST = {"A": ("x8", "wl8", "wh8"), "B": ("x4", "wl4", "wh4")}     # (x, wl, wh name) per role
+W_FAMILY = ("x", "wl", "wh")        # destinations that live in the W register file
 Q_DEST = {"A": "q0", "B": "q2"}                          # q1 and q3 hold the masks
 
 
@@ -310,8 +341,8 @@ def render(ins: Ins, r: Regs) -> str:
         kw[f"S{i + 1}"] = s
     if ins.dst == "q":
         kw["DQ"] = Q_DEST[r.wsel]
-    if ins.dst in ("x", "wl"):
-        kw["DW"] = W_DEST[r.wsel][0 if ins.dst == "x" else 1]
+    if ins.dst in W_FAMILY:
+        kw["DW"] = W_DEST[r.wsel][W_FAMILY.index(ins.dst)]
     return ins.asm.format(**kw)
 
 
@@ -367,10 +398,11 @@ def same_resource(ua: str, ub: str) -> bool:
     ports."""
     if ua.rstrip("*") == ub.rstrip("*"):
         return True
-    return ua in ACC_WRITE_UNITS and ub in ACC_WRITE_UNITS
+    return ((ua in ACC_WRITE_UNITS and ub in ACC_WRITE_UNITS)
+            or (ua in W_WRITE_UNITS and ub in W_WRITE_UNITS))
 
 
-def derive_collisions(res, only_new: bool = False) -> list[dict]:
+def derive_collisions(res, only_new: bool = False, unit: Optional[str] = None) -> list[dict]:
     """Every (A, B, g) where A holds a unit at cycle a and B holds the same resource at b, with
     g = a - b >= 0 (A issued g bundles before B), merged over the units that collide there."""
     merged: dict[tuple, dict] = {}
@@ -386,6 +418,10 @@ def derive_collisions(res, only_new: bool = False) -> list[dict]:
                     if ua.endswith("*") and ub.endswith("*"):
                         continue
                     if only_new and a.key not in NEW_KEYS and b.key not in NEW_KEYS:
+                        continue
+                    if KEYS_ONLY and not (a.key in KEYS_ONLY and b.key in KEYS_ONLY):
+                        continue
+                    if unit and unit not in (ua.rstrip("*"), ub.rstrip("*")):
                         continue
                     k = (a.key, b.key, g)
                     m = merged.setdefault(k, {"a": a.key, "b": b.key, "g": g, "units": [],
@@ -414,8 +450,8 @@ def allocate(a: Ins, b: Ins, cfg: str) -> Optional[tuple[Regs, Regs]]:
     elif cfg == "dstshare":
         if a.dst in ACC_DST and b.dst in ACC_DST:
             db = ra.d
-        elif a.dst == b.dst and a.dst in ("x", "wl", "q"):
-            wsel = "A"
+        elif (a.dst == b.dst and a.dst == "q") or (a.dst in W_FAMILY and b.dst in W_FAMILY):
+            wsel = "A"          # one W register (or its halves) written by both
         else:
             return None
     elif cfg != "sep":
@@ -448,6 +484,8 @@ def dst_init_lines(ins: Ins, r: Regs, dom: str) -> list[str]:
         return load_w(f"wl{n}", f"wh{n}", "WINIT")
     if ins.dst == "wl":
         return load_vec(W_DEST[r.wsel][1], "WINIT", 0)
+    if ins.dst == "wh":
+        return load_vec(W_DEST[r.wsel][2], "WINIT", 1)
     return []
 
 
@@ -466,8 +504,8 @@ def observe_lines(ins: Ins, r: Regs, off: int) -> list[str]:
     elif ins.dst == "x":
         x = W_DEST[r.wsel][0][1:]
         out += [f"  vst wl{x}, [p1, #{off}]", f"  vst wh{x}, [p1, #{off + 32}]"]
-    elif ins.dst == "wl":
-        out.append(f"  vst {W_DEST[r.wsel][1]}, [p1, #{off}]")
+    elif ins.dst in ("wl", "wh"):
+        out.append(f"  vst {W_DEST[r.wsel][W_FAMILY.index(ins.dst)]}, [p1, #{off}]")
     return out
 
 
@@ -531,10 +569,11 @@ def point_lines(point: dict, dom: str) -> list[str]:
     return lines
 
 
-def make_points(res, limit: Optional[int] = None, only_new: bool = False) -> list[dict]:
+def make_points(res, limit: Optional[int] = None, only_new: bool = False,
+                unit: Optional[str] = None) -> list[dict]:
     """All collision, control and reference points, in generation order."""
     points: list[dict] = []
-    colls = derive_collisions(res, only_new)
+    colls = derive_collisions(res, only_new, unit)
     if limit:
         colls = colls[:limit]
     ref_specs = []
@@ -620,14 +659,15 @@ def text_size(text: str) -> int:
         return int(sz)
 
 
-def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False) -> dict:
+def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
+             unit: Optional[str] = None) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "input.bin"), "wb") as f:
         f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
     res = reservations_of_catalogue()
     with open(os.path.join(out_dir, "reservations.json"), "w") as f:
         json.dump(res, f, indent=1)
-    points = make_points(res, limit, only_new)
+    points = make_points(res, limit, only_new, unit)
     manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": [],
                 "catalogue": {i.key: i.asm for i in CATALOGUE}}
     for dom in ("i", "f"):
@@ -744,6 +784,7 @@ def main(argv=None):
     g.add_argument("--limit", type=int)
     g.add_argument("--only-new", action="store_true",
                    help="only pairs with an instruction from CATALOGUE_2B (phase 2b)")
+    g.add_argument("--unit", help="only collisions on this unit (e.g. UPPER_SRS)")
     n = sub.add_parser("negate")
     n.add_argument("out_dir")
     c = sub.add_parser("calibrate")
@@ -763,7 +804,7 @@ def main(argv=None):
     if args.cmd == "calibrate":
         generate_calibration(args.out_dir)
         return 0
-    m = generate(args.out_dir, args.limit, args.only_new)
+    m = generate(args.out_dir, args.limit, args.only_new, args.unit)
     pts = [p for k in m["kernels"] for p in k["points"]]
     print(f"{len(m['kernels'])} kernels, {len(pts)} points")
     return 0
