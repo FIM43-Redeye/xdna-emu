@@ -1454,50 +1454,40 @@ impl ExecutionContext {
             return lane(a1 as u32, a2 as u32) as u64
                 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32);
         }
+        // The config word's shift16 bit shifts acc1 left by 16 before its negation and the add
+        // (silicon: vadd -> (acc1 << 16) + acc2, vsub -> (acc1 << 16) - acc2, vneg -> -(acc1 << 16)).
+        let shift = if pa.shift16 { 16 } else { 0 };
         if pa.acc64 {
             // Acc64 mode: one 64-bit lane per word, so the sign extends and the add carries.
-            let v1 = if pa.zero_acc1 { 0i64 } else { a1 as i64 };
+            let v1 = if pa.zero_acc1 {
+                0i64
+            } else {
+                (a1 as i64).wrapping_shl(shift)
+            };
             let v1 = if pa.negate_acc1 { v1.wrapping_neg() } else { v1 };
             let v2 = if pa.negate_acc2 {
                 (a2 as i64).wrapping_neg()
             } else {
                 a2 as i64
             };
-            let r = v1.wrapping_add(v2);
-            return if pa.shift16 { r >> 16 } else { r } as u64;
+            return v1.wrapping_add(v2) as u64;
         }
         // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
-        let v1_lo = if pa.zero_acc1 { 0i32 } else { a1 as i32 };
-        let v1_hi = if pa.zero_acc1 { 0i32 } else { (a1 >> 32) as i32 };
-        let v2_lo = a2 as i32;
-        let v2_hi = (a2 >> 32) as i32;
-        let v1_lo = if pa.negate_acc1 {
-            v1_lo.wrapping_neg()
-        } else {
-            v1_lo
+        let lane = |x1: u32, x2: u32| -> u32 {
+            let v1 = if pa.zero_acc1 {
+                0i32
+            } else {
+                (x1 as i32).wrapping_shl(shift)
+            };
+            let v1 = if pa.negate_acc1 { v1.wrapping_neg() } else { v1 };
+            let v2 = if pa.negate_acc2 {
+                (x2 as i32).wrapping_neg()
+            } else {
+                x2 as i32
+            };
+            v1.wrapping_add(v2) as u32
         };
-        let v1_hi = if pa.negate_acc1 {
-            v1_hi.wrapping_neg()
-        } else {
-            v1_hi
-        };
-        let v2_lo = if pa.negate_acc2 {
-            v2_lo.wrapping_neg()
-        } else {
-            v2_lo
-        };
-        let v2_hi = if pa.negate_acc2 {
-            v2_hi.wrapping_neg()
-        } else {
-            v2_hi
-        };
-        let mut r_lo = v1_lo.wrapping_add(v2_lo);
-        let mut r_hi = v1_hi.wrapping_add(v2_hi);
-        if pa.shift16 {
-            r_lo >>= 16;
-            r_hi >>= 16;
-        }
-        (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32)
+        lane(a1 as u32, a2 as u32) as u64 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32)
     }
 
     /// Check if there are pending (deferred) register writes awaiting commit.

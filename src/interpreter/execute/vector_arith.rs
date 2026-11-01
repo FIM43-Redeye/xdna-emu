@@ -1533,7 +1533,8 @@ impl VectorAlu {
     ///
     /// The config register (scalar operand) controls:
     /// - Bit  0: zero_acc1 (zero acc1 before operation)
-    /// - Bit 10: shift16 (right-shift result by 16 bits; integer only)
+    /// - Bit 10: shift16 (shift acc1 left by 16 before its negation and the add; integer only,
+    ///   silicon-observed in build/experiments/collisions/neg)
     /// - Integer: bit 11 sub_acc1, bit 12 sub_acc2 (as decoded here historically;
     ///   TableGen's VecConf and the Chess-emitted constants put dynAcc0Neg and
     ///   dynAcc1Neg at bits 12 and 13, which the float decode uses -- the
@@ -1716,17 +1717,17 @@ impl VectorAlu {
         // Integer acc64 mode (silicon: the sign extends through the high word); acc32 mode:
         // independent 32-bit negation per lane half.
         let acc64 = Self::int_acc_is_64(conf);
+        // shift16 shifts the source left by 16 before the negation (silicon).
+        let shift = if (conf >> 10) & 1 != 0 { 16 } else { 0 };
         let neg_pair = |word: u64| -> u64 {
-            if acc64 {
-                return if zero_acc {
-                    0
-                } else {
-                    (word as i64).wrapping_neg() as u64
-                };
+            if zero_acc {
+                return 0;
             }
-            let lo = if zero_acc { 0i32 } else { word as i32 };
-            let hi = if zero_acc { 0i32 } else { (word >> 32) as i32 };
-            (lo.wrapping_neg() as u32 as u64) | ((hi.wrapping_neg() as u32 as u64) << 32)
+            if acc64 {
+                return (word as i64).wrapping_shl(shift).wrapping_neg() as u64;
+            }
+            let lane = |x: u32| (x as i32).wrapping_shl(shift).wrapping_neg() as u32 as u64;
+            lane(word as u32) | (lane((word >> 32) as u32) << 32)
         };
         if is_wide {
             let mut result = ctx.accumulator.read_wide(acc_reg);
@@ -2612,6 +2613,126 @@ mod tests {
             ), // vnegsub r1 carry shift16=0
             (SemanticOp::AccumNegSub, 0x31c, false, [0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0, 0x2bc, 0x0]), // vnegsub r3 pat shift16=0
             (SemanticOp::AccumNegSub, 0x31c, true, [0x2, 0x0, 0x2, 0x0, 0x2, 0x0, 0x2, 0x0]), // vnegsub r3 carry shift16=0
+        ]);
+    }
+
+    #[test]
+    fn int_acc_shift16_shifts_acc1_left_like_silicon() {
+        check_int_acc_rows(&[
+            (
+                SemanticOp::Neg,
+                0x71a,
+                false,
+                [
+                    0xf7680000, 0xffffffff, 0xf7670000, 0xffffffff, 0xf7660000, 0xffffffff, 0xf7650000,
+                    0xffffffff,
+                ],
+            ), // vneg r1 pat shift16=1
+            (
+                SemanticOp::Neg,
+                0x71a,
+                true,
+                [0x10000, 0xffff0000, 0x10000, 0xffff0000, 0x10000, 0xffff0000, 0x10000, 0xffff0000],
+            ), // vneg r1 carry shift16=1
+            (
+                SemanticOp::Neg,
+                0x71c,
+                false,
+                [0xf7680000, 0x0, 0xf7670000, 0x0, 0xf7660000, 0x0, 0xf7650000, 0x0],
+            ), // vneg r3 pat shift16=1
+            (SemanticOp::Neg, 0x71c, true, [0x10000, 0x0, 0x10000, 0x0, 0x10000, 0x0, 0x10000, 0x0]), // vneg r3 carry shift16=1
+            (
+                SemanticOp::Accumulate,
+                0x71a,
+                false,
+                [0x8980b54, 0x0, 0x8990b55, 0x0, 0x89a0b56, 0x0, 0x89b0b57, 0x0],
+            ), // vadd r1 pat shift16=1
+            (
+                SemanticOp::Accumulate,
+                0x71a,
+                true,
+                [0xffff0001, 0xffff, 0xffff0001, 0xffff, 0xffff0001, 0xffff, 0xffff0001, 0xffff],
+            ), // vadd r1 carry shift16=1
+            (
+                SemanticOp::Accumulate,
+                0x71c,
+                false,
+                [0x8980b54, 0x0, 0x8990b55, 0x0, 0x89a0b56, 0x0, 0x89b0b57, 0x0],
+            ), // vadd r3 pat shift16=1
+            (
+                SemanticOp::Accumulate,
+                0x71c,
+                true,
+                [0xffff0001, 0x0, 0xffff0001, 0x0, 0xffff0001, 0x0, 0xffff0001, 0x0],
+            ), // vadd r3 carry shift16=1
+            (
+                SemanticOp::AccumSub,
+                0x71a,
+                false,
+                [0x897f4ac, 0x0, 0x898f4ab, 0x0, 0x899f4aa, 0x0, 0x89af4a9, 0x0],
+            ), // vsub r1 pat shift16=1
+            (
+                SemanticOp::AccumSub,
+                0x71a,
+                true,
+                [0xfffeffff, 0xffff, 0xfffeffff, 0xffff, 0xfffeffff, 0xffff, 0xfffeffff, 0xffff],
+            ), // vsub r1 carry shift16=1
+            (
+                SemanticOp::AccumSub,
+                0x71c,
+                false,
+                [0x897f4ac, 0x0, 0x898f4ab, 0x0, 0x899f4aa, 0x0, 0x89af4a9, 0x0],
+            ), // vsub r3 pat shift16=1
+            (
+                SemanticOp::AccumSub,
+                0x71c,
+                true,
+                [0xfffeffff, 0x0, 0xfffeffff, 0x0, 0xfffeffff, 0x0, 0xfffeffff, 0x0],
+            ), // vsub r3 carry shift16=1
+            (
+                SemanticOp::AccumNegAdd,
+                0x71a,
+                false,
+                [
+                    0xf767f4ac, 0xffffffff, 0xf766f4ab, 0xffffffff, 0xf765f4aa, 0xffffffff, 0xf764f4a9,
+                    0xffffffff,
+                ],
+            ), // vnegadd r1 pat shift16=1
+            (
+                SemanticOp::AccumNegAdd,
+                0x71a,
+                true,
+                [0xffff, 0xffff0000, 0xffff, 0xffff0000, 0xffff, 0xffff0000, 0xffff, 0xffff0000],
+            ), // vnegadd r1 carry shift16=1
+            (
+                SemanticOp::AccumNegAdd,
+                0x71c,
+                false,
+                [0xf767f4ac, 0x0, 0xf766f4ab, 0x0, 0xf765f4aa, 0x0, 0xf764f4a9, 0x0],
+            ), // vnegadd r3 pat shift16=1
+            (SemanticOp::AccumNegAdd, 0x71c, true, [0xffff, 0x0, 0xffff, 0x0, 0xffff, 0x0, 0xffff, 0x0]), // vnegadd r3 carry shift16=1
+            (
+                SemanticOp::AccumNegSub,
+                0x71a,
+                false,
+                [
+                    0xf7680b54, 0xffffffff, 0xf7670b55, 0xffffffff, 0xf7660b56, 0xffffffff, 0xf7650b57,
+                    0xffffffff,
+                ],
+            ), // vnegsub r1 pat shift16=1
+            (
+                SemanticOp::AccumNegSub,
+                0x71a,
+                true,
+                [0x10001, 0xffff0000, 0x10001, 0xffff0000, 0x10001, 0xffff0000, 0x10001, 0xffff0000],
+            ), // vnegsub r1 carry shift16=1
+            (
+                SemanticOp::AccumNegSub,
+                0x71c,
+                false,
+                [0xf7680b54, 0x0, 0xf7670b55, 0x0, 0xf7660b56, 0x0, 0xf7650b57, 0x0],
+            ), // vnegsub r3 pat shift16=1
+            (SemanticOp::AccumNegSub, 0x71c, true, [0x10001, 0x0, 0x10001, 0x0, 0x10001, 0x0, 0x10001, 0x0]), // vnegsub r3 carry shift16=1
         ]);
     }
 }
