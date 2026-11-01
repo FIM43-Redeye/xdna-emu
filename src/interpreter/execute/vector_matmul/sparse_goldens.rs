@@ -27,7 +27,6 @@ const MODES: [(&str, (u32, u32, u32)); 5] = [
     ("2x8_8x8", (1, 3, 5)),
     ("4x16_16x4", (2, 3, 2)),
 ];
-const KINDS: [&str; 5] = ["probe", "ops", "rand", "conf", "alt"];
 
 /// Registers the replay uses: A in x0 (narrow) or y2 (wide), the sparse operand in qx1.
 const A_NARROW_REG: u8 = 0;
@@ -47,7 +46,6 @@ struct Form {
 }
 
 struct Golden {
-    kernel: String,
     key: (u32, u32, u32),
     a_bits: u32,
     b_bits: u32,
@@ -58,7 +56,6 @@ struct Golden {
     kind: String,
     tiles: usize,
     stages: usize,
-    sets: usize,
     a_lanes: usize,
     b_stored: usize,
     out_words: usize,
@@ -102,7 +99,6 @@ fn load(kernel: &str) -> Golden {
         .collect();
     let stages = num(&tile["stages"]) as usize;
     Golden {
-        kernel: kernel.to_string(),
         key: (num(&mode["amode"]) as u32, num(&mode["bmode"]) as u32, num(&mode["variant"]) as u32),
         a_bits: num(&mode["a_bits"]) as u32,
         b_bits: num(&mode["b_bits"]) as u32,
@@ -113,7 +109,6 @@ fn load(kernel: &str) -> Golden {
         kind: v["class"].as_str().unwrap().trim_start_matches("mac_sparse_").to_string(),
         tiles: num(&tile["tiles"]) as usize,
         stages,
-        sets,
         a_lanes: num(&tile["a_lanes"]) as usize,
         b_stored: num(&mode["b_stored"]) as usize,
         out_words: num(&tile["out_words"]) as usize,
