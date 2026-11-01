@@ -508,6 +508,23 @@ impl VectorAlu {
         }
     }
 
+    /// Write a 512-bit vector result to its destination: an x register, or a `bm` half. The
+    /// accumulator form is a raw reinterpretation, the layout `vmov bml, x` uses (u64 lane j holds
+    /// vector words 2j and 2j+1); `vshuffle bml0, x0, x1, r1` and `vbcstshfl.* bml0, ...` write
+    /// theirs that way on silicon (collision probe references).
+    pub(super) fn write_wide_vec_or_acc_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Vec512) {
+        if matches!(op.dest, Some(Operand::AccumReg(_))) {
+            let mut lanes = [0u64; 16];
+            for j in 0..8 {
+                lanes[j] = value[2 * j] as u64 | ((value[2 * j + 1] as u64) << 32);
+            }
+            let dst = Self::get_acc_dest(op);
+            ctx.queue_acc_write(Operand::AccumReg(dst), lanes, true);
+        } else {
+            Self::write_wide_vec_dest(op, ctx, value);
+        }
+    }
+
     /// Write a 1024-bit result to the accumulator destination, timed by the instruction's
     /// itinerary result latency and bypass class.
     pub(super) fn write_wide_acc_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Acc1024) {

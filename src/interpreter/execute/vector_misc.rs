@@ -382,7 +382,7 @@ impl VectorAlu {
                 out_bytes[i * 4 + 3],
             ]);
         }
-        Self::write_wide_vec_dest(op, ctx, result);
+        Self::write_wide_vec_or_acc_dest(op, ctx, result);
         true
     }
 

@@ -139,3 +139,14 @@ fn vmov_am_quarter_from_q_zero_extends_all_four_quarters() {
     check_quarter("59 87 5e 18 37 88 03 00 00 00 00 00 00 00 00 00", 0);
     check_quarter("59 87 7e 18 37 88 03 00 00 00 00 00 00 00 00 00", 4);
 }
+
+#[test]
+fn vshuffle_into_a_bm_half_is_a_raw_512_bit_write() {
+    for hex in [
+        "f9 80 40 18 37 88 03 00 00 00 00 00 00 00 00 00", // vshuffle bml0, x0, x1, r1
+        "f9 80 40 1c 37 88 03 00 00 00 00 00 00 00 00 00", // vshuffle bmh0, x0, x1, r1
+    ] {
+        let (_, got) = run(hex);
+        assert_eq!(words(&got), SHUFFLE_BM, "{hex}");
+    }
+}
