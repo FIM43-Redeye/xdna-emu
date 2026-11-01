@@ -191,6 +191,10 @@ const DEVICE_KNOWN_FIELDS: &[&str] = &[
     "mem_base_addresses",
     "tile_types",
     "tile_map",
+    // Harness-facing facts (cascade width/adjacency, default core stack);
+    // consumed by tools/harness, not by the emulator.
+    "cascade",
+    "default_core_stack_size",
 ];
 
 fn extract_device(name: &str, value: &Value, file: &str) -> Result<ArchModel, ExtractError> {

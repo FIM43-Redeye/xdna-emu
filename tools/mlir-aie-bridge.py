@@ -199,6 +199,44 @@ def classify_tile(model, col, row):
     return "unknown"
 
 
+# Accumulator cascade width in bits, keyed by AIEArch (AIEAttrs.td:92:
+# AIE=1, AIE2=2, AIE2p=3, AIE2ps=4). The Python binding does not expose
+# getAccumulatorCascadeSize, so the values are transcribed from
+# AIETargetModel.h: AIE1TargetModel returns 384 (line 752); AIE2TargetModel
+# returns 512 (line 891) and AIE2p/AIE2ps inherit it without an override.
+CASCADE_WIDTH_BITS_BY_ARCH = {1: 384, 2: 512, 3: 512, 4: 512}
+
+# Which core pairs a cascade flow may connect. This is not in the target
+# model: it is the routing rule of the AIELowerCascadeFlows pass (lines
+# 50-60), which accepts targetModel.isSouth(src, dst) (src.row == dst.row + 1,
+# flow leaves South) or isEast(src, dst) (src.col == dst.col - 1, flow leaves
+# East) and rejects everything else. Stated as `src = dst + src_offset`.
+CASCADE_ADJACENCY = [
+    {"direction": "South", "src_offset": [0, 1]},
+    {"direction": "East", "src_offset": [-1, 0]},
+]
+
+
+def cascade_block(model):
+    """Cascade facts for one device: width and the legal-adjacency rule."""
+    arch = model.get_target_arch()
+    if arch not in CASCADE_WIDTH_BITS_BY_ARCH:
+        raise ValueError(
+            f"unknown AIEArch {arch}: no cascade width recorded; "
+            "extend CASCADE_WIDTH_BITS_BY_ARCH from AIETargetModel.h"
+        )
+    return {
+        "width_bits": CASCADE_WIDTH_BITS_BY_ARCH[arch],
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize "
+                        "(AIE1TargetModel:752, AIE2TargetModel:891); "
+                        "not exposed by the Python binding",
+        "core_tiles_only": True,
+        "adjacency": CASCADE_ADJACENCY,
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/"
+                            "AIELowerCascadeFlows.cpp:50-60",
+    }
+
+
 def dump_device(model, device_id, physical_column_start):
     """Extract all queryable parameters from a single device model."""
     cols = model.columns()
@@ -222,6 +260,12 @@ def dump_device(model, device_id, physical_column_start):
             "east": model.get_mem_east_base_address(),
         },
     }
+
+    device["cascade"] = cascade_block(model)
+    # Core stack the compiler reserves when aie.core has no stack_size
+    # (AIETargetModel::getDefaultCoreStackSize); the harness validator
+    # reserves this much of each core's data memory.
+    device["default_core_stack_size"] = model.get_default_core_stack_size()
 
     # These methods were removed in mlir-aie after LLVM 23 update.
     # Populate them only if the API still exposes them.

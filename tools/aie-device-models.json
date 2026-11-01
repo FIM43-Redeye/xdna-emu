@@ -531,7 +531,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu1_1col": {
       "device_id": 5,
@@ -758,7 +781,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu1_2col": {
       "device_id": 6,
@@ -1089,7 +1135,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu1_3col": {
       "device_id": 7,
@@ -1524,7 +1593,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2": {
       "device_id": 8,
@@ -2439,7 +2531,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_1col": {
       "device_id": 9,
@@ -2666,7 +2781,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_2col": {
       "device_id": 10,
@@ -2997,7 +3135,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_3col": {
       "device_id": 11,
@@ -3432,7 +3593,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_4col": {
       "device_id": 12,
@@ -3963,7 +4147,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_5col": {
       "device_id": 13,
@@ -4590,7 +4797,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_6col": {
       "device_id": 14,
@@ -5313,7 +5543,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "npu2_7col": {
       "device_id": 15,
@@ -6132,7 +6385,30 @@
             "east": false
           }
         }
-      ]
+      ],
+      "cascade": {
+        "width_bits": 512,
+        "width_source": "mlir-aie AIETargetModel.h getAccumulatorCascadeSize (AIE1TargetModel:752, AIE2TargetModel:891); not exposed by the Python binding",
+        "core_tiles_only": true,
+        "adjacency": [
+          {
+            "direction": "South",
+            "src_offset": [
+              0,
+              1
+            ]
+          },
+          {
+            "direction": "East",
+            "src_offset": [
+              -1,
+              0
+            ]
+          }
+        ],
+        "adjacency_source": "mlir-aie lib/Dialect/AIE/Transforms/AIELowerCascadeFlows.cpp:50-60"
+      },
+      "default_core_stack_size": 1024
     },
     "xcve2802": {
       "device_id": 2,
