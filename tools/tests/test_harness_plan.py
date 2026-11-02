@@ -274,11 +274,11 @@ def test_offsets_pack_in_core_then_buffer_order(dev):
 
 def test_offsets_align_to_dma_granularity(dev):
     wide = dataclasses.replace(dev, address_gen_granularity_bits=256)   # 32 bytes
-    t = topo(core("a", 0, 2, ins=(36, 64, 4)))
+    t = topo(core("a", 0, 2, ins=(36, 64)), core("b", 1, 2, ins=(4,)))
     plan = plan_channels(t, wide)
     r = routes(plan)
     assert plan.alignment_bytes == 32
-    assert [r[("a", f"i{k}")].host_offset for k in range(3)] == [0, 64, 128]
+    assert [r[k].host_offset for k in [("a", "i0"), ("a", "i1"), ("b", "i0")]] == [0, 64, 128]
     assert plan.phases[0].host_in_bytes == 132
 
 
