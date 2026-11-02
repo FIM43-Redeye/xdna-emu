@@ -177,8 +177,8 @@ const VUNPACK_SRC_READ_LATENCY: u64 = 6;
 /// A `vmov x/bm, SCD` awaiting its cascade-data stage.
 ///
 /// Silicon (Phoenix, `build/experiments/cascade-collisions/p2/`): the vmov does not
-/// stall at issue, nor at the first use of its destination. The five bundles after
-/// it issue normally; the sixth is held until a cascade word is available, then
+/// stall at issue, nor at the first use of its destination. The four bundles after
+/// it issue normally; the fifth is held until a cascade word is available, then
 /// the word is taken and the destination is written so that it is visible
 /// `II_VMOV_CASCADE_READ` (7) issued bundles after the vmov, regardless of how
 /// long the hold lasted. A reader inside that window sees the old register value
