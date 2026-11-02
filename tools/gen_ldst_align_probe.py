@@ -58,7 +58,6 @@ IN_BYTES = WIN_OFF + WIN_BYTES
 HDR_BYTES = 64
 SLOT = 128                        # store case: bytes per iteration
 STORE_BASE = 32                   # store case: first pointer offset inside a slot
-REC = 64                          # load case: bytes per record
 OUT_BUDGET = 14 * 1024            # bytes of out buffer per kernel (data memory is 64 KiB)
 SECONDARY_STEP = 5                # sweep stride of the secondary variants
 NOPS = 6
@@ -75,61 +74,102 @@ def in_bytes() -> bytes:
 
 @dataclass(frozen=True)
 class Family:
-    """One instruction family: `op` is a template over {a} (the address operand)."""
+    """One instruction family. `mn` is the mnemonic (2D/3D forms insert the dimension after its
+    first component), `ops` the operands before the address, `width` the bytes the access
+    moves (0 = not predicted, measured)."""
     key: str
     kind: str                  # "st" or "ld"
-    op: str                    # e.g. "vst wl0, {a}"
-    width: int                 # bytes the access moves (store: written; load: read)
-    pre: tuple[str, ...] = ()  # per-iteration lines before the op (load: marker into dest)
+    mn: str                    # e.g. "vst.srs.s16.s32"
+    ops: str                   # e.g. "bml0, s1"
+    width: int
+    pre: tuple[str, ...] = ()  # per-iteration lines before the op (load: marker into dest; store: source)
     dump: tuple[str, ...] = () # per-iteration lines after the op (load: dest -> record, via p4)
     imm: int = 0               # post-modify immediate to use (and the expected delta)
+    rec: int = 64              # load: bytes per record
     idx_imm: bool = True       # supports [p, #0]
     pstm_imm: bool = True
     pstm_m: bool = True
     idx_dj: bool = True
+    dims: tuple[str, ...] = ()  # "2d" / "3d" forms that exist
     plain: bool = False        # only the bare [p] form exists
     conv: bool = False         # result bytes are a conversion of the source (no raw identity)
 
+    def op(self, addr: str, dim: str = "") -> str:
+        mn = self.mn
+        if dim:
+            head, _, rest = mn.partition(".")
+            mn = f"{head}.{dim}" + (f".{rest}" if rest else "")
+        return f"{mn} {self.ops}, {addr}" if self.ops else f"{mn} {addr}"
+
 
 # load destinations: how to pre-load the marker and how to dump the result to a record
-LD_W = dict(pre=("vlda wl2, [p0, #64]",), dump=("vst wl2, [p4, #0]",))
-LD_W128 = LD_W
+LD_W = dict(pre=("vlda wl2, [p0, #64]",), dump=("vst wl2, [p4, #0]",), rec=32)
 LD_X = dict(pre=("vlda wl2, [p0, #64]", "vlda wh2, [p0, #96]"),
             dump=("vst wl2, [p4, #0]", "vst wh2, [p4, #32]"))
-LD_AM = dict(pre=("vlda amll0, [p0, #64]",), dump=("vst amll0, [p4, #0]",))
-LD_Q = dict(pre=("lda q0, [p0, #64]",), dump=("st q0, [p4, #0]",))
-LD_R = dict(pre=("mov r3, r9",), dump=("st r3, [p4, #0]",))
+LD_AM = dict(pre=("vlda amll0, [p0, #64]",), dump=("vst amll0, [p4, #0]",), rec=32)
+LD_Q = dict(pre=("lda q0, [p0, #64]",), dump=("st q0, [p4, #0]",), rec=16)
+LD_R = dict(pre=("mov r3, r9",), dump=("st r3, [p4, #0]",), rec=4)
 LD_BM = dict(pre=("vmov bml0, x1",),
-             dump=("vmov x2, bml0", "vst wl2, [p4, #0]", "vst wh2, [p4, #32]"))
+             dump=("vmov x2, bml0", "nop", "nop", "nop", "nop", "nop", "nop", "vst wl2, [p4, #0]", "vst wh2, [p4, #32]"))
+LD_CM = dict(pre=("vmov bml0, x1", "vmov bmh0, x1"),
+             dump=("vmov x2, bml0", "vmov x3, bmh0", "nop", "nop", "nop", "nop", "nop", "nop", "vst wl2, [p4, #0]", "vst wh2, [p4, #32]",
+                   "vst wl3, [p4, #64]", "vst wh3, [p4, #96]"), rec=128)
+# store sources for the fused stores
+ST_BM = dict(pre=("vmov bml0, x0",))
+ST_CM = dict(pre=("vmov bml0, x0", "vmov bmh0, x0"))
+D23 = ("2d", "3d")
 
 
 def families() -> list[Family]:
     F = Family
     out = [
         # scalar stores
-        F("st_w", "st", "st r8, {a}", 4, imm=4),
-        F("st_s16", "st", "st.s16 r8, {a}", 2, imm=2),
-        F("st_s8", "st", "st.s8 r8, {a}", 1, imm=1),
+        F("st_w", "st", "st", "r8", 4, imm=4, dims=D23),
+        F("st_s16", "st", "st.s16", "r8", 2, imm=2, dims=D23, pstm_m=True),
+        F("st_s8", "st", "st.s8", "r8", 1, imm=1, dims=D23),
         # scalar loads
-        F("lda_w", "ld", "lda r3, {a}", 4, imm=4, **LD_R),
-        F("lda_s16", "ld", "lda.s16 r3, {a}", 2, imm=2, conv=True, **LD_R),
-        F("lda_u16", "ld", "lda.u16 r3, {a}", 2, imm=2, conv=True, **LD_R),
-        F("lda_s8", "ld", "lda.s8 r3, {a}", 1, imm=1, conv=True, **LD_R),
-        F("lda_u8", "ld", "lda.u8 r3, {a}", 1, imm=1, conv=True, **LD_R),
+        F("lda_w", "ld", "lda", "r3", 4, imm=4, dims=D23, **LD_R),
+        F("lda_s16", "ld", "lda.s16", "r3", 2, imm=2, conv=True, dims=D23, **LD_R),
+        F("lda_u16", "ld", "lda.u16", "r3", 2, imm=2, conv=True, dims=D23, **LD_R),
+        F("lda_s8", "ld", "lda.s8", "r3", 1, imm=1, conv=True, dims=D23, **LD_R),
+        F("lda_u8", "ld", "lda.u8", "r3", 1, imm=1, conv=True, dims=D23, **LD_R),
         # 128-bit
-        F("st_q", "st", "st q1, {a}", 16, imm=16),
-        F("lda_q", "ld", "lda q0, {a}", 16, imm=16, **LD_Q),
-        F("vst_128", "st", "vst.128 wl0, {a}", 16, imm=32),
-        F("vlda_128", "ld", "vlda.128 wl2, {a}", 16, imm=32, idx_imm=False, pstm_imm=False,
-          pstm_m=False, idx_dj=False, plain=True, **LD_W128),
-        F("vldb_128", "ld", "vldb.128 wl2, {a}", 16, imm=32, idx_imm=False, pstm_imm=False, **LD_W128),
+        F("st_q", "st", "st", "q1", 16, imm=16, dims=D23),
+        F("lda_q", "ld", "lda", "q0", 16, imm=16, dims=D23, **LD_Q),
+        F("vst_128", "st", "vst.128", "wl0", 16, imm=32, dims=D23),
+        F("vlda_128", "ld", "vlda.128", "wl2", 16, imm=32, idx_imm=False, pstm_imm=False,
+          pstm_m=False, idx_dj=False, plain=True, **LD_W),
+        F("vldb_128", "ld", "vldb.128", "wl2", 16, imm=32, idx_imm=False, pstm_imm=False,
+          dims=D23, **LD_W),
         # 256-bit
-        F("vst_w", "st", "vst wl0, {a}", 32, imm=32),
-        F("vst_am", "st", "vst amll0, {a}", 32, imm=32),
-        F("vlda_w", "ld", "vlda wl2, {a}", 32, imm=32, **LD_W),
-        F("vldb_w", "ld", "vldb wl2, {a}", 32, imm=32, **LD_W),
-        F("vlda_am", "ld", "vlda amll0, {a}", 32, imm=32, **LD_AM),
+        F("vst_w", "st", "vst", "wl0", 32, imm=32, dims=D23),
+        F("vst_am", "st", "vst", "amll0", 32, imm=32, dims=D23),
+        F("vlda_w", "ld", "vlda", "wl2", 32, imm=32, dims=D23, **LD_W),
+        F("vldb_w", "ld", "vldb", "wl2", 32, imm=32, dims=D23, **LD_W),
+        F("vlda_am", "ld", "vlda", "amll0", 32, imm=32, dims=D23, **LD_AM),
     ]
+    # fused loads: vlda.ups.<acc>.<src> (all read 32 bytes), vlda.conv, vldb.unpack
+    for acc, src, dst, ld in (("s32", "s16", "bml0", LD_BM), ("s32", "d16", "bml0", LD_BM),
+                              ("s64", "s32", "bml0", LD_BM), ("s64", "d32", "bml0", LD_BM),
+                              ("s32", "s8", "cm0", LD_CM), ("s32", "d8", "cm0", LD_CM),
+                              ("s64", "s16", "cm0", LD_CM), ("s64", "d16", "cm0", LD_CM)):
+        out.append(F(f"ups_{acc}_{src}", "ld", f"vlda.ups.{acc}.{src}", f"{dst}, s0", 32, imm=32,
+                     conv=True, dims=D23, **ld))
+    out.append(F("conv_ld", "ld", "vlda.conv.fp32.bf16", "bml0", 32, imm=32, conv=True,
+                 dims=D23, **LD_BM))
+    for dst, src, nbytes in (("s16", "s8", 32), ("d16", "d8", 32), ("s8", "s4", 16), ("d8", "d4", 16)):
+        out.append(F(f"unpack_{dst}_{src}", "ld", f"vldb.unpack.{dst}.{src}", "x2", nbytes, imm=32,
+                     idx_imm=False, pstm_imm=False, conv=True, dims=D23, **LD_X))
+    # fused stores: vst.srs.<out>.<acc> (all write 32 bytes), vst.pack, vst.conv
+    for o, acc, srcreg, st in (("s16", "s32", "bml0", ST_BM), ("d16", "s32", "bml0", ST_BM),
+                               ("s32", "s64", "bml0", ST_BM), ("d32", "s64", "bml0", ST_BM),
+                               ("s8", "s32", "cm0", ST_CM), ("d8", "s32", "cm0", ST_CM),
+                               ("s16", "s64", "cm0", ST_CM), ("d16", "s64", "cm0", ST_CM)):
+        out.append(F(f"srs_{o}_{acc}", "st", f"vst.srs.{o}.{acc}", f"{srcreg}, s1", 32, imm=32,
+                     conv=True, dims=D23, **st))
+    for kind, o, i in (("s", "s8", "s16"), ("d", "d8", "d16"), ("s", "s4", "s8"), ("d", "d4", "d8")):
+        out.append(F(f"pack_{o}_{i}", "st", f"vst.pack.{o}.{i}", "x0", 0, imm=32, conv=True, dims=D23))
+    out.append(F("conv_st", "st", "vst.conv.bf16.fp32", "bml0", 32, imm=32, conv=True, dims=D23, **ST_BM))
     return out
 
 
@@ -144,10 +184,11 @@ class Case:
     mod_start: int             # modifier register value at iteration 0
     mod_step: int
     addr: str                  # the address operand text
+    dim: str = ""              # "" | "2d" | "3d": which instruction variant
 
     @property
     def stride(self) -> int:
-        return SLOT if self.fam.kind == "st" else REC
+        return SLOT if self.fam.kind == "st" else self.fam.rec
 
     @property
     def data_bytes(self) -> int:
@@ -174,8 +215,8 @@ def build_cases(fams: list[Family] | None = None) -> list[Case]:
         base = STORE_BASE if f.kind == "st" else CENTER
         sec_n = max(4, min(13, n_full // SECONDARY_STEP + 1))
 
-        def add(form, addr, n, step, start, mod0, mods):
-            cases.append(Case(f"{f.key}.{form}", f, form, n, step, base + start, mod0, mods, addr))
+        def add(form, addr, n, step, start, mod0, mods, dim=""):
+            cases.append(Case(f"{f.key}.{form}", f, form, n, step, base + start, mod0, mods, addr, dim))
 
         if f.plain:
             add("plain", "[p2]", n_full, 1, 0, 0, 0)
@@ -184,12 +225,18 @@ def build_cases(fams: list[Family] | None = None) -> list[Case]:
         if f.pstm_imm:
             add("pstm_imm", f"[p2], #{f.imm}", sec_n, SECONDARY_STEP, 0, 0, 0)
         if f.pstm_m:
-            add("pstm_m", "[p2], m0", sec_n, SECONDARY_STEP, 0, f.imm, 0)
+            if f.idx_imm or f.plain:
+                add("pstm_m", "[p2], m0", sec_n, SECONDARY_STEP, 0, f.imm, 0)
+            else:   # no [p, #0] form: the post-modify form carries the full byte sweep
+                add("pstm_m", "[p2], m0", n_full, 1, 0, f.imm, 0)
         if f.idx_dj:
             # aligned base, index swept
             add("dj_sweep", "[p2, dj0]", sec_n, 0, 32 if f.kind == "st" else 0, 0, SECONDARY_STEP)
             # base swept, constant odd index
             add("dj_mix", "[p2, dj0]", sec_n, SECONDARY_STEP, 0, 5, 0)
+        # multi-dimensional post-modify: counts and sizes zero, so the pointer steps by m0
+        for dim in f.dims:
+            add(f"pstm_{dim}", "[p2], d0", sec_n, SECONDARY_STEP, 0, f.imm, 0, dim)
     return cases
 
 
@@ -254,18 +301,21 @@ def kernel_asm(cases: list[Case], tag: str = "k") -> str:
                  "  mov r4, p1", *_nops(2), "  add r4, r4, r6", *_nops(2), "  mov p4, r4",
                  f"  movxm r0, #{c.n}", *_nops(4)]
         body += [".p2align 4", f"{label}:"]
-        body += ["  mov p2, r5", "  mov m0, r7", "  mov dj0, r7", *_nops(NOPS)]
+        body += ["  mov p2, r5", "  mov m0, r7", "  mov dj0, r7"]
+        if c.dim:   # counts and sizes of the dimensions in use are zero: the step is the modifier
+            body += ["  mov dn0, r10", "  mov dc0, r10", "  mov dn4, r10", "  mov dc4, r10"]
+        body += _nops(NOPS)
         for ln in f.pre:
             body += [f"  {ln}"]
         if f.pre:
             body += _nops(NOPS + 2)
-        body += [f"  {f.op.format(a=c.addr)}", *_nops(NOPS + 6)]
+        body += [f"  {f.op(c.addr, c.dim)}", *_nops(NOPS + 6)]
         body += ["  mov r6, p2", *_nops(3), "  sub r6, r6, r5", *_nops(2),
                  "  st r6, [p3, #0]", "  padda [p3], #4"]
-        for ln in f.dump:
+        for ln in f.dump:           # (dump lines that need latency carry their own nops)
             body += [f"  {ln}"]
         if f.kind == "ld":
-            body += [f"  padda [p4], #{REC}"]
+            body += [f"  padda [p4], #{f.rec}"]
         body += _nops(3)
         # movxm into a register: `add` immediates are narrow and llvm-mc truncates silently
         total_step = c.ptr_step + (SLOT if f.kind == "st" else 0)
@@ -365,7 +415,7 @@ def floor_to(addr: int, width: int) -> int:
     return addr - addr % width
 
 
-def verify_natural(res: CaseResult) -> list[str]:
+def verify_natural(res: CaseResult) -> list[str]:  # noqa: C901
     """Check a raw (non-converting) case against the natural-alignment rule; returns problems."""
     c, w = res.case, res.case.fam.width
     bad = []
@@ -390,6 +440,59 @@ def verify_natural(res: CaseResult) -> list[str]:
         if d != want_d:
             bad.append(f"i={i}: pointer delta {d}, want {want_d} (unmasked)")
     return bad
+
+
+def _pow2_ceil(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def observed_granule(res: CaseResult) -> dict:
+    """Granule of the address rounding, measured without assuming a width.
+
+    store: `width` = bytes changed per access (constant across the sweep, else None) and
+           `granule` = largest power of two dividing every landing address, with `ok` set
+           when every landing address is the swept address rounded down to `granule`.
+    load:  records are grouped by equal content over consecutive swept addresses; `granule`
+           is the (constant) group length of the interior groups, `ok` when each group starts
+           at a multiple of it, groups are distinct, and the rule floor(addr, granule) holds.
+           Needs a step-1 sweep (the `imm0` / `plain` forms).
+    """
+    c = res.case
+    out = dict(case=c.name, width=None, granule=None, ok=False)
+    if c.fam.kind == "st":
+        rows = store_landing(res)
+        counts = {r["count"] for r in rows}
+        if len(counts) != 1 or 0 in counts:
+            out["note"] = f"counts {sorted(counts)}"
+            return out
+        out["width"] = counts.pop()
+        g = 1
+        while g < 128 and all(r["first"] % (g * 2) == 0 for r in rows):
+            g *= 2
+        out["granule"] = g
+        out["ok"] = all(r["first"] == floor_to(r["addr"], g) for r in rows)
+        return out
+    if c.ptr_step != 1 or c.mod_step != 0:
+        out["note"] = "needs a step-1 sweep"
+        return out
+    rows = load_landing(res)
+    groups: list[tuple[int, int, bytes]] = []       # (first addr, length, record)
+    for r in rows:
+        if groups and groups[-1][2] == r["rec"]:
+            a, n, rec = groups[-1]
+            groups[-1] = (a, n + 1, rec)
+        else:
+            groups.append((r["addr"], 1, r["rec"]))
+    # interior groups are complete; with only two groups, both must agree
+    interior = {n for _, n, _ in (groups[1:-1] if len(groups) > 2 else groups)}
+    if len(interior) != 1:
+        out["note"] = f"group lengths {[n for _, n, _ in groups]}"
+        return out
+    g = interior.pop()
+    out["granule"] = g
+    out["ok"] = (all(a % g == 0 for a, _, _ in groups[1:])
+                 and len({rec for _, _, rec in groups}) == len(groups))
+    return out
 
 
 def main(argv=None) -> int:
