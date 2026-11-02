@@ -52,9 +52,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiecc_artifacts
+import toolchain_paths
 
 REPO = Path(__file__).resolve().parents[1]
-NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or REPO.parent)
+NPU_WORK = toolchain_paths.workspace_root(REPO)
 DRIVER_REPO = NPU_WORK / "xdna-driver"
 DEFAULT_OUT_ROOT = REPO / "build" / "experiments" / "dispatch-overhead-multirun"
 MLIR_AIE_ROOT = NPU_WORK / "mlir-aie"
@@ -200,11 +201,11 @@ def env_with_emu(runtime: str = "debug") -> dict:
 # The bridge is built in the sibling xdna-emu-priv checkout.
 AIESIM_BRIDGE_SO = Path(os.environ.get(
     "AIESIM_BRIDGE_SO",
-    Path(os.environ.get("NPU_WORK_DIR", REPO.parent))
+    NPU_WORK
     / "xdna-emu-priv" / "aiesim-bridge" / "build" / "libxdna_aiesim_bridge.so"))
 AIESIM_DEVICE_JSON = Path(os.environ.get(
     "AIESIM_DEVICE_JSON",
-    Path(os.environ.get("NPU_WORK_DIR", REPO.parent))
+    NPU_WORK
     / "xdna-emu-priv" / "aiesim-bridge" / "device" / "NPU1.json"))
 
 

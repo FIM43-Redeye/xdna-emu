@@ -59,10 +59,11 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import aiecc_artifacts
+import toolchain_paths
 
 REPO = Path(__file__).resolve().parents[1]
 PARSE_TRACE = REPO / "tools" / "parse-trace.py"
-NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or REPO.parent)
+NPU_WORK = toolchain_paths.workspace_root(REPO)
 DEFAULT_BUILD_BASE = NPU_WORK / "mlir-aie/build/test/npu-xrt"
 DEFAULT_PYTHONPATH = str(NPU_WORK / "mlir-aie/install/python")
 
