@@ -93,6 +93,41 @@ class DeviceModel:
             return StreamPorts(0, 0)
         return StreamPorts(ports["master"], ports["slave"])
 
+    def row_of(self, tile_type: str) -> int:
+        """Row of a tile type (column independent: one shim row, one memtile row)."""
+        return next(r for r in range(self.rows) if self.tile_type(0, r) == tile_type)
+
+    def vertical_capacity(self, col: int, row: int, direction: str) -> int:
+        """Stream channels across the boundary between (col, row-1) and (col, row).
+
+        "south" runs toward the shim: the upper tile's South master ports into
+        the lower tile's North slave ports. "north" is the reverse: the lower
+        tile's North master ports into the upper tile's South slave ports.
+        """
+        upper, lower = self.tile_type(col, row), self.tile_type(col, row - 1)
+        if upper is None or lower is None:
+            return 0
+        if direction == "south":
+            return min(self.stream_ports(upper, "South").master,
+                       self.stream_ports(lower, "North").slave)
+        if direction == "north":
+            return min(self.stream_ports(lower, "North").master,
+                       self.stream_ports(upper, "South").slave)
+        raise ValueError(f"vertical direction {direction!r}")
+
+    def horizontal_capacity(self, row: int, col: int, direction: str) -> int:
+        """Stream channels across the boundary between (col, row) and (col+1, row)."""
+        west, east = self.tile_type(col, row), self.tile_type(col + 1, row)
+        if west is None or east is None:
+            return 0
+        if direction == "east":
+            return min(self.stream_ports(west, "East").master,
+                       self.stream_ports(east, "West").slave)
+        if direction == "west":
+            return min(self.stream_ports(east, "West").master,
+                       self.stream_ports(west, "East").slave)
+        raise ValueError(f"horizontal direction {direction!r}")
+
     def dma_channels(self, tile_type: str) -> DmaChannels:
         """DMA channels per direction. Shim DMA ports live in the shim mux."""
         cfg = self._type_config(tile_type)

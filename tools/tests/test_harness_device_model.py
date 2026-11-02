@@ -92,3 +92,34 @@ def test_dma_alignment_is_granularity_in_bytes(npu1):
     # (32 on AIE2); the 4-byte alignment is derived, not stored.
     assert npu1.address_gen_granularity_bits == 32
     assert npu1.dma_alignment_bytes == 4
+
+
+# -- stream-switch capacity across tile boundaries ---------------------------
+
+def test_vertical_capacity_matches_aiecc_for_core_to_memtile():
+    # aiecc: "takes 7 channels across, and it has 4 channels" (row 2 -> row 1).
+    dev = load_device_model("npu1")
+    assert dev.vertical_capacity(0, 2, "south") == 4
+
+
+def test_vertical_capacity_each_boundary_and_direction():
+    dev = load_device_model("npu1")
+    assert dev.vertical_capacity(0, 1, "south") == 4     # memtile -> shim
+    assert dev.vertical_capacity(0, 1, "north") == 6     # shim -> memtile
+    assert dev.vertical_capacity(0, 2, "north") == 6     # memtile -> core
+    assert dev.vertical_capacity(0, 3, "south") == 4     # core -> core
+    assert dev.vertical_capacity(0, 3, "north") == 6
+
+
+def test_horizontal_capacity():
+    dev = load_device_model("npu1")
+    assert dev.horizontal_capacity(0, 0, "east") == 4    # shim row
+    assert dev.horizontal_capacity(0, 0, "west") == 4
+    assert dev.horizontal_capacity(2, 1, "east") == 4    # core row
+    assert dev.horizontal_capacity(1, 0, "east") == 0    # memtile row has no E/W ports in the model
+    assert dev.horizontal_capacity(0, 3, "east") == 0    # no tile east of the last column
+
+
+def test_row_of():
+    dev = load_device_model("npu1")
+    assert (dev.row_of("shim_noc"), dev.row_of("mem_tile")) == (0, 1)
