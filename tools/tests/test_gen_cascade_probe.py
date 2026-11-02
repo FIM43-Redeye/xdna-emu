@@ -174,3 +174,13 @@ def test_consumer_data_region_is_32_byte_aligned(k):
     # silicon clears the low 5 address bits of vst; an unaligned region lands early
     ts_bytes = g.depth_consumer_out_bytes(k) - k * g.WORD_BYTES
     assert ts_bytes % 32 == 0 and ts_bytes >= (k + 2) * 4
+
+
+def test_producer_pre_delay_adds_nops_before_first_write():
+    plain = g.producer_depth_asm(4)
+    delayed = g.producer_depth_asm(4, pre_delay_nops=500)
+    assert count(delayed, "nop") == count(plain, "nop") + 500
+    first_write = next(i for i, l in enumerate(delayed.splitlines()) if "vmov MCD" in l)
+    assert delayed.splitlines()[:first_write].count("  nop") >= 500
+    with pytest.raises(ValueError):
+        g.producer_depth_asm(4, pre_delay_nops=g.MAX_DELAY_NOPS + 1)

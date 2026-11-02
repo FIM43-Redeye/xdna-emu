@@ -157,11 +157,19 @@ def depth_consumer_out_bytes(k: int) -> int:
     return _consumer_ts_bytes(k) + k * WORD_BYTES
 
 
-def producer_depth_asm(k: int) -> str:
+def producer_depth_asm(k: int, pre_delay_nops: int = 0) -> str:
+    """K back-to-back writes with a timestamp after each.
+
+    `pre_delay_nops` straight-line nop bundles run before the first write, so a
+    consumer with a short delay is already blocked in its first SCD read when the
+    first word arrives (the forward-latency measurement).
+    """
+    if not 0 <= pre_delay_nops <= MAX_DELAY_NOPS:
+        raise ValueError(f"pre_delay_nops must be 0..{MAX_DELAY_NOPS}")
     body = _enable("crMCDEn")
     for j in range(DEPTH_WORD_REGS):
         body += [f"  mov r1, #{depth_word_value(j)}", *_nops(2), f"  vbcst.32 x{j}, r1"]
-    body += _nops(8)
+    body += _nops(8 + pre_delay_nops)
     body += _timestamp_store()                      # t_start
     for i in range(k):
         body += [f"  vmov MCD, x{i % DEPTH_WORD_REGS}"]
@@ -258,10 +266,11 @@ def smoke_topology(direction: str, n_words: int, out_dir: Path, form: str = "x",
 
 
 def depth_topology(direction: str, k: int, delay_nops: int, out_dir: Path,
-                   name: str | None = None) -> Topology:
+                   name: str | None = None, pre_delay_nops: int = 0) -> Topology:
     _placement(direction)
-    return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}", direction, out_dir,
-                 producer_depth_asm(k), consumer_depth_asm(k, delay_nops),
+    suffix = f"_p{pre_delay_nops}" if pre_delay_nops else ""
+    return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}{suffix}", direction, out_dir,
+                 producer_depth_asm(k, pre_delay_nops), consumer_depth_asm(k, delay_nops),
                  (Buffer("ts", "out", depth_producer_out_bytes(k)),),
                  (Buffer("log", "out", depth_consumer_out_bytes(k)),))
 
@@ -283,7 +292,7 @@ def cmd_generate(args) -> int:
     for direction in PLACEMENT:
         for k in args.depth_k:
             for d in args.delays:
-                _write(depth_topology(direction, k, d, out), out)
+                _write(depth_topology(direction, k, d, out, pre_delay_nops=args.pre), out)
     return 0
 
 
@@ -302,6 +311,8 @@ def main(argv=None) -> int:
     g.add_argument("--smoke-words", type=int, default=8)
     g.add_argument("--depth-k", type=int, nargs="+", default=[24])
     g.add_argument("--delays", type=int, nargs="+", default=[1500, 3000])
+    g.add_argument("--pre", type=int, default=0,
+                   help="producer nop bundles before the first write (forward-latency probes)")
     g.set_defaults(fn=cmd_generate)
     a = sub.add_parser("analyze", help="stalled-write analysis of a producer ts file")
     a.add_argument("ts_file")
