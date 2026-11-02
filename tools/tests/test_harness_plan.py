@@ -391,3 +391,109 @@ def test_first_fit_backfills_an_earlier_phase(dev):
     assert len(plan.phases) == 2
     # cores inside a phase stay in topology order
     assert plan.phases[0].cores == ("a0", "a1", "a2", "a3", "a4", "c")
+
+
+# -- stream-switch capacity across row/column boundaries ---------------------
+
+def bound(plan, kind, col, row, direction, phase=0):
+    return next((b for b in plan.phases[phase].boundaries
+                 if (b.kind, b.col, b.row, b.direction) == (kind, col, row, direction)), None)
+
+
+def test_direct_flows_are_counted_on_every_boundary_they_cross(dev):
+    plan = plan_channels(topo(core("a", 0, 3, ins=(64,), outs=(64,))), dev)
+    for row in (1, 2, 3):
+        assert bound(plan, "vertical", 0, row, "south").used == 1
+        assert bound(plan, "vertical", 0, row, "north").used == 1
+    assert bound(plan, "vertical", 0, 2, "south").capacity == 4
+    assert bound(plan, "vertical", 0, 2, "north").capacity == 6
+    assert bound(plan, "vertical", 0, 4, "south") is None
+
+
+def test_staged_join_counts_member_legs_and_one_group_leg(dev):
+    plan = plan_channels(topo(*column_cores(0, ins=())), dev)
+    assert bound(plan, "vertical", 0, 2, "south").used == 4     # four cores' legs reach the memtile
+    assert bound(plan, "vertical", 0, 1, "south").used == 1     # one joined object to the shim
+
+
+def test_column_cannot_send_more_than_the_south_channels(dev):
+    # aiecc: 7 flows cross row 2 -> row 1 but only 4 channels exist. 3 cores x
+    # 2 outputs = 6 outputs in one column: split into phases, not one phase.
+    cores = column_cores(0, n=3, ins=(), outs=(32, 32))
+    plan = plan_channels(topo(*cores), dev)
+    assert [len(p.cores) for p in plan.phases] == [2, 1]
+    for p in plan.phases:
+        for b in p.boundaries:
+            assert b.used <= b.capacity
+
+
+def test_six_way_distribute_fits_the_north_channels(dev):
+    cores = column_cores(0, n=3, ins=(32, 32), outs=())
+    plan = plan_channels(topo(*cores), dev)
+    assert len(plan.phases) == 1
+    assert bound(plan, "vertical", 0, 2, "north").used == 6
+    assert bound(plan, "vertical", 0, 2, "north").capacity == 6
+
+
+def test_seventh_input_in_a_column_forces_a_new_phase(dev):
+    cores = column_cores(0, n=4, ins=(32, 32), outs=())
+    plan = plan_channels(topo(*cores), dev)
+    assert [len(p.cores) for p in plan.phases] == [3, 1]
+
+
+def test_borrowed_route_counts_horizontal_hops_on_the_shim_row(dev):
+    small = tiny_memtile(dev)
+    plan = plan_channels(topo(*column_cores(1, n=3, outs=())), small)
+    # the borrowed input comes from column 0's shim, east along row 0 into column 1
+    b = bound(plan, "horizontal", 0, 0, "east")
+    assert b is not None and b.used == 1 and b.capacity == 4
+    assert bound(plan, "vertical", 1, 1, "north").used == 3
+
+
+def test_borrow_skips_a_lender_whose_row_zero_path_is_full(dev):
+    # Shrink the shim's East/West ports to 0: nothing can cross columns.
+    cfg = dict(dev._type_configs)
+    shim = dict(cfg["shim_noc"])
+    ports = {k: dict(v) for k, v in shim["switchbox_ports"].items()}
+    ports["East"] = {"master": 0, "slave": 0}
+    ports["West"] = {"master": 0, "slave": 0}
+    cfg["shim_noc"] = {**shim, "switchbox_ports": ports}
+    nowhere = dataclasses.replace(tiny_memtile(dev), _type_configs=cfg)
+    err = plan_channels(topo(*column_cores(1, n=3, outs=())), nowhere)
+    assert isinstance(err, PlanError) and err.code == "unplaceable"
+
+
+def test_core_stream_in_one_column_counts_vertical_boundaries(dev):
+    a, b = core("a", 0, 5), core("b", 0, 3, outs=(64,))
+    plan = plan_channels(topo(a, b, links=[CoreStream("a", "b")]), dev)
+    assert bound(plan, "vertical", 0, 5, "south").used == 1
+    assert bound(plan, "vertical", 0, 4, "south").used == 1
+    # the stream stops at row 3; b's own output then crosses boundaries 3, 2, 1
+    assert [bound(plan, "vertical", 0, r, "south").used for r in (1, 2, 3, 4, 5)] == [1] * 5
+
+
+def test_core_stream_across_columns_runs_along_the_source_row(dev):
+    a, b = core("a", 0, 3), core("b", 1, 2, outs=(64,))
+    plan = plan_channels(topo(a, b, links=[CoreStream("a", "b")]), dev)
+    assert bound(plan, "horizontal", 3, 0, "east").used == 1
+    assert bound(plan, "vertical", 1, 3, "south").used == 1      # then down b's column to row 2
+
+
+def test_cascade_uses_no_stream_channels(dev):
+    a, b = core("a", 0, 3), core("b", 0, 2, outs=(64,))
+    plan = plan_channels(topo(a, b, links=[Cascade("a", "b")]), dev)
+    assert bound(plan, "vertical", 0, 3, "south") is None
+
+
+def test_sixteen_cores_balance_two_per_column_per_phase(dev):
+    cs = [c for col in range(4)
+          for c in column_cores(col, ins=(64, 64), outs=(64, 64), prefix="c")]
+    plan = plan_channels(topo(*cs), dev)
+    assert len(plan.phases) == 2
+    for p in plan.phases:
+        per_col = {}
+        for name in p.cores:
+            col = int(name[1])
+            per_col[col] = per_col.get(col, 0) + 1
+        assert per_col == {0: 2, 1: 2, 2: 2, 3: 2}
+        assert not any(r.borrowed for r in p.routes)
