@@ -67,6 +67,15 @@ def resolve_mlir_aie(start=None, env=None):
         f"{here}; set MLIR_AIE_PATH or NPU_WORK_DIR")
 
 
+def try_resolve_mlir_aie(start=None, env=None):
+    """``resolve_mlir_aie`` for callers that can run without mlir-aie (tests
+    that skip when it is absent): None instead of raising."""
+    try:
+        return resolve_mlir_aie(start, env)
+    except ToolchainPathError:
+        return None
+
+
 def events_header(start=None, env=None):
     """Path of xaie_events_aieml.h under the resolved mlir-aie."""
     return resolve_mlir_aie(start, env) / EVENTS_HEADER_REL

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+import toolchain_paths  # noqa: E402
 from trace_config import load as trace_config_load  # noqa: E402
 
 # The script under test.
@@ -314,8 +315,11 @@ except (ImportError, ModuleNotFoundError):
     pass
 
 # Also check that the npu-xrt test directory exists.
-_NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or Path(__file__).resolve().parents[2])
-_ADD_ONE_DIR = _NPU_WORK / "mlir-aie/test/npu-xrt/add_one_using_dma"
+_MLIR_AIE = (
+    toolchain_paths.try_resolve_mlir_aie(Path(__file__))
+    or Path(__file__).resolve().parents[2] / "mlir-aie"  # absent: test skips
+)
+_ADD_ONE_DIR = _MLIR_AIE / "test/npu-xrt/add_one_using_dma"
 
 
 @pytest.mark.skipif(

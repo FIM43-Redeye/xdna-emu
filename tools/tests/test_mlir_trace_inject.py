@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "tools"))
+import toolchain_paths  # noqa: E402
 INJECTOR = REPO / "tools" / "mlir-trace-inject.py"
 FIXTURES = REPO / "tools" / "tests" / "fixtures"
 UNTRACED = FIXTURES / "sample_untraced.mlir"
@@ -579,8 +581,9 @@ def test_memmod_injection_in_trace_config(tmp_path):
 # npu-xrt tests).  Located in mlir-aie's test/aiecc/ tree, which is
 # specifically designed for aiecc compilation testing.
 BRIDGE_TEST_MLIR = (
-    Path(os.environ.get("NPU_WORK_DIR") or Path(__file__).resolve().parents[3])
-    / "mlir-aie/test/aiecc/cpp_npu_and_xclbin.mlir"
+    (toolchain_paths.try_resolve_mlir_aie(Path(__file__))
+     or Path(__file__).resolve().parents[3] / "mlir-aie")  # absent: tests skip
+    / "test/aiecc/cpp_npu_and_xclbin.mlir"
 )
 
 

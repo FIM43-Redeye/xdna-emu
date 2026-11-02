@@ -505,6 +505,9 @@ class SafeTransactionTests(unittest.TestCase):
     def test_frozen_workload_paths_use_canonical_fixture_bytes(self):
         paths = fw.frozen_input_paths()
         reserve = fw._workspace_root() / "npu1-research-reserve"
+        if not reserve.is_dir():
+            self.skipTest("npu1-research-reserve (workspace-local frozen "
+                          "fixtures, not in this repo) is absent")
 
         for name in ("xclbin", "instructions", "executable"):
             self.assertTrue(paths[name].is_relative_to(reserve))

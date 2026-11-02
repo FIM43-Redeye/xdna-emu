@@ -13,9 +13,14 @@ import os
 import sys
 from pathlib import Path
 
-_NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or Path(__file__).resolve().parents[2])
-_CLANG_SITE = (_NPU_WORK / "amd-unified-software/tps/lnx64"
-               "/python-3.13.0/lib/python3.13/site-packages")
+# Resolved like the Rust side (NPU_WORK_DIR, then ancestor discovery), so it
+# also works from a checkout under .worktrees/<name>/.
+sys.path.insert(0, str(Path(__file__).parent))
+import toolchain_paths  # noqa: E402
 
-if _CLANG_SITE.is_dir() and str(_CLANG_SITE) not in sys.path:
-    sys.path.append(str(_CLANG_SITE))
+_AMD_SW = toolchain_paths.find_workspace_dir("amd-unified-software", __file__)
+if _AMD_SW is not None:
+    _CLANG_SITE = (_AMD_SW / "tps/lnx64"
+                   "/python-3.13.0/lib/python3.13/site-packages")
+    if _CLANG_SITE.is_dir() and str(_CLANG_SITE) not in sys.path:
+        sys.path.append(str(_CLANG_SITE))

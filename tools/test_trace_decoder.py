@@ -29,6 +29,8 @@ import sys
 # Add tools/ to the import path so test_trace_decoder.py can `import trace_decoder`
 sys.path.insert(0, str(Path(__file__).parent))
 
+import toolchain_paths
+
 from trace_decoder import (
     EventCmd,
     PacketType,
@@ -43,9 +45,10 @@ from trace_decoder import (
 from trace_decoder.packet import deinterleave_packets, words_to_bytes
 
 FIXTURE_DIR = Path(__file__).parent / "trace_decoder" / "fixtures"
+# Resolved like the Rust side, so it also works from .worktrees/<name>/.
 _MLIR_AIE = (
-    Path(os.environ.get("NPU_WORK_DIR") or Path(__file__).resolve().parents[2])
-    / "mlir-aie"
+    toolchain_paths.try_resolve_mlir_aie(Path(__file__))
+    or Path(__file__).resolve().parents[2] / "mlir-aie"  # absent: tests skip
 )
 
 # The CLI tests need some resolved design MLIR to name trace slots and tiles,

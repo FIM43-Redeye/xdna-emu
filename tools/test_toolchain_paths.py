@@ -94,3 +94,9 @@ def test_workspace_dir_absent_is_none(tmp_path):
     assert tp.find_workspace_dir("xdna-emu-priv", tmp_path, {}) is None
     assert tp.find_workspace_dir(
         "xdna-emu-priv", tmp_path, {"NPU_WORK_DIR": str(tmp_path)}) is None
+
+
+def test_try_resolve_returns_none_instead_of_raising(tmp_path):
+    assert tp.try_resolve_mlir_aie(tmp_path, {}) is None
+    m = _make_mlir_aie(tmp_path / "mlir-aie")
+    assert tp.try_resolve_mlir_aie(tmp_path, {}) == m.resolve()
