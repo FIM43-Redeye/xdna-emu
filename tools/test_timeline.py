@@ -855,7 +855,8 @@ def test_two_col_connectivity_is_logical_and_honest(tmp_path):
                                      candidate_pairs_from_dump)
     from inference.engine import run_engine
 
-    dump = load_dump("config_extract/fixtures/two_col.config.json")
+    dump = load_dump(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "config_extract/fixtures/two_col.config.json"))
     sc = 1
     configured = enumerate_configured_events(dump, sc)
     cps = candidate_pairs_from_dump(dump, configured, sc)
