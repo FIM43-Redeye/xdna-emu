@@ -72,15 +72,32 @@ the position of the group's first member, because the shim moves the whole
 joined object as one contiguous transfer. Hence a non-last member of a group
 must be a multiple of the alignment (`join_member_misaligned` otherwise).
 
+Routing capacity
+----------------
+Stream-switch channels across tile boundaries are finite and the capacities
+are device-model data (`DeviceModel.vertical_capacity` / `horizontal_capacity`:
+the sender's master ports against the receiver's slave ports, e.g. 4 channels
+southbound from a core row into the memtile, 6 northbound). Every DMA flow of
+a plan (direct, both legs of a staged route, borrowed) and every CoreStream is
+counted on each boundary it crosses, and a placement is feasible only if no
+boundary is over capacity. This bounds a column to 4 outputs and 6 inputs per
+phase whatever the shim or memtile could carry, and it is part of the joint
+per-column choice and of borrowing. Routes are assumed to stay in the core's
+column (a borrowed route descends it, then runs along the shim row; a
+cross-column CoreStream runs along the source row, then down the destination
+column); detours through neighbouring columns are never relied on, so a plan
+routes without them. The usage per boundary is in `Phase.boundaries`.
+
 Not modelled
 ------------
-Stream-switch routing congestion. Cascade, CoreStream and DMA flows all need
-switch ports and `aiecc` owns that routing; failures surface in the aiecc
-sweep of the emitter step. Cascade links consume no DMA channels.
+The detailed switch-port assignment (which master/slave port a flow takes,
+packet vs circuit switching): `aiecc` owns it, and failures there surface in
+the aiecc sweep. Cascade links consume neither DMA channels nor stream ports.
 """
 from __future__ import annotations
 
 import dataclasses
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -148,6 +165,22 @@ class TileUsage:
 
 
 @dataclass(frozen=True)
+class BoundaryUsage:
+    """Stream flows crossing one tile boundary, against its channel capacity.
+
+    vertical: the boundary between rows `row - 1` and `row` of column `col`;
+    direction "south" runs toward the shim row. horizontal: the boundary
+    between columns `col` and `col + 1` on row `row`; direction "east"/"west".
+    """
+    kind: Literal["vertical", "horizontal"]
+    col: int
+    row: int
+    direction: str
+    used: int
+    capacity: int
+
+
+@dataclass(frozen=True)
 class Phase:
     index: int
     cores: tuple[str, ...]
@@ -156,6 +189,7 @@ class Phase:
     usage: tuple[TileUsage, ...]      # sorted by (col, row)
     host_in_bytes: int
     host_out_bytes: int
+    boundaries: tuple[BoundaryUsage, ...] = ()   # sorted; only boundaries in use
 
 
 @dataclass(frozen=True)
@@ -331,6 +365,77 @@ class _Group:
     items: list[_Item]
 
 
+# -- stream-switch boundaries -------------------------------------------------
+# A boundary key is (kind, col, row, direction), the BoundaryUsage fields
+# without the counts. Routes are modelled as follows (aiecc owns the real
+# switch-port assignment; this only keeps a plan inside the capacity data):
+#   - a vertical hop stays in the column of the tile it starts or ends at;
+#   - a borrowed route runs vertically in its core's own column and along the
+#     shim row between the core's column and the lending shim's column;
+#   - a CoreStream between columns runs along the source core's row, then
+#     vertically in the destination core's column;
+#   - detours through neighbouring columns are never assumed.
+
+Boundary = tuple[str, int, int, str]
+
+
+def _vertical(col: int, src_row: int, dst_row: int) -> list[Boundary]:
+    if src_row > dst_row:
+        return [("vertical", col, r, "south") for r in range(dst_row + 1, src_row + 1)]
+    return [("vertical", col, r, "north") for r in range(src_row + 1, dst_row + 1)]
+
+
+def _horizontal(row: int, src_col: int, dst_col: int) -> list[Boundary]:
+    if dst_col > src_col:
+        return [("horizontal", c, row, "east") for c in range(src_col, dst_col)]
+    return [("horizontal", c, row, "west") for c in range(dst_col, src_col)]
+
+
+def _capacity(device: DeviceModel, key: Boundary) -> int:
+    kind, col, row, direction = key
+    if kind == "vertical":
+        return device.vertical_capacity(col, row, direction)
+    return device.horizontal_capacity(row, col, direction)
+
+
+def _over(device: DeviceModel, usage: Counter) -> list[str]:
+    return [f"{k[0]} {k[3]} at col {k[1]} row {k[2]}: {n} flows, {_capacity(device, k)} channels"
+            for k, n in sorted(usage.items()) if n > _capacity(device, k)]
+
+
+def _stream_flows(topology: Topology, cores: list[Core]) -> list[Boundary]:
+    by_name = {c.name: c.tile for c in cores}
+    flows: list[Boundary] = []
+    for link in topology.links:
+        if not isinstance(link, CoreStream) or link.src not in by_name or link.dst not in by_name:
+            continue
+        s, d = by_name[link.src], by_name[link.dst]
+        if s.col != d.col:
+            flows += _horizontal(s.row, s.col, d.col)
+        flows += _vertical(d.col, s.row, d.row)
+    return flows
+
+
+def _placement_flows(placements: list["_Placement"], shim_row: int,
+                     mem_row: int) -> list[Boundary]:
+    """Boundaries crossed by placements: one flow per direct route or member
+    leg, plus one per staged group (its shim-side leg)."""
+    flows: list[Boundary] = []
+    seen: set[int] = set()
+    for p in placements:
+        c, r = p.item.core.tile.col, p.item.core.tile.row
+        out = p.item.buf.direction == "out"
+        if p.group is None:
+            flows += (_vertical(c, r, shim_row) + _horizontal(shim_row, c, p.shim_col)) if out \
+                else (_horizontal(shim_row, p.shim_col, c) + _vertical(c, shim_row, r))
+            continue
+        flows += _vertical(c, r, mem_row) if out else _vertical(c, mem_row, r)
+        if id(p.group) not in seen:
+            seen.add(id(p.group))
+            flows += _vertical(c, mem_row, shim_row) if out else _vertical(c, shim_row, mem_row)
+    return flows
+
+
 def _split_even(items: list[_Item], groups: int) -> list[list[_Item]]:
     base, extra = divmod(len(items), groups)
     out, at = [], 0
@@ -402,62 +507,107 @@ def _plan_phase(index: int, cores: list[Core], topology: Topology,
                 and a.locks + b.locks <= device.num_locks("mem_tile")
                 and a.bds + b.bds <= device.num_bds("mem_tile"))
 
+    shim_row, mem_row = device.row_of("shim_noc"), device.row_of("mem_tile")
+    usage: Counter = Counter(_stream_flows(topology, cores))
+    over = _over(device, usage)
+    if over:
+        return _Fail("CoreStream flows exceed stream-switch capacity: " + "; ".join(over),
+                     "route_capacity")
+
+    def materialize(items: list[_Item], direction: str, opt: tuple, col: int,
+                    ) -> tuple[list[_Placement], list[_Item]]:
+        """Placements an option implies, plus the buffers left to borrow."""
+        _, _, _, d, s_count, chunks, _ = opt
+        kind = "memtile_join" if direction == "out" else "memtile_distribute"
+        out_p = [_Placement(it, "direct", col) for it in items[:d]]
+        for chunk in chunks:
+            if len(chunk) < 2:
+                out_p.append(_Placement(chunk[0], "direct", col))
+                continue
+            group = _Group(kind, col, list(chunk))
+            out_p.extend(_Placement(it, kind, col, group) for it in chunk)
+        return out_p, items[d + s_count:]
+
+    def delta_of(parts: list[tuple[list[_Placement], list[_Item]]], col: int) -> Counter:
+        # A buffer left to borrow still descends its own column to the shim row;
+        # the row-0 hops are added when a lender is chosen.
+        pseudo = [p for placed_, left in parts
+                  for p in placed_ + [_Placement(it, "direct", col) for it in left]]
+        return Counter(_placement_flows(pseudo, shim_row, mem_row))
+
     for col in sorted(by_col):
         # The memtile's channels, locks and bytes are shared by the column's
         # distribute (inputs) and join (outputs), so choose both together:
         # most buffers placed, then fewest shim channels (the rest stay free
         # for borrowers), then fewest groups; first option wins remaining ties.
+        # A pair is feasible only if its flows stay within boundary capacity.
         in_opts = options(by_col[col]["in"], "in", free["in"])
         out_opts = options(by_col[col]["out"], "out", free["out"])
         best = None
+        first_over: list[str] = []
         for oi in in_opts:
             for oo in out_opts:
                 if not joint_fit(oi[6], oo[6]):
                     continue
+                parts = [materialize(by_col[col]["in"], "in", oi, col),
+                         materialize(by_col[col]["out"], "out", oo, col)]
+                delta = delta_of(parts, col)
+                trial = usage + delta
+                bad = _over(device, trial)
+                if bad:
+                    first_over = first_over or bad
+                    continue
                 key = (oi[0] + oo[0], -(oi[1] + oo[1]), -(oi[2] + oo[2]))
                 if best is None or key > best[0]:
-                    best = (key, oi, oo)
-        # Every direction has the direct-only option, which costs no memtile.
-        assert best is not None
-        for direction, opt in (("in", best[1]), ("out", best[2])):
-            items = by_col[col][direction]
-            _, _, _, d, s_count, chunks, add = opt
+                    best = (key, oi, oo, parts, delta)
+        if best is None:
+            return _Fail(f"column {col}: no placement stays within stream-switch "
+                         f"capacity ({'; '.join(first_over)})", "route_capacity")
+        usage += best[4]
+        for direction, opt, (placed_, left) in (("in", best[1], best[3][0]),
+                                                ("out", best[2], best[3][1])):
+            add = opt[6]
             m = mt[col]
             m.s2mm += add.s2mm; m.mm2s += add.mm2s; m.bytes += add.bytes
             m.locks += add.locks; m.bds += add.bds
-            kind = "memtile_join" if direction == "out" else "memtile_distribute"
-            for it in items[:d]:
-                placed.append(_Placement(it, "direct", col))
-            shim_used[direction][col] += d
-            for chunk in chunks:
-                shim_used[direction][col] += 1
-                if len(chunk) < 2:
-                    placed.append(_Placement(chunk[0], "direct", col))
-                    continue
-                group = _Group(kind, col, list(chunk))
-                placed.extend(_Placement(it, kind, col, group) for it in chunk)
-            leftover.extend(items[d + s_count:])
+            shim_used[direction][col] += opt[3] + len(opt[5])
+            placed.extend(placed_)
+            leftover.extend(left)
 
     for it in leftover:           # borrow, after every column placed its own
         direction, home = it.buf.direction, it.core.tile.col
         lenders = sorted((c for c in range(device.columns)
                           if c != home and shim_used[direction][c] < free[direction]),
                          key=lambda c: (abs(c - home), c))
-        if not lenders:
+        chosen = None
+        for lender in lenders:
+            hops = (_horizontal(shim_row, home, lender) if direction == "out"
+                    else _horizontal(shim_row, lender, home))
+            if all(usage[h] + 1 <= _capacity(device, h) for h in hops):
+                chosen = (lender, hops)
+                break
+        if chosen is None:
             channel = "MM2S" if direction == "in" else "S2MM"
-            return _Fail(f"no free shim {channel} channel for {it.core.name}.{it.buf.name} "
+            return _Fail(f"no free shim {channel} channel with row-{shim_row} stream capacity "
+                    f"for {it.core.name}.{it.buf.name} "
                     f"(column {home}; {free[direction]} usable per shim, "
                     f"reserve_shim_s2mm={reserve}) after staging and borrowing")
-        shim_used[direction][lenders[0]] += 1
-        placed.append(_Placement(it, "direct", lenders[0]))
+        lender, hops = chosen
+        usage.update(hops)
+        shim_used[direction][lender] += 1
+        placed.append(_Placement(it, "direct", lender))
 
     placed.sort(key=lambda p: p.item.pos)
-    return _assemble(index, cores, placed, shim_used, mt, device, reserve, depth, align)
+    boundaries = tuple(BoundaryUsage(k[0], k[1], k[2], k[3], n, _capacity(device, k))
+                       for k, n in sorted(usage.items()) if n > 0)
+    return _assemble(index, cores, placed, shim_used, mt, device, reserve, depth, align,
+                     boundaries)
 
 
 def _assemble(index: int, cores: list[Core], placed: list[_Placement],
               shim_used: dict[str, dict[int, int]], mt: dict[int, _Memtile],
-              device: DeviceModel, reserve: int, depth: int, align: int) -> Phase | _Fail:
+              device: DeviceModel, reserve: int, depth: int, align: int,
+              boundaries: tuple[BoundaryUsage, ...] = ()) -> Phase | _Fail:
     # Groups get indices in order of their first member, then direction.
     group_list: list[_Group] = []
     for p in placed:
@@ -516,7 +666,8 @@ def _assemble(index: int, cores: list[Core], placed: list[_Placement],
 
     return Phase(index=index, cores=tuple(c.name for c in cores), routes=routes,
                  groups=groups, usage=_usage(cores, shim_used, mt, device, reserve),
-                 host_in_bytes=totals["in"], host_out_bytes=totals["out"])
+                 host_in_bytes=totals["in"], host_out_bytes=totals["out"],
+                 boundaries=boundaries)
 
 
 def _tile_row(device: DeviceModel, col: int, tile_type: str) -> int:

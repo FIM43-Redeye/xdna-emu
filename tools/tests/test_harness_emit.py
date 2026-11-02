@@ -82,8 +82,11 @@ def test_staged_join_and_distribute_use_element_offsets(dev):
 
 
 def test_borrowed_route_uses_other_columns_shim(dev):
-    cores = [core(f"c{r}", 0, r, outs=(32, 32)) for r in range(2, 6)]
-    plan = plan_channels(topo(*cores), dev)
+    # Borrowing never happens at real limits (the stream-switch capacity binds
+    # first), so plan against a memtile too small to stage anything.
+    small = dataclasses.replace(dev, mem_tile_size=4)
+    cores = [core(f"c{r}", 1, r, ins=(64,)) for r in range(2, 5)]
+    plan = plan_channels(topo(*cores), small)
     assert any(r.borrowed for r in plan.phases[0].routes)
     text = emit_mlir(topo(*cores), plan, 0, dev)
     assert "%tile_1_0 = aie.tile(1, 0)" in text

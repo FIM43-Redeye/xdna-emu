@@ -108,11 +108,10 @@ def test_staged_column_uses_one_shim_channel_per_direction(dev):
 
 
 def test_memtile_channel_limit_is_respected(dev):
-    # 4 cores x 2 outputs = 8 core MM2S, but a memtile has 6 S2MM: one
-    # direct, a 6-way join, and the last output borrows another column.
-    plan = plan_channels(topo(*column_cores(0, ins=(), outs=(32, 32))), dev)
+    # 3 cores x 2 inputs = 6 distribute members: all 6 memtile MM2S channels.
+    plan = plan_channels(topo(*column_cores(0, n=3, outs=(), ins=(32, 32))), dev)
     assert len(plan.phases[0].groups[0].members) == 6
-    assert usage(plan, 0, 1).s2mm_used == 6
+    assert (usage(plan, 0, 1).s2mm_used, usage(plan, 0, 1).mm2s_used) == (1, 6)
 
 
 def test_partial_staging_when_memtile_is_too_small_for_all(dev):
@@ -327,7 +326,7 @@ def test_sixteen_cores_two_in_two_out_take_two_phases(dev):
     plan = plan_channels(topo(*cs), dev)
     assert isinstance(plan, ChannelPlan)
     assert len(plan.phases) == 2
-    assert [c for p in plan.phases for c in p.cores] == [c.name for c in cs]
+    assert sorted(c for p in plan.phases for c in p.cores) == sorted(c.name for c in cs)
     for p in plan.phases:
         for u in p.usage:     # no tile ever exceeds its channels
             assert u.s2mm_used <= u.s2mm_available and u.mm2s_used <= u.mm2s_available
@@ -335,13 +334,13 @@ def test_sixteen_cores_two_in_two_out_take_two_phases(dev):
 
 
 def test_stage_everything_when_one_group_holds_the_whole_column(dev):
-    # 3 cores x 2 outputs in one column, one S2MM held back: one 6-way join.
-    plan = plan_channels(topo(*column_cores(0, n=3, ins=(), outs=(32, 32)),
+    # 2 cores x 2 outputs in one column, one S2MM held back: one 4-way join.
+    plan = plan_channels(topo(*column_cores(0, n=2, ins=(), outs=(32, 32)),
                               reserve_shim_s2mm=1), dev)
     p = plan.phases[0]
     assert {r.kind for r in p.routes} == {"memtile_join"}
-    assert len(p.groups) == 1 and len(p.groups[0].members) == 6
-    assert (usage(plan, 0, 1).s2mm_used, usage(plan, 0, 1).mm2s_used) == (6, 1)
+    assert len(p.groups) == 1 and len(p.groups[0].members) == 4
+    assert (usage(plan, 0, 1).s2mm_used, usage(plan, 0, 1).mm2s_used) == (4, 1)
 
 
 def test_partial_staging_one_direct_rest_staged(dev):
@@ -367,11 +366,11 @@ def test_partial_staging_with_one_free_channel_borrows_the_remainder(dev):
 
 
 def test_staging_beats_borrowing(dev):
-    plan = plan_channels(topo(*column_cores(0, ins=(), outs=(32, 32))), dev)
-    # 8 outputs: 1 direct + 6-way join (memtile S2MM 6) + 1 borrowed
+    # 6 inputs in one column: a 6-way distribute on one shim channel, no borrow.
+    plan = plan_channels(topo(*column_cores(0, n=3, ins=(32, 32), outs=())), dev)
     rs = plan.phases[0].routes
-    assert sum(1 for r in rs if r.kind == "memtile_join") == 6
-    assert sum(1 for r in rs if r.borrowed) == 1
+    assert sum(1 for r in rs if r.kind == "memtile_distribute") == 6
+    assert not any(r.borrowed for r in rs)
 
 
 # -- first-fit phase packing -------------------------------------------------
@@ -459,8 +458,10 @@ def test_borrow_skips_a_lender_whose_row_zero_path_is_full(dev):
     ports["West"] = {"master": 0, "slave": 0}
     cfg["shim_noc"] = {**shim, "switchbox_ports": ports}
     nowhere = dataclasses.replace(tiny_memtile(dev), _type_configs=cfg)
-    err = plan_channels(topo(*column_cores(1, n=3, outs=())), nowhere)
-    assert isinstance(err, PlanError) and err.code == "unplaceable"
+    plan = plan_channels(topo(*column_cores(1, n=3, outs=())), nowhere)
+    # borrowing is impossible, so the third core moves to a second phase
+    assert [len(p.cores) for p in plan.phases] == [2, 1]
+    assert not any(r.borrowed for p in plan.phases for r in p.routes)
 
 
 def test_core_stream_in_one_column_counts_vertical_boundaries(dev):
@@ -475,7 +476,7 @@ def test_core_stream_in_one_column_counts_vertical_boundaries(dev):
 def test_core_stream_across_columns_runs_along_the_source_row(dev):
     a, b = core("a", 0, 3), core("b", 1, 2, outs=(64,))
     plan = plan_channels(topo(a, b, links=[CoreStream("a", "b")]), dev)
-    assert bound(plan, "horizontal", 3, 0, "east").used == 1
+    assert bound(plan, "horizontal", 0, 3, "east").used == 1
     assert bound(plan, "vertical", 1, 3, "south").used == 1      # then down b's column to row 2
 
 

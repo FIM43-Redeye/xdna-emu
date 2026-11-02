@@ -4,14 +4,14 @@ Marked `aiecc` (minutes): deselect with `-m 'not aiecc'`. Skips when aiecc or
 the Peano assembler is unavailable. Kernels are a bare `ret`: the sweep checks
 that the emitted MLIR is accepted and routed, not what kernels compute.
 """
-import shutil
+import dataclasses
 import time
 from pathlib import Path
 
 import pytest
 
 from harness.build import BuildError, aiecc_path, build_package
-from harness.plan import plan_channels
+from harness.plan import plan_channels, resolve_device
 from harness.topology import Buffer, Cascade, Core, CoreStream, TileRef, Topology
 
 pytestmark = pytest.mark.aiecc
@@ -62,18 +62,34 @@ def reserve_forces_staging(k):
     return Topology("reserve", tuple(column(k, 0, n=2)), device="auto", reserve_shim_s2mm=1)
 
 
-def partial_staging(k, device="npu1"):
-    # 7 outputs vs 2 S2MM channels and 6 memtile S2MM: 1 direct + a 6-way join
-    # (the planner stages everything it can, so partial staging needs overflow).
-    cores = column(k, 0, ins=(), outs=(32, 32))
-    cores[3] = mk(k, "c0_5", 0, 5, outs=(32,))
-    return Topology("partial", tuple(cores), device=device)
+# Partial staging and borrowing never happen at the real device's limits (the
+# stream-switch capacity binds first), so these two are planned against a
+# memtile too small to hold everything; the MLIR still targets the real device.
+SMALL_MEMTILE = 130
+
+
+def partial_staging(k):
+    # 3 inputs vs 2 channels, memtile fits 2 buffers: 1 direct + a 2-way distribute.
+    return Topology("partial", tuple(column(k, 0, n=3, outs=())), device="auto")
 
 
 def borrowed_cross_column(k):
-    # 8 outputs in one column: 1 direct + 6-way join + 1 borrowed from column 1.
+    # 4 outputs: 1 direct, a 2-way join, the last borrows column 1's shim.
     # "auto" would pick the one-column device, which has no neighbour to borrow from.
-    return Topology("borrow", tuple(column(k, 0, ins=(), outs=(32, 32))), device="npu1")
+    return Topology("borrow", tuple(column(k, 0, ins=())), device="npu1")
+
+
+def one_column_overflow(k):
+    # 7 outputs in one column on the one-column device: more than the 4 south
+    # channels allow, so the planner splits phases (aiecc used to fail this).
+    cores = column(k, 0, ins=(), outs=(32, 32))
+    cores[3] = mk(k, "c0_5", 0, 5, outs=(32,))
+    return Topology("overflow", tuple(cores), device="npu1_1col")
+
+
+def one_column_six_way_distribute(k):
+    return Topology("distribute6", tuple(column(k, 0, n=3, ins=(32, 32), outs=())),
+                    device="npu1_1col")
 
 
 def sixteen_cores(k):
@@ -94,6 +110,11 @@ def cascade_east(k):
 def core_stream_pair(k):
     a, b = mk(k, "p", 0, 3, outs=(64,)), mk(k, "q", 0, 2, outs=(64,))
     return Topology("stream_pair", (a, b), links=(CoreStream("p", "q"),), device="auto")
+
+
+def core_stream_cross_column(k):
+    a, b = mk(k, "p", 0, 3, outs=(64,)), mk(k, "q", 2, 2, outs=(64,))
+    return Topology("stream_cross", (a, b), links=(CoreStream("p", "q"),), device="auto")
 
 
 def cascade_producer_without_args(k):
@@ -119,14 +140,21 @@ SHAPES = {
                              lambda p: {"memtile_join", "memtile_distribute"} <= kinds(p)),
     "reserve_forces_staging": (reserve_forces_staging, lambda p: "memtile_join" in kinds(p)),
     "partial_staging": (partial_staging,
-                        lambda p: {"direct", "memtile_join"} <= kinds(p)
-                        and not any(r.borrowed for r in p.phases[0].routes)),
+                        lambda p: {"direct", "memtile_distribute"} <= kinds(p)
+                        and not any(r.borrowed for r in p.phases[0].routes), SMALL_MEMTILE),
     "borrowed_cross_column": (borrowed_cross_column,
-                              lambda p: any(r.borrowed for r in p.phases[0].routes)),
+                              lambda p: any(r.borrowed for r in p.phases[0].routes)
+                              and "memtile_join" in kinds(p), SMALL_MEMTILE),
+    "one_column_overflow_phases": (one_column_overflow, lambda p: len(p.phases) > 1),
+    "one_column_six_way_distribute": (
+        one_column_six_way_distribute,
+        lambda p: len(p.phases) == 1 and len(p.phases[0].groups[0].members) == 6),
     "sixteen_cores_two_phases": (sixteen_cores, lambda p: len(p.phases) == 2),
     "cascade_south": (cascade_south, lambda p: True),
     "cascade_east": (cascade_east, lambda p: True),
     "core_stream_pair": (core_stream_pair, lambda p: True),
+    "core_stream_cross_column": (core_stream_cross_column,
+                                 lambda p: any(b.kind == "horizontal" for b in p.phases[0].boundaries)),
     "cascade_producer_no_args": (cascade_producer_without_args, lambda p: True),
     "mixed_cascade_and_staging": (mixed_cascade_and_staging,
                                   lambda p: "memtile_join" in kinds(p)),
@@ -135,22 +163,16 @@ SHAPES = {
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_shape_packages_with_aiecc(shape, kernel, tmp_path):
-    factory, shape_holds = SHAPES[shape]
+    factory, shape_holds, *shrink = SHAPES[shape]
     t = factory(kernel)
-    plan = plan_channels(t)
+    device = None
+    if shrink:
+        device = dataclasses.replace(resolve_device(t), mem_tile_size=shrink[0])
+    plan = plan_channels(t, device)
     assert not isinstance(plan, Exception) and shape_holds(plan), f"{shape}: plan changed shape"
     start = time.time()
-    pkg = build_package(t, tmp_path / shape)
+    pkg = build_package(t, tmp_path / shape, device=device)
     elapsed = time.time() - start
     for d in pkg.phase_dirs:
         assert (d / "aie.xclbin").stat().st_size > 0 and (d / "insts.bin").stat().st_size > 0
     print(f"SWEEP {shape}: {len(pkg.phase_dirs)} phase(s) ok in {elapsed:.1f}s")
-
-
-@pytest.mark.xfail(strict=True, raises=BuildError, reason=(
-    "known planner/router gap: on the one-column device the 7 flows of "
-    "partial_staging cross row 2 -> row 1 but the column has 4 channels "
-    "(aiecc: 'Unable to find a legal routing'); the full npu1 routes them "
-    "through neighbouring columns. Coordinator decision pending."))
-def test_partial_staging_on_one_column_device(kernel, tmp_path):
-    build_package(partial_staging(kernel, device="npu1_1col"), tmp_path / "p1col")

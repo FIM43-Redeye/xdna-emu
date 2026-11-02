@@ -26,11 +26,11 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .device_model import DeviceModelError, load_device_model
+from .device_model import DeviceModel
 from .emit import emit_mlir, kernel_object, kernel_symbol
 from .plan import ChannelPlan, PlanError, plan_channels, resolve_device
 from .topology import Topology, to_dict
-from .validate import ValidationError, validate_topology
+from .validate import validate, validate_topology
 
 AIECC_FLAGS = ("--xchesscc=false", "--xbridge=false",
                "--get-xclbin", "--xclbin-name=aie.xclbin",
@@ -132,13 +132,22 @@ def _tool_versions(root: Path) -> dict:
     return tools
 
 
-def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = True) -> Package:
-    """Validate, plan, emit and build every phase of `topology` into `out_dir`."""
+def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = True,
+                  device: DeviceModel | None = None) -> Package:
+    """Validate, plan, emit and build every phase of `topology` into `out_dir`.
+
+    `device` overrides the planning model (tests shrink the memtile to reach
+    plan shapes the real limits never produce); the emitted MLIR still targets
+    the real device of that name.
+    """
     out_dir = Path(out_dir)
-    device = resolve_device(topology)
-    if isinstance(device, PlanError):
-        raise BuildError(f"{topology.name}: {device.code}: {device.message}")
-    errors = validate_topology(topology)
+    if device is None:
+        device = resolve_device(topology)
+        if isinstance(device, PlanError):
+            raise BuildError(f"{topology.name}: {device.code}: {device.message}")
+        errors = validate_topology(topology)
+    else:
+        errors = validate(dataclasses.replace(topology, device=device.name), device)
     if errors:
         raise BuildError(f"{topology.name}: validation failed:\n" +
                          "\n".join(f"  {e.code}: {e.message}" for e in errors))
