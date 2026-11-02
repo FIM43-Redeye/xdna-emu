@@ -41,6 +41,10 @@ pub struct WriteTag {
     /// Absolute issued-bundle count at which the result lands (issue + result operand cycle).
     /// Writes collide only when this is equal.
     pub land: u64,
+    /// The write is a `vmov x/bm, SCD` cascade read. Silicon (probe3,
+    /// `build/experiments/cascade-collisions/probe3`): beside a cascade read, a narrow
+    /// (single-chunk) writer on an odd bank also drives lane 1 of the port.
+    pub cascade_read: bool,
 }
 
 /// One 256-bit piece of a register write.
@@ -58,6 +62,8 @@ pub struct Chunk {
     pub reg: u16,
     /// The 256 bits the instruction itself computed for this chunk.
     pub data: [u32; 8],
+    /// The chunk belongs to a cascade read ([`WriteTag::cascade_read`]).
+    pub cascade: bool,
 }
 
 /// What happens to one input chunk.
@@ -95,10 +101,23 @@ fn resolve_port(chunks: &[Chunk], port: u16, out: &mut [Landing]) {
         return;
     }
     let on_port = || chunks.iter().enumerate().filter(|(_, c)| c.port == port);
-    // lane k: the data of ordinal k of the latest-issued writer that has one
+    // Beside a cascade read a narrow writer on an odd bank also drives lane 1 (see
+    // `WriteTag::cascade_read`); otherwise lane k belongs to ordinal k alone.
+    let cascade_present = on_port().any(|(_, c)| c.cascade);
+    let chunks_of = |w: u64| on_port().filter(|(_, c)| c.writer == w).count();
+    let drives = |c: &Chunk, k: u8| {
+        c.ordinal == k
+            || (cascade_present
+                && k == 1
+                && !c.cascade
+                && c.ordinal == 0
+                && c.bank & 1 == 1
+                && chunks_of(c.writer) == 1)
+    };
+    // lane k: the data of the latest-issued writer that drives it
     let lane = |k: u8| -> Option<[u32; 8]> {
         on_port()
-            .filter(|(_, c)| c.ordinal == k)
+            .filter(|(_, c)| drives(c, k))
             .max_by_key(|(_, c)| c.writer)
             .map(|(_, c)| c.data)
     };
@@ -108,7 +127,7 @@ fn resolve_port(chunks: &[Chunk], port: u16, out: &mut [Landing]) {
             out[i].lands = false;
             continue;
         }
-        out[i].data = lane(c.bank).or_else(|| lane(0)).unwrap_or(c.data);
+        out[i].data = lane(c.bank).or_else(|| lane(c.ordinal)).or_else(|| lane(0)).unwrap_or(c.data);
     }
 }
 
@@ -135,11 +154,45 @@ mod tests {
 
     /// A chunk whose 256 bits are recognisable: every word is `tag`.
     fn chunk(writer: u64, port: u16, ordinal: u8, bank: u8, reg: u16, tag: u32) -> Chunk {
-        Chunk { writer, port, ordinal, bank, reg, data: [tag; 8] }
+        Chunk { writer, port, ordinal, bank, reg, data: [tag; 8], cascade: false }
     }
 
     fn lands(l: &Landing) -> Option<u32> {
         l.lands.then(|| l.data[0])
+    }
+
+    // Silicon (cascade-collisions probe3, `vmov bmh, SCD` against `vmov bm, bm`): a chunk on a
+    // bank no writer drives a lane for takes the lane of its own ordinal before lane 0.
+    #[test]
+    fn an_undriven_bank_takes_the_lane_of_its_own_ordinal() {
+        // A (earlier): bmh, banks 2,3, ordinals 0,1. B (later): bm, banks 0,1, ordinals 0,1.
+        let all = [
+            chunk(1, 0, 0, 2, 7, 0xA0),
+            chunk(1, 0, 1, 3, 7, 0xA1),
+            chunk(2, 0, 0, 0, 5, 0xB0),
+            chunk(2, 0, 1, 1, 5, 0xB1),
+        ];
+        let r = resolve(&all);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), Some(0xB1), Some(0xB0), Some(0xB1)]);
+    }
+
+    // Silicon (probe3, `vmov bm, SCD` against `vmov am.., q`): beside a cascade read a narrow
+    // writer on an odd bank also drives lane 1; on an even bank it does not.
+    #[test]
+    fn beside_a_cascade_read_a_narrow_odd_bank_writer_drives_lane_one() {
+        let scd = |ordinal, bank, tag| Chunk { cascade: true, ..chunk(1, 0, ordinal, bank, 4, tag) };
+        // B (later) on bank 3: the read's second chunk (bank 1) takes B's data, B keeps its own
+        let all = [scd(0, 0, 0xA0), scd(1, 1, 0xA1), chunk(2, 0, 0, 3, 11, 0xB0)];
+        let r = resolve(&all);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), Some(0xB0), Some(0xB0)]);
+        // B on bank 2: lane 1 stays the read's, its second chunk keeps its own data
+        let all = [scd(0, 0, 0xA0), scd(1, 1, 0xA1), chunk(2, 0, 0, 2, 11, 0xB0)];
+        let r = resolve(&all);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), Some(0xA1), Some(0xB0)]);
+        // without a cascade read the same pair is the plain rule: bank 3 is no lane of A's
+        let plain = [chunk(1, 0, 0, 0, 4, 0xA0), chunk(1, 0, 1, 1, 4, 0xA1), chunk(2, 0, 0, 3, 11, 0xB0)];
+        let r = resolve(&plain);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), Some(0xA1), Some(0xB0)]);
     }
 
     #[test]

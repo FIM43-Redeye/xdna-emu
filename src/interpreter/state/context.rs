@@ -1039,6 +1039,7 @@ impl ExecutionContext {
             port,
             seq: self.write_seq,
             land: self.bundle_seq + self.result_latency as u64,
+            cascade_read: false,
         });
         self.set_write_tag(tag);
     }
@@ -1462,12 +1463,15 @@ impl ExecutionContext {
     /// current op's result latency and bypass class and write tag.
     pub fn queue_pending_cascade_read(&mut self, dest: Operand) {
         self.pending_cascade_reads.push_back(PendingCascadeRead {
-            dest,
+            dest: dest.clone(),
             issue_bundle: self.bundle_seq,
             ready_bundle: self.bundle_seq + CASCADE_READ_HOLD_BUNDLES,
             l_def: self.result_latency,
             def_bypass: self.result_bypass,
-            tag: self.write_tag,
+            // the lane quirk is the accumulator side's (probe3: x destinations follow the plain rule)
+            tag: self
+                .write_tag
+                .map(|t| WriteTag { cascade_read: matches!(dest, Operand::AccumReg(_)), ..t }),
         });
     }
 

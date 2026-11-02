@@ -11,6 +11,7 @@
 //!
 //! Regenerate the table with `tools/gen_collision_goldens.py`.
 
+use super::collision_goldens_cascade_data::{CASCADE_GOLDENS, CASCADE_VARIANTS};
 use super::collision_goldens_data::{Golden, Out, Variant, GOLDENS, VARIANTS};
 use super::cycle_accurate::CycleAccurateExecutor;
 use crate::device::tile::Tile;
@@ -86,10 +87,24 @@ fn read_out(ctx: &ExecutionContext, out: &Out) -> Vec<u8> {
     bytes
 }
 
+/// The word the producer core of `tools/gen_cascade_collision_probe.py` streams: every read of
+/// the cascade returns it (16 lanes `0x5C0D0000 + lane`).
+fn cascade_word() -> [u64; xdna_archspec::aie2::CASCADE_WORDS] {
+    let lane = |k: u64| 0x5C0D_0000 + k;
+    std::array::from_fn(|i| lane(2 * i as u64) | lane(2 * i as u64 + 1) << 32)
+}
+
 /// Replay one golden; the two destination registers' bytes as `(a, b)`.
-fn replay(g: &Golden) -> (Vec<u8>, Vec<u8>) {
+fn replay(g: &Golden, variants: &[Variant]) -> (Vec<u8>, Vec<u8>) {
     let decoder = InstructionDecoder::load_default();
-    let (mut ctx, mut tile) = start_state(&VARIANTS[g.variant]);
+    let (mut ctx, mut tile) = start_state(&variants[g.variant]);
+    if g.a.asm.contains("SCD") || g.b.asm.contains("SCD") {
+        // the probe's consumer finds the cascade full: the producer core has been writing for
+        // longer than the consumer's start-up wait
+        for _ in 0..2 {
+            tile.push_cascade_input(cascade_word());
+        }
+    }
     let (a, b) = (op_of(&decoder, &g.a), op_of(&decoder, &g.b));
     let mut executor = CycleAccurateExecutor::new();
     let last = g.pa.max(g.pb) as usize;
@@ -117,12 +132,12 @@ fn replay(g: &Golden) -> (Vec<u8>, Vec<u8>) {
     (read_out(&ctx, &g.a), read_out(&ctx, &g.b))
 }
 
-fn failures(filter: impl Fn(&Golden) -> bool) -> Vec<String> {
-    GOLDENS
+fn failures(goldens: &[Golden], variants: &[Variant], filter: impl Fn(&Golden) -> bool) -> Vec<String> {
+    goldens
         .iter()
         .filter(|g| filter(g))
         .filter_map(|g| {
-            let (a, b) = replay(g);
+            let (a, b) = replay(g, variants);
             let (want_a, want_b) = (unhex(g.a.silicon), unhex(g.b.silicon));
             (a != want_a || b != want_b).then(|| {
                 format!(
@@ -144,12 +159,27 @@ fn failures(filter: impl Fn(&Golden) -> bool) -> Vec<String> {
 /// Every golden: all rules at once.
 #[test]
 fn every_silicon_collision_point_replays_exactly() {
-    let bad = failures(|_| true);
+    let bad = failures(GOLDENS, VARIANTS, |_| true);
     assert!(
         bad.is_empty(),
         "{} of {} goldens differ from silicon:\n{}",
         bad.len(),
         GOLDENS.len(),
+        bad.join("\n")
+    );
+}
+
+/// The cascade-read pairs (`tools/gen_cascade_collision_probe.py`, probe3): a `vmov x/bm, SCD`
+/// against every instruction whose reservations collide with it, the cascade word fed from a
+/// producer core on silicon.
+#[test]
+fn every_silicon_cascade_read_collision_replays_exactly() {
+    let bad = failures(CASCADE_GOLDENS, CASCADE_VARIANTS, |_| true);
+    assert!(
+        bad.is_empty(),
+        "{} of {} cascade goldens differ from silicon:\n{}",
+        bad.len(),
+        CASCADE_GOLDENS.len(),
         bad.join("\n")
     );
 }
@@ -160,7 +190,7 @@ fn show_golden() {
     let id: u32 = std::env::var("GOLDEN_ID").unwrap().parse().unwrap();
     let probe = std::env::var("GOLDEN_PROBE").unwrap();
     let g = GOLDENS.iter().find(|g| g.id == id && g.probe == probe).unwrap();
-    let (a, b) = replay(g);
+    let (a, b) = replay(g, VARIANTS);
     for (n, got, want) in [("A", a, unhex(g.a.silicon)), ("B", b, unhex(g.b.silicon))] {
         println!(
             "{n} {} {}\n  emu {}\n  hw  {}",

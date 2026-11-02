@@ -114,11 +114,14 @@ BITPAT = os.environ.get("COLLISION_BITPAT") in ("1", "2")
 BITPAT_ODD = os.environ.get("COLLISION_BITPAT") == "2"
 # COLLISION_KEYS=a,b,c restricts the collision list to pairs of these catalogue instructions.
 KEYS_ONLY = set(filter(None, os.environ.get("COLLISION_KEYS", "").split(",")))
+# COLLISION_ANY_KEYS=a,b,c keeps the pairs in which at least one of the two is one of these.
+ANY_KEYS = set(filter(None, os.environ.get("COLLISION_ANY_KEYS", "").split(",")))
 # COLLISION_SOLO=a,b,c adds the alone / initial references of these instructions even when they
 # cannot collide with anything (a check of one instruction against silicon).
 # COLLISION_SRS_SHIFT=n sets the shift register of the srs family (s1) to n while the pattern
 # loads keep s3 = 0, to tell a converted result from raw data bits.
 SRS_SHIFT = int(os.environ.get("COLLISION_SRS_SHIFT", "0"))
+CASCADE_WAIT_ITERS = 1500       # ~15000 cycles for the producer to fill the cascade
 SOLO_KEYS = [k for k in os.environ.get("COLLISION_SOLO", "").split(",") if k]
 
 
@@ -218,7 +221,57 @@ def prologue(dom):
     for k in range(NUM_PAT + 1):
         lines += load_acc(k, dom)
     lines += nops(6)
+    if CASCADE:
+        lines += cascade_prologue()
     return lines
+
+
+CASCADE_ALIGN_MARK = "  // CASCADE_ALIGN"
+
+
+def cascade_prologue() -> list[str]:
+    """Enable the cascade input and wait for the producer core to fill it.
+
+    The two cores do not start in lockstep (the producer starts ~1000 cycles before or after
+    the consumer), so the consumer waits a counted loop and finds the cascade full. Silicon
+    ignores the low 4 bits of a branch target (gen_cascade_probe.delay_loop), so the label must be
+    16-byte aligned; the padding is written as explicit nops (kernel_text fills in the count at
+    the marker) rather than `.p2align`, so that one assembly line is still one bundle for the
+    checkers that map bundles back to lines."""
+    import gen_cascade_probe as cp
+    return (["  // ==== cascade prologue ===="] + cp._enable("crSCDEn")
+            + [f"  movxm r0, #{CASCADE_WAIT_ITERS}"] + nops(2) + [CASCADE_ALIGN_MARK, ".Lcascwait:",
+               "  add r0, r0, #-1"] + nops(2) + ["  jnz r0, #.Lcascwait"] + nops(5) + nops(4))
+
+
+def label_offset(head: str) -> int:
+    """Byte offset in .text at which the line after `head` would start (the assembler rounds the
+    whole section up to 16 bytes, so the section size is no measure; a label is)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src, obj = os.path.join(tmp, "k.s"), os.path.join(tmp, "k.o")
+        with open(src, "w") as f:
+            f.write(head + "\n.globl alignprobe\nalignprobe:\n  nop\n")
+        r = subprocess.run([LLVM_MC, "--triple=aie2", "--filetype=obj", "-o", obj, src],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(r.stderr[:2000])
+        dump = subprocess.run([os.path.join(os.path.dirname(LLVM_MC), "llvm-objdump"), "-d", obj],
+                              capture_output=True, text=True).stdout
+    return int(re.search(r"^([0-9a-f]+) <alignprobe>:", dump, re.M).group(1), 16)
+
+
+def align_cascade_label(text: str) -> str:
+    """Replace the alignment marker by the nops that put the next line on a 16-byte boundary."""
+    if CASCADE_ALIGN_MARK not in text:
+        return text
+    # `.p2align 4` at the top raises the section alignment to 16 so the linker places the kernel
+    # on a 16-byte boundary; without it the offsets computed here are not the final addresses.
+    text = text.replace(".text\n", ".text\n.p2align 4\n", 1)
+    head, tail = text.split(CASCADE_ALIGN_MARK + "\n", 1)
+    pad = (-label_offset(head)) % 16
+    assert pad % 2 == 0, pad
+    return head + "  nop\n" * (pad // 2) + tail
 
 
 # --------------------------------------------------------------------------
@@ -340,8 +393,17 @@ CATALOGUE_2D = [
     Ins("vbcstshfl8_x", "vbcstshfl.8 {DW}, r12, r29", None, (), "x"),
     Ins("vbcstshfl16_x", "vbcstshfl.16 {DW}, r12, r29", None, (), "x"),
 ]
+# Cascade reads (step 7): the SCD word is the source, so these need a producer core feeding the
+# cascade (tools/gen_cascade_collision_probe.py). Present only with COLLISION_CASCADE=1, so the
+# single-tile probes keep their catalogue.
+CASCADE = os.environ.get("COLLISION_CASCADE") == "1"
+CATALOGUE_CASCADE = [
+    Ins("vmov_x_scd", "vmov {DW}, SCD", None, (), "x"),
+    Ins("vmov_bm_scd", "vmov bml{D}, SCD", None, (), "bml"),
+    Ins("vmov_bmh_scd", "vmov bmh{D}, SCD", None, (), "bmh"),
+]
 NEW_KEYS = {i.key for i in CATALOGUE_2B}
-CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D
+CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D + (CATALOGUE_CASCADE if CASCADE else [])
 BY_KEY = {i.key: i for i in CATALOGUE}
 W_DEST = {"A": ("x8", "wl8", "wh8"), "B": ("x4", "wl4", "wh4")}     # (x, wl, wh name) per role
 W_FAMILY = ("x", "wl", "wh")        # destinations that live in the W register file
@@ -446,6 +508,8 @@ def derive_collisions(res, only_new: bool = False, unit: Optional[str] = None) -
                     if only_new and a.key not in NEW_KEYS and b.key not in NEW_KEYS:
                         continue
                     if KEYS_ONLY and not (a.key in KEYS_ONLY and b.key in KEYS_ONLY):
+                        continue
+                    if ANY_KEYS and not (a.key in ANY_KEYS or b.key in ANY_KEYS):
                         continue
                     if unit and unit not in (ua.rstrip("*"), ub.rstrip("*")):
                         continue
@@ -666,7 +730,7 @@ def kernel_text(points: list[dict], dom: str) -> str:
     chunks = ["\n".join(prologue(dom))]
     for p in points:
         chunks.append("\n".join(point_lines(p, dom)))
-    return isa_gen.build_mega_program(chunks, max(4, len(points) * RECORD_BYTES))
+    return align_cascade_label(isa_gen.build_mega_program(chunks, max(4, len(points) * RECORD_BYTES)))
 
 
 def text_size(text: str) -> int:

@@ -619,6 +619,7 @@ impl VectorRegisterFile {
                     bank: w.reg & 1,
                     reg: w.reg as u16,
                     data: w.orig,
+                    cascade: tag.cascade_read,
                 }
             })
             .collect();
@@ -1151,13 +1152,15 @@ impl AccumulatorRegisterFile {
                     data[2 * k] = *l as u32;
                     data[2 * k + 1] = (*l >> 32) as u32;
                 }
+                let ordinal = w.ordinal + n as u8;
                 chunks.push(Chunk {
                     writer: tag.seq,
                     port: tag.port,
-                    ordinal: w.ordinal + n as u8,
+                    ordinal,
                     bank: 2 * (w.reg & 1) + q,
                     reg: w.reg as u16,
                     data,
+                    cascade: tag.cascade_read,
                 });
                 owner.push((i, q));
             }
@@ -1998,7 +2001,7 @@ mod tests {
     // --- same-cycle write collisions (see `write_collision`) ---
 
     fn tag(port: u16, seq: u64, land: u64) -> Option<WriteTag> {
-        Some(WriteTag { port, seq, land })
+        Some(WriteTag { port, seq, land, cascade_read: false })
     }
 
     #[test]

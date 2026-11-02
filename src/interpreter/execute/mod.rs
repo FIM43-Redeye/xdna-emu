@@ -128,6 +128,8 @@ mod collision_goldens;
 
 #[cfg(test)]
 mod collision_goldens_data;
+#[cfg(test)]
+mod collision_goldens_cascade_data;
 
 #[cfg(test)]
 mod vector_validate;
