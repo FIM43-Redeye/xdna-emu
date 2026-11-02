@@ -120,9 +120,17 @@ impl CascadeOps {
         if let Some(dest) = &op.dest {
             match dest {
                 Operand::VectorReg(r) => {
-                    let words = cascade_to_vector(&data);
-                    ctx.vector.write(*r, words);
-                    log::info!("[CASCADE] Read SCD -> v{} (tile {},{})", r, tile.col, tile.row);
+                    // `vmov xN, SCD`: xN = VectorReg(2N) (low) + VectorReg(2N+1) (high).
+                    let (lo, hi) = cascade_to_vector(&data);
+                    ctx.vector.write(*r, lo);
+                    ctx.vector.write(*r + 1, hi);
+                    log::info!(
+                        "[CASCADE] Read SCD -> x (v{}, v{}) (tile {},{})",
+                        r,
+                        r + 1,
+                        tile.col,
+                        tile.row
+                    );
                 }
                 Operand::AccumReg(r) => {
                     let lanes = cascade_to_accumulator(&data);
@@ -167,9 +175,17 @@ impl CascadeOps {
         let data = if let Some(src) = op.sources.first() {
             match src {
                 Operand::VectorReg(r) => {
-                    let words = ctx.vector.read(*r);
-                    let d = vector_to_cascade(&words);
-                    log::info!("[CASCADE] Write v{} -> MCD (tile {},{})", r, tile.col, tile.row);
+                    // `vmov MCD, xN`: the operand is the 512-bit x register.
+                    let lo = ctx.vector.read(*r);
+                    let hi = ctx.vector.read(*r + 1);
+                    let d = vector_to_cascade(&lo, &hi);
+                    log::info!(
+                        "[CASCADE] Write x (v{}, v{}) -> MCD (tile {},{})",
+                        r,
+                        r + 1,
+                        tile.col,
+                        tile.row
+                    );
                     d
                 }
                 Operand::AccumReg(r) => {
@@ -203,26 +219,29 @@ impl CascadeOps {
     }
 }
 
-/// Pack a 256-bit vector register (8 x u32) into 512-bit cascade data (8 x u64).
-/// Low 4 slots hold the vector data, high 4 slots are zero-padded.
-fn vector_to_cascade(words: &[u32; 8]) -> [u64; CASCADE_WORDS] {
+/// Pack a 512-bit x register, held as two 256-bit halves (8 x u32 each), into
+/// 512-bit cascade data (8 x u64): the low half fills slots 0..4, the high half
+/// slots 4..8.
+fn vector_to_cascade(lo: &[u32; 8], hi: &[u32; 8]) -> [u64; CASCADE_WORDS] {
     let mut data = [0u64; CASCADE_WORDS];
     for i in 0..4 {
-        data[i] = (words[i * 2] as u64) | ((words[i * 2 + 1] as u64) << 32);
+        data[i] = (lo[i * 2] as u64) | ((lo[i * 2 + 1] as u64) << 32);
+        data[4 + i] = (hi[i * 2] as u64) | ((hi[i * 2 + 1] as u64) << 32);
     }
-    // data[4..] remain zero (padding -- a vector only fills the low 256 bits)
     data
 }
 
-/// Unpack 512-bit cascade data (8 x u64) into a 256-bit vector register (8 x u32).
-/// Takes the low 4 slots (256 bits), ignores the high slots.
-fn cascade_to_vector(data: &[u64; CASCADE_WORDS]) -> [u32; 8] {
-    let mut words = [0u32; 8];
+/// Unpack 512-bit cascade data into the (low, high) 256-bit halves of an x register.
+fn cascade_to_vector(data: &[u64; CASCADE_WORDS]) -> ([u32; 8], [u32; 8]) {
+    let mut lo = [0u32; 8];
+    let mut hi = [0u32; 8];
     for i in 0..4 {
-        words[i * 2] = data[i] as u32;
-        words[i * 2 + 1] = (data[i] >> 32) as u32;
+        lo[i * 2] = data[i] as u32;
+        lo[i * 2 + 1] = (data[i] >> 32) as u32;
+        hi[i * 2] = data[4 + i] as u32;
+        hi[i * 2 + 1] = (data[4 + i] >> 32) as u32;
     }
-    words
+    (lo, hi)
 }
 
 /// Pack a 512-bit accumulator register (8 x u64) into 512-bit cascade data
@@ -284,19 +303,15 @@ mod tests {
         tile.push_cascade_input(test_data);
 
         let op =
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(5));
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(4));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
 
-        let result = ctx.vector.read(5);
-        assert_eq!(result[0], 1);
-        assert_eq!(result[1], 2);
-        assert_eq!(result[2], 3);
-        assert_eq!(result[3], 4);
-        assert_eq!(result[4], 5);
-        assert_eq!(result[5], 6);
-        assert_eq!(result[6], 7);
-        assert_eq!(result[7], 8);
+        // `vmov x2, SCD`: the destination is the 512-bit x register, i.e. the
+        // 256-bit pair VectorReg(4) (low) + VectorReg(5) (high). Silicon carries
+        // the whole 512-bit cascade word through x (harness cascade smoke probe).
+        assert_eq!(ctx.vector.read(4), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ctx.vector.read(5), [0xDEAD, 0, 0xBEEF, 0, 0xCAFE, 0, 0xF00D, 0]);
     }
 
     #[test]
@@ -322,7 +337,9 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
+        // `vmov MCD, x1` = VectorReg(2) (low 256 bits) + VectorReg(3) (high).
         ctx.vector.write(2, [0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11]);
+        ctx.vector.write(3, [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27]);
 
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
             .with_source(Operand::VectorReg(2));
@@ -336,8 +353,11 @@ mod tests {
         assert_eq!(data[1], 0x0000_000D_0000_000C);
         assert_eq!(data[2], 0x0000_000F_0000_000E);
         assert_eq!(data[3], 0x0000_0011_0000_0010);
-        // High 4 words zero-padded -- a vector fills only the low 256 bits.
-        assert_eq!(data[4..], [0, 0, 0, 0]);
+        // The x register's high half fills the high 256 bits of the cascade word.
+        assert_eq!(data[4], 0x0000_0021_0000_0020);
+        assert_eq!(data[5], 0x0000_0023_0000_0022);
+        assert_eq!(data[6], 0x0000_0025_0000_0024);
+        assert_eq!(data[7], 0x0000_0027_0000_0026);
     }
 
     #[test]
@@ -367,10 +387,10 @@ mod tests {
 
     #[test]
     fn test_vector_cascade_roundtrip() {
-        let original = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        let cascade = vector_to_cascade(&original);
-        let recovered = cascade_to_vector(&cascade);
-        assert_eq!(original, recovered);
+        let lo = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let hi = [9u32, 10, 11, 12, 13, 14, 15, 16];
+        let cascade = vector_to_cascade(&lo, &hi);
+        assert_eq!(cascade_to_vector(&cascade), (lo, hi));
     }
 
     #[test]
