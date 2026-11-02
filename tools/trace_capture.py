@@ -13,9 +13,16 @@ from pathlib import Path
 from shlex import quote
 from typing import Dict, List
 
+import toolchain_paths
+
 _REPO = Path(__file__).resolve().parent.parent
-_EVENTS_HEADER = (_REPO.parent / "mlir-aie/build/include/xaienginecdo_static/"
-                  "xaiengine/xaie_events_aieml.h")
+try:
+    _MLIR_AIE = toolchain_paths.resolve_mlir_aie(_REPO)
+except toolchain_paths.ToolchainPathError:
+    # Defer the failure to first use of the header or build tree, so
+    # importing the pure-logic parts keeps working without mlir-aie.
+    _MLIR_AIE = _REPO.parent / "mlir-aie"
+_EVENTS_HEADER = _MLIR_AIE / toolchain_paths.EVENTS_HEADER_REL
 _MOD_PREFIX = {"core": "CORE", "memmod": "MEM", "memtile": "MEM_TILE", "shim": "PL"}
 
 
@@ -283,8 +290,6 @@ def capture(plan, runner, *, test, out_dir, start_col=1,
 # pure-logic core (above) stays import-clean and HW coupling only activates
 # when HwRunner is actually constructed.
 # ---------------------------------------------------------------------------
-
-_MLIR_AIE = _REPO.parent / "mlir-aie"
 
 
 

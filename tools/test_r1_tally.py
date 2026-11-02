@@ -28,8 +28,31 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+import toolchain_paths
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_R1_TALLY = _REPO_ROOT / "build" / "experiments" / "sp5-skew" / "r1_tally.py"
+
+
+def _find_r1_tally():
+    """r1_tally.py is the verbatim task brief file kept in the private
+    companion repo (xdna-emu-priv/experiments/sp5-skew); older checkouts
+    kept it in the gitignored build/experiments tree."""
+    candidates = [_REPO_ROOT / "build" / "experiments" / "sp5-skew" / "r1_tally.py"]
+    priv = toolchain_paths.find_workspace_dir("xdna-emu-priv", _REPO_ROOT)
+    if priv is not None:
+        candidates.append(priv / "experiments" / "sp5-skew" / "r1_tally.py")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[-1]
+
+
+_R1_TALLY = _find_r1_tally()
+
+pytestmark = pytest.mark.skipif(
+    not _R1_TALLY.is_file(),
+    reason=f"r1_tally.py not found (private companion xdna-emu-priv absent?): {_R1_TALLY}")
 
 _CORE = 0
 _MEM = 1

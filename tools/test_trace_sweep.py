@@ -497,6 +497,8 @@ def test_sweep_lockstep_writes_manifest_on_patch_failure(tmp_path, monkeypatch):
             Path(kw["trace_out"]).parent.mkdir(parents=True, exist_ok=True)
             Path(kw["trace_out"]).write_bytes(b"\x00")
             return {"ok": True}
+        # sweep_lockstep resets the session before every batch.
+        def reset(self): pass
         def close(self): pass
 
     class StubParser:
@@ -588,6 +590,8 @@ def test_sweep_lockstep_excludes_grounding_from_sweep_filter(tmp_path, monkeypat
             Path(kw["trace_out"]).parent.mkdir(parents=True, exist_ok=True)
             Path(kw["trace_out"]).write_bytes(b"\x00")
             return {"ok": True}
+        # sweep_lockstep resets the session before every batch.
+        def reset(self): pass
         def close(self): pass
 
     class StubParser:

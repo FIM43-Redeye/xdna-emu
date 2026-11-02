@@ -14,7 +14,11 @@ _spec.loader.exec_module(tv)
 
 TOOLS = Path(__file__).parent
 ROOT = TOOLS.parent
-DDR_CAPS = ROOT / "build/experiments/ddr-stochasticity"
+# 20 real NPU1 add_one_using_dma captures (2026-06-14), reduced to the fields
+# trace_variance reads and with the level (PORT_*) events and the repetitive
+# LOCK_STALL events stripped, so the fixture is ~120 KB instead of ~10 MB. The
+# full captures live in the gitignored build/experiments/ddr-stochasticity.
+DDR_CAPS = TOOLS / "fixtures" / "ddr_stochasticity"
 
 
 def _write_events(tmp_path, events):
@@ -49,7 +53,7 @@ def test_load_milestone_events_reanchors_per_tile(tmp_path):
 
 
 def test_load_milestone_events_on_real_capture():
-    # run_01.json is a real NPU1 add_one_using_dma capture.
+    # run_01.json is a (reduced) real NPU1 add_one_using_dma capture.
     out = tv.load_milestone_events(str(DDR_CAPS / "run_01.json"))
     # The shim S2MM starvation milestone family is present and non-empty.
     keys = [k for k in out if "STREAM_STARVATION" in k[2]]
