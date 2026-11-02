@@ -58,8 +58,10 @@ def test_depth_producer_cycles_distinct_registers():
 def test_depth_consumer_reads_and_delay():
     text = g.consumer_depth_asm(6, 123)
     assert count(text, ", SCD") == 6
-    assert "mov r0, #123" in text
-    assert count(text, "jnz") == 1
+    assert count(text, "nop") >= 123
+    assert count(text, "jnz") == 0          # silicon hangs on jnz loops in cascade probes
+    with pytest.raises(ValueError):
+        g.consumer_depth_asm(6, g.MAX_DELAY_NOPS + 1)
 
 
 @pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
@@ -165,3 +167,10 @@ def test_cli_generate_writes_loadable_topologies(tmp_path):
         assert validate_topology(t) == []
         for c in t.cores:
             assert Path(c.source).is_file()
+
+
+@pytest.mark.parametrize("k", [1, 3, 8, 24])
+def test_consumer_data_region_is_32_byte_aligned(k):
+    # silicon clears the low 5 address bits of vst; an unaligned region lands early
+    ts_bytes = g.depth_consumer_out_bytes(k) - k * g.WORD_BYTES
+    assert ts_bytes % 32 == 0 and ts_bytes >= (k + 2) * 4

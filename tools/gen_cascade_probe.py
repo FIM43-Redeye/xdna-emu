@@ -15,7 +15,7 @@ Expected consumer output == producer input, in order.
 
 Depth (total cascade buffering between producer and consumer)
 -------------------------------------------------------------
-The consumer spins a known loop (`delay_iters` iterations) before its first
+The consumer waits a known number of cycles (`delay_nops` straight-line nops) before its first
 read, so the cascade can only drain after that. The producer issues K
 back-to-back `vmov MCD` writes, cycling through registers x0..x11 (distinct
 values), and reads the core cycle counter (`MOV_CNTR`: `mov r17:r16, cntr`,
@@ -55,6 +55,7 @@ WORD_BYTES = 64                 # one cascade word: 512 bits
 DEPTH_WORD_REGS = 12            # x0..x11 hold distinct words in the depth probe
 LOAD_NOPS = 6
 SCD_NOPS = 8                    # VMOV_CASCADE_READ latency 7, plus one
+MAX_DELAY_NOPS = 6000           # 2 bytes per nop bundle in 16 KiB of program memory
 JUMP_MIN_CYCLES = 100           # a stall shorter than this is not distinguishable
 
 # direction -> ((producer col, row), (consumer col, row)); the producer is the
@@ -147,7 +148,9 @@ def depth_producer_out_bytes(k: int) -> int:
 
 
 def _consumer_ts_bytes(k: int) -> int:
-    return _round16((k + 2) * 4)
+    """Timestamp region size; the data after it must be 32-byte aligned because silicon
+    clears the low 5 address bits of `vst` (the emulator does not: permissive-vs-hw.md)."""
+    return (((k + 2) * 4) + 31) // 32 * 32
 
 
 def depth_consumer_out_bytes(k: int) -> int:
@@ -166,14 +169,19 @@ def producer_depth_asm(k: int) -> str:
     return _frame(body)
 
 
-def consumer_depth_asm(k: int, delay_iters: int) -> str:
-    if delay_iters < 1:
-        raise ValueError("delay_iters must be at least 1")
+def consumer_depth_asm(k: int, delay_nops: int) -> str:
+    """Read K words after `delay_nops` straight-line nop bundles (one cycle each).
+
+    The delay is straight-line code, not a `jnz` loop: on silicon any cascade probe
+    with a `jnz` loop in either core hung (docs/fidelity-gaps/core-compute-timing.md),
+    while the same delay as nops runs. Program memory (16 KiB) bounds it.
+    """
+    if not 1 <= delay_nops <= MAX_DELAY_NOPS:
+        raise ValueError(f"delay_nops must be 1..{MAX_DELAY_NOPS}")
     body = _enable("crSCDEn")
     body += ["  mov p1, p0", f"  padda [p1], #{_consumer_ts_bytes(k)}", *_nops(2)]
     body += _timestamp_store()                      # t_start
-    body += [f"  mov r0, #{delay_iters}", *_nops(2),
-             ".Ldelay:", "  add r0, r0, #-1", *_nops(2), "  jnz r0, #.Ldelay", *_nops(5)]
+    body += _nops(delay_nops)
     body += _timestamp_store()                      # t_after_delay
     for _ in range(k):
         body += ["  vmov x0, SCD", "  mov r17:r16, cntr", *_nops(SCD_NOPS),
@@ -249,11 +257,11 @@ def smoke_topology(direction: str, n_words: int, out_dir: Path, form: str = "x",
                  (Buffer("words", "out", size),))
 
 
-def depth_topology(direction: str, k: int, delay_iters: int, out_dir: Path,
+def depth_topology(direction: str, k: int, delay_nops: int, out_dir: Path,
                    name: str | None = None) -> Topology:
     _placement(direction)
-    return _pair(name or f"depth_{direction}_k{k}_d{delay_iters}", direction, out_dir,
-                 producer_depth_asm(k), consumer_depth_asm(k, delay_iters),
+    return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}", direction, out_dir,
+                 producer_depth_asm(k), consumer_depth_asm(k, delay_nops),
                  (Buffer("ts", "out", depth_producer_out_bytes(k)),),
                  (Buffer("log", "out", depth_consumer_out_bytes(k)),))
 
@@ -293,7 +301,7 @@ def main(argv=None) -> int:
     g.add_argument("out_dir")
     g.add_argument("--smoke-words", type=int, default=8)
     g.add_argument("--depth-k", type=int, nargs="+", default=[24])
-    g.add_argument("--delays", type=int, nargs="+", default=[400, 1600])
+    g.add_argument("--delays", type=int, nargs="+", default=[1500, 3000])
     g.set_defaults(fn=cmd_generate)
     a = sub.add_parser("analyze", help="stalled-write analysis of a producer ts file")
     a.add_argument("ts_file")
