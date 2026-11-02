@@ -27,7 +27,7 @@ these destinations:
 | `ShuffleMode` enum + `SHUFFLE_ROUTING` table (48 x 64 bytes, hardware-probed) | `xdna_archspec::aie2::permute` | Moved wholesale from `vector_permute.rs` |
 | MAC geometry table (`CONFIG_GEOMETRY_TABLE`, with `dense_geometries()` / `sparse_geometries()` views) + `GeometryEntry` and its structured lane map `MacShape` (matmul tile, elementwise, convolution, multi-channel; `operand_indices` gives the A and B element of each product) | `xdna_archspec::aie2::matmul` | Generated at build time from llvm-aie `aiev2_vmult.h` (`mac_geometry_extract`); the index maps of the non-matmul kinds are silicon-derived (`docs/fidelity-gaps/vector-compute.md`) |
 | UPS mode lookup table + `UpsScale`/`UpsAccMode`/`UpsMode` types | `xdna_archspec::aie2::ups` | Moved from `vector_ups.rs::ups_mode()` |
-| Cascade data (`CASCADE_WORDS = 6`) + `has_cascade_link: bool` feature flag | `xdna_archspec::aie2::{mod,processor}` + `ProcessorModel` field | New field; cascade gate added to `cascade.rs` |
+| Cascade data (`CASCADE_WORDS = 8`, 512-bit) + `has_cascade_link: bool` feature flag | `xdna_archspec::aie2::{mod,processor}` + `ProcessorModel` field | New field; cascade gate added to `cascade.rs` |
 | Pipeline latency constants (7 items: `SCALAR_MUL`, `SCALAR_DIV`, `VECTOR_MUL`, `VECTOR_MAC`, `VECTOR_SIMPLE`, `VECTOR_SHUFFLE`, `VECTOR_PACK`) | `xdna_archspec::aie2::instruction_latency` | Moved from `timing/latency.rs` raw literals |
 | Control-register IDs (`crSat`, `crRnd`, `crSRSSign`, q-regs) | `xdna_archspec::aie2::{aiert,processor}` | Read via accessor in `semantic.rs` |
 | Lock quadrant boundaries (South/West/North/East + internal) | `xdna_archspec::aie2::locks::quadrants` | Read via accessor in `control.rs` |

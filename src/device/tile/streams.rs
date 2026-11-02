@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Total cascade buffering between a producer's `vmov MCD` and the consumer's
+/// `vmov SCD`, in 512-bit words: 2.
+///
+/// Measured on Phoenix silicon with the harness depth probe
+/// (`tools/gen_cascade_probe.py`; consumer idle for 1500-5000 cycles, producer
+/// issues back-to-back MCD writes with a cycle-counter stamp after each): the
+/// third write always stalls until the consumer reads, in 27/27 stalling runs
+/// over South and East pairs, K = 3/8/24 writes and three delays. It matches the
+/// "2-deep" FIFO of AM020. The same probe cannot say where the two words sit
+/// (producer side, consumer side, or the wire), so the split below is a
+/// modelling choice, not a measurement.
+pub const CASCADE_TOTAL_DEPTH: usize = 2;
+/// Producer-side (MCD) share of [`CASCADE_TOTAL_DEPTH`]; unpinned split.
+pub const CASCADE_OUTPUT_DEPTH: usize = 1;
+/// Consumer-side (SCD) share of [`CASCADE_TOTAL_DEPTH`]; unpinned split.
+pub const CASCADE_INPUT_DEPTH: usize = CASCADE_TOTAL_DEPTH - CASCADE_OUTPUT_DEPTH;
+
 impl Tile {
     // === Stream Port Access (for core direct stream reads/writes) ===
 
@@ -74,6 +91,16 @@ impl Tile {
     }
 
     // === Cascade Stream Helpers ===
+
+    /// Words the producer-side (MCD) FIFO holds before `vmov MCD` stalls.
+    pub fn cascade_output_full(&self) -> bool {
+        self.cascade_output.len() >= CASCADE_OUTPUT_DEPTH
+    }
+
+    /// Words the consumer-side (SCD) FIFO holds before the link refuses more.
+    pub fn cascade_input_full(&self) -> bool {
+        self.cascade_input.len() >= CASCADE_INPUT_DEPTH
+    }
 
     /// Push a 512-bit value into the cascade input FIFO (SCD).
     pub fn push_cascade_input(&mut self, data: [u64; xdna_archspec::aie2::CASCADE_WORDS]) {

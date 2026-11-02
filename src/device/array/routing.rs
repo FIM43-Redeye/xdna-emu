@@ -201,7 +201,7 @@ impl TileArray {
         let words_routed = self.route_streams();
 
         // Phase 4.5: Cascade Propagation
-        // Dedicated point-to-point 384-bit links between compute tiles.
+        // Dedicated point-to-point 512-bit links between compute tiles.
         // Entirely separate from the stream switch fabric.
         self.route_cascade();
 
@@ -347,8 +347,8 @@ impl TileArray {
                     continue;
                 }
 
-                // Check backpressure: destination SCD FIFO must have room (depth 4).
-                if self.tiles[dst_idx].cascade_input.len() < 4 {
+                // Check backpressure: destination SCD FIFO must have room.
+                if !self.tiles[dst_idx].cascade_input_full() {
                     transfers.push((idx, dst_col, dst_row));
                 }
             }

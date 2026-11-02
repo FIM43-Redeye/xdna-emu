@@ -91,7 +91,7 @@ impl CascadeOps {
             }
             Some(SemanticOp::CascadeWrite) => {
                 // Mirror the depth limit applied in execute_write.
-                if tile.cascade_output.len() >= 4 {
+                if tile.cascade_output_full() {
                     Some(CascadeResult::StallWrite)
                 } else {
                     None
@@ -157,11 +157,9 @@ impl CascadeOps {
 
     /// Execute cascade write: push source register data to MCD.
     fn execute_write(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
-        // Backpressure: if MCD FIFO is full, stall.
-        // Depth 4: hardware has a 2-deep 512-bit FIFO (AM020), and each
-        // VMOV MCD writes one 256-bit half-register, so 4 entries covers
-        // two full accumulator transfers with room for pipeline slack.
-        if tile.cascade_output.len() >= 4 {
+        // Backpressure: if the MCD FIFO is full, stall. Total depth is pinned by
+        // silicon (see `CASCADE_TOTAL_DEPTH`).
+        if tile.cascade_output_full() {
             log::info!(
                 "[CASCADE] Write stall: MCD full (tile {},{}, pc=0x{:X})",
                 tile.col,
@@ -365,8 +363,8 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Fill the MCD FIFO (depth 4)
-        for _ in 0..4 {
+        // Fill the MCD FIFO
+        for _ in 0..crate::device::tile::CASCADE_OUTPUT_DEPTH {
             tile.push_cascade_output([0; CASCADE_WORDS]);
         }
 

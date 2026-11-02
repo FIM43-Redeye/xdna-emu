@@ -379,8 +379,8 @@ fn test_cascade_backpressure() {
     array.tile_mut(1, 2).cascade_input_dir = 0;
     array.tile_mut(1, 2).cascade_output_dir = 0;
 
-    // Fill destination's input FIFO (depth 4)
-    for _ in 0..4 {
+    // Fill destination's input FIFO
+    while !array.tile(1, 2).cascade_input_full() {
         array.tile_mut(1, 2).push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
     }
 
@@ -394,6 +394,37 @@ fn test_cascade_backpressure() {
     // Source still has data, destination still has old data
     assert!(array.tile(1, 3).has_cascade_output());
     assert!(array.tile(1, 2).has_cascade_input());
+}
+
+/// Total buffering between a producer's MCD write and the consumer's SCD read
+/// is 2 words on silicon (harness depth probe, see `CASCADE_TOTAL_DEPTH`): with
+/// the consumer never reading, exactly two writes are accepted and the third
+/// stalls, however the link is clocked in between.
+#[test]
+fn test_cascade_total_buffering_is_two_words() {
+    let mut array = TileArray::npu1();
+    array.clock_mut().ungate_all();
+    array.tile_mut(1, 3).cascade_input_dir = 0;
+    array.tile_mut(1, 3).cascade_output_dir = 0;
+    array.tile_mut(1, 2).cascade_input_dir = 0;
+    array.tile_mut(1, 2).cascade_output_dir = 0;
+
+    let mut accepted = 0;
+    for attempt in 0..16u64 {
+        if !array.tile(1, 3).cascade_output_full() {
+            array
+                .tile_mut(1, 3)
+                .push_cascade_output([attempt; xdna_archspec::aie2::CASCADE_WORDS]);
+            accepted += 1;
+        }
+        array.route_cascade();
+    }
+    assert_eq!(accepted, 2);
+
+    // Words come out in write order.
+    assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap()[0], 0);
+    array.route_cascade();
+    assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap()[0], 1);
 }
 
 #[test]

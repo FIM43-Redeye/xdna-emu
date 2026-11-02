@@ -39,6 +39,7 @@ pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
 pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
 pub use xdna_archspec::types::TileKind;
 pub use edge::EdgeDetector;
+pub use streams::{CASCADE_INPUT_DEPTH, CASCADE_OUTPUT_DEPTH, CASCADE_TOTAL_DEPTH};
 
 use super::events::EventModuleType;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
