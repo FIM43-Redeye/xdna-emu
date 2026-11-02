@@ -108,23 +108,21 @@ def test_staged_column_uses_one_shim_channel_per_direction(dev):
 
 
 def test_memtile_channel_limit_is_respected(dev):
-    # 4 cores x 2 outputs = 8 core MM2S would need 8 memtile S2MM > 6, so
-    # the column cannot stage; 2 go direct, 6 borrow the other 3 columns.
+    # 4 cores x 2 outputs = 8 core MM2S, but a memtile has 6 S2MM: one
+    # direct, a 6-way join, and the last output borrows another column.
     plan = plan_channels(topo(*column_cores(0, ins=(), outs=(32, 32))), dev)
-    rs = plan.phases[0].routes
-    assert all(r.kind == "direct" for r in rs)
-    assert sum(1 for r in rs if r.borrowed) == 6
-    assert plan.phases[0].groups == ()
+    assert len(plan.phases[0].groups[0].members) == 6
+    assert usage(plan, 0, 1).s2mm_used == 6
 
 
-def test_mixed_group_size_one_chunk_goes_direct(dev):
+def test_partial_staging_when_memtile_is_too_small_for_all(dev):
     # 3 inputs, 2 channels: one group of 3 needs 192 B; memtile of 130 B only
-    # fits 2 buffers, so split 2 + 1 and the singleton goes direct.
+    # fits 2 buffers, so the first goes direct and the other two are staged.
     small = tiny_memtile(dev, 130)
     cores = column_cores(0, n=3, outs=())
     plan = plan_channels(topo(*cores), small)
     kinds = [r.kind for r in plan.phases[0].routes]
-    assert kinds == ["memtile_distribute", "memtile_distribute", "direct"]
+    assert kinds == ["direct", "memtile_distribute", "memtile_distribute"]
     assert usage(plan, 0, 0).mm2s_used == 2
 
 
@@ -319,3 +317,77 @@ def test_plan_does_not_depend_on_unused_columns(dev):
     t = topo(core("a", 1, 2, ins=(64,), outs=(64,)))
     assert plan_channels(t, dev).phases[0].routes == plan_channels(
         t, load_device_model("npu1_2col")).phases[0].routes
+
+
+# -- partial staging (direct + staged + borrowed in one column) -------------
+
+def test_sixteen_cores_two_in_two_out_take_two_phases(dev):
+    cs = [c for col in range(4)
+          for c in column_cores(col, ins=(64, 64), outs=(64, 64), prefix="c")]
+    plan = plan_channels(topo(*cs), dev)
+    assert isinstance(plan, ChannelPlan)
+    assert len(plan.phases) == 2
+    assert [c for p in plan.phases for c in p.cores] == [c.name for c in cs]
+    for p in plan.phases:
+        for u in p.usage:     # no tile ever exceeds its channels
+            assert u.s2mm_used <= u.s2mm_available and u.mm2s_used <= u.mm2s_available
+            assert u.bytes_used <= u.bytes_available
+
+
+def test_stage_everything_when_one_group_holds_the_whole_column(dev):
+    # 3 cores x 2 outputs in one column, one S2MM held back: one 6-way join.
+    plan = plan_channels(topo(*column_cores(0, n=3, ins=(), outs=(32, 32)),
+                              reserve_shim_s2mm=1), dev)
+    p = plan.phases[0]
+    assert {r.kind for r in p.routes} == {"memtile_join"}
+    assert len(p.groups) == 1 and len(p.groups[0].members) == 6
+    assert (usage(plan, 0, 1).s2mm_used, usage(plan, 0, 1).mm2s_used) == (6, 1)
+
+
+def test_partial_staging_one_direct_rest_staged(dev):
+    # 4 outputs, 2 shim channels, memtile fits only 2 buffers' worth: the
+    # first goes direct, the next two are joined, the last borrows.
+    small = tiny_memtile(dev, 130)
+    plan = plan_channels(topo(*column_cores(0, ins=())), small)
+    rs = plan.phases[0].routes
+    assert [(r.kind, r.borrowed) for r in rs] == [
+        ("direct", False), ("memtile_join", False), ("memtile_join", False),
+        ("direct", True)]
+    assert rs[3].shim_col == 1
+    assert len(plan.phases[0].groups[0].members) == 2
+
+
+def test_partial_staging_with_one_free_channel_borrows_the_remainder(dev):
+    small = tiny_memtile(dev, 130)
+    plan = plan_channels(topo(*column_cores(0, ins=()), reserve_shim_s2mm=1), small)
+    rs = plan.phases[0].routes
+    assert [(r.kind, r.borrowed) for r in rs] == [
+        ("memtile_join", False), ("memtile_join", False),
+        ("direct", True), ("direct", True)]
+
+
+def test_staging_beats_borrowing(dev):
+    plan = plan_channels(topo(*column_cores(0, ins=(), outs=(32, 32))), dev)
+    # 8 outputs: 1 direct + 6-way join (memtile S2MM 6) + 1 borrowed
+    rs = plan.phases[0].routes
+    assert sum(1 for r in rs if r.kind == "memtile_join") == 6
+    assert sum(1 for r in rs if r.borrowed) == 1
+
+
+# -- first-fit phase packing -------------------------------------------------
+
+def test_first_fit_backfills_an_earlier_phase(dev):
+    small = tiny_memtile(dev)
+    # Capacity 8 inputs per phase. A(5 cores) fills most of phase 0, B(4,
+    # linked) cannot join it, C (single) can still backfill phase 0.
+    A = [core(f"a{k}", 0, 2 + k % 4, ins=(64,)) for k in range(4)] + [core("a4", 1, 2, ins=(64,))]
+    B = [core(f"b{k}", 2, 2 + k, ins=(64,)) for k in range(4)]
+    C = [core("c", 3, 2, ins=(64,))]
+    links = [CoreStream("b0", "b1"), CoreStream("b1", "b2"), CoreStream("b2", "b3")]
+    plan = plan_channels(topo(*A, *B, *C, links=links), small)
+    where = {c: p.index for p in plan.phases for c in p.cores}
+    assert where["b0"] == where["b3"] == 1
+    assert where["c"] == 0
+    assert len(plan.phases) == 2
+    # cores inside a phase stay in topology order
+    assert plan.phases[0].cores == ("a0", "a1", "a2", "a3", "a4", "c")

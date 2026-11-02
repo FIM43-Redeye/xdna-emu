@@ -15,18 +15,23 @@ trace), so per phase and per column the planner applies, in this order:
 
 1. direct: shim and core in the same column, one shim channel per buffer.
 2. staged: when a column's buffers in one direction exceed its free shim
-   channels, they go through that column's memtile with `aie.objectfifo.link`.
-   Outputs JOIN (k core MM2S -> k memtile S2MM -> 1 memtile MM2S -> 1 shim
-   S2MM), inputs DISTRIBUTE (mirror image). The smallest number of groups that
-   fits the memtile is used; a group of one buffer degenerates to a direct
-   route (a link of one is a pointless hop).
-3. borrowed: buffers a column could not place on its own shim (staging did not
-   fit the memtile, or no shim channel is free) take the free shim channels of
+   channels, as many as the memtile can take go through that column's memtile
+   with `aie.objectfifo.link`. Outputs JOIN (k core MM2S -> k memtile S2MM ->
+   1 memtile MM2S -> 1 shim S2MM), inputs DISTRIBUTE (mirror image). The free
+   shim channels are split between direct routes (the first buffers in core
+   order) and staged groups, picking the split that places the most buffers,
+   then uses the fewest shim channels, then the fewest groups; memtile channels are shared by the column's joins
+   and distributes, plus locks, BDs and bytes. A group of one buffer
+   degenerates to a direct route (a link of one is a pointless hop). Staging
+   in the core's own column is preferred to borrowing because cross-column
+   flows load the shim row's East/West stream ports.
+3. borrowed: the remainder a column could not place on its own shim (neither
+   direct nor staged) take the free shim channels of
    the nearest other column (|dcol|, then lower column), as a direct route
    that crosses columns. Borrowing only uses channels left over after every
    column has placed its own buffers; any device column may lend, used or not.
 4. phases: if the whole array cannot hold the topology, cores are split into
-   sequential phases (next-fit, in core order). Cores connected by a `Cascade`
+   sequential phases (first-fit over units, in core order). Cores connected by a `Cascade`
    or `CoreStream` link form one unit that always lands in a single phase; a
    unit that cannot fit even alone is a `PlanError("unplaceable")`.
 
@@ -248,30 +253,31 @@ def _linked_units(topology: Topology) -> list[list[int]]:
 
 def _split_phases(units: list[list[int]], cores: list[Core], topology: Topology,
                   device: DeviceModel) -> list[Phase] | PlanError:
-    """Next-fit over linked units in core order; each phase is re-planned whole."""
-    phases: list[Phase] = []
-    current: list[int] = []
+    """First-fit over linked units in core order: each unit goes into the
+    first open phase that still plans, else opens a new one. Phases are
+    re-planned whole each time, and keep their cores in topology order."""
+    members: list[list[int]] = []
 
-    def attempt(indices: list[int]) -> Phase | _Fail:
-        return _plan_phase(len(phases), [cores[i] for i in sorted(indices)],
-                           topology, device)
+    def attempt(indices: list[int], index: int) -> Phase | _Fail:
+        return _plan_phase(index, [cores[i] for i in sorted(indices)], topology, device)
 
     for unit in units:
-        if current:
-            trial = attempt(current + unit)
+        for i, open_phase in enumerate(members):
+            trial = attempt(open_phase + unit, i)
             if isinstance(trial, Phase):
-                current = sorted(current + unit)
-                continue
+                members[i] = sorted(open_phase + unit)
+                break
             if trial.fatal:
-                return _as_error(trial, [cores[i].name for i in current + unit])
-            phases.append(attempt(current))   # known to fit: it did before
-            current = []
-        alone = attempt(unit)
-        if isinstance(alone, _Fail):
-            return _as_error(alone, [cores[i].name for i in unit])
-        current = list(unit)
-    if current:
-        phases.append(attempt(current))
+                return _as_error(trial, [cores[j].name for j in open_phase + unit])
+        else:
+            alone = attempt(unit, len(members))
+            if isinstance(alone, _Fail):
+                return _as_error(alone, [cores[i].name for i in unit])
+            members.append(list(unit))
+    phases = [attempt(m, i) for i, m in enumerate(members)]
+    bad = next((p for p in phases if isinstance(p, _Fail)), None)
+    if bad:     # each phase planned before, so this cannot happen; never hide it
+        return _as_error(bad, [c.name for c in cores])
     return phases
 
 
@@ -356,14 +362,6 @@ def _plan_phase(index: int, cores: list[Core], topology: Topology,
     placed: list[_Placement] = []
     leftover: list[_Item] = []
 
-    def fits(col: int, direction: str, sizes: list[int], addition: _Memtile) -> bool:
-        m = mt[col]
-        return (m.s2mm + addition.s2mm <= memtile.s2mm
-                and m.mm2s + addition.mm2s <= memtile.mm2s
-                and m.bytes + addition.bytes <= device.data_memory_bytes("mem_tile")
-                and m.locks + addition.locks <= device.num_locks("mem_tile")
-                and m.bds + addition.bds <= device.num_bds("mem_tile"))
-
     def cost(direction: str, chunks: list[list[_Item]]) -> _Memtile:
         add = _Memtile()
         for chunk in chunks:
@@ -381,35 +379,56 @@ def _plan_phase(index: int, cores: list[Core], topology: Topology,
             add.bds += (k + 1) * depth
         return add
 
+    def options(items: list[_Item], direction: str, f: int) -> list[tuple]:
+        """Ways to place a column's buffers of one direction on its own shim:
+        (placed, channels, groups, d, staged_count, chunks, memtile_cost).
+        d buffers go direct (the first ones), the next staged_count are split
+        over g staged groups; the rest is left for borrowing."""
+        n = len(items)
+        if n <= f:
+            return [(n, n, 0, n, 0, [], _Memtile())]
+        out = [(f, f, 0, f, 0, [], _Memtile())]
+        for g in range(1, f + 1):
+            for d in range(0, f - g + 1):
+                for s_count in range(2, n - d + 1):
+                    chunks = [c for c in _split_even(items[d:d + s_count], g) if c]
+                    out.append((d + s_count, d + g, g, d, s_count, chunks,
+                                cost(direction, chunks)))
+        return out
+
+    def joint_fit(a: _Memtile, b: _Memtile) -> bool:
+        return (a.s2mm + b.s2mm <= memtile.s2mm and a.mm2s + b.mm2s <= memtile.mm2s
+                and (a.bytes + b.bytes) <= device.data_memory_bytes("mem_tile")
+                and a.locks + b.locks <= device.num_locks("mem_tile")
+                and a.bds + b.bds <= device.num_bds("mem_tile"))
+
     for col in sorted(by_col):
-        for direction in ("in", "out"):
+        # The memtile's channels, locks and bytes are shared by the column's
+        # distribute (inputs) and join (outputs), so choose both together:
+        # most buffers placed, then fewest shim channels (the rest stay free
+        # for borrowers), then fewest groups; first option wins remaining ties.
+        in_opts = options(by_col[col]["in"], "in", free["in"])
+        out_opts = options(by_col[col]["out"], "out", free["out"])
+        best = None
+        for oi in in_opts:
+            for oo in out_opts:
+                if not joint_fit(oi[6], oo[6]):
+                    continue
+                key = (oi[0] + oo[0], -(oi[1] + oo[1]), -(oi[2] + oo[2]))
+                if best is None or key > best[0]:
+                    best = (key, oi, oo)
+        # Every direction has the direct-only option, which costs no memtile.
+        assert best is not None
+        for direction, opt in (("in", best[1]), ("out", best[2])):
             items = by_col[col][direction]
-            n, f = len(items), free[direction]
-            if not n:
-                continue
-            if n <= f:
-                for it in items:
-                    placed.append(_Placement(it, "direct", col))
-                shim_used[direction][col] += n
-                continue
-            chosen = None
-            for g in range(1, f + 1):
-                chunks = _split_even(items, g)
-                add = cost(direction, chunks)
-                if fits(col, direction, [], add):
-                    chosen = (chunks, add)
-                    break
-            if chosen is None:
-                for it in items[:f]:
-                    placed.append(_Placement(it, "direct", col))
-                shim_used[direction][col] += min(f, n)
-                leftover.extend(items[f:])
-                continue
-            chunks, add = chosen
+            _, _, _, d, s_count, chunks, add = opt
             m = mt[col]
             m.s2mm += add.s2mm; m.mm2s += add.mm2s; m.bytes += add.bytes
             m.locks += add.locks; m.bds += add.bds
             kind = "memtile_join" if direction == "out" else "memtile_distribute"
+            for it in items[:d]:
+                placed.append(_Placement(it, "direct", col))
+            shim_used[direction][col] += d
             for chunk in chunks:
                 shim_used[direction][col] += 1
                 if len(chunk) < 2:
@@ -417,6 +436,7 @@ def _plan_phase(index: int, cores: list[Core], topology: Topology,
                     continue
                 group = _Group(kind, col, list(chunk))
                 placed.extend(_Placement(it, kind, col, group) for it in chunk)
+            leftover.extend(items[d + s_count:])
 
     for it in leftover:           # borrow, after every column placed its own
         direction, home = it.buf.direction, it.core.tile.col

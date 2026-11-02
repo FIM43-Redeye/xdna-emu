@@ -228,3 +228,24 @@ def test_reserve_shim_s2mm(dev):
 def test_validate_reports_all_errors_without_raising(dev):
     t = topo(core("a", 9, 2, [Buffer("b", "in", 3)]), core("a", 0, 0))
     assert len(validate(t, dev)) >= 3
+
+
+# -- device="auto" -----------------------------------------------------------
+
+def test_validate_topology_resolves_auto():
+    t = topo(core("a", 0, 2), core("b", 2, 2), device="auto")
+    assert validate_topology(t) == []
+
+
+def test_validate_topology_auto_reports_unresolvable_columns():
+    errs = validate_topology(topo(core("a", 9, 2), device="auto"))
+    assert codes(errs) == ["no_device"]
+
+
+def test_validate_topology_auto_still_checks_the_rest():
+    errs = validate_topology(topo(core("a", 0, 3), core("b", 0, 3), device="auto"))
+    assert codes(errs) == ["tile_shared"]
+
+
+def test_validate_itself_still_compares_names(dev):
+    assert "device_mismatch" in codes(validate(topo(core(), device="auto"), dev))

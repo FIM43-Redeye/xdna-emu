@@ -16,6 +16,7 @@ kernel argument, as in the design note).
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +35,14 @@ class ValidationError:
 
 def validate_topology(topology: Topology,
                       models_path: Path = DEFAULT_MODELS_PATH) -> list[ValidationError]:
-    """Load the topology's device by name, then validate against it."""
+    """Load the topology's device (resolving "auto" from the used columns, via
+    `plan.resolve_device`), then validate against it."""
+    if topology.device == "auto":
+        from .plan import PlanError, resolve_device    # plan imports topology only
+        resolved = resolve_device(topology, models_path)
+        if isinstance(resolved, PlanError):
+            return [ValidationError(resolved.code, resolved.message, resolved.names)]
+        return validate(dataclasses.replace(topology, device=resolved.name), resolved)
     try:
         device = load_device_model(topology.device, models_path)
     except DeviceModelError as e:
