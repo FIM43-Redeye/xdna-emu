@@ -174,6 +174,34 @@ pub struct PendingUnpack {
 /// operand cycle 7, sampled one bundle before write-back; see PendingUnpack).
 const VUNPACK_SRC_READ_LATENCY: u64 = 6;
 
+/// A `vmov x/bm, SCD` awaiting its cascade-data stage.
+///
+/// Silicon (Phoenix, `build/experiments/cascade-collisions/p2/`): the vmov does not
+/// stall at issue, nor at the first use of its destination. The five bundles after
+/// it issue normally; the sixth is held until a cascade word is available, then
+/// the word is taken and the destination is written so that it is visible
+/// `II_VMOV_CASCADE_READ` (7) issued bundles after the vmov, regardless of how
+/// long the hold lasted. A reader inside that window sees the old register value
+/// (there is no interlock).
+#[derive(Debug, Clone)]
+pub struct PendingCascadeRead {
+    /// Destination (`VectorReg` x pair base, or `AccumReg` bm half).
+    pub dest: Operand,
+    /// Issued-bundle count (`bundle_seq`) of the vmov itself.
+    pub issue_bundle: u64,
+    /// `bundle_seq` of the first bundle that is held until the word is available.
+    pub ready_bundle: u64,
+    /// The vmov's result latency and bypass class (itinerary), captured at issue.
+    pub l_def: u8,
+    pub def_bypass: Bypass,
+    /// Write tag of the instruction, restored when the destination is queued.
+    pub tag: Option<WriteTag>,
+}
+
+/// Bundles that issue after a `vmov x/bm, SCD` before the core is held for the word
+/// (silicon: timestamps 1..=4 bundles after the vmov exclude the wait, 5 includes it).
+pub const CASCADE_READ_HOLD_BUNDLES: u64 = 5;
+
 /// A deferred accumulator add/sub awaiting its stage-3 source read.
 ///
 /// II_VACC / II_VACCf (AIE2Schedule.td) read their accumulator
@@ -434,6 +462,7 @@ pub struct ExecutionContext {
     // === Late-Read VUNPACK Pipeline ===
     /// Deferred VUNPACKs awaiting their stage-7 source read (see PendingUnpack).
     pending_unpacks: Vec<PendingUnpack>,
+    pending_cascade_reads: std::collections::VecDeque<PendingCascadeRead>,
 
     /// Deferred accumulator add/subs awaiting their stage-3 source read
     /// (see PendingAccAdd).
@@ -602,6 +631,7 @@ impl ExecutionContext {
             bundle_seq: 0,
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
+            pending_cascade_reads: std::collections::VecDeque::new(),
             pending_acc_adds: Vec::new(),
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
@@ -1426,6 +1456,48 @@ impl ExecutionContext {
     /// Store the raw value of an unmodelled control register.
     pub fn set_control_reg_raw(&mut self, id: u8, value: u32) {
         self.control_raw[(id & 0xF) as usize] = value;
+    }
+
+    /// Queue a cascade read for its hold stage (see [`PendingCascadeRead`]). Uses the
+    /// current op's result latency and bypass class and write tag.
+    pub fn queue_pending_cascade_read(&mut self, dest: Operand) {
+        self.pending_cascade_reads.push_back(PendingCascadeRead {
+            dest,
+            issue_bundle: self.bundle_seq,
+            ready_bundle: self.bundle_seq + CASCADE_READ_HOLD_BUNDLES,
+            l_def: self.result_latency,
+            def_bypass: self.result_bypass,
+            tag: self.write_tag,
+        });
+    }
+
+    /// The oldest queued cascade read, if the bundle about to issue is its hold bundle
+    /// (or later): that bundle may not issue until a cascade word is available.
+    pub fn due_cascade_read(&self) -> Option<&PendingCascadeRead> {
+        self.pending_cascade_reads.front().filter(|p| p.ready_bundle <= self.bundle_seq)
+    }
+
+    /// Complete the oldest due cascade read with the word just taken from SCD, given in
+    /// both register layouts (`vec` for an x destination, `acc` for a bm half): queue
+    /// the destination write so it lands `l_def` bundles after the vmov's issue.
+    pub fn complete_due_cascade_read(&mut self, vec: [u32; 16], acc: [u64; 8]) {
+        let Some(p) = self.pending_cascade_reads.pop_front() else {
+            return;
+        };
+        let remaining = (p.issue_bundle + p.l_def as u64).saturating_sub(self.bundle_seq).clamp(1, 255) as u8;
+        self.set_write_tag(p.tag);
+        match p.dest {
+            Operand::VectorReg(r) => {
+                self.vector.queue_write_wide(r, vec, remaining, p.def_bypass);
+            }
+            Operand::AccumReg(_) => {
+                let mut value = [0u64; 16];
+                value[..8].copy_from_slice(&acc);
+                self.queue_acc_write_timed(p.issue_bundle, p.dest, value, true, p.l_def, p.def_bypass);
+            }
+            _ => unreachable!("cascade read destination is validated at issue"),
+        }
+        self.set_write_tag(None);
     }
 
     /// Queue an unpack for its stage-7 source and sign read (see [`PendingUnpack`]).

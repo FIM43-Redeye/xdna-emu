@@ -739,6 +739,18 @@ impl CycleAccurateExecutor {
         // motivated this (matmul_using_cascade::cascade was producing wrong
         // accumulator values whenever an `ADD r28, r14, r28` was bundled
         // with a `VMOV bml, SCD` and the SCD ran empty).
+        // A cascade read issued five bundles ago holds this bundle until its word
+        // arrives (the vmov itself, and the four bundles after it, did not wait).
+        if CascadeOps::due_read_would_stall(ctx, tile) {
+            let stall_cycle = ctx.cycles;
+            ctx.timing_context_mut()
+                .record_event(stall_cycle, EventType::CascadeStallLevel { active: true });
+            ctx.record_instruction(1);
+            let timing = ctx.timing_context_mut();
+            timing.hazard_stalls = self.total_hazard_stalls;
+            return ExecuteResult::WaitStream { port: 254 };
+        }
+
         for slot_idx in &execution_order {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
                 if let Some(stall) = CascadeOps::would_stall(op, tile) {
@@ -791,6 +803,10 @@ impl CycleAccurateExecutor {
         // actually-issued bundle (stall pre-checks above return earlier), so
         // the clock tracks issued bundles, not stall cycles.
         ctx.advance_vector_bundle();
+
+        // Take the SCD word for a cascade read whose hold bundle this is (the stall
+        // pre-check above guarantees the word is there) and queue its destination.
+        CascadeOps::complete_due_read(ctx, tile);
 
         // Sample sources for VUNPACKs whose stage-7 read bundle arrived
         // (after the vector clock advance so producer writes landing this
@@ -1405,7 +1421,14 @@ mod tests {
         let bundle =
             make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
                 .with_dest(Operand::VectorReg(0))]);
+        // The read itself and the four bundles after it issue; the fifth after it is held.
         let result = executor.execute(&bundle, &mut ctx, &mut tile);
+        assert!(!matches!(result, ExecuteResult::WaitStream { .. }), "the vmov does not stall at issue");
+        for i in 0..4 {
+            let r = executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            assert!(!matches!(r, ExecuteResult::WaitStream { .. }), "bundle +{} must issue", i + 1);
+        }
+        let result = executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
         assert!(matches!(result, ExecuteResult::WaitStream { port: 254 }));
 
         let events: Vec<_> = ctx.timing_context().events.events().iter().map(|e| e.event).collect();

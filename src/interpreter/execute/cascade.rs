@@ -82,13 +82,9 @@ impl CascadeOps {
             return None;
         }
         match op.semantic {
-            Some(SemanticOp::CascadeRead) => {
-                if tile.cascade_input.is_empty() {
-                    Some(CascadeResult::StallRead)
-                } else {
-                    None
-                }
-            }
+            // A read never stalls at its own issue: it is held five bundles later
+            // (`due_read_would_stall`).
+            Some(SemanticOp::CascadeRead) => None,
             Some(SemanticOp::CascadeWrite) => {
                 // Mirror the depth limit applied in execute_write.
                 if tile.cascade_output_full() {
@@ -101,58 +97,42 @@ impl CascadeOps {
         }
     }
 
-    /// Execute cascade read: pop 512-bit data from SCD into destination register.
-    fn execute_read(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> CascadeResult {
-        let data = match tile.pop_cascade_input() {
-            Some(d) => d,
-            None => {
-                log::info!(
-                    "[CASCADE] Read stall: SCD empty (tile {},{}, pc=0x{:X})",
-                    tile.col,
-                    tile.row,
-                    ctx.pc()
-                );
-                return CascadeResult::StallRead;
+    /// Issue a cascade read: queue it for its hold stage (see
+    /// [`PendingCascadeRead`](crate::interpreter::state::context::PendingCascadeRead)).
+    /// The word is taken later, by [`Self::complete_due_read`].
+    fn execute_read(op: &SlotOp, ctx: &mut ExecutionContext, _tile: &mut Tile) -> CascadeResult {
+        match &op.dest {
+            Some(dest @ (Operand::VectorReg(_) | Operand::AccumReg(_))) => {
+                ctx.queue_pending_cascade_read(dest.clone());
+                CascadeResult::Completed
             }
-        };
-
-        // Write to destination register (vector or accumulator)
-        if let Some(dest) = &op.dest {
-            match dest {
-                Operand::VectorReg(r) => {
-                    // `vmov xN, SCD`: xN = VectorReg(2N) (low) + VectorReg(2N+1) (high).
-                    let (lo, hi) = cascade_to_vector(&data);
-                    ctx.vector.write(*r, lo);
-                    ctx.vector.write(*r + 1, hi);
-                    log::info!(
-                        "[CASCADE] Read SCD -> x (v{}, v{}) (tile {},{})",
-                        r,
-                        r + 1,
-                        tile.col,
-                        tile.row
-                    );
-                }
-                Operand::AccumReg(r) => {
-                    let lanes = cascade_to_accumulator(&data);
-                    ctx.accumulator.write(*r, lanes);
-                    log::info!(
-                        "[CASCADE] Read SCD -> acc{} (tile {},{}) data[0]={:#X}",
-                        r,
-                        tile.col,
-                        tile.row,
-                        data[0]
-                    );
-                }
-                _ => {
-                    return CascadeResult::Error(format!(
-                        "[CASCADE] Read SCD: unexpected dest {:?} (tile {},{}) -- impossible operand",
-                        dest, tile.col, tile.row,
-                    ));
-                }
-            }
+            other => CascadeResult::Error(format!(
+                "[CASCADE] Read SCD: unexpected dest {other:?} -- impossible operand"
+            )),
         }
+    }
 
-        CascadeResult::Completed
+    /// True if the bundle about to issue is held by a due cascade read whose word has
+    /// not arrived (SCD empty). Call before issuing a bundle; no side effects.
+    pub fn due_read_would_stall(ctx: &ExecutionContext, tile: &Tile) -> bool {
+        arch_handle::has_cascade_link() && ctx.due_cascade_read().is_some() && tile.cascade_input.is_empty()
+    }
+
+    /// Take the word for every cascade read that is due (normally at most one per
+    /// bundle) and queue its destination write. Call once per issued bundle, after
+    /// `ExecutionContext::advance_vector_bundle` and before the slots execute.
+    pub fn complete_due_read(ctx: &mut ExecutionContext, tile: &mut Tile) {
+        while ctx.due_cascade_read().is_some() {
+            let Some(data) = tile.pop_cascade_input() else {
+                return;
+            };
+            let (lo, hi) = cascade_to_vector(&data);
+            let mut vec = [0u32; 16];
+            vec[..8].copy_from_slice(&lo);
+            vec[8..].copy_from_slice(&hi);
+            log::info!("[CASCADE] SCD word taken (tile {},{}) data[0]={:#X}", tile.col, tile.row, data[0]);
+            ctx.complete_due_cascade_read(vec, cascade_to_accumulator(&data));
+        }
     }
 
     /// Execute cascade write: push source register data to MCD.
@@ -272,62 +252,137 @@ mod tests {
         Tile::compute(0, 2)
     }
 
+    const WORD: [u64; CASCADE_WORDS] = [
+        0x0000_0002_0000_0001,
+        0x0000_0004_0000_0003,
+        0x0000_0006_0000_0005,
+        0x0000_0008_0000_0007,
+        0xDEAD,
+        0xBEEF,
+        0xCAFE,
+        0xF00D,
+    ];
+
+    fn read_op(dest: Operand) -> SlotOp {
+        SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(dest)
+    }
+
+    /// Read a vector register as a store's data source does (use cycle 1, no bypass), the
+    /// consumer the silicon probes used (`vst wl0/wh0`).
+    fn vst_read(ctx: &ExecutionContext, reg: u8) -> [u32; 8] {
+        ctx.vector.read_with(reg, 1, crate::interpreter::state::Bypass::No)
+    }
+
+    /// An accumulator reader with use cycle 1 (the `vmov x, bml` of the silicon probe).
+    fn acc_read(ctx: &ExecutionContext, reg: u8) -> [u64; 8] {
+        ctx.accumulator.read_with(reg, 1, crate::interpreter::state::Bypass::No)
+    }
+
+    /// Issue a cascade read at bundle `at` with the itinerary latency (7), as the executor does.
+    fn issue_read(ctx: &mut ExecutionContext, tile: &mut Tile, dest: Operand, at: u64) {
+        ctx.bundle_seq = at;
+        ctx.result_latency = 7;
+        assert_eq!(CascadeOps::execute(&read_op(dest), ctx, tile), CascadeResult::Completed);
+    }
+
+    /// Run the per-bundle part of the executor for the bundle numbered `seq`: stall check,
+    /// advance, take the due word.
+    fn begin_bundle(ctx: &mut ExecutionContext, tile: &mut Tile, seq: u64) -> bool {
+        ctx.bundle_seq = seq;
+        if CascadeOps::due_read_would_stall(ctx, tile) {
+            return false;
+        }
+        ctx.advance_vector_bundle();
+        CascadeOps::complete_due_read(ctx, tile);
+        true
+    }
+
+    // Silicon (Phoenix, build/experiments/cascade-collisions/p2/hw_r1_sweep1.txt, use_N/nouse_N
+    // "absent" rows): `vmov x, SCD` on an empty cascade does not hold the vmov or the next four
+    // bundles (timestamps 1..=4 bundles later exclude the wait); the fifth bundle after it is held.
     #[test]
-    fn test_cascade_read_empty_stalls() {
+    fn cascade_read_does_not_stall_at_issue() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
-
-        let op =
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(0));
-
-        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::StallRead);
+        let op = read_op(Operand::VectorReg(0));
+        assert_eq!(CascadeOps::would_stall(&op, &tile), None);
+        issue_read(&mut ctx, &mut tile, Operand::VectorReg(0), 10);
+        for seq in 11..=14 {
+            assert!(begin_bundle(&mut ctx, &mut tile, seq), "bundle {seq} must issue");
+        }
     }
 
     #[test]
-    fn test_cascade_read_vector() {
+    fn cascade_read_holds_the_fifth_bundle_after_it_until_a_word_arrives() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
+        issue_read(&mut ctx, &mut tile, Operand::VectorReg(0), 10);
+        for seq in 11..=14 {
+            assert!(begin_bundle(&mut ctx, &mut tile, seq));
+        }
+        // Bundle 15 is held for as long as SCD is empty ...
+        for _ in 0..3 {
+            assert!(!begin_bundle(&mut ctx, &mut tile, 15), "held while SCD is empty");
+        }
+        // ... and issues once the word has arrived, taking it.
+        tile.push_cascade_input(WORD);
+        assert!(begin_bundle(&mut ctx, &mut tile, 15));
+        assert!(!tile.has_cascade_input(), "the word was taken");
+    }
 
-        let test_data: [u64; CASCADE_WORDS] = [
-            0x0000_0002_0000_0001,
-            0x0000_0004_0000_0003,
-            0x0000_0006_0000_0005,
-            0x0000_0008_0000_0007,
-            0xDEAD,
-            0xBEEF,
-            0xCAFE,
-            0xF00D,
-        ];
-        tile.push_cascade_input(test_data);
-
-        let op =
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::VectorReg(4));
-
-        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
-
-        // `vmov x2, SCD`: the destination is the 512-bit x register, i.e. the
-        // 256-bit pair VectorReg(4) (low) + VectorReg(5) (high). Silicon carries
-        // the whole 512-bit cascade word through x (harness cascade smoke probe).
-        assert_eq!(ctx.vector.read(4), [1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(ctx.vector.read(5), [0xDEAD, 0, 0xBEEF, 0, 0xCAFE, 0, 0xF00D, 0]);
+    // Silicon (same sweeps, the `data=` flags): the destination is written so that it is visible
+    // 7 issued bundles after the vmov (readers at +6 or earlier see the old value, at +7 the
+    // word), with or without a hold, for x and bm destinations alike. No register interlock.
+    #[test]
+    fn cascade_read_vector_destination_is_visible_seven_bundles_after_issue() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.vector.write(4, [7; 8]);
+        ctx.vector.write(5, [7; 8]);
+        tile.push_cascade_input(WORD);
+        issue_read(&mut ctx, &mut tile, Operand::VectorReg(4), 10);
+        for seq in 11..=16 {
+            assert!(begin_bundle(&mut ctx, &mut tile, seq));
+            assert_eq!(vst_read(&ctx, 4), [7; 8], "bundle +{} still sees the old value", seq - 10);
+        }
+        assert!(begin_bundle(&mut ctx, &mut tile, 17));
+        // `vmov x2, SCD`: the 256-bit pair VectorReg(4) (low) + VectorReg(5) (high); silicon carries
+        // the whole 512-bit word through x (harness cascade smoke probe).
+        assert_eq!(vst_read(&ctx, 4), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(vst_read(&ctx, 5), [0xDEAD, 0, 0xBEEF, 0, 0xCAFE, 0, 0xF00D, 0]);
     }
 
     #[test]
-    fn test_cascade_read_accumulator() {
+    fn cascade_read_visibility_is_independent_of_the_hold() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
+        ctx.vector.write(4, [7; 8]);
+        issue_read(&mut ctx, &mut tile, Operand::VectorReg(4), 10);
+        for seq in 11..=14 {
+            assert!(begin_bundle(&mut ctx, &mut tile, seq));
+        }
+        assert!(!begin_bundle(&mut ctx, &mut tile, 15)); // held; bundle_seq does not advance
+        tile.push_cascade_input(WORD);
+        assert!(begin_bundle(&mut ctx, &mut tile, 15));
+        assert!(begin_bundle(&mut ctx, &mut tile, 16));
+        assert_eq!(vst_read(&ctx, 4), [7; 8], "+6: old value");
+        assert!(begin_bundle(&mut ctx, &mut tile, 17));
+        assert_eq!(vst_read(&ctx, 4), [1, 2, 3, 4, 5, 6, 7, 8], "+7: the word");
+    }
 
-        let test_data: [u64; CASCADE_WORDS] = [10, 20, 30, 40, 50, 60, 70, 80];
-        tile.push_cascade_input(test_data);
-
-        let op =
-            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead).with_dest(Operand::AccumReg(3));
-
-        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
-
-        // All 8 accumulator lanes are carried by the 512-bit cascade (no padding).
-        let result = ctx.accumulator.read(3);
-        assert_eq!(result, [10, 20, 30, 40, 50, 60, 70, 80]);
+    #[test]
+    fn cascade_read_accumulator_destination_carries_all_lanes_seven_bundles_after_issue() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.push_cascade_input([10, 20, 30, 40, 50, 60, 70, 80]);
+        ctx.accumulator.write(3, [7; 8]);
+        issue_read(&mut ctx, &mut tile, Operand::AccumReg(3), 10);
+        for seq in 11..=16 {
+            assert!(begin_bundle(&mut ctx, &mut tile, seq));
+            assert_eq!(acc_read(&ctx, 3), [7; 8], "bundle +{} still sees the old value", seq - 10);
+        }
+        assert!(begin_bundle(&mut ctx, &mut tile, 17));
+        assert_eq!(acc_read(&ctx, 3), [10, 20, 30, 40, 50, 60, 70, 80]);
     }
 
     #[test]

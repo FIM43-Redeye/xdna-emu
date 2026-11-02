@@ -57,9 +57,23 @@ Probe-design findings (silicon):
   (`PendingBranch` masks targets, `FETCH_LINE_BYTES`). llvm-aie pads every jump
   target and return address to 16 bytes (`AIEMachineAlignment.cpp`), so compiled
   code never notices; hand-written loops need `.p2align 4` before the label.
-- A `vmov x, SCD` does not block at the vmov: the core stalls at the first
-  *use* of the register (the following `vst`), so a stamp taken right after the
-  vmov does not include the wait.
+- **Where a cascade read stalls (derived, EMU matches).** `vmov x/bml, SCD`
+  neither stalls at the vmov nor at the first use of its destination. The four
+  bundles after it issue normally (a cycle-counter read 1..4 bundles later excludes
+  the wait); the fifth bundle after it is held until a cascade word is available
+  (a counter read there or later includes the whole wait). The destination is
+  written so that it is visible 7 issued bundles after the vmov (`II_VMOV_CASCADE_READ`
+  = 7, TableGen), independent of any hold; there is no interlock, so a reader at
+  +1..+6 sees the OLD register value even if the core then holds. Same for x and
+  bm destinations, with independent vector ops in between; a later `vbcst x0` (+1)
+  is overwritten by the SCD word landing at +7; two reads hold at the same point
+  relative to the first. Word already buffered: no stall, one bundle per cycle.
+  Probe: `tools/gen_cascade_read_probe.py`, data `build/experiments/cascade-collisions/p2/`
+  (`hw_r1_sweep1.txt`, 72 cases x absent/present; EMU `emu_e1_sweep1.txt` identical via
+  `p2/cmp.py`). EMU: `PendingCascadeRead` (`state/context.rs`), `CascadeOps::{execute_read,
+  due_read_would_stall, complete_due_read}`; tests in `execute/cascade.rs`. Before this the
+  EMU stalled at the vmov and wrote the destination immediately. Not probed: the per-side
+  split of the 2-word buffer, and the release latency from word arrival to the held bundle.
 - `vst` clears the low 5 address bits on silicon (a store at +48 landed at +32);
   the emulator stores at the unaligned address (permissive). Not chased.
 
