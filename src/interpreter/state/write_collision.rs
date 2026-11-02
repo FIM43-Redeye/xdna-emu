@@ -20,7 +20,8 @@
 //!
 //! 1. **Same port, same landing cycle.** The port has one 256-bit data lane per ordinal. Lane
 //!    `k` carries the data of ordinal `k` of the *latest-issued* writer that has one. Bank `p`
-//!    takes its data from lane `p` when some writer drives it, else from lane 0, and goes to the
+//!    takes its data from lane `p` when some writer drives it, else from the lane of the chunk's
+//!    own ordinal, else from lane 0, and goes to the
 //!    register of the latest-issued writer that targets bank `p`; the chunks of earlier writers
 //!    on that bank are dropped. Banks nobody targets are untouched. A port with a single writer
 //!    passes through unchanged.

@@ -112,8 +112,8 @@ two (`wl`, `wh`); a write is a list of 256-bit chunks numbered in the order the 
 them.
 
 1. *Same port, same landing cycle.* The port has one data lane per chunk ordinal; lane `k` carries
-   ordinal `k` of the latest-issued writer that has one. Bank `p` takes lane `p` (lane 0 when no writer
-   drives lane `p`) and goes to the register of the latest-issued writer that targets `p`; earlier
+   ordinal `k` of the latest-issued writer that has one. Bank `p` takes lane `p` (else the lane of the chunk's own ordinal, else
+   lane 0, when no writer drives lane `p`) and goes to the register of the latest-issued writer that targets `p`; earlier
    writers' chunks on that bank are dropped. Banks nobody targets are untouched; registers do not
    matter, the bank is the resource. A port with one writer passes through.
 2. *Different ports, same landing cycle.* Only chunks on the same register and bank conflict; the
@@ -188,11 +188,54 @@ part-word store unit), so Chess legitimately schedules through reservations the 
 Those are real silicon schedules, and silicon is fine with them; they are not collisions in the
 sense of this section.
 
+### Cascade-read (`VMOV_CASCADE_READ`) collisions
+
+Derivation. TableGen's `II_VMOV_CASCADE_READ` = `[EmptyCycles<1>, AvoidSemaphore<6>, EmptyCycles<5>,
+PrefixCycle<W_WA_PORT>, SimpleCycle<CM_WM_PORT>]` (latency 7): `collision-check ops` gives
+`W_WA_PORT:6, CM_WM_PORT:6` plus the reserved `SEMAPHORE:1..6`. The register-port side puts it in the same
+design space as every other writer, so `tools/gen_collision_probe.py` (with `COLLISION_CASCADE=1`, three
+catalogue entries `vmov {x,bml,bmh}, SCD`) derives its pairs: 317 pair points against 88 catalogue
+instructions, 634 controls, 375 solo/zero references, config `sep` and `dstshare`.
+
+Probe. `tools/gen_cascade_collision_probe.py` runs those kernels on the topology harness: the
+consumer tile (0,2) runs the generated kernel plus a cascade prologue (enable SCD, a counted loop so the
+producer has filled the cascade), the producer tile (0,3) enables MCD and streams exactly as many
+identical words as the kernel has SCD reads. Directory `build/experiments/cascade-collisions/probe3`:
+22 kernels, 1326 points, silicon r1 == r2 byte-identical on every kernel, no TDR; `analyze_collision_probe.py
+check` reports every pair/control/reference as designed (alignment guard in the tool: an unaligned loop
+label re-runs its setup on silicon, see core-compute-timing.md).
+
+Result. The existing resolver explained every point whose destination is an `x` register and all but
+36 accumulator-destination points; two rules, both read off probe3, close the rest:
+
+1. A chunk on a bank no writer drives a lane for takes the lane of **its own ordinal** before lane 0
+   (`bmh` write beside a `bm` mover: both of its chunks take the mover's two lanes, not lane 0 twice).
+2. **Beside a cascade read with an accumulator destination, a narrow (single-chunk) writer on an odd
+   bank also drives lane 1** of the port: against `vmov bm, SCD` an `am` quarter mover on bank 1 or 3
+   supplies the data of the read's second chunk (bank 3: the read's second chunk lands the mover's data;
+   banks 0 and 2: it keeps the SCD data); against the plain 512-bit movers the old rule stands. `x`
+   destinations need no cascade-specific rule.
+
+EMU vs silicon after both rules: 0/1326 points differ (pair 0/317, control 0/634, ref 0/375); the old
+collision probes stay exact (see the sweep line in `build/experiments/cascade-collisions/PROGRESS.md`);
+75 probe3 points are replayed as goldens (`collision_goldens_cascade_data.rs`,
+`every_silicon_cascade_read_collision_replays_exactly`), and the mutation check has seven new mutations
+(`build/experiments/cascade-collisions/mutation_cascade.txt`). The read's own timing (hold at the fifth
+bundle after the vmov, destination visible 7 issued bundles after it, no interlock) is in
+core-compute-timing.md.
+
+Open within this section: rule 2 is an observation about narrow odd-bank writers beside a cascade read;
+the probe cannot say whether the cause is the narrow writer's lane or the read's second chunk, and only
+the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
+
 **Open (not modelled), each with its reason.**
 
-- `VMOV_CASCADE_READ` collisions: the cascade read writes the accumulator file through a port the
-  tables share (`CM_WM`), but its data arrives from a neighbouring tile, so a collision needs a
-  two-tile harness. Deferred, required for 100%.
+- `VMOV_CASCADE_READ` collisions were **modelled** 2026-11-01 (section below). Still unprobed: the
+  `SEMAPHORE` reservation (the itinerary holds the semaphore unit for the six cycles after the vmov;
+  lock `acq`/`rel`, the stream moves and `vmov MCD` also hold it), because a probe needs a lock or a
+  stream source under the pair and the single-bank accumulator probes never touched them; a cascade
+  read colliding with a second cascade read (the two cannot issue in one bundle and are six apart on
+  the port); and the AIE2P cascade.
 - `UPS_UNIT` cannot be separated from `CM_WM_PORT`: every instruction that holds the UPS unit holds
   the write port exactly two cycles later (`vups` 0 and 2, `vlda.ups` 6 and 8), so two instructions
   colliding on the UPS unit collide on the write port at the same instant and no probe can tell which
