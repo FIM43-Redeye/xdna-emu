@@ -164,9 +164,20 @@ def _instr_gen():
     return importlib.import_module("instr-test-gen")
 
 
+def workspace() -> Path:
+    """Directory holding mlir-aie/ and llvm-aie/: NPU_WORK_DIR, else the nearest ancestor."""
+    env = os.environ.get("NPU_WORK_DIR")
+    if env:
+        return Path(env)
+    for anc in Path(__file__).resolve().parents:
+        if (anc / "mlir-aie").is_dir() and (anc / "llvm-aie").is_dir():
+            return anc
+    raise RunError("cannot find the workspace (set NPU_WORK_DIR)")
+
+
 def build_test_host(pkg_dir: Path) -> Path:
     """Compile the shared test_host into `pkg_dir` (as run_acc_timing_probe does)."""
-    mlir_aie = Path(os.environ.get("MLIR_AIE", REPO.parent.parent / "mlir-aie"))
+    mlir_aie = Path(os.environ.get("MLIR_AIE") or workspace() / "mlir-aie")
     test_lib = mlir_aie / "build" / "runtime_lib" / "x86_64" / "test_lib"
     cpp, exe = pkg_dir / "test_host.cpp", pkg_dir / "test_host"
     cpp.write_text(_instr_gen().generate_test_host_cpp())
