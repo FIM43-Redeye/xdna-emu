@@ -70,3 +70,19 @@ def resolve_mlir_aie(start=None, env=None):
 def events_header(start=None, env=None):
     """Path of xaie_events_aieml.h under the resolved mlir-aie."""
     return resolve_mlir_aie(start, env) / EVENTS_HEADER_REL
+
+
+def find_workspace_dir(name, start=None, env=None):
+    """Locate a sibling workspace directory (e.g. ``xdna-emu-priv``) the same
+    way: ``NPU_WORK_DIR/<name>`` if set, else the nearest ancestor of
+    ``start`` containing ``<name>``. Returns None when it is not there, since
+    callers of sibling repos (private companions) must tolerate absence."""
+    env = os.environ if env is None else env
+    if env.get("NPU_WORK_DIR"):
+        candidate = Path(env["NPU_WORK_DIR"]) / name
+        return candidate.resolve() if candidate.is_dir() else None
+    here = Path(start if start is not None else __file__).resolve()
+    for ancestor in (here, *here.parents):
+        if (ancestor / name).is_dir():
+            return (ancestor / name).resolve()
+    return None

@@ -7,13 +7,28 @@ ever reaches hardware."""
 import json
 import os
 import struct
+from pathlib import Path
+
 import pytest
+import toolchain_paths
 from calibration.skew.r3b_observe import observe_r3b
 from calibration.skew.r3b_extract import extract_r3b
 
-GEOM_PATH = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), os.pardir, os.pardir,
-    "mlir-aie", "test", "npu-xrt", "sp5_skew_r3b_pc", "geometry.json"))
+try:
+    _MLIR_AIE = toolchain_paths.resolve_mlir_aie(os.path.dirname(__file__))
+except toolchain_paths.ToolchainPathError:
+    _MLIR_AIE = None
+GEOM_PATH = str(
+    (_MLIR_AIE or Path("mlir-aie")) / "test" / "npu-xrt" / "sp5_skew_r3b_pc"
+    / "geometry.json")
+
+# The kernel dir is not part of this repo and is not on every mlir-aie branch
+# (it lives on the fork's xdna-emu-cycle-budget branch), so a checkout
+# without it has nothing to guard.
+pytestmark = pytest.mark.skipif(
+    not os.path.exists(GEOM_PATH),
+    reason="R3b-PC geometry.json not in the checked-out mlir-aie "
+           "(kernel is on the fork's xdna-emu-cycle-budget branch)")
 
 
 def _load():

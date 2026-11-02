@@ -73,3 +73,24 @@ def test_events_header_path(tmp_path):
     m = _make_mlir_aie(tmp_path / "mlir-aie")
     assert tp.events_header(env={"MLIR_AIE_PATH": str(m)}) == (
         m.resolve() / tp.EVENTS_HEADER_REL)
+
+
+def test_workspace_dir_prefers_npu_work_dir(tmp_path):
+    (tmp_path / "work" / "xdna-emu-priv").mkdir(parents=True)
+    got = tp.find_workspace_dir(
+        "xdna-emu-priv", tmp_path, {"NPU_WORK_DIR": str(tmp_path / "work")})
+    assert got == (tmp_path / "work" / "xdna-emu-priv").resolve()
+
+
+def test_workspace_dir_ancestor_discovery_from_a_worktree(tmp_path):
+    (tmp_path / "xdna-emu-priv").mkdir()
+    wt = tmp_path / "xdna-emu" / ".worktrees" / "x"
+    wt.mkdir(parents=True)
+    assert tp.find_workspace_dir("xdna-emu-priv", wt, {}) == (
+        tmp_path / "xdna-emu-priv").resolve()
+
+
+def test_workspace_dir_absent_is_none(tmp_path):
+    assert tp.find_workspace_dir("xdna-emu-priv", tmp_path, {}) is None
+    assert tp.find_workspace_dir(
+        "xdna-emu-priv", tmp_path, {"NPU_WORK_DIR": str(tmp_path)}) is None
