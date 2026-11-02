@@ -48,6 +48,15 @@ _MLIR_AIE = (
     / "mlir-aie"
 )
 
+# The CLI tests need some resolved design MLIR to name trace slots and tiles,
+# but nothing here depends on which one: the assertions are on the decoded
+# commands and the Perfetto shape. Use the checked-in parse-trace fixture
+# rather than a build-tree artifact: aiecc no longer writes
+# input_with_addresses.mlir into the .prj dir unless asked for it with
+# --get-input-with-addresses, so the build-tree path does not exist.
+_CLI_MLIR = (Path(__file__).parent / "tests" / "fixtures" / "vector_scalar"
+             / "input_with_addresses.mlir")
+
 
 # ---------------------------------------------------------------------------
 # packet header parsing
@@ -443,7 +452,7 @@ def test_parse_trace_cli_out_commands_matches_oracle(tmp_path):
             "--trace-bin",
             str(fixture),
             "--xclbin-mlir",
-            str(_MLIR_AIE / "build/test/npu-xrt/add_one_objFifo/peano/aie_arch.mlir.prj/input_with_addresses.mlir"),
+            str(_CLI_MLIR),
             "--decoder",
             "ours",
             "--out-commands",
@@ -484,7 +493,7 @@ def test_parse_trace_cli_out_perfetto_mode0_emits_be_pairs(tmp_path):
             "--trace-bin",
             str(fixture),
             "--xclbin-mlir",
-            str(_MLIR_AIE / "build/test/npu-xrt/add_one_objFifo/peano/aie_arch.mlir.prj/input_with_addresses.mlir"),
+            str(_CLI_MLIR),
             "--decoder",
             "ours",
             "--out-perfetto",
@@ -538,7 +547,7 @@ def test_parse_trace_cli_out_perfetto_rejects_non_mode0(tmp_path):
             "--trace-bin",
             str(fixture),
             "--xclbin-mlir",
-            str(_MLIR_AIE / "build/test/npu-xrt/add_one_objFifo/peano/aie_arch.mlir.prj/input_with_addresses.mlir"),
+            str(_CLI_MLIR),
             "--decoder",
             "ours",
             "--trace-mode",
