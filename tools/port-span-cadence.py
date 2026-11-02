@@ -39,6 +39,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import aiecc_artifacts
 import toolchain_paths
 
 REPO = Path(__file__).resolve().parent.parent
@@ -178,8 +179,8 @@ def main():
     out = {}
     if args.session:
         for kernel, runs in collect_runs(args.session, args.limit).items():
-            mlir = args.mlir or (MLIR_AIE / "build" / "test" / "npu-xrt" / kernel /
-                                 "chess" / "aie_arch.mlir.prj" / "input_with_addresses.mlir")
+            mlir = args.mlir or aiecc_artifacts.require_input_with_addresses(
+                MLIR_AIE / "build" / "test" / "npu-xrt" / kernel / "chess")
             per_run = []
             for tb, ej in runs:
                 pf = gen_perfetto(tb, mlir)

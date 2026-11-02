@@ -58,6 +58,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+import aiecc_artifacts
+
 REPO = Path(__file__).resolve().parents[1]
 PARSE_TRACE = REPO / "tools" / "parse-trace.py"
 NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or REPO.parent)
@@ -263,9 +265,8 @@ def discover_pairs(results_dir: Path, build_base: Path) -> list[TestPair]:
 
     # MLIR discovery uses the standard mlir-aie build layout.
     for p in pairs.values():
-        candidate = build_base / p.name / p.compiler / "aie_arch.mlir.prj" / "input_with_addresses.mlir"
-        if candidate.exists():
-            p.mlir = candidate
+        p.mlir = aiecc_artifacts.find_input_with_addresses(
+            build_base / p.name / p.compiler)
 
     return sorted(pairs.values(), key=lambda p: (p.name, p.compiler))
 
@@ -421,10 +422,13 @@ def main(argv=None) -> int:
                 continue
 
             if pair.mlir is None:
-                if args.verbose:
-                    print(f"[skip] {pair.name}.{pair.compiler}: no "
-                          f"input_with_addresses.mlir under {args.build_base}",
-                          file=sys.stderr)
+                # Always say so: a silent skip looks like a clean run. aiecc
+                # only writes the file when asked.
+                print(f"[skip] {pair.name}.{pair.compiler}: no "
+                      f"{aiecc_artifacts.FILENAME} under {args.build_base}; "
+                      f"rebuild with `aiecc "
+                      f"{aiecc_artifacts.GET_INPUT_WITH_ADDRESSES}`",
+                      file=sys.stderr)
                 continue
 
             with tempfile.TemporaryDirectory(prefix="dma-fill-") as tmp:

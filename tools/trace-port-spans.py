@@ -41,6 +41,10 @@ def _find_mlir(name, comp):
     base = f"{NPU_WORK}/mlir-aie/build/test/npu-xrt/{name}/{comp}"
     r = subprocess.run(["find", base, "-name", "input_with_addresses.mlir",
                         "-print", "-quit"], capture_output=True, text=True)
+    if not r.stdout.strip():
+        # aiecc writes it only when asked; say how to get it.
+        print(f"warning: no input_with_addresses.mlir under {base}; rebuild "
+              f"with `aiecc --get-input-with-addresses`", file=sys.stderr)
     return r.stdout.strip()
 
 

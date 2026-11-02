@@ -51,6 +51,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiecc_artifacts
+
 REPO = Path(__file__).resolve().parents[1]
 NPU_WORK = Path(os.environ.get("NPU_WORK_DIR") or REPO.parent)
 DRIVER_REPO = NPU_WORK / "xdna-driver"
@@ -111,17 +113,27 @@ def fw_state_from_xrt_smi() -> dict:
     return out
 
 
+def _mlir_hint(artifact: str) -> str:
+    """Suffix for a missing-artifact error: the MLIR needs an explicit flag."""
+    if artifact != "mlir":
+        return ""
+    return (f" (aiecc writes {aiecc_artifacts.FILENAME} only when asked: "
+            f"rebuild with `aiecc {aiecc_artifacts.GET_INPUT_WITH_ADDRESSES}`)")
+
+
 def kbuild_paths(k: int) -> dict:
     """Compute artifact paths for a given K. Raises if any are missing."""
     base = MLIR_AIE_ROOT / "build" / "test" / "npu-xrt" / "_diag_shim_chain_sweep" / f"k{k}" / "chess"
     paths = {
         "xclbin": base / "aie.xclbin",
         "instr":  base / "insts.bin",
-        "mlir":   base / "aie_arch.mlir.prj" / "input_with_addresses.mlir",
+        "mlir":   aiecc_artifacts.find_input_with_addresses(base)
+                  or base / aiecc_artifacts.FILENAME,
     }
     for name, p in paths.items():
         if not p.exists():
-            raise FileNotFoundError(f"K={k}: missing {name} at {p}")
+            raise FileNotFoundError(f"K={k}: missing {name} at {p}"
+                                    + _mlir_hint(name))
     return paths
 
 
@@ -136,11 +148,13 @@ def kernel_build_paths(name: str) -> dict:
     paths = {
         "xclbin": base / "aie.xclbin",
         "instr":  base / "insts.bin",
-        "mlir":   base / "aie_arch.mlir.prj" / "input_with_addresses.mlir",
+        "mlir":   aiecc_artifacts.find_input_with_addresses(base)
+                  or base / aiecc_artifacts.FILENAME,
     }
     for pname, p in paths.items():
         if not p.exists():
-            raise FileNotFoundError(f"kernel {name}: missing {pname} at {p}")
+            raise FileNotFoundError(f"kernel {name}: missing {pname} at {p}"
+                                    + _mlir_hint(pname))
     return paths
 
 

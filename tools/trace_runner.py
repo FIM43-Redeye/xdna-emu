@@ -766,6 +766,10 @@ def _find_post_lowering_mlir(build_dir: Path) -> Optional[Path]:
     build_dir/*.prj/. Same discovery shape as emu-bridge-test.sh so parse
     behaves identically.
     """
+    # `aiecc --get-input-with-addresses` writes it beside the xclbin.
+    cand = build_dir / "input_with_addresses.mlir"
+    if cand.exists():
+        return cand
     for prj in build_dir.glob("*.mlir.prj"):
         cand = prj / "input_with_addresses.mlir"
         if cand.exists():

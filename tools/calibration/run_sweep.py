@@ -39,6 +39,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import aiecc_artifacts  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 GEN_KERNEL = REPO_ROOT / "tools" / "calibration" / "gen_kernel.py"
 PARSE_TRACE = REPO_ROOT / "tools" / "parse-trace.py"
@@ -162,6 +165,9 @@ def compile_one(work_dir: Path, src_mlir: str = "aie.mlir",
             "--xchesscc=false", "--xbridge=false",
             "--get-xclbin",
             "--get-npu-insts",
+            # parse_one reads input_with_addresses.mlir, which aiecc only
+            # writes when asked (into the working directory).
+            aiecc_artifacts.GET_INPUT_WITH_ADDRESSES,
             "--xclbin-name=final.xclbin",
             "--npu-insts-name=insts.bin",
             src_mlir,
@@ -238,8 +244,9 @@ def parse_one(work_dir: Path, task: dict = None) -> dict:
     is_passthrough = task and task["kind"] == "dma_passthrough"
     # The passthrough builds aie_traced.mlir, so its lowered MLIR lives in a
     # differently-named project dir.
-    xclbin_mlir = ("aie_traced.mlir.prj/input_with_addresses.mlir"
-                   if is_passthrough else "aie.mlir.prj/input_with_addresses.mlir")
+    xclbin_mlir = str(aiecc_artifacts.require_input_with_addresses(
+        work_dir, "aie_traced.mlir" if is_passthrough else "aie.mlir"
+    ).relative_to(work_dir))
     log_path = work_dir / "parse.log"
     with open(log_path, "w") as logf:
         proc = subprocess.run([

@@ -1663,6 +1663,15 @@ compile_one_compiler() {
       cmd="$(transform_for_peano "$cmd" "$src_dir")"
     fi
 
+    # parse-trace needs the post-lowering MLIR (input_with_addresses.mlir),
+    # which aiecc writes only when asked. Ask on the primary compile; the
+    # secondary steps that read aie_arch_orig.mlir would overwrite it with
+    # the untraced design's.
+    if _is_aiecc_cmd "$cmd" && [[ "$cmd" != *aie_arch_orig* ]] \
+        && ! _cmd_has_flag "$cmd" --get-input-with-addresses; then
+      cmd="$(_aiecc_add_flag "$cmd" --get-input-with-addresses)"
+    fi
+
     # Skip commands that couldn't be transformed
     [[ "$cmd" == "# SKIP"* ]] && { echo "$cmd" >> "$log_file"; continue; }
 
@@ -2602,7 +2611,9 @@ _predecode_events_next_to_trace() {
   # Discover the aiecc-lowered MLIR; the .prj dir name varies by test
   # (aie_arch.mlir.prj for the diag corpus, aie2.mlir.prj for objfifo).
   local mlir
-  mlir="$(find "$BUILD_BASE/$name/${compiler}" -mindepth 2 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
+  # --get-input-with-addresses puts it beside the xclbin; older builds had
+  # it one level down in the .prj dir.
+  mlir="$(find "$BUILD_BASE/$name/${compiler}" -mindepth 1 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
   [[ -n "$mlir" && -f "$mlir" ]] || return 0
   # When cycles_out is set, the same parse also writes the total-cycle scalar.
   _bin_to_events_json "$bin" "$mlir" "$out" "$cycles_out" || true
@@ -3649,7 +3660,8 @@ main() {
       local emu_trace="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.emu/trace_raw.bin"
       local summary_file="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.summary"
       # parse-trace.py needs the post-lowering MLIR to resolve event slots.
-      local t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
+      local t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/input_with_addresses.mlir"
+      [[ -f "$t5_mlir" ]] || t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
 
       if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]] && [[ -f "$t5_mlir" ]]; then
         local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
