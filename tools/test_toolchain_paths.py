@@ -100,3 +100,20 @@ def test_try_resolve_returns_none_instead_of_raising(tmp_path):
     assert tp.try_resolve_mlir_aie(tmp_path, {}) is None
     m = _make_mlir_aie(tmp_path / "mlir-aie")
     assert tp.try_resolve_mlir_aie(tmp_path, {}) == m.resolve()
+
+
+def test_workspace_root_env_wins(tmp_path):
+    assert tp.workspace_root(tmp_path, {"NPU_WORK_DIR": str(tmp_path)}) == tmp_path.resolve()
+
+
+def test_workspace_root_from_main_checkout_and_worktree(tmp_path):
+    (tmp_path / "ws" / "xdna-emu" / ".worktrees" / "x" / "tools").mkdir(parents=True)
+    ws = (tmp_path / "ws").resolve()
+    assert tp.workspace_root(tmp_path / "ws" / "xdna-emu" / "tools", {}) == ws
+    assert tp.workspace_root(
+        tmp_path / "ws" / "xdna-emu" / ".worktrees" / "x" / "tools", {}) == ws
+
+
+def test_workspace_root_missing_raises(tmp_path):
+    with pytest.raises(tp.ToolchainPathError):
+        tp.workspace_root(tmp_path, {})
