@@ -17,6 +17,7 @@ Usage:
 import argparse
 import json
 import os
+import multiprocessing
 import re
 import subprocess
 import sys
@@ -649,25 +650,28 @@ def _build_pipeline_string(passes: list[tuple[str, str]]) -> str:
 
 
 def _fallback_lowering_pipeline() -> str:
-    """Hardcoded pipeline snapshot as fallback.
+    """Hardcoded pipeline snapshot, used when derivation from aiecc.cpp fails.
 
-    Matches aiecc.cpp runResourceAllocationPipeline() as of 2026-03-10.
-    Used when the mlir-aie source tree is not found or parsing fails.
+    Snapshot of the pre-routing resource-allocation passes against the
+    mlir-aie of 2026-11. aiecc.cpp no longer has a runResourceAllocationPipeline
+    to parse (the pipeline moved into aiecc/IRTransforms.h), so this is
+    currently the pipeline in effect. Changes from the 2026-03-10 snapshot:
+    aie-register-objectFifos is gone, and aie-generate-column-control-overlay
+    is a module-level pass rather than a device-level one.
     """
     return (
         "builtin.module("
         "aie-canonicalize-device,"
         "aie.device("
         "aie-assign-lock-ids,"
-        "aie-register-objectFifos,"
         "aie-objectFifo-stateful-transform,"
         "aie-assign-bd-ids,"
         "aie-lower-cascade-flows,"
         "aie-lower-broadcast-packet,"
         "aie-lower-multicast,"
-        "aie-assign-tile-controller-ids,"
+        "aie-assign-tile-controller-ids"
+        "),"
         "aie-generate-column-control-overlay"
-        ")"
         ")"
     )
 
@@ -1006,6 +1010,14 @@ def assign_targets_to_shims(
 #   mlir-aie allocates BDs 0..N from the bottom, so BD 15 is almost
 #   always free.  A future diagnostic check could verify this.
 
+# The workers unpickle _evaluate_candidate/_evaluate_distributed by module
+# name, but this file (hyphenated, loaded by path) is only importable in the
+# parent. Python 3.14 changed the POSIX default start method from fork to
+# forkserver, whose fresh interpreters cannot import it ("No module named
+# 'trace_inject'"). Fork inherits the parent's sys.modules, as before 3.14.
+_WORKER_CONTEXT = multiprocessing.get_context("fork")
+
+
 def _evaluate_candidate(
     mlir_asm: str,
     shim_col: int,
@@ -1176,7 +1188,8 @@ def _try_distributed_plan(
     )
 
     # Validate the entire assignment in a subprocess.
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as pool:
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=1, mp_context=_WORKER_CONTEXT) as pool:
         future = pool.submit(
             _evaluate_distributed,
             mlir_text,
@@ -1297,7 +1310,8 @@ def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
 
     # -- Evaluate in parallel via ProcessPoolExecutor ---------------------
     raw_results: list[dict] = []
-    with concurrent.futures.ProcessPoolExecutor() as pool:
+    with concurrent.futures.ProcessPoolExecutor(
+        mp_context=_WORKER_CONTEXT) as pool:
         futures = {
             pool.submit(
                 _evaluate_candidate,
