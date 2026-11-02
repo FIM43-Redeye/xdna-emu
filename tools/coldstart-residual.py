@@ -26,6 +26,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import aiecc_artifacts
+import toolchain_paths
+
 REPO = Path(__file__).resolve().parent.parent
 PARSE_TRACE = REPO / "tools" / "parse-trace.py"
 
@@ -69,19 +72,20 @@ def measure(events: list[dict], anchor: str) -> tuple[int | None, int | None, in
     return start, end, end - start
 
 
-def resolve_mlir(name: str, variant: str) -> Path | None:
-    """Find the post-lowering MLIR for a kernel; try several layouts."""
-    npu_work = Path(os.environ.get("NPU_WORK_DIR") or Path(__file__).resolve().parents[2])
-    base = npu_work / "mlir-aie/build/test/npu-xrt" / name
-    candidates = [
-        base / variant / "aie_arch.mlir.prj" / "input_with_addresses.mlir",
-        base / "chess" / "aie_arch.mlir.prj" / "input_with_addresses.mlir",
-        base / "aie2.mlir.prj" / "input_with_addresses.mlir",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+def resolve_mlir(name: str, variant: str) -> Path:
+    """Find the post-lowering MLIR for a kernel's build.
+
+    Raises MissingInputWithAddresses, naming the aiecc flag that produces the
+    file, when no build of the kernel has one.
+    """
+    base = toolchain_paths.resolve_mlir_aie(Path(__file__)) / "build/test/npu-xrt" / name
+    for build_dir, source in ((base / variant, "aie_arch.mlir"),
+                              (base / "chess", "aie_arch.mlir"),
+                              (base, "aie2.mlir")):
+        found = aiecc_artifacts.find_input_with_addresses(build_dir, source)
+        if found:
+            return found
+    return aiecc_artifacts.require_input_with_addresses(base / variant)
 
 
 def main():
@@ -117,9 +121,11 @@ def main():
 
     residuals = []
     for k in kernels:
-        mlir = resolve_mlir(k, args.variant)
-        if not mlir:
+        try:
+            mlir = resolve_mlir(k, args.variant)
+        except aiecc_artifacts.MissingInputWithAddresses as e:
             print(f"{k:<48}  -- no MLIR")
+            print(f"  {e}", file=sys.stderr)
             continue
         hw = parse_one(args.hw_dir / f"{k}.{args.variant}.hw" / "trace_raw.bin",
                        mlir, args.cache_dir / "hw")

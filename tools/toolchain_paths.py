@@ -95,3 +95,19 @@ def find_workspace_dir(name, start=None, env=None):
         if (ancestor / name).is_dir():
             return (ancestor / name).resolve()
     return None
+
+
+def workspace_root(start=None, env=None):
+    """The workspace directory that holds xdna-emu and its sibling repos:
+    ``NPU_WORK_DIR`` if set, else the ancestor containing ``xdna-emu``
+    (which also holds from inside ``xdna-emu/.worktrees/<name>/``).
+    Raises ToolchainPathError when neither applies."""
+    env = os.environ if env is None else env
+    if env.get("NPU_WORK_DIR"):
+        return Path(env["NPU_WORK_DIR"]).resolve()
+    emu = find_workspace_dir("xdna-emu", start, {})
+    if emu is None:
+        raise ToolchainPathError(
+            "workspace root not found: set NPU_WORK_DIR or run from a "
+            "checkout inside a workspace holding xdna-emu")
+    return emu.parent

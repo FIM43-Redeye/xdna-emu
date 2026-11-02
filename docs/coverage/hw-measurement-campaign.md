@@ -322,6 +322,9 @@ committed before moving on.
      four corpus tests with that layout got events.json automatically
      and the two with `aie2.mlir.prj` did not. Helper now discovers
      `input_with_addresses.mlir` under `<test>/<compiler>/*.prj/`.
+     (Since then aiecc writes the file only with
+     `--get-input-with-addresses`, into the output dir beside the xclbin;
+     `tools/aiecc_artifacts.py` finds either location.)
 5. **Item #10 first-pass regression.** Mine the existing-corpus
    data for BD size variation. **Closed -- infeasible**: all four
    working corpus tests have identical 64-word shim BDs.  10x

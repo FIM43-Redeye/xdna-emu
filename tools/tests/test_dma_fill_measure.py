@@ -184,3 +184,14 @@ def test_discover_pairs_resolves_mlir_when_present(tmp_path):
     pairs = tool.discover_pairs(results, build_base)
     assert len(pairs) == 1
     assert pairs[0].mlir == mlir
+
+
+def test_discover_pairs_resolves_mlir_beside_the_build(tmp_path):
+    """aiecc --get-input-with-addresses writes it next to the xclbin."""
+    results = tmp_path / "results"
+    (results / "kernA.chess.emu").mkdir(parents=True)
+    (results / "kernA.chess.emu" / "trace_raw.bin").write_bytes(b"\x00")
+    mlir = tmp_path / "build" / "kernA" / "chess" / "input_with_addresses.mlir"
+    mlir.parent.mkdir(parents=True)
+    mlir.write_text("dummy")
+    assert tool.discover_pairs(results, tmp_path / "build")[0].mlir == mlir

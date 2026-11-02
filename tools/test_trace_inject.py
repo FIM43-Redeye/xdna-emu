@@ -921,3 +921,59 @@ class TestMlirTraceInjectPacketIds:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Planner routing is delegated to the installed aiecc
+# ---------------------------------------------------------------------------
+
+def _aie_and_aiecc():
+    import shutil
+    try:
+        import aie.dialects.aie  # noqa: F401
+    except ImportError:
+        return False
+    return shutil.which("aiecc") is not None
+
+
+@pytest.mark.skipif(_trace_inject_missing or not _aie_and_aiecc(),
+                    reason="needs deprecated/trace-inject.py, aie bindings and aiecc")
+class TestLowerAndRoute:
+    """The planner must route through aiecc itself, so it cannot go stale
+    against the toolchain (it used to copy aiecc's pass list)."""
+
+    def _source(self):
+        import toolchain_paths
+        mlir_aie = toolchain_paths.try_resolve_mlir_aie(Path(__file__))
+        src = mlir_aie and mlir_aie / "test/npu-xrt/add_one_using_dma"
+        if not (src and src.is_dir()):
+            pytest.skip("mlir-aie add_one_using_dma test not available")
+        return _mod.get_mlir_text(src, _mod.detect_source_type(src), "npu1_1col")
+
+    def test_routes_a_real_design(self):
+        from aie.ir import Context, Location, Module
+        text = self._source()
+        with Context(), Location.unknown():
+            module = Module.parse(text)
+            before = str(module)
+            routed = _mod.lower_and_route(module)
+            assert routed is not None
+            assert _mod.extract_connections(routed), "no routed connections"
+            assert str(module) == before, "input module must be left untouched"
+
+    def test_aiecc_failure_returns_none(self, tmp_path, monkeypatch):
+        """A design aiecc cannot route is reported as None, not an exception."""
+        from aie.ir import Context, Location, Module
+        fake = tmp_path / "aiecc"
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        fake.chmod(0o755)
+        monkeypatch.setattr(_mod.shutil, "which", lambda name: str(fake))
+        with Context(), Location.unknown():
+            assert _mod.lower_and_route(Module.parse("module {}")) is None
+
+    def test_missing_aiecc_is_an_error(self, monkeypatch):
+        from aie.ir import Context, Location, Module
+        monkeypatch.setattr(_mod.shutil, "which", lambda name: None)
+        with Context(), Location.unknown():
+            with pytest.raises(RuntimeError, match="aiecc not found"):
+                _mod.lower_and_route(Module.parse("module {}"))

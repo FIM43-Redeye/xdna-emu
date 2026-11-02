@@ -20,6 +20,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+# Imported by path so this works both as `tools.npu1_firmware_evidence` and
+# as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import toolchain_paths  # noqa: E402
+
 
 class Outcome(str, Enum):
     SUCCESS = "success"
@@ -1766,11 +1771,7 @@ def _command_stdout(argv: Sequence[str], timeout: int = 10) -> str:
 
 
 def _workspace_root() -> Path:
-    return next(
-        parent
-        for parent in Path(__file__).resolve().parents
-        if parent.name == "npu-work"
-    )
+    return toolchain_paths.workspace_root(Path(__file__))
 
 
 def load_protocol_opcodes(repository: Path, revision: str) -> ProtocolOpcodes:

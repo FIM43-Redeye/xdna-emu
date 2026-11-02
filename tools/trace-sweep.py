@@ -514,8 +514,9 @@ def sweep_multi(
     mlir = _find_post_lowering_mlir(build_dir)
     if mlir is None:
         raise FileNotFoundError(
-            f"no input_with_addresses.mlir under {build_dir}/*.prj/; "
-            f"parse-trace cannot decode without it"
+            f"no input_with_addresses.mlir under {build_dir} (or its *.prj/); "
+            f"parse-trace cannot decode without it. aiecc writes it only "
+            f"when asked: rebuild with `aiecc --get-input-with-addresses`"
         )
 
     all_events = load_events(tile_type)
@@ -1013,8 +1014,9 @@ def sweep_lockstep(
     mlir = _find_post_lowering_mlir(build_dir)
     if mlir is None:
         raise FileNotFoundError(
-            f"no input_with_addresses.mlir under {build_dir}/*.prj/; "
-            f"parse-trace cannot decode without it"
+            f"no input_with_addresses.mlir under {build_dir} (or its *.prj/); "
+            f"parse-trace cannot decode without it. aiecc writes it only "
+            f"when asked: rebuild with `aiecc --get-input-with-addresses`"
         )
 
     # Defaults for grounding event lists.

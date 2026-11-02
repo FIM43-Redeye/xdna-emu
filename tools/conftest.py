@@ -15,7 +15,10 @@ from pathlib import Path
 
 # Resolved like the Rust side (NPU_WORK_DIR, then ancestor discovery), so it
 # also works from a checkout under .worktrees/<name>/.
+# The repo root too, so `from tools import ...` works however pytest is
+# invoked (e.g. `cd tools && pytest`).
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import toolchain_paths  # noqa: E402
 
 _AMD_SW = toolchain_paths.find_workspace_dir("amd-unified-software", __file__)
