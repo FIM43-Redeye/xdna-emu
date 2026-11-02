@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .device_model import DeviceModel
 from .emit import emit_mlir, kernel_object, kernel_symbol
+from .run import RunError, input_sources
 from .plan import ChannelPlan, PlanError, plan_channels, resolve_device
 from .topology import Topology, to_dict
 from .validate import validate, validate_topology
@@ -155,6 +156,11 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
     if isinstance(plan, PlanError):
         raise BuildError(f"{topology.name}: planning failed: {plan.code}: {plan.message}")
 
+    try:
+        inputs = input_sources(topology)     # fails early on mis-sized Buffer.data
+    except RunError as e:
+        raise BuildError(f"{topology.name}: {e}") from None
+
     out_dir.mkdir(parents=True, exist_ok=True)
     by_name = {c.name: c for c in topology.cores}
     phase_dirs: list[Path] = []
@@ -179,6 +185,7 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
         "git_rev": _git_rev(),
         "tools": _tool_versions(root),
         "aiecc_flags": list(AIECC_FLAGS),
+        "inputs": inputs,
         "phases": [f"phase_{p.index}" for p in plan.phases],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True,
