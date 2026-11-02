@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""Load/store address-alignment probes for the topology harness (one core, hand-written asm).
+
+What it measures
+----------------
+For each load/store instruction family and addressing form, the kernel issues the access at
+a pointer swept byte by byte across a window and records what the hardware did with the
+address:
+
+  store  the destination region is pre-filled with a marker byte (0xEE); after the access
+         the bytes that changed show where the data landed.
+  load   the source window holds a distinct byte per position (byte = window index mod 256);
+         the loaded register is stored back through an aligned store, so its bytes show
+         which source bytes were read. The destination register is pre-loaded with the
+         marker so a load that does not write it is visible.
+
+Each iteration also records the pointer register after the access (the delta against the
+value before it), so post-modify forms show whether the updated pointer keeps the
+unaligned low bits.
+
+A "case" is one family x addressing form x sweep (see `build_cases`). Cases are packed into
+kernels (packages) by an output-size budget. The analysis side (`analyze_*`) is a pure
+function of the output bytes; it needs no knowledge of the rule being tested.
+
+Buffers
+-------
+  in  (read-only):  [0,64)    data bytes 1..64 (store source: wl0 = 1..32, wh0 = 33..64)
+                    [64,128)  marker 0xEE (load destination pre-load)
+                    [128,..)  load window, byte = index mod 256 (WIN_BYTES long)
+  out: [0,64)        header, u32 words: in pointer, out pointer, then zero
+       [64,..)       the cases' regions, each: data (n * stride bytes), pointer-delta table
+                     (n u32, padded to 64 bytes); the whole area is first filled with the marker
+Both buffers sit at 1 KiB-aligned addresses on silicon (0x74000 / 0x70400 observed); the header
+records the real pointers, and `parse_output` rejects a 64-byte-misaligned base.
+
+Pointer registers: p0 = in (never changed), p1 = out, p2 = access pointer (rebuilt every
+iteration from the scalar r5), p3 = delta table cursor, p4 = load record cursor.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import struct
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "tools"))
+
+from harness.topology import Buffer, Core, TileRef, Topology, to_dict      # noqa: E402
+
+MARKER = 0xEE
+DATA_OFF, MARK_OFF, WIN_OFF = 0, 64, 128
+WIN_BYTES = 1024
+CENTER = 384                      # window offset where the swept pointer starts (loads)
+IN_BYTES = WIN_OFF + WIN_BYTES
+HDR_BYTES = 64
+SLOT = 128                        # store case: bytes per iteration
+STORE_BASE = 32                   # store case: first pointer offset inside a slot
+REC = 64                          # load case: bytes per record
+OUT_BUDGET = 14 * 1024            # bytes of out buffer per kernel (data memory is 64 KiB)
+SECONDARY_STEP = 5                # sweep stride of the secondary variants
+NOPS = 6
+
+
+def in_bytes() -> bytes:
+    data = bytes(range(1, 65))
+    marker = bytes([MARKER]) * 64
+    window = bytes(i & 0xFF for i in range(WIN_BYTES))
+    return data + marker + window
+
+
+# -- the case catalogue -------------------------------------------------------
+
+@dataclass(frozen=True)
+class Family:
+    """One instruction family: `op` is a template over {a} (the address operand)."""
+    key: str
+    kind: str                  # "st" or "ld"
+    op: str                    # e.g. "vst wl0, {a}"
+    width: int                 # bytes the access moves (store: written; load: read)
+    pre: tuple[str, ...] = ()  # per-iteration lines before the op (load: marker into dest)
+    dump: tuple[str, ...] = () # per-iteration lines after the op (load: dest -> record, via p4)
+    imm: int = 0               # post-modify immediate to use (and the expected delta)
+    idx_imm: bool = True       # supports [p, #0]
+    pstm_imm: bool = True
+    pstm_m: bool = True
+    idx_dj: bool = True
+    plain: bool = False        # only the bare [p] form exists
+    conv: bool = False         # result bytes are a conversion of the source (no raw identity)
+
+
+# load destinations: how to pre-load the marker and how to dump the result to a record
+LD_W = dict(pre=("vlda wl2, [p0, #64]",), dump=("vst wl2, [p4, #0]",))
+LD_W128 = LD_W
+LD_X = dict(pre=("vlda wl2, [p0, #64]", "vlda wh2, [p0, #96]"),
+            dump=("vst wl2, [p4, #0]", "vst wh2, [p4, #32]"))
+LD_AM = dict(pre=("vlda amll0, [p0, #64]",), dump=("vst amll0, [p4, #0]",))
+LD_Q = dict(pre=("lda q0, [p0, #64]",), dump=("st q0, [p4, #0]",))
+LD_R = dict(pre=("mov r3, r9",), dump=("st r3, [p4, #0]",))
+LD_BM = dict(pre=("vmov bml0, x1",),
+             dump=("vmov x2, bml0", "vst wl2, [p4, #0]", "vst wh2, [p4, #32]"))
+
+
+def families() -> list[Family]:
+    F = Family
+    out = [
+        # scalar stores
+        F("st_w", "st", "st r8, {a}", 4, imm=4),
+        F("st_s16", "st", "st.s16 r8, {a}", 2, imm=2),
+        F("st_s8", "st", "st.s8 r8, {a}", 1, imm=1),
+        # scalar loads
+        F("lda_w", "ld", "lda r3, {a}", 4, imm=4, **LD_R),
+        F("lda_s16", "ld", "lda.s16 r3, {a}", 2, imm=2, conv=True, **LD_R),
+        F("lda_u16", "ld", "lda.u16 r3, {a}", 2, imm=2, conv=True, **LD_R),
+        F("lda_s8", "ld", "lda.s8 r3, {a}", 1, imm=1, conv=True, **LD_R),
+        F("lda_u8", "ld", "lda.u8 r3, {a}", 1, imm=1, conv=True, **LD_R),
+        # 128-bit
+        F("st_q", "st", "st q1, {a}", 16, imm=16),
+        F("lda_q", "ld", "lda q0, {a}", 16, imm=16, **LD_Q),
+        F("vst_128", "st", "vst.128 wl0, {a}", 16, imm=32),
+        F("vlda_128", "ld", "vlda.128 wl2, {a}", 16, imm=32, idx_imm=False, pstm_imm=False,
+          pstm_m=False, idx_dj=False, plain=True, **LD_W128),
+        F("vldb_128", "ld", "vldb.128 wl2, {a}", 16, imm=32, idx_imm=False, pstm_imm=False, **LD_W128),
+        # 256-bit
+        F("vst_w", "st", "vst wl0, {a}", 32, imm=32),
+        F("vst_am", "st", "vst amll0, {a}", 32, imm=32),
+        F("vlda_w", "ld", "vlda wl2, {a}", 32, imm=32, **LD_W),
+        F("vldb_w", "ld", "vldb wl2, {a}", 32, imm=32, **LD_W),
+        F("vlda_am", "ld", "vlda amll0, {a}", 32, imm=32, **LD_AM),
+    ]
+    return out
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    fam: Family
+    form: str                  # "imm0" | "pstm_imm" | "pstm_m" | "dj_sweep" | "dj_mix"
+    n: int
+    ptr_step: int              # byte step of the pointer per iteration
+    ptr_start: int             # pointer offset at iteration 0 (store: inside slot; load: window offset)
+    mod_start: int             # modifier register value at iteration 0
+    mod_step: int
+    addr: str                  # the address operand text
+
+    @property
+    def stride(self) -> int:
+        return SLOT if self.fam.kind == "st" else REC
+
+    @property
+    def data_bytes(self) -> int:
+        return self.n * self.stride
+
+    @property
+    def table_bytes(self) -> int:
+        return (self.n * 4 + 63) // 64 * 64
+
+    @property
+    def total_bytes(self) -> int:
+        return self.data_bytes + self.table_bytes
+
+
+def sweep_count(width: int) -> int:
+    """Byte offsets worth sweeping for an access of `width` bytes (0..2*width, at least 8)."""
+    return max(8, 2 * width) if width < 32 else 64
+
+
+def build_cases(fams: list[Family] | None = None) -> list[Case]:
+    cases: list[Case] = []
+    for f in fams if fams is not None else families():
+        n_full = sweep_count(f.width)
+        base = STORE_BASE if f.kind == "st" else CENTER
+        sec_n = max(4, min(13, n_full // SECONDARY_STEP + 1))
+
+        def add(form, addr, n, step, start, mod0, mods):
+            cases.append(Case(f"{f.key}.{form}", f, form, n, step, base + start, mod0, mods, addr))
+
+        if f.plain:
+            add("plain", "[p2]", n_full, 1, 0, 0, 0)
+        if f.idx_imm:
+            add("imm0", "[p2, #0]", n_full, 1, 0, 0, 0)
+        if f.pstm_imm:
+            add("pstm_imm", f"[p2], #{f.imm}", sec_n, SECONDARY_STEP, 0, 0, 0)
+        if f.pstm_m:
+            add("pstm_m", "[p2], m0", sec_n, SECONDARY_STEP, 0, f.imm, 0)
+        if f.idx_dj:
+            # aligned base, index swept
+            add("dj_sweep", "[p2, dj0]", sec_n, 0, 32 if f.kind == "st" else 0, 0, SECONDARY_STEP)
+            # base swept, constant odd index
+            add("dj_mix", "[p2, dj0]", sec_n, SECONDARY_STEP, 0, 5, 0)
+    return cases
+
+
+# -- assembly ---------------------------------------------------------------
+
+def _nops(n: int) -> list[str]:
+    return ["  nop"] * n
+
+
+def _frame(body: list[str]) -> str:
+    pro = [".text", ".globl test_kernel", "test_kernel:"]
+    epi = ["  nop"] * 7 + ["  ret lr"] + ["  nop"] * 5
+    return "\n".join(pro + body + epi) + "\n"
+
+
+def layout(cases: list[Case]) -> list[int]:
+    """Offset (from the out buffer start) of each case's region; first is after the header."""
+    offs, cur = [], HDR_BYTES
+    for c in cases:
+        offs.append(cur)
+        cur += c.total_bytes
+    return offs
+
+
+def out_bytes(cases: list[Case]) -> int:
+    offs = layout(cases)
+    return (offs[-1] + cases[-1].total_bytes) if cases else HDR_BYTES
+
+
+def kernel_asm(cases: list[Case], tag: str = "k") -> str:
+    body: list[str] = []
+    # header: the real pointers
+    body += ["  mov r2, p0", "  mov r3, p1", *_nops(3), "  st r2, [p1, #0]", "  st r3, [p1, #4]"]
+    # constants and sources: data in x0, marker in x1, scalar data r8, scalar marker r9, zero r10
+    body += ["  vlda wl0, [p0, #0]", "  vlda wh0, [p0, #32]",
+             "  vlda wl1, [p0, #64]", "  vlda wh1, [p0, #96]",
+             "  vlda amll0, [p0, #0]", "  lda q1, [p0, #0]",
+             "  lda r8, [p0, #0]", "  lda r9, [p0, #64]", "  mov r10, #0", *_nops(NOPS + 4),
+             "  mov s0, r10", "  mov s1, r10", *_nops(2),
+             "  vmov bml0, x0", *_nops(NOPS)]
+    # fill the case area with the marker (aligned 256-bit stores)
+    area = out_bytes(cases) - HDR_BYTES
+    body += ["  mov p2, p1", "  padda [p2], #64", f"  movxm r0, #{area // 32}", *_nops(3),
+             ".p2align 4", f".L{tag}_fill:",
+             "  vst wl1, [p2], #32", "  add r0, r0, #-1", *_nops(2),
+             f"  jnz r0, #.L{tag}_fill", *_nops(5)]
+    # restore the data registers clobbered by nothing (wl1 is marker; keep)
+    for idx, (c, off) in enumerate(zip(cases, layout(cases))):
+        f = c.fam
+        label = f".L{tag}_c{idx}"
+        data_off = off
+        tab_off = off + c.data_bytes
+        # r5 = absolute pointer for iteration 0
+        if f.kind == "st":
+            rel_ptr = data_off + c.ptr_start
+            body += ["  mov r5, p1", f"  movxm r6, #{rel_ptr}", *_nops(2), "  add r5, r5, r6"]
+        else:
+            rel_ptr = WIN_OFF + c.ptr_start
+            body += ["  mov r5, p0", f"  movxm r6, #{rel_ptr}", *_nops(2), "  add r5, r5, r6"]
+        body += [f"  movxm r7, #{c.mod_start}", f"  movxm r6, #{tab_off}", "  mov r4, p1", *_nops(2),
+                 "  add r4, r4, r6", f"  movxm r6, #{data_off}", *_nops(2), "  mov p3, r4",
+                 "  mov r4, p1", *_nops(2), "  add r4, r4, r6", *_nops(2), "  mov p4, r4",
+                 f"  movxm r0, #{c.n}", *_nops(4)]
+        body += [".p2align 4", f"{label}:"]
+        body += ["  mov p2, r5", "  mov m0, r7", "  mov dj0, r7", *_nops(NOPS)]
+        for ln in f.pre:
+            body += [f"  {ln}"]
+        if f.pre:
+            body += _nops(NOPS + 2)
+        body += [f"  {f.op.format(a=c.addr)}", *_nops(NOPS + 6)]
+        body += ["  mov r6, p2", *_nops(3), "  sub r6, r6, r5", *_nops(2),
+                 "  st r6, [p3, #0]", "  padda [p3], #4"]
+        for ln in f.dump:
+            body += [f"  {ln}"]
+        if f.kind == "ld":
+            body += [f"  padda [p4], #{REC}"]
+        body += _nops(3)
+        # movxm into a register: `add` immediates are narrow and llvm-mc truncates silently
+        total_step = c.ptr_step + (SLOT if f.kind == "st" else 0)
+        body += [f"  movxm r11, #{total_step}", f"  movxm r12, #{c.mod_step}", *_nops(2),
+                 "  add r5, r5, r11", "  add r7, r7, r12"]
+        body += ["  add r0, r0, #-1", *_nops(2), f"  jnz r0, #{label}", *_nops(5)]
+    return _frame(body)
+
+
+# -- topology -----------------------------------------------------------------
+
+def topology(name: str, cases: list[Case], out_dir: Path) -> Topology:
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    src = out_dir / f"{name}.s"
+    src.write_text(kernel_asm(cases, tag=name.replace("-", "_")))
+    return Topology(name, (Core("k", TileRef(0, 2), src, args=(
+        Buffer("in", "in", IN_BYTES, data=in_bytes()),
+        Buffer("out", "out", out_bytes(cases)))),), device="auto")
+
+
+def pack(cases: list[Case], budget: int = OUT_BUDGET) -> list[list[Case]]:
+    """Greedy packing of cases into kernels by out-buffer size."""
+    groups: list[list[Case]] = []
+    cur: list[Case] = []
+    size = HDR_BYTES
+    for c in cases:
+        if cur and size + c.total_bytes > budget:
+            groups.append(cur)
+            cur, size = [], HDR_BYTES
+        cur.append(c)
+        size += c.total_bytes
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+# -- analysis ------------------------------------------------------------------
+
+@dataclass
+class CaseResult:
+    case: Case
+    data: bytes                        # n * stride bytes
+    deltas: list[int]                  # pointer after - pointer before, per iteration (signed)
+
+    def record(self, i: int) -> bytes:
+        s = self.case.stride
+        return self.data[i * s:(i + 1) * s]
+
+
+def parse_output(cases: list[Case], blob: bytes) -> tuple[dict[str, int], list[CaseResult]]:
+    if len(blob) < out_bytes(cases):
+        raise ValueError(f"output is {len(blob)} bytes, expected {out_bytes(cases)}")
+    in_ptr, out_ptr = struct.unpack_from("<II", blob, 0)
+    if out_ptr % 64 or in_ptr % 64:
+        raise ValueError(f"buffers not 64-byte aligned: in {in_ptr:#x} out {out_ptr:#x}")
+    results = []
+    for c, off in zip(cases, layout(cases)):
+        data = blob[off:off + c.data_bytes]
+        raw = struct.unpack_from(f"<{c.n}i", blob, off + c.data_bytes)
+        results.append(CaseResult(c, data, list(raw)))
+    return {"in": in_ptr, "out": out_ptr}, results
+
+
+def store_landing(res: CaseResult) -> list[dict]:
+    """Per iteration: which slot bytes changed (offsets relative to the slot start)."""
+    rows = []
+    for i in range(res.case.n):
+        rec = res.record(i)
+        changed = [j for j, b in enumerate(rec) if b != MARKER]
+        ptr = res.case.ptr_start + i * res.case.ptr_step
+        mod = res.case.mod_start + i * res.case.mod_step
+        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0),
+                         first=changed[0] if changed else None,
+                         last=changed[-1] if changed else None,
+                         count=len(changed), data=bytes(rec[j] for j in changed),
+                         delta=res.deltas[i]))
+    return rows
+
+
+def load_landing(res: CaseResult) -> list[dict]:
+    """Per iteration: the record's leading bytes and, for raw loads, the source window offset
+    of its first byte (window byte = index mod 256, so it is the low byte of the offset)."""
+    rows = []
+    for i in range(res.case.n):
+        rec = res.record(i)
+        ptr = res.case.ptr_start + i * res.case.ptr_step
+        mod = res.case.mod_start + i * res.case.mod_step
+        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0),
+                         rec=rec, first=rec[0], delta=res.deltas[i]))
+    return rows
+
+
+def floor_to(addr: int, width: int) -> int:
+    """The natural-alignment rule under test: an access of `width` bytes at `addr` touches
+    the `width`-aligned block holding `addr` (low log2(width) address bits dropped)."""
+    return addr - addr % width
+
+
+def verify_natural(res: CaseResult) -> list[str]:
+    """Check a raw (non-converting) case against the natural-alignment rule; returns problems."""
+    c, w = res.case, res.case.fam.width
+    bad = []
+    if c.fam.kind == "st":
+        want = bytes(range(1, w + 1))
+        for row in store_landing(res):
+            at = floor_to(row["addr"], w)
+            if (row["first"], row["last"], row["count"]) != (at, at + w - 1, w) or row["data"] != want:
+                bad.append(f"i={row['i']} addr={row['addr']}: touched {row['first']}..{row['last']} "
+                           f"n={row['count']} data={row['data'].hex()}, want {at}..{at + w - 1}")
+    elif not c.fam.conv:
+        for row in load_landing(res):
+            at = floor_to(row["addr"], w)
+            want = bytes((at + k) & 0xFF for k in range(w))
+            if row["rec"][:w] != want:
+                bad.append(f"i={row['i']} addr={row['addr']}: loaded {row['rec'][:w].hex()}, want {want.hex()}")
+    for i, d in enumerate(res.deltas):
+        if c.form.startswith("pstm"):
+            want_d = c.fam.imm
+        else:
+            want_d = 0
+        if d != want_d:
+            bad.append(f"i={i}: pointer delta {d}, want {want_d} (unmasked)")
+    return bad
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("generate", help="write topology JSON + asm per kernel")
+    g.add_argument("out_dir")
+    g.add_argument("--only", nargs="*", help="family keys (default all)")
+    g.add_argument("--budget", type=int, default=OUT_BUDGET)
+    a = ap.parse_args(argv)
+    fams = [f for f in families() if not a.only or f.key in a.only]
+    groups = pack(build_cases(fams), a.budget)
+    out = Path(a.out_dir)
+    manifest = []
+    for gi, grp in enumerate(groups):
+        name = f"ldst_{gi:02d}"
+        t = topology(name, grp, out)
+        (out / f"{name}.json").write_text(json.dumps(to_dict(t), indent=2) + "\n")
+        manifest.append(dict(name=name, cases=[c.name for c in grp], out_bytes=out_bytes(grp)))
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"{len(groups)} kernel(s), {sum(len(g) for g in groups)} case(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
