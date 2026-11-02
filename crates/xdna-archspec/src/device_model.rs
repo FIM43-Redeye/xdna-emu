@@ -264,7 +264,8 @@ fn extract_constants(
     // These fields were removed from the mlir-aie Python API after the
     // LLVM 23 update. Use architecture-appropriate defaults when absent.
     // AIE2/AIE2P: max_lock_value=63 (signed 7-bit counter, aie-rt
-    // VAL_UPPER_BOUND), address_gen_granularity=32 bytes.
+    // VAL_UPPER_BOUND), address_gen_granularity=32 bits (the data bus width,
+    // AIETargetModel::getAddressGenGranularity).
     let max_lock_value = obj.get("max_lock_value").and_then(|v| v.as_u64()).unwrap_or(63) as u32;
     let address_gen_granularity =
         obj.get("address_gen_granularity").and_then(|v| v.as_u64()).unwrap_or(32) as u32;
@@ -287,6 +288,14 @@ fn extract_constants(
         mem_base_addresses.insert(dir.clone(), addr);
     }
 
+    // Cascade width from the export's `cascade` block (transcribed there from
+    // AIETargetModel::getAccumulatorCascadeSize, which the binding lacks).
+    let accumulator_cascade_bits = obj
+        .get("cascade")
+        .and_then(|c| c.get("width_bits"))
+        .and_then(|v| v.as_u64())
+        .map(|bits| bits as u32);
+
     // Architecture-appropriate defaults for fields not in the JSON.
     // min_lock_value: AIE2/AIE2P both use -64 (from aie-rt VAL_LOWER_BOUND).
     let min_lock_value = -64;
@@ -295,7 +304,7 @@ fn extract_constants(
         max_lock_value,
         min_lock_value,
         address_gen_granularity,
-        accumulator_cascade_bits: None, // populated by aie-rt extractor
+        accumulator_cascade_bits,
         mem_base_addresses,
         properties: DeviceProperties {
             uses_semaphore_locks: true, // AIE2/AIE2P both use semaphore locks
@@ -851,6 +860,15 @@ mod tests {
         assert_eq!(*shim.instances.channels.value(), 2, "shim should have 2 DMA channels (from shim_mux)");
     }
 
+    // The emulator's cascade FIFO entry type is sized by the compile-time
+    // aie2::CASCADE_WORDS; pin it to the toolchain-derived width.
+    #[test]
+    fn test_cascade_words_match_device_model_width() {
+        let model = extract_device_model(&json_path(), "npu1").expect("parse failed");
+        let bits = model.device_constants.as_ref().unwrap().accumulator_cascade_bits.unwrap();
+        assert_eq!(crate::aie2::CASCADE_WORDS * 64, bits as usize);
+    }
+
     // Test: DeviceConstants populated correctly.
     #[test]
     fn test_device_constants_from_json() {
@@ -860,7 +878,7 @@ mod tests {
         assert_eq!(constants.max_lock_value, 63);
         assert_eq!(constants.min_lock_value, -64);
         assert_eq!(constants.address_gen_granularity, 32);
-        assert_eq!(constants.accumulator_cascade_bits, None);
+        assert_eq!(constants.accumulator_cascade_bits, Some(512));
         assert_eq!(constants.mem_base_addresses.len(), 4);
         assert_eq!(constants.mem_base_addresses["south"], 262144);
         assert!(constants.properties.uses_semaphore_locks);
