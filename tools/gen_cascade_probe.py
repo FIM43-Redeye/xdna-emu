@@ -56,6 +56,7 @@ DEPTH_WORD_REGS = 12            # x0..x11 hold distinct words in the depth probe
 LOAD_NOPS = 6
 SCD_NOPS = 8                    # VMOV_CASCADE_READ latency 7, plus one
 MAX_DELAY_NOPS = 6000           # 2 bytes per nop bundle in 16 KiB of program memory
+MAX_LOOP_ITERS = 1 << 16        # mov r0, #imm range is far larger; this bounds probe run time
 JUMP_MIN_CYCLES = 100           # a stall shorter than this is not distinguishable
 
 # direction -> ((producer col, row), (consumer col, row)); the producer is the
@@ -87,6 +88,24 @@ def _timestamp_store(offset_reg: str = "p0") -> list[str]:
     """Read the cycle counter and store its low word at [p0], then advance p0."""
     return ["  mov r17:r16, cntr", "  nop", "  nop",
             f"  st r16, [{offset_reg}, #0]", f"  padda [{offset_reg}], #4"]
+
+
+def delay_loop(iters: int, label: str) -> list[str]:
+    """A counted busy loop: r0 counts `iters` down, about 10 cycles per iteration.
+
+    Silicon fetches program memory in aligned 16-byte lines and a taken branch
+    resumes at the start of the line holding its target (low 4 bits ignored), so
+    the label sits after `.p2align 4`, as the toolchain pads every jump target.
+    The counter setup precedes the alignment, outside the loop's fetch line: an
+    unaligned label with `mov r0, #N` in its line re-ran the setup forever (the
+    "jnz loop hangs cascade probes" finding of step 5).
+    """
+    if not 1 <= iters <= MAX_LOOP_ITERS:
+        raise ValueError(f"loop iterations must be 1..{MAX_LOOP_ITERS}")
+    # movxm, not mov: llvm-mc silently truncates a `mov` immediate that does not fit its
+    # 11-bit field (mov r0, #2000 assembled as -48: a near-endless loop)
+    return [f"  movxm r0, #{iters}", *_nops(2), ".p2align 4", f"{label}:",
+            "  add r0, r0, #-1", *_nops(2), f"  jnz r0, #{label}", *_nops(5)]
 
 
 def _enable(reg_name: str) -> list[str]:
@@ -157,7 +176,7 @@ def depth_consumer_out_bytes(k: int) -> int:
     return _consumer_ts_bytes(k) + k * WORD_BYTES
 
 
-def producer_depth_asm(k: int, pre_delay_nops: int = 0) -> str:
+def producer_depth_asm(k: int, pre_delay_nops: int = 0, pre_delay_iters: int = 0) -> str:
     """K back-to-back writes with a timestamp after each.
 
     `pre_delay_nops` straight-line nop bundles run before the first write, so a
@@ -170,6 +189,8 @@ def producer_depth_asm(k: int, pre_delay_nops: int = 0) -> str:
     for j in range(DEPTH_WORD_REGS):
         body += [f"  mov r1, #{depth_word_value(j)}", *_nops(2), f"  vbcst.32 x{j}, r1"]
     body += _nops(8 + pre_delay_nops)
+    if pre_delay_iters:
+        body += delay_loop(pre_delay_iters, ".Lpre")
     body += _timestamp_store()                      # t_start
     for i in range(k):
         body += [f"  vmov MCD, x{i % DEPTH_WORD_REGS}"]
@@ -177,12 +198,11 @@ def producer_depth_asm(k: int, pre_delay_nops: int = 0) -> str:
     return _frame(body)
 
 
-def consumer_depth_asm(k: int, delay_nops: int) -> str:
-    """Read K words after `delay_nops` straight-line nop bundles (one cycle each).
+def consumer_depth_asm(k: int, delay_nops: int, delay_iters: int = 0) -> str:
+    """Read K words after `delay_nops` straight-line nop bundles (one cycle each),
+    then `delay_iters` iterations of an aligned counted loop (`delay_loop`).
 
-    The delay is straight-line code, not a `jnz` loop: on silicon any cascade probe
-    with a `jnz` loop in either core hung (docs/fidelity-gaps/core-compute-timing.md),
-    while the same delay as nops runs. Program memory (16 KiB) bounds it.
+    Straight-line nops are bounded by program memory (16 KiB); the loop is not.
     """
     if not 1 <= delay_nops <= MAX_DELAY_NOPS:
         raise ValueError(f"delay_nops must be 1..{MAX_DELAY_NOPS}")
@@ -190,6 +210,8 @@ def consumer_depth_asm(k: int, delay_nops: int) -> str:
     body += ["  mov p1, p0", f"  padda [p1], #{_consumer_ts_bytes(k)}", *_nops(2)]
     body += _timestamp_store()                      # t_start
     body += _nops(delay_nops)
+    if delay_iters:
+        body += delay_loop(delay_iters, ".Ldelay")
     body += _timestamp_store()                      # t_after_delay
     for _ in range(k):
         body += ["  vmov x0, SCD", "  mov r17:r16, cntr", *_nops(SCD_NOPS),
@@ -266,11 +288,14 @@ def smoke_topology(direction: str, n_words: int, out_dir: Path, form: str = "x",
 
 
 def depth_topology(direction: str, k: int, delay_nops: int, out_dir: Path,
-                   name: str | None = None, pre_delay_nops: int = 0) -> Topology:
+                   name: str | None = None, pre_delay_nops: int = 0,
+                   delay_iters: int = 0, pre_delay_iters: int = 0) -> Topology:
     _placement(direction)
-    suffix = f"_p{pre_delay_nops}" if pre_delay_nops else ""
+    suffix = (f"_p{pre_delay_nops}" if pre_delay_nops else "") + \
+             (f"_L{delay_iters}" if delay_iters else "") + (f"_P{pre_delay_iters}" if pre_delay_iters else "")
     return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}{suffix}", direction, out_dir,
-                 producer_depth_asm(k, pre_delay_nops), consumer_depth_asm(k, delay_nops),
+                 producer_depth_asm(k, pre_delay_nops, pre_delay_iters),
+                 consumer_depth_asm(k, delay_nops, delay_iters),
                  (Buffer("ts", "out", depth_producer_out_bytes(k)),),
                  (Buffer("log", "out", depth_consumer_out_bytes(k)),))
 
@@ -292,7 +317,8 @@ def cmd_generate(args) -> int:
     for direction in PLACEMENT:
         for k in args.depth_k:
             for d in args.delays:
-                _write(depth_topology(direction, k, d, out, pre_delay_nops=args.pre), out)
+                _write(depth_topology(direction, k, d, out, pre_delay_nops=args.pre,
+                                      delay_iters=args.loop_iters, pre_delay_iters=args.pre_loop_iters), out)
     return 0
 
 
@@ -313,6 +339,9 @@ def main(argv=None) -> int:
     g.add_argument("--delays", type=int, nargs="+", default=[1500, 3000])
     g.add_argument("--pre", type=int, default=0,
                    help="producer nop bundles before the first write (forward-latency probes)")
+    g.add_argument("--loop-iters", type=int, default=0,
+                   help="consumer counted-loop iterations after the nop delay (about 10 cycles each)")
+    g.add_argument("--pre-loop-iters", type=int, default=0, help="producer counted-loop iterations before the first write")
     g.set_defaults(fn=cmd_generate)
     a = sub.add_parser("analyze", help="stalled-write analysis of a producer ts file")
     a.add_argument("ts_file")

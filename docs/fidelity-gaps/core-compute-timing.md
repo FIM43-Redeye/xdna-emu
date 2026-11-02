@@ -43,11 +43,20 @@ or a shared timebase between tiles).
 
 Probe-design findings (silicon):
 
-- **Any `jnz` loop in either core hung every cascade probe with live traffic**
-  (TDR, `state=8`; the driver recovered, the NPU kept running). The same loop
-  runs fine in a single core and in a cascade-configured pair with no traffic;
-  the same delay as straight-line nops runs. Mechanism unexplained; the probes
-  use nops (at most ~6000 cycles of delay in 16 KiB of program memory).
+- **The "jnz loop hangs cascade probes" finding was a probe bug, now explained.**
+  Silicon fetches program memory in aligned 16-byte lines and a taken
+  `jnz`/`j`/`jl` (and the `ret` return address) resumes fetch at the start of the
+  line holding the target: the low 4 bits of a branch target are ignored. The old
+  probes put `mov r0, #N` in the same line before the loop label, so it re-ran on
+  every iteration and the loop never ended (core never finished, TDR, Status 8).
+  Nothing to do with the cascade. Evidence
+  (`build/experiments/cascade-collisions/p1/`): a marker `add r5,r5,#1` at a line
+  start and the loop label at line offset R, four iterations: R=0 gives r5=1,
+  every R in 4..14 gives r5=4; `j` (fj), `jl` callee entry (fjl_entry2) and the
+  `jl` return address (fjl_ret3) truncate the same way. The emulator now matches
+  (`PendingBranch` masks targets, `FETCH_LINE_BYTES`). llvm-aie pads every jump
+  target and return address to 16 bytes (`AIEMachineAlignment.cpp`), so compiled
+  code never notices; hand-written loops need `.p2align 4` before the label.
 - A `vmov x, SCD` does not block at the vmov: the core stalls at the first
   *use* of the register (the following `vst`), so a stamp taken right after the
   vmov does not include the wait.

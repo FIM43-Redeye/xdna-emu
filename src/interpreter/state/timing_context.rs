@@ -215,9 +215,29 @@ pub struct PendingBranch {
 /// Branch delay slot count (pipeline depth, from archspec processor model).
 const BRANCH_DELAY_SLOTS: u8 = xdna_archspec::aie2::processor::BRANCH_DELAY_SLOTS;
 
+/// Instruction-fetch line size in bytes. Silicon fetches program memory in
+/// aligned lines of this size and a taken branch resumes fetch at the start of
+/// the line holding the target: the low `log2(FETCH_LINE_BYTES)` bits of a
+/// branch/call/return target are ignored.
+///
+/// Silicon evidence (Phoenix, `build/experiments/cascade-collisions/p1/`): a
+/// marker `add r5,r5,#1` at a line start, a `jnz` loop label at line offset R,
+/// four iterations: R=0 leaves r5=1, every R in 4..14 gives r5=4 (the marker
+/// re-ran on each taken branch). The same holds for `j`, the `jl` callee entry
+/// and the `jl` return address. The toolchain agrees: llvm-aie pads every jump
+/// target and return address to `getMachineBlockAlignmentBytes()` = 16
+/// (`AIE2InstrInfo.h`, `AIEMachineAlignment.cpp`), so compiled code never
+/// notices; hand-written code with an unaligned loop label does.
+pub const FETCH_LINE_BYTES: u32 = 16;
+
 /// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
 /// the branch cycle itself (before the first delay-slot instruction executes).
 const BRANCH_DELAY_INITIAL: u8 = BRANCH_DELAY_SLOTS + 1;
+
+/// Start of the fetch line containing `addr` (where silicon resumes fetch).
+pub fn fetch_line_start(addr: u32) -> u32 {
+    addr & !(FETCH_LINE_BYTES - 1)
+}
 
 impl PendingBranch {
     /// Create a new pending branch with BRANCH_DELAY_SLOTS delay slots.
@@ -225,6 +245,7 @@ impl PendingBranch {
     /// Uses initial count of BRANCH_DELAY_INITIAL because tick() is called
     /// on the branch cycle.
     pub fn new(target: u32) -> Self {
+        let target = fetch_line_start(target);
         Self { target, delay_slots: BRANCH_DELAY_INITIAL, is_call: false }
     }
 
@@ -232,6 +253,7 @@ impl PendingBranch {
     ///
     /// When delay slots are exhausted, the caller should set LR = current PC.
     pub fn new_call(target: u32) -> Self {
+        let target = fetch_line_start(target);
         Self { target, delay_slots: BRANCH_DELAY_INITIAL, is_call: true }
     }
 
@@ -305,6 +327,17 @@ impl SrsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_target_resumes_at_fetch_line_start() {
+        // Silicon: a taken branch to a non-16-byte-aligned target fetches from
+        // the start of its line (cascade-collisions p1/e*, fj, fjl_*).
+        for off in 0..16u32 {
+            assert_eq!(PendingBranch::new(0xB0 + off).target, 0xB0, "jnz/j offset {off}");
+            assert_eq!(PendingBranch::new_call(0xB0 + off).target, 0xB0, "jl offset {off}");
+        }
+        assert_eq!(PendingBranch::new(0xC0).target, 0xC0);
+    }
 
     #[test]
     fn test_timing_context_reset() {

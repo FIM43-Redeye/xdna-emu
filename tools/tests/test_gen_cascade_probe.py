@@ -59,7 +59,7 @@ def test_depth_consumer_reads_and_delay():
     text = g.consumer_depth_asm(6, 123)
     assert count(text, ", SCD") == 6
     assert count(text, "nop") >= 123
-    assert count(text, "jnz") == 0          # silicon hangs on jnz loops in cascade probes
+    assert count(text, "jnz") == 0          # nop delay only unless delay_iters is given
     with pytest.raises(ValueError):
         g.consumer_depth_asm(6, g.MAX_DELAY_NOPS + 1)
 
@@ -184,3 +184,40 @@ def test_producer_pre_delay_adds_nops_before_first_write():
     assert delayed.splitlines()[:first_write].count("  nop") >= 500
     with pytest.raises(ValueError):
         g.producer_depth_asm(4, pre_delay_nops=g.MAX_DELAY_NOPS + 1)
+
+
+def test_delay_loop_label_is_16_byte_aligned_and_setup_precedes_alignment():
+    # silicon resumes a taken branch at the start of the target's 16-byte fetch line
+    lines = g.delay_loop(50, ".Lx")
+    assert lines.index(".p2align 4") + 1 == lines.index(".Lx:")
+    assert lines.index("  movxm r0, #50") < lines.index(".p2align 4")
+    with pytest.raises(ValueError):
+        g.delay_loop(0, ".Lx")
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("text", [g.consumer_depth_asm(4, 10, delay_iters=300),
+                                  g.producer_depth_asm(4, 10, pre_delay_iters=300)])
+def test_loop_delay_asm_assembles_with_aligned_label(text, tmp_path):
+    s = tmp_path / "k.s"
+    s.write_text(text)
+    o = tmp_path / "k.o"
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(o), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    dump = subprocess.run([_peano_tool("llvm-objdump"), "-d", str(o)], capture_output=True, text=True).stdout
+    addr = [int(l.split()[0], 16) for l in dump.splitlines() if l.strip().endswith((">:",)) and ".L" in l]
+    assert addr and all(a % 16 == 0 for a in addr)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+def test_delay_loop_counter_survives_assembly(tmp_path):
+    # `mov r0, #2000` would assemble silently truncated; the counter must be exact
+    s = tmp_path / "k.s"
+    s.write_text(".text\n" + "\n".join(g.delay_loop(2000, ".Lx")) + "\n")
+    o = tmp_path / "k.o"
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(o), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    dump = subprocess.run([_peano_tool("llvm-objdump"), "-d", str(o)], capture_output=True, text=True).stdout
+    assert "#0x7d0" in dump
