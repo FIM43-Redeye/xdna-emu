@@ -3770,7 +3770,7 @@ def generate_conversion_ll(test_points: list[dict]) -> tuple[str, list[tuple[int
 # Branch test generation via LLVM IR
 # ---------------------------------------------------------------------------
 
-def generate_branch_ll() -> tuple[str, list[dict]]:
+def generate_branch_ll() -> tuple[str, list[dict], int, int]:
     """Generate LLVM IR (.ll) for branch instruction tests.
 
     AIE2 branch instructions (j, jl, jnz, jz, jnzd, ret) use absolute byte

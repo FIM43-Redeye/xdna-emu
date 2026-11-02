@@ -399,11 +399,12 @@ class TestClassifyInstruction:
         status, _ = classify_instruction(instr)
         assert status == "skipped"
 
-    def test_hardware_counter_testable(self):
-        """MOV_CNTR reads hardware cycle counter into register pair -- testable.
+    def test_hardware_counter_skipped(self):
+        """MOV_CNTR reads the hardware cycle counter -- skipped.
 
-        The counter is always running on an active core.  Output is a 64-bit
-        cycle count in a register pair (register+16, bw=3 -> eL class).
+        The count varies run to run with DMA/lock handshake timing (confirmed
+        nondeterministic across 10 NPU runs), so it cannot be a golden test.
+        classify_instruction skips it by name on purpose.
         """
         instr = _make_instr("MOV_CNTR", "mov", "mov\t$dst, cntr", [
             {
@@ -417,7 +418,8 @@ class TestClassifyInstruction:
             },
         ])
         status, reason = classify_instruction(instr)
-        assert status == "testable", f"Expected testable, got {status}: {reason}"
+        assert status == "skipped", f"Expected skipped, got {status}: {reason}"
+        assert "nondeterministic" in reason
 
     def test_imm_only_skipped(self):
         """Instructions with only immediate operands (no register output)."""
@@ -772,7 +774,9 @@ class TestRegisterNames:
                                operand_type="register+16",
                                instr_name="VGE_D8")
         assert ":" in names[0]
-        assert names[0] == "r19:r18"  # r17:r16 avoided (r16 callee-saved)
+        # l0-l3 (r17:r16 .. r23:r22) are callee-saved per the AIE2 ABI, so
+        # the generator offers only the caller-saved pairs l4-l7.
+        assert names == ["r25:r24", "r27:r26", "r29:r28", "r31:r30"]
 
     def test_wide_y_returns_y_registers(self):
         """wide_y kind maps to y2-y5 (eYs 1024-bit wide vector class)."""
@@ -782,7 +786,10 @@ class TestRegisterNames:
     def test_sparse_qx_returns_qx_registers(self):
         """sparse_qx kind maps to qx0-qx3 (mQQXw sparse composite class)."""
         names = register_names("sparse_qx")
-        assert names == ["qx0", "qx1", "qx2", "qx3"]
+        # qx0={x0,q0} aliases the default vector512 operand (x0), so the
+        # baseline combo would read identical A and B data; qx0 goes last.
+        assert names == ["qx1", "qx2", "qx3", "qx0"]
+        assert sorted(names) == ["qx0", "qx1", "qx2", "qx3"]
 
     def test_result_latency_scalar_alu(self):
         """Scalar ALU gets MIN_RESULT_LATENCY floor (model says 1)."""
@@ -1351,22 +1358,6 @@ class TestGenerateOperandCombos:
 # ComputeStrategy tests
 # ===================================================================
 
-class TestPostModifyDetection:
-    """Tests for _is_postmodify_immediate."""
-
-    def test_postmodify_detected(self):
-        assert isa_test_gen._is_postmodify_immediate(
-            "lda.u8\t$mRa, [$ptr], $imm", "imm")
-
-    def test_offset_not_postmodify(self):
-        assert not isa_test_gen._is_postmodify_immediate(
-            "lda.s16\t$mRa, [$ptr, $imm]", "imm")
-
-    def test_no_match_different_name(self):
-        assert not isa_test_gen._is_postmodify_immediate(
-            "lda.u8\t$mRa, [$ptr], $imm", "off")
-
-
 class TestComputeStrategy:
     """Tests for ComputeStrategy (refactored from existing logic)."""
 
@@ -1508,8 +1499,8 @@ class TestLoadStrategy:
         assert "vlda.128" in asm
         assert "vst" in asm
 
-    def test_postmodify_preserves_immediate(self):
-        """Post-modify load must preserve the combo-specified immediate."""
+    def test_postmodify_immediate_zeroed(self):
+        """Post-modify load zeroes the combo immediate like every other immediate."""
         instr = _make_instr("LDA_U8_ag_pstm_nrm_imm", "lda.u8",
                             "lda.u8\t$mRa, [$ptr], $imm", [
             _make_reg_op("mRa", "scalar"),
@@ -1520,9 +1511,11 @@ class TestLoadStrategy:
         regs = {"mRa": "r0", "ptr": "p2", "imm": "-8"}
         asm = strategy.generate_test_point(instr, regs,
                                            in_offset=0, out_offset=0)
-        # Post-modify immediate should NOT be zeroed.
-        assert "], #-8" in asm or "], -8" in asm, \
-            f"Post-modify immediate should be preserved, got:\n{asm}"
+        # All immediates are zeroed, post-modify included: a non-zero
+        # post-modify step let the pointer escape to wild addresses.
+        assert "], #0" in asm or "], 0" in asm, \
+            f"Post-modify immediate should be zeroed, got:\n{asm}"
+        assert "-8" not in asm
 
     def test_offset_immediate_zeroed(self):
         """Basic address offset immediate should be zeroed."""
@@ -1610,8 +1603,8 @@ class TestStoreStrategy:
         assert "vlda" in asm
         assert "vst.128" in asm
 
-    def test_postmodify_preserves_immediate(self):
-        """Post-modify store must preserve the combo-specified immediate."""
+    def test_postmodify_immediate_zeroed(self):
+        """Post-modify store zeroes the combo immediate like every other immediate."""
         instr = _make_instr("ST_S16_ag_pstm_nrm_imm", "st.s16",
                             "st.s16\t$mRv, [$ptr], $imm", [
             _make_reg_op("mRv", "scalar"),
@@ -1622,8 +1615,9 @@ class TestStoreStrategy:
         regs = {"mRv": "r0", "ptr": "p7", "imm": "-4"}
         asm = strategy.generate_test_point(instr, regs,
                                            in_offset=0, out_offset=0)
-        assert "], #-4" in asm or "], -4" in asm, \
-            f"Post-modify immediate should be preserved, got:\n{asm}"
+        assert "], #0" in asm or "], 0" in asm, \
+            f"Post-modify immediate should be zeroed, got:\n{asm}"
+        assert "-4" not in asm
 
     def test_store_width_s8(self):
         instr = _make_instr("ST_S8", "st.s8",
@@ -1722,15 +1716,22 @@ class TestSpRelative:
 
     # --- LoadStrategy with SP-relative ---
 
-    def test_sp_load_can_test(self):
-        """SP-relative load should be accepted by LoadStrategy."""
+    # SP-relative spills are deferred in can_test (the paddb step=32,
+    # negative-only alignment constraints make the SP adjustment sequences
+    # fragile), so every strategy-level acceptance below is now a rejection.
+    # generate_test_point keeps the stack-scratch sequences ready for when
+    # the deferral is lifted.
+
+    def test_sp_load_deferred(self):
+        """SP-relative load is deferred by LoadStrategy."""
         instr = self._make_sp_load()
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected can_test=True for SP load: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_sp_load_with_testable_composite_accepted(self):
-        """SP-relative load with LdaScl composite destination is now testable."""
+    def test_sp_load_with_testable_composite_deferred(self):
+        """SP-relative load with LdaScl composite destination is deferred."""
         instr = _make_instr("LDA_dms_spill", "lda",
                             "lda\t$mLdaScl, [sp, $imm]", [
             _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
@@ -1738,10 +1739,11 @@ class TestSpRelative:
         ], may_load=True, slot="lda")
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"SP+LdaScl should be testable, got: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_sp_load_with_bw2_accumulator_accepted(self):
-        """SP-relative load with bw=2 accumulator is now testable.
+    def test_sp_load_with_bw2_accumulator_deferred(self):
+        """SP-relative load with bw=2 accumulator is deferred.
 
         LDA_dmv_lda_q_ag_spill: accumulator bw=2 is the quad register class
         (q0-q3, mQQa in TableGen) which uses the scalar 'lda' slot and IS
@@ -1762,7 +1764,8 @@ class TestSpRelative:
         ], may_load=True, slot="lda")
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"DMV_Q quad load (bw=2 acc) should be testable, got: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
     def test_sp_load_generates_assembly_with_sp_init(self):
         """SP-relative load should set up SP (p6) to point at input data."""
@@ -1796,15 +1799,16 @@ class TestSpRelative:
 
     # --- StoreStrategy with SP-relative ---
 
-    def test_sp_store_can_test(self):
-        """SP-relative store should be accepted by StoreStrategy."""
+    def test_sp_store_deferred(self):
+        """SP-relative store is deferred by StoreStrategy."""
         instr = self._make_sp_store()
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected can_test=True for SP store: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_sp_store_with_ldascl_composite_accepted(self):
-        """SP-relative store with LdaScl composite source is now testable.
+    def test_sp_store_with_ldascl_composite_deferred(self):
+        """SP-relative store with LdaScl composite source is deferred.
 
         ST_dms_spill uses mSclSt (kind="LdaScl") which is mapped to scalar
         in TESTABLE_COMPOSITE_KINDS.  The test harness treats it as a plain
@@ -1817,10 +1821,11 @@ class TestSpRelative:
         ], may_store=True, slot="st")
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"ST_dms_spill with LdaScl should be testable, got: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
     def test_sp_store_generates_assembly_with_sp_init(self):
-        """SP-relative store should set up SP (p6) to point at output buffer."""
+        """SP-relative store runs against the stack scratch, then copies out to p1."""
         instr = self._make_sp_store()
         strategy = isa_test_gen.StoreStrategy()
         regs = {"src": "wl0", "imm": "0"}
@@ -1828,16 +1833,17 @@ class TestSpRelative:
                                            in_offset=0, out_offset=0)
         # Should load source data from p0.
         assert "p0" in asm
-        # SP is p6: the setup sequence should initialize p6 from p1 (output).
-        assert "mov p6, p1" in asm, \
-            f"Expected SP (p6) initialization from p1:\n{asm}"
-        # The store instruction itself.
-        assert "vst" in asm
-        # Should use [sp, ...] syntax.
-        assert "[sp," in asm
-        # Immediate should be zeroed (data is at sp).
-        assert "[sp, #0]" in asm or "[sp, 0]" in asm, \
-            f"Expected zeroed immediate in SP-relative store:\n{asm}"
+        # The spill store lands in the stack scratch area: SP is rebuilt
+        # from the saved SP (r8), lowered with paddb, then restored.
+        assert "mov sp, r8" in asm
+        assert "paddb [sp]," in asm
+        assert asm.rstrip().splitlines()[-1].strip() == "mov sp, r8"
+        # The store instruction itself, addressed through [sp, ...].
+        assert "vst\twl0, [sp, #" in asm
+        # The result is read back from scratch and stored to the output
+        # buffer (p1), not written to p1 directly by the spill store.
+        assert "vlda wl0, [sp, #0]" in asm
+        assert "vst wl0, [p1, #0]" in asm
 
     def test_sp_store_does_not_use_p7(self):
         """SP-relative store should NOT set up p7 (not used for SP stores)."""
@@ -1904,58 +1910,65 @@ class TestSpRelative:
                         return i
         return None
 
-    def test_vlda_w_spill_testable(self, isa_data):
-        """VLDA_dmw_lda_w_ag_spill must be testable via LoadStrategy."""
+    def test_vlda_w_spill_deferred(self, isa_data):
+        """VLDA_dmw_lda_w_ag_spill: SP-relative spills are deferred (paddb constraints)."""
         instr = self._find_instr(isa_data, "VLDA_dmw_lda_w_ag_spill")
         assert instr is not None
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected testable: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_vst_w_spill_testable(self, isa_data):
-        """VST_dmw_sts_w_ag_spill must be testable via StoreStrategy."""
+    def test_vst_w_spill_deferred(self, isa_data):
+        """VST_dmw_sts_w_ag_spill: SP-relative spills are deferred (paddb constraints)."""
         instr = self._find_instr(isa_data, "VST_dmw_sts_w_ag_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected testable: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
     def test_vst_am_spill_blocked_by_llvm_bug(self, isa_data):
-        """VST_dmw_sts_am_ag_spill is blocked by llvm-mc encoder bug.
+        """VST_dmw_sts_am_ag_spill stays unavailable.
 
-        The SP-relative am-class spill store crashes llvm-mc because the
-        encoder expects step=32 but the immediate field has scale=1.
+        The SP-relative am-class spill store crashes llvm-mc (the encoder
+        expects step=32 but the immediate field has scale=1).  It is now
+        rejected with every other SP-relative spill, before the encoder is
+        ever reached.
         """
         instr = self._find_instr(isa_data, "VST_dmw_sts_am_ag_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
         assert not can
-        assert "llvm-mc" in reason.lower() or "bug" in reason.lower()
+        assert "SP-relative spill" in reason
 
-    def test_vst_128_spill_testable(self, isa_data):
-        """VST_128_ag_spill must be testable via StoreStrategy."""
+    def test_vst_128_spill_deferred(self, isa_data):
+        """VST_128_ag_spill: SP-relative spills are deferred (paddb constraints)."""
         instr = self._find_instr(isa_data, "VST_128_ag_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected testable: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_lda_dms_spill_now_testable(self, isa_data):
-        """LDA_dms_spill: LdaScl composite is now in TESTABLE_COMPOSITE_KINDS."""
+    def test_lda_dms_spill_deferred(self, isa_data):
+        """LDA_dms_spill: SP-relative spills are deferred (paddb constraints)."""
         instr = self._find_instr(isa_data, "LDA_dms_spill")
         assert instr is not None
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"LDA_dms_spill should be testable now: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
-    def test_st_dms_spill_now_testable(self, isa_data):
-        """ST_dms_spill: LdaScl composite is now in TESTABLE_COMPOSITE_KINDS."""
+    def test_st_dms_spill_deferred(self, isa_data):
+        """ST_dms_spill: SP-relative spills are deferred (paddb constraints)."""
         instr = self._find_instr(isa_data, "ST_dms_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"ST_dms_spill should be testable now: {reason}"
+        assert not can
+        assert "SP-relative spill" in reason
 
     def test_lda_dms_idx_imm_testable(self, isa_data):
         """LDA_dms_lda_idx_imm (DMS scalar load, mLdaScl dest) must be testable."""
@@ -2035,20 +2048,29 @@ class TestBranchStrategy:
             _make_imm_op("cpmaddr", bit_width=20, signed=False),
         ], slot="lng")
 
-    def test_jnz_can_test(self):
+    def test_jnz_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_jnz())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
-    def test_jz_can_test(self):
+    def test_jz_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_jz())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
-    def test_j_immediate_can_test(self):
+    def test_j_immediate_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_j())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
     def _make_j_ind(self):
         return _make_instr("J_jump_ind", "j", "j\t$mPm", [
@@ -2070,29 +2092,37 @@ class TestBranchStrategy:
             _make_reg_op("mPm", "pointer"),
         ], slot="alu")
 
-    def test_j_register_indirect_can_test(self):
-        """Register-indirect j $mPm should now be testable."""
+    def test_j_register_indirect_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_j_ind())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
-    def test_jl_register_indirect_can_test(self):
-        """Register-indirect jl $mPm should now be testable."""
+    def test_jl_register_indirect_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_jl_ind())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
-    def test_ret_can_test(self):
-        """ret lr should now be testable."""
+    def test_ret_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_ret())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
-    def test_jnzd_can_test(self):
-        """jnzd should now be testable."""
+    def test_jnzd_rejected_in_assembly(self):
+        # Branch targets are absolute, so they are unrelocatable in
+        # hand-written assembly; they are covered by the .ll batch instead.
         strategy = isa_test_gen.BranchStrategy()
         can, reason = strategy.can_test(self._make_jnzd())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert ".ll" in reason
 
     def test_ret_generates_lr_setup(self):
         """ret should set LR to the taken target IW address."""
@@ -2682,11 +2712,15 @@ class TestCascadeStrategy:
             {"name": "dst", "bit_width": 4, "operand_type": "unknown"},
         ], slot="lda")
 
-    def test_mcd_write_can_test(self):
-        """Cascade write should be testable (MCD FIFO depth 4)."""
+    def test_mcd_write_rejected(self):
+        """Cascade write is rejected: it stalls with no downstream consumer.
+
+        Confirmed on real NPU (batch_62 hang); needs the multi-tile harness.
+        """
         strategy = isa_test_gen.CascadeStrategy()
         can, reason = strategy.can_test(self._make_mcd_write())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert "cascade write" in reason
 
     def test_scd_read_rejected(self):
         """Cascade read should be rejected (stalls without neighboring tile)."""
@@ -3825,7 +3859,7 @@ class TestConversionLLGeneration:
         test_points = []
         for mnemonic, info in list(table.items())[:1]:
             test_points.append({"mnemonic": mnemonic, **info})
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert 'target triple = "aie2"' in ll
 
     def test_has_test_kernel(self):
@@ -3834,42 +3868,42 @@ class TestConversionLLGeneration:
         test_points = []
         for mnemonic, info in list(table.items())[:1]:
             test_points.append({"mnemonic": mnemonic, **info})
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "define void @test_kernel(ptr %in, ptr %out)" in ll
 
     def test_ups_generates_intrinsic_call(self):
         """UPS test point should call the ups intrinsic."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
         test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "@llvm.aie2.acc32.v16.I256.ups" in ll
 
     def test_srs_generates_intrinsic_call(self):
         """SRS test point should call the srs intrinsic."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vst.srs.s16.s32"]
         test_points = [{"mnemonic": "vst.srs.s16.s32", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "@llvm.aie2.I256.v16.acc32.srs" in ll
 
     def test_pack_generates_intrinsic_call(self):
         """PACK test point should call the pack intrinsic."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vst.pack.s8.s16"]
         test_points = [{"mnemonic": "vst.pack.s8.s16", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "@llvm.aie2.pack.I8.I16" in ll
 
     def test_unpack_generates_intrinsic_call(self):
         """UNPACK test point should call the unpack intrinsic."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vldb.unpack.s16.s8"]
         test_points = [{"mnemonic": "vldb.unpack.s16.s8", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "@llvm.aie2.unpack.I16.I8" in ll
 
     def test_uses_volatile_loads_stores(self):
         """Must use volatile to prevent optimization."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
         test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "load volatile" in ll
         assert "store volatile" in ll
 
@@ -3879,14 +3913,14 @@ class TestConversionLLGeneration:
         # Use two test points to verify the second has a non-zero offset.
         items = list(table.items())[:2]
         test_points = [{"mnemonic": m, **info} for m, info in items]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "getelementptr i8" in ll
 
     def test_all_24_conversions_generate(self):
         """All 24 conversion mnemonics should produce valid IR."""
         table = isa_test_gen.CONVERSION_INTRINSICS
         test_points = [{"mnemonic": m, **info} for m, info in table.items()]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         # Should have one load per test point at minimum.
         assert ll.count("load volatile") >= 24
 
@@ -3894,7 +3928,7 @@ class TestConversionLLGeneration:
         """All intrinsics used must be declared."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
         test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
-        ll = isa_test_gen.generate_conversion_ll(test_points)
+        ll, _sizes = isa_test_gen.generate_conversion_ll(test_points)
         assert "declare" in ll
         assert "@llvm.aie2.acc32.v16.I256.ups" in ll
 
@@ -4102,12 +4136,21 @@ class TestGenerateAllWithConversions:
             assert os.path.exists(ll_path), f"Missing {batch['filename']}"
 
     def test_conversion_batch_has_26_tests(self, isa_json_path, out_dir):
-        """Conversion batch should have 26 test points (ups+srs+pack+unpack+bf16)."""
+        """Conversion .ll batch has one test point per CONVERSION_INTRINSICS entry.
+
+        Branches are tested through a separate .ll batch (they cannot be
+        relocated in hand-written assembly), so the llvm_ir total is
+        conversions plus branch test points.
+        """
         manifest = generate_all(isa_json_path, out_dir)
         ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
+        conv_tests = sum(
+            1 for b in ll_batches for t in b["tests"] if t["slot"] == "conversion")
+        assert conv_tests == len(isa_test_gen.CONVERSION_INTRINSICS) == 26, \
+            f"Expected 26 conversion test points, got {conv_tests}"
+        _, branch_points, _, _ = isa_test_gen.generate_branch_ll()
         total_ll_tests = sum(b["test_count"] for b in ll_batches)
-        assert total_ll_tests == 26, \
-            f"Expected 26 conversion test points, got {total_ll_tests}"
+        assert total_ll_tests == conv_tests + len(branch_points)
 
     def test_conversion_testable_counted(self, isa_json_path, out_dir):
         """Conversion instructions should be counted as testable, not skipped."""
