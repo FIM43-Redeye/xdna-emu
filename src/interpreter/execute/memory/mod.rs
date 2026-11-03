@@ -105,6 +105,16 @@ pub(crate) fn lut_lane_address(v: u32, lane: usize, align_mask: u32) -> u32 {
     (v & !31) | (((v & 31) & align_mask) >> 1) | if lane % 2 == 1 { 0x10 } else { 0 }
 }
 
+/// The ring line a `vldb.sparse.*` fetch writes, from the 32-byte aligned `block` holding
+/// `addr`: the block rotated to start at `addr` rounded down to a word; bytes past the block end
+/// wrap to its start. Silicon (`sparse_{4,8,16}.plain` in build/experiments/ldst-align, 64
+/// byte-granular pointers each): the records at addresses 0..3 of a word are equal, and a stream
+/// starting at +12 of a block continues `.. 9f 80 81 ..` where the block spans 80..9f.
+pub(crate) fn sparse_fetch_line(block: &[u8; 32], addr: u32) -> [u8; 32] {
+    let start = (addr & !3) as usize % 32;
+    std::array::from_fn(|k| block[(start + k) % 32])
+}
+
 impl MemoryUnit {
     /// Execute a memory operation.
     ///
@@ -786,13 +796,18 @@ impl MemoryUnit {
         let dp = ctx.scalar_read(DP_REG_INDEX);
 
         // The line this op writes into the ring, read at issue (a dropped fetch reads nothing).
+        // Silicon fetches the 32-byte block holding the pointer and rotates it to start at the
+        // pointer rounded down to a word: bytes past the block end wrap to its start
+        // (`sparse_*.plain` probes in build/experiments/ldst-align).
         let mut line = [0u8; LINE_BYTES];
         let mut load_line = |ctx: &ExecutionContext, neighbors, view| {
             let _ = ctx;
-            let words = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            let words = Self::read_vector_from_memory(tile, addr & !(LINE_BYTES as u32 - 1), neighbors, view);
+            let mut block = [0u8; LINE_BYTES];
             for (i, w) in words.iter().enumerate() {
-                line[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+                block[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
             }
+            line = sparse_fetch_line(&block, addr);
             line
         };
 
@@ -3769,5 +3784,18 @@ mod tests {
         assert_eq!(tile.read_data_u32(0xB3C), Some(4));
         assert_eq!(tile.read_data_u32(0xB40), Some(0xEEEE_EEEE));
         assert_eq!(tile.read_data_u32(0xB4C), Some(0xEEEE_EEEE));
+    }
+
+    #[test]
+    fn a_sparse_fetch_rotates_the_aligned_block_to_the_word_below_the_pointer() {
+        let block: [u8; 32] = std::array::from_fn(|k| 0x80 + k as u8);
+        // pointer offsets 0..3 of a word give the same line (silicon: records equal)
+        for off in 0..4u32 {
+            assert_eq!(sparse_fetch_line(&block, 0x4180 + off), block);
+        }
+        // +12: starts at 0x8c, wraps from 0x9f to 0x80 (silicon sparse_8 i=12)
+        let line = sparse_fetch_line(&block, 0x418c);
+        assert_eq!(&line[..2], &[0x8c, 0x8d]);
+        assert_eq!(&line[19..22], &[0x9f, 0x80, 0x81]);
     }
 }
