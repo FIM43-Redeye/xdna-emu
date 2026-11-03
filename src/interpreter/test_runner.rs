@@ -2083,32 +2083,21 @@ mod tests {
         }
         eprintln!("Pushed {} words to source tile stream output", test_values.len());
 
-        // Step 2: Run data movement cycles to route the data
+        // Step 2: Run data movement cycles to route the data. The destination core reads each
+        // word as it arrives (its input buffer is finite, as on silicon: a core that does not
+        // read backpressures the stream).
         let mut cycles = 0;
-        let max_cycles = 20;
-        while cycles < max_cycles {
-            let (_, moved, routed) = array.step_data_movement(&mut host_memory);
+        let max_cycles = 40;
+        let mut received: Vec<u32> = Vec::new();
+        while cycles < max_cycles && received.len() < test_values.len() {
+            let (_, _, routed) = array.step_data_movement(&mut host_memory);
             if routed > 0 {
                 eprintln!("Cycle {}: routed {} words", cycles, routed);
             }
             cycles += 1;
-
-            // Check if destination has received all data
-            let dst_tile = array.tile(dst_col, dst_row);
-            if dst_tile.stream_input_len(0) >= test_values.len() {
-                break;
+            while let Some(value) = array.tile_mut(dst_col, dst_row).pop_stream_input(0) {
+                received.push(value);
             }
-            if !moved && routed == 0 {
-                // No progress, might be done or stuck
-                break;
-            }
-        }
-
-        // Step 3: Read data from destination tile's stream input (simulates StreamReadScalar)
-        let dst_tile = array.tile_mut(dst_col, dst_row);
-        let mut received: Vec<u32> = Vec::new();
-        while let Some(value) = dst_tile.pop_stream_input(0) {
-            received.push(value);
         }
 
         eprintln!("Received {} words at destination after {} cycles", received.len(), cycles);
@@ -2149,13 +2138,13 @@ mod tests {
         for &(word, tlast) in &beats {
             array.tile_mut(1, 2).push_stream_output_beat(0, word, tlast);
         }
-        for _ in 0..40 {
-            array.step_data_movement(&mut host_memory);
-        }
-        let dst = array.tile_mut(1, 3);
+        // the destination core reads as the words arrive: its input buffer is finite
         let mut received = Vec::new();
-        while let Some(beat) = dst.pop_stream_input_beat(0) {
-            received.push(beat);
+        for _ in 0..60 {
+            array.step_data_movement(&mut host_memory);
+            while let Some(beat) = array.tile_mut(1, 3).pop_stream_input_beat(0) {
+                received.push(beat);
+            }
         }
         assert_eq!(received, beats);
     }

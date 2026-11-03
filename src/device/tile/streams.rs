@@ -19,6 +19,14 @@ pub const CASCADE_OUTPUT_DEPTH: usize = 1;
 /// Consumer-side (SCD) share of [`CASCADE_TOTAL_DEPTH`]; unpinned split.
 pub const CASCADE_INPUT_DEPTH: usize = CASCADE_TOTAL_DEPTH - CASCADE_OUTPUT_DEPTH;
 
+/// Words the core's stream input buffer holds before the Core master port is backpressured: 1.
+/// AM020 ch.2:143 gives the core's AXI4-Stream interface no FIFO, so this is only the hand-off
+/// register between the switch and the `mov r, SS` read; the buffering of the path is the Core
+/// master port's own 2-deep FIFO (ch.2:82). Without a bound the buffer absorbed any number of
+/// words and a held consumer never backpressured its producer (silicon: 18 words between two
+/// cores one tile apart, `tools/gen_stream_absorb_probe.py`).
+pub const CORE_STREAM_INPUT_DEPTH: usize = 1;
+
 impl Tile {
     // === Stream Port Access (for core direct stream reads/writes) ===
 
@@ -51,6 +59,11 @@ impl Tile {
         } else {
             None
         }
+    }
+
+    /// Whether the core's stream input buffer for `port` can take another beat.
+    pub fn stream_input_has_room(&self, port: u8) -> bool {
+        self.stream_input_len(port) < CORE_STREAM_INPUT_DEPTH
     }
 
     /// Check if stream input has data for a port.

@@ -59,6 +59,9 @@ class CoreStream:
     dst: str
     src_port: int = 0
     dst_port: int = 0
+    # Route through the source tile's stream-switch FIFO 0 (AM020 ch.2:74): the flow is
+    # `src Core:src_port -> src FIFO:0` and `src FIFO:0 -> dst Core:dst_port`.
+    via_fifo: bool = False
 
 
 Link = Cascade | CoreStream
@@ -101,6 +104,8 @@ def to_dict(t: Topology) -> dict[str, Any]:
         d: dict[str, Any] = {"kind": kind, "src": l.src, "dst": l.dst}
         if isinstance(l, CoreStream):
             d.update(src_port=l.src_port, dst_port=l.dst_port)
+            if l.via_fifo:
+                d["via_fifo"] = True
         return d
 
     return {"name": t.name, "device": t.device,
@@ -155,8 +160,9 @@ def topology_from_dict(d: dict[str, Any]) -> Topology:
         if isinstance(l, dict) and l["kind"] == "cascade":
             l = _fields(l, {"kind", "src", "dst"}, set(), where)
             return Cascade(l["src"], l["dst"])
-        l = _fields(l, {"kind", "src", "dst"}, {"src_port", "dst_port"}, where)
-        return CoreStream(l["src"], l["dst"], l.get("src_port", 0), l.get("dst_port", 0))
+        l = _fields(l, {"kind", "src", "dst"}, {"src_port", "dst_port", "via_fifo"}, where)
+        return CoreStream(l["src"], l["dst"], l.get("src_port", 0), l.get("dst_port", 0),
+                          bool(l.get("via_fifo", False)))
 
     return Topology(
         name=d["name"],

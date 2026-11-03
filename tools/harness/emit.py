@@ -241,6 +241,11 @@ def _emit_links(out: list[str], topology: Topology, ph: Phase,
         s, d = by_name[link.src].tile, by_name[link.dst].tile
         if isinstance(link, Cascade):
             lines.append(f"    aie.cascade_flow(%tile_{s.col}_{s.row}, %tile_{d.col}_{d.row})")
+        elif isinstance(link, CoreStream) and link.via_fifo:
+            lines.append(f"    aie.flow(%tile_{s.col}_{s.row}, Core : {link.src_port}, "
+                         f"%tile_{s.col}_{s.row}, FIFO : 0)")
+            lines.append(f"    aie.flow(%tile_{s.col}_{s.row}, FIFO : 0, "
+                         f"%tile_{d.col}_{d.row}, Core : {link.dst_port})")
         elif isinstance(link, CoreStream):
             lines.append(f"    aie.flow(%tile_{s.col}_{s.row}, Core : {link.src_port}, "
                          f"%tile_{d.col}_{d.row}, Core : {link.dst_port})")

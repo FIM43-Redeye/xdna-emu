@@ -486,6 +486,12 @@ impl TileArray {
                 continue;
             }
 
+            // The core's input buffer is finite: a core that is not reading holds the word in
+            // the master port, which backpressures the switch (and so the producer).
+            if !self.tiles[i].stream_input_has_room(0) {
+                continue;
+            }
+
             // Verify it's a Core port
             if !matches!(self.tiles[i].stream_switch.masters[0].port_type, PortType::Core) {
                 continue;
@@ -676,6 +682,10 @@ impl TileArray {
     /// When a core executes StreamWriteScalar or StreamWritePacketHeader,
     /// data is pushed to tile.stream_output. This routes that data to
     /// the Core slave port (port 0) on the tile's StreamSwitch.
+    ///
+    /// A beat leaves the core's output buffer only when its slave port can take it. The
+    /// buffer then fills and the core stalls on `STREAM_FIFO_DEPTH`; popping first and
+    /// pushing second silently dropped every beat that met a full slave port.
     fn route_core_to_tile_switches(&mut self) -> usize {
         let mut words_routed = 0;
 
@@ -683,40 +693,27 @@ impl TileArray {
             if !self.tile_present[i] {
                 continue;
             }
-            // Core stream output goes to slave port 0 (Core port)
-            // The stream switch then routes it based on configured local routes
+            // Core stream output goes to slave port 0 (Core port); other ports map to the
+            // slave of the same index.  The stream switch then routes it by its local routes.
             for port in 0..8u8 {
-                while let Some((data, tlast)) = self.tiles[i].pop_stream_output_beat(port) {
-                    // For core-initiated streams, use the Core slave port (port 0)
-                    // The actual destination is determined by local routes
-                    if port == 0 {
-                        // Direct core output goes to Core slave port
-                        if self.tiles[i].stream_switch.slaves[0].push_with_tlast(data, tlast) {
-                            words_routed += 1;
-                            log::debug!(
-                                "Core->TileSwitch: tile({},{}) slave[0] <- 0x{:08X}",
-                                self.tiles[i].col,
-                                self.tiles[i].row,
-                                data
-                            );
-                        }
-                    } else {
-                        // Other ports: push to corresponding slave if it exists
-                        // This handles multi-port core stream writes
-                        let slave_port = port as usize;
-                        if slave_port < self.tiles[i].stream_switch.slaves.len() {
-                            if self.tiles[i].stream_switch.slaves[slave_port].push_with_tlast(data, tlast) {
-                                words_routed += 1;
-                                log::debug!(
-                                    "Core->TileSwitch: tile({},{}) slave[{}] <- 0x{:08X}",
-                                    self.tiles[i].col,
-                                    self.tiles[i].row,
-                                    slave_port,
-                                    data
-                                );
-                            }
-                        }
-                    }
+                let slave_port = port as usize;
+                while slave_port < self.tiles[i].stream_switch.slaves.len()
+                    && self.tiles[i].stream_switch.slaves[slave_port].can_accept()
+                {
+                    let Some((data, tlast)) = self.tiles[i].pop_stream_output_beat(port) else {
+                        break;
+                    };
+                    let accepted =
+                        self.tiles[i].stream_switch.slaves[slave_port].push_with_tlast(data, tlast);
+                    debug_assert!(accepted, "slave port {slave_port} reported room and refused a beat");
+                    words_routed += 1;
+                    log::debug!(
+                        "Core->TileSwitch: tile({},{}) slave[{}] <- 0x{:08X}",
+                        self.tiles[i].col,
+                        self.tiles[i].row,
+                        slave_port,
+                        data
+                    );
                 }
             }
         }

@@ -41,7 +41,7 @@ def test_defaults():
     assert (c.symbol, c.args) == ("test_kernel", ())
     assert Buffer("b", "in", 4).data is None
     s = CoreStream("a", "b")
-    assert (s.src_port, s.dst_port) == (0, 0)
+    assert (s.src_port, s.dst_port, s.via_fifo) == (0, 0, False)
 
 
 def test_dict_round_trip_is_identity():
@@ -128,3 +128,11 @@ def test_load_topology_resolves_relative_sources(tmp_path):
     got = load_topology(d / "topology.json")
     assert got.cores[0].source == d / "kernel.s"
     assert got.cores[1].source == Path("/abs/e.s")
+
+
+def test_via_fifo_round_trips_and_is_absent_from_plain_streams():
+    t = Topology("t", cores=(), links=(CoreStream("a", "b", via_fifo=True), CoreStream("a", "b")))
+    d = to_dict(t)
+    assert d["links"][0]["via_fifo"] is True
+    assert "via_fifo" not in d["links"][1], "plain streams serialize as before (case hashes stay)"
+    assert topology_from_dict(d) == t

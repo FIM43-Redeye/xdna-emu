@@ -67,6 +67,15 @@ def test_core_stream_flow(dev):
     assert "aie.flow(%tile_0_3, Core : 1, %tile_0_2, Core : 0)" in text
 
 
+def test_core_stream_through_the_switch_fifo(dev):
+    """via_fifo routes the flow through the source tile's stream-switch FIFO 0 (AM020 ch.2:74)."""
+    a, b = core("a", 0, 3), core("b", 0, 2, outs=(64,))
+    text = emit(topo(a, b, links=[CoreStream("a", "b", via_fifo=True)]), dev)
+    assert "aie.flow(%tile_0_3, Core : 0, %tile_0_3, FIFO : 0)" in text
+    assert "aie.flow(%tile_0_3, FIFO : 0, %tile_0_2, Core : 0)" in text
+    assert "aie.flow(%tile_0_3, Core : 0, %tile_0_2, Core : 0)" not in text
+
+
 def test_staged_join_and_distribute_use_element_offsets(dev):
     cores = [core(f"c{r}", 0, r, ins=(64,), outs=(64,)) for r in range(2, 6)]
     text = emit(topo(*cores), dev)

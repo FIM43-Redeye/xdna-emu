@@ -978,6 +978,21 @@ where
                         ctx.record_stall(1);
                         Some(StepResult::WaitStream { port })
                     }
+                } else if crate::interpreter::execute::stream::write_stall_port(port).is_some() {
+                    // (the core has one stream port: `write_would_stall` looks at it)
+                    // Stream WRITE stall: the core's output buffer was full. Resume when the
+                    // router has moved a word on, whatever arrives on the input side.
+                    if !crate::interpreter::execute::stream::write_would_stall(tile) {
+                        log::debug!("Stream port {} output drained, resuming execution", port);
+                        self.status = CoreStatus::Ready;
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut()
+                            .record_event(cycle, EventType::StreamStallLevel { active: false });
+                        None
+                    } else {
+                        ctx.record_stall(1);
+                        Some(StepResult::WaitStream { port })
+                    }
                 } else {
                     // Regular stream stall: check if stream data is available
                     if tile.has_stream_input(port) {
@@ -1449,6 +1464,34 @@ mod tests {
             .filter(|e| matches!(e, EventType::StreamStallLevel { active: false }))
             .count();
         assert_eq!(falling, 1, "exactly one STREAM_STALL falling edge on resume");
+    }
+
+    #[test]
+    fn stream_write_stall_resumes_when_the_output_drains_not_when_input_arrives() {
+        use crate::interpreter::execute::stream::{write_would_stall, WRITE_STALL_FLAG};
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = Tile::compute(0, 2);
+        while !write_would_stall(&tile) {
+            tile.push_stream_output(0, 0xAA);
+        }
+        interp.status = CoreStatus::WaitingStream { port: WRITE_STALL_FLAG };
+
+        // Input arriving does not wake a core blocked on a full output...
+        tile.push_stream_input(0, 0xCAFE);
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(matches!(r, Some(StepResult::WaitStream { port: WRITE_STALL_FLAG })));
+
+        // ...a word leaving the output does, with exactly one falling edge.
+        tile.pop_stream_output_beat(0);
+        let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
+        assert!(r.is_none(), "resumes once the output has room");
+        let falling = recorded_events(&ctx)
+            .into_iter()
+            .filter(|e| matches!(e, EventType::StreamStallLevel { active: false }))
+            .count();
+        assert_eq!(falling, 1);
     }
 
     #[test]

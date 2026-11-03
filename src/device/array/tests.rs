@@ -1040,3 +1040,67 @@ fn inter_tile_crossing_flows_when_dest_drains() {
          {steady_cycles} cycles (expected continuous ~1 word/cycle flow)"
     );
 }
+
+// === Core stream output into a full Core slave port ===
+
+/// A core writing faster than the switch drains must back up in its own output buffer. The
+/// router popped each beat before checking the Core slave port could take it, so every beat
+/// past the slave's depth was dropped: the consumer never saw those words and any design that
+/// streamed more than a handful of words from a core into a held sink wedged.
+#[test]
+fn core_stream_output_waits_in_its_buffer_when_the_core_slave_port_is_full() {
+    let mut array = TileArray::npu1();
+    let mut host = HostMemory::new();
+    let idx = array.tile_index(1, 2);
+    let capacity = array.tiles[idx].stream_switch.slaves[0].fifo_capacity;
+    // no route: the slave port can only fill, never drain
+    for w in 0..(capacity as u32 + 6) {
+        array.tiles[idx].push_stream_output_beat(0, 0xA000 + w, w == capacity as u32 + 5);
+    }
+    for _ in 0..8 {
+        array.step_data_movement(&mut host);
+    }
+    let slave = &array.tiles[idx].stream_switch.slaves[0];
+    assert_eq!(slave.fifo.len(), capacity, "the slave port filled");
+    assert_eq!(array.tiles[idx].stream_output_len(0), 6, "the rest waits, none dropped");
+    let first: Vec<u32> = slave.fifo.iter().copied().collect();
+    assert_eq!(first, (0..capacity as u32).map(|w| 0xA000 + w).collect::<Vec<_>>(), "in order");
+}
+
+/// The core's stream input is a finite buffer: a consumer that is not reading backpressures the
+/// switch instead of absorbing the stream without bound. It used to take every word the Core
+/// master port offered, so a held consumer never stalled its producer at all (silicon: 18 words
+/// between a core and a core one tile away).
+#[test]
+fn core_stream_input_is_bounded_and_backpressures_the_switch() {
+    let mut array = TileArray::npu1();
+    array.clock_mut().write_register(1, 0, 0x000FFF20, 0x1); // ungate column 1
+    let mut host = HostMemory::new();
+    let idx = array.tile_index(1, 2);
+    // core out -> slave 0 -> master 0 -> core in: a loopback through the switch
+    array.tiles[idx].stream_switch.configure_local_route(0, 0);
+    let mut sent = 0u32;
+    for _ in 0..200 {
+        if array.tiles[idx].stream_output_len(0) < 4 {
+            array.tiles[idx].push_stream_output_beat(0, 0xB000 + sent, false);
+            sent += 1;
+        }
+        array.step_data_movement(&mut host);
+    }
+    let held = array.tiles[idx].stream_input_len(0);
+    assert_eq!(held, crate::device::tile::CORE_STREAM_INPUT_DEPTH, "the input buffer filled and stopped");
+    // nothing was lost: every word sent is in the input buffer or still in flight upstream
+    let sw = &array.tiles[idx].stream_switch;
+    let in_flight = array.tiles[idx].stream_output_len(0)
+        + sw.slaves.iter().map(|p| p.fifo.len()).sum::<usize>()
+        + sw.masters.iter().map(|p| p.fifo.len()).sum::<usize>()
+        + sw.switch_pipeline.len();
+    assert_eq!(held + in_flight, sent as usize, "every word is accounted for");
+    // reading frees the buffer and the stream resumes, in order
+    let first = array.tiles[idx].pop_stream_input_beat(0).unwrap().0;
+    assert_eq!(first, 0xB000);
+    for _ in 0..20 {
+        array.step_data_movement(&mut host);
+    }
+    assert_eq!(array.tiles[idx].stream_input_len(0), crate::device::tile::CORE_STREAM_INPUT_DEPTH);
+}

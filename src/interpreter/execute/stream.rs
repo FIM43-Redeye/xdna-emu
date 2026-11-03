@@ -71,6 +71,27 @@ pub enum StreamResult {
 /// The core's stream port (the only one a `mov ms` / `mov SS` instruction addresses).
 const CORE_PORT: u8 = 0;
 
+/// Set in the port of a [`StreamResult::Stall`] when the core is blocked WRITING (its output
+/// buffer is full); clear for a blocked read. The core's wait state carries only a port, and the
+/// two stalls clear on opposite conditions: a read when input arrives, a write when the output
+/// drains. A write stall that waited for input never woke a core whose consumer was held.
+/// Ports 254 / 255 are the cascade sentinels, above any flagged stream port.
+pub const WRITE_STALL_FLAG: u8 = 0x80;
+
+/// Whether `port` (of a stream stall) is a write stall, and which stream port.
+pub const fn write_stall_port(port: u8) -> Option<u8> {
+    if port & WRITE_STALL_FLAG != 0 && port < 254 {
+        Some(port & !WRITE_STALL_FLAG)
+    } else {
+        None
+    }
+}
+
+/// Whether a blocking write on the core's port would stall: its output buffer is full.
+pub fn write_would_stall(tile: &Tile) -> bool {
+    tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH
+}
+
 /// Words the core's output FIFO holds before a blocking write stalls (a non-blocking write
 /// is refused instead). The depth is a modelling choice, not a measurement.
 const STREAM_FIFO_DEPTH: usize = 4;
@@ -140,7 +161,7 @@ impl StreamOps {
     }
 
     fn execute_write(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
-        let full = tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH;
+        let full = write_would_stall(tile);
         if full && op.blocking {
             log::debug!(
                 "[STREAM] Write stall: FIFO full (tile {},{}, pc=0x{:X})",
@@ -148,7 +169,7 @@ impl StreamOps {
                 tile.row,
                 ctx.pc()
             );
-            return StreamResult::Stall { port: CORE_PORT };
+            return StreamResult::Stall { port: CORE_PORT | WRITE_STALL_FLAG };
         }
         let accepted = !full;
         if accepted {
@@ -208,14 +229,15 @@ impl StreamOps {
         if !op.blocking {
             return None;
         }
-        let stalls = match op.semantic {
+        match op.semantic {
             Some(SemanticOp::StreamWrite) | Some(SemanticOp::StreamWritePacketHeader) => {
-                tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH
+                write_would_stall(tile).then_some(StreamResult::Stall { port: CORE_PORT | WRITE_STALL_FLAG })
             }
-            Some(SemanticOp::StreamRead) => tile.stream_input_len(CORE_PORT) == 0,
-            _ => false,
-        };
-        stalls.then_some(StreamResult::Stall { port: CORE_PORT })
+            Some(SemanticOp::StreamRead) => {
+                (tile.stream_input_len(CORE_PORT) == 0).then_some(StreamResult::Stall { port: CORE_PORT })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -275,8 +297,12 @@ mod tests {
             tile.push_stream_output(0, 0xAAAA);
         }
         let blocking = write_op(true, false, 0);
-        assert_eq!(StreamOps::execute(&blocking, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
-        assert!(StreamOps::would_stall(&blocking, &tile).is_some());
+        let write_stall = StreamResult::Stall { port: WRITE_STALL_FLAG };
+        assert_eq!(StreamOps::execute(&blocking, &mut ctx, &mut tile), write_stall);
+        assert_eq!(StreamOps::would_stall(&blocking, &tile), Some(write_stall));
+        assert_eq!(write_stall_port(WRITE_STALL_FLAG), Some(0), "a write stall is told from a read stall");
+        assert_eq!(write_stall_port(0), None);
+        assert_eq!(write_stall_port(254), None, "the cascade sentinels are not stream ports");
 
         let nb = write_op(false, false, 0);
         assert!(StreamOps::would_stall(&nb, &tile).is_none());

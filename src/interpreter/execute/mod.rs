@@ -91,7 +91,7 @@ pub mod vector_convert;
 pub mod vector_matmul;
 mod memory;
 mod control;
-mod stream;
+pub(crate) mod stream;
 mod cascade;
 pub(crate) mod cycle_accurate;
 pub mod fuzz_recorder;
