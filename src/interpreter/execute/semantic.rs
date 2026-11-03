@@ -279,13 +279,19 @@ pub(super) fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 ///   validation in `extract_ordered_operands`. Debug-assert to catch regressions.
 pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
     match operand {
-        Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
+        Operand::ScalarReg(r) => {
+            ctx.scalar.write(*r, value);
+            ctx.log_scalar_write(operand, value);
+        }
         Operand::PointerReg(r) if *r == crate::interpreter::state::SP_PTR_INDEX => {
             // Dedicated SP register -- write immediately (no pipeline alias)
             ctx.set_sp(value);
         }
         Operand::PointerReg(r) => ctx.queue_pointer_write(*r, value, 1),
-        Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
+        Operand::ModifierReg(r) => {
+            ctx.modifier.write(*r, value);
+            ctx.log_scalar_write(operand, value);
+        }
         Operand::ControlReg(id) => {
             // Control register write: update SRS/UPS config.
             // Hardware register IDs from AIE2GenRegisterInfo.td via archspec.

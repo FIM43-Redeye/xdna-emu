@@ -873,7 +873,7 @@ impl CycleAccurateExecutor {
                 // lookup on the base class would return No).
                 ctx.result_latency = self.operation_cycles(op);
                 ctx.result_bypass = op.result_bypass;
-                ctx.begin_slot_writes(op.ports.write_port);
+                ctx.begin_slot_writes(&op.ports);
                 ctx.set_slot_acc_read(op.ports.acc_read);
                 ctx.accumulator.set_reader_slot(Some(op.slot as u8));
                 ctx.record_read_claim(op);
@@ -932,6 +932,7 @@ impl CycleAccurateExecutor {
         ctx.result_latency = 0;
         ctx.result_bypass = Bypass::No;
         ctx.set_write_tag(None);
+        ctx.end_slot_writes();
         ctx.set_slot_acc_read(None);
         ctx.set_srs_partner_units(None);
         ctx.set_srs_mode_override(0, None);

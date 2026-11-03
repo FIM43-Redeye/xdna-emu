@@ -21,8 +21,11 @@ use super::registers::{
     AccumulatorRegisterFile, Bypass, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile,
     ScalarRegisterFile, VectorRegisterFile,
 };
+use smallvec::SmallVec;
+
+use super::scalar_collision::{self, PortedWrite};
 use super::write_collision::WriteTag;
-use crate::interpreter::bundle::{ElementType, Operand};
+use crate::interpreter::bundle::{ElementType, Operand, PortUse, ScalarDefPort, ScalarFile};
 use crate::interpreter::traits::{Flags, StateAccess};
 
 // Re-export types that were previously defined in this file. Downstream code
@@ -79,6 +82,21 @@ pub struct PendingWrite {
     /// Handle of this load's stand-in in the register file's collision resolver, when the load
     /// has a collision-modelled write port (see `VectorRegisterFile::register_phantom`).
     pub phantom: Option<u32>,
+    /// Handle of this write in the scalar write-port log (`ExecutionContext::log_scalar_write`),
+    /// when its instruction holds a scalar write port: a later-issued write landing through the
+    /// same port in the same cycle drops it, one reaching the same register through another
+    /// port ORs into it.
+    pub scalar_log_id: Option<u64>,
+}
+
+/// One scalar-file write of a recent instruction, for the port collision rules
+/// (`state::scalar_collision`).
+#[derive(Debug, Clone)]
+struct LoggedScalarWrite {
+    id: u64,
+    /// Absolute issued-bundle count at which the write lands.
+    land: u64,
+    write: PortedWrite,
 }
 
 /// A deferred partial-word store awaiting its data register read.
@@ -444,6 +462,11 @@ pub struct ExecutionContext {
     srs_mode_override: Option<(u8, (ElementType, ElementType))>,
     /// Issue sequence counter: one number per executed slot op, in issue order.
     write_seq: u64,
+    /// The scalar-file results (and their ports) of the slot op being executed.
+    slot_scalar_defs: SmallVec<[ScalarDefPort; 1]>,
+    /// Scalar-file writes of recent instructions that hold a write port.
+    scalar_log: Vec<LoggedScalarWrite>,
+    next_scalar_log_id: u64,
 
     /// Monotonic counter of issued bundles, incremented once per executed
     /// bundle by the cycle-accurate executor. This is the issue-slot-relative
@@ -636,6 +659,9 @@ impl ExecutionContext {
             srs_partner_units: None,
             srs_mode_override: None,
             write_seq: 0,
+            slot_scalar_defs: SmallVec::new(),
+            scalar_log: Vec::new(),
+            next_scalar_log_id: 0,
             bundle_seq: 0,
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
@@ -925,6 +951,7 @@ impl ExecutionContext {
     /// At branch boundaries, `delay_pending_writes(1)` adds an extra cycle
     /// to model the loss of forwarding when the pipeline is flushed.
     pub fn queue_scalar_load(&mut self, dest: Operand, value: u32, latency: u64) {
+        let scalar_log_id = self.log_scalar_write(&dest, value);
         self.pending_writes.push(PendingWrite {
             dest,
             scalar_value: value,
@@ -933,6 +960,7 @@ impl ExecutionContext {
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
             phantom: None,
+            scalar_log_id,
         });
     }
 
@@ -950,6 +978,7 @@ impl ExecutionContext {
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
             phantom,
+            scalar_log_id: None,
         });
     }
 
@@ -987,6 +1016,7 @@ impl ExecutionContext {
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
             phantom,
+            scalar_log_id: None,
         });
     }
 
@@ -1042,9 +1072,10 @@ impl ExecutionContext {
     /// Start a slot op's writes: number the op in issue order and tag its register writes with its
     /// write port and landing bundle (`bundle_seq + result_latency`). Call after setting
     /// `result_latency`. An op without a write port, or without a result latency, is untagged.
-    pub fn begin_slot_writes(&mut self, write_port: Option<u16>) {
+    pub fn begin_slot_writes(&mut self, ports: &PortUse) {
         self.write_seq += 1;
-        let tag = write_port.filter(|_| self.result_latency > 0).map(|port| WriteTag {
+        self.slot_scalar_defs = ports.scalar_defs.clone();
+        let tag = ports.write_port.filter(|_| self.result_latency > 0).map(|port| WriteTag {
             port,
             seq: self.write_seq,
             land: self.bundle_seq + self.result_latency as u64,
@@ -1176,6 +1207,46 @@ impl ExecutionContext {
         self.write_tag
     }
 
+    /// Forget the slot op's scalar results once it has executed.
+    pub fn end_slot_writes(&mut self) {
+        self.slot_scalar_defs.clear();
+    }
+
+    /// Record a scalar-file write of the slot op being executed in the port log and return its
+    /// handle. `None` (not logged) when the op has no scalar result in `dest`'s file. An
+    /// immediate write (the register is already written) needs no handle; a deferred one keeps
+    /// it to learn at landing whether it survived (see [`scalar_landing`](Self::scalar_landing)).
+    pub fn log_scalar_write(&mut self, dest: &Operand, value: u32) -> Option<u64> {
+        let file = ScalarFile::of_operand(dest)?;
+        let def = self.slot_scalar_defs.iter().find(|d| d.file == file)?;
+        let reg = match *dest {
+            Operand::ScalarReg(r) | Operand::PointerReg(r) | Operand::ModifierReg(r) => r,
+            _ => return None,
+        };
+        let land = self.bundle_seq + def.land as u64;
+        let id = self.next_scalar_log_id;
+        self.next_scalar_log_id += 1;
+        let bundle = self.bundle_seq;
+        self.scalar_log.retain(|e| e.land + 16 >= bundle);
+        self.scalar_log.push(LoggedScalarWrite {
+            id,
+            land,
+            write: PortedWrite { seq: self.write_seq, file, reg, units: def.units.clone(), value },
+        });
+        Some(id)
+    }
+
+    /// What a logged write does when it lands: dropped, or written with the value the
+    /// collision rules leave (its own unless another port ORs into the register).
+    fn scalar_landing(&self, id: u64) -> Option<scalar_collision::Landing> {
+        let mine = self.scalar_log.iter().find(|e| e.id == id)?;
+        let together: Vec<&LoggedScalarWrite> =
+            self.scalar_log.iter().filter(|e| e.land == mine.land).collect();
+        let writes: Vec<PortedWrite> = together.iter().map(|e| e.write.clone()).collect();
+        let at = together.iter().position(|e| e.id == id)?;
+        Some(scalar_collision::resolve(&writes)[at])
+    }
+
     /// Stamp `tag` on the register writes queued from here on (both files).
     pub fn set_write_tag(&mut self, tag: Option<WriteTag>) {
         self.write_tag = tag;
@@ -1212,14 +1283,17 @@ impl ExecutionContext {
             self.sp_value = value;
             return;
         }
+        let dest = Operand::PointerReg(reg);
+        let scalar_log_id = self.log_scalar_write(&dest, value);
         self.pending_writes.push(PendingWrite {
-            dest: Operand::PointerReg(reg),
+            dest,
             scalar_value: value,
             vec_value: None,
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
             phantom: None,
+            scalar_log_id,
         });
     }
 
@@ -1308,6 +1382,16 @@ impl ExecutionContext {
 
     /// Apply a single pending write to the register file.
     fn apply_pending_write(&mut self, pw: &PendingWrite) {
+        let mut landed;
+        let pw = match pw.scalar_log_id.and_then(|id| self.scalar_landing(id)) {
+            Some(l) if !l.lands => return,
+            Some(l) => {
+                landed = pw.clone();
+                landed.scalar_value = l.value;
+                &landed
+            }
+            None => pw,
+        };
         match &pw.dest {
             Operand::ScalarReg(r) => self.scalar.write(*r, pw.scalar_value),
             Operand::PointerReg(r) if *r == super::registers::SP_PTR_INDEX => {
