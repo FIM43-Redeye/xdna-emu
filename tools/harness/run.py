@@ -182,7 +182,7 @@ def workspace() -> Path:
 
 
 def build_test_host(pkg_dir: Path) -> Path:
-    """Compile the shared test_host into `pkg_dir` (as run_acc_timing_probe does)."""
+    """Compile the shared test_host into `pkg_dir` (the shared host, built once per suite)."""
     mlir_aie = Path(os.environ.get("MLIR_AIE") or workspace() / "mlir-aie")
     test_lib = mlir_aie / "build" / "runtime_lib" / "x86_64" / "test_lib"
     cpp, exe = pkg_dir / "test_host.cpp", pkg_dir / "test_host"

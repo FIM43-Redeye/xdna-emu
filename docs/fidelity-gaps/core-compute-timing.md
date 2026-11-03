@@ -23,8 +23,8 @@ HW-validated; these gaps are in the memory-port / stall accounting layered on to
 
 ## Cascade link (depth pinned by silicon 2026-11-01; hop latency open)
 
-Probes: `tools/gen_cascade_probe.py` through the topology harness
-(`python3 -m harness build|hw|emu`); data in `build/experiments/harness/cascade/final/`.
+Probes: `tools/gen_cascade_probe.py` (writes a suite) through the topology harness
+(`python3 -m harness suite build|hw|emu|compare`); data in `build/experiments/harness/cascade/final/`.
 Producer on the north (flow South) or west (flow East) of the consumer, one
 `aie.cascade_flow`.
 

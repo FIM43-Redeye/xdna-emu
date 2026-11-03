@@ -62,7 +62,7 @@ The old per-kernel patches this replaces (sparse MACs reading their accumulators
 compensation for the missing "+1" and for modelling the MAC read at issue instead of `issue + use`.
 
 **Probe and evidence.** `tools/gen_acc_timing_probe.py` generates raw-asm kernels (assembled by
-llvm-mc, packaged through the ISA harness path by `tools/run_acc_timing_probe.py`) that place a
+llvm-mc, written as a suite and built/run by `python3 -m harness suite`) that place a
 producer and a consumer at signed distance `s` (RAW `+d`, WAR `-d`, `d` = 0..9) and classify each
 output word OLD or NEW against two in-kernel references (`tools/analyze_acc_timing.py`);
 `tools/fit_acc_timing.py` fits the read and write cycles with no TableGen input and then compares
