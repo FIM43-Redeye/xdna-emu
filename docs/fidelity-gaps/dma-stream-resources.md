@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated; 1 bounded peek/commit under-claim (decompression, low-impact, not HW-gated); memtile granule cap width/interleave/port DERIVED from AM020 ch.5:105/137/153, and HW-measured 2026-07-15 (Phoenix A1+A2): memtile DMA is STREAM-BOUND at 1 word/cy so memory is never the bottleneck -- the "1 vs 4 words/cy" exposure is MOOT for stream transfers, and the EMU-vs-HW span check (2026-07-15) CLOSED it as no fidelity error (EMU flat 258 across strides == stream-bound, cap never bites; one logged sub-3% residual = HW contiguous-burst fast-path EMU flattens); DMA memory-pressure events CLOSED -- both are now driven by the staging FIFOs, MM2S_MEMORY_STARVATION matches HW's 0 exactly, and S2MM_MEMORY_BACKPRESSURE reproduces HW's per-window shape and steady-state magnitude (one residual: the total is inflated by a pre-existing emulator warmup lock-stall, tracked separately)
+status: stream-switch FIFO route and core stream writes fixed 2026-11-03 (see "Stream wedges"); send/recv port cadence substantially resolved (recv exact); 2 residual open, both HW-empirical-gated; 1 bounded peek/commit under-claim (decompression, low-impact, not HW-gated); memtile granule cap width/interleave/port DERIVED from AM020 ch.5:105/137/153, and HW-measured 2026-07-15 (Phoenix A1+A2): memtile DMA is STREAM-BOUND at 1 word/cy so memory is never the bottleneck -- the "1 vs 4 words/cy" exposure is MOOT for stream transfers, and the EMU-vs-HW span check (2026-07-15) CLOSED it as no fidelity error (EMU flat 258 across strides == stream-bound, cap never bites; one logged sub-3% residual = HW contiguous-burst fast-path EMU flattens); DMA memory-pressure events CLOSED -- both are now driven by the staging FIFOs, MM2S_MEMORY_STARVATION matches HW's 0 exactly, and S2MM_MEMORY_BACKPRESSURE reproduces HW's per-window shape and steady-state magnitude (one residual: the total is inflated by a pre-existing emulator warmup lock-stall, tracked separately)
 ---
 
 # DMA & Stream Resource Gaps
@@ -60,5 +60,62 @@ under-emission) is closed and lives in
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | `DMA_S2MM_n_MEMORY_BACKPRESSURE` fill delay is one cycle long | Per steady-state window (the only valid axis -- see below), EMU's backpressure opens **+16** cycles into the S2MM's lock stall and holds **101** of a **117**-cycle window; HW opens **+15** and holds **104** of **119**. | `src/device/dma/engine/stream_io.rs` (the ingress FIFO), `src/interpreter/engine/coordinator.rs` (Phase E) | **The EVENT is CLOSED; the residual is a one-cycle fill difference.** The event is driven by the S2MM ingress FIFO (`note_ingress_offer_refused`: a beat offered, the FIFO full), with nothing consulting the lock or the arbiter. HW's shape reproduces emergently: zero variance across steady-state windows, cold-start and stream-drained windows correctly assert **nothing** (HW: same), every window sustained, zero single-cycle pulses. The **+16 vs +15 is our depth-16 FIFO taking one more beat than silicon** (we accept 16 beats and refuse the 17th; silicon accepts 15 and refuses the 16th). **NOT fitted away** -- matching exactly means an effective usable depth of 15, for which there is no independent evidence. **Do NOT compare run totals against the `of_q0_rich` capture:** it holds ~9 of the kernel's 16 pipeline iterations (see `xdna-emu-priv: research/findings/2026-07-13-memory-stall-bank-arbitration.md`, coverage trap), so any total-vs-total ratio against it is an artifact. A prior row here quoted EMU 8544/8390 vs HW 756/853 on exactly that invalid axis; withdrawn. |
-| MM2S egress staging depth (25) pinned by silicon on compute tiles; downstream route capacities diverge | `DMA_MM2S_EGRESS_FIFO_DEPTH = 25`, **measured** (R4-D3, Phoenix NPU1, 2026-10-28): a compute-tile MM2S holds 25 words ahead of a stalled consumer, upstream of the switch's local-slave port. Measured by data race (overwrite the source buffer while the consumer is held; count words still carrying the old pattern), cross-checked against a core source and BD start phases (details in the `mm2s_egress_fifo_depth` field doc, `crates/xdna-archspec/src/types.rs`). | `crates/xdna-archspec` (`DMA_MM2S_EGRESS_FIFO_DEPTH`), `src/device/dma/engine/stepping.rs` (`next_granule_fetch`), rig `tools/experiments/r4d3_*.py` | **CLOSED for the staging term on compute tiles** (+/-1: assumes a stalled core holds one word; mem tiles inherit it unverified). The former placeholder (12) is replaced. **Residual, logged not retuned:** whole-route absorb on the same designs run under the emulator is `staged + downstream`, and the downstream part differs from silicon: silicon absorbs `A = 25, 33, 41, 49` words beyond the staging for a stalled DMA consumer 0/1/2/3 tiles away (slope 8 per hop, = AM020 ch.2:88/92 `8-deep` external hops) while the emulator's slope is 14 per hop; the S2MM ingress plus same-tile switch path absorbs 25 on silicon (core source) against ~17 in the emulator; routing through the switch FIFO port (`aie.flow ... FIFO : 0`) works on silicon (+21 words for a core source, +20 DMA) but wedges the emulator. A core streaming into `Core : 0` also wedges the emulator on these designs. |
+| MM2S egress staging depth (25) pinned by silicon on compute tiles; downstream route capacities diverge | `DMA_MM2S_EGRESS_FIFO_DEPTH = 25`, **measured** (R4-D3, Phoenix NPU1, 2026-10-28): a compute-tile MM2S holds 25 words ahead of a stalled consumer, upstream of the switch's local-slave port. Measured by data race (overwrite the source buffer while the consumer is held; count words still carrying the old pattern), cross-checked against a core source and BD start phases (details in the `mm2s_egress_fifo_depth` field doc, `crates/xdna-archspec/src/types.rs`). | `crates/xdna-archspec` (`DMA_MM2S_EGRESS_FIFO_DEPTH`), `src/device/dma/engine/stepping.rs` (`next_granule_fetch`), rig `tools/experiments/r4d3_*.py` | **CLOSED for the staging term on compute tiles** (+/-1: assumes a stalled core holds one word; mem tiles inherit it unverified). The former placeholder (12) is replaced. **Residual, logged not retuned:** whole-route absorb on the same designs run under the emulator is `staged + downstream`, and the downstream part differs from silicon: silicon absorbs `A = 25, 33, 41, 49` words beyond the staging for a stalled DMA consumer 0/1/2/3 tiles away (slope 8 per hop, = AM020 ch.2:88/92 `8-deep` external hops) while the emulator's slope is 14 per hop; the S2MM ingress plus same-tile switch path absorbs 25 on silicon (core source) against ~17 in the emulator; routing through the switch FIFO port (`aie.flow ... FIFO : 0`) works on silicon (+21 words for a core source, +20 DMA); **the FIFO and core-stream wedges are FIXED** (2026-11-03, see "Stream wedges" below) and the FIFO route now adds +23 in the emulator (2-3 words over silicon). |
 | `DMA_MM2S_n_MEMORY_STARVATION` cold-fetch residual | EMU 0 on `of_q0_rich` (**HW 0**, exact match). In a synthetic worst case (core hammering the DMA's bank every cycle) EMU emits a few cycles where HW emits 0. | `src/device/dma/engine/stepping.rs` (`next_granule_fetch`) | **CLOSED for the measured workloads; one known residual.** The event is now driven by the MM2S egress staging FIFO running dry (`DMA_MM2S_EGRESS_FIFO_DEPTH` = 12). Silicon's 0 EMERGES -- the MM2S in `of_q0_rich` loses bank arbitrations and the staging absorbs every one, and a unit test proves losing EVERY arbitration costs zero cycles and zero starvation (HW: `T_collide/T_apart` = 1.0000). Residual: a transfer's very FIRST granule fetch has an empty staging behind it, so losing THAT one does bubble the port for a cycle. Silicon apparently primes its egress before the port opens (it reported 0 starvation across 112 losses and 16 transfer starts). Bounded by transfer starts, not by denials; needs a capture that starves an egress on purpose to pin. |
+
+
+## Stream wedges: switch FIFO route and core stream writes (FIXED, NPU1 silicon 2026-11-03)
+
+Two designs wedged the emulator that silicon runs: a flow routed through the stream switch's FIFO
+(`aie.flow(t, Core:0, t, FIFO:0)`, `aie.flow(t, FIFO:0, ...)`), and a core streaming more words than
+its path holds into a held consumer (the R4-D3 `core_h*` designs, `tools/experiments/r4d3_*.py`).
+Four independent defects, all root-caused with the original designs
+(`build/experiments/r4-d3/{core_h0,core_h0_fifo,h0_d1200_d220_fifo}`):
+
+1. **A core output beat was dropped when the Core slave port was full**
+   (`device/array/routing.rs` `route_core_to_tile_switches`: `pop_stream_output_beat` ran before the
+   slave `can_accept` check, so `push_with_tlast` failed and the popped word vanished). The sink saw
+   25 of 128 words and waited forever (`core_h0` before: `Tier C wedge ... (1,2)ch0 Transferring(100/512)`,
+   `build/experiments/harness/bugs/core_h0-prefix-wedge.txt`). The beat now leaves the output buffer
+   only when the slave takes it. Test: `array::tests::core_stream_output_waits_in_its_buffer_when_the_core_slave_port_is_full`.
+2. **A core blocked on a full output never woke**: `CoreStatus::WaitingStream { port }` carries no
+   direction and `try_resume_stall` resumed only when stream INPUT was available. A write stall now
+   carries `stream::WRITE_STALL_FLAG` and resumes when the output buffer has room
+   (`interpreter/core/interpreter.rs`, test `stream_write_stall_resumes_when_the_output_drains_not_when_input_arrives`).
+3. **`tile.stream_input` was unbounded** (`route_tile_switches_to_core` popped the Core master port
+   unconditionally), so a held consumer never backpressured its producer. Bounded at
+   `CORE_STREAM_INPUT_DEPTH = 1` (AM020 ch.2:143: the core stream interface has no FIFO). Test
+   `array::tests::core_stream_input_is_bounded_and_backpressures_the_switch`.
+4. **The switch FIFO did not exist**: master FIFO:0 and slave FIFO:0 were port types with no link,
+   so a flow through `FIFO:0` delivered nothing. The master port is now the 16-deep FIFO
+   (`stream_switch.switch_fifo_depth`, AM020 ch.2:74) and `advance_switch_fifos` moves a word per cycle
+   to the paired slave port (tests `the_switch_fifo_*`).
+
+The core output buffer depth was 4 ("a modelling choice, not a measurement"); AM020 gives the core
+interface no FIFO and silicon pins it: a core streaming into a held DMA on its own tile writes 26 words
+before stalling (EMU 30 at depth 4, 27 at the 1-word hand-off register now used).
+
+**Absorb counts, silicon vs emulator** (words the source writes before it stalls on a held consumer;
+`core_h*`/`h0_*` are the R4-D3 xclbins under the bridge runner, `direct`/`fifo` the harness suite
+`gen_stream_absorb_probe.py`, 96 words, consumer held ~28000 cycles; HW stable over 3 runs):
+
+| Design | Silicon | Emulator |
+|---|---|---|
+| core source -> DMA sink, 0 / 1 / 2 / 3 hops | 26 / 34 / 42 / 50 | 27 / 41 / 55 / 69 |
+| core source through the switch FIFO, 0 hops | 47 (+21) | 50 (+23) |
+| DMA source -> DMA sink, 0 hops, with FIFO | 68 (+20 over 48) | 52 (+23 over 29) |
+| core -> core, one tile apart (harness `direct`) | 18 | 25 |
+| same through the producer's FIFO (harness `fifo`) | 39 (+21) | 48 (+23) |
+
+The per-hop growth is the known residual (silicon 8 words per hop, emulator 14): the core-source
+intercept now matches within a word and the slope is untouched, **the DMA-source rows are unchanged by
+this fix** (29 / 43 at 0 / 1 hops before and after; it was not retuned). The FIFO route adds 23 words in
+the emulator against 21 / 20: the FIFO's 16 plus the FIFO slave port's 4 and the extra crossbar hop's
+pipeline counted as buffering (the same latency-as-capacity overcount as the slope, not a separate
+parameter); open.
+
+Reproduce: `python3 tools/gen_stream_absorb_probe.py generate DIR`, then `python3 -m harness suite
+build|hw|emu DIR TAG` and `... summarize DIR/runs/TAG/<case> 96` (cycle stamps differ run to run, so
+the byte compare does not apply; the summary is the absorb count and whether all 96 words arrived in
+order). Before the fix the `fifo` case wedged (`wedge_recovered`, `Kernel did not complete`). The
+core -> DMA wedge reproduces only with the R4-D3 xclbin (the topology harness has no core -> DMA flow).
