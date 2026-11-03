@@ -103,7 +103,7 @@ appended to `.git-blame-ignore-revs`.
 
 ## Test suite costs
 
-- `./scripts/isa-test.sh`: ~5-10 minutes (release build + 123 HW batches)
+- `./scripts/isa-test.sh`: ~8-10 minutes (200 cases: serial HW, parallel EMU; unchanged packages are reused)
 - `./scripts/emu-bridge-test.sh`: ~15-30 minutes (dual-compiler, HW + EMU)
 
 These are expensive; don't re-run them just to "check progress." Run

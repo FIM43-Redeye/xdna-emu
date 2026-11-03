@@ -7,7 +7,7 @@ host offsets) was made by the planner; this module only spells it. The text is
 a pure function of its inputs, so the same topology gives byte-identical MLIR.
 
 Idioms reused from the probes that already run on this machine
-(tools/instr-test-gen.py, tools/isa-multi-tile-gen.py): objectfifos of
+(tools/instr-test-gen.py and the retired multi-tile ISA generator): objectfifos of
 `memref<Nxi32>`, `link_with` kernels, a `(%in, %buf, %out)` runtime sequence
 of `dma_memcpy_nd` ops addressed through the fourth offset/size dimension,
 output DMAs issued before inputs with `issue_token` and one `dma_wait` each.

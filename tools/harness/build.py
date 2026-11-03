@@ -10,8 +10,8 @@ Kernel objects, by source suffix (`SOURCE_KINDS`; C++ joins there later): `.s` i
 assembled with Peano `llvm-mc --triple=aie2 --filetype=obj`; `.ll` is compiled with
 Peano `llc -mtriple=aie2 --issue-limit=1` (one instruction per bundle, as
 scripts/isa-test.sh does for single-instruction tests); `.o` is copied. Each object's `core.symbol` is then renamed to the core's unique
-linker symbol with `llvm-objcopy --redefine-sym` (as tools/isa-multi-tile-gen.py
-does), so several cores can share one source symbol.
+linker symbol with `llvm-objcopy --redefine-sym` (the idiom the retired
+multi-tile ISA generator used), so several cores can share one source symbol.
 
 The aiecc invocation is the one scripts/isa-test.sh uses (Peano, no Chess).
 Tool paths come from the environment the workspace activates

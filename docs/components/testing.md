@@ -84,10 +84,12 @@ cargo test --lib
 ./scripts/emu-bridge-test.sh --sweep            # add event sweep across all tiles
 ./scripts/emu-bridge-test.sh --trace=pc-anchored ...  # add PC-anchored cycle trace comparison
 
-# ISA test harness (real NPU only)
-./scripts/isa-test.sh
+# ISA test harness (generate -> suite build -> hw -> emu -> compare -> analyze;
+# 200 cases: 177 single-instruction batches + 23 two-core cascade/stream pairs)
+./scripts/isa-test.sh [--seed N] [--filter PAT] [--tag NAME]
+python3 tools/isa-test-analyze.py build/isa-suite       # re-analyze the last run
 
-# Kernel suites (hand-written kernels we run ourselves; probes today, ISA tests next)
+# Kernel suites (hand-written kernels we run ourselves; probes and the ISA tests)
 # A suite is a directory of cases (tools/harness/suite.py); generators write it, never run it.
 export PYTHONPATH=tools
 python3 -m harness suite build   <suite>              # parallel; unchanged packages are reused (content hash)

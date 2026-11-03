@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ISA test dependency analysis.
 
-Reads the ISA test manifest and analysis results to determine which instruction
+Reads the ISA suite's test points and the analysis log of a run to determine which instruction
 failures might be caused by broken supporting instructions (loads, stores,
 vups, vsrs, etc.) versus genuine bugs in the target instruction.
 
@@ -15,14 +15,22 @@ results are unreliable. This tool maps those dependencies and flags which
 failures we can trust vs which we need to investigate more carefully.
 
 Usage:
-  python3 tools/isa-dep-analysis.py [--manifest PATH] [--results-dir PATH]
+  python3 tools/isa-dep-analysis.py [SUITE_DIR] [--results-dir PATH]
+
+SUITE_DIR defaults to build/isa-suite; the analysis log is that of the suite's last run
+(runs/emu-<run>/analysis.log, written by scripts/isa-test.sh).
 """
 
 import json
 import os
+import importlib
 import re
 import sys
 from collections import defaultdict
+
+from harness import suite as S
+
+last_tags = importlib.import_module("isa-test-analyze").last_tags
 
 
 def parse_analysis_results(results_dir: str) -> dict[str, tuple[int, int]]:
@@ -171,11 +179,10 @@ def classify_instruction(name: str) -> str:
     return "scalar_compute"
 
 
-def analyze_dependencies(manifest_path: str, results_dir: str):
+def analyze_dependencies(suite_dir: str, results_dir: str):
     """Main analysis: map instruction failures to their dependencies."""
 
-    with open(manifest_path) as f:
-        manifest = json.load(f)
+    manifest = {"batches": S.load_suite(suite_dir).case_entries()}
 
     results = parse_analysis_results(results_dir)
 
@@ -367,43 +374,32 @@ def analyze_dependencies(manifest_path: str, results_dir: str):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="ISA test dependency analysis")
-    parser.add_argument("--manifest", default=None,
-                        help="Path to manifest.json")
+    parser.add_argument("suite_dir", nargs="?", default=None,
+                        help="ISA suite directory (default: build/isa-suite)")
     parser.add_argument("--results-dir", default=None,
-                        help="Path to results directory")
+                        help="Directory holding analysis.log (default: the last run's)")
     args = parser.parse_args()
 
-    # Auto-detect paths.
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_dir = os.path.dirname(script_dir)
-
-    manifest = args.manifest or os.path.join(
-        project_dir, "build/isa-tests/manifest.json")
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    suite_dir = args.suite_dir or os.path.join(project_dir, "build/isa-suite")
     results_dir = args.results_dir
-
     if not results_dir:
-        # Find the latest results directory.
-        base = os.path.join(project_dir, "build/isa-test-results")
-        if os.path.islink(os.path.join(base, "latest")):
-            results_dir = os.path.realpath(os.path.join(base, "latest"))
-        else:
-            # Fall back to most recent date directory.
-            dates = sorted(
-                d for d in os.listdir(base)
-                if os.path.isdir(os.path.join(base, d)) and d.isdigit()
-            )
-            if dates:
-                results_dir = os.path.join(base, dates[-1])
+        try:
+            _, emu_tag = last_tags(suite_dir)
+        except S.SuiteError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        results_dir = os.path.join(suite_dir, "runs", emu_tag)
 
-    if not results_dir or not os.path.isdir(results_dir):
+    if not os.path.isdir(results_dir):
         print("ERROR: No results directory found", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Manifest:    {manifest}")
+    print(f"Suite:       {suite_dir}")
     print(f"Results dir: {results_dir}")
     print()
 
-    analyze_dependencies(manifest, results_dir)
+    analyze_dependencies(suite_dir, results_dir)
 
 
 if __name__ == "__main__":
