@@ -2,7 +2,7 @@
 class: core-compute-timing
 subsystem: compute-core memory-port / execution cycle timing
 posture: mechanism AND per-iteration magnitude modelled + HW-confirmed (bank-arbitration arc); DMA bank-demand cadence HW-derived and fixed; DMA memory-pressure events closed by the staging-FIFO model; producer core-vs-DMA conflict count fixed (C-cycle arbiter, 2026-07-15), residual stall-count phase-average tail documented
-status: scalar write-port collisions modelled (fixed 2026-11-03; shift-register width open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
+status: scalar write-port collisions modelled (fixed 2026-11-03); scalar-side register widths derived and fixed (2026-11-03; status-flag producers open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
 ---
 
 # Core Compute Timing Gaps
@@ -130,9 +130,59 @@ compare masks) asks the pure resolver `state::scalar_collision::resolve` when it
 Not probed: `mov SS` (`R_WA@6`, needs a stream), `sthb`, collisions of two writes to the S file
 among themselves, M vs DN cross-file on a shared unit. Found in passing: the wide (x) forms of
 `vabs_gtz`/`vneg_gtz`/`vneg_ltz`/`vsub_lt`/`vsub_ge`/`vmaxdiff_lt` wrote no compare mask in the
-emulator (fixed, `execute/wide_cmp_goldens.rs`); shift registers `s0-s3` hold 6 bits on silicon
-(`mov s0, r6` with `r6 = 0x66666666` reads back `0x26`) and 32 in the emulator (open, unrelated to
-the port model).
+emulator (fixed, `execute/wide_cmp_goldens.rs`); shift registers `s0-s3` held 6 bits on silicon
+and 32 in the emulator (fixed with every other register width, next section).
+
+## Scalar-side register widths: a write keeps only the register's own bits (FIXED, NPU1 silicon 2026-11-03)
+
+`mov s0, r6` with `r6 = 0x66666666` reads back `0x26` on silicon (6 bits); the emulator kept 32, as
+it did for `lr`, `LS`, `LE`, `DP`, `sp`, every control register and every status register.
+
+**Derivation** (`interpreter/state/register_widths.rs`): the width is TableGen's, the narrowest
+register class holding the register (`RegInfo.RegSize` of its classes, extracted into
+`RegisterClassDef::reg_size_bits`, `RegisterModel::register_width_bits`): the 20-bit classes
+(`AIE220BitRegisterClass`: `eP`, `eM`, `eDN`, `eDJ`, `eDC`, `eSpecial20` = LS, DP, lr, LE, SP,
+CORE_ID) give 20, the scalar classes 32. TableGen states a CLASS width and puts the shift, control and
+status registers in 32-bit scalar classes (`eS`, `mCRm`, `mSRm`), so where silicon keeps fewer bits
+`silicon_bits` narrows them (the only hand data; each entry below is a measured row). Reads: `mov r,
+<reg>` zero-extends every register except `m` and `dj`, which sign-extend their 20 bits.
+
+Silicon probe: `build/experiments/harness/bugs/widths` (`widths_gen.py`; 17 cases, eight patterns
+per register: all ones, `0x66666666`, `0xA5A5A5A5`, `0x5A5A5A5A`, bit 19, bit 31, `0x40`, `1`; HW
+r1 == r2 byte-identical; the probe restores every register it writes). Pinned in the ISA suite by
+batches 200-205 (68 test points, `ScalarWidthStrategy`, declared payload, EMU == HW).
+
+| Register(s) | Bits | Read-back | TableGen (class: RegSize) | Silicon (all ones -> readback) |
+|---|---|---|---|---|
+| r0-r31 | 32 | n/a | `eR`: 32 | `r9` `ffffffff` |
+| p0-p7 | 20 | zero-extended | `eP`: 20 | `p2..p5` `000fffff` (`0x5a5a5a5a` -> `000a5a5a`) |
+| m0-m7 | 20 | sign-extended | `eM`: 20 | `ffffffff` (`0x5a5a5a5a` -> `fffa5a5a`, bit 19 -> `fff80000`) |
+| dj0-dj7 | 20 | sign-extended | `eDJ`: 20 | `ffffffff`, same |
+| dn0-dn7, dc0-dc7 | 20 | zero-extended | `eDN`, `eDC`: 20 | `000fffff` (`0x5a5a5a5a` -> `000a5a5a`) |
+| LS, LE, DP, lr, sp | 20 | zero-extended | `eSpecial20`: 20 | `000fffff` |
+| CORE_ID | 20 | read only | `eSpecial20`: 20 | `col << 16 | row` (`00010002` at tile 1,2); writes ignored |
+| LC | 32 | n/a | `eRLC`/`mMvSclDst`: 32 only | `ffffffff` |
+| s0-s3 | 6 | zero-extended | `eS`: 32 | `0000003f` (`0x66666666` -> `26`) |
+| crSat | 2 | zero-extended | `mCRm`: 32 | `3` |
+| crRnd | 4 | zero-extended | `mCRm`: 32 | `f` |
+| crFPMask, crF2IMask, crF2FMask | 5 | zero-extended | `mCRm`: 32 | `1f` |
+| crSRSSign, crUPSSign, crPackSign, crUnpackSign, crVaddSign, crSCDEn, crMCDEn | 1 | zero-extended | `mCRm`: 32 | `1` |
+| srSS0 | 2 | zero-extended | `mSRm`: 32 | `3` |
+| srFPFlags, srF2IFlags, srF2FFlags | 5 | zero-extended | `mSRm`: 32 | `1f` |
+| srCarry, srMS0, srSRS_of, srUPS_of, srCompr_uf, srSparse_of | 1 | zero-extended | `mSRm`: 32 | `1` |
+
+p6/p7, p0/p1 and the m/dn/dj/dc indices not probed take the class width; the m0/m7 and dn/dj/dc 0/7
+probes showed the eight registers of a file alike. The pointer and modifier masks were 20 bits in the
+emulator already (from the tile address mask), but `dn`/`dc` sign-extended on a scalar read where
+silicon zero-extends (fixed), and `lr`/`LS`/`LE`/`DP`/`sp`, the control and the status registers kept
+32 bits.
+
+Open: six status registers were not modelled at all (`mov srCarry, r6` was dropped, a read gave 0); they
+are now plain slots that keep what a move wrote, masked to their width. **Nothing sets them**: no
+producer exists for `srCarry`, `srSRS_of`, `srUPS_of` (saturation overflow of SRS/UPS) or the
+floating-point flag registers `srFPFlags`/`srF2IFlags`/`srF2FFlags`, so a kernel that reads one after
+the operation that should set it sees 0. The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`,
+`srSparse_of`) keep their producers.
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
 
