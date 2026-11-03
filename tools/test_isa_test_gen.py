@@ -4490,3 +4490,13 @@ class TestHollowSingleTileFixes:
         assert variants["VCLR_vclr"] == "_preload_output"
         assert variants["PADDA_sp_imm"] == "_observe_sp"
         assert next(t for t in last if t["instruction"] == "VCLR_vclr")["zero_expected"]
+
+
+class TestBranchLlJzTaken:
+    def test_jz_taken_has_a_zero_condition_the_compiler_cannot_fold(self):
+        ll, meta, _, _ = isa_test_gen.generate_branch_ll()
+        body = ll[ll.index("define internal void @_branch_jz_taken"):]
+        body = body[:body.index("\n}\n")]
+        assert "store volatile i32 0, ptr %slot" in body
+        assert "load volatile i32, ptr %slot" in body
+        assert "%in" not in body.split("entry:")[1], "random input is never zero"

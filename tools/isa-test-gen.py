@@ -4101,7 +4101,12 @@ done:
     helpers.append(("@_branch_jz_taken", 4, 8, """\
 define internal void @_branch_jz_taken(ptr %in, ptr %out) {
 entry:
-  %cv = load volatile i32, ptr %in, align 4
+  ; The condition must be zero at run time without the compiler seeing it: random input never
+  ; is, and a constant folds the branch away.  A volatile round trip through the slot the
+  ; result overwrites afterwards gives a zero.
+  %slot = getelementptr i8, ptr %out, i64 4
+  store volatile i32 0, ptr %slot, align 4
+  %cv = load volatile i32, ptr %slot, align 4
   %cond = icmp eq i32 %cv, 0
   store volatile i32 170, ptr %out, align 4
   br i1 %cond, label %taken, label %not_taken

@@ -221,11 +221,14 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
 
     # Hardware payload bytes of every test point, grouped by instruction (hollow guard).
     hw_by_instr = defaultdict(list)
+    zero_expected = set()      # instructions with a test whose answer is zero by definition
     for case in suite.cases:
         for test in suite.case_meta(case).get("tests", []):
             data = _read_payload(suite, hw_tag, case, test)
-            if data is not None and not test.get("zero_expected"):
+            if data is not None:
                 hw_by_instr[test["instruction"]].append(data)
+            if test.get("zero_expected"):
+                zero_expected.add(test["instruction"])
     hollow_found = []
 
     for case in suite.cases:
@@ -263,7 +266,7 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
             # `zero_expected`: the answer is zero by definition (vclr on a loaded register).
             hollow = (hollow_reason(hw_payload, _read_variants(suite, hw_tag, case, test),
                                     hw_by_instr[name], declared="payload" in test)
-                      if hw_payload is not None and not test.get("zero_expected") else None)
+                      if hw_payload is not None and name not in zero_expected else None)
             if hollow:
                 hollow_found.append((name, batch_idx, hollow))
                 passed = False
