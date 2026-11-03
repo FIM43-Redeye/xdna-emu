@@ -39,7 +39,6 @@ iteration from the scalar r5), p3 = delta table cursor, p4 = load record cursor.
 from __future__ import annotations
 
 import argparse
-import json
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -48,8 +47,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
-from harness.topology import Buffer, Core, TileRef, Topology, to_dict      # noqa: E402
+from harness import suite                                                  # noqa: E402
+from harness.topology import Buffer, Core, TileRef, Topology              # noqa: E402
 
+CORE = "k"                       # the one core; its output is the suite result `k.out.bin`
 MARKER = 0xEE
 DATA_OFF, MARK_OFF, WIN_OFF = 0, 64, 128
 WIN_BYTES = 1024
@@ -372,14 +373,12 @@ def kernel_asm(cases: list[Case], tag: str = "k") -> str:
 
 # -- topology -----------------------------------------------------------------
 
-def topology(name: str, cases: list[Case], out_dir: Path) -> Topology:
-    out_dir = Path(out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    src = out_dir / f"{name}.s"
-    src.write_text(kernel_asm(cases, tag=name.replace("-", "_")))
-    return Topology(name, (Core("k", TileRef(0, 2), src, args=(
+def case_topology(name: str, cases: list[Case]) -> tuple[Topology, str]:
+    """One-core topology for a packed kernel, and its asm (the source is `kernel.s` in the case dir)."""
+    asm = kernel_asm(cases, tag=name.replace("-", "_"))
+    return Topology(name, (Core(CORE, TileRef(0, 2), Path("kernel.s"), args=(
         Buffer("in", "in", IN_BYTES, data=in_bytes()),
-        Buffer("out", "out", out_bytes(cases)))),), device="auto")
+        Buffer("out", "out", out_bytes(cases)))),), device="auto"), asm
 
 
 def pack(cases: list[Case], budget: int = OUT_BUDGET) -> list[list[Case]]:
@@ -609,24 +608,23 @@ class ManifestMismatch(RuntimeError):
     pass
 
 
-def load_manifest(path: Path) -> list[dict]:
-    """Kernel list of a generation's manifest; raises ManifestMismatch unless it was written by
-    a generator with the same `layout_fingerprint` (old captures would be silently misread)."""
-    m = json.loads(Path(path).read_text())
-    if not isinstance(m, dict) or "layout_fingerprint" not in m:
-        raise ManifestMismatch(f"{path}: no layout_fingerprint (written by an older generator); "
+def load_manifest(suite_dir: Path) -> list[dict]:
+    """Kernel list of a generated suite; raises ManifestMismatch unless it was written by a
+    generator with the same `layout_fingerprint` (old captures would be silently misread)."""
+    s = suite.load_suite(suite_dir)
+    if "layout_fingerprint" not in s.meta:
+        raise ManifestMismatch(f"{suite_dir}: no layout_fingerprint (written by an older generator); "
                                "regenerate and recapture, or stamp it after checking by hand")
-    if m["layout_fingerprint"] != layout_fingerprint():
-        raise ManifestMismatch(f"{path}: layout {m['layout_fingerprint']} (generator "
-                               f"{m.get('generator_rev')}), current generator is "
-                               f"{layout_fingerprint()} ({_git_rev()})")
-    return m["kernels"]
+    if s.meta["layout_fingerprint"] != layout_fingerprint():
+        raise ManifestMismatch(f"{suite_dir}: layout {s.meta['layout_fingerprint']} (generator "
+                               f"{s.git_rev}), current generator is {layout_fingerprint()} ({_git_rev()})")
+    return s.case_entries()
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("generate", help="write topology JSON + asm per kernel")
+    g = sub.add_parser("generate", help="write a suite: one case (topology + asm) per packed kernel")
     g.add_argument("out_dir")
     g.add_argument("--only", nargs="*", help="family keys (default all)")
     g.add_argument("--budget", type=int, default=OUT_BUDGET)
@@ -634,15 +632,16 @@ def main(argv=None) -> int:
     fams = [f for f in families() if not a.only or f.key in a.only]
     groups = pack(build_cases(fams), a.budget)
     out = Path(a.out_dir)
-    manifest = []
+    names = []
     for gi, grp in enumerate(groups):
         name = f"ldst_{gi:02d}"
-        t = topology(name, grp, out)
-        (out / f"{name}.json").write_text(json.dumps(to_dict(t), indent=2) + "\n")
-        manifest.append(dict(name=name, cases=[c.name for c in grp], out_bytes=out_bytes(grp)))
-    (out / "manifest.json").write_text(json.dumps(
-        dict(layout_fingerprint=layout_fingerprint(), generator_rev=_git_rev(), kernels=manifest),
-        indent=2) + "\n")
+        topo, asm = case_topology(name, grp)
+        suite.write_case(out, name, topo, files={"kernel.s": asm},
+                         meta=dict(name=name, cases=[c.name for c in grp], out_bytes=out_bytes(grp),
+                                   result=dict(core=CORE, buffer="out")))
+        names.append(name)
+    suite.write_suite_json(out, "ldst-align", "gen_ldst_align_probe.py", names,
+                           meta=dict(layout_fingerprint=layout_fingerprint()))
     print(f"{len(groups)} kernel(s), {sum(len(g) for g in groups)} case(s)")
     return 0
 

@@ -100,8 +100,9 @@ def test_depth_word_values_repeat_with_register_cycle():
     ("south", (0, 3), (0, 2)),
     ("east", (0, 2), (1, 2)),
 ])
-def test_smoke_topology_placement_and_validity(direction, prod, cons, tmp_path):
-    t = g.smoke_topology(direction, 4, tmp_path)
+def test_smoke_topology_placement_and_validity(direction, prod, cons):
+    t, files = g.smoke_case(direction, 4)
+    assert set(files) == {"producer.s", "consumer.s"}
     p = next(c for c in t.cores if c.name == "producer")
     c = next(c for c in t.cores if c.name == "consumer")
     assert (p.tile.col, p.tile.row) == prod and (c.tile.col, c.tile.row) == cons
@@ -111,19 +112,19 @@ def test_smoke_topology_placement_and_validity(direction, prod, cons, tmp_path):
     assert c.args[0].direction == "out" and c.args[0].size_bytes == 4 * 64
 
 
-def test_depth_topology_sizes(tmp_path):
-    t = g.depth_topology("south", 20, 777, tmp_path)
+def test_depth_topology_sizes():
+    t, files = g.depth_case("south", 20, 777)
     p, c = t.cores
     assert [a.direction for a in p.args] == ["out"]       # no inputs: no DMA start skew
     assert c.args[0].size_bytes == g.depth_consumer_out_bytes(20)
     assert p.args[0].size_bytes == g.depth_producer_out_bytes(20)
     assert validate_topology(t) == []
-    assert Path(p.source).is_file() and Path(c.source).is_file()
+    assert {str(p.source), str(c.source)} == set(files)
 
 
-def test_unknown_direction_rejected(tmp_path):
+def test_unknown_direction_rejected():
     with pytest.raises(ValueError):
-        g.smoke_topology("north", 2, tmp_path)
+        g.smoke_case("north", 2)
 
 
 # -- analysis ----------------------------------------------------------------
@@ -155,18 +156,20 @@ def test_analyze_depth_tolerates_pitch_jitter():
     assert g.analyze_depth(out, 6).buffered == 4
 
 
-def test_cli_generate_writes_loadable_topologies(tmp_path):
+def test_cli_generate_writes_a_loadable_suite(tmp_path):
+    from harness import suite
     rc = g.main(["generate", str(tmp_path), "--delays", "300", "--depth-k", "6"])
     assert rc == 0
-    jsons = sorted(tmp_path.glob("*.json"))
-    names = {j.stem for j in jsons}
-    assert {"smoke_south", "smoke_east"} <= names
-    assert any(n.startswith("depth_south") for n in names)
-    for j in jsons:
-        t = load_topology(j)
+    s = suite.load_suite(tmp_path)
+    assert {"smoke_south", "smoke_east"} <= set(s.cases)
+    assert any(n.startswith("depth_south") for n in s.cases)
+    depth = next(n for n in s.cases if n.startswith("depth_south"))
+    assert s.case_meta(depth)["k"] == 6 and s.case_meta(depth)["delay_nops"] == 300
+    for c in s.cases:
+        t = s.topology(c)
         assert validate_topology(t) == []
-        for c in t.cores:
-            assert Path(c.source).is_file()
+        for core in t.cores:
+            assert Path(core.source).is_file()
 
 
 @pytest.mark.parametrize("k", [1, 3, 8, 24])

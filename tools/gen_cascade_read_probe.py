@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cascade read-timing probes (where a `vmov x, SCD` stalls), for the topology harness.
+"""Cascade read-timing probes (where a `vmov x, SCD` stalls); writes a suite (harness/suite.py).
 
 One producer, one consumer, one cascade flow (same placement as gen_cascade_probe).
 The consumer runs a small program with `@ts` markers; each marker reads the core
@@ -20,7 +20,6 @@ the program stores at its `@store` markers.
 from __future__ import annotations
 
 import argparse
-import json
 import struct
 import sys
 from dataclasses import dataclass
@@ -30,7 +29,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import gen_cascade_probe as base                                   # noqa: E402
-from harness.topology import Buffer, Topology, to_dict             # noqa: E402
+from harness import suite                                           # noqa: E402
+from harness.topology import Buffer                                # noqa: E402
 
 TS_PAIRS = [(17, 16), (19, 18), (21, 20), (23, 22), (25, 24), (27, 26), (29, 28), (31, 30)]
 TS_SLOTS = len(TS_PAIRS)
@@ -149,24 +149,28 @@ def parse_result(case: str, consumer_out: bytes) -> ReadResult:
     return ReadResult(ts, [(ts[i + 1] - ts[i]) & 0xFFFFFFFF for i in range(n_ts - 1)], words)
 
 
-def topology(case: str, mode: str, late_iters: int, out_dir: Path, direction: str = "south") -> Topology:
+def read_case(case: str, mode: str, late_iters: int, direction: str = "south") -> base.Case:
     if mode not in ("absent", "present"):
         raise ValueError("mode is absent or present")
     prod_late = late_iters if mode == "absent" else 0
     cons_late = late_iters if mode == "present" else 0
     name = f"rd_{case}_{mode}_{direction}"
-    return base._pair(name, direction, out_dir,
+    return base._pair(name, direction,
                       producer_asm(reads_per_case(case), prod_late), consumer_asm(case, cons_late),
                       (Buffer("ts", "out", 16),), (Buffer("log", "out", consumer_out_bytes(case)),))
 
 
 def cmd_generate(args) -> int:
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    names = []
     for case in args.cases:
         for mode in args.modes:
-            t = topology(case, mode, args.late_iters, out, args.direction)
-            (out / f"{t.name}.json").write_text(json.dumps(to_dict(t), indent=2) + "\n")
+            topo, files = read_case(case, mode, args.late_iters, args.direction)
+            suite.write_case(out, topo.name, topo, files=files,
+                             meta={"case": case, "mode": mode, "late_iters": args.late_iters,
+                                   "direction": args.direction})
+            names.append(topo.name)
+    suite.write_suite_json(out, "cascade-read", "gen_cascade_read_probe.py", names)
     return 0
 
 

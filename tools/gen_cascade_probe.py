@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Cascade probes for the topology harness: smoke (data and order) and depth.
 
-Writes harness topology JSON plus hand-written `.s` kernels; everything runs
-through the harness CLI (`python3 -m harness build|hw|emu`). Two cores, one
+Writes a suite (harness/suite.py) of hand-written `.s` kernels, one case per topology; everything
+runs through the suite CLI (`python3 -m harness suite build|hw|emu|compare <dir> ...`, with
+PYTHONPATH=tools). Two cores, one
 `aie.cascade_flow`, producer on the north (flow South) or west (flow East) side.
 
 Smoke
@@ -48,8 +49,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
-from harness.topology import (Buffer, Cascade, Core, TileRef, Topology,    # noqa: E402
-                              to_dict)
+from harness import suite                                                  # noqa: E402
+from harness.topology import Buffer, Cascade, Core, TileRef, Topology     # noqa: E402
 
 WORD_BYTES = 64                 # one cascade word: 512 bits
 DEPTH_WORD_REGS = 12            # x0..x11 hold distinct words in the depth probe
@@ -262,38 +263,35 @@ def _placement(direction: str):
     return PLACEMENT[direction]
 
 
-def _pair(name: str, direction: str, out_dir: Path, prod_asm: str, cons_asm: str,
-          prod_args: tuple[Buffer, ...], cons_args: tuple[Buffer, ...]) -> Topology:
+Case = tuple[Topology, dict[str, str]]       # a topology and the files its sources name
+
+
+def _pair(name: str, direction: str, prod_asm: str, cons_asm: str,
+          prod_args: tuple[Buffer, ...], cons_args: tuple[Buffer, ...]) -> Case:
     (pc, pr), (cc, cr) = _placement(direction)
-    out_dir = Path(out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    psrc, csrc = out_dir / f"{name}.producer.s", out_dir / f"{name}.consumer.s"
-    psrc.write_text(prod_asm)
-    csrc.write_text(cons_asm)
-    return Topology(
+    topo = Topology(
         name=name,
-        cores=(Core("producer", TileRef(pc, pr), psrc, args=prod_args),
-               Core("consumer", TileRef(cc, cr), csrc, args=cons_args)),
+        cores=(Core("producer", TileRef(pc, pr), Path("producer.s"), args=prod_args),
+               Core("consumer", TileRef(cc, cr), Path("consumer.s"), args=cons_args)),
         links=(Cascade("producer", "consumer"),))
+    return topo, {"producer.s": prod_asm, "consumer.s": cons_asm}
 
 
-def smoke_topology(direction: str, n_words: int, out_dir: Path, form: str = "x",
-                   name: str | None = None) -> Topology:
+def smoke_case(direction: str, n_words: int, form: str = "x", name: str | None = None) -> Case:
     _placement(direction)
     size = n_words * WORD_BYTES
-    return _pair(name or f"smoke_{direction}", direction, out_dir,
+    return _pair(name or f"smoke_{direction}", direction,
                  producer_smoke_asm(n_words, form), consumer_smoke_asm(n_words, form),
                  (Buffer("words", "in", size, data=smoke_data(n_words)),),
                  (Buffer("words", "out", size),))
 
 
-def depth_topology(direction: str, k: int, delay_nops: int, out_dir: Path,
-                   name: str | None = None, pre_delay_nops: int = 0,
-                   delay_iters: int = 0, pre_delay_iters: int = 0) -> Topology:
+def depth_case(direction: str, k: int, delay_nops: int, name: str | None = None,
+               pre_delay_nops: int = 0, delay_iters: int = 0, pre_delay_iters: int = 0) -> Case:
     _placement(direction)
     suffix = (f"_p{pre_delay_nops}" if pre_delay_nops else "") + \
              (f"_L{delay_iters}" if delay_iters else "") + (f"_P{pre_delay_iters}" if pre_delay_iters else "")
-    return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}{suffix}", direction, out_dir,
+    return _pair(name or f"depth_{direction}_k{k}_d{delay_nops}{suffix}", direction,
                  producer_depth_asm(k, pre_delay_nops, pre_delay_iters),
                  consumer_depth_asm(k, delay_nops, delay_iters),
                  (Buffer("ts", "out", depth_producer_out_bytes(k)),),
@@ -302,23 +300,25 @@ def depth_topology(direction: str, k: int, delay_nops: int, out_dir: Path,
 
 # -- command line ------------------------------------------------------------
 
-def _write(t: Topology, out_dir: Path) -> None:
-    import json
-    (out_dir / f"{t.name}.json").write_text(json.dumps(to_dict(t), indent=2) + "\n")
-
-
 def cmd_generate(args) -> int:
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    cases: list[tuple[Case, dict]] = []
     for direction in PLACEMENT:
-        _write(smoke_topology(direction, args.smoke_words, out), out)
-    _write(smoke_topology("south", args.smoke_words, out, form="bm",
-                          name="smoke_south_bm"), out)
+        cases.append((smoke_case(direction, args.smoke_words),
+                      {"kind": "smoke", "direction": direction, "words": args.smoke_words}))
+    cases.append((smoke_case("south", args.smoke_words, form="bm", name="smoke_south_bm"),
+                  {"kind": "smoke", "direction": "south", "words": args.smoke_words, "form": "bm"}))
     for direction in PLACEMENT:
         for k in args.depth_k:
             for d in args.delays:
-                _write(depth_topology(direction, k, d, out, pre_delay_nops=args.pre,
-                                      delay_iters=args.loop_iters, pre_delay_iters=args.pre_loop_iters), out)
+                cases.append((depth_case(direction, k, d, pre_delay_nops=args.pre,
+                                         delay_iters=args.loop_iters, pre_delay_iters=args.pre_loop_iters),
+                              {"kind": "depth", "direction": direction, "k": k, "delay_nops": d,
+                               "pre_delay_nops": args.pre, "delay_iters": args.loop_iters,
+                               "pre_delay_iters": args.pre_loop_iters}))
+    for (topo, files), meta in cases:
+        suite.write_case(out, topo.name, topo, files=files, meta=meta)
+    suite.write_suite_json(out, "cascade", "gen_cascade_probe.py", [t.name for (t, _), _ in cases])
     return 0
 
 
@@ -332,7 +332,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("generate", help="write topology JSON and kernels")
+    g = sub.add_parser("generate", help="write a suite of cascade smoke and depth cases")
     g.add_argument("out_dir")
     g.add_argument("--smoke-words", type=int, default=8)
     g.add_argument("--depth-k", type=int, nargs="+", default=[24])

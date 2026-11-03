@@ -39,9 +39,14 @@ def test_cascade_reads_join_the_catalogue_only_when_enabled(monkeypatch):
     assert [i.key for i in g.cp.CATALOGUE[single:]] == g.CASCADE_KEYS
 
 
-def test_alignment_guard_refuses_an_unaligned_label(tmp_path, monkeypatch):
-    monkeypatch.setattr(g, "label_addresses", lambda pkg: {".Lcascwait": 0x48E})
-    with pytest.raises(SystemExit):
-        g.assert_aligned(tmp_path)
-    monkeypatch.setattr(g, "label_addresses", lambda pkg: {".Lcascwait": 0x490})
-    g.assert_aligned(tmp_path)
+def test_case_is_a_two_core_cascade_topology_with_a_matching_producer():
+    asm = "  vmov x8, SCD\n  vmov x9, SCD\n"
+    kernel = {"in_size": 32, "out_size": 256}
+    topo, prod = g.case_topology("k007", kernel, asm, bytes(32))
+    assert topo.name == "cascol_k007"
+    assert [(c.name, c.tile.col, c.tile.row) for c in topo.cores] == [("producer", 0, 3), ("consumer", 0, 2)]
+    assert [str(c.source) for c in topo.cores] == ["producer.s", "consumer.s"]
+    assert prod.count("vmov MCD, x0") == 2
+    assert [(l.src, l.dst) for l in topo.links] == [("producer", "consumer")]
+    consumer = topo.cores[1]
+    assert [b.size_bytes for b in consumer.args] == [32, 256]

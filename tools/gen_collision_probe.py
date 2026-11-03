@@ -775,12 +775,10 @@ def write_probe_suite(out_dir: str, name: str, kernels: list[tuple[dict, str]], 
     return {**meta, "kernels": [e for e, _ in kernels]}
 
 
-def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
-             unit: Optional[str] = None) -> dict:
-    os.makedirs(out_dir, exist_ok=True)
+def plan_kernels(limit: Optional[int] = None, only_new: bool = False,
+                 unit: Optional[str] = None) -> tuple[list[tuple[dict, str]], dict, dict]:
+    """The collision kernels as (case entry, asm), the suite meta, and the reservations they derive from."""
     res = reservations_of_catalogue()
-    with open(os.path.join(out_dir, "reservations.json"), "w") as f:
-        json.dump(res, f, indent=1)
     points = make_points(res, limit, only_new, unit)
     kernels: list[tuple[dict, str]] = []
     for dom in ("i", "f"):
@@ -805,7 +803,16 @@ def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
                             kernel_text(chunk, dom)))
             i += n
             k += 1
-    return write_probe_suite(out_dir, "collisions", kernels, {"catalogue": {i.key: i.asm for i in CATALOGUE}})
+    return kernels, {"catalogue": {i.key: i.asm for i in CATALOGUE}}, res
+
+
+def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
+             unit: Optional[str] = None) -> dict:
+    os.makedirs(out_dir, exist_ok=True)
+    kernels, meta, res = plan_kernels(limit, only_new, unit)
+    with open(os.path.join(out_dir, "reservations.json"), "w") as f:
+        json.dump(res, f, indent=1)
+    return write_probe_suite(out_dir, "collisions", kernels, meta)
 
 
 def generate_calibration(out_dir: str) -> dict:

@@ -61,3 +61,12 @@ def test_asm_assembles(case, fn, tmp_path):
     res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "k.o"), str(s)],
                          capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+def test_cli_generate_writes_a_loadable_suite(tmp_path):
+    from harness import suite
+    assert r.main([str(tmp_path), "--cases", "use_3", "two_2", "--modes", "present"]) == 0
+    s = suite.load_suite(tmp_path)
+    assert s.cases == ("rd_use_3_present_south", "rd_two_2_present_south")
+    assert s.case_meta("rd_two_2_present_south")["mode"] == "present"
+    assert s.topology("rd_use_3_present_south").cores[1].source.read_text()

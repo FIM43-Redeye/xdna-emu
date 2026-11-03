@@ -1,6 +1,7 @@
 """Tests for tools/gen_ldst_align_probe.py: catalogue, layout, packing, manifest guard, analysis
 on synthetic outputs that follow the silicon rule (floor to the access width)."""
 import json
+from pathlib import Path
 import struct
 import subprocess
 
@@ -132,25 +133,37 @@ def test_lut_lane_model_matches_recorded_silicon_values():
     assert g.lut_expected_lane(0x4200 + 17, 0, 64)[0] == 8
 
 
+def write_suite(tmp_path, meta):
+    from harness import suite
+    from harness.topology import Core, TileRef, Topology
+    topo = Topology("ldst_00", (Core(g.CORE, TileRef(0, 2), Path("kernel.s")),))
+    suite.write_case(tmp_path, "ldst_00", topo, files={"kernel.s": ""},
+                     meta=dict(name="ldst_00", cases=[], out_bytes=64))
+    suite.write_suite_json(tmp_path, "ldst-align", "test", ["ldst_00"], meta=meta, generator_rev="x")
+
+
 def test_manifest_with_the_current_fingerprint_loads(tmp_path):
-    m = tmp_path / "manifest.json"
-    m.write_text(json.dumps(dict(layout_fingerprint=g.layout_fingerprint(), generator_rev="x",
-                                 kernels=[dict(name="ldst_00", cases=[], out_bytes=64)])))
-    assert g.load_manifest(m)[0]["name"] == "ldst_00"
+    write_suite(tmp_path, dict(layout_fingerprint=g.layout_fingerprint()))
+    assert g.load_manifest(tmp_path)[0]["name"] == "ldst_00"
 
 
 def test_manifest_from_another_layout_is_refused(tmp_path):
-    m = tmp_path / "manifest.json"
-    m.write_text(json.dumps(dict(layout_fingerprint="0" * 16, generator_rev="old", kernels=[])))
+    write_suite(tmp_path, dict(layout_fingerprint="0" * 16))
     with pytest.raises(g.ManifestMismatch):
-        g.load_manifest(m)
+        g.load_manifest(tmp_path)
 
 
 def test_manifest_without_a_fingerprint_is_refused(tmp_path):
-    m = tmp_path / "manifest.json"
-    m.write_text(json.dumps([dict(name="ldst_00", cases=[], out_bytes=64)]))
+    write_suite(tmp_path, {})
     with pytest.raises(g.ManifestMismatch):
-        g.load_manifest(m)
+        g.load_manifest(tmp_path)
+
+
+def test_a_packed_kernel_becomes_a_one_core_topology():
+    topo, asm = g.case_topology("ldst_03", g.pack(g.build_cases())[0])
+    (core,) = topo.cores
+    assert (core.name, str(core.source), topo.device) == ("k", "kernel.s", "auto")
+    assert core.args[1].size_bytes == g.out_bytes(g.pack(g.build_cases())[0]) and "test_kernel" in asm
 
 
 def test_fingerprint_changes_when_a_case_changes(monkeypatch):
