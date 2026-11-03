@@ -2,7 +2,7 @@
 class: core-compute-timing
 subsystem: compute-core memory-port / execution cycle timing
 posture: mechanism AND per-iteration magnitude modelled + HW-confirmed (bank-arbitration arc); DMA bank-demand cadence HW-derived and fixed; DMA memory-pressure events closed by the staging-FIFO model; producer core-vs-DMA conflict count fixed (C-cycle arbiter, 2026-07-15), residual stall-count phase-average tail documented
-status: delayed-move write collision documented (open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
+status: scalar write-port collisions modelled (fixed 2026-11-03; shift-register width open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
 ---
 
 # Core Compute Timing Gaps
@@ -78,19 +78,61 @@ Probe-design findings (silicon):
   the whole load/store family and fixed in the emulator: see "Unaligned accesses" in
   [`addressing.md`](addressing.md).
 
-## Delayed scalar moves: a colliding `mov` drops the write (open, NPU1 silicon 2026-11-03)
+## Scalar write-port collisions: a delayed write dropped or ORed (FIXED, NPU1 silicon 2026-11-03)
 
-`mov.dN dst, src` (N = 1..6) writes `dst` N+1 cycles after issue, from the source read at issue;
-the emulator models that (`execute_mov`, result latency from the schedule; probe
-`build/experiments/harness/pairs/probe3c`, 7 delays x 14 capture points, EMU == HW).
+`mov.dN dst, src` (N = 1..6) writes `dst` N+1 cycles after issue, from the source read at issue
+(`execute_mov`, result latency from the schedule; probe `build/experiments/harness/pairs/probe3c`).
+Silicon **drops that write** when another scalar write lands in the same cycle through the same
+write port: `mov.d1 r1, r2` then `mov r5, r6` makes `r1` keep its old value for good. The compilers
+never emit such schedules (TableGen's resource model forbids them); hand-written assembly, fuzzers
+and suite tests do.
 
-Silicon also **drops the delayed write** when a plain scalar move lands in the same cycle: a
-`mov` or `movxm` issued exactly N cycles after `mov.dN` makes `dst` keep its old value for good.
-Probe `build/experiments/harness/pairs/probe4` (interferer issued k bundles after the move,
-N = 1 and 3): `mov` and `movxm` lose the write at k = N only; `add` and `lda` never do. The
-emulator keeps the write. Only schedules TableGen's port model forbids reach it (the compiler
-never places a move there), and the ISA suite's delay tests avoid it on purpose (`add` as the
-interfering write); the other scalar writers that share the port are unprobed.
+**Port model, derived from TableGen** (`llvm-aie/.../aie2/AIE2Schedule.td`): `AIE2Schedule.td:73-96`
+names the r/s register write unit `RS_WM_PORT`; `II_MOVd1..6` hold it in cycle N (`:633-638`:
+`SimpleCycle<P_RM_PORT>, EmptyCycles<N-1>, SimpleCycle<RS_WM_PORT>`, result latency N+1), the plain
+movers (`II_MOV*` `:606-631`, `II_ADD_NC*` `:445-454`) in cycle 0, the vector extract and compare
+family (`II_VEXTRACT*`, `II_VCMP`, `II_VEQZ`, `II_VMAX_LT`, ... `:755-968`) in cycle 1. The other
+scalar write units are `R_WX_PORT` (ALU, `mul` in cycle 1), `R_WA_PORT` (`lda`/`mova`/`mov SS`, a load
+in cycle 6) and the per-file `P_WM_PORT`/`M_WM_PORT`/`DN_WM_PORT`/`DJ_WM_PORT`/`DC_WM_PORT`. An
+instruction holds its write unit in the cycle before its result lands (`def - 1`).
+
+**The rule on silicon** (510 trials in three suites, `build/experiments/harness/movd/p{1,2,3}`,
+probes `probe{1,2,3}.py`; HW r1 == r2 byte-identical on every case):
+
+1. *Same register file, same port, same landing cycle: the later-issued write survives, every
+   earlier one is dropped* (register keeps its old value). The interferer's own write always
+   survives. Of two delayed moves landing together the one issued second (shorter delay) wins;
+   with three, only the last survives.
+2. *Same register through two different ports in one cycle: the bitwise OR of both values*
+   (`mov.d3 r1` + `add r1` = `0x12345673 | 0x0f0f0f01`; `mova r1, #5` makes `..77`, not `..78`;
+   `lda r1` bundled with `mov.d6 r1`; `mul r1` with `mov.d1 r1`). The same port with the same
+   register is a drop, not an OR.
+3. *Different register files do not collide even where the schedule lists the same unit.* TableGen
+   **overpredicts**: `II_MOV_SCL_{RS(eS),P,M,D*}`, `II_ADD_NC_{P,M,..}` and `II_VEXTRACT_{P,M,..}` also
+   hold `RS_WM_PORT`, but `mov s0/p4/m1/dn1/dj1/dc1`, `add.nc` and `vextract` into them never drop a
+   `mov.dN` into `r1`. A write is therefore keyed by (unit, destination register file).
+4. Collides exactly when `k + (own hold cycle) = (the lead's hold cycle)`: `mov`/`movxm`/`add.nc` `k = N`;
+   `vextract`/`vlt`/`veqz`/`vmax_lt`/`vabs_gtz`/`vsub_lt` into `r` `k = N-1`; neighbours (+-1, +-2) never.
+   Other ports: `lda r` (`R_WA@6`) is dropped by `mova` at `k = 6`; `lda p/m/dn` by `mov` to the same file
+   at `k = 6` (not by `mov m1` for `lda p5`); `mul r` (`R_WX@1`) by `add`/`sub` at `k = 1` (not by
+   `movx crSat`, which writes no r register); `add`, `mul`, `lda`, `mova`, `movx`, `vadd` never drop
+   a `mov.dN`.
+
+**EMU** (branch `feat/movd-port`): `decode::ports::PortModel::scalar_defs` lists, per scalar result,
+the units its resolved itinerary holds in the cycle before it lands and the destination file
+(`PortUse::scalar_defs`, no unit named in code); the context logs every such write
+(`ExecutionContext::log_scalar_write`); a deferred write (`mov.dN`, `lda`, `mul`, vector extract and
+compare masks) asks the pure resolver `state::scalar_collision::resolve` when it lands. Tests:
+`scalar_collision` (rules), `decode/scalar_ports_goldens.rs` (derived ports of 30 instructions),
+`execute/scalar_port_goldens.rs` (decoded bytes through the executor), ISA suite batches 195-199
+(63 test points, declared payload, EMU == HW). Probe suites replay EMU == HW: p1 11/11, p2 6/6, p3 3/3.
+
+Not probed: `mov SS` (`R_WA@6`, needs a stream), `sthb`, collisions of two writes to the S file
+among themselves, M vs DN cross-file on a shared unit. Found in passing: the wide (x) forms of
+`vabs_gtz`/`vneg_gtz`/`vneg_ltz`/`vsub_lt`/`vsub_ge`/`vmaxdiff_lt` wrote no compare mask in the
+emulator (fixed, `execute/wide_cmp_goldens.rs`); shift registers `s0-s3` hold 6 bits on silicon
+(`mov s0, r6` with `r6 = 0x66666666` reads back `0x26`) and 32 in the emulator (open, unrelated to
+the port model).
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
 

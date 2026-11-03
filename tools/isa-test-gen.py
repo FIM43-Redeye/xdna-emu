@@ -3722,7 +3722,8 @@ class MovDelayStrategy(TestStrategy):
         dst takes the value the source had at issue.
     The captures are stores and the overwrite an `add`, not moves: on silicon a plain `mov` /
     `movxm` issued N cycles after `mov.dN` (its result lands in the cycle the delayed write
-    does) makes the delayed write vanish (docs/known-fidelity-gaps.md).
+    does) makes the delayed write vanish; those schedules are ScalarCollisionStrategy's, and
+    the plain tests here stay clear of them (docs/fidelity-gaps/core-compute-timing.md).
     """
 
     OLD, NEW, SAMPLED = 0, 4, 8
