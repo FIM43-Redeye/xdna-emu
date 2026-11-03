@@ -25,11 +25,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_acc_timing_probe import RECORD_BYTES, RECORD_WORDS, REF_DISTANCE  # noqa: E402
+from harness import suite  # noqa: E402
 
 
 def load_records(d, tag, kernel):
-    with open(os.path.join(d, tag, kernel["name"] + ".bin"), "rb") as f:
-        data = f.read()
+    data = suite.load_suite(d).output(tag, kernel["name"]).read_bytes()
     n = len(kernel["points"])
     return [struct.unpack_from(f"<{RECORD_WORDS}I", data, i * RECORD_BYTES) for i in range(n)]
 
@@ -136,8 +136,7 @@ def main(argv=None):
     ap.add_argument("--compare", metavar="TAG", help="compare the thresholds with another run, e.g. the emulator")
     args = ap.parse_args(argv)
     d = os.path.abspath(args.dir)
-    with open(os.path.join(d, "manifest.json")) as f:
-        m = json.load(f)
+    m = suite.load_suite(d).manifest()
     pairs = group_pairs(m["kernels"], args.tag, d)
     if args.compare:
         return compare(pairs, group_pairs(m["kernels"], args.compare, d), args.tag, args.compare)

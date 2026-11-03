@@ -254,3 +254,25 @@ def test_unaligned_labels_found_in_a_disassembly():
             "00000044 <.Lbad>:\n   44: nop\n")
     assert S.unaligned_labels(dump) == [".Lbad@0x44"]
     assert S.unaligned_labels("") == []
+
+
+def test_single_core_case_is_in_out_with_core_out_result(tmp_path):
+    S.write_single_core_case(tmp_path, "k0", "; asm\n", input_bytes=b"\x07" * 16, out_bytes=32,
+                             meta={"points": [1, 2]})
+    S.write_suite_json(tmp_path, "d", "g", ["k0"])
+    s = S.load_suite(tmp_path)
+    t = s.topology("k0")
+    (core,) = t.cores
+    assert (core.name, core.tile) == ("core", TileRef(0, 2))
+    assert [(b.name, b.direction, b.size_bytes, b.data) for b in core.args] == [
+        ("in", "in", 16, b"\x07" * 16), ("out", "out", 32, None)]
+    assert core.source.read_text() == "; asm\n"
+    assert s.case_entries() == [{"name": "k0", "points": [1, 2]}]
+
+
+def test_probe_views_manifest_source_object(tmp_path):
+    suite = make_suite(tmp_path, meta={"record_bytes": 128})
+    m = suite.manifest()
+    assert m["record_bytes"] == 128 and [k["name"] for k in m["kernels"]] == ["c0", "c1", "c2"]
+    assert suite.kernel_source("c1") == tmp_path / "cases" / "c1" / "kernel.s"
+    assert suite.kernel_object("c1") == tmp_path / "pkgs" / "c1" / "phase_0" / "core.o"

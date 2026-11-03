@@ -38,8 +38,9 @@ each hypothesis predicts without any model.
 
   python3 tools/gen_collision_probe.py generate <out-dir> [--limit N]
   python3 tools/gen_collision_probe.py calibrate <out-dir>
-Run with tools/run_acc_timing_probe.py (build / hw / emu); analyse with
-tools/analyze_collision_probe.py.
+Writes a suite (tools/harness/suite.py): run it with
+`python3 -m harness suite build|hw|emu|compare <out-dir> ...` (PYTHONPATH=tools); analyse
+with tools/analyze_collision_probe.py.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import gen_acc_timing_probe as base  # noqa: E402
+from harness import suite  # noqa: E402
 
 isa_gen = base.isa_gen
 nops = base.nops
@@ -760,17 +762,27 @@ def text_size(text: str) -> int:
         return int(sz)
 
 
+def write_probe_suite(out_dir: str, name: str, kernels: list[tuple[dict, str]], meta: dict) -> dict:
+    """Write one case per (entry, asm) kernel plus `suite.json`; returns the old manifest shape
+    ({in_size, record_bytes, kernels, ...meta}) for callers that count points."""
+    table = TABLE_BYTES.ljust(IN_SIZE, b"\0")
+    for entry, asm in kernels:
+        suite.write_single_core_case(out_dir, entry["name"], asm, input_bytes=table,
+                                     out_bytes=entry["out_size"], meta=entry)
+    meta = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, **meta}
+    suite.write_suite_json(out_dir, name, "gen_collision_probe.py",
+                           [e["name"] for e, _ in kernels], meta=meta)
+    return {**meta, "kernels": [e for e, _ in kernels]}
+
+
 def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
              unit: Optional[str] = None) -> dict:
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "input.bin"), "wb") as f:
-        f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
     res = reservations_of_catalogue()
     with open(os.path.join(out_dir, "reservations.json"), "w") as f:
         json.dump(res, f, indent=1)
     points = make_points(res, limit, only_new, unit)
-    manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": [],
-                "catalogue": {i.key: i.asm for i in CATALOGUE}}
+    kernels: list[tuple[dict, str]] = []
     for dom in ("i", "f"):
         dp = [p for p in points if p["dom"] == dom]
         k = 0
@@ -787,23 +799,18 @@ def generate(out_dir: str, limit: Optional[int] = None, only_new: bool = False,
             while n > 1 and text_size(kernel_text(dp[i:i + n], dom)) > PROGRAM_BYTES - 512:
                 n = int(n * 0.85)
             chunk = dp[i:i + n]
-            stem = f"k{len(manifest['kernels']):03d}"
-            with open(os.path.join(out_dir, stem + ".s"), "w") as f:
-                f.write(kernel_text(chunk, dom))
-            manifest["kernels"].append({"name": stem, "dom": dom, "points": chunk, "in_size": IN_SIZE,
-                                        "out_size": max(4, len(chunk) * RECORD_BYTES)})
+            stem = f"k{len(kernels):03d}"
+            kernels.append(({"name": stem, "dom": dom, "points": chunk, "in_size": IN_SIZE,
+                             "out_size": max(4, len(chunk) * RECORD_BYTES)},
+                            kernel_text(chunk, dom)))
             i += n
             k += 1
-    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    return manifest
+    return write_probe_suite(out_dir, "collisions", kernels, {"catalogue": {i.key: i.asm for i in CATALOGUE}})
 
 
 def generate_calibration(out_dir: str) -> dict:
     """Witness calibration: C then a witness read d bundles later, d = 1..12, domain i."""
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "input.bin"), "wb") as f:
-        f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
     chunks = ["\n".join(prologue("i"))]
     pts = []
     for d in range(1, 13):
@@ -813,14 +820,10 @@ def generate_calibration(out_dir: str) -> dict:
         lines += [f"  padda [p1], #{RECORD_BYTES}"] + nops(4)
         chunks.append("\n".join(lines))
         pts.append({"kind": "calib", "d": d, "id": d - 1})
-    with open(os.path.join(out_dir, "k000.s"), "w") as f:
-        f.write(isa_gen.build_mega_program(chunks, len(pts) * RECORD_BYTES))
-    manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES,
-                "kernels": [{"name": "k000", "dom": "i", "points": pts, "in_size": IN_SIZE,
-                             "out_size": len(pts) * RECORD_BYTES}]}
-    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    return manifest
+    entry = {"name": "k000", "dom": "i", "points": pts, "in_size": IN_SIZE,
+             "out_size": len(pts) * RECORD_BYTES}
+    return write_probe_suite(out_dir, "collisions-calibration",
+                             [(entry, isa_gen.build_mega_program(chunks, len(pts) * RECORD_BYTES))], {})
 
 
 ADDSUB_OPS = [("vneg", "vneg cm5, cm3, {c}"), ("vadd", "vadd cm5, cm3, cm4, {c}"),
@@ -837,9 +840,7 @@ def generate_negate_probe(out_dir: str) -> dict:
     (r3), on ordinary patterns and on carry operands, with and without the shift16 bit (a
     per-point config word in r5). MACs run under the dense integer config r1."""
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "input.bin"), "wb") as f:
-        f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
-    kernels = []
+    kernels: list[tuple[dict, str]] = []
     specs = []
     for name, tmpl in ADDSUB_OPS:
         specs.append((name, [(tmpl, cfg, data, sh) for cfg in ("r1", "r3") for data in ("pat", "carry")
@@ -866,15 +867,10 @@ def generate_negate_probe(out_dir: str) -> dict:
             chunks.append("\n".join(lines))
             pts.append({"kind": "neg", "id": len(pts), "op": name, "cfg": cfg, "data": data,
                         "shift16": sh, "asm": asm})
-        stem = f"k{ki:03d}"
-        with open(os.path.join(out_dir, stem + ".s"), "w") as f:
-            f.write(isa_gen.build_mega_program(chunks, len(pts) * RECORD_BYTES))
-        kernels.append({"name": stem, "dom": "i", "points": pts, "in_size": IN_SIZE,
-                        "out_size": len(pts) * RECORD_BYTES})
-    manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": kernels}
-    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    return manifest
+        kernels.append(({"name": f"k{ki:03d}", "dom": "i", "points": pts, "in_size": IN_SIZE,
+                         "out_size": len(pts) * RECORD_BYTES},
+                        isa_gen.build_mega_program(chunks, len(pts) * RECORD_BYTES)))
+    return write_probe_suite(out_dir, "collisions-negate", kernels, {})
 
 
 def main(argv=None):

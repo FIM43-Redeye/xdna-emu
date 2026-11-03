@@ -9,7 +9,8 @@
   report  <dir> <hw-tag> [<emu-tag>]   classify every point's observation against the reference
                                    points and write <dir>/report_<hw-tag>.tsv
 
-Evidence in <dir>: manifest.json, kNNN.s, kNNN/kernel.o, <tag>/kNNN.bin.
+Evidence in <dir>, a suite (harness/suite.py): suite.json, cases/kNNN/{kernel.s,case.json},
+pkgs/kNNN/phase_0/core.o, runs/<tag>/kNNN/core.out.bin.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gen_collision_probe as gen  # noqa: E402
+from harness import suite  # noqa: E402
 
 COLLISION_RE = re.compile(r"COLLISION (\S+) cycle (\d+) : (\S+)@(\d+)\+(\d+) vs (\S+)@(\d+)\+(\d+)")
 POINT_RE = re.compile(r"//\s*-+\s*point (\d+):")
@@ -59,14 +61,14 @@ def run_checker(obj):
 
 
 def check(d):
-    with open(os.path.join(d, "manifest.json")) as f:
-        manifest = json.load(f)
+    s = suite.load_suite(d)
+    manifest = s.manifest()
     bad = []
     stats = {"pair": [0, 0], "control": [0, 0], "ref": [0, 0]}
     flagged_units = {}
     for k in manifest["kernels"]:
-        owners = bundle_owners(os.path.join(d, k["name"] + ".s"))
-        nb, cols = run_checker(os.path.join(d, k["name"], "kernel.o"))
+        owners = bundle_owners(s.kernel_source(k["name"]))
+        nb, cols = run_checker(s.kernel_object(k["name"]))
         assert 0 <= nb - len(owners) <= 2, (k["name"], nb, len(owners))
         by_point = {}
         for c in cols:
@@ -128,11 +130,11 @@ def ref_key(kind, ins_key, r, dom):
 
 def load_points(d, tag):
     """(manifest, points by id with their record bytes)"""
-    with open(os.path.join(d, "manifest.json")) as f:
-        manifest = json.load(f)
+    s = suite.load_suite(d)
+    manifest = s.manifest()
     pts = {}
     for k in manifest["kernels"]:
-        data = open(os.path.join(d, tag, k["name"] + ".bin"), "rb").read()
+        data = s.output(tag, k["name"]).read_bytes()
         for i, p in enumerate(k["points"]):
             pts[p["id"]] = (p, data[i * REC:(i + 1) * REC], k["dom"])
     return manifest, pts

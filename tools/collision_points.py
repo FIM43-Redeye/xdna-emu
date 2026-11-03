@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Which probe points does the itinerary resource checker flag, and where do EMU and silicon differ?
 
-Runs `collision-check elf` over every kernel.o of a probe directory (manifest.json from
-gen_acc_timing_probe.py), maps each collision back to the probe point whose assembly lines hold
+Runs `collision-check elf` over every kernel object of a probe suite (harness/suite.py), maps each collision back to the probe point whose assembly lines hold
 the colliding bundles (one assembly line is one bundle, a `;`-joined line is still one), and
 compares two output tags record by record.
 
@@ -20,6 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_acc_timing_probe import RECORD_BYTES  # noqa: E402
+from harness import suite  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHECKER = os.path.join(REPO, "target", "debug", "collision-check")
@@ -49,8 +49,7 @@ def bundle_points(asm_path):
 
 
 def read_records(d, tag, kernel):
-    with open(os.path.join(d, tag, kernel["name"] + ".bin"), "rb") as f:
-        data = f.read()
+    data = suite.load_suite(d).output(tag, kernel["name"]).read_bytes()
     return [data[i * RECORD_BYTES:(i + 1) * RECORD_BYTES] for i in range(len(kernel["points"]))]
 
 
@@ -62,14 +61,14 @@ def main(argv=None):
     ap.add_argument("--json")
     args = ap.parse_args(argv)
     d = os.path.abspath(args.dir)
-    with open(os.path.join(d, "manifest.json")) as f:
-        manifest = json.load(f)
+    s = suite.load_suite(d)
+    manifest = s.manifest()
     flagged, differing, cross = {}, {}, []
     total = 0
     for k in manifest["kernels"]:
         name = k["name"]
-        owner = bundle_points(os.path.join(d, name + ".s"))
-        out = subprocess.run([CHECKER, "elf", os.path.join(d, name, "kernel.o")],
+        owner = bundle_points(s.kernel_source(name))
+        out = subprocess.run([CHECKER, "elf", s.kernel_object(name)],
                              capture_output=True, text=True, check=True).stdout
         head = out.splitlines()[0]
         nb = int(re.search(r"bundles (\d+)", head).group(1))

@@ -27,7 +27,7 @@ kernel. A kernel packs several pairs; each point writes one RECORD_BYTES record.
 Usage
 -----
   python3 tools/gen_acc_timing_probe.py generate <out-dir> [--pairs SPEC ...]
-  python3 tools/run_acc_timing_probe.py build|run|... (see that tool)
+  python3 -m harness suite build|hw|emu|compare <out-dir> ...   (PYTHONPATH=tools)
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ from typing import Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "tools"))
+
+from harness import suite                                   # noqa: E402
 
 isa_gen = importlib.import_module("isa-test-gen")
 instr_gen = importlib.import_module("instr-test-gen")
@@ -455,20 +457,20 @@ def chunk(pairs, size):
 
 
 def generate(out_dir: str, pairs: list[tuple[str, str]], pairs_per_kernel: int) -> dict:
+    """Write a suite (harness/suite.py): one case per kernel, `case.json` = {name, points, sizes}."""
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "input.bin"), "wb") as f:
-        f.write(TABLE_BYTES.ljust(IN_SIZE, b"\0"))
-    manifest = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES, "kernels": []}
+    table = TABLE_BYTES.ljust(IN_SIZE, b"\0")
+    kernels = []
     for k, group in enumerate(chunk(pairs, pairs_per_kernel)):
         text, points = kernel_text(group)
-        stem = f"k{k:03d}"
-        with open(os.path.join(out_dir, stem + ".s"), "w") as f:
-            f.write(text)
-        entry = {"name": stem, "points": points, **kernel_geometry(points)}
-        manifest["kernels"].append(entry)
-    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=1)
-    return manifest
+        entry = {"name": f"k{k:03d}", "points": points, **kernel_geometry(points)}
+        suite.write_single_core_case(out_dir, entry["name"], text, input_bytes=table,
+                                     out_bytes=entry["out_size"], meta=entry)
+        kernels.append(entry)
+    meta = {"in_size": IN_SIZE, "record_bytes": RECORD_BYTES}
+    suite.write_suite_json(out_dir, "acc-timing", "gen_acc_timing_probe.py",
+                           [k["name"] for k in kernels], meta=meta)
+    return {**meta, "kernels": kernels}
 
 
 def main(argv=None):

@@ -3,14 +3,18 @@
 
   diff_probe_points.py <probe-dir> <hw-tag> <emu-tag> [--list]
 
-Works on both probe layouts: the collision probes (manifest `kernels[].points[]`, fixed
-RECORD_BYTES records, `kind` = pair | control | ref*) and the accumulator-timing probe
-(`record_bytes` in the manifest). Prints `differ/total` per kind and in total.
+Works on probe suites (harness/suite.py) of both kinds: the collision probes (case.json
+`points[]`, fixed RECORD_BYTES records, `kind` = pair | control | ref*) and the
+accumulator-timing probe (`record_bytes` in the suite meta). Prints `differ/total` per kind
+and in total.
 """
 import argparse
 import collections
-import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import suite  # noqa: E402
 
 
 def main():
@@ -21,13 +25,14 @@ def main():
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     d = os.path.abspath(a.dir)
-    m = json.load(open(os.path.join(d, "manifest.json")))
+    s = suite.load_suite(d)
+    m = s.manifest()
     rec = m.get("record_bytes", 320)
     tot, bad = collections.Counter(), collections.Counter()
     for k in m["kernels"]:
-        hw = open(os.path.join(d, a.hw, k["name"] + ".bin"), "rb").read()
+        hw = s.output(a.hw, k["name"]).read_bytes()
         try:
-            emu = open(os.path.join(d, a.emu, k["name"] + ".bin"), "rb").read()
+            emu = s.output(a.emu, k["name"]).read_bytes()
         except FileNotFoundError:
             emu = b""
         for i, p in enumerate(k["points"]):

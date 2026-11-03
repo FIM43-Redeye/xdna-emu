@@ -36,10 +36,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .emit import kernel_object
 from .build import BuildError, _peano_tool, build_package
 from .run import (RunError, build_ffi, build_test_host, git_rev, output_file_name,
                   read_run_record, run_package)
-from .topology import Topology, load_topology, to_dict
+from .topology import Buffer, Core, TileRef, Topology, load_topology, to_dict
 
 SUITE_FORMAT = 1
 DEFAULT_CORE, DEFAULT_BUFFER = "core", "out"
@@ -90,6 +91,20 @@ def write_case(suite_dir: str | Path, name: str, topology: Topology, *,
     (d / "case.json").write_text(json.dumps(meta or {}, indent=1) + "\n")
 
 
+def write_single_core_case(suite_dir: str | Path, name: str, asm: str, *, input_bytes: bytes,
+                           out_bytes: int, meta: dict[str, Any] | None = None,
+                           tile: tuple[int, int] = (0, 2)) -> None:
+    """The common probe case: one core running `asm` on one input, one output buffer.
+
+    The kernel ABI is `(in, out)`; the result is `core.out.bin`, the default
+    `Suite.output` looks for.
+    """
+    topo = Topology(name, (Core(DEFAULT_CORE, TileRef(*tile), Path("kernel.s"), args=(
+        Buffer("in", "in", len(input_bytes), data=input_bytes),
+        Buffer(DEFAULT_BUFFER, "out", out_bytes))),))
+    write_case(suite_dir, name, topo, files={"kernel.s": asm}, meta=meta)
+
+
 def write_suite_json(suite_dir: str | Path, name: str, generator: str, cases: Iterable[str], *,
                      meta: dict[str, Any] | None = None, hw_checks: Iterable[str] = (),
                      generator_rev: str | None = None) -> None:
@@ -124,6 +139,19 @@ class Suite:
     def case_entries(self) -> list[dict[str, Any]]:
         """Each case's `case.json` with its `name`, in suite order (what a probe analyzer iterates)."""
         return [{"name": c, **self.case_meta(c)} for c in self.cases]
+
+    def manifest(self) -> dict[str, Any]:
+        """Probe-analyzer view: the suite `meta` plus `kernels` = every case's `case.json` with its name."""
+        return {**self.meta, "kernels": self.case_entries()}
+
+    def kernel_source(self, case: str) -> Path:
+        """The first (for probes: only) core's source file."""
+        return self.topology(case).cores[0].source
+
+    def kernel_object(self, case: str) -> Path:
+        """The first core's built object, once `suite build` has run."""
+        core = self.topology(case).cores[0]
+        return pkg_dir(self.path, case) / "phase_0" / kernel_object(core)
 
     def output(self, tag: str, case: str) -> Path:
         """The case's result file: `case.json` `result` ({core, buffer}) or core.out."""
