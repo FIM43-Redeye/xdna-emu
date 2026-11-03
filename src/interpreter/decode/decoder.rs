@@ -2272,4 +2272,76 @@ mod tests {
         assert_eq!(uc, 1, "VEXTRACT x0 source use_cycle should be 1");
         assert_eq!(ub, Bypass::Mov, "VEXTRACT x0 source use_bypass should be Bypass::Mov");
     }
+
+    // -- core stream / cascade instructions (encodings from llvm-mc -triple aie2) --
+
+    fn decode_single(bytes: [u8; 4]) -> SlotOp {
+        let decoder = InstructionDecoder::load_default();
+        let bundle = decoder.decode(&bytes, 0).expect("should decode");
+        bundle
+            .slots()
+            .iter()
+            .flatten()
+            .find(|s| !s.is_nop())
+            .expect("one non-nop slot")
+            .clone()
+    }
+
+    #[test]
+    fn test_vmov_hi_fills_the_upper_half_of_the_cm_pair() {
+        // vmov.lo cm0 -> bml0 (AccumReg 0); vmov.hi cm0 -> bmh0 (AccumReg 1); cm2 -> 4 / 5.
+        let lo = decode_single([0x19, 0x01, 0x1c, 0x00]);
+        let hi = decode_single([0x19, 0x03, 0x1c, 0x00]);
+        let hi2 = decode_single([0x19, 0x0b, 0x1c, 0x00]);
+        assert_eq!(lo.semantic, Some(SemanticOp::CascadeRead));
+        assert_eq!(lo.dest, Some(Operand::AccumReg(0)));
+        assert_eq!(hi.dest, Some(Operand::AccumReg(1)));
+        assert_eq!(hi2.dest, Some(Operand::AccumReg(5)));
+    }
+
+    #[test]
+    fn test_stream_reads_are_blocking_unless_nb() {
+        let blocking = decode_single([0x19, 0x8a, 0x01, 0x00]); // mov r5, SS
+        let nb = decode_single([0x19, 0x8c, 0x01, 0x04]); // mov.nb r6, SS
+        assert_eq!(blocking.semantic, Some(SemanticOp::StreamRead));
+        assert!(blocking.blocking && !nb.blocking);
+        assert_eq!(blocking.dest, Some(Operand::ScalarReg(5)));
+        assert_eq!(nb.dest, Some(Operand::ScalarReg(6)));
+    }
+
+    #[test]
+    fn test_stream_writes_carry_blocking_and_tlast_from_the_mnemonic() {
+        let plain = decode_single([0x19, 0x06, 0x1e, 0x08]); // mov ms, r3
+        let tlast = decode_single([0x19, 0x06, 0x1e, 0x09]); // mov.tlast ms, r3
+        let nb_tlast = decode_single([0x19, 0x06, 0x1e, 0x0d]); // mov.nb.tlast ms, r3
+        for op in [&plain, &tlast, &nb_tlast] {
+            assert_eq!(op.semantic, Some(SemanticOp::StreamWrite));
+            assert_eq!(&op.sources[..], &[Operand::ScalarReg(3)]);
+        }
+        assert!(plain.blocking && !plain.tlast);
+        assert!(tlast.blocking && tlast.tlast);
+        assert!(!nb_tlast.blocking && nb_tlast.tlast);
+    }
+
+    #[test]
+    fn test_packet_header_writes_keep_their_operands_in_instruction_order() {
+        let ph = decode_single([0x19, 0x09, 0x15, 0x08]); // mov.ph ms, r4, #5
+        assert_eq!(ph.semantic, Some(SemanticOp::StreamWritePacketHeader));
+        assert_eq!(&ph.sources[..], &[Operand::ScalarReg(4), Operand::Immediate(5)]);
+        let cph = decode_single([0x19, 0x0e, 0x3d, 0x0d]); // mov.cph.nb.tlast ms, m1, #2, #3, r7
+        assert_eq!(cph.semantic, Some(SemanticOp::StreamWritePacketHeader));
+        assert_eq!(
+            &cph.sources[..],
+            &[Operand::ModifierReg(1), Operand::Immediate(2), Operand::Immediate(3), Operand::ScalarReg(7)]
+        );
+        assert!(!cph.blocking && cph.tlast);
+    }
+
+    #[test]
+    fn test_stream_status_registers_read_as_scalar_slots() {
+        use crate::interpreter::state::SS_STATUS_REG_INDEX;
+        let mv = decode_single([0x59, 0xb6, 0x47, 0x18]); // mov r1, srSS0
+        assert_eq!(mv.semantic, Some(SemanticOp::Copy));
+        assert_eq!(&mv.sources[..], &[Operand::ScalarReg(SS_STATUS_REG_INDEX)]);
+    }
 }

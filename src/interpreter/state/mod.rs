@@ -56,6 +56,8 @@ pub use registers::{
     CORE_ID_REG_INDEX,
     SPARSE_OF_REG_INDEX,
     COMPR_UF_REG_INDEX,
+    SS_STATUS_REG_INDEX,
+    MS_STATUS_REG_INDEX,
     SP_PTR_INDEX,
     // q-register views in the ControlReg index space.
     CTRL_BASE_Q,

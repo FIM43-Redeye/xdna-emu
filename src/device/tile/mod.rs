@@ -160,11 +160,12 @@ pub struct Tile {
 
     // === Stream port buffers (for core direct stream access) ===
     /// Stream input buffer for core direct reads (StreamReadScalar)
-    /// Maps port number to queue of incoming data
-    pub stream_input: [std::collections::VecDeque<u32>; 8],
+    /// Maps port number to queue of incoming `(word, tlast)` beats.
+    pub stream_input: [std::collections::VecDeque<(u32, bool)>; 8],
 
     /// Stream output buffer for core direct writes (StreamWriteScalar)
-    pub stream_output: [std::collections::VecDeque<u32>; 8],
+    /// Maps port number to queue of outgoing `(word, tlast)` beats.
+    pub stream_output: [std::collections::VecDeque<(u32, bool)>; 8],
 
     // === Cold data (routing configuration) ===
     /// Stream switch configuration (full functional model with FIFOs and local routes)

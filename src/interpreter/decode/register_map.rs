@@ -10,8 +10,9 @@ use xdna_archspec::aie2::isa::decoder_ffi::*;
 use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
-    SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D,
-    MOD_BASE_D3D, CTRL_BASE_Q, CTRL_BASE_QWL, CTRL_BASE_QWH, CTRL_BASE_QL, CTRL_BASE_QH,
+    SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, SS_STATUS_REG_INDEX, MS_STATUS_REG_INDEX, MOD_BASE_M,
+    MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D, MOD_BASE_D3D, CTRL_BASE_Q, CTRL_BASE_QWL,
+    CTRL_BASE_QWH, CTRL_BASE_QL, CTRL_BASE_QH,
 };
 
 /// Width hint for accumulator operands from LLVM register names.
@@ -106,6 +107,20 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         }
         "srCompr_uf" => {
             return Some(MappedOperand { operand: Operand::ScalarReg(COMPR_UF_REG_INDEX), accum_width: None })
+        }
+        // The stream-switch status registers a `mov SS` read / `mov.nb ms` write leaves: scalar
+        // slots, so a plain move reads them (`mov r1, srSS0`).
+        "srSS0" => {
+            return Some(MappedOperand {
+                operand: Operand::ScalarReg(SS_STATUS_REG_INDEX),
+                accum_width: None,
+            })
+        }
+        "srMS0" => {
+            return Some(MappedOperand {
+                operand: Operand::ScalarReg(MS_STATUS_REG_INDEX),
+                accum_width: None,
+            })
         }
         "CORE_ID" | "core_id" => {
             return Some(MappedOperand { operand: Operand::ScalarReg(CORE_ID_REG_INDEX), accum_width: None })

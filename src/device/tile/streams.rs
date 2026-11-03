@@ -22,20 +22,30 @@ pub const CASCADE_INPUT_DEPTH: usize = CASCADE_TOTAL_DEPTH - CASCADE_OUTPUT_DEPT
 impl Tile {
     // === Stream Port Access (for core direct stream reads/writes) ===
 
-    /// Push a word to the stream input buffer for a port.
+    /// Push a word (no TLAST) to the stream input buffer for a port.
+    pub fn push_stream_input(&mut self, port: u8, value: u32) {
+        self.push_stream_input_beat(port, value, false);
+    }
+
+    /// Push a `(word, tlast)` beat to the stream input buffer for a port.
     ///
     /// Called by the stream router when data arrives for this tile.
-    pub fn push_stream_input(&mut self, port: u8, value: u32) {
+    pub fn push_stream_input_beat(&mut self, port: u8, value: u32, tlast: bool) {
         if (port as usize) < self.stream_input.len() {
-            self.stream_input[port as usize].push_back(value);
+            self.stream_input[port as usize].push_back((value, tlast));
         }
     }
 
-    /// Pop a word from the stream input buffer for a port.
+    /// Pop a word from the stream input buffer for a port, dropping its TLAST.
+    pub fn pop_stream_input(&mut self, port: u8) -> Option<u32> {
+        self.pop_stream_input_beat(port).map(|(word, _)| word)
+    }
+
+    /// Pop a `(word, tlast)` beat from the stream input buffer for a port.
     ///
     /// Called by StreamReadScalar when the core reads from a stream port.
     /// Returns None if no data is available (should stall if blocking).
-    pub fn pop_stream_input(&mut self, port: u8) -> Option<u32> {
+    pub fn pop_stream_input_beat(&mut self, port: u8) -> Option<(u32, bool)> {
         if (port as usize) < self.stream_input.len() {
             self.stream_input[port as usize].pop_front()
         } else {
@@ -61,12 +71,17 @@ impl Tile {
         }
     }
 
-    /// Push a word to the stream output buffer for a port.
+    /// Push a word (no TLAST) to the stream output buffer for a port.
+    pub fn push_stream_output(&mut self, port: u8, value: u32) {
+        self.push_stream_output_beat(port, value, false);
+    }
+
+    /// Push a `(word, tlast)` beat to the stream output buffer for a port.
     ///
     /// Called by StreamWriteScalar when the core writes to a stream port.
-    pub fn push_stream_output(&mut self, port: u8, value: u32) {
+    pub fn push_stream_output_beat(&mut self, port: u8, value: u32, tlast: bool) {
         if (port as usize) < self.stream_output.len() {
-            self.stream_output[port as usize].push_back(value);
+            self.stream_output[port as usize].push_back((value, tlast));
         }
     }
 
@@ -79,10 +94,10 @@ impl Tile {
         }
     }
 
-    /// Pop a word from the stream output buffer for a port.
+    /// Pop a `(word, tlast)` beat from the stream output buffer for a port.
     ///
     /// Called by the stream router to collect data from this tile.
-    pub fn pop_stream_output(&mut self, port: u8) -> Option<u32> {
+    pub fn pop_stream_output_beat(&mut self, port: u8) -> Option<(u32, bool)> {
         if (port as usize) < self.stream_output.len() {
             self.stream_output[port as usize].pop_front()
         } else {

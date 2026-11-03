@@ -2,7 +2,7 @@
 class: core-compute-timing
 subsystem: compute-core memory-port / execution cycle timing
 posture: mechanism AND per-iteration magnitude modelled + HW-confirmed (bank-arbitration arc); DMA bank-demand cadence HW-derived and fixed; DMA memory-pressure events closed by the staging-FIFO model; producer core-vs-DMA conflict count fixed (C-cycle arbiter, 2026-07-15), residual stall-count phase-average tail documented
-status: cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
+status: delayed-move write collision documented (open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
 ---
 
 # Core Compute Timing Gaps
@@ -77,6 +77,20 @@ Probe-design findings (silicon):
 - `vst` clears the low 5 address bits on silicon (a store at +48 landed at +32). Derived for
   the whole load/store family and fixed in the emulator: see "Unaligned accesses" in
   [`addressing.md`](addressing.md).
+
+## Delayed scalar moves: a colliding `mov` drops the write (open, NPU1 silicon 2026-11-03)
+
+`mov.dN dst, src` (N = 1..6) writes `dst` N+1 cycles after issue, from the source read at issue;
+the emulator models that (`execute_mov`, result latency from the schedule; probe
+`build/experiments/harness/pairs/probe3c`, 7 delays x 14 capture points, EMU == HW).
+
+Silicon also **drops the delayed write** when a plain scalar move lands in the same cycle: a
+`mov` or `movxm` issued exactly N cycles after `mov.dN` makes `dst` keep its old value for good.
+Probe `build/experiments/harness/pairs/probe4` (interferer issued k bundles after the move,
+N = 1 and 3): `mov` and `movxm` lose the write at k = N only; `add` and `lda` never do. The
+emulator keeps the write. Only schedules TableGen's port model forbids reach it (the compiler
+never places a move there), and the ISA suite's delay tests avoid it on purpose (`add` as the
+interfering write); the other scalar writers that share the port are unprobed.
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
 

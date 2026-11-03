@@ -109,6 +109,19 @@ pub fn odd_parity_ok(word: u32) -> bool {
     word.count_ones() & 1 == 1
 }
 
+/// The header word a core's `mov.ph` puts on its stream: the stream id (low 5 bits of the
+/// register), the 3-bit packet type (all eight values pass through, unlike [`PacketType`]),
+/// and the writing tile's coordinates, under odd parity. Silicon (NPU1): `mov.ph ms, r, #t`
+/// from physical (1,3) with r = 0xab, t = 1 puts 0x0023100b on the wire.
+pub fn core_packet_header(stream_id: u32, packet_type: u32, src_col: u8, src_row: u8) -> u32 {
+    use xdna_archspec::aie2::packet::*;
+    let word = (stream_id & STREAM_ID_MASK)
+        | ((packet_type & TYPE_MASK) << TYPE_SHIFT as usize)
+        | ((src_row as u32 & SRC_ROW_MASK) << SRC_ROW_SHIFT as usize)
+        | ((src_col as u32 & SRC_COL_MASK) << SRC_COL_SHIFT as usize);
+    word | (((word.count_ones() & 1) ^ 1) << PARITY_SHIFT as usize)
+}
+
 impl PacketHeader {
     /// Create a new packet header.
     pub fn new(stream_id: u8, src_col: u8, src_row: u8) -> Self {

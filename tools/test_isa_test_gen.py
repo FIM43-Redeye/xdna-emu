@@ -3008,19 +3008,19 @@ class TestCascadeReadStrategy:
             {"name": "dst", "bit_width": 6, "operand_type": "composite_register",
              "register_kind": "MvBMXDst", "is_output": False,
              "signed": False, "scale": None},
-        ], slot="lda")
+        ], slot="lda", sched_class="II_VMOV_CASCADE_READ")
 
     def _make_vmov_hi_scd(self):
         return _make_instr("VMOV_HI", "vmov.hi", "vmov.hi\t$dst, SCD", [
             {"name": "dst", "bit_width": 4, "operand_type": "unknown",
              "is_output": False, "signed": False, "scale": None},
-        ], slot="lda")
+        ], slot="lda", sched_class="II_VMOV_CASCADE_READ")
 
     def _make_vmov_lo_scd(self):
         return _make_instr("VMOV_LO", "vmov.lo", "vmov.lo\t$dst, SCD", [
             {"name": "dst", "bit_width": 4, "operand_type": "unknown",
              "is_output": False, "signed": False, "scale": None},
-        ], slot="lda")
+        ], slot="lda", sched_class="II_VMOV_CASCADE_READ")
 
     def _make_mcd_write(self):
         return _make_instr("VMOV_mv_mcd", "vmov", "vmov\tMCD, $src", [
@@ -3081,9 +3081,15 @@ class TestCascadeReadStrategy:
 
     def test_consumer_output_size_half(self):
         strategy = isa_test_gen.CascadeReadStrategy()
-        # Half variants use marker-based verification (2 x 4-byte markers = 8).
-        assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 8
-        assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 8
+        # Both 512-bit halves of cm0 are stored, so the half the instruction did not fill shows.
+        assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 128
+        assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 128
+
+    def test_payload_is_the_consumers_whole_output(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        for instr, size in ((self._make_vmov_scd(), 64), (self._make_vmov_hi_scd(), 128)):
+            assert strategy.payload(instr) == [
+                {"core": "consumer", "buffer": "out", "offset": 0, "size": size}]
 
     def test_producer_asm_loads_data(self):
         strategy = isa_test_gen.CascadeReadStrategy()
@@ -3151,25 +3157,30 @@ class TestCascadeReadStrategy:
         cons = result["consumer_asm"]
         assert "wl0" in cons and "wh0" in cons
 
-    def test_consumer_hi_uses_markers(self):
-        """vmov.hi writes to cm (accumulator) -- uses marker-based verification."""
-        strategy = isa_test_gen.CascadeReadStrategy()
-        regs = {"dst": "cm0"}
-        result = strategy.generate_cascade_pair(self._make_vmov_hi_scd(), regs)
-        cons = result["consumer_asm"]
-        assert "#170" in cons  # before marker
-        assert "#204" in cons  # after marker
-        assert "vst" not in cons  # no vector store for accumulator
+    def _consumer_lines(self, instr, dst):
+        cons = isa_test_gen.CascadeReadStrategy().generate_cascade_pair(instr, {"dst": dst})["consumer_asm"]
+        return [l.strip().replace("\t", " ") for l in cons.split("\n")
+                if l.strip() and not l.strip().startswith("//")]
 
-    def test_consumer_lo_uses_markers(self):
-        """vmov.lo writes to cm (accumulator) -- uses marker-based verification."""
-        strategy = isa_test_gen.CascadeReadStrategy()
-        regs = {"dst": "cm0"}
-        result = strategy.generate_cascade_pair(self._make_vmov_lo_scd(), regs)
-        cons = result["consumer_asm"]
-        assert "#170" in cons  # before marker
-        assert "#204" in cons  # after marker
-        assert "vst" not in cons  # no vector store for accumulator
+    def test_consumer_waits_the_itinerary_latency_before_it_reads_the_result(self):
+        """II_VMOV_CASCADE_READ's result latency is 7: the first bundle that sees the value
+        issues 7 cycles after the read, i.e. 6 bundles between (silicon: 5 stores wl0 stale)."""
+        lines = self._consumer_lines(self._make_vmov_scd(), "x0")
+        i = lines.index("vmov x0, SCD")
+        assert lines[i + 1:i + 7] == ["nop"] * 6
+        assert lines[i + 7].startswith("vst wl0")
+
+    def test_consumer_hi_reads_both_halves_of_cm0(self):
+        """vmov.hi / vmov.lo fill one half of cm0; both halves are copied to x registers
+        and stored so the untouched half shows as such."""
+        for instr, dst in ((self._make_vmov_hi_scd(), "cm0"), (self._make_vmov_lo_scd(), "cm0")):
+            lines = self._consumer_lines(instr, dst)
+            i = next(k for k, l in enumerate(lines) if l.endswith("SCD"))
+            assert lines[i + 1:i + 7] == ["nop"] * 6
+            assert lines[i + 7:i + 9] == ["vmov x0, bml0", "vmov x1, bmh0"]
+            stores = [l for l in lines if l.startswith("vst")]
+            assert stores == ["vst wl0, [p0, #0]", "vst wh0, [p0, #32]",
+                              "vst wl1, [p0, #64]", "vst wh1, [p0, #96]"]
 
 
 # ===================================================================
@@ -3344,26 +3355,27 @@ class TestGenerateAll:
         assert "stream instruction" not in skip_reasons
         assert "stream switch status read (hangs without streams)" not in skip_reasons
 
-    def test_mov_d_dual_testing(self, isa_json_path, out_dir):
-        """mov.d* should appear in both normal batches and stream_pair batches."""
+    def test_mov_d_are_scalar_tests_not_stream_pairs(self, isa_json_path, out_dir):
+        """mov.d1-d6 are delayed scalar moves: value tests in normal batches plus one delay
+        test each, and no stream_pair batch."""
         manifest = generate_all(isa_json_path, out_dir)
-        stream_batches = [
-            b for b in manifest["batches"]
-            if b.get("source_type") == "stream_pair"
-        ]
-        normal_batches = [
-            b for b in manifest["batches"]
-            if b.get("source_type", "assembly") == "assembly"
-        ]
-        stream_instrs = {b["instruction"] for b in stream_batches if "instruction" in b}
-        has_d_stream = any("MOV_D" in i for i in stream_instrs)
-        assert has_d_stream, "Expected mov.d* in stream_pair batches"
-        normal_instrs = set()
-        for batch in normal_batches:
-            for test in batch.get("tests", []):
-                normal_instrs.add(test.get("instruction", ""))
-        has_d_normal = any("MOV_D" in i for i in normal_instrs)
-        assert has_d_normal, "Expected mov.d* in normal assembly batches"
+        pair_instrs = {b["instruction"] for b in manifest["batches"] if "instruction" in b}
+        assert not any(i.startswith("MOV_D") for i in pair_instrs)
+        points = [t for b in manifest["batches"] if b["source_type"] == "assembly"
+                  for t in b["tests"] if t["instruction"].startswith("MOV_D")]
+        for n in range(1, 7):
+            mine = [t for t in points if t["instruction"] == f"MOV_D{n}"]
+            assert len(mine) == 17, f"MOV_D{n}: 16 value combos + 1 delay test"
+
+    def test_pair_tests_declare_payload(self, isa_json_path, out_dir):
+        """Every pair test point names the output bytes it observes (not the markers)."""
+        manifest = generate_all(isa_json_path, out_dir)
+        for b in manifest["batches"]:
+            if b["source_type"] in ("cascade_pair", "stream_pair"):
+                t = b["tests"][0]
+                assert t["payload"], b["instruction"]
+                assert all(sl["core"] == "consumer" or sl["offset"] >= 8 for sl in t["payload"]), \
+                    f"{b['instruction']}: payload covers a marker word"
 
 
 # ===================================================================
@@ -4165,355 +4177,259 @@ class TestGenerateAllWithConversions:
 # ---------------------------------------------------------------------------
 
 class TestStreamStrategy:
-    """Tests for StreamStrategy -- stream read/write/status instructions."""
+    """StreamStrategy: core stream writes and reads as producer / consumer pairs."""
 
     # -- helpers to build mock instructions --
 
-    def _make_stream_write_nb(self):
-        """mov.nb ms, $src -- non-blocking scalar-to-master-stream write."""
-        return _make_instr("MOV_NB_mv_scl2ms", "mov.nb", "mov.nb\tms, $src", [
-            _make_reg_op("src", "scalar"),
-        ])
+    @staticmethod
+    def _write(name, mnemonic, operands):
+        asm = mnemonic + "\tms, " + ", ".join(f"${o['name']}" for o in operands)
+        return _make_instr(name, mnemonic, asm, operands)
 
-    def _make_stream_write_blocking(self):
-        """mov ms, $src -- blocking scalar-to-master-stream write."""
-        return _make_instr("MOV_mv_scl2ms", "mov", "mov\tms, $src", [
-            _make_reg_op("src", "scalar"),
-        ])
+    def _scl(self, name="MOV_mv_scl2ms", mnemonic="mov"):
+        return self._write(name, mnemonic, [_make_reg_op("src", "scalar")])
 
-    def _make_stream_write_ph(self):
-        """mov.ph ms, $id, $pcktType -- packet header write."""
-        return _make_instr("MOV_PH_mv_scl2ms", "mov.ph",
-                           "mov.ph\tms, $id, $pcktType", [
-            _make_reg_op("id", "scalar"),
-            _make_imm_op("pcktType", bit_width=3, signed=False),
-        ])
+    def _ph(self, name="MOV_mv_ph2ms", mnemonic="mov.ph"):
+        return self._write(name, mnemonic, [_make_reg_op("id", "scalar"),
+                                            _make_imm_op("pcktType", bit_width=3, signed=False)])
 
-    def _make_stream_write_cph(self):
-        """mov.cph ms, $addr, $nw, $op, $id -- config packet header."""
-        return _make_instr("MOV_CPH_mv_scl2ms", "mov.cph",
-                           "mov.cph\tms, $addr, $nw, $op, $id", [
-            _make_reg_op("addr", "modifier_m"),
-            _make_imm_op("nw", bit_width=5, signed=False),
-            _make_imm_op("op", bit_width=2, signed=False),
-            _make_reg_op("id", "scalar"),
-        ])
+    def _cph(self, name="MOV_mv_cph2ms", mnemonic="mov.cph"):
+        return self._write(name, mnemonic, [
+            _make_reg_op("addr", "modifier_m"), _make_imm_op("nw", bit_width=2, signed=False),
+            _make_imm_op("op", bit_width=2, signed=False), _make_reg_op("id", "scalar")])
 
-    def _make_stream_write_tlast(self):
-        """mov.nb.tlast ms, $src, $tlast -- with tlast register."""
-        return _make_instr("MOV_NB_TLAST_mv_scl2ms", "mov.nb.tlast",
-                           "mov.nb.tlast\tms, $src, $tlast", [
-            _make_reg_op("src", "scalar"),
-            _make_reg_op("tlast", "scalar"),
-        ])
+    def _read(self, name="MOV_mv_ss2scl", mnemonic="mov"):
+        return _make_instr(name, mnemonic, f"{mnemonic}\t$mRa, SS", [
+            _make_reg_op("mRa", "scalar", is_output=True)])
 
-    def _make_stream_read_d1(self):
-        """mov.d1 $dst, $src -- stream read with 1 delay slot."""
-        return _make_instr("MOV_D1", "mov.d1",
-                           "mov.d1\t$dst, $src", [
+    def _tlast_reg(self):
+        return _make_instr("MOV_NB_mv_scl2ms_doTlast_reg", "mov.nb", "mov.nb\tms, $src, $tlast", [
+            _make_reg_op("src", "scalar"), _make_reg_op("tlast", "scalar")])
+
+    def _mov_d1(self):
+        return _make_instr("MOV_D1", "mov.d1", "mov.d1\t$dst, $src", [
             _make_reg_op("dst", "scalar", is_output=True),
             {"name": "src", "bit_width": 7, "operand_type": "composite_register",
-             "register_kind": "MvSclSrc", "is_output": False,
-             "signed": False, "scale": None},
-        ])
+             "register_kind": "MvSclSrc", "is_output": False, "signed": False, "scale": None}])
 
-    def _make_ss_status_read(self):
-        """mov $mRa, SS -- stream switch status read."""
-        return _make_instr("MOV_mv_SS2scl", "mov",
-                           "mov\t$mRa, SS", [
-            _make_reg_op("mRa", "scalar", is_output=True),
-        ])
-
-    def _make_ss_status_read_nb(self):
-        """mov.nb $mRa, SS -- non-blocking SS read (mnemonic collision test)."""
-        return _make_instr("MOV_NB_mv_ss2scl", "mov.nb",
-                           "mov.nb\t$mRa, SS", [
-            _make_reg_op("mRa", "scalar", is_output=True),
-        ])
-
-    def _make_non_stream(self):
-        """add $mRx, $mRy, $mRz -- plain compute, not stream."""
+    def _add(self):
         return _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
-            _make_reg_op("mRx", "scalar"),
-            _make_reg_op("mRy", "scalar"),
-            _make_reg_op("mRz", "scalar"),
-        ])
+            _make_reg_op("mRx", "scalar"), _make_reg_op("mRy", "scalar"), _make_reg_op("mRz", "scalar")])
 
-    # -- can_test: accepts --
+    def _all_writes(self):
+        out = []
+        for form, make in (("scl2ms", self._scl), ("ph2ms", self._ph), ("cph2ms", self._cph)):
+            stem = {"scl2ms": "mov", "ph2ms": "mov.ph", "cph2ms": "mov.cph"}[form]
+            for suffix in ("", ".tlast", ".nb", ".nb.tlast"):
+                out.append(make(name=f"{form}{suffix}", mnemonic=stem + suffix))
+        return out
 
-    def test_can_test_stream_write_nb(self):
+    @staticmethod
+    def _lines(asm):
+        return [l.strip().replace("\t", " ") for l in asm.split("\n")
+                if l.strip() and not l.strip().startswith("//")]
+
+    def _pair(self, instr):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_write_nb())
-        assert can, f"Expected can_test=True: {reason}"
+        return strategy.generate_stream_pair(instr, strategy.generate_combos(instr)[0])
 
-    def test_can_test_stream_write_blocking(self):
+    # -- classification --
+
+    def test_every_write_form_and_both_reads_are_testable(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_write_blocking())
-        assert can, f"Expected can_test=True: {reason}"
+        for instr in self._all_writes():
+            assert strategy.can_test(instr)[0], instr["name"]
+            assert strategy._detect_mode(instr) == "stream_write"
+        for instr in (self._read(), self._read("MOV_NB_mv_ss2scl", "mov.nb")):
+            assert strategy.can_test(instr)[0]
+            assert strategy._detect_mode(instr) == "stream_read"
 
-    def test_can_test_stream_write_ph(self):
+    def test_mov_nb_ss_read_is_not_an_nb_write(self):
+        """`mov.nb` names both the NB write and the NB read: the asm string tells them apart."""
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_write_ph())
-        assert can, f"Expected can_test=True: {reason}"
+        assert strategy._detect_mode(self._read("MOV_NB_mv_ss2scl", "mov.nb")) == "stream_read"
+        assert strategy._detect_mode(self._scl("MOV_NB_mv_scl2ms", "mov.nb")) == "stream_write"
 
-    def test_can_test_stream_write_cph(self):
+    def test_delayed_moves_are_not_stream_instructions(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_write_cph())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not strategy.can_test(self._mov_d1())[0]
 
-    def test_can_test_stream_write_tlast_reg_rejected(self):
-        """doTlast_reg variants are rejected (unsupported by llvm-mc)."""
+    def test_tlast_register_forms_and_non_stream_are_rejected(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_write_tlast())
-        assert not can
-        assert "doTlast_reg" in reason
+        can, reason = strategy.can_test(self._tlast_reg())
+        assert not can and "doTlast_reg" in reason
+        assert not strategy.can_test(self._add())[0]
 
-    def test_can_test_stream_read_d1(self):
+    # -- sizes and payload --
+
+    def test_sizes(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_stream_read_d1())
-        assert can, f"Expected can_test=True: {reason}"
+        n = isa_test_gen.STREAM_WORDS
+        assert strategy.compute_producer_input_size(self._scl()) == 0
+        assert strategy.compute_producer_output_size(self._scl()) == 8
+        assert strategy.compute_producer_output_size(self._scl("x", "mov.nb")) == 8 + 4 * n
+        assert strategy.compute_consumer_output_size(self._scl()) == 8 * n
+        assert strategy.compute_consumer_output_size(self._read()) == 8 * n
+        assert strategy.compute_consumer_output_size(self._read("n", "mov.nb")) == 4 * isa_test_gen.NB_READ_RECORDS
 
-    def test_can_test_ss_status(self):
+    def test_payload_is_words_and_statuses_not_markers(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_ss_status_read())
-        assert can, f"Expected can_test=True: {reason}"
+        n = isa_test_gen.STREAM_WORDS
+        assert strategy.payload(self._scl()) == [
+            {"core": "consumer", "buffer": "out", "offset": 0, "size": 8 * n}]
+        nb = strategy.payload(self._scl("x", "mov.nb"))
+        assert {"core": "producer", "buffer": "out", "offset": 8, "size": 4 * n} in nb  # srMS0s, after the markers
 
-    def test_can_test_ss_status_nb(self):
-        """mov.nb $mRa, SS should route to ss_status, NOT stream_write."""
+    def test_write_variants_pair_each_word_with_its_status(self):
         strategy = isa_test_gen.StreamStrategy()
-        can, reason = strategy.can_test(self._make_ss_status_read_nb())
-        assert can, f"Expected can_test=True: {reason}"
+        variants = strategy.payload_variants(self._ph())
+        assert len(variants) == isa_test_gen.STREAM_WORDS
+        assert variants[1] == [{"core": "consumer", "buffer": "out", "offset": 4, "size": 4},
+                               {"core": "consumer", "buffer": "out", "offset": 20, "size": 4}]
+        assert strategy.payload_variants(self._read()) == []
 
-    # -- can_test: rejects --
+    # -- stream writes --
 
-    def test_rejects_non_stream(self):
-        strategy = isa_test_gen.StreamStrategy()
-        can, _ = strategy.can_test(self._make_non_stream())
-        assert not can
+    def test_producer_writes_distinct_words_with_the_instruction_under_test(self):
+        prod = self._lines(self._pair(self._scl())["producer_asm"])
+        writes = [l for l in prod if l.startswith("mov ms,")]
+        assert writes == ["mov ms, r0", "mov ms, r1", "mov ms, r2", "mov ms, r3"]
+        words = [l for l in prod if l.startswith("movxm")]
+        assert len({l.split("#")[1] for l in words}) == 4
+        assert all(int(l.split("#")[1], 16) > 0xFFFF for l in words), "full 32-bit words, not truncated immediates"
 
-    # -- _detect_mode --
+    def test_tlast_form_writes_words_one_and_three_and_the_plain_sibling_the_others(self):
+        for instr, plain in ((self._scl("t", "mov.tlast"), "mov ms,"), (self._ph("t", "mov.ph.tlast"), "mov.ph ms,"),
+                             (self._scl("t", "mov.nb.tlast"), "mov.nb ms,")):
+            prod = self._lines(self._pair(instr)["producer_asm"])
+            ops = [l.split()[0] for l in prod if " ms," in l]
+            tl = instr["mnemonic"]
+            assert ops == [tl.replace(".tlast", ""), tl, tl.replace(".tlast", ""), tl], instr["name"]
 
-    def test_detect_mode_stream_write(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_stream_write_nb()) == "stream_write"
+    def test_header_forms_vary_every_operand(self):
+        ph = [l for l in self._lines(self._pair(self._ph())["producer_asm"]) if l.startswith("mov.ph ms")]
+        assert [l.split("#")[1] for l in ph] == ["0", "1", "4", "7"], "packet types"
+        cph = [l for l in self._lines(self._pair(self._cph())["producer_asm"]) if l.startswith("mov.cph ms")]
+        assert len(cph) == 4 and len(set(cph)) == 4
+        assert any("m1" in l for l in cph), "address modifiers vary"
 
-    def test_detect_mode_stream_write_blocking(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_stream_write_blocking()) == "stream_write"
+    def test_nb_producer_reads_srms0_after_its_latency_and_stores_it_past_the_markers(self):
+        prod = self._lines(self._pair(self._scl("x", "mov.nb"))["producer_asm"])
+        i = prod.index("mov.nb ms, r0")
+        assert prod[i + 1:i + 3] == ["nop", "nop"], "srMS0 lands 3 cycles after the write"
+        assert prod[i + 3] == "mov r24, srMS0"
+        assert any(l == "st r24, [p0, #8]" for l in prod)
 
-    def test_detect_mode_stream_write_ph(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_stream_write_ph()) == "stream_write"
+    def test_blocking_producer_has_no_status_capture(self):
+        assert "srMS0" not in self._pair(self._scl())["producer_asm"]
 
-    def test_detect_mode_stream_write_cph(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_stream_write_cph()) == "stream_write"
+    def test_consumer_reads_each_beat_blocking_and_captures_srss0_after_its_latency(self):
+        cons = self._lines(self._pair(self._scl())["consumer_asm"])
+        i = cons.index("mov r16, SS")
+        assert cons[i + 1:i + 8] == ["nop"] * 7, "srSS0 lands one cycle after the word (8)"
+        assert cons[i + 8] == "mov r24, srSS0"
+        reads = [l for l in cons if l.endswith(", SS")]
+        assert reads == [f"mov r{16 + k}, SS" for k in range(4)]
+        assert "st r16, [p0, #0]" in cons and "st r27, [p0, #28]" in cons
 
-    def test_detect_mode_stream_read_d1(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_stream_read_d1()) == "stream_read"
+    # -- stream reads --
 
-    def test_detect_mode_ss_status(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_ss_status_read()) == "ss_status"
+    def test_blocking_read_consumer_uses_the_instruction_under_test_for_every_word(self):
+        cons = self._lines(self._pair(self._read())["consumer_asm"])
+        assert [l for l in cons if l.endswith(", SS")] == [f"mov r{16 + k}, SS" for k in range(4)]
+        prod = self._lines(self._pair(self._read())["producer_asm"])
+        assert [l.split()[0] for l in prod if " ms," in l] == ["mov", "mov", "mov.tlast", "mov"]
 
-    def test_detect_mode_ss_status_nb_not_stream_write(self):
-        """mov.nb $mRa, SS: SS check must come before ms check to avoid
-        routing this to stream_write (both share mnemonic 'mov.nb')."""
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy._detect_mode(self._make_ss_status_read_nb()) == "ss_status"
+    def test_nb_read_consumer_syncs_waits_reads_and_then_reads_the_empty_stream(self):
+        instr = self._read("MOV_NB_mv_ss2scl", "mov.nb")
+        cons = self._lines(self._pair(instr)["consumer_asm"])
+        reads = [l for l in cons if l.endswith(", SS")]
+        assert reads[0] == "mov r20, SS", "blocking sync read first"
+        assert reads[1:] == ["mov.nb r16, SS", "mov.nb r17, SS", "mov.nb r18, SS",
+                             "mov.nb r21, SS", "mov.nb r22, SS"]
+        sync = cons.index("mov r20, SS")
+        first_nb = cons.index("mov.nb r16, SS")
+        assert first_nb - sync > isa_test_gen.NB_SYNC_WAIT
+        assert "mov r21, #0" in cons and "mov r22, #0" in cons, "empty-read targets start at 0"
+        prod = self._lines(self._pair(instr)["producer_asm"])
+        assert [l.split()[0] for l in prod if " ms," in l] == ["mov", "mov", "mov.tlast", "mov.tlast"]
 
-    # -- generate_combos --
+    def test_the_consumer_reads_exactly_as_many_beats_as_the_producer_writes(self):
+        """Never hang silicon: a blocking read with no beat behind it stalls the core for good."""
+        for write in self._all_writes():
+            pair = self._pair(write)
+            n_w = sum(1 for l in self._lines(pair["producer_asm"]) if " ms," in l)
+            n_r = sum(1 for l in self._lines(pair["consumer_asm"]) if l.endswith(", SS"))
+            assert n_w == n_r == isa_test_gen.STREAM_WORDS, write["name"]
+        for read in (self._read(), self._read("n", "mov.nb")):
+            pair = self._pair(read)
+            n_w = sum(1 for l in self._lines(pair["producer_asm"]) if " ms," in l)
+            n_r = sum(1 for l in self._lines(pair["consumer_asm"]) if l.endswith(", SS") and "mov.nb r2" not in l)
+            assert n_w == isa_test_gen.STREAM_WORDS
+            assert n_r == (isa_test_gen.STREAM_WORDS if read["mnemonic"] == "mov" else 1 + (isa_test_gen.STREAM_WORDS - 1))
 
-    def test_combos_stream_write(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_stream_write_nb())
-        assert len(combos) == 1
-        assert "src" in combos[0]
 
-    def test_combos_stream_write_ph(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_stream_write_ph())
-        assert len(combos) == 1
-        assert "id" in combos[0]
-        assert "pcktType" in combos[0]
+class TestMovDelayStrategy:
+    """mov.d1-d6: the delay is observed with stores, the source sampling with an add."""
 
-    def test_combos_stream_write_cph(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_stream_write_cph())
-        assert len(combos) == 1
-        assert "addr" in combos[0]
-        assert "id" in combos[0]
+    def _mov_d(self, n):
+        return _make_instr(f"MOV_D{n}", f"mov.d{n}", f"mov.d{n}\t$dst, $src", [
+            _make_reg_op("dst", "scalar", is_output=True),
+            {"name": "src", "bit_width": 7, "operand_type": "composite_register",
+             "register_kind": "MvSclSrc", "is_output": False, "signed": False, "scale": None}])
 
-    def test_combos_stream_read(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_stream_read_d1())
-        assert len(combos) == 1
-        assert "dst" in combos[0]
-        assert "src" in combos[0]
+    def test_only_delayed_moves_are_claimed(self):
+        strategy = isa_test_gen.MovDelayStrategy()
+        assert all(strategy.can_test(self._mov_d(n))[0] for n in range(1, 7))
+        assert not strategy.can_test(_make_instr("MOV", "mov", "mov\t$a, $b", []))[0]
+        assert isa_test_gen.mov_delay_count(self._mov_d(4)) == 4
 
-    def test_combos_ss_status(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_ss_status_read())
-        assert len(combos) == 1
-        assert "mRa" in combos[0]
+    def test_captures_straddle_the_landing_cycle(self):
+        """mov.dN issues at C; dst changes at C+N+1: a store at C+N sees the old value, the
+        next bundle the new one."""
+        for n in range(1, 7):
+            asm = isa_test_gen.MovDelayStrategy().generate_test_point(self._mov_d(n), {"dst": "r1", "src": "r2"}, 0, 0)
+            lines = [l.strip() for l in asm.split("\n") if l.strip() and not l.strip().startswith("//")]
+            i = lines.index(f"mov.d{n} r1, r2")
+            assert lines[i + 1:i + n] == ["nop"] * (n - 1)
+            assert lines[i + n] == "st r1, [p6, #0]"
+            assert lines[i + n + 1] == "st r1, [p6, #4]"
 
-    # -- buffer sizes --
+    def test_source_is_changed_by_an_add_never_a_mov(self):
+        """A plain mov / movxm N cycles after mov.dN would make silicon drop its write."""
+        asm = isa_test_gen.MovDelayStrategy().generate_test_point(self._mov_d(3), {"dst": "r1", "src": "r2"}, 0, 0)
+        lines = [l.strip() for l in asm.split("\n") if l.strip()]
+        i = lines.index("mov.d3 r5, r6")
+        assert lines[i + 1] == "add r6, r6, r9"
 
-    def test_producer_input_size_always_zero(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy.compute_producer_input_size(self._make_stream_write_nb()) == 0
-        assert strategy.compute_producer_input_size(self._make_stream_read_d1()) == 0
-        assert strategy.compute_producer_input_size(self._make_ss_status_read()) == 0
+    def test_output_pointer_is_set_after_the_loads_that_use_p6(self):
+        asm = isa_test_gen.MovDelayStrategy().generate_test_point(self._mov_d(1), {"dst": "r1", "src": "r2"}, 1024, 64)
+        lines = [l.strip() for l in asm.split("\n") if l.strip()]
+        last_far_load = max(i for i, l in enumerate(lines) if l.startswith("lda"))
+        assert lines.index("mov p6, p1") > last_far_load
 
-    def test_producer_output_size(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy.compute_producer_output_size(self._make_stream_write_nb()) == 8
-        assert strategy.compute_producer_output_size(self._make_stream_read_d1()) == 8
-        assert strategy.compute_producer_output_size(self._make_ss_status_read()) == 8
 
-    def test_consumer_output_size_write(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy.compute_consumer_output_size(self._make_stream_write_nb()) == 4
+class TestStatusLatenciesAgainstTableGen:
+    """The status-register latencies the stream tests wait for are TableGen's."""
 
-    def test_consumer_output_size_read(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy.compute_consumer_output_size(self._make_stream_read_d1()) == 4
+    @pytest.fixture
+    def schedule(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        # checkout, or a worktree under .worktrees/, next to the sibling llvm-aie
+        for root in (os.environ.get("LLVM_AIE_PATH"), os.path.join(here, "..", "..", "llvm-aie"),
+                     os.path.join(here, "..", "..", "..", "..", "llvm-aie")):
+            if root:
+                p = os.path.join(root, "llvm/lib/Target/AIE/aie2/AIE2Schedule.td")
+                if os.path.exists(p):
+                    return open(p).read()
+        pytest.skip("llvm-aie AIE2Schedule.td not found")
 
-    def test_consumer_output_size_ss_status(self):
-        strategy = isa_test_gen.StreamStrategy()
-        assert strategy.compute_consumer_output_size(self._make_ss_status_read()) == 12
-
-    # -- generate_stream_pair: stream_write mode --
-
-    def test_stream_write_producer_has_markers(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        prod = result["producer_asm"]
-        assert "#170" in prod
-        assert "#204" in prod
-
-    def test_stream_write_producer_uses_p0(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        prod = result["producer_asm"]
-        assert "p0" in prod
-        assert "p1" not in prod
-
-    def test_stream_write_producer_has_test_instruction(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        prod = result["producer_asm"]
-        assert "mov.nb" in prod
-        assert "ms" in prod
-
-    def test_stream_write_consumer_reads_stream(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        cons = result["consumer_asm"]
-        assert "srSS0" in cons
-
-    def test_stream_write_consumer_stores_to_p0(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        cons = result["consumer_asm"]
-        assert "p0" in cons
-
-    def test_stream_write_consumer_has_nop_after_read(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
-        cons = result["consumer_asm"]
-        lines = cons.strip().split("\n")
-        # Find mov.d1 line, next should be nop
-        for i, line in enumerate(lines):
-            if "mov.d1" in line and i + 1 < len(lines):
-                assert "nop" in lines[i + 1]
-                break
-        else:
-            assert False, "mov.d1 not found in consumer"
-
-    def test_stream_write_cph_zeros_modifier(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"addr": "m0", "nw": "0", "op": "0", "id": "r0"}
-        result = strategy.generate_stream_pair(self._make_stream_write_cph(), regs)
-        prod = result["producer_asm"]
-        assert "m0" in prod
-        assert "#0" in prod
-
-    # -- generate_stream_pair: stream_read mode --
-
-    def test_stream_read_consumer_has_test_instruction(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "srSS0"}
-        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
-        cons = result["consumer_asm"]
-        assert "mov.d1" in cons
-        assert "srSS0" in cons
-
-    def test_stream_read_consumer_has_nop_sled(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "srSS0"}
-        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
-        cons = result["consumer_asm"]
-        lines = cons.strip().split("\n")
-        # Find mov.d1 line, nop should follow before the store
-        for i, line in enumerate(lines):
-            if "mov.d1" in line and i + 1 < len(lines):
-                assert "nop" in lines[i + 1]
-                break
-        else:
-            assert False, "mov.d1 not found in consumer"
-
-    def test_stream_read_producer_writes_ms(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "srSS0"}
-        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
-        prod = result["producer_asm"]
-        assert "ms" in prod
-
-    def test_stream_read_producer_has_markers(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "srSS0"}
-        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
-        prod = result["producer_asm"]
-        assert "#170" in prod
-        assert "#204" in prod
-
-    # -- generate_stream_pair: ss_status mode --
-
-    def test_ss_status_consumer_has_ss_read(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"mRa": "r0"}
-        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
-        cons = result["consumer_asm"]
-        assert "SS" in cons
-
-    def test_ss_status_consumer_has_markers(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"mRa": "r0"}
-        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
-        cons = result["consumer_asm"]
-        assert "#170" in cons
-        assert "#204" in cons
-
-    def test_ss_status_consumer_stores_value(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"mRa": "r0"}
-        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
-        cons = result["consumer_asm"]
-        # Should have 3+ stores: marker_before, marker_after, value
-        store_count = cons.count("st ")
-        assert store_count >= 3, f"Expected 3+ stores, got {store_count}"
-
-    def test_ss_status_producer_writes_ms(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"mRa": "r0"}
-        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
-        prod = result["producer_asm"]
-        assert "ms" in prod
+    def test_ss_and_ms_status_latencies(self, schedule):
+        import re
+        ss = re.search(r"InstrItinData<II_MOV_SS,[^\]]*\],\s*\[(\d+),\s*/\*def:srSS0\*/(\d+)\]", schedule)
+        assert ss, "II_MOV_SS itinerary not found"
+        assert int(ss.group(1)) == isa_test_gen._load_sched_latencies()["II_MOV_SS"]
+        assert int(ss.group(2)) == isa_test_gen.SS_STATUS_LATENCY
+        ms = re.search(r"InstrItinData<II_ST_MS_NB,\s*\[[^\]]*\],\s*\[\d+,\s*/\*def:srMS0\*/(\d+)\]", schedule)
+        assert ms, "II_ST_MS_NB itinerary not found"
+        assert int(ms.group(1)) == isa_test_gen.MS_STATUS_LATENCY

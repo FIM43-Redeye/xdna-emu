@@ -148,11 +148,56 @@ def last_tags(suite_dir: Path) -> tuple[str, str]:
     return f"hw-{run}", f"emu-{run}"
 
 
+def _read_payload(suite: S.Suite, tag: str, case: str, test: dict) -> Optional[bytes]:
+    """The bytes of the test point's payload (default: all its slices) on one backend."""
+    out = b""
+    for sl in test.get("payload", test["slices"]):
+        p = S.output_path(suite.path, tag, case, sl["core"], sl["buffer"])
+        if not p.is_file():
+            return None
+        part = _slice_of(p.read_bytes(), sl["offset"], sl["size"])
+        if part is None:
+            return None
+        out += part
+    return out
+
+
+def _read_variants(suite: S.Suite, tag: str, case: str, test: dict) -> list[bytes]:
+    """The bytes of each declared variant group of the test point's payload."""
+    groups = []
+    for group in test.get("variants", []):
+        data = b""
+        for sl in group:
+            p = S.output_path(suite.path, tag, case, sl["core"], sl["buffer"])
+            part = _slice_of(p.read_bytes(), sl["offset"], sl["size"]) if p.is_file() else None
+            data += part if part is not None else b""
+        groups.append(data)
+    return groups
+
+
+def hollow_reason(payload: bytes, variants: list[bytes], siblings: list[bytes]) -> Optional[str]:
+    """Why a test point looked at nothing, or None if it did look.
+
+    A test point is hollow when the hardware payload is the pre-run fill (all zero), or when
+    it is the same across what should be different inputs: the test point's own declared
+    variants, or every test point of its instruction (`siblings`, itself included).  Such a
+    test passes while checking nothing: both backends can agree on a constant.
+    """
+    if not any(payload):
+        return "payload is all zero (the pre-run fill)"
+    if len(variants) > 1 and len(set(variants)) == 1:
+        return f"payload identical across its {len(variants)} variants"
+    if len(siblings) > 1 and len(set(siblings)) == 1:
+        return f"payload identical across the instruction's {len(siblings)} test points"
+    return None
+
+
 @dataclass(frozen=True)
 class Totals:
     passed: int
     failed: int
     skipped_cases: int
+    hollow: int = 0
 
 
 def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = None,
@@ -163,6 +208,15 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
     category_stats = defaultdict(lambda: {"pass": 0, "fail": 0})
     skipped_cases = 0
     total_points = 0
+
+    # Hardware payload bytes of every test point, grouped by instruction (hollow guard).
+    hw_by_instr = defaultdict(list)
+    for case in suite.cases:
+        for test in suite.case_meta(case).get("tests", []):
+            data = _read_payload(suite, hw_tag, case, test)
+            if data is not None:
+                hw_by_instr[test["instruction"]].append(data)
+    hollow_found = []
 
     for case in suite.cases:
         tests = suite.case_meta(case).get("tests", [])
@@ -195,6 +249,13 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
 
             total_points += 1
 
+            hw_payload = _read_payload(suite, hw_tag, case, test)
+            hollow = (hollow_reason(hw_payload, _read_variants(suite, hw_tag, case, test),
+                                    hw_by_instr[name]) if hw_payload is not None else None)
+            if hollow:
+                hollow_found.append((name, batch_idx, hollow))
+                passed = False
+
             if passed:
                 instr_stats[name]["pass"] += 1
                 category_stats[cat]["pass"] += 1
@@ -206,6 +267,7 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
                         "batch": batch_idx,
                         "combo": test["combo_index"],
                         "operands": test.get("operands", {}),
+                        "hollow": hollow,
                     })
             instr_stats[name]["total"] += 1
 
@@ -266,11 +328,21 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
             # Show up to 3 failing combos.
             for detail in stats["details"][:3]:
                 ops = ", ".join(f"{k}={v}" for k, v in detail["operands"].items())
-                print(f"    batch={detail['batch']} combo={detail['combo']}  {ops}")
+                why = f"  HOLLOW: {detail['hollow']}" if detail.get("hollow") else ""
+                print(f"    batch={detail['batch']} combo={detail['combo']}  {ops}{why}")
             if len(stats["details"]) > 3:
                 print(f"    ... and {len(stats['details']) - 3} more")
 
-    return Totals(total_pass, total_fail, skipped_cases)
+    if hollow_found:
+        print()
+        print(f"=== Hollow test points ({len(hollow_found)}): pass by comparing constants ===")
+        by_reason = defaultdict(list)
+        for name, batch, reason in hollow_found:
+            by_reason[(name, reason)].append(batch)
+        for (name, reason), batches in sorted(by_reason.items()):
+            print(f"  {name:40s} x{len(batches)}  {reason}  (batches {sorted(set(batches))[:6]})")
+
+    return Totals(total_pass, total_fail, skipped_cases, len(hollow_found))
 
 
 def main():
@@ -299,7 +371,8 @@ def main():
     print(f"Tags:  {hw_tag} (hw) vs {emu_tag} (emu)")
     print()
 
-    analyze(suite, hw_tag, emu_tag, args.category, args.failing, args.summary)
+    totals = analyze(suite, hw_tag, emu_tag, args.category, args.failing, args.summary)
+    sys.exit(1 if totals.failed else 0)
 
 
 if __name__ == "__main__":

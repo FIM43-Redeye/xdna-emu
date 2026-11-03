@@ -161,7 +161,9 @@ ANALYZER="${PROJECT_DIR}/tools/isa-test-analyze.py"
 ANALYSIS_LOG="${SUITE_DIR}/runs/${EMU_TAG}/analysis.log"
 DETAIL_LOG="${SUITE_DIR}/runs/${EMU_TAG}/analysis-failing.log"
 echo "--- Phase 6: Test-Point Analysis ---"
+# A failed test point (EMU != HW, or a hollow test that checked nothing) fails the run.
 python3 "$ANALYZER" "$SUITE_DIR" "$HW_TAG" "$EMU_TAG" --summary 2>&1 | tee "$ANALYSIS_LOG"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || status=1
 python3 "$ANALYZER" "$SUITE_DIR" "$HW_TAG" "$EMU_TAG" --failing > "$DETAIL_LOG" 2>&1
 echo ""
 echo "Analysis logs written to:"

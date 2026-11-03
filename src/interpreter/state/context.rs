@@ -464,6 +464,11 @@ pub struct ExecutionContext {
     pending_unpacks: Vec<PendingUnpack>,
     pending_cascade_reads: std::collections::VecDeque<PendingCascadeRead>,
 
+    /// The last stream word the core took from its input (`mov SS`) and its TLAST: a
+    /// non-blocking read of an empty stream returns this word again (silicon), with the
+    /// valid bit of `srSS0` clear and the TLAST bit kept.
+    stream_read_latch: (u32, bool),
+
     /// Deferred accumulator add/subs awaiting their stage-3 source read
     /// (see PendingAccAdd).
     pending_acc_adds: Vec<PendingAccAdd>,
@@ -595,6 +600,9 @@ impl ExecutionContext {
         // stream yet).
         scalar.write(super::registers::SPARSE_OF_REG_INDEX, 0);
         scalar.write(super::registers::COMPR_UF_REG_INDEX, 0);
+        // The stream status registers read 0 before any stream access (silicon).
+        scalar.write(super::registers::SS_STATUS_REG_INDEX, 0);
+        scalar.write(super::registers::MS_STATUS_REG_INDEX, 0);
 
         Self {
             pc: 0,
@@ -632,6 +640,7 @@ impl ExecutionContext {
             pending_stores: Vec::new(),
             pending_unpacks: Vec::new(),
             pending_cascade_reads: std::collections::VecDeque::new(),
+            stream_read_latch: (0, false),
             pending_acc_adds: Vec::new(),
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
@@ -1457,6 +1466,16 @@ impl ExecutionContext {
     /// Store the raw value of an unmodelled control register.
     pub fn set_control_reg_raw(&mut self, id: u8, value: u32) {
         self.control_raw[(id & 0xF) as usize] = value;
+    }
+
+    /// The word and TLAST of the last stream beat the core read.
+    pub fn stream_read_latch(&self) -> (u32, bool) {
+        self.stream_read_latch
+    }
+
+    /// Record the beat a stream read just took (see `stream_read_latch`).
+    pub fn set_stream_read_latch(&mut self, word: u32, tlast: bool) {
+        self.stream_read_latch = (word, tlast);
     }
 
     /// Queue a cascade read for its hold stage (see [`PendingCascadeRead`]). Uses the

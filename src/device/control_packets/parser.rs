@@ -184,6 +184,20 @@ pub fn build_header(address: u32, beats: u8, opcode: CtrlOpCode, response_id: u8
     // Parity bit left as 0; caller can set it if needed.
 }
 
+/// The header word a core's `mov.cph` puts on its stream: the register-held address (low
+/// 20 bits), the instruction's 2-bit length and operation fields as written (not decoded),
+/// and the response id (low 5 bits of the register), under odd parity. Silicon (NPU1):
+/// `mov.cph ms, m, #2, #2, r` with m = 0x123, r = 3 puts 0x83a00123 on the wire.
+pub fn core_control_header(address: u32, length_field: u32, op_field: u32, response_id: u32) -> u32 {
+    use xdna_archspec::aie2::{ctrl_packet::*, packet::STREAM_ID_MASK};
+
+    let word = (address & ADDRESS_MASK)
+        | ((length_field & LENGTH_MASK) << LENGTH_SHIFT)
+        | ((op_field & OPERATION_MASK) << OPERATION_SHIFT)
+        | ((response_id & STREAM_ID_MASK) << RESPONSE_ID_SHIFT);
+    word | (((word.count_ones() & 1) ^ 1) << PARITY_BIT)
+}
+
 /// A fully parsed control packet with header and payload.
 ///
 /// Represents one complete control packet operation ready for processing.

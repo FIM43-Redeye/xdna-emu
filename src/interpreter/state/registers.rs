@@ -54,6 +54,13 @@ pub const SPARSE_OF_REG_INDEX: u8 = 38;
 /// Sparse-load underflow status (`srCompr_uf`): set by a pop or peek that runs the ring low,
 /// cleared by writing it.
 pub const COMPR_UF_REG_INDEX: u8 = 39;
+// 40-43 are the SRS shift registers s0-s3.
+/// Stream-switch read status (`srSS0`): bit 1 = the last `mov SS` read took a word, bit 0 = that
+/// word carried TLAST. A non-blocking read of an empty stream leaves bit 1 clear and bit 0 at the
+/// last word's TLAST.
+pub const SS_STATUS_REG_INDEX: u8 = 44;
+/// Stream-switch write status (`srMS0`): bit 0 = the last non-blocking write was accepted.
+pub const MS_STATUS_REG_INDEX: u8 = 45;
 
 // ControlReg index ranges of the q-register views (`Operand::ControlReg`), four registers each.
 // The decoder maps `q`, `qwl`, `qwh`, `ql` and `qh` operands onto them (decode::register_map).

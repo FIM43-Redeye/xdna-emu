@@ -492,9 +492,9 @@ impl TileArray {
             }
 
             // Pop from Core master port and push to tile stream_input
-            if let Some(data) = self.tiles[i].stream_switch.masters[0].pop() {
+            if let Some((data, tlast)) = self.tiles[i].stream_switch.masters[0].pop_with_tlast() {
                 // Push to tile's stream input buffer (port 0 for core)
-                self.tiles[i].push_stream_input(0, data);
+                self.tiles[i].push_stream_input_beat(0, data, tlast);
                 words_routed += 1;
                 log::debug!(
                     "TileSwitch->Core: tile ({},{}) master[0] -> stream_input = 0x{:08X}",
@@ -686,12 +686,12 @@ impl TileArray {
             // Core stream output goes to slave port 0 (Core port)
             // The stream switch then routes it based on configured local routes
             for port in 0..8u8 {
-                while let Some(data) = self.tiles[i].pop_stream_output(port) {
+                while let Some((data, tlast)) = self.tiles[i].pop_stream_output_beat(port) {
                     // For core-initiated streams, use the Core slave port (port 0)
                     // The actual destination is determined by local routes
                     if port == 0 {
                         // Direct core output goes to Core slave port
-                        if self.tiles[i].stream_switch.slaves[0].push(data) {
+                        if self.tiles[i].stream_switch.slaves[0].push_with_tlast(data, tlast) {
                             words_routed += 1;
                             log::debug!(
                                 "Core->TileSwitch: tile({},{}) slave[0] <- 0x{:08X}",
@@ -705,7 +705,7 @@ impl TileArray {
                         // This handles multi-port core stream writes
                         let slave_port = port as usize;
                         if slave_port < self.tiles[i].stream_switch.slaves.len() {
-                            if self.tiles[i].stream_switch.slaves[slave_port].push(data) {
+                            if self.tiles[i].stream_switch.slaves[slave_port].push_with_tlast(data, tlast) {
                                 words_routed += 1;
                                 log::debug!(
                                     "Core->TileSwitch: tile({},{}) slave[{}] <- 0x{:08X}",

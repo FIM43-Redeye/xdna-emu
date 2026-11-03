@@ -12,9 +12,16 @@
 //!
 //! # Operations
 //!
-//! - **StreamWriteScalar**: Write scalar register value to master stream port
-//! - **StreamWritePacketHeader**: Write packet header to master stream port
-//! - **StreamReadScalar**: Read from slave stream port into scalar register
+//! - **StreamWrite** (`mov ms, r`, `.tlast`, `.nb`): the register's word, with TLAST for the
+//!   `.tlast` forms.
+//! - **StreamWritePacketHeader** (`mov.ph`, `mov.cph`): the *hardware-built* header word, not a
+//!   register copy: [`core_packet_header`] / [`core_control_header`] from the operands and the
+//!   writing tile's coordinates.
+//! - **StreamRead** (`mov r, SS`, `.nb`): the next input beat into the scalar register
+//!   ([`SS_READ_DEST_LATENCY`] cycles later) and the read status `srSS0`.
+//!
+//! All of them use the core port (port 0). Blocking forms stall; `.nb` forms never do, and
+//! leave their outcome in the status registers (`srMS0` for writes, `srSS0` for reads).
 //!
 //! # Stream Architecture
 //!
@@ -35,12 +42,14 @@
 //! Stream operations push/pop data to/from the Tile's stream buffers.
 //! The TileArray routes this data through the stream switch fabric.
 
+use crate::device::control_packets::parser::core_control_header;
+use crate::device::stream_switch::core_packet_header;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp};
 use xdna_archspec::aie2::isa::SemanticOp;
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{ExecutionContext, MS_STATUS_REG_INDEX, SS_STATUS_REG_INDEX};
 
-use super::semantic::{read_operand, write_dest};
+use super::semantic::read_operand;
 
 /// Stream operations execution unit.
 ///
@@ -59,12 +68,42 @@ pub enum StreamResult {
     NotStreamOp,
 }
 
+/// The core's stream port (the only one a `mov ms` / `mov SS` instruction addresses).
+const CORE_PORT: u8 = 0;
+
+/// Words the core's output FIFO holds before a blocking write stalls (a non-blocking write
+/// is refused instead). The depth is a modelling choice, not a measurement.
+const STREAM_FIFO_DEPTH: usize = 4;
+
+/// Cycles from a `mov r, SS` issue to its destination register (II_MOV_SS, operand 0 in
+/// AIE2Schedule.td).
+const SS_READ_DEST_LATENCY: u64 = 7;
+/// Cycles from a `mov r, SS` issue to `srSS0` (II_MOV_SS, `def:srSS0`).
+const SS_STATUS_LATENCY: u64 = 8;
+/// Cycles from a non-blocking write's issue to `srMS0` (II_ST_MS_NB, `def:srMS0`).
+const MS_STATUS_LATENCY: u64 = 3;
+
+/// `srSS0` bit 1: the read took a word.
+const SS_VALID: u32 = 0b10;
+/// `srSS0` bit 0: the word carried TLAST.
+const SS_TLAST: u32 = 0b01;
+/// `srMS0` bit 0: the non-blocking write was accepted.
+const MS_ACCEPTED: u32 = 1;
+
+/// What a stream write puts on the wire, by operand shape (`mov ms, src`; `mov.ph ms, id,
+/// type`; `mov.cph ms, addr, nw, op, id`).
+enum WriteForm {
+    Scalar,
+    PacketHeader,
+    ControlHeader,
+}
+
 impl StreamOps {
     /// Execute a stream operation.
     ///
     /// Returns:
     /// - `StreamResult::Completed` if the operation was handled successfully
-    /// - `StreamResult::Stall { port }` if blocking on empty stream
+    /// - `StreamResult::Stall { port }` if blocking on a full output or empty input
     /// - `StreamResult::NotStreamOp` if not a stream operation
     ///
     /// # Arguments
@@ -73,104 +112,84 @@ impl StreamOps {
     /// * `ctx` - Execution context with register files
     /// * `tile` - The tile containing stream buffers
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
-        let blocking = op.blocking;
         match op.semantic {
-            Some(SemanticOp::StreamWrite) => {
-                // Get the source value from the scalar register
-                let value = Self::get_source_value(op, ctx);
-
-                // Get the port from the second source operand if present, otherwise use port 0
-                // AIE2 stream ops typically encode the port as an immediate operand
-                let port = Self::get_port_from_operands(op);
-
-                log::info!(
-                    "[STREAM] WriteScalar: value=0x{:08X} port={} blocking={} (tile {},{})",
-                    value,
-                    port,
-                    blocking,
-                    tile.col,
-                    tile.row
-                );
-
-                // Hardware stream output FIFO is 4 words deep per port.
-                // If full and blocking, stall until the router drains it.
-                const STREAM_FIFO_DEPTH: usize = 4;
-                if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
-                    log::debug!(
-                        "[STREAM] Write stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
-                        port,
-                        tile.col,
-                        tile.row,
-                        ctx.pc()
-                    );
-                    return StreamResult::Stall { port };
-                }
-
-                tile.push_stream_output(port, value);
-                StreamResult::Completed
+            Some(SemanticOp::StreamWrite) | Some(SemanticOp::StreamWritePacketHeader) => {
+                Self::execute_write(op, ctx, tile)
             }
-
-            Some(SemanticOp::StreamWritePacketHeader) => {
-                // Get the header value from the scalar register
-                let header = Self::get_source_value(op, ctx);
-
-                // Get the port from operands
-                let port = Self::get_port_from_operands(op);
-
-                log::info!(
-                    "[STREAM] WritePacketHeader: header=0x{:08X} port={} blocking={} (tile {},{})",
-                    header,
-                    port,
-                    blocking,
-                    tile.col,
-                    tile.row
-                );
-
-                // Hardware stream output FIFO is 4 words deep per port.
-                const STREAM_FIFO_DEPTH: usize = 4;
-                if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
-                    log::debug!(
-                        "[STREAM] PacketHeader stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
-                        port,
-                        tile.col,
-                        tile.row,
-                        ctx.pc()
-                    );
-                    return StreamResult::Stall { port };
-                }
-
-                tile.push_stream_output(port, header);
-                StreamResult::Completed
-            }
-
-            Some(SemanticOp::StreamRead) => {
-                // Get the stream port from operands (default to port 0)
-                let port = Self::get_port_from_operands(op);
-
-                // Try to pop value from tile's stream input buffer
-                if let Some(value) = tile.pop_stream_input(port) {
-                    // Data available - write to destination register
-                    write_dest(op, ctx, value);
-                    StreamResult::Completed
-                } else if blocking {
-                    // No data and blocking - signal stall
-                    // The interpreter will retry this instruction
-                    StreamResult::Stall { port }
-                } else {
-                    // No data but non-blocking - write 0 and continue
-                    log::debug!(
-                        "[STREAM] Non-blocking read: port {} empty, writing 0 (tile {},{})",
-                        port,
-                        tile.col,
-                        tile.row
-                    );
-                    write_dest(op, ctx, 0);
-                    StreamResult::Completed
-                }
-            }
-
+            Some(SemanticOp::StreamRead) => Self::execute_read(op, ctx, tile),
             _ => StreamResult::NotStreamOp,
         }
+    }
+
+    fn write_form(op: &SlotOp) -> WriteForm {
+        match (op.semantic, op.sources.len()) {
+            (Some(SemanticOp::StreamWritePacketHeader), 4) => WriteForm::ControlHeader,
+            (Some(SemanticOp::StreamWritePacketHeader), _) => WriteForm::PacketHeader,
+            _ => WriteForm::Scalar,
+        }
+    }
+
+    /// The word the write puts on the stream.
+    fn write_word(op: &SlotOp, ctx: &ExecutionContext, tile: &Tile) -> u32 {
+        let src = |i: usize| op.sources.get(i).map_or(0, |s| read_operand(s, ctx));
+        match Self::write_form(op) {
+            WriteForm::Scalar => src(0),
+            WriteForm::PacketHeader => core_packet_header(src(0), src(1), tile.col, tile.row),
+            WriteForm::ControlHeader => core_control_header(src(0), src(1), src(2), src(3)),
+        }
+    }
+
+    fn execute_write(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
+        let full = tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH;
+        if full && op.blocking {
+            log::debug!(
+                "[STREAM] Write stall: FIFO full (tile {},{}, pc=0x{:X})",
+                tile.col,
+                tile.row,
+                ctx.pc()
+            );
+            return StreamResult::Stall { port: CORE_PORT };
+        }
+        let accepted = !full;
+        if accepted {
+            let word = Self::write_word(op, ctx, tile);
+            log::info!(
+                "[STREAM] Write: word=0x{:08X} tlast={} blocking={} (tile {},{})",
+                word,
+                op.tlast,
+                op.blocking,
+                tile.col,
+                tile.row
+            );
+            tile.push_stream_output_beat(CORE_PORT, word, op.tlast);
+        }
+        if !op.blocking {
+            let status = if accepted { MS_ACCEPTED } else { 0 };
+            ctx.queue_scalar_load(Operand::ScalarReg(MS_STATUS_REG_INDEX), status, MS_STATUS_LATENCY);
+        }
+        StreamResult::Completed
+    }
+
+    fn execute_read(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
+        let (word, status) = match tile.pop_stream_input_beat(CORE_PORT) {
+            Some((word, tlast)) => {
+                ctx.set_stream_read_latch(word, tlast);
+                (word, SS_VALID | if tlast { SS_TLAST } else { 0 })
+            }
+            None if op.blocking => return StreamResult::Stall { port: CORE_PORT },
+            None => {
+                // Silicon: an empty non-blocking read hands back the last word again, valid
+                // bit clear, TLAST bit as that word had it.
+                let (word, tlast) = ctx.stream_read_latch();
+                log::debug!("[STREAM] Non-blocking read: empty (tile {},{})", tile.col, tile.row);
+                (word, if tlast { SS_TLAST } else { 0 })
+            }
+        };
+        if let Some(dest) = &op.dest {
+            ctx.queue_scalar_load(dest.clone(), word, SS_READ_DEST_LATENCY);
+        }
+        ctx.queue_scalar_load(Operand::ScalarReg(SS_STATUS_REG_INDEX), status, SS_STATUS_LATENCY);
+        StreamResult::Completed
     }
 
     /// Pre-check whether this op would stall, without any side effects.
@@ -189,50 +208,14 @@ impl StreamOps {
         if !op.blocking {
             return None;
         }
-        const STREAM_FIFO_DEPTH: usize = 4;
-        match op.semantic {
+        let stalls = match op.semantic {
             Some(SemanticOp::StreamWrite) | Some(SemanticOp::StreamWritePacketHeader) => {
-                let port = Self::get_port_from_operands(op);
-                if tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
-                    Some(StreamResult::Stall { port })
-                } else {
-                    None
-                }
+                tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH
             }
-            Some(SemanticOp::StreamRead) => {
-                let port = Self::get_port_from_operands(op);
-                if tile.stream_input_len(port) == 0 {
-                    Some(StreamResult::Stall { port })
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Get the source value for a stream write operation.
-    ///
-    /// Stream writes typically take a single source operand (scalar register).
-    fn get_source_value(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        op.sources.first().map_or(0, |src| read_operand(src, ctx))
-    }
-
-    /// Get the stream port from operands.
-    ///
-    /// AIE2 stream operations may encode the port as:
-    /// - An immediate operand (second source)
-    /// - Part of the instruction encoding (in which case decoder should set it)
-    /// - Default to port 0 if not specified
-    fn get_port_from_operands(op: &SlotOp) -> u8 {
-        // Check for a second source that's an immediate (port number)
-        if op.sources.len() >= 2 {
-            if let Operand::Immediate(port) = &op.sources[1] {
-                return (*port as u8) & 0x7; // Ports 0-7
-            }
-        }
-        // Default to port 0 (core port)
-        0
+            Some(SemanticOp::StreamRead) => tile.stream_input_len(CORE_PORT) == 0,
+            _ => false,
+        };
+        stalls.then_some(StreamResult::Stall { port: CORE_PORT })
     }
 }
 
@@ -246,193 +229,184 @@ mod tests {
         ExecutionContext::new()
     }
 
+    /// Physical (1,3), where the NPU1 silicon probes ran their producer.
     fn make_tile() -> Tile {
-        Tile::compute(0, 2)
+        Tile::compute(1, 3)
+    }
+
+    fn write_op(blocking: bool, tlast: bool, src: u8) -> SlotOp {
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::StreamWrite)
+            .with_blocking(blocking)
+            .with_source(Operand::ScalarReg(src));
+        op.tlast = tlast;
+        op
+    }
+
+    /// Run the pipeline forward until every queued write has landed.
+    fn settle(ctx: &mut ExecutionContext) {
+        ctx.cycles += 16;
+        ctx.commit_pending_writes();
     }
 
     #[test]
-    fn test_stream_write_scalar_pushes_data() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        ctx.scalar.write(0, 0xDEADBEEF);
-
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
-            .with_blocking(true)
-            .with_source(Operand::ScalarReg(0));
-
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-
-        // Verify data was actually pushed to stream output
-        assert_eq!(tile.pop_stream_output(0), Some(0xDEADBEEF));
+    fn write_pushes_the_register_word_without_tlast() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        ctx.scalar.write(2, 0xDEADBEEF);
+        assert_eq!(
+            StreamOps::execute(&write_op(true, false, 2), &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
+        assert_eq!(tile.pop_stream_output_beat(0), Some((0xDEADBEEF, false)));
     }
 
     #[test]
-    fn test_stream_write_scalar_with_port() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        ctx.scalar.write(0, 0x12345678);
-
-        // Write to port 3 using immediate operand
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
-            .with_blocking(true)
-            .with_source(Operand::ScalarReg(0))
-            .with_source(Operand::Immediate(3)); // Port 3
-
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-
-        // Verify data went to port 3, not port 0
-        assert_eq!(tile.pop_stream_output(0), None);
-        assert_eq!(tile.pop_stream_output(3), Some(0x12345678));
+    fn tlast_form_marks_the_beat() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        ctx.scalar.write(2, 7);
+        StreamOps::execute(&write_op(true, true, 2), &mut ctx, &mut tile);
+        assert_eq!(tile.pop_stream_output_beat(0), Some((7, true)));
     }
 
     #[test]
-    fn test_stream_write_packet_header_pushes_data() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
+    fn blocking_write_stalls_on_a_full_fifo_and_nb_drops_with_status_zero() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        ctx.scalar.write(0, 0x11111111);
+        for _ in 0..STREAM_FIFO_DEPTH {
+            tile.push_stream_output(0, 0xAAAA);
+        }
+        let blocking = write_op(true, false, 0);
+        assert_eq!(StreamOps::execute(&blocking, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
+        assert!(StreamOps::would_stall(&blocking, &tile).is_some());
 
-        ctx.scalar.write(1, 0x12345678);
-
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWritePacketHeader)
-            .with_blocking(false)
-            .with_source(Operand::ScalarReg(1));
-
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-
-        // Verify packet header was pushed to stream output
-        assert_eq!(tile.pop_stream_output(0), Some(0x12345678));
+        let nb = write_op(false, false, 0);
+        assert!(StreamOps::would_stall(&nb, &tile).is_none());
+        assert_eq!(StreamOps::execute(&nb, &mut ctx, &mut tile), StreamResult::Completed);
+        assert_eq!(tile.stream_output_len(0), STREAM_FIFO_DEPTH, "the refused word is dropped");
+        ctx.scalar.write(MS_STATUS_REG_INDEX, 1);
+        settle(&mut ctx);
+        assert_eq!(ctx.scalar.read(MS_STATUS_REG_INDEX), 0, "srMS0 reports the refusal");
     }
 
     #[test]
-    fn test_stream_read_with_data() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
+    fn nb_write_status_lands_after_its_latency_and_reports_acceptance() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        StreamOps::execute(&write_op(false, false, 0), &mut ctx, &mut tile);
+        assert_eq!(ctx.scalar.read(MS_STATUS_REG_INDEX), 0, "not yet");
+        ctx.cycles += MS_STATUS_LATENCY - 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(MS_STATUS_REG_INDEX), 0, "one cycle early");
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(MS_STATUS_REG_INDEX), 1);
+    }
 
-        // Push data into the stream input buffer
-        tile.push_stream_input(0, 0xCAFEBABE);
+    #[test]
+    fn packet_header_is_built_from_id_type_and_the_tile() {
+        // NPU1 silicon, producer at physical (1,3): mov.ph with r = 0xab, #1 -> 0x0023100b
+        // (id masked to 5 bits); r = 0x20, #4 -> 0x80234000 (id 0, parity bit set).
+        for (reg, ptype, expect) in
+            [(0xabu32, 1, 0x0023_100bu32), (0x20, 4, 0x8023_4000), (0xffff_ffff, 7, 0x0023_701f)]
+        {
+            let (mut ctx, mut tile) = (make_ctx(), make_tile());
+            ctx.scalar.write(1, reg);
+            let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::StreamWritePacketHeader)
+                .with_blocking(true)
+                .with_source(Operand::ScalarReg(1))
+                .with_source(Operand::Immediate(ptype));
+            StreamOps::execute(&op, &mut ctx, &mut tile);
+            assert_eq!(tile.pop_stream_output_beat(0), Some((expect, false)), "r={reg:#x} type={ptype}");
+        }
+    }
 
-        ctx.scalar.write(5, 0xFFFFFFFF);
+    #[test]
+    fn control_packet_header_carries_address_length_op_and_id() {
+        // NPU1 silicon: m = 0x123, r = 3, nw 2, op 2 -> 0x83a00123; m = 0xfedcba98, r = -1,
+        // nw 3, op 3 -> 0x1ffcba98 (20-bit address, 5-bit id).
+        for (m, r, nw, opc, expect) in
+            [(0x123u32, 3u32, 2, 2, 0x83a0_0123u32), (0xfedc_ba98, 0xffff_ffff, 3, 3, 0x1ffc_ba98)]
+        {
+            let (mut ctx, mut tile) = (make_ctx(), make_tile());
+            ctx.modifier.write(1, m);
+            ctx.scalar.write(2, r);
+            let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::StreamWritePacketHeader)
+                .with_blocking(true)
+                .with_source(Operand::ModifierReg(1))
+                .with_source(Operand::Immediate(nw))
+                .with_source(Operand::Immediate(opc))
+                .with_source(Operand::ScalarReg(2));
+            op.tlast = true;
+            StreamOps::execute(&op, &mut ctx, &mut tile);
+            assert_eq!(tile.pop_stream_output_beat(0), Some((expect, true)));
+        }
+    }
 
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
-            .with_blocking(true)
-            .with_dest(Operand::ScalarReg(5));
+    fn read_op(blocking: bool, dest: u8) -> SlotOp {
+        SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::StreamRead)
+            .with_blocking(blocking)
+            .with_dest(Operand::ScalarReg(dest))
+    }
 
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-
-        // Should have read the actual data
+    #[test]
+    fn read_lands_after_seven_cycles_and_status_after_eight() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        tile.push_stream_input_beat(0, 0xCAFEBABE, true);
+        ctx.scalar.write(5, 0xFFFF_FFFF);
+        assert_eq!(StreamOps::execute(&read_op(true, 5), &mut ctx, &mut tile), StreamResult::Completed);
+        ctx.cycles += SS_READ_DEST_LATENCY - 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(5), 0xFFFF_FFFF);
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(5), 0xCAFEBABE);
+        assert_eq!(ctx.scalar.read(SS_STATUS_REG_INDEX), 0, "srSS0 is one cycle behind");
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(SS_STATUS_REG_INDEX), 0b11, "valid and TLAST");
     }
 
     #[test]
-    fn test_stream_read_blocking_stall() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
+    fn plain_word_reads_valid_without_tlast() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        tile.push_stream_input(0, 5);
+        StreamOps::execute(&read_op(true, 5), &mut ctx, &mut tile);
+        settle(&mut ctx);
+        assert_eq!(ctx.scalar.read(SS_STATUS_REG_INDEX), 0b10);
+    }
 
-        // No data in buffer - should stall
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
-            .with_blocking(true)
-            .with_dest(Operand::ScalarReg(5));
-
+    #[test]
+    fn blocking_read_of_an_empty_stream_stalls() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
+        let op = read_op(true, 5);
         assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
+        assert!(StreamOps::would_stall(&op, &tile).is_some());
     }
 
     #[test]
-    fn test_stream_read_nonblocking_empty() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        ctx.scalar.write(5, 0xFFFFFFFF);
-
-        // Non-blocking read with no data should return 0
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
-            .with_blocking(false)
-            .with_dest(Operand::ScalarReg(5));
-
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-
-        // Non-blocking returns 0 when empty
-        assert_eq!(ctx.scalar.read(5), 0);
+    fn nb_read_of_an_empty_stream_returns_the_last_word_with_valid_clear() {
+        // NPU1 silicon: after a TLAST word, an empty `mov.nb` returns that word again and
+        // srSS0 = 1 (TLAST kept, valid clear); after a plain word, 0.
+        for (tlast, status) in [(true, 1u32), (false, 0)] {
+            let (mut ctx, mut tile) = (make_ctx(), make_tile());
+            tile.push_stream_input_beat(0, 0x4444_0004, tlast);
+            StreamOps::execute(&read_op(true, 1), &mut ctx, &mut tile);
+            settle(&mut ctx);
+            ctx.scalar.write(2, 0);
+            let nb = read_op(false, 2);
+            assert!(StreamOps::would_stall(&nb, &tile).is_none());
+            assert_eq!(StreamOps::execute(&nb, &mut ctx, &mut tile), StreamResult::Completed);
+            settle(&mut ctx);
+            assert_eq!(ctx.scalar.read(2), 0x4444_0004);
+            assert_eq!(ctx.scalar.read(SS_STATUS_REG_INDEX), status);
+        }
     }
 
     #[test]
-    fn test_non_stream_op_not_handled() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // A scalar add should not be handled by StreamOps
+    fn non_stream_op_not_handled() {
+        let (mut ctx, mut tile) = (make_ctx(), make_tile());
         let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(2))
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1));
-
         assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::NotStreamOp);
-    }
-
-    #[test]
-    fn test_stream_write_with_immediate_source() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // Edge case: immediate as source (unusual but should work)
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
-            .with_blocking(true)
-            .with_source(Operand::Immediate(42));
-
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-    }
-
-    #[test]
-    fn test_stream_write_blocking_stalls_when_fifo_full() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        ctx.scalar.write(0, 0x11111111);
-
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
-            .with_blocking(true)
-            .with_source(Operand::ScalarReg(0));
-
-        // Fill the FIFO (depth 4)
-        for _ in 0..4 {
-            tile.push_stream_output(0, 0xAAAA);
-        }
-
-        // 5th write should stall
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Stall { port: 0 });
-    }
-
-    #[test]
-    fn test_stream_write_nonblocking_always_succeeds() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        ctx.scalar.write(0, 0x22222222);
-
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
-            .with_blocking(false)
-            .with_source(Operand::ScalarReg(0));
-
-        // Fill the FIFO (depth 4)
-        for _ in 0..4 {
-            tile.push_stream_output(0, 0xBBBB);
-        }
-
-        // Non-blocking write should still succeed (unbounded for non-blocking)
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
-    }
-
-    #[test]
-    fn test_stream_read_without_dest() {
-        let mut ctx = make_ctx();
-        let mut tile = make_tile();
-
-        // Push data - even without dest, should read and discard
-        tile.push_stream_input(0, 0x12345678);
-
-        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead).with_blocking(false);
-
-        // Should return Completed (data consumed but discarded)
-        assert_eq!(StreamOps::execute(&op, &mut ctx, &mut tile), StreamResult::Completed);
     }
 }

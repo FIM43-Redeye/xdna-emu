@@ -30,7 +30,7 @@ impl InstructionDecoder {
         &self,
         slot_index: SlotIndex,
         decoded: &DecodedInstr,
-        dest: Option<Operand>,
+        mut dest: Option<Operand>,
         sources: Vec<Operand>,
         extracted_pm: Option<PostModify>,
         source_forward: SmallVec<[(u8, Bypass); 4]>,
@@ -121,6 +121,26 @@ impl InstructionDecoder {
         // correctly. The shuffle step is a no-op when all lanes are identical.
         if enc.mnemonic.starts_with("vbcstshfl") {
             slot_op.semantic = Some(SemanticOp::VectorBroadcast);
+        }
+
+        // Stream writes and reads are blocking unless the mnemonic carries `.nb`, and a write
+        // ends its packet when it carries `.tlast` (`mov.cph.nb.tlast`, `mov.tlast`, ...): both
+        // are mnemonic suffixes of the TableGen definitions, not separate operands.
+        if matches!(
+            slot_op.semantic,
+            Some(SemanticOp::StreamRead | SemanticOp::StreamWrite | SemanticOp::StreamWritePacketHeader)
+        ) {
+            let mut parts = enc.mnemonic.split('.');
+            slot_op.blocking = !parts.clone().any(|p| p == "nb");
+            slot_op.tlast = parts.any(|p| p == "tlast");
+        }
+
+        // `vmov.hi cm, SCD` fills the upper half of cm (bmh); the operand names the pair, which
+        // decodes to its low half.
+        if enc.mnemonic == "vmov.hi" {
+            if let Some(Operand::AccumReg(r)) = dest {
+                dest = Some(Operand::AccumReg(r + 1));
+            }
         }
 
         // Add implicit registers from TableGen

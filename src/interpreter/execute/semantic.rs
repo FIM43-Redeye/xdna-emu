@@ -736,7 +736,15 @@ fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 fn execute_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let value = read_source(op, ctx, 0);
     log::debug!("[SEMANTIC MOV] dest={:?} src={:?} value={}", op.dest, op.sources.get(0), value);
-    write_dest(op, ctx, value);
+    match &op.dest {
+        // The delayed scalar moves (`mov.d1`..`mov.d6`, II_MOVd1..6) land `N + 1` cycles after
+        // issue where a plain `mov` lands after one: the schedule's result latency says so.
+        // The source is read at issue (silicon).
+        Some(dest @ Operand::ScalarReg(_)) if ctx.result_latency > 1 => {
+            ctx.queue_scalar_load(dest.clone(), value, ctx.result_latency as u64);
+        }
+        _ => write_dest(op, ctx, value),
+    }
     true
 }
 
@@ -1133,6 +1141,41 @@ mod tests {
         let mut op = SlotOp::nop(SlotIndex::Scalar0);
         op.semantic = None; // Simulate unknown instruction with no semantic
         assert!(!execute_semantic(&op, &mut ctx.clone()));
+    }
+
+    #[test]
+    fn delayed_scalar_move_lands_n_plus_one_cycles_after_issue_with_the_source_read_at_issue() {
+        // mov.d3: II_MOVd3's result latency is 4. Silicon: dst still old three cycles after
+        // the issue, the source's value on the fourth.
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x11);
+        ctx.scalar.write(2, 0x22);
+        let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
+        op.sources = smallvec![Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(1));
+        ctx.result_latency = 4;
+        assert!(execute_semantic(&op, &mut ctx));
+        ctx.scalar.write(2, 0x99); // the source changes after the issue
+        for _ in 0..3 {
+            ctx.cycles += 1;
+            ctx.commit_pending_writes();
+            assert_eq!(ctx.scalar.read(1), 0x11);
+        }
+        ctx.cycles += 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(1), 0x22);
+    }
+
+    #[test]
+    fn plain_move_writes_at_once() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(2, 0x22);
+        let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
+        op.sources = smallvec![Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(1));
+        ctx.result_latency = 1;
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar.read(1), 0x22);
     }
 
     #[test]

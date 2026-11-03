@@ -295,5 +295,78 @@ class TestRealGeneration:
     def test_pairs_have_two_cores_and_one_link(self, suite):
         _, s = suite
         pairs = [c for c in s.cases if s.case_meta(c)["source_type"] in isa_suite.PAIR_TYPES]
-        assert len(pairs) == 23
+        assert len(pairs) == 17
         assert all(len(s.topology(c).cores) == 2 and len(s.topology(c).links) == 1 for c in pairs)
+
+
+class TestHollowGuard:
+    """A test point that checked nothing fails, even where both backends agree."""
+
+    def _suite(self, tmp_path, batches, hw, emu=None):
+        src = tmp_path / "src"
+        src.mkdir(parents=True)
+        for name, text in _sources(*batches).items():
+            (src / name).write_text(text)
+        suite_dir = tmp_path / "suite"
+        isa_suite.write_isa_suite(_manifest(*batches), src, suite_dir, SEED)
+        for tag, data in (("hw-t", hw), ("emu-t", emu or hw)):
+            for case, bufs in data.items():
+                for (core, buf), content in bufs.items():
+                    _bin(S.output_path(suite_dir, tag, case, core, buf), content)
+        return S.load_suite(suite_dir)
+
+    def _pair(self, payload, variants=None):
+        b = _cascade(0)
+        b["tests"][0]["payload"] = payload
+        if variants:
+            b["tests"][0]["variants"] = variants
+        return b
+
+    CONSUMER = [{"core": "consumer", "buffer": "out", "offset": 0, "size": 12}]
+
+    def test_an_all_zero_payload_is_hollow(self, tmp_path):
+        bufs = {"batch_000": {("producer", "out"): b"\xaa" * 8, ("consumer", "out"): bytes(12)}}
+        res = ANALYZER.analyze(self._suite(tmp_path, [self._pair(self.CONSUMER)], bufs), "hw-t", "emu-t")
+        assert (res.passed, res.failed, res.hollow) == (0, 1, 1)
+
+    def test_markers_outside_the_declared_payload_do_not_count(self, tmp_path):
+        """The producer's marker words are non-zero, the consumer saw nothing."""
+        bufs = {"batch_000": {("producer", "out"): b"\xaa\xcc" * 4, ("consumer", "out"): bytes(12)}}
+        res = ANALYZER.analyze(self._suite(tmp_path, [self._pair(self.CONSUMER)], bufs), "hw-t", "emu-t")
+        assert res.hollow == 1
+
+    def test_without_a_declared_payload_the_whole_output_counts(self, tmp_path):
+        b = _cascade(0)
+        bufs = {"batch_000": {("producer", "out"): b"\xaa" * 8, ("consumer", "out"): bytes(12)}}
+        res = ANALYZER.analyze(self._suite(tmp_path, [b], bufs), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (1, 0)
+
+    def test_variants_that_are_all_identical_are_hollow(self, tmp_path):
+        variants = [[{"core": "consumer", "buffer": "out", "offset": 4 * i, "size": 4}] for i in range(3)]
+        same = {"batch_000": {("producer", "out"): bytes(8), ("consumer", "out"): b"\x07\x00\x00\x00" * 3}}
+        res = ANALYZER.analyze(self._suite(tmp_path, [self._pair(self.CONSUMER, variants)], same), "hw-t", "emu-t")
+        assert res.hollow == 1
+        varied = {"batch_000": {("producer", "out"): bytes(8), ("consumer", "out"): bytes([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])}}
+        res = ANALYZER.analyze(self._suite(tmp_path / "v", [self._pair(self.CONSUMER, variants)], varied), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (1, 0)
+
+    def test_every_test_point_of_an_instruction_identical_is_hollow(self, tmp_path):
+        same = {"batch_000": {("core", "out"): b"\x05" * 48}, "batch_001": {("core", "out"): b"\x05" * 48}}
+        a, b = _single(0), _single(1)
+        b["tests"] = [{**t, "instruction": "ADD"} for t in b["tests"]]
+        a["tests"] = [{**t, "instruction": "ADD"} for t in a["tests"]]
+        res = ANALYZER.analyze(self._suite(tmp_path, [a, b], same), "hw-t", "emu-t")
+        assert res.hollow == 4 and res.passed == 0
+
+    def test_distinct_points_of_an_instruction_pass(self, tmp_path):
+        data = {"batch_000": {("core", "out"): bytes(range(1, 49))}}
+        a = _single(0)
+        a["tests"] = [{**t, "instruction": "ADD"} for t in a["tests"]]
+        res = ANALYZER.analyze(self._suite(tmp_path, [a], data), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (2, 0)
+
+    def test_hollow_reason_unit(self):
+        assert ANALYZER.hollow_reason(b"\0\0", [], [b"\0\0"]).startswith("payload is all zero")
+        assert ANALYZER.hollow_reason(b"\1", [b"a", b"a"], []).startswith("payload identical across its 2")
+        assert ANALYZER.hollow_reason(b"\1", [], [b"a", b"a", b"a"]).startswith("payload identical across the instruction's 3")
+        assert ANALYZER.hollow_reason(b"\1", [b"a", b"b"], [b"a", b"b"]) is None

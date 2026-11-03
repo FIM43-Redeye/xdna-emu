@@ -278,6 +278,8 @@ pub struct SlotOp {
     pub select_variant: Option<SelectVariant>,
     /// Whether this stream read/write is blocking.
     pub blocking: bool,
+    /// Whether this stream write ends the packet (`.tlast` forms).
+    pub tlast: bool,
     /// Source element type for SRS/UPS/Convert (element_type is destination).
     pub from_type: Option<ElementType>,
     /// Shuffle pattern for shuffle operations.
@@ -550,6 +552,7 @@ impl SlotOp {
             branch_condition: None,
             select_variant: None,
             blocking: false,
+            tlast: false,
             from_type: None,
             shuffle_pattern: ShufflePattern::default(),
             sources: SmallVec::new(),
@@ -648,6 +651,7 @@ impl SlotOp {
             branch_condition: None,
             select_variant: None,
             blocking: false,
+            tlast: false,
             from_type: None,
             shuffle_pattern: ShufflePattern::default(),
             sources: SmallVec::new(),

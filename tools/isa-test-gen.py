@@ -519,6 +519,16 @@ def result_latency(instr: dict) -> int:
     return max(model_latency, MIN_RESULT_LATENCY)
 
 
+def _cascade_read_latency(instr: dict) -> int:
+    """Cycles from a cascade read's issue to its destination (II_VMOV_CASCADE_READ)."""
+    return _load_sched_latencies()[instr["sched_class"]]
+
+
+def _slice(core: str, offset: int, size: int) -> dict:
+    """One byte range of one core's output buffer (the suite's slice shape)."""
+    return {"core": core, "buffer": "out", "offset": offset, "size": size}
+
+
 # ---------------------------------------------------------------------------
 # Strategy Interface
 # ---------------------------------------------------------------------------
@@ -3250,15 +3260,23 @@ class CascadeReadStrategy(TestStrategy):
         return 0
 
     def compute_consumer_output_size(self, instr: dict) -> int:
-        # Half variants use marker-based verification (2 x 4-byte markers).
-        # Full vmov stores the 512-bit (64-byte) vector result.
-        return 8 if self._is_half(instr) else 64
+        # Full vmov stores the 512-bit vector (64 bytes).  The half forms store both
+        # 512-bit halves of cm0 (bml0 then bmh0), so which half the instruction filled
+        # is visible: the other stays as the preamble's vclr left it.
+        return 128 if self._is_half(instr) else 64
 
     def compute_input_size(self, instr, regs):
         return self.compute_producer_input_size()
 
     def compute_output_size(self, instr):
         return self.compute_producer_output_size() + self.compute_consumer_output_size(instr)
+
+    def payload(self, instr: dict) -> list[dict]:
+        """The output bytes that carry the data path under test (not the markers)."""
+        return [_slice("consumer", 0, self.compute_consumer_output_size(instr))]
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
 
     def generate_cascade_pair(self, instr: dict, regs: dict) -> dict:
         """Generate producer and consumer assembly programs.
@@ -3289,33 +3307,32 @@ class CascadeReadStrategy(TestStrategy):
         return "\n".join(lines)
 
     def _generate_consumer(self, instr: dict, regs: dict) -> str:
-        """Consumer: enable SCD, read cascade, store result to p0.
+        """Consumer: enable SCD, read the cascade, wait out the read latency, store it all.
 
-        For full vmov (512-bit, dst=x0): stores the vector data directly.
-        For half variants vmov.hi/vmov.lo (dst=cm0): uses marker-based
-        verification (0xAA before, 0xCC after) since accumulator registers
-        cannot be stored with plain vst.
+        The wait is the itinerary's result latency (II_VMOV_CASCADE_READ, 7): the first
+        bundle that sees the value issues 7 cycles after the read, so 6 bundles sit
+        between.  Fewer would store the stale register (silicon: 5 stores wl0 stale and
+        wh0 fresh).  Full vmov stores x0 (the producer's 64 bytes).  vmov.hi / vmov.lo
+        fill one 512-bit half of cm0: both halves are read out through x0 / x1 and stored.
         """
-        mnemonic = instr.get("mnemonic", "")
         asm_str = instr.get("asm_string", "")
         name = instr["name"]
+        wait = _cascade_read_latency(instr) - 1
         lines = []
         lines.append(f"  // ---- cascade consumer: {name} ----")
+        lines.append("  mov r14, #1")
+        lines.append("  mov crSCDEn, r14")
+        lines.append(f"  {_substitute_asm(asm_str, regs)}")
+        lines.extend(_nop_sled(wait))
         if self._is_half(instr):
-            # Marker-based: store 0xAA, execute cascade read, store 0xCC.
-            lines.append("  mov r14, #170")
-            lines.extend(_scalar_store("r14", "p0", 0))
-            lines.append("  mov r14, #1")
-            lines.append("  mov crSCDEn, r14")
-            asm_line = _substitute_asm(asm_str, regs)
-            lines.append(f"  {asm_line}")
-            lines.append("  mov r14, #204")
-            lines.extend(_scalar_store("r14", "p0", 4))
+            lines.append("  vmov x0, bml0")
+            lines.append("  vmov x1, bmh0")
+            lines.extend(_nop_sled(8))
+            lines.append("  vst wl0, [p0, #0]")
+            lines.append("  vst wh0, [p0, #32]")
+            lines.append("  vst wl1, [p0, #64]")
+            lines.append("  vst wh1, [p0, #96]")
         else:
-            lines.append("  mov r14, #1")
-            lines.append("  mov crSCDEn, r14")
-            asm_line = _substitute_asm(asm_str, regs)
-            lines.append(f"  {asm_line}")
             lines.append("  vst wl0, [p0, #0]")
             lines.append("  vst wh0, [p0, #32]")
         lines.append("")
@@ -3328,34 +3345,69 @@ class CascadeReadStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
-# StreamStrategy: stream read, write, and status instructions
+# StreamStrategy: core stream writes (mov ms ...) and reads (mov r, SS)
 # ---------------------------------------------------------------------------
 
-class StreamStrategy(TestStrategy):
-    """Handle stream-related instructions in three internal modes:
+# Cycles from a `mov r, SS` / `mov.nb r, SS` issue to srSS0 (II_MOV_SS, `def:srSS0` in
+# AIE2Schedule.td): one more than the destination register.  tools/test_isa_test_gen.py
+# checks these against the TableGen when llvm-aie is present.
+SS_STATUS_LATENCY = 8
+# Cycles from a non-blocking write's issue to srMS0 (II_ST_MS_NB, `def:srMS0`).
+MS_STATUS_LATENCY = 3
+# Beats a stream test moves in one run.  Kept small so a producer that starts before its
+# consumer never fills the path (NB writes would drop words, blocking ones would stall).
+STREAM_WORDS = 4
+# Output bytes of a stream consumer: STREAM_WORDS words, then their STREAM_WORDS statuses.
+STREAM_WORD_BYTES = 4
 
-    - stream_write: instructions that write to ms (master stream port)
-    - stream_read:  mov.d1-d6 with stream source ss0
-    - ss_status:    mov $mRa, SS (stream switch status read)
+# Distinct 32-bit words with every byte different, so a byte swizzle or a truncation shows.
+STREAM_PAYLOAD = (0xA1B2C3D4, 0x5E6F7081, 0x8899AABB, 0xC0FFEE11)
+# mov.ph variants: (register value, packet type).  The stream id is the register's low 5
+# bits (0xAB -> 0x0B, 0xFFFFFFFF -> 0x1F, 0x20 -> 0), all eight packet types pass through.
+PACKET_HEADER_VARIANTS = ((0x00000001, 0), (0x000000AB, 1), (0x00000020, 4), (0xFFFFFFFF, 7))
+# mov.cph variants: (address register value, n-words field, op field, response id register
+# value).  The address is its low 20 bits, the id its low 5; the two fields are written as
+# given.
+CONTROL_HEADER_VARIANTS = (
+    (0x00000123, 0, 0, 0x00000001),
+    (0xFEDCBA98, 3, 3, 0xFFFFFFFF),
+    (0x00000055, 2, 2, 0x00000003),
+    (0x00080000, 1, 3, 0x00000020),
+)
+# Registers a stream test may use: r8 holds the stack pointer copy, r14 is the marker
+# scratch, r16-r23 are saved by the prologue.
+_WORD_REGS = ("r0", "r1", "r2", "r3")      # payload words
+_ID_REGS = ("r4", "r5", "r6", "r7")        # packet / response ids
+_ADDR_REGS = ("r9", "r10", "r11", "r12")   # control-packet addresses
+_READ_REGS = ("r16", "r17", "r18", "r19")  # stream read destinations
+_STATUS_REGS = ("r24", "r25", "r26", "r27")
+
+
+class StreamStrategy(TestStrategy):
+    """Core stream instructions, tested as a producer / consumer pair over a core-to-core flow.
+
+    - stream_write: `mov[.cph|.ph][.nb][.tlast] ms, ...` on the producer; the consumer
+      reads every beat with a blocking `mov r, SS`, and stores the word and the `srSS0`
+      the read left (bit 1 valid, bit 0 TLAST).  The header forms put a header word built
+      by the hardware on the wire, so the consumer's copy is the only way to see it.  The
+      NB forms also store `srMS0` (1 = accepted) on the producer.
+    - stream_read: `mov[.nb] r, SS` on the consumer (the instruction under test), fed by a
+      producer of plain and TLAST words.  The NB form syncs on a blocking first word, then
+      reads the rest and two reads of the empty stream (silicon returns the last word with
+      the valid bit clear).
+
+    mov.d1-d6 are delayed scalar moves, not stream instructions (ComputeStrategy and
+    MovDelayStrategy test them).
     """
 
     def _detect_mode(self, instr: dict) -> str:
-        """Detect which stream sub-mode applies to *instr*.
-
-        Order matters: SS status check must come BEFORE the ms check
-        because mov.nb appears in both SS reads and stream writes.
-        """
+        """`stream_write`, `stream_read`, or "" (checked with the asm, not just the mnemonic:
+        `mov.nb` names both the NB write and the NB read)."""
         asm = instr.get("asm_string", "")
-        mnemonic = instr.get("mnemonic", "")
-        # SS status -- check BEFORE mnemonic/ms (mov.nb collision)
-        if "SS" in asm and "mov" in mnemonic:
-            return "ss_status"
-        # Stream writes -- word-boundary check for "ms"
-        if re.search(r'\bms\b', asm):
-            return "stream_write"
-        # Stream reads -- mov.d*
-        if re.match(r"mov\.d[1-6]", mnemonic):
+        if re.search(r"\bSS\b", asm) and instr.get("mnemonic", "").startswith("mov"):
             return "stream_read"
+        if re.search(r"\bms\b", asm):
+            return "stream_write"
         return ""
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
@@ -3364,43 +3416,52 @@ class StreamStrategy(TestStrategy):
         # and mnemonic-tlast variants cover the same encodings.
         if self._has_tlast_reg(instr):
             return (False, "doTlast_reg variant (unsupported by llvm-mc)")
-        mode = self._detect_mode(instr)
-        if mode:
+        if self._detect_mode(instr):
             return (True, "")
         return (False, "not a stream instruction")
 
     def _has_tlast_reg(self, instr: dict) -> bool:
         return "$tlast" in instr.get("asm_string", "")
 
+    # -- instruction shape --
+
+    def _form(self, instr: dict) -> str:
+        """`scl`, `ph` or `cph` for a write."""
+        mnemonic = instr["mnemonic"]
+        if ".cph" in mnemonic:
+            return "cph"
+        if ".ph" in mnemonic:
+            return "ph"
+        return "scl"
+
+    def _is_nb(self, instr: dict) -> bool:
+        return ".nb" in instr["mnemonic"]
+
+    def _has_tlast(self, instr: dict) -> bool:
+        return instr["mnemonic"].endswith(".tlast")
+
     def generate_combos(self, instr: dict) -> list[dict[str, str]]:
-        mode = self._detect_mode(instr)
-        asm = instr.get("asm_string", "")
-        if mode == "ss_status":
-            return [{"mRa": "r0"}]
-        if mode == "stream_read":
-            return [{"dst": "r0", "src": "srSS0"}]
-        # stream_write
-        combo: dict[str, str] = {}
-        if "cph" in asm:
-            combo = {"addr": "m0", "nw": "0", "op": "0", "id": "r0"}
-        elif "ph" in asm:
-            combo = {"id": "r0", "pcktType": "0"}
-        else:
-            combo = {"src": "r0"}
-        if self._has_tlast_reg(instr):
-            combo["tlast"] = "r1"
-        return [combo]
+        """One test point; the per-word operand variants are fixed by the form (the combo
+        only labels the form in the manifest)."""
+        if self._detect_mode(instr) == "stream_read":
+            return [{"mRa": ",".join(_READ_REGS[:STREAM_WORDS - 1])}]
+        return [{"form": self._form(instr), "words": str(STREAM_WORDS)}]
+
+    # -- buffer sizes --
 
     def compute_producer_input_size(self, instr: dict) -> int:
         return 0
 
     def compute_producer_output_size(self, instr: dict) -> int:
+        # Markers, then (NB writes) the srMS0 each write left.
+        if self._detect_mode(instr) == "stream_write" and self._is_nb(instr):
+            return 8 + 4 * STREAM_WORDS
         return 8
 
     def compute_consumer_output_size(self, instr: dict) -> int:
-        if self._detect_mode(instr) == "ss_status":
-            return 12
-        return 4
+        if self._detect_mode(instr) == "stream_read" and self._is_nb(instr):
+            return 4 * NB_READ_RECORDS
+        return 2 * STREAM_WORDS * STREAM_WORD_BYTES
 
     def compute_input_size(self, instr: dict, regs: dict[str, str]) -> int:
         return 0
@@ -3408,107 +3469,243 @@ class StreamStrategy(TestStrategy):
     def compute_output_size(self, instr: dict) -> int:
         return self.compute_producer_output_size(instr) + self.compute_consumer_output_size(instr)
 
+    def payload(self, instr: dict) -> list[dict]:
+        """The output bytes that carry the data path under test."""
+        out = [_slice("consumer", 0, self.compute_consumer_output_size(instr))]
+        if self._detect_mode(instr) == "stream_write" and self._is_nb(instr):
+            out.append(_slice("producer", 8, 4 * STREAM_WORDS))
+        return out
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        """Per-word groups of payload bytes: a test whose words all came out the same did
+        not look at the data."""
+        if self._detect_mode(instr) != "stream_write":
+            return []
+        n = STREAM_WORDS
+        return [[_slice("consumer", 4 * i, 4), _slice("consumer", 4 * (n + i), 4)] for i in range(n)]
+
     def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         raise NotImplementedError("StreamStrategy uses generate_stream_pair()")
-
-    def _delay_count(self, instr):
-        """Extract delay count from mov.d* mnemonic."""
-        m = re.match(r"mov\.d(\d)", instr.get("mnemonic", ""))
-        return int(m.group(1)) if m else 1
 
     def generate_stream_pair(self, instr, regs):
         """Generate producer + consumer assembly pair for a stream instruction.
 
         Returns dict with 'producer_asm' and 'consumer_asm' keys.
         """
-        mode = self._detect_mode(instr)
-        if mode == "stream_write":
-            return {"producer_asm": self._gen_write_producer(instr, regs),
+        if self._detect_mode(instr) == "stream_write":
+            return {"producer_asm": self._gen_write_producer(instr),
                     "consumer_asm": self._gen_write_consumer()}
-        elif mode == "stream_read":
-            return {"producer_asm": self._gen_read_producer(),
-                    "consumer_asm": self._gen_read_consumer(instr, regs)}
-        else:  # ss_status
-            return {"producer_asm": self._gen_status_producer(),
-                    "consumer_asm": self._gen_status_consumer(instr, regs)}
+        return {"producer_asm": self._gen_read_producer(instr),
+                "consumer_asm": self._gen_read_consumer(instr)}
 
-    def _gen_write_producer(self, instr, regs):
-        """Test tile: immediate value, markers, stream write instruction."""
-        asm_str = instr.get("asm_string", "")
-        name = instr["name"]
+    # -- stream writes --
+
+    def _write_setup(self, form: str) -> list[str]:
+        lines = []
+        if form == "scl":
+            lines += [f"  movxm {r}, #{v:#x}" for r, v in zip(_WORD_REGS, STREAM_PAYLOAD)]
+        elif form == "ph":
+            lines += [f"  movxm {r}, #{v:#x}" for r, (v, _) in zip(_ID_REGS, PACKET_HEADER_VARIANTS)]
+        else:
+            lines += [f"  movxm {r}, #{v:#x}" for r, (v, _, _, _) in zip(_ADDR_REGS, CONTROL_HEADER_VARIANTS)]
+            lines += [f"  movxm {r}, #{v:#x}" for r, (_, _, _, v) in zip(_ID_REGS, CONTROL_HEADER_VARIANTS)]
+            lines += [f"  mov m{i}, {r}" for i, r in enumerate(_ADDR_REGS)]
+        return lines
+
+    def _write_asm(self, mnemonic: str, form: str, i: int) -> str:
+        if form == "scl":
+            return f"{mnemonic} ms, {_WORD_REGS[i]}"
+        if form == "ph":
+            return f"{mnemonic} ms, {_ID_REGS[i]}, #{PACKET_HEADER_VARIANTS[i][1]}"
+        _, nw, op, _ = CONTROL_HEADER_VARIANTS[i]
+        return f"{mnemonic} ms, m{i}, #{nw}, #{op}, {_ID_REGS[i]}"
+
+    def _gen_write_producer(self, instr):
+        """Test tile: the instruction under test writes STREAM_WORDS distinct words.
+
+        A TLAST form writes words 1 and 3; words 0 and 2 use its plain sibling, so the
+        consumer's status shows TLAST on exactly the words the instruction under test sent.
+        """
+        name, form = instr["name"], self._form(instr)
+        mnemonic = instr["mnemonic"]
+        sibling = mnemonic[:-len(".tlast")] if self._has_tlast(instr) else mnemonic
+        nb = self._is_nb(instr)
         lines = [f"  // ---- stream write producer (test): {name} ----"]
-        lines.append("  mov r0, #0xBEEF")
-        if self._has_tlast_reg(instr):
-            lines.append("  mov r1, #1")
-        if "cph" in asm_str:
-            lines.append("  mov m0, #0")
+        lines += self._write_setup(form)
         lines.append("  mov r14, #170")
         lines.extend(_scalar_store("r14", "p0", 0))
-        asm_line = _substitute_asm(asm_str, regs)
-        lines.append(f"  {asm_line}")
+        for i in range(STREAM_WORDS):
+            used = mnemonic if (not self._has_tlast(instr) or i % 2 == 1) else sibling
+            lines.append(f"  {self._write_asm(used, form, i)}")
+            if nb:
+                # srMS0 lands MS_STATUS_LATENCY cycles after the write.
+                lines.extend(_nop_sled(MS_STATUS_LATENCY - 1))
+                lines.append(f"  mov {_STATUS_REGS[i]}, srMS0")
         lines.append("  mov r14, #204")
         lines.extend(_scalar_store("r14", "p0", 4))
+        if nb:
+            lines.extend(_nop_sled(2))
+            for i in range(STREAM_WORDS):
+                lines.extend(_scalar_store(_STATUS_REGS[i], "p0", 8 + 4 * i))
         lines.append("")
         return "\n".join(lines)
 
     def _gen_write_consumer(self):
-        """Helper: drain stream via mov.d1, store received value."""
-        lines = ["  // ---- stream write consumer (helper): drain stream ----"]
-        lines.append("  mov.d1 r0, srSS0")
-        lines.append("  nop")
-        lines.extend(_scalar_store("r0", "p0", 0))
+        """Helper: read every beat (blocking), keep each word and the srSS0 its read left."""
+        lines = ["  // ---- stream write consumer (helper): read + status ----"]
+        lines += [f"  mov {r}, #0" for r in _READ_REGS]
+        for i in range(STREAM_WORDS):
+            lines.append(f"  mov {_READ_REGS[i]}, SS")
+            # The word lands after the itinerary's result latency, srSS0 one cycle later.
+            lines.extend(_nop_sled(SS_STATUS_LATENCY - 1))
+            lines.append(f"  mov {_STATUS_REGS[i]}, srSS0")
+        lines.extend(_nop_sled(2))
+        for i in range(STREAM_WORDS):
+            lines.extend(_scalar_store(_READ_REGS[i], "p0", 4 * i))
+        for i in range(STREAM_WORDS):
+            lines.extend(_scalar_store(_STATUS_REGS[i], "p0", 4 * (STREAM_WORDS + i)))
         lines.append("")
         return "\n".join(lines)
 
-    def _gen_read_producer(self):
-        """Helper: write known value to ms."""
-        lines = ["  // ---- stream read producer (helper): write ms ----"]
-        lines.append("  mov r0, #0xBEEF")
+    # -- stream reads --
+
+    def _gen_read_producer(self, instr):
+        """Helper: send STREAM_WORDS words.  Blocking test: TLAST on word 2.  NB test: word
+        0 is the consumer's sync read, TLAST on words 2 and 3 (so the empty reads that
+        follow show the TLAST the last word had)."""
+        lines = ["  // ---- stream read producer (helper): words, TLAST ----"]
+        lines += [f"  movxm {r}, #{v:#x}" for r, v in zip(_WORD_REGS, STREAM_PAYLOAD)]
         lines.append("  mov r14, #170")
         lines.extend(_scalar_store("r14", "p0", 0))
-        lines.append("  mov ms, r0")
+        tlast_words = {2, 3} if self._is_nb(instr) else {2}
+        for i in range(STREAM_WORDS):
+            op = "mov.tlast" if i in tlast_words else "mov"
+            lines.append(f"  {op} ms, {_WORD_REGS[i]}")
         lines.append("  mov r14, #204")
         lines.extend(_scalar_store("r14", "p0", 4))
         lines.append("")
         return "\n".join(lines)
 
-    def _gen_read_consumer(self, instr, regs):
-        """Test tile: execute mov.d* stream read, NOP sled, store result."""
+    def _read_and_status(self, asm: str, status_reg: str) -> list[str]:
+        lines = [f"  {asm}"]
+        lines.extend(_nop_sled(SS_STATUS_LATENCY - 1))
+        lines.append(f"  mov {status_reg}, srSS0")
+        return lines
+
+    def _gen_read_consumer(self, instr):
+        """Test tile: the instruction under test reads.  Blocking: STREAM_WORDS reads, each
+        into its own register.  NB: a blocking sync read (word 0), a wait for the rest to
+        arrive, STREAM_WORDS-1 NB reads, then NB reads of the now-empty stream into
+        registers that held 0."""
         name = instr["name"]
-        delay = self._delay_count(instr)
-        asm_str = instr.get("asm_string", "")
+        mnemonic = instr["mnemonic"]
         lines = [f"  // ---- stream read consumer (test): {name} ----"]
-        asm_line = _substitute_asm(asm_str, regs)
-        lines.append(f"  {asm_line}")
-        lines.extend(_nop_sled(delay))
-        lines.extend(_scalar_store("r0", "p0", 0))
+        # r16-r23 are callee-saved, not zeroed by the preamble: a read that failed to land
+        # must show as 0, not as whatever the caller left.
+        lines += [f"  mov {r}, #0" for r in (*_READ_REGS, "r20", "r21", "r22")]
+        if not self._is_nb(instr):
+            for i in range(STREAM_WORDS):
+                lines += self._read_and_status(f"{mnemonic} {_READ_REGS[i]}, SS", _STATUS_REGS[i])
+            lines.extend(_nop_sled(2))
+            for i in range(STREAM_WORDS):
+                lines.extend(_scalar_store(_READ_REGS[i], "p0", 4 * i))
+            for i in range(STREAM_WORDS):
+                lines.extend(_scalar_store(_STATUS_REGS[i], "p0", 4 * (STREAM_WORDS + i)))
+        else:
+            sync_reg, sync_status = "r20", "r28"
+            lines += self._read_and_status(f"mov {sync_reg}, SS", sync_status)
+            # The producer's remaining beats follow the sync word within a few cycles; the
+            # wait covers the stream hops with a wide margin.
+            lines.extend(_nop_sled(NB_SYNC_WAIT))
+            data_regs = _READ_REGS[:STREAM_WORDS - 1]
+            data_status = _STATUS_REGS[:STREAM_WORDS - 1]
+            for r, st_reg in zip(data_regs, data_status):
+                lines += self._read_and_status(f"{mnemonic} {r}, SS", st_reg)
+            empty_regs, empty_status = ("r21", "r22"), ("r29", "r30")
+            for r, st_reg in zip(empty_regs, empty_status):
+                lines += self._read_and_status(f"{mnemonic} {r}, SS", st_reg)
+            lines.extend(_nop_sled(2))
+            record = [sync_reg, sync_status, *data_regs, *data_status, *empty_regs, *empty_status]
+            assert len(record) == NB_READ_RECORDS
+            for i, r in enumerate(record):
+                lines.extend(_scalar_store(r, "p0", 4 * i))
         lines.append("")
         return "\n".join(lines)
 
-    def _gen_status_producer(self):
-        """Helper: write dummy value to establish active flow."""
-        lines = ["  // ---- SS status producer (helper): establish flow ----"]
-        lines.append("  mov r0, #0xDEAD")
-        lines.append("  mov r14, #170")
-        lines.extend(_scalar_store("r14", "p0", 0))
-        lines.append("  mov ms, r0")
-        lines.append("  mov r14, #204")
-        lines.extend(_scalar_store("r14", "p0", 4))
-        lines.append("")
-        return "\n".join(lines)
 
-    def _gen_status_consumer(self, instr, regs):
-        """Test tile: markers around SS read, plus store status value."""
-        name = instr["name"]
-        asm_str = instr.get("asm_string", "")
-        lines = [f"  // ---- SS status consumer (test): {name} ----"]
-        lines.append("  mov r14, #170")
-        lines.extend(_scalar_store("r14", "p0", 0))
-        asm_line = _substitute_asm(asm_str, regs)
-        lines.append(f"  {asm_line}")
-        lines.append("  mov r14, #204")
-        lines.extend(_scalar_store("r14", "p0", 4))
-        lines.extend(_scalar_store("r0", "p0", 8))
+# Words of the NB read record: sync word + status, (STREAM_WORDS - 1) words + statuses, two
+# empty reads + statuses.
+NB_READ_RECORDS = 2 + 2 * (STREAM_WORDS - 1) + 4
+# Idle bundles between the sync read and the NB reads: far more than the producer needs to
+# push its remaining beats through the stream switches.
+NB_SYNC_WAIT = 200
+
+
+# ---------------------------------------------------------------------------
+# MovDelayStrategy: mov.d1-d6, the delayed scalar moves
+# ---------------------------------------------------------------------------
+
+def mov_delay_count(instr: dict) -> int:
+    """N of `mov.dN`, or 0 if the instruction is not a delayed move."""
+    m = re.fullmatch(r"mov\.d([1-6])", instr.get("mnemonic", ""))
+    return int(m.group(1)) if m else 0
+
+
+class MovDelayStrategy(TestStrategy):
+    """`mov.dN dst, src` writes dst N+1 cycles after issue (a plain `mov` writes after one;
+    II_MOVdN's result latency is N+1) from the source as read at issue.
+
+    One test point per N, three observations:
+      - dst read by two stores in the cycles N and N+1 after the issue: the old value, then
+        the source (a store at N would see the source if the move were not delayed),
+      - a second move whose source register is overwritten the cycle after the issue:
+        dst takes the value the source had at issue.
+    The captures are stores and the overwrite an `add`, not moves: on silicon a plain `mov` /
+    `movxm` issued N cycles after `mov.dN` (its result lands in the cycle the delayed write
+    does) makes the delayed write vanish (docs/known-fidelity-gaps.md).
+    """
+
+    OLD, NEW, SAMPLED = 0, 4, 8
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if mov_delay_count(instr):
+            return (True, "")
+        return (False, "not a delayed scalar move")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"dst": "r1", "src": "r2"}]
+
+    def compute_input_size(self, instr, regs):
+        return 16
+
+    def compute_output_size(self, instr):
+        return 12
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        n = mov_delay_count(instr)
+        op = instr["mnemonic"]
+        in_offset = _align(in_offset, 4)
+        lines = [f"  // ---- test (delayed move): {instr['name']} ----"]
+        # dst / src of the timing check, then dst / src of the sampling check.  (The loads
+        # use p6 as scratch for far offsets: the output pointer is set up after them.)
+        for k, reg in enumerate(("r1", "r2", "r5", "r6")):
+            lines += _scalar_load(reg, "p0", in_offset + 4 * k)
+        lines += _padda_sequence("p6", "p1", out_offset)
+        lines.append("  movxm r9, #1")
+        lines.extend(_nop_sled(LOAD_LATENCY))
+        lines.append(f"  {op} r1, r2")
+        lines.extend(_nop_sled(n - 1))
+        lines.append(f"  st r1, [p6, #{self.OLD}]")
+        lines.append(f"  st r1, [p6, #{self.NEW}]")
+        lines.append(f"  {op} r5, r6")
+        # Not a mov: a plain mov or movxm issued N cycles after mov.dN (landing in the same
+        # cycle as its write) makes silicon drop the delayed write.
+        lines.append("  add r6, r6, r9")
+        lines.extend(_nop_sled(n + 2))
+        lines.append(f"  st r5, [p6, #{self.SAMPLED}]")
         lines.append("")
         return "\n".join(lines)
 
@@ -5221,6 +5418,18 @@ MAX_BUNDLES_PER_BATCH = int(
 MAX_OUT_BUFFER_BYTES = 32768  # 32KB -- conservative half of 64KB
 
 
+def _payload_meta(strategy, instr: dict) -> dict:
+    """The `payload` (and `variants`) keys of a test point whose strategy declares them:
+    the output bytes that carry what the test observes (markers excluded), and the groups
+    of those bytes that must differ from one another.  The analyzer fails a test point
+    whose payload is all zero (the pre-run fill) or whose variants are all identical."""
+    meta = {"payload": strategy.payload(instr)}
+    variants = strategy.payload_variants(instr)
+    if variants:
+        meta["variants"] = variants
+    return meta
+
+
 def _count_bundles(asm_text: str) -> int:
     """Count the number of assembly bundles (non-empty, non-comment lines)."""
     count = 0
@@ -5308,6 +5517,11 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             branch_instr_count += 1
             continue
 
+        # The delayed scalar moves are tested by the second pass below (value tests) and by
+        # MovDelayStrategy (delay tests): they are not stream instructions.
+        if mov_delay_count(instr):
+            continue
+
         strategy, reason = classify_with_strategies(instr)
         if strategy is None:
             skipped_count += 1
@@ -5353,7 +5567,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     compute = ComputeStrategy()
     for instr in all_instrs:
         mnemonic = instr.get("mnemonic", "")
-        if re.match(r"mov\.d[1-6]", mnemonic):
+        if mov_delay_count(instr):
             can, _ = compute.can_test(instr)
             if can:
                 testable_count += 1
@@ -5361,6 +5575,15 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 for combo_idx, regs in enumerate(combos):
                     regs["_combo_idx"] = combo_idx
                     test_point_specs.append((instr, combo_idx, regs, compute))
+
+    # One delay test per delayed move, in a batch of their own after the pairs.
+    delay_strategy = MovDelayStrategy()
+    delay_specs = []
+    for instr in all_instrs:
+        if mov_delay_count(instr):
+            for combo_idx, regs in enumerate(delay_strategy.generate_combos(instr)):
+                regs["_combo_idx"] = combo_idx
+                delay_specs.append((instr, combo_idx, regs, delay_strategy))
 
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
@@ -5592,6 +5815,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 "out_offset": 0,
                 "out_size": (strategy.compute_producer_output_size()
                              + strategy.compute_consumer_output_size(instr)),
+                **_payload_meta(strategy, instr),
             }],
         })
         batch_idx += 1
@@ -5643,7 +5867,44 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 "out_offset": 0,
                 "out_size": (strategy.compute_producer_output_size(instr)
                              + strategy.compute_consumer_output_size(instr)),
+                **_payload_meta(strategy, instr),
             }],
+        })
+        batch_idx += 1
+
+    # Delay tests: one standalone assembly batch.
+    if delay_specs:
+        offset_in = offset_out = 0
+        asm_parts, delay_meta = [], []
+        for instr, combo_idx, regs, strategy in delay_specs:
+            offset_in, offset_out = _align(offset_in, 32), _align(offset_out, 32)
+            in_size = strategy.compute_input_size(instr, regs)
+            out_size = strategy.compute_output_size(instr)
+            asm_parts.append(strategy.generate_test_point(
+                instr, regs, in_offset=offset_in, out_offset=offset_out))
+            delay_meta.append({
+                "instruction": instr["name"],
+                "slot": instr.get("slot", ""),
+                "combo_index": combo_idx,
+                "operands": {k: v for k, v in regs.items() if not k.startswith("_")},
+                "in_offset": offset_in,
+                "in_size": in_size,
+                "out_offset": offset_out,
+                "out_size": out_size,
+            })
+            offset_in += in_size
+            offset_out += out_size
+        filename = f"batch_{batch_idx:03d}.s"
+        write_if_changed(os.path.join(out_dir, filename),
+                         build_mega_program(asm_parts, out_size=offset_out))
+        batches.append({
+            "batch_index": batch_idx,
+            "filename": filename,
+            "source_type": "assembly",
+            "test_count": len(delay_meta),
+            "in_size": offset_in,
+            "out_size": offset_out,
+            "tests": delay_meta,
         })
         batch_idx += 1
 
@@ -5651,7 +5912,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     # Count branch .ll test points from the branch batch.
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
-                         + len(cascade_specs) + len(stream_specs)
+                         + len(cascade_specs) + len(stream_specs) + len(delay_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())

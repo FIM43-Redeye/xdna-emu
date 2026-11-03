@@ -2132,6 +2132,34 @@ mod tests {
         eprintln!("  Data: {} words transferred correctly in {} cycles", test_values.len(), cycles);
     }
 
+    /// TLAST rides the core-to-core stream path: a beat the source core wrote with TLAST
+    /// reaches the destination core's input with TLAST, the others without.
+    #[test]
+    fn test_core_stream_tlast_travels_to_the_destination_core() {
+        use crate::device::array::TileArray;
+        use crate::device::host_memory::HostMemory;
+
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let mut host_memory = HostMemory::new();
+        array.tile_mut(1, 2).stream_switch.configure_local_route(0, 13); // Core -> North0
+        array.tile_mut(1, 3).stream_switch.configure_local_route(5, 0); // South0 -> Core
+
+        let beats = [(0xA1u32, false), (0xB2, true), (0xC3, false)];
+        for &(word, tlast) in &beats {
+            array.tile_mut(1, 2).push_stream_output_beat(0, word, tlast);
+        }
+        for _ in 0..40 {
+            array.step_data_movement(&mut host_memory);
+        }
+        let dst = array.tile_mut(1, 3);
+        let mut received = Vec::new();
+        while let Some(beat) = dst.pop_stream_input_beat(0) {
+            received.push(beat);
+        }
+        assert_eq!(received, beats);
+    }
+
     /// Test that loads and executes a real XCLBIN file.
     ///
     /// This test validates our parser and state application work with real binaries.
