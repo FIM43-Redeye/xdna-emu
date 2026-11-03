@@ -26,6 +26,10 @@ from .device_model import (
 from .topology import Cascade, Core, CoreStream, Topology
 
 
+# Chess joins with the C++ source kind; aiecc needs `--xchesscc --xbridge` for it.
+SUPPORTED_COMPILERS = ("peano",)
+
+
 @dataclass(frozen=True)
 class ValidationError:
     code: str                 # stable identifier, asserted by tests
@@ -60,6 +64,11 @@ def validate(topology: Topology, device: DeviceModel) -> list[ValidationError]:
         err("device_mismatch",
             f"topology targets {topology.device!r} but was validated against "
             f"{device.name!r}", topology.device)
+
+    if topology.compiler not in SUPPORTED_COMPILERS:
+        err("unsupported_compiler",
+            f"compiler {topology.compiler!r} is not supported (one of "
+            f"{', '.join(SUPPORTED_COMPILERS)})", topology.compiler)
 
     placed = _check_cores(topology, device, err)
     for core in placed:

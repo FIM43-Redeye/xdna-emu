@@ -11,7 +11,7 @@ Field order note: `Topology` lists `cores` before the defaulted fields
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -72,6 +72,9 @@ class Topology:
     links: tuple[Link, ...] = ()
     reserve_shim_s2mm: int = 0      # shim S2MM channels kept free (trace uses them)
     seed: int = 1
+    # aiecc picks the linker per package, so the compiler belongs to the package, not to a
+    # core. Only "peano" is accepted until the C++ source kind lands (validate.py).
+    compiler: str = "peano"
 
 
 # -- serialization -----------------------------------------------------------
@@ -103,7 +106,8 @@ def to_dict(t: Topology) -> dict[str, Any]:
     return {"name": t.name, "device": t.device,
             "cores": [core(c) for c in t.cores],
             "links": [link(l) for l in t.links],
-            "reserve_shim_s2mm": t.reserve_shim_s2mm, "seed": t.seed}
+            "reserve_shim_s2mm": t.reserve_shim_s2mm, "seed": t.seed,
+            "compiler": t.compiler}
 
 
 def _fields(d: Any, required: set[str], optional: set[str], where: str) -> dict:
@@ -121,7 +125,7 @@ def _fields(d: Any, required: set[str], optional: set[str], where: str) -> dict:
 def topology_from_dict(d: dict[str, Any]) -> Topology:
     """Strict inverse of `to_dict`: unknown or missing keys raise."""
     d = _fields(d, {"name", "cores"},
-                {"device", "links", "reserve_shim_s2mm", "seed"}, "topology")
+                {"device", "links", "reserve_shim_s2mm", "seed", "compiler"}, "topology")
 
     def buffer(b: Any, where: str) -> Buffer:
         b = _fields(b, {"name", "direction", "size_bytes"}, {"data"}, where)
@@ -161,11 +165,18 @@ def topology_from_dict(d: dict[str, Any]) -> Topology:
         links=tuple(link(l, i) for i, l in enumerate(d.get("links", []))),
         reserve_shim_s2mm=d.get("reserve_shim_s2mm", 0),
         seed=d.get("seed", 1),
+        compiler=d.get("compiler", "peano"),
     )
 
 
 def load_topology(path: str | Path) -> Topology:
+    """Read a topology file. A relative `Core.source` is relative to the file's directory,
+    so a case directory (topology plus its kernels) can be moved as a unit."""
+    path = Path(path)
     try:
-        return topology_from_dict(json.loads(Path(path).read_text()))
+        t = topology_from_dict(json.loads(path.read_text()))
     except json.JSONDecodeError as e:
         raise TopologyFormatError(f"{path}: invalid JSON: {e}") from None
+    base = path.resolve().parent
+    return replace(t, cores=tuple(
+        c if c.source.is_absolute() else replace(c, source=base / c.source) for c in t.cores))

@@ -62,7 +62,9 @@ def test_load_topology_from_file(tmp_path):
     t = _topology()
     p = tmp_path / "topology.json"
     p.write_text(json.dumps(to_dict(t)))
-    assert load_topology(p) == t
+    resolved = dataclasses.replace(t, cores=tuple(
+        dataclasses.replace(c, source=tmp_path / c.source) for c in t.cores))
+    assert load_topology(p) == resolved
 
 
 def test_unknown_key_is_rejected():
@@ -91,3 +93,38 @@ def test_bad_hex_data_is_rejected():
     d["cores"][0]["args"][0]["data"] = "zz"
     with pytest.raises(TopologyFormatError, match="data"):
         topology_from_dict(d)
+
+
+# -- compiler is a package-level property ------------------------------------
+
+def test_compiler_defaults_to_peano_and_round_trips():
+    t = Topology("t", cores=())
+    assert t.compiler == "peano"
+    assert to_dict(t)["compiler"] == "peano"
+    t2 = dataclasses.replace(_topology(), compiler="peano")
+    assert topology_from_dict(to_dict(t2)) == t2
+
+
+def test_dict_without_compiler_key_means_peano():
+    d = to_dict(Topology("t", cores=()))
+    del d["compiler"]
+    assert topology_from_dict(d).compiler == "peano"
+
+
+def test_validator_rejects_other_compilers():
+    from harness.validate import validate_topology
+    t = Topology("t", (Core("c", TileRef(0, 2), Path("c.s")),), device="auto", compiler="chess")
+    assert "unsupported_compiler" in {e.code for e in validate_topology(t)}
+
+
+# -- relative sources resolve against the topology file ----------------------
+
+def test_load_topology_resolves_relative_sources(tmp_path):
+    d = tmp_path / "case"
+    d.mkdir()
+    t = Topology("t", (Core("c", TileRef(0, 2), Path("kernel.s")),
+                       Core("e", TileRef(0, 3), Path("/abs/e.s"))))
+    (d / "topology.json").write_text(json.dumps(to_dict(t)))
+    got = load_topology(d / "topology.json")
+    assert got.cores[0].source == d / "kernel.s"
+    assert got.cores[1].source == Path("/abs/e.s")
