@@ -69,3 +69,71 @@ def test_objects_symbols_and_manifest(kernel, tmp_path):
     assert m["plan"]["device"] == "npu1_1col" and len(m["plan"]["phases"]) == 1
     assert m["phases"] == ["phase_0"] and m["git_rev"]
     assert not m["tools"]["llvm-mc"]["path"].startswith("/home")
+
+
+# -- .ll sources ---------------------------------------------------------------
+
+LL_KERNEL = "define void @test_kernel() {\n  ret void\n}\n"
+
+
+@pytest.mark.skipif(not peano("llc"), reason="Peano llc unavailable")
+def test_ll_source_is_compiled_with_llc(tmp_path):
+    src = tmp_path / "k.ll"
+    src.write_text(LL_KERNEL)
+    t = Topology("ll", (Core("a", TileRef(0, 2), src, args=(Buffer("o", "out", 64),)),), device="auto")
+    pkg = build_package(t, tmp_path / "out", run_aiecc=False)
+    obj = pkg.phase_dirs[0] / "a.o"
+    assert obj.is_file()
+    log = (pkg.phase_dirs[0] / "a.o.log").read_text()
+    assert "--issue-limit=1" in log and "llc" in log
+
+
+def test_unknown_source_suffix_names_the_supported_kinds(tmp_path):
+    src = tmp_path / "k.cc"
+    src.write_text("")
+    t = Topology("cc", (Core("a", TileRef(0, 2), src),), device="auto")
+    with pytest.raises(BuildError, match=r"unsupported source type '\.cc'.*\.s.*\.ll.*\.o"):
+        build_package(t, tmp_path / "out", run_aiecc=False)
+
+
+# -- inputs hash and reuse -----------------------------------------------------
+
+def test_inputs_hash_follows_source_content_not_path(kernel, tmp_path):
+    from harness.build import compute_inputs_hash, _workspace
+    other = tmp_path / "copy.s"
+    other.write_text(KERNEL)
+    base = two_cores(kernel)
+    moved = Topology("two", (
+        Core("a", TileRef(0, 2), other, args=(Buffer("i", "in", 64),)),
+        Core("b", TileRef(0, 3), other, args=(Buffer("o", "out", 64),))), device="auto")
+    root = _workspace()
+    assert compute_inputs_hash(base, ["m"], root) == compute_inputs_hash(moved, ["m"], root)
+    assert compute_inputs_hash(base, ["m"], root) != compute_inputs_hash(base, ["m2"], root)
+    other.write_text(KERNEL + "\tnop\n")
+    assert compute_inputs_hash(base, ["m"], root) != compute_inputs_hash(moved, ["m"], root)
+
+
+def test_inputs_hash_follows_topology(kernel):
+    from harness.build import compute_inputs_hash, _workspace
+    import dataclasses
+    t = two_cores(kernel)
+    root = _workspace()
+    assert (compute_inputs_hash(t, ["m"], root)
+            != compute_inputs_hash(dataclasses.replace(t, seed=9), ["m"], root))
+
+
+@pytest.mark.skipif(not shutil.which("aiecc") or not (peano("llvm-mc") and peano("llvm-objcopy")),
+                    reason="aiecc or Peano unavailable")
+def test_reuse_skips_an_unchanged_package_and_rebuilds_a_changed_one(kernel, tmp_path):
+    t = two_cores(kernel)
+    out = tmp_path / "out"
+    first = build_package(t, out, reuse=True)
+    assert not first.reused and first.inputs_hash
+    stamp = (out / "phase_0" / "aie.xclbin").stat().st_mtime_ns
+    again = build_package(t, out, reuse=True)
+    assert again.reused and again.inputs_hash == first.inputs_hash
+    assert (out / "phase_0" / "aie.xclbin").stat().st_mtime_ns == stamp
+    kernel.write_text(KERNEL + "\tnop\n")
+    third = build_package(t, out, reuse=True)
+    assert not third.reused and third.inputs_hash != first.inputs_hash
+    assert not build_package(t, out).reused          # reuse is opt-in

@@ -6,19 +6,27 @@ Any validation or planning error stops before aiecc. Per phase it writes
     <out_dir>/phase_<i>/aie.mlir, <core>.o ..., aie.xclbin, insts.bin, aiecc.log
     <out_dir>/manifest.json
 
-Kernel objects: a `.s` source is assembled with Peano `llvm-mc
---triple=aie2 --filetype=obj` (as tools/run_acc_timing_probe.py does); a `.o`
-is copied. Each object's `core.symbol` is then renamed to the core's unique
+Kernel objects, by source suffix (`SOURCE_KINDS`; C++ joins there later): `.s` is
+assembled with Peano `llvm-mc --triple=aie2 --filetype=obj`; `.ll` is compiled with
+Peano `llc -mtriple=aie2 --issue-limit=1` (one instruction per bundle, as
+scripts/isa-test.sh does for single-instruction tests); `.o` is copied. Each object's `core.symbol` is then renamed to the core's unique
 linker symbol with `llvm-objcopy --redefine-sym` (as tools/isa-multi-tile-gen.py
 does), so several cores can share one source symbol.
 
 The aiecc invocation is the one scripts/isa-test.sh uses (Peano, no Chess).
 Tool paths come from the environment the workspace activates
 (`PEANO_INSTALL_DIR`, `PATH`); the manifest records them workspace-relative.
+
+Reuse: with `reuse=True` a package whose inputs hash the same as the one on disk is
+not rebuilt. The hash covers the topology (sources by content), the emitted MLIR of
+every phase, the aiecc flags and the identity (version, size, mtime) of every tool,
+and is stored in the manifest as `inputs_hash`.
 """
 from __future__ import annotations
 
 import dataclasses
+import functools
+import hashlib
 import json
 import os
 import shutil
@@ -47,6 +55,8 @@ class Package:
     out_dir: Path
     plan: ChannelPlan
     phase_dirs: tuple[Path, ...]
+    inputs_hash: str = ""
+    reused: bool = False         # True when an up-to-date build was found and left alone
 
 
 def _workspace() -> Path:
@@ -88,19 +98,35 @@ def _run(cmd: list[str], cwd: Path | None, log: Path, what: str) -> None:
         raise BuildError(f"{what} failed (exit {r.returncode}); log: {log}")
 
 
+def _assemble(src: Path, dest: Path, log: Path) -> None:
+    _run([_peano_tool("llvm-mc"), "--triple=aie2", "--filetype=obj",
+          "-o", str(dest), str(src)], None, log, f"assembling {src.name}")
+
+
+def _llc(src: Path, dest: Path, log: Path) -> None:
+    _run([_peano_tool("llc"), "-mtriple=aie2", "--issue-limit=1", "-filetype=obj",
+          "-o", str(dest), str(src)], None, log, f"compiling {src.name}")
+
+
+def _copy_object(src: Path, dest: Path, log: Path) -> None:
+    shutil.copyfile(src, dest)
+
+
+# source suffix -> function(src, dest object, log) producing a relocatable AIE2 object
+SOURCE_KINDS = {".s": _assemble, ".ll": _llc, ".o": _copy_object}
+
+
 def _build_object(core, phase_dir: Path) -> None:
     dest = phase_dir / kernel_object(core)
     log = phase_dir / f"{kernel_object(core)}.log"
     src = Path(core.source)
     if not src.is_file():
         raise BuildError(f"core {core.name!r}: source {src} does not exist")
-    if src.suffix == ".s":
-        _run([_peano_tool("llvm-mc"), "--triple=aie2", "--filetype=obj",
-              "-o", str(dest), str(src)], None, log, f"assembling {src.name}")
-    elif src.suffix == ".o":
-        shutil.copyfile(src, dest)
-    else:
-        raise BuildError(f"core {core.name!r}: unsupported source type {src.suffix!r}")
+    make = SOURCE_KINDS.get(src.suffix)
+    if make is None:
+        raise BuildError(f"core {core.name!r}: unsupported source type {src.suffix!r} "
+                         f"(one of {', '.join(SOURCE_KINDS)})")
+    make(src, dest, log)
     _run([_peano_tool("llvm-objcopy"), "--redefine-sym",
           f"{core.symbol}={kernel_symbol(core)}", str(dest)],
          None, log.with_suffix(".objcopy.log"), f"renaming symbol in {dest.name}")
@@ -115,31 +141,62 @@ def _git_rev() -> str:
         return "unknown"
 
 
+@functools.lru_cache(maxsize=None)
 def _tool_versions(root: Path) -> dict:
+    """Path, version line and file stamp (size, mtime) of every tool a build runs."""
     def first_line(cmd: list[str]) -> str:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             return (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else ""
         except (OSError, subprocess.TimeoutExpired):
             return ""
-    aiecc = aiecc_path() or ""
-    tools = {"aiecc": {"path": _rel(aiecc, root), "version": first_line([aiecc, "--version"]) if aiecc else ""}}
-    for name in ("llvm-mc", "llvm-objcopy"):
+
+    def entry(p: str) -> dict:
+        st = Path(p).stat()
+        return {"path": _rel(p, root), "version": first_line([p, "--version"]),
+                "stamp": f"{st.st_size}:{st.st_mtime_ns}"}
+
+    tools = {"aiecc": entry(aiecc_path()) if aiecc_path() else {"path": "", "version": "", "stamp": ""}}
+    for name in ("llvm-mc", "llc", "llvm-objcopy"):
         try:
-            p = _peano_tool(name)
-            tools[name] = {"path": _rel(p, root), "version": first_line([p, "--version"])}
+            tools[name] = entry(_peano_tool(name))
         except BuildError:
-            tools[name] = {"path": "", "version": ""}
+            tools[name] = {"path": "", "version": "", "stamp": ""}
     return tools
 
 
+def compute_inputs_hash(topology: Topology, mlir: list[str], root: Path) -> str:
+    """Hash of everything a build depends on; sources count by content, not path."""
+    sources = {}
+    for c in topology.cores:
+        src = Path(c.source)
+        if not src.is_file():
+            raise BuildError(f"core {c.name!r}: source {src} does not exist")
+        sources[c.name] = hashlib.sha256(src.read_bytes()).hexdigest()
+    doc = {"topology": {**to_dict(topology), "cores": [
+               {**c, "source": sources[c["name"]]} for c in to_dict(topology)["cores"]]},
+           "mlir": mlir, "aiecc_flags": list(AIECC_FLAGS), "tools": _tool_versions(root)}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
+
+
+def _up_to_date(out_dir: Path, inputs_hash: str, phases: int) -> bool:
+    try:
+        m = json.loads((out_dir / "manifest.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return m.get("inputs_hash") == inputs_hash and all(
+        (out_dir / f"phase_{i}" / n).is_file()
+        for i in range(phases) for n in ("aie.xclbin", "insts.bin"))
+
+
 def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = True,
-                  device: DeviceModel | None = None) -> Package:
+                  device: DeviceModel | None = None, reuse: bool = False) -> Package:
     """Validate, plan, emit and build every phase of `topology` into `out_dir`.
 
     `device` overrides the planning model (tests shrink the memtile to reach
     plan shapes the real limits never produce); the emitted MLIR still targets
-    the real device of that name.
+    the real device of that name. `reuse` leaves an up-to-date build in place (see the
+    module docstring); it needs `run_aiecc`, since a package without xclbins is never current.
     """
     out_dir = Path(out_dir)
     if device is None:
@@ -162,12 +219,20 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
         raise BuildError(f"{topology.name}: {e}") from None
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    root = _workspace()
+    mlir = [emit_mlir(topology, plan, ph.index, device) for ph in plan.phases]
+    inputs_hash = compute_inputs_hash(topology, mlir, root)
+    if reuse and run_aiecc and _up_to_date(out_dir, inputs_hash, len(plan.phases)):
+        return Package(out_dir, plan, tuple(out_dir / f"phase_{p.index}" for p in plan.phases),
+                       inputs_hash, reused=True)
+
+    (out_dir / "manifest.json").unlink(missing_ok=True)   # a half-built package is never current
     by_name = {c.name: c for c in topology.cores}
     phase_dirs: list[Path] = []
-    for ph in plan.phases:
+    for ph, text in zip(plan.phases, mlir):
         pdir = out_dir / f"phase_{ph.index}"
         pdir.mkdir(exist_ok=True)
-        (pdir / "aie.mlir").write_text(emit_mlir(topology, plan, ph.index, device))
+        (pdir / "aie.mlir").write_text(text)
         for name in ph.cores:
             _build_object(by_name[name], pdir)
         if run_aiecc:
@@ -178,7 +243,6 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
                  f"aiecc for {topology.name} phase {ph.index}")
         phase_dirs.append(pdir)
 
-    root = _workspace()
     manifest = {
         "topology": to_dict(topology),
         "plan": dataclasses.asdict(plan),
@@ -186,8 +250,9 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
         "tools": _tool_versions(root),
         "aiecc_flags": list(AIECC_FLAGS),
         "inputs": inputs,
+        "inputs_hash": inputs_hash,
         "phases": [f"phase_{p.index}" for p in plan.phases],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True,
                                                       default=str) + "\n")
-    return Package(out_dir, plan, tuple(phase_dirs))
+    return Package(out_dir, plan, tuple(phase_dirs), inputs_hash)
