@@ -365,6 +365,14 @@ class TestHollowGuard:
         res = ANALYZER.analyze(self._suite(tmp_path, [a], data), "hw-t", "emu-t")
         assert (res.passed, res.hollow) == (0, 2)
 
+    def test_a_zero_expected_test_point_is_not_hollow(self, tmp_path):
+        """vclr on a loaded register: zero is the right answer."""
+        data = {"batch_000": {("core", "out"): bytes(48)}}
+        a = _single(0)
+        a["tests"] = [{**t, "instruction": "VCLR_vclr", "zero_expected": True} for t in a["tests"]]
+        res = ANALYZER.analyze(self._suite(tmp_path, [a], data), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (2, 0)
+
     def test_every_test_point_of_an_instruction_identical_is_hollow(self, tmp_path):
         same = {"batch_000": {("core", "out"): b"\x05" * 48}, "batch_001": {("core", "out"): b"\x05" * 48}}
         a, b = _single(0), _single(1)

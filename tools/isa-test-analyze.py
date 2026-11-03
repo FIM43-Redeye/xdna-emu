@@ -224,7 +224,7 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
     for case in suite.cases:
         for test in suite.case_meta(case).get("tests", []):
             data = _read_payload(suite, hw_tag, case, test)
-            if data is not None:
+            if data is not None and not test.get("zero_expected"):
                 hw_by_instr[test["instruction"]].append(data)
     hollow_found = []
 
@@ -260,9 +260,10 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
             total_points += 1
 
             hw_payload = _read_payload(suite, hw_tag, case, test)
+            # `zero_expected`: the answer is zero by definition (vclr on a loaded register).
             hollow = (hollow_reason(hw_payload, _read_variants(suite, hw_tag, case, test),
                                     hw_by_instr[name], declared="payload" in test)
-                      if hw_payload is not None else None)
+                      if hw_payload is not None and not test.get("zero_expected") else None)
             if hollow:
                 hollow_found.append((name, batch_idx, hollow))
                 passed = False

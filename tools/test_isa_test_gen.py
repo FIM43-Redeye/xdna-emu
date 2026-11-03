@@ -2974,14 +2974,26 @@ class TestPaddaSpStrategy:
         combos = strategy.generate_combos(self._make_padda_sp())
         assert len(combos) == 1
 
-    def test_generates_sp_setup(self):
-        """Should set up p6 (SP) with a known value before padda."""
+    def test_observing_test_measures_how_far_sp_moved_and_restores_it(self):
+        """sp (not p6) is what padda [sp] changes: measure the move after the latency, restore sp."""
+        strategy = isa_test_gen.PaddaSpStrategy()
+        regs = {**strategy.generate_combos(self._make_padda_sp())[0], "_observe_sp": True}
+        asm = strategy.generate_test_point(self._make_padda_sp(), regs, in_offset=0, out_offset=0)
+        lines = [l.strip() for l in asm.split("\n") if l.strip() and not l.strip().startswith("//")]
+        i = lines.index("padda [sp], #32")
+        assert lines[i - 1] == "mov r13, sp"
+        assert lines[i + 1:i + 1 + isa_test_gen.LOAD_LATENCY] == ["nop"] * isa_test_gen.LOAD_LATENCY
+        assert lines[i + 1 + isa_test_gen.LOAD_LATENCY:i + 3 + isa_test_gen.LOAD_LATENCY] == [
+            "mov r14, sp", "sub r14, r14, r13"]
+        assert lines[-1] == "mov sp, r8"
+        assert "p6" not in asm
+
+    def test_ordinary_combination_is_unchanged(self):
+        """It moves p6, which padda [sp] does not touch; kept so neighbouring batches keep their bytes."""
         strategy = isa_test_gen.PaddaSpStrategy()
         regs = strategy.generate_combos(self._make_padda_sp())[0]
-        asm = strategy.generate_test_point(self._make_padda_sp(), regs,
-                                           in_offset=0, out_offset=0)
-        # Should reference p6 (SP alias)
-        assert "p6" in asm
+        asm = strategy.generate_test_point(self._make_padda_sp(), regs, in_offset=0, out_offset=0)
+        assert "movxm p6, #0" in asm and "mov r14, p6" in asm
 
     def test_reads_back_modified_sp(self):
         """Should store the modified p6 value to the output buffer."""
@@ -4433,3 +4445,48 @@ class TestStatusLatenciesAgainstTableGen:
         ms = re.search(r"InstrItinData<II_ST_MS_NB,\s*\[[^\]]*\],\s*\[\d+,\s*/\*def:srMS0\*/(\d+)\]", schedule)
         assert ms, "II_ST_MS_NB itinerary not found"
         assert int(ms.group(1)) == isa_test_gen.MS_STATUS_LATENCY
+
+
+class TestHollowSingleTileFixes:
+    """The observability variants: a zero source for comparisons with zero, a loaded
+    destination for vclr; ordinary combinations are untouched."""
+
+    def _instr(self, name):
+        import json
+        d = json.load(open(os.path.join(os.path.dirname(__file__), "aie2-isa.json")))
+        return next(i for l in d.values() for i in l if i["name"] == name)
+
+    def _point(self, name, regs):
+        asm = isa_test_gen.generate_test_point(self._instr(name), {**regs, "_combo_idx": 0}, 0, 0)
+        return [l.strip().replace("\t", " ") for l in asm.split("\n")
+                if l.strip() and not l.strip().startswith("//")]
+
+    def test_eqz_zeroes_its_source_only_when_asked(self):
+        regs = {"mRx": "r1", "mRx0": "r2"}
+        plain = self._point("EQZ", regs)
+        zeroed = self._point("EQZ", {**regs, "_zero_sources": True})
+        assert "mov r2, #0" not in plain
+        assert zeroed.index("mov r2, #0") < zeroed.index("eqz r1, r2")
+
+    def test_veqz_zeroes_its_vector_source(self):
+        pt = self._point("VEQZ_16", {"cmp": "r16", "s2": "x0", "_zero_sources": True})
+        assert pt.index("vbcst.32 x0, r14") < next(i for i, l in enumerate(pt) if l.startswith("veqz.16"))
+
+    def test_vclr_loads_its_destination_first(self):
+        for dst, halves in (("cm2", ["vmov bml2, x11", "vmov bmh2, x11"]), ("bml3", ["vmov bml3, x11"])):
+            pt = self._point("VCLR_vclr", {"dst": dst, "_preload_output": True})
+            i = pt.index("vbcst.32 x11, r14")
+            j = next(k for k, l in enumerate(pt) if l.startswith("vclr"))
+            assert [l for l in pt[i:j] if l.startswith("vmov")] == halves
+        plain = self._point("VCLR_vclr", {"dst": "cm2"})
+        assert not any("x11" in l for l in plain)
+
+    def test_variants_are_extra_test_points_in_the_last_batch(self, tmp_path):
+        isa_json = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        manifest = generate_all(isa_json, str(tmp_path / "t"))
+        last = manifest["batches"][-1]["tests"]
+        variants = {t["instruction"]: t["variant"] for t in last if "variant" in t}
+        assert variants["EQZ"] == "_zero_sources"
+        assert variants["VCLR_vclr"] == "_preload_output"
+        assert variants["PADDA_sp_imm"] == "_observe_sp"
+        assert next(t for t in last if t["instruction"] == "VCLR_vclr")["zero_expected"]
