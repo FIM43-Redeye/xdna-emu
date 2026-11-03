@@ -7,6 +7,7 @@ Run: python3 -m pytest tools/test_isa_test_gen.py -v
 
 import pytest
 import json
+import re
 import sys
 import os
 
@@ -3374,7 +3375,8 @@ class TestGenerateAll:
         pair_instrs = {b["instruction"] for b in manifest["batches"] if "instruction" in b}
         assert not any(i.startswith("MOV_D") for i in pair_instrs)
         points = [t for b in manifest["batches"] if b["source_type"] == "assembly"
-                  for t in b["tests"] if t["instruction"].startswith("MOV_D")]
+                  for t in b["tests"]
+                  if t["instruction"].startswith("MOV_D") and "case" not in t["operands"]]
         for n in range(1, 7):
             mine = [t for t in points if t["instruction"] == f"MOV_D{n}"]
             assert len(mine) == 17, f"MOV_D{n}: 16 value combos + 1 delay test"
@@ -4421,6 +4423,68 @@ class TestMovDelayStrategy:
         assert lines.index("mov p6, p1") > last_far_load
 
 
+class TestScalarCollisionStrategy:
+    """Two scalar writes landing in one cycle (movd probes): the cases, their timing, their
+    declared payload."""
+
+    @pytest.fixture
+    def isa_json_path(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        return path
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        return str(tmp_path / "isa-tests")
+
+    @staticmethod
+    def _asm(name):
+        c = isa_test_gen.ScalarCollisionStrategy.case(name)
+        text = isa_test_gen.ScalarCollisionStrategy().generate_test_point({"name": c["isa"]}, {"case": name}, 0, 0)
+        return [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("//")], c
+
+    def test_second_write_issues_k_bundles_after_the_lead(self):
+        for c in isa_test_gen.ScalarCollisionStrategy.cases():
+            lines, _ = self._asm(c["name"])
+            i = lines.index(c["lead"])
+            assert lines[i + 1:i + c["k"]] == ["nop"] * (c["k"] - 1), c["name"]
+            assert lines[i + c["k"]] == c["second"], c["name"]
+
+    def test_collisions_follow_the_schedule_hold_cycles(self):
+        """A plain mover holds the shared write unit in its first cycle, mov.dN in cycle N (the
+        EmptyCycles in II_MOVdN), a vector extract / compare in its second: the second write
+        collides when k + own hold cycle = the lead's."""
+        own = {"mov r5, r6": 0, "movxm r5, #0x55555555": 0, "add.nc r5, r6, #3": 0,
+               "vextract.s32 r5, x0, r17": 1, "vlt.s32 r16, x0, x1": 1}
+        for c in isa_test_gen.ScalarCollisionStrategy.cases():
+            if c["name"].endswith(("_mov", "_movxm", "_add_nc", "_vextract", "_vlt")) and "same" not in c["name"]:
+                n = int(c["lead"].split()[0].removeprefix("mov.d"))
+                assert c["k"] + own[c["second"]] == n, c["name"]
+
+    def test_every_lead_is_an_isa_instruction_and_cases_are_unique(self, isa_json_path):
+        import json
+        names = {e["name"] for slot in json.load(open(isa_json_path)).values() for e in slot}
+        cases = isa_test_gen.ScalarCollisionStrategy.cases()
+        assert all(c["isa"] in names for c in cases)
+        assert len({c["name"] for c in cases}) == len(cases)
+
+    def test_nothing_touches_the_reserved_register(self):
+        for c in isa_test_gen.ScalarCollisionStrategy.cases():
+            lines, _ = self._asm(c["name"])
+            assert not any(re.search(r"\br8\b", l) for l in lines), c["name"]
+
+    def test_collision_batches_declare_their_payload_and_come_last(self, isa_json_path, out_dir):
+        manifest = generate_all(isa_json_path, out_dir)
+        batches = manifest["batches"]
+        mine = [b for b in batches if any("case" in t["operands"] for t in b["tests"])]
+        assert mine and batches[-len(mine):] == mine, "collision batches are the last batches"
+        for b in mine:
+            for t in b["tests"]:
+                assert t["payload"] == [{"core": "core", "buffer": "out", "offset": t["out_offset"], "size": 8}]
+        assert sum(len(b["tests"]) for b in mine) == len(isa_test_gen.ScalarCollisionStrategy.cases())
+
+
 class TestStatusLatenciesAgainstTableGen:
     """The status-register latencies the stream tests wait for are TableGen's."""
 
@@ -4489,10 +4553,13 @@ class TestHollowSingleTileFixes:
         plain = self._point("VCONV_FP32_BF16", {"dst": "bml0", "src": "wl0"})
         assert any(l.startswith("vsrs") for l in plain) and "vmov x4, bml0" not in plain
 
-    def test_variants_are_extra_test_points_in_the_last_batch(self, tmp_path):
+    def test_variants_are_extra_test_points_in_the_delay_batch(self, tmp_path):
+        """The delay tests and the variants share one standalone batch; the collision batches
+        follow it."""
         isa_json = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
         manifest = generate_all(isa_json, str(tmp_path / "t"))
-        last = manifest["batches"][-1]["tests"]
+        last = next(b for b in reversed(manifest["batches"])
+                    if any("variant" in t for t in b["tests"]))["tests"]
         variants = {t["instruction"]: t["variant"] for t in last if "variant" in t}
         assert variants["EQZ"] == "_zero_sources"
         assert variants["VCLR_vclr"] == "_preload_output"

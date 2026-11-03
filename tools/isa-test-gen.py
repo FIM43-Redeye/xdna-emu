@@ -3771,6 +3771,141 @@ class MovDelayStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# ScalarCollisionStrategy: two scalar-file writes landing in one cycle
+# ---------------------------------------------------------------------------
+
+class ScalarCollisionStrategy(TestStrategy):
+    """Two scalar writes that land in the same cycle, issued a chosen number of bundles apart.
+
+    The write-port model of the scalar register files (state/scalar_collision.rs in the
+    emulator, docs/fidelity-gaps/core-compute-timing.md) as silicon showed it with the movd
+    probes (build/experiments/harness/movd):
+
+      - two writes to one register file through one port: the later-issued survives, the
+        earlier-issued is dropped (`mov.d3 r1, r2` then `mov r5, r6` three bundles later:
+        r1 keeps its old value),
+      - the same register through two ports: the bitwise OR,
+      - another register file, or another port: no interaction (controls, and the off-by-one
+        neighbours of every collision).
+
+    The ports are the units AIE2Schedule.td holds in the cycle before a result lands: a write
+    issued `k` bundles after another collides when `k + (own hold cycle) = (other's hold cycle)`.
+
+    One test point per case; the lead instruction is the one the case is filed under.  Two
+    observed words: the lead's destination and the other write's (or an untouched sentinel).
+    The test points declare their payload, so the hollow guard applies strictly.
+    """
+
+    # (lead instruction, ISA entry name of the lead, second instruction, bundles apart,
+    #  observed registers).  Built by `cases()`.
+    SENTINEL = {"r5": 0xAAAAAAAA, "r3": 0x33333333, "r12": 0xBBBBBBBB, "r16": 0xAAAAAAAA}
+
+    @staticmethod
+    def cases() -> list[dict]:
+        out = []
+
+        def add(name, lead_isa, lead, second, k, obs):
+            out.append({"name": name, "isa": lead_isa, "lead": lead, "second": second, "k": k, "obs": obs})
+
+        # A: the delayed move against every kind of plain write holding the same port.  A plain
+        # mov / movxm / add.nc holds it in its first cycle (collides k = N bundles later), the
+        # vector extract and compare in their second (k = N - 1).
+        for n in range(1, 7):
+            lead = f"mov.d{n} r1, r2"
+            isa = f"MOV_D{n}"
+            add(f"d{n}_mov", isa, lead, "mov r5, r6", n, ("r1", "r5"))
+            add(f"d{n}_movxm", isa, lead, "movxm r5, #0x55555555", n, ("r1", "r5"))
+            add(f"d{n}_add_nc", isa, lead, "add.nc r5, r6, #3", n, ("r1", "r5"))
+            if n >= 2:
+                add(f"d{n}_vextract", isa, lead, "vextract.s32 r5, x0, r17", n - 1, ("r1", "r5"))
+                add(f"d{n}_vlt", isa, lead, "vlt.s32 r16, x0, x1", n - 1, ("r1", "r16"))
+        # B: controls: other register files and ports leave the delayed write alone; one bundle
+        # either side of the collision it survives.
+        for n in (3, 6):
+            lead, isa = f"mov.d{n} r1, r2", f"MOV_D{n}"
+            add(f"d{n}_ctl_mov_s", isa, lead, "mov s0, r13", n, ("r1", "s0"))
+            add(f"d{n}_ctl_mov_p", isa, lead, "mov p4, r6", n, ("r1", "p4"))
+            add(f"d{n}_ctl_add", isa, lead, "add r5, r6, r9", n, ("r1", "r5"))
+            add(f"d{n}_ctl_mul", isa, lead, "mul r5, r6, r9", n, ("r1", "r5"))
+            add(f"d{n}_ctl_mov_early", isa, lead, "mov r5, r6", n - 1, ("r1", "r5"))
+            add(f"d{n}_ctl_mov_late", isa, lead, "mov r5, r6", n + 1, ("r1", "r5"))
+        # C: two delayed moves landing together: the later-issued (shorter delay) survives.
+        for n1, n2 in [(2, 1), (3, 1), (3, 2), (6, 1), (6, 3), (6, 5)]:
+            add(f"d{n1}_d{n2}", f"MOV_D{n1}", f"mov.d{n1} r1, r2", f"mov.d{n2} r3, r4", n1 - n2, ("r1", "r3"))
+        # D: one destination register: through two ports the OR, through one the later value.
+        for n in (1, 3, 6):
+            lead, isa = f"mov.d{n} r1, r2", f"MOV_D{n}"
+            add(f"d{n}_same_add", isa, lead, "add r1, r11, r9", n, ("r1", "r5"))
+            add(f"d{n}_same_mova", isa, lead, "mova r1, #5", n, ("r1", "r5"))
+        for n in (3, 6):
+            lead, isa = f"mov.d{n} r1, r2", f"MOV_D{n}"
+            add(f"d{n}_same_mov", isa, lead, "mov r1, r11", n, ("r1", "r5"))
+            add(f"d{n}_same_vextract", isa, lead, "vextract.s32 r1, x0, r17", n - 1, ("r1", "r5"))
+        # E: the multiply holds its write unit one cycle later than the ALU ops.
+        add("mul_add", "MUL_mul_r_rr", "mul r5, r6, r9", "add r3, r6, r9", 1, ("r5", "r3"))
+        add("mul_sub", "MUL_mul_r_rr", "mul r5, r6, r9", "sub r3, r6, r9", 1, ("r5", "r3"))
+        add("mul_add_late", "MUL_mul_r_rr", "mul r5, r6, r9", "add r3, r6, r9", 2, ("r5", "r3"))
+        # F: loads (write unit held 6 cycles on): against mova (r file), mov (p file).
+        lda = "LDA_dms_lda_idx_imm"
+        add("lda_mova", lda, "lda r5, [p6, #0]", "mova r12, #5", 6, ("r5", "r12"))
+        add("lda_mova_same", lda, "lda r5, [p6, #0]", "mova r5, #5", 6, ("r5", "r12"))
+        add("lda_p_mov_p", lda, "lda p5, [p6, #0]", "mov p4, r6", 6, ("p5", "p4"))
+        add("lda_p_ctl_mov_m", lda, "lda p5, [p6, #0]", "mov m1, r6", 6, ("p5", "m1"))
+        return out
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if any(c["isa"] == instr["name"] for c in self.cases()):
+            return (True, "")
+        return (False, "not the lead of a collision case")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"case": c["name"]} for c in self.cases() if c["isa"] == instr["name"]]
+
+    def compute_input_size(self, instr, regs):
+        # one word (the load cases read it); a batch never has an empty input buffer
+        return 4
+
+    def compute_output_size(self, instr):
+        return 8
+
+    @staticmethod
+    def _readback(reg: str) -> list[str]:
+        """Lines that bring a non-r register into r7 (the value to store is then r7)."""
+        return [f"  mov r7, {reg}"] if not reg.startswith("r") else []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["case"])
+        lines = [f"  // ---- test (scalar write-port collision): {c['name']} ----"]
+        # Inputs: r2 / r4 the moves' sources, r6 / r9 / r11 / r13 the interferers', x0 / x1 the
+        # vector extract / compare operands (r11 in every lane, 0x7fffffff in every lane).
+        # 0x12345673 and 0x0f0f0f00 are bit-distinguishable under OR, sum and either winner.
+        lines += ["  movxm r2, #0x12345673", "  movxm r4, #0x44444444", "  movxm r6, #0x66666666",
+                  "  movxm r9, #1", "  movxm r11, #0x0f0f0f00", "  movxm r12, #0x7fffffff",
+                  "  mov r13, #21", "  mov r16, #0", "  mov r17, #0",
+                  "  vbcst.32 x0, r11", "  vbcst.32 x1, r12",
+                  "  movxm r1, #0x11111111", "  movxm r3, #0x33333333", "  movxm r5, #0xaaaaaaaa"]
+        lines += ["  mov p4, r0", "  mov p5, r0", "  mov m1, r0", "  mov s0, r0"]
+        if "[p6" in c["lead"]:
+            lines += _padda_sequence("p6", "p0", in_offset)
+        lines.extend(_nop_sled(8))
+        last = c["k"]
+        for b in range(last + 1):
+            lines.append(f"  {c['lead']}" if b == 0 else f"  {c['second']}" if b == last else "  nop")
+        lines.extend(_nop_sled(14))
+        lines += _padda_sequence("p6", "p1", out_offset)
+        lines.extend(_nop_sled(2))
+        for i, reg in enumerate(c["obs"]):
+            lines += self._readback(reg)
+            lines.append(f"  st {'r7' if not reg.startswith('r') else reg}, [p6, #{4 * i}]")
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -5689,6 +5824,16 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             regs = {**strategy.generate_combos(instr)[0], flag: True, "_combo_idx": 0}
             delay_specs.append((instr, 0, regs, strategy))
 
+    # Scalar write-port collision tests (ScalarCollisionStrategy): standalone batches after the
+    # delay batch, so every earlier batch keeps its bytes.
+    collision_strategy = ScalarCollisionStrategy()
+    by_name = {i["name"]: i for i in all_instrs}
+    collision_specs = []
+    for case in ScalarCollisionStrategy.cases():
+        lead = by_name[case["isa"]]
+        collision_specs.append((lead, len(collision_specs), {"case": case["name"], "_combo_idx": 0},
+                                collision_strategy))
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -5976,17 +6121,20 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         })
         batch_idx += 1
 
-    # Delay tests and observability variants: one standalone assembly batch.
-    if delay_specs:
+    # Delay tests and observability variants: one standalone assembly batch; then the
+    # collision tests in as many standalone batches as program memory needs (they declare
+    # their payload).
+    def emit_standalone(specs, declare_payload):
+        nonlocal batch_idx
         offset_in = offset_out = 0
-        asm_parts, delay_meta = [], []
-        for instr, combo_idx, regs, strategy in delay_specs:
+        asm_parts, meta = [], []
+        for instr, combo_idx, regs, strategy in specs:
             offset_in, offset_out = _align(offset_in, 32), _align(offset_out, 32)
             in_size = strategy.compute_input_size(instr, regs)
             out_size = strategy.compute_output_size(instr)
             asm_parts.append(strategy.generate_test_point(
                 instr, regs, in_offset=offset_in, out_offset=offset_out))
-            delay_meta.append({
+            meta.append({
                 "instruction": instr["name"],
                 "slot": instr.get("slot", ""),
                 "combo_index": combo_idx,
@@ -5996,6 +6144,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 "out_offset": offset_out,
                 "out_size": out_size,
                 **_variant_meta(regs),
+                **({"payload": [_slice("core", offset_out, out_size)]} if declare_payload else {}),
             })
             offset_in += in_size
             offset_out += out_size
@@ -6009,18 +6158,34 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             "batch_index": batch_idx,
             "filename": filename,
             "source_type": "assembly",
-            "test_count": len(delay_meta),
+            "test_count": len(meta),
             "in_size": offset_in,
             "out_size": offset_out,
-            "tests": delay_meta,
+            "tests": meta,
         })
         batch_idx += 1
+
+    if delay_specs:
+        emit_standalone(delay_specs, declare_payload=False)
+
+    chunk, chunk_bundles = [], 0
+    for spec in collision_specs:
+        instr, _, regs, strategy = spec
+        bundles = _count_bundles(strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0))
+        if chunk and chunk_bundles + bundles > MAX_BUNDLES_PER_BATCH - 64:
+            emit_standalone(chunk, declare_payload=True)
+            chunk, chunk_bundles = [], 0
+        chunk.append(spec)
+        chunk_bundles += bundles
+    if chunk:
+        emit_standalone(chunk, declare_payload=True)
 
     # Write manifest.json.
     # Count branch .ll test points from the branch batch.
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
+                         + len(collision_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())
