@@ -3907,6 +3907,95 @@ class ScalarCollisionStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# ScalarWidthStrategy: how many bits each scalar-side register keeps
+# ---------------------------------------------------------------------------
+
+class ScalarWidthStrategy(TestStrategy):
+    """Write patterned values to one register through `mov` / `movx` and read them back.
+
+    Silicon keeps only a register's own width: `mov s0, r6` with r6 = 0x66666666 reads back 0x26,
+    `mov lr, r6` reads back 0x66666, a status flag keeps one bit.  The emulator derives the widths
+    (state/register_widths.rs: TableGen register classes, narrowed by silicon for the shift, control
+    and status registers); the table is in docs/fidelity-gaps/core-compute-timing.md and was
+    measured with build/experiments/harness/bugs/widths.
+
+    One test point per register; the observed words are the read-backs of PATTERNS in order
+    (all ones, then patterns that tell a mask from a clamp, then bit 19, whose read-back shows
+    whether a 20-bit register sign-extends).  The register's value before the test is saved and
+    written back after it, because silicon keeps register state across kernels.  The loop
+    registers: LC is written with LE parked at an unreachable pc.  The test points declare
+    their payload.
+    """
+
+    PATTERNS = (0xFFFFFFFF, 0x66666666, 0xA5A5A5A5, 0x5A5A5A5A, 0x00080000)
+    CONTROL = ("crSat", "crRnd", "crFPMask", "crF2IMask", "crF2FMask", "crSRSSign", "crUPSSign",
+               "crPackSign", "crUnpackSign", "crVaddSign", "crSCDEn", "crMCDEn")
+    STATUS = ("srCarry", "srSS0", "srMS0", "srSRS_of", "srUPS_of", "srCompr_uf", "srSparse_of",
+              "srFPFlags", "srF2IFlags", "srF2FFlags")
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        regs = [f"s{i}" for i in range(4)] + [f"p{i}" for i in range(2, 6)]
+        regs += [f"{f}{i}" for f in ("m", "dn", "dj", "dc") for i in range(8)]
+        regs += ["ls", "le", "dp", "lr", "sp", "lc"] + list(cls.CONTROL) + list(cls.STATUS)
+        out = []
+        for reg in regs:
+            ctl = reg in cls.CONTROL
+            out.append({"name": f"width_{reg}", "reg": reg, "isa": "MOVX_mvx_scl" if ctl else "MOV_mv_scl",
+                        "write": "movx" if ctl else "mov"})
+        return out
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if any(c["isa"] == instr["name"] for c in self.cases()):
+            return (True, "")
+        return (False, "not a register-width lead")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"width": c["name"]} for c in self.cases() if c["isa"] == instr["name"]]
+
+    def compute_input_size(self, instr, regs):
+        return 4    # a batch never has an empty input buffer
+
+    def compute_output_size(self, instr):
+        return 4 * len(self.PATTERNS)
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    @staticmethod
+    def _save_restore(reg: str) -> tuple[list[str], list[str]]:
+        """Lines that keep `reg` across the test.  r30 holds the value (r28 the loop end, r29
+        lr); sp comes back from r8, the copy the preamble made for the epilogue."""
+        if reg == "sp":
+            return [], ["  mov sp, r8"]
+        if reg == "lc":
+            return (["  mov r30, lc", "  mov r28, le", "  movxm r6, #0xFFFFF", "  mov le, r6"],
+                    ["  mov lc, r30", "  mov le, r28"])
+        if reg == "lr":
+            return ["  mov r30, lr"], ["  mov lr, r30"]
+        if reg.startswith("cr"):
+            return [f"  mov r30, {reg}"], [f"  movx {reg}, r30"]
+        return [f"  mov r30, {reg}"], [f"  mov {reg}, r30"]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["width"])
+        reg = c["reg"]
+        save, restore = self._save_restore(reg)
+        lines = [f"  // ---- test (register width): {reg} ----"] + save + _nop_sled(3)
+        for i, value in enumerate(self.PATTERNS):
+            lines += [f"  movxm r6, #0x{value:08x}", f"  {c['write']} {reg}, r6"] + _nop_sled(3)
+            lines += [f"  mov r7, {reg}"] + _nop_sled(3)
+            lines += _scalar_store("r7", "p1", out_offset + 4 * i)
+        lines += restore + _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -5835,6 +5924,13 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         collision_specs.append((lead, len(collision_specs), {"case": case["name"], "_combo_idx": 0},
                                 collision_strategy))
 
+    # Register-width tests (ScalarWidthStrategy): standalone batches after the collision ones.
+    width_strategy = ScalarWidthStrategy()
+    width_specs = []
+    for case in ScalarWidthStrategy.cases():
+        width_specs.append((by_name[case["isa"]], len(width_specs), {"width": case["name"], "_combo_idx": 0},
+                            width_strategy))
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6169,24 +6265,25 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    chunk, chunk_bundles = [], 0
-    for spec in collision_specs:
-        instr, _, regs, strategy = spec
-        bundles = _count_bundles(strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0))
-        if chunk and chunk_bundles + bundles > MAX_BUNDLES_PER_BATCH - 64:
+    for specs in (collision_specs, width_specs):
+        chunk, chunk_bundles = [], 0
+        for spec in specs:
+            instr, _, regs, strategy = spec
+            bundles = _count_bundles(strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0))
+            if chunk and chunk_bundles + bundles > MAX_BUNDLES_PER_BATCH - 64:
+                emit_standalone(chunk, declare_payload=True)
+                chunk, chunk_bundles = [], 0
+            chunk.append(spec)
+            chunk_bundles += bundles
+        if chunk:
             emit_standalone(chunk, declare_payload=True)
-            chunk, chunk_bundles = [], 0
-        chunk.append(spec)
-        chunk_bundles += bundles
-    if chunk:
-        emit_standalone(chunk, declare_payload=True)
 
     # Write manifest.json.
     # Count branch .ll test points from the branch batch.
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
-                         + len(collision_specs)
+                         + len(collision_specs) + len(width_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())

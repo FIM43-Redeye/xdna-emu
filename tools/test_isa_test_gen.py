@@ -4474,15 +4474,84 @@ class TestScalarCollisionStrategy:
             lines, _ = self._asm(c["name"])
             assert not any(re.search(r"\br8\b", l) for l in lines), c["name"]
 
-    def test_collision_batches_declare_their_payload_and_come_last(self, isa_json_path, out_dir):
+    def test_collision_batches_declare_their_payload_and_come_after_the_rest(self, isa_json_path, out_dir):
         manifest = generate_all(isa_json_path, out_dir)
         batches = manifest["batches"]
         mine = [b for b in batches if any("case" in t["operands"] for t in b["tests"])]
-        assert mine and batches[-len(mine):] == mine, "collision batches are the last batches"
+        at = batches.index(mine[0])
+        assert mine and batches[at:at + len(mine)] == mine, "collision batches are contiguous"
+        # only the register-width batches (ScalarWidthStrategy) follow them
+        assert all(any("width" in t["operands"] for t in b["tests"]) for b in batches[at + len(mine):])
         for b in mine:
             for t in b["tests"]:
                 assert t["payload"] == [{"core": "core", "buffer": "out", "offset": t["out_offset"], "size": 8}]
         assert sum(len(b["tests"]) for b in mine) == len(isa_test_gen.ScalarCollisionStrategy.cases())
+
+
+class TestScalarWidthStrategy:
+    """Register-width test points (bugs/widths probe): every scalar-side register, restored after
+    the test, payload declared, appended after the collision batches."""
+
+    S = isa_test_gen.ScalarWidthStrategy
+
+    @staticmethod
+    def _asm(name):
+        c = isa_test_gen.ScalarWidthStrategy.case(name)
+        text = isa_test_gen.ScalarWidthStrategy().generate_test_point({"name": c["isa"]}, {"width": name}, 0, 0)
+        return [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("//")]
+
+    def test_every_scalar_side_register_file_is_covered(self):
+        regs = {c["reg"] for c in self.S.cases()}
+        for r in ("s0", "s3", "p2", "p5", "m0", "m7", "dn0", "dn7", "dj0", "dj7", "dc0", "dc7", "ls", "le",
+                  "dp", "lr", "sp", "lc", "crSat", "crMCDEn", "srCarry", "srF2FFlags"):
+            assert r in regs, r
+        assert len(regs) == len(self.S.cases())
+
+    def test_control_registers_are_written_with_movx_the_rest_with_mov(self):
+        for c in self.S.cases():
+            assert c["write"] == ("movx" if c["reg"].startswith("cr") else "mov"), c["name"]
+
+    def test_a_register_is_written_with_every_pattern_and_read_back(self):
+        lines = self._asm("width_s0")
+        for v in self.S.PATTERNS:
+            i = lines.index(f"movxm r6, #0x{v:08x}")
+            assert lines[i + 1] == "mov s0, r6"
+        assert lines.count("mov r7, s0") == len(self.S.PATTERNS)
+
+    def test_the_value_before_the_test_is_written_back(self):
+        assert self._asm("width_m3")[0] == "mov r30, m3" and "mov m3, r30" in self._asm("width_m3")
+        assert "movx crRnd, r30" in self._asm("width_crRnd")
+        assert "mov sp, r8" in self._asm("width_sp")      # the preamble's copy
+        assert "mov lr, r30" in self._asm("width_lr")
+
+    def test_the_loop_count_is_written_with_the_loop_end_parked_out_of_reach(self):
+        lines = self._asm("width_lc")
+        assert lines.index("mov le, r6") < lines.index("mov lc, r6")
+        assert "movxm r6, #0xFFFFF" in lines and "mov le, r28" == lines[-4:][0] or "mov le, r28" in lines
+
+    def test_nothing_touches_the_reserved_register(self):
+        for c in self.S.cases():
+            assert not any(re.search(r"\br8\b", l) for l in self._asm(c["name"]) if l != "mov sp, r8"), c["name"]
+
+    def test_every_lead_is_an_isa_instruction(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        names = {e["name"] for slot in json.load(open(path)).values() for e in slot}
+        assert all(c["isa"] in names for c in self.S.cases())
+
+    def test_width_batches_declare_their_payload_and_follow_the_collision_batches(self, tmp_path):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        batches = generate_all(path, str(tmp_path / "isa"))["batches"]
+        mine = [b for b in batches if any("width" in t["operands"] for t in b["tests"])]
+        assert mine and batches[-len(mine):] == mine
+        size = 4 * len(self.S.PATTERNS)
+        for b in mine:
+            for t in b["tests"]:
+                assert t["payload"] == [{"core": "core", "buffer": "out", "offset": t["out_offset"], "size": size}]
+        assert sum(len(b["tests"]) for b in mine) == len(self.S.cases())
 
 
 class TestStatusLatenciesAgainstTableGen:
