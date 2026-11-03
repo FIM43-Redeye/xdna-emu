@@ -208,6 +208,121 @@ def test_emu_no_rebuild_skips_cargo(tmp_path, monkeypatch):
     S.run_emu(suite, "e1", rebuild_ffi=False)
 
 
+# -- repeat (determinism) ----------------------------------------------------
+
+class RepeatRuns(FakeRuns):
+    """FakeRuns whose output depends on the repeat index: `script[(case, k)]` bytes, else `fill`."""
+
+    def __init__(self, monkeypatch, script=None, **kw):
+        super().__init__(monkeypatch, **kw)
+        self.script = script or {}
+
+    def run(self, pkg, backend, tag, *, out_dir, host, **kw):
+        case = Path(pkg).name
+        k = int(out_dir.name.split("_")[1]) if out_dir.name.startswith("repeat_") else 1
+        self.fill = self.script.get((case, k), b"\x01" * 8)
+        return super().run(pkg, backend, tag, out_dir=out_dir, host=host, **kw)
+
+
+def test_repeat_runs_each_case_back_to_back_and_keeps_every_repeat(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path)
+    built(tmp_path, suite)
+    fake = RepeatRuns(monkeypatch)
+    out = S.run_hw(suite, "r1", repeat=3)
+    assert [c for c, *_ in fake.calls] == ["c0"] * 3 + ["c1"] * 3 + ["c2"] * 3
+    for c in suite.cases:
+        d = tmp_path / "runs" / "r1" / c
+        assert (d / "core.out.bin").is_file() and (d / "run.json").is_file()      # repeat 1: the plain layout
+        for k in (2, 3):
+            assert (d / f"repeat_{k}" / "core.out.bin").is_file()
+    assert [(o.status, o.agree) for o in out] == [("ok", True)] * 3
+    summary = json.loads((tmp_path / "runs" / "r1" / "summary.json").read_text())
+    assert summary["repeat"] == 3 and summary["cases"]["c1"]["agree"] is True
+
+
+def test_no_repeat_leaves_the_layout_and_agreement_unset(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path)
+    built(tmp_path, suite)
+    fake = RepeatRuns(monkeypatch)
+    out = S.run_hw(suite, "r1")
+    assert len(fake.calls) == 3 and all(o.agree is None for o in out)
+    assert not list((tmp_path / "runs" / "r1").glob("*/repeat_*"))
+    summary = json.loads((tmp_path / "runs" / "r1" / "summary.json").read_text())
+    assert summary["repeat"] == 1 and "agree" not in summary["cases"]["c0"]
+
+
+def test_repeat_flags_the_case_whose_repeats_differ_and_still_runs_the_rest(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path)
+    built(tmp_path, suite)
+    RepeatRuns(monkeypatch, script={("c1", 2): b"\x01\x01\x07\x01\x01\x01\x01\x01"})
+    out = S.run_hw(suite, "r1", repeat=3)
+    assert [(o.case, o.status, o.agree) for o in out] == [
+        ("c0", "ok", True), ("c1", "ok", False), ("c2", "ok", True)]
+    assert "c1: repeats DIFFER" in S.format_outcomes(out, "hw r1")
+
+
+def test_repeat_report_names_the_differing_bytes_and_the_settling_pattern(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path)
+    built(tmp_path, suite)
+    # c1: the first run differs, runs 2-3 agree (state left by the previous kernel)
+    RepeatRuns(monkeypatch, script={("c1", 1): b"\x09\x01\x01\x01\x01\x01\x01\x08"})
+    S.run_hw(suite, "r1", repeat=3)
+    rep = {r.case: r for r in S.repeat_report(suite, "r1")}
+    assert rep["c0"].agree and rep["c0"].repeats == 3 and not rep["c0"].diffs
+    r = rep["c1"]
+    assert not r.agree and r.first_run_only
+    assert {(d.repeat, d.file, d.offset, d.ref, d.got) for d in r.diffs} == {
+        (k, "core.out.bin", off, ref, 1) for k in (2, 3) for off, ref in ((0, 9), (7, 8))}
+    text = S.format_repeat_report(list(rep.values()), "r1")
+    assert "c1" in text and "first run only" in text and "0x00: 09 -> 01" in text
+    assert "2/3 cases agree" in text or "2 of 3" in text
+
+
+def test_repeat_report_distinguishes_a_drifting_case(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path, names=("c0",))
+    built(tmp_path, suite)
+    RepeatRuns(monkeypatch, script={("c0", 2): b"\x02" * 8, ("c0", 3): b"\x03" * 8})
+    S.run_hw(suite, "r1", repeat=3)
+    (r,) = S.repeat_report(suite, "r1")
+    assert not r.agree and not r.first_run_only
+
+
+def test_repeat_timeout_aborts_the_run(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path, names=("c0", "c1", "c2"))
+    built(tmp_path, suite)
+
+    class Timeout(RepeatRuns):
+        def run(self, pkg, backend, tag, *, out_dir, host, **kw):
+            if Path(pkg).name == "c1" and out_dir.name == "repeat_2":
+                self.rcs = {"c1": -1}
+            return super().run(pkg, backend, tag, out_dir=out_dir, host=host, **kw)
+
+    Timeout(monkeypatch)
+    out = S.run_hw(suite, "r1", repeat=3)
+    assert [o.status for o in out] == ["ok", "timeout", "skipped"]
+    assert "repeat 2" in out[1].detail
+
+
+def test_repeat_failure_other_than_timeout_is_recorded_and_the_run_continues(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path, names=("c0", "c1"))
+    built(tmp_path, suite)
+
+    class Fail(RepeatRuns):
+        def run(self, pkg, backend, tag, *, out_dir, host, **kw):
+            self.rcs = {"c0": 2} if out_dir.name == "repeat_2" else {}
+            return super().run(pkg, backend, tag, out_dir=out_dir, host=host, **kw)
+
+    Fail(monkeypatch)
+    out = S.run_hw(suite, "r1", repeat=2)
+    assert [o.status for o in out] == ["failed", "ok"] and "repeat 2" in out[0].detail
+
+
+def test_repeat_must_be_positive(tmp_path, monkeypatch):
+    suite = make_suite(tmp_path)
+    with pytest.raises(S.SuiteError, match="repeat"):
+        S.run_hw(suite, "r1", repeat=0)
+
+
 # -- compare -----------------------------------------------------------------
 
 def run_two(tmp_path, monkeypatch, fill_b, rcs_b=None):

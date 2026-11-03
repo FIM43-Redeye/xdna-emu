@@ -5,12 +5,15 @@
   python3 -m tools.harness emu   <pkg_dir> <tag> [--release]
 
   python3 -m harness suite build   <suite_dir> [--only CASE ...] [-j N]
-  python3 -m harness suite hw      <suite_dir> <tag> [--only ...] [--timeout S]
+  python3 -m harness suite hw      <suite_dir> <tag> [--only ...] [--timeout S] [--repeat N]
+  python3 -m harness suite repeats <suite_dir> <tag> [--only ...]
   python3 -m harness suite emu     <suite_dir> <tag> [--only ...] [-j N] [--release] [--no-rebuild]
   python3 -m harness suite compare <suite_dir> <tag_a> <tag_b> [--only ...]
 
 (or `PYTHONPATH=tools python3 -m harness ...`). A suite (suite.py) is a directory of cases;
-results land in <suite_dir>/runs/<tag>/<case>/. `suite compare` exits 1 on any mismatch. Never run two hardware jobs at
+results land in <suite_dir>/runs/<tag>/<case>/. `suite compare` exits 1 on any mismatch;
+`suite hw --repeat N` runs every case N times (repeats 2..N in <case>/repeat_<k>/) and exits 1 if
+any case's repeats disagree; `suite repeats` lists the differing bytes of such a run. Never run two hardware jobs at
 once. Outputs land in <pkg_dir>/<tag>/<core>.<buffer>.bin plus run.json.
 """
 from __future__ import annotations
@@ -41,7 +44,7 @@ def main(argv=None) -> int:
             p.add_argument("--no-rebuild", action="store_true", help="skip cargo build -p xdna-emu-ffi")
     st = sub.add_parser("suite", help="build, run and compare a suite directory")
     ssub = st.add_subparsers(dest="suite_cmd", required=True)
-    for name in ("build", "hw", "emu", "compare"):
+    for name in ("build", "hw", "emu", "compare", "repeats"):
         p = ssub.add_parser(name)
         p.add_argument("suite_dir")
         if name == "compare":
@@ -54,6 +57,9 @@ def main(argv=None) -> int:
             p.add_argument("-j", type=int, default=None, help="parallel jobs (default: all cores)")
         if name in ("hw", "emu"):
             p.add_argument("--timeout", type=float, default=None, help="seconds per phase")
+        if name == "hw":
+            p.add_argument("--repeat", type=int, default=1, metavar="N",
+                           help="run every case N times and report whether all repeats agree")
         if name == "emu":
             p.add_argument("--release", action="store_true", help="use the release FFI .so")
             p.add_argument("--no-rebuild", action="store_true", help="skip cargo build -p xdna-emu-ffi")
@@ -88,9 +94,15 @@ def suite_main(args) -> int:
         if args.suite_cmd == "build":
             out = S.build_suite(suite, only=args.only, jobs=args.j)
             print(S.format_outcomes(out, "build"))
+        elif args.suite_cmd == "repeats":
+            rows = S.repeat_report(suite, args.tag, only=args.only)
+            print(S.format_repeat_report(rows, args.tag))
+            return 0 if all(r.agree for r in rows) else 1
         elif args.suite_cmd == "hw":
-            out = S.run_hw(suite, args.tag, only=args.only, timeout=args.timeout)
+            out = S.run_hw(suite, args.tag, only=args.only, timeout=args.timeout, repeat=args.repeat)
             print(S.format_outcomes(out, f"hw {args.tag}"))
+            if any(o.agree is False for o in out):
+                return 1
         else:
             out = S.run_emu(suite, args.tag, only=args.only, jobs=args.j,
                             runtime="release" if args.release else None,

@@ -196,6 +196,7 @@ class CaseOutcome:
     status: str            # built | reused | ok | failed | timeout | refused | skipped
     detail: str = ""
     wall_seconds: float = 0.0
+    agree: bool | None = None   # hw --repeat: did every repeat produce the same bytes (None: not repeated)
 
     @property
     def good(self) -> bool:
@@ -274,18 +275,20 @@ def _write_summary(out: Path, suite: Suite, backend: str, tag: str, outcomes: li
     doc = {"suite": suite.name, "tag": tag, "backend": backend, "git_rev": git_rev(),
            "counts": counts, "aborted": aborted, **extra,
            "cases": {o.case: {"status": o.status, "detail": o.detail,
-                              "wall_seconds": round(o.wall_seconds, 3)} for o in outcomes}}
+                              "wall_seconds": round(o.wall_seconds, 3),
+                              **({} if o.agree is None else {"agree": o.agree})}
+                     for o in outcomes}}
     (out / "summary.json").write_text(json.dumps(doc, indent=1) + "\n")
 
 
 def _run_case(suite: Suite, case: str, backend: str, tag: str, host: Path,
-              **kw: Any) -> CaseOutcome:
+              out_dir: Path | None = None, **kw: Any) -> CaseOutcome:
     t0 = time.monotonic()
     pkg = pkg_dir(suite.path, case)
     if not (pkg / "manifest.json").is_file():
         return CaseOutcome(case, "failed", "not built (run `suite build`)")
     try:
-        rec = run_package(pkg, backend, tag, out_dir=runs_dir(suite.path, tag) / case,
+        rec = run_package(pkg, backend, tag, out_dir=out_dir or runs_dir(suite.path, tag) / case,
                           host=host, **kw)
     except RunError as e:
         return CaseOutcome(case, "failed", str(e), time.monotonic() - t0)
@@ -299,8 +302,16 @@ def _run_case(suite: Suite, case: str, backend: str, tag: str, host: Path,
 
 
 def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
-           timeout: float | None = None) -> list[CaseOutcome]:
-    """Run the selected cases on silicon, one at a time; the first timeout stops the run."""
+           timeout: float | None = None, repeat: int = 1) -> list[CaseOutcome]:
+    """Run the selected cases on silicon, one at a time; the first timeout stops the run.
+
+    `repeat` N > 1 runs each case N times back to back: repeat 1 lands in the plain
+    layout (`runs/<tag>/<case>/`, so every reader works unchanged), repeats 2..N in
+    `runs/<tag>/<case>/repeat_<k>/`. A case's `agree` says whether all N produced the
+    same bytes; `repeat_report` names the differing bytes.
+    """
+    if repeat < 1:
+        raise SuiteError(f"repeat must be >= 1, got {repeat}")
     cases = select(suite, only)
     out = _prepare_tag(suite, tag)
     host = build_test_host(_host_dir(suite))
@@ -313,6 +324,8 @@ def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
                 outcomes.append(CaseOutcome(case, "refused", "; ".join(problems)))
                 continue
             o = _run_case(suite, case, "hw", tag, host, timeout=timeout)
+            if o.good and repeat > 1:
+                o = _repeat_case(suite, case, tag, host, timeout, repeat, o)
             outcomes.append(o)
             if o.status == "timeout":
                 aborted = {"case": case, "reason": "hardware timeout; the NPU may be wedged, "
@@ -320,8 +333,27 @@ def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
                 outcomes += [CaseOutcome(c, "skipped", f"run aborted at {case}") for c in cases[i + 1:]]
                 break
     finally:
-        _write_summary(out, suite, "hw", tag, outcomes, aborted, {})
+        _write_summary(out, suite, "hw", tag, outcomes, aborted, {"repeat": repeat})
     return outcomes
+
+
+def repeat_dir(suite_dir: Path, tag: str, case: str, k: int) -> Path:
+    """Where repeat `k` (>= 2) of a case lands; repeat 1 is the case's plain run directory."""
+    return runs_dir(suite_dir, tag) / case / f"repeat_{k}"
+
+
+def _repeat_case(suite: Suite, case: str, tag: str, host: Path, timeout: float | None,
+                 repeat: int, first: CaseOutcome) -> CaseOutcome:
+    wall, agree = first.wall_seconds, True
+    base = runs_dir(suite.path, tag) / case
+    for k in range(2, repeat + 1):
+        o = _run_case(suite, case, "hw", tag, host, out_dir=repeat_dir(suite.path, tag, case, k),
+                      timeout=timeout)
+        wall += o.wall_seconds
+        if not o.good:
+            return CaseOutcome(case, o.status, f"repeat {k}: {o.detail}", wall)
+        agree = agree and not _file_diffs(base, repeat_dir(suite.path, tag, case, k), k)
+    return CaseOutcome(case, "ok", "", wall, agree=agree)
 
 
 def run_emu(suite: Suite, tag: str, *, only: Iterable[str] | None = None, jobs: int | None = None,
@@ -402,6 +434,67 @@ def compare_runs(suite: Suite, tag_a: str, tag_b: str, *,
     return results
 
 
+# -- repeat report -------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ByteDiff:
+    repeat: int            # the repeat that differs from repeat 1
+    file: str
+    offset: int
+    ref: int               # repeat 1's byte
+    got: int
+
+
+@dataclass(frozen=True)
+class CaseRepeats:
+    case: str
+    repeats: int
+    diffs: tuple[ByteDiff, ...]
+    first_run_only: bool   # repeats 2..N agree with each other and only repeat 1 stands apart
+
+    @property
+    def agree(self) -> bool:
+        return not self.diffs
+
+
+def _output_names(case_run: Path) -> tuple[str, ...]:
+    return read_run_record(case_run).outputs
+
+
+def _file_diffs(ref_dir: Path, other_dir: Path, k: int) -> list[ByteDiff]:
+    """Byte differences of repeat `k` against repeat 1, over repeat 1's output files."""
+    diffs: list[ByteDiff] = []
+    for name in _output_names(ref_dir):
+        a = (ref_dir / name).read_bytes()
+        p = other_dir / name
+        b = p.read_bytes() if p.is_file() else b""
+        diffs += [ByteDiff(k, name, i, x, y) for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        if len(a) != len(b):
+            diffs.append(ByteDiff(k, name, min(len(a), len(b)), -1, -1))   # size mismatch marker
+    return diffs
+
+
+def repeat_report(suite: Suite, tag: str, *, only: Iterable[str] | None = None) -> list[CaseRepeats]:
+    """Per case of a `hw --repeat` run: do all repeats agree, and if not, which bytes differ."""
+    if not runs_dir(suite.path, tag).is_dir():
+        raise SuiteError(f"no run tagged {tag!r} in {suite.path}")
+    rows: list[CaseRepeats] = []
+    for case in select(suite, only):
+        base = runs_dir(suite.path, tag) / case
+        ks = sorted(int(d.name.split("_")[1]) for d in base.glob("repeat_*") if d.is_dir())
+        if not (base / "run.json").is_file():
+            continue
+        diffs: list[ByteDiff] = []
+        for k in ks:
+            diffs += _file_diffs(base, repeat_dir(suite.path, tag, case, k), k)
+        later_agree = all(not _file_diffs(repeat_dir(suite.path, tag, case, ks[0]),
+                                          repeat_dir(suite.path, tag, case, k), k) for k in ks[1:]) if ks else True
+        differing = {d.repeat for d in diffs}
+        rows.append(CaseRepeats(case, 1 + len(ks), tuple(diffs),
+                                bool(diffs) and len(ks) >= 2 and differing == set(ks) and later_agree))
+    return rows
+
+
 # -- reports -----------------------------------------------------------------
 
 def format_outcomes(outcomes: list[CaseOutcome], verb: str) -> str:
@@ -410,6 +503,7 @@ def format_outcomes(outcomes: list[CaseOutcome], verb: str) -> str:
     counts: dict[str, int] = {}
     for o in outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
+    lines += [f"{o.case}: repeats DIFFER (see `suite repeats`)" for o in outcomes if o.agree is False]
     lines.append(f"{verb}: " + ", ".join(f"{n} {s}" for s, n in sorted(counts.items())) +
                  f" of {len(outcomes)}")
     return "\n".join(lines)
@@ -421,4 +515,24 @@ def format_comparison(results: list[CaseComparison], tag_a: str, tag_b: str) -> 
     lines.append(f"compare {tag_a} vs {tag_b}: {n_id}/{len(results)} identical, "
                  f"{sum(r.status == 'differs' for r in results)} differ, "
                  f"{sum(r.status == 'unusable' for r in results)} unusable")
+    return "\n".join(lines)
+
+
+def format_repeat_report(rows: list[CaseRepeats], tag: str, *, max_bytes: int = 16) -> str:
+    lines: list[str] = []
+    for r in rows:
+        if r.agree:
+            continue
+        pattern = ("first run only: repeats 2.." f"{r.repeats} agree with each other"
+                   if r.first_run_only else "repeats disagree among themselves")
+        lines.append(f"{r.case}: NONDETERMINISTIC, {len({d.repeat for d in r.diffs})} of "
+                     f"{r.repeats - 1} repeat(s) differ from repeat 1 ({pattern})")
+        for d in r.diffs[:max_bytes]:
+            lines.append(f"    repeat {d.repeat} {d.file} 0x{d.offset:02x}: "
+                         + (f"{d.ref:02x} -> {d.got:02x}" if d.ref >= 0 else "size differs"))
+        if len(r.diffs) > max_bytes:
+            lines.append(f"    ... {len(r.diffs) - max_bytes} more byte(s)")
+    n_agree = sum(r.agree for r in rows)
+    lines.append(f"repeat {tag}: {n_agree}/{len(rows)} cases agree across all repeats, "
+                 f"{len(rows) - n_agree} nondeterministic")
     return "\n".join(lines)
