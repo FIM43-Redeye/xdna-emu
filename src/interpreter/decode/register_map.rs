@@ -10,9 +10,10 @@ use xdna_archspec::aie2::isa::decoder_ffi::*;
 use crate::interpreter::bundle::slot::Operand;
 use crate::interpreter::state::{
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX, DP_REG_INDEX, CORE_ID_REG_INDEX, SP_PTR_INDEX,
-    SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, SS_STATUS_REG_INDEX, MS_STATUS_REG_INDEX, MOD_BASE_M,
-    MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D, MOD_BASE_D3D, CTRL_BASE_Q, CTRL_BASE_QWL,
-    CTRL_BASE_QWH, CTRL_BASE_QL, CTRL_BASE_QH,
+    SPARSE_OF_REG_INDEX, COMPR_UF_REG_INDEX, SS_STATUS_REG_INDEX, MS_STATUS_REG_INDEX, CARRY_REG_INDEX,
+    SRS_OF_REG_INDEX, UPS_OF_REG_INDEX, FP_FLAGS_REG_INDEX, F2I_FLAGS_REG_INDEX, F2F_FLAGS_REG_INDEX,
+    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC, MOD_BASE_D2D, MOD_BASE_D3D, CTRL_BASE_Q,
+    CTRL_BASE_QWL, CTRL_BASE_QWH, CTRL_BASE_QL, CTRL_BASE_QH,
 };
 
 /// Width hint for accumulator operands from LLVM register names.
@@ -121,6 +122,18 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
                 operand: Operand::ScalarReg(MS_STATUS_REG_INDEX),
                 accum_width: None,
             })
+        }
+        // The remaining status registers: slots a move reads and writes (nothing sets them yet).
+        "srCarry" | "srSRS_of" | "srUPS_of" | "srFPFlags" | "srF2IFlags" | "srF2FFlags" => {
+            let index = match name {
+                "srCarry" => CARRY_REG_INDEX,
+                "srSRS_of" => SRS_OF_REG_INDEX,
+                "srUPS_of" => UPS_OF_REG_INDEX,
+                "srFPFlags" => FP_FLAGS_REG_INDEX,
+                "srF2IFlags" => F2I_FLAGS_REG_INDEX,
+                _ => F2F_FLAGS_REG_INDEX,
+            };
+            return Some(MappedOperand { operand: Operand::ScalarReg(index), accum_width: None });
         }
         "CORE_ID" | "core_id" => {
             return Some(MappedOperand { operand: Operand::ScalarReg(CORE_ID_REG_INDEX), accum_width: None })

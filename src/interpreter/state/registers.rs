@@ -9,7 +9,7 @@
 //! - **Vector**: 32 x 256-bit SIMD registers (v0-v31)
 //! - **Accumulator**: 18 x 512-bit MAC accumulators (9 cm pairs: bml0-bml8 + bmh0-bmh8)
 //!
-//! The scalar register file is extended to 48 entries to include special-
+//! The scalar register file is extended to 52 entries to include special-
 //! purpose registers at indices 32-47. In AIE2 hardware these are separate
 //! registers (not part of the GPR file), but for simplicity we store them
 //! in the same array with dedicated index constants.
@@ -27,8 +27,8 @@ pub type Vec512 = [u32; 16];
 pub type Acc1024 = [u64; 16];
 
 /// Number of scalar registers including special-purpose slots.
-/// Indices 0-31 are GPRs (r0-r31); 32-47 are special registers.
-pub const NUM_SCALAR_REGS: usize = 48;
+/// Indices 0-31 are GPRs (r0-r31); 32-51 are special registers.
+pub const NUM_SCALAR_REGS: usize = 52;
 
 /// Number of general-purpose scalar registers (r0-r31).
 pub const NUM_SCALAR_GPRS: usize = 32;
@@ -64,6 +64,21 @@ pub const NUM_SHIFT_REGS: u8 = 4;
 pub const SS_STATUS_REG_INDEX: u8 = 44;
 /// Stream-switch write status (`srMS0`): bit 0 = the last non-blocking write was accepted.
 pub const MS_STATUS_REG_INDEX: u8 = 45;
+// Status registers a `mov` reaches that nothing in the emulator sets yet (no producer for the
+// carry, the SRS / UPS overflow or the floating-point flags): plain slots that keep what was
+// written, masked to their silicon width.
+/// `srCarry`.
+pub const CARRY_REG_INDEX: u8 = 46;
+/// `srSRS_of`.
+pub const SRS_OF_REG_INDEX: u8 = 47;
+/// `srUPS_of`.
+pub const UPS_OF_REG_INDEX: u8 = 48;
+/// `srFPFlags`.
+pub const FP_FLAGS_REG_INDEX: u8 = 49;
+/// `srF2IFlags`.
+pub const F2I_FLAGS_REG_INDEX: u8 = 50;
+/// `srF2FFlags`.
+pub const F2F_FLAGS_REG_INDEX: u8 = 51;
 
 // ControlReg index ranges of the q-register views (`Operand::ControlReg`), four registers each.
 // The decoder maps `q`, `qwl`, `qwh`, `ql` and `qh` operands onto them (decode::register_map).
@@ -136,9 +151,6 @@ pub const NUM_VECTOR_REGS: usize = 32;
 /// So indices range from 0 to 17 (cm8 = bml8 = index 16, bmh8 = index 17).
 pub const NUM_ACCUMULATOR_REGS: usize = 18;
 
-/// Mask for pointer/modifier values (tile-local address width, from archspec).
-const PTR_MASK: u32 = xdna_archspec::aie2::TILE_OFFSET_MASK;
-
 /// Scalar register file including special-purpose registers.
 ///
 /// Indices 0-31: general-purpose registers r0-r31.
@@ -192,7 +204,7 @@ impl ScalarRegisterFile {
             return;
         }
         let idx = (reg as usize) % NUM_SCALAR_REGS;
-        self.regs[idx] = value;
+        self.regs[idx] = value & super::register_widths::widths().scalar_mask(reg);
     }
 
     /// Get a slice of GPR registers only (r0-r31) for debugging/display.
@@ -257,14 +269,15 @@ impl PointerRegisterFile {
     /// Value is masked to 20 bits.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
-        self.regs[(reg & 0x07) as usize] = value & PTR_MASK;
+        self.regs[(reg & 0x07) as usize] = value & super::register_widths::widths().pointer_mask();
     }
 
     /// Add offset to a pointer register (with wrapping at 20 bits).
     #[inline]
     pub fn add(&mut self, reg: u8, offset: i32) {
         let idx = (reg & 0x07) as usize;
-        let new_value = self.regs[idx].wrapping_add(offset as u32) & PTR_MASK;
+        let new_value =
+            self.regs[idx].wrapping_add(offset as u32) & super::register_widths::widths().pointer_mask();
         self.regs[idx] = new_value;
     }
 
@@ -344,7 +357,8 @@ impl ModifierRegisterFile {
     /// Indices: m0-m7 = 0-7, dn0-dn7 = 8-15, dj0-dj7 = 16-23, dc0-dc7 = 24-31.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
-        self.regs[Self::index(reg)] = value & PTR_MASK;
+        let idx = Self::index(reg);
+        self.regs[idx] = value & super::register_widths::widths().modifier_mask(reg);
     }
 
     /// Index of a register of the file. An operand index past the file (the 2D / 3D
@@ -1656,8 +1670,8 @@ mod tests {
         assert_eq!(regs.read(LC_REG_INDEX), 100);
         assert_eq!(regs.read(LR_REG_INDEX), 0x1234); // lr unaffected
 
-        // Wrapping still applies at NUM_SCALAR_REGS (48).
-        regs.write(48, 0xABCD); // wraps to index 0 (r0)
+        // Wrapping still applies at NUM_SCALAR_REGS.
+        regs.write(NUM_SCALAR_REGS as u8, 0xABCD); // wraps to index 0 (r0)
         assert_eq!(regs.read(0), 0xABCD);
     }
 

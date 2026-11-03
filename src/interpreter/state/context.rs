@@ -819,7 +819,7 @@ impl ExecutionContext {
         match self.sp_reg {
             SpRegister::Pointer(r) => self.pointer.write(r, value),
             SpRegister::Scalar(r) => self.scalar.write(r, value),
-            SpRegister::Dedicated => self.sp_value = value,
+            SpRegister::Dedicated => self.sp_value = value & super::register_widths::widths().sp_mask(),
         }
     }
 
@@ -1280,7 +1280,7 @@ impl ExecutionContext {
     pub fn queue_pointer_write(&mut self, reg: u8, value: u32, latency: u64) {
         if reg == super::registers::SP_PTR_INDEX {
             // Dedicated SP -- write immediately, no pipeline delay
-            self.sp_value = value;
+            self.sp_value = value & super::register_widths::widths().sp_mask();
             return;
         }
         let dest = Operand::PointerReg(reg);
@@ -1395,7 +1395,7 @@ impl ExecutionContext {
         match &pw.dest {
             Operand::ScalarReg(r) => self.scalar.write(*r, pw.scalar_value),
             Operand::PointerReg(r) if *r == super::registers::SP_PTR_INDEX => {
-                self.sp_value = pw.scalar_value;
+                self.sp_value = pw.scalar_value & super::register_widths::widths().sp_mask();
             }
             Operand::PointerReg(r) => {
                 self.pointer.write(*r, pw.scalar_value);
@@ -1549,7 +1549,7 @@ impl ExecutionContext {
 
     /// Store the raw value of an unmodelled control register.
     pub fn set_control_reg_raw(&mut self, id: u8, value: u32) {
-        self.control_raw[(id & 0xF) as usize] = value;
+        self.control_raw[(id & 0xF) as usize] = value & super::register_widths::widths().control_mask(id);
     }
 
     /// The word and TLAST of the last stream beat the core read.

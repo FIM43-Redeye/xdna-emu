@@ -27,6 +27,7 @@
 //! ```
 
 mod registers;
+pub mod register_widths;
 pub mod write_collision;
 pub mod scalar_collision;
 mod event_trace;
@@ -61,6 +62,12 @@ pub use registers::{
     SHIFT_REG_BASE,
     NUM_SHIFT_REGS,
     MS_STATUS_REG_INDEX,
+    CARRY_REG_INDEX,
+    SRS_OF_REG_INDEX,
+    UPS_OF_REG_INDEX,
+    FP_FLAGS_REG_INDEX,
+    F2I_FLAGS_REG_INDEX,
+    F2F_FLAGS_REG_INDEX,
     SP_PTR_INDEX,
     // q-register views in the ControlReg index space.
     CTRL_BASE_Q,

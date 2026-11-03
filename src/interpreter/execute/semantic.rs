@@ -61,6 +61,7 @@
 
 use crate::interpreter::bundle::{Operand, SlotIndex, SlotOp, SelectVariant};
 use super::memory::agu;
+use crate::interpreter::state::register_widths::widths;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -226,7 +227,7 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
         // silicon: `vec_unpack_addr` reads a negative dj back as base + dj and gets base - 32).
         Operand::ModifierReg(r) => {
             let v = ctx.modifier_read(*r);
-            if v & 0x8_0000 != 0 {
+            if widths().modifier_reads_signed(*r) && v & 0x8_0000 != 0 {
                 v | 0xFFF0_0000
             } else {
                 v
@@ -296,17 +297,21 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
             // Control register write: update SRS/UPS config.
             // Hardware register IDs from AIE2GenRegisterInfo.td via archspec.
             match *id {
+                // The widths come from register_widths (TableGen class, silicon where it narrows).
                 ctrl_regs::CR_SAT => {
-                    ctx.srs_config.saturation_mode = (value & 0x3) as u8;
-                    log::trace!("crSat = {} (raw 0x{:X})", value & 0x3, value);
+                    let kept = value & widths().control_mask(*id);
+                    ctx.srs_config.saturation_mode = kept as u8;
+                    log::trace!("crSat = {} (raw 0x{:X})", kept, value);
                 }
                 ctrl_regs::CR_RND => {
-                    ctx.srs_config.rounding_mode = (value & 0xF) as u8;
-                    log::trace!("crRnd = {} (raw 0x{:X})", value & 0xF, value);
+                    let kept = value & widths().control_mask(*id);
+                    ctx.srs_config.rounding_mode = kept as u8;
+                    log::trace!("crRnd = {} (raw 0x{:X})", kept, value);
                 }
                 ctrl_regs::CR_SRS_SIGN => {
-                    ctx.srs_config.srs_sign = (value & 1) != 0;
-                    log::trace!("crSRSSign = {} (raw 0x{:X})", value & 1, value);
+                    let kept = value & widths().control_mask(*id);
+                    ctx.srs_config.srs_sign = kept != 0;
+                    log::trace!("crSRSSign = {} (raw 0x{:X})", kept, value);
                 }
                 // Mask registers q0-q3: ControlReg(16..19).
                 // Scalar write sets the low 32 bits (clears upper bits).
@@ -950,6 +955,98 @@ mod tests {
     use crate::interpreter::bundle::SelectVariant;
     use xdna_archspec::aie2::isa::ImplicitReg;
     use smallvec::smallvec;
+
+    // ===== register widths: what a move reads back (silicon: bugs/widths probe) =====
+    /// The register-width table of silicon (Phoenix, probe suite `bugs/widths`): the value
+    /// `mov r7, <reg>` returns after `mov <reg>, r6` for r6 = 0xFFFFFFFF.
+    const ALL_ONES_READBACK: &[(&str, u32)] = &[
+        ("s0", 0x3F),
+        ("s1", 0x3F),
+        ("s2", 0x3F),
+        ("s3", 0x3F),
+        ("ls", 0xF_FFFF),
+        ("le", 0xF_FFFF),
+        ("dp", 0xF_FFFF),
+        ("lr", 0xF_FFFF),
+        ("sp", 0xF_FFFF),
+        ("lc", 0xFFFF_FFFF),
+        ("crSat", 0x3),
+        ("crRnd", 0xF),
+        ("crFPMask", 0x1F),
+        ("crF2IMask", 0x1F),
+        ("crF2FMask", 0x1F),
+        ("crSRSSign", 1),
+        ("crUPSSign", 1),
+        ("crPackSign", 1),
+        ("crUnpackSign", 1),
+        ("crVaddSign", 1),
+        ("crSCDEn", 1),
+        ("crMCDEn", 1),
+        ("srCarry", 1),
+        ("srSS0", 3),
+        ("srMS0", 1),
+        ("srSRS_of", 1),
+        ("srUPS_of", 1),
+        ("srCompr_uf", 1),
+        ("srSparse_of", 1),
+        ("srFPFlags", 0x1F),
+        ("srF2IFlags", 0x1F),
+        ("srF2FFlags", 0x1F),
+    ];
+
+    fn write_then_read(ctx: &mut ExecutionContext, name: &str, value: u32) -> u32 {
+        let op = crate::interpreter::decode::register_map::classify_reg_name(name)
+            .unwrap_or_else(|| panic!("{name} does not map"))
+            .operand;
+        write_operand(&op, ctx, value);
+        // a pointer write lands a cycle later
+        ctx.flush_pending_writes();
+        read_operand(&op, ctx)
+    }
+
+    #[test]
+    fn every_scalar_side_register_keeps_the_bits_silicon_keeps() {
+        let mut ctx = ExecutionContext::new();
+        for (name, expect) in ALL_ONES_READBACK {
+            assert_eq!(write_then_read(&mut ctx, name, 0xFFFF_FFFF), *expect, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_patterned_value_is_masked_not_clamped() {
+        let mut ctx = ExecutionContext::new();
+        // the case that found it: mov s0, r6 with r6 = 0x66666666 reads back 0x26
+        assert_eq!(write_then_read(&mut ctx, "s0", 0x6666_6666), 0x26);
+        assert_eq!(write_then_read(&mut ctx, "lr", 0x6666_6666), 0x6_6666);
+        assert_eq!(write_then_read(&mut ctx, "crRnd", 0xA5A5_A5A5), 0x5);
+        assert_eq!(write_then_read(&mut ctx, "crF2FMask", 0x5A5A_5A5A), 0x1A);
+        assert_eq!(write_then_read(&mut ctx, "p3", 0x5A5A_5A5A), 0xA_5A5A);
+    }
+
+    #[test]
+    fn modifier_registers_read_back_20_bits_m_and_dj_sign_extended() {
+        let mut ctx = ExecutionContext::new();
+        // silicon: 0x5A5A5A5A -> m, dj fffa5a5a; dn, dc 000a5a5a. 0x80000 likewise; all-ones:
+        // m, dj ffffffff, dn, dc 000fffff.
+        for (name, ones, low20, bit19) in [
+            ("m2", 0xFFFF_FFFF, 0xFFFA_5A5A, 0xFFF8_0000),
+            ("dj5", 0xFFFF_FFFF, 0xFFFA_5A5A, 0xFFF8_0000),
+            ("dn6", 0x000F_FFFF, 0x000A_5A5A, 0x0008_0000),
+            ("dc1", 0x000F_FFFF, 0x000A_5A5A, 0x0008_0000),
+        ] {
+            assert_eq!(write_then_read(&mut ctx, name, 0xFFFF_FFFF), ones, "{name} ones");
+            assert_eq!(write_then_read(&mut ctx, name, 0x5A5A_5A5A), low20, "{name} pattern");
+            assert_eq!(write_then_read(&mut ctx, name, 0x0008_0000), bit19, "{name} bit 19");
+            assert_eq!(write_then_read(&mut ctx, name, 0x8000_0000), 0, "{name} bit 31");
+        }
+    }
+
+    #[test]
+    fn core_id_is_read_only() {
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.set_core_id(1, 2);
+        assert_eq!(write_then_read(&mut ctx, "CORE_ID", 0xFFFF_FFFF), 0x1_0002);
+    }
 
     fn make_test_context() -> ExecutionContext {
         ExecutionContext::new()

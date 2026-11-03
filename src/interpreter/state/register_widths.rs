@@ -1,0 +1,179 @@
+//! How many bits each scalar-side register keeps, and how a move reads it back.
+//!
+//! A write to a register narrower than 32 bits stores only its low bits: `mov s0, r6` with
+//! `r6 = 0x66666666` reads back `0x26` on silicon, `mov lr, r6` reads back `0x66666`.
+//! The widths are DERIVED, in this order:
+//!
+//! 1. TableGen: the narrowest register class that holds the register
+//!    (`RegisterModel::register_width_bits`, from `RegInfo.RegSize`). That gives 20 bits for
+//!    p, m, dn, dj, dc and the special registers LS, LE, DP, lr, SP, CORE_ID, and 32 for r, LC
+//!    and everything in a scalar class.
+//! 2. Silicon, where TableGen is silent: it states the width of a register CLASS, and the shift,
+//!    control and status registers share the 32-bit scalar classes while keeping fewer bits
+//!    ([`silicon_bits`]).
+//!
+//! Evidence: `build/experiments/harness/bugs/widths` (HW r1 == r2, one probe suite writing
+//! eight patterns to every register, 2026-11-03); the table is in `docs/fidelity-gaps`.
+
+use std::sync::OnceLock;
+
+use super::registers::{NUM_MODIFIER_REGS, NUM_SCALAR_REGS, SP_PTR_INDEX};
+use crate::interpreter::bundle::slot::Operand;
+use crate::interpreter::decode::register_map::classify_reg_name;
+
+/// Control registers are indexed by their TableGen `HWEncoding` (0..=11); the table keeps 16.
+pub const NUM_CONTROL_REGS: usize = 16;
+
+/// Bits a register keeps where the 32-bit scalar class TableGen puts it in says otherwise.
+/// Measured on Phoenix: every pattern written reads back masked to exactly these bits.
+///
+/// - `s0`-`s3`: 6 (an SRS shift amount).
+/// - `crSat` 2, `crRnd` 4, `crFPMask` / `crF2IMask` / `crF2FMask` 5, every other `cr*` flag 1.
+/// - `srSS0` 2, `srFPFlags` / `srF2IFlags` / `srF2FFlags` 5, every other `sr*` flag 1.
+pub fn silicon_bits(name: &str) -> Option<u8> {
+    let shift = name.len() == 2 && name.starts_with('s') && name.as_bytes()[1].is_ascii_digit();
+    match name {
+        _ if shift => Some(6),
+        "crSat" | "srSS0" => Some(2),
+        "crRnd" => Some(4),
+        "crFPMask" | "crF2IMask" | "crF2FMask" | "srFPFlags" | "srF2IFlags" | "srF2FFlags" => Some(5),
+        _ if name.starts_with("cr") || name.starts_with("sr") => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether `mov r, <register>` sign-extends the register's 20 bits. Measured: m and dj do
+/// (a negative stride reads back negative); p, dn, dc and the special registers zero-extend.
+fn reads_sign_extended(name: &str) -> bool {
+    let indexed = |p: &str| {
+        name.strip_prefix(p)
+            .is_some_and(|d| d.len() == 1 && d.as_bytes()[0].is_ascii_digit())
+    };
+    indexed("m") || indexed("dj")
+}
+
+fn mask(bits: u16) -> u32 {
+    if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    }
+}
+
+/// Per-register write masks, in the emulator's operand index spaces.
+pub struct RegisterWidths {
+    scalar: [u32; NUM_SCALAR_REGS],
+    modifier: [u32; NUM_MODIFIER_REGS],
+    modifier_signed: [bool; NUM_MODIFIER_REGS],
+    pointer: u32,
+    sp: u32,
+    control: [u32; NUM_CONTROL_REGS],
+}
+
+impl RegisterWidths {
+    /// Derive the table from the TableGen register model and [`silicon_bits`].
+    fn derive() -> Self {
+        let model = xdna_archspec::aie2::isa::load_from_generated().register_model;
+        let mut w = Self {
+            scalar: [u32::MAX; NUM_SCALAR_REGS],
+            modifier: [u32::MAX; NUM_MODIFIER_REGS],
+            modifier_signed: [false; NUM_MODIFIER_REGS],
+            pointer: u32::MAX,
+            sp: u32::MAX,
+            control: [u32::MAX; NUM_CONTROL_REGS],
+        };
+        // Several names can map to one operand slot (a long register l<n> overlays r<2n>): the
+        // narrowest wins, so iteration order does not matter.
+        let narrow = |slot: &mut u32, bits: u16| *slot = (*slot).min(mask(bits));
+        for name in model.registers.keys() {
+            let Some(tablegen) = model.register_width_bits(name) else {
+                continue;
+            };
+            let bits = silicon_bits(name).map_or(tablegen, u16::from);
+            let Some(mapped) = classify_reg_name(name) else {
+                continue;
+            };
+            match mapped.operand {
+                Operand::ScalarReg(i) if (i as usize) < NUM_SCALAR_REGS => {
+                    narrow(&mut w.scalar[i as usize], bits)
+                }
+                Operand::PointerReg(SP_PTR_INDEX) => narrow(&mut w.sp, bits),
+                Operand::PointerReg(_) => narrow(&mut w.pointer, bits),
+                Operand::ModifierReg(i) if (i as usize) < NUM_MODIFIER_REGS => {
+                    narrow(&mut w.modifier[i as usize], bits);
+                    w.modifier_signed[i as usize] = reads_sign_extended(name);
+                }
+                Operand::ControlReg(i) if (i as usize) < NUM_CONTROL_REGS && name.starts_with("cr") => {
+                    narrow(&mut w.control[i as usize], bits)
+                }
+                _ => {}
+            }
+        }
+        w
+    }
+
+    /// Bits kept by a write to scalar-file slot `index` (GPRs, lr, LS, LE, LC, DP, the shift and
+    /// status registers).
+    #[inline]
+    pub fn scalar_mask(&self, index: u8) -> u32 {
+        self.scalar[(index as usize) % NUM_SCALAR_REGS]
+    }
+
+    /// Bits kept by a write to modifier-file slot `index` (m, dn, dj, dc).
+    #[inline]
+    pub fn modifier_mask(&self, index: u8) -> u32 {
+        self.modifier[index as usize]
+    }
+
+    /// Whether `mov r, <modifier register>` sign-extends it.
+    #[inline]
+    pub fn modifier_reads_signed(&self, index: u8) -> bool {
+        self.modifier_signed[index as usize]
+    }
+
+    /// Bits kept by a write to p0-p7.
+    #[inline]
+    pub fn pointer_mask(&self) -> u32 {
+        self.pointer
+    }
+
+    /// Bits kept by a write to the stack pointer.
+    #[inline]
+    pub fn sp_mask(&self) -> u32 {
+        self.sp
+    }
+
+    /// Bits kept by a write to control register `id` (its `HWEncoding`).
+    #[inline]
+    pub fn control_mask(&self, id: u8) -> u32 {
+        self.control[(id as usize) % NUM_CONTROL_REGS]
+    }
+}
+
+/// The derived table, built on first use.
+pub fn widths() -> &'static RegisterWidths {
+    static WIDTHS: OnceLock<RegisterWidths> = OnceLock::new();
+    WIDTHS.get_or_init(RegisterWidths::derive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::state::registers::*;
+
+    #[test]
+    fn widths_derive_from_tablegen_unless_silicon_narrows() {
+        let w = widths();
+        // TableGen-only: the 20-bit classes and the 32-bit scalar ones
+        assert_eq!(w.pointer_mask(), 0xF_FFFF);
+        assert_eq!(w.modifier_mask(MOD_BASE_DC + 7), 0xF_FFFF);
+        assert_eq!(w.scalar_mask(5), u32::MAX);
+        assert_eq!(w.scalar_mask(LC_REG_INDEX), u32::MAX);
+        assert_eq!(w.scalar_mask(LR_REG_INDEX), 0xF_FFFF);
+        // narrowed by silicon: shift registers
+        assert_eq!(w.scalar_mask(SHIFT_REG_BASE), 0x3F);
+        assert_eq!(silicon_bits("r9"), None);
+        assert_eq!(silicon_bits("s2"), Some(6));
+        assert_eq!(silicon_bits("sp"), None);
+    }
+}
