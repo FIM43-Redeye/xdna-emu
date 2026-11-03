@@ -3750,4 +3750,24 @@ mod tests {
         let lane0: Vec<u8> = got[0..2].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(lane0, vec![0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0, 0]);
     }
+
+    #[test]
+    fn a_128_bit_store_leaves_the_next_sixteen_bytes_alone() {
+        // silicon vst_128 / st_q probes: 16 bytes change, the marker after them survives
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0xB40, 0xEEEE_EEEE);
+        tile.write_data_u32(0xB4C, 0xEEEE_EEEE);
+        ctx.vector.write(4, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.pointer.write(2, 0xB30);
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::QuadWord)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::PointerReg(2));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        assert_eq!(tile.read_data_u32(0xB3C), Some(4));
+        assert_eq!(tile.read_data_u32(0xB40), Some(0xEEEE_EEEE));
+        assert_eq!(tile.read_data_u32(0xB4C), Some(0xEEEE_EEEE));
+    }
 }
