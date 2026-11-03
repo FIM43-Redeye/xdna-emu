@@ -1356,6 +1356,8 @@ impl VectorAlu {
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_abs_gtz);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&[0; 16], &a, et, Self::vector_compare_lt);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let src = Self::get_vector_source(op, ctx, 0);
             let result = Self::vector_abs_gtz(&src, et);
@@ -1380,6 +1382,8 @@ impl VectorAlu {
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_gtz);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&[0; 16], &a, et, Self::vector_compare_lt);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let vec_source_count = op.sources.iter().filter(|s| matches!(s, Operand::VectorReg(_))).count();
 
@@ -1409,6 +1413,8 @@ impl VectorAlu {
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_ltz);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&a, &[0; 16], et, Self::vector_compare_lt);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let src = Self::get_vector_source(op, ctx, 0);
             let result = Self::vector_neg_ltz(&src, et);
@@ -1438,6 +1444,8 @@ impl VectorAlu {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_lt);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let (a, b) = Self::get_two_vector_sources(op, ctx);
             let result = Self::vector_sub_lt(&a, &b, et);
@@ -1458,6 +1466,8 @@ impl VectorAlu {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_ge);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let (a, b) = Self::get_two_vector_sources(op, ctx);
             let result = Self::vector_sub_ge(&a, &b, et);
@@ -1475,6 +1485,8 @@ impl VectorAlu {
             let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
             let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_maxdiff_lt);
             Self::write_wide_vec_dest(op, ctx, result);
+            let cmp = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
+            Self::write_wide_cmp_dest(op, ctx, &cmp, et);
         } else {
             let (a, b) = Self::get_two_vector_sources(op, ctx);
             let result = Self::vector_maxdiff_lt(&a, &b, et);

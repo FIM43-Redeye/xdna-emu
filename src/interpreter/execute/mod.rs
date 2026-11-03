@@ -130,6 +130,9 @@ mod collision_goldens;
 mod scalar_port_goldens;
 
 #[cfg(test)]
+mod wide_cmp_goldens;
+
+#[cfg(test)]
 mod collision_goldens_data;
 #[cfg(test)]
 mod collision_goldens_cascade_data;

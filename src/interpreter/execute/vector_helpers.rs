@@ -459,6 +459,26 @@ impl VectorAlu {
         }
     }
 
+    /// Write the compare mask of a wide (x, 512-bit) dual-result op to its cmp register: one bit
+    /// per lane of the whole vector, the low half's lanes first (a register pair for 8-bit lanes).
+    pub(super) fn write_wide_cmp_dest(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        cmp: &Vec512,
+        et: ElementType,
+    ) {
+        let lo: [u32; 8] = cmp[..8].try_into().unwrap();
+        let hi: [u32; 8] = cmp[8..].try_into().unwrap();
+        let lanes_per_half = 256 / et.bits() as u32;
+        let full_mask = (Self::condense_comparison_mask(&lo, op.element_type) as u64)
+            | ((Self::condense_comparison_mask(&hi, op.element_type) as u64) << lanes_per_half);
+        if lanes_per_half >= 32 {
+            Self::write_cmp_dest_wide(op, ctx, full_mask);
+        } else {
+            Self::write_cmp_dest(op, ctx, full_mask as u32);
+        }
+    }
+
     // ========== Wide (512-bit / 1024-bit) Helpers ==========
 
     /// Read the nth VectorReg source as a full 512-bit value.
