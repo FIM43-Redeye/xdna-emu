@@ -257,6 +257,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             local_slave_fifo_depth: 4,
             local_master_fifo_depth: 2,
             external_master_fifo_depth: 4,
+            switch_fifo_depth: 16,
             local_to_local_latency: 3,
             local_to_external_latency: 4,
             external_to_external_latency: 4,

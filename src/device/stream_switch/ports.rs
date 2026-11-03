@@ -150,7 +150,11 @@ impl StreamPort {
         // wires and have a deeper FIFO (4) than local masters (2) which feed
         // the DMA / core / trace / control consumers on the same tile.
         // All slaves share the same 4-deep depth.
+        // The switch's own FIFO (AM020 ch.2:74, 16-deep) is what the FIFO master port fills.
         let fifo_capacity = match direction {
+            PortDirection::Master if port_type == PortType::Fifo => {
+                arch_timing::STREAM_SWITCH_FIFO_DEPTH as usize
+            }
             PortDirection::Master if port_type.is_external() => {
                 arch_timing::STREAM_EXTERNAL_MASTER_FIFO_DEPTH as usize
             }

@@ -1425,3 +1425,59 @@ fn test_multicast_reconverging_arbiter_no_deadlock() {
     assert_eq!(b_out.len(), 10, "M_B received {} words: {:08X?}", b_out.len(), b_out);
     assert!(ss.arbiter_locks[0].is_none(), "arbiter released after packet completes");
 }
+
+/// The stream switch's FIFO (AM020 ch.2:74: one FIFO, 16 deep, TLAST kept) joins master port
+/// FIFO:0 to slave port FIFO:0: what a route delivers to the master comes out of the slave, in
+/// order, `fifo_depth` words held. Routing a flow `Core -> FIFO:0` and `FIFO:0 -> Core` through
+/// it wedged the emulator because nothing ever carried a word from the master to the slave.
+#[test]
+fn the_switch_fifo_carries_master_fifo_words_to_the_slave_fifo_in_order() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    let fifo_master = ss.masters.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    let fifo_slave = ss.slaves.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    ss.configure_local_route(0, fifo_master); // Core slave -> FIFO master
+    ss.configure_local_route(fifo_slave, 0); // FIFO slave -> Core master
+
+    // keep the Core master drained and feed the Core slave: a word crosses both hops
+    let mut got = Vec::new();
+    let mut next = 0u32;
+    for cycle in 0..200 {
+        if next < 40 && ss.slaves[0].can_accept() {
+            ss.slaves[0].push_with_tlast(0x7000 + next, next == 39);
+            next += 1;
+        }
+        ss.step();
+        if let Some((w, t)) = ss.masters[0].pop_with_tlast() {
+            got.push((w, t));
+        }
+        let _ = cycle;
+    }
+    let want: Vec<(u32, bool)> = (0..40).map(|i| (0x7000 + i, i == 39)).collect();
+    assert_eq!(got, want, "all words, in order, TLAST kept");
+}
+
+#[test]
+fn the_switch_fifo_holds_its_depth_when_the_slave_side_is_blocked() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    let fifo_master = ss.masters.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    let fifo_slave = ss.slaves.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    ss.configure_local_route(0, fifo_master);
+    ss.configure_local_route(fifo_slave, 0);
+    // the Core master is never drained: the path fills up and stops
+    let mut accepted = 0;
+    for _ in 0..400 {
+        if ss.slaves[0].push(accepted) {
+            accepted += 1;
+        }
+        ss.step();
+    }
+    let depth = xdna_archspec::aie2::timing::STREAM_SWITCH_FIFO_DEPTH as usize;
+    assert_eq!(depth, 16);
+    let held = ss.masters[fifo_master].fifo.len();
+    assert_eq!(held, depth, "the FIFO filled to its depth");
+    // everything accepted is somewhere in the path: nothing lost
+    let in_path = ss.slaves.iter().map(|p| p.fifo.len()).sum::<usize>()
+        + ss.masters.iter().map(|p| p.fifo.len()).sum::<usize>()
+        + ss.switch_pipeline.len();
+    assert_eq!(in_path as u32, accepted);
+}

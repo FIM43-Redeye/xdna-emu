@@ -141,6 +141,8 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         manual("stream_switch.local_master_fifo_depth", "AM020 ch.2 'local master ports ... 2-deep FIFO'."),
         manual("stream_switch.external_master_fifo_depth", "AM020 ch.2 'external ports ... 4-deep FIFO' (does not say master or \
             slave); part of the contradicted per-hop sum."),
+        manual("stream_switch.switch_fifo_depth", "AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through \
+            FIFO:0 absorbs +21 words (core source) / +20 (DMA source) on silicon (gen_stream_absorb_probe.py, r4d3 rig)."),
         manual("stream_switch.local_to_local_latency", "AM020 ch.2 '3-cycle latency and 6-deep FIFO'; the 6-deep half has no field."),
         manual("stream_switch.local_to_external_latency", "AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile \
             data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for."),

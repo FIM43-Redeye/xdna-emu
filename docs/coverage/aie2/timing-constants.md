@@ -6,7 +6,7 @@ Every `TimingModel` field with its provenance and verification verdict
 (`coverage/constants.rs`). The backlog lists what silicon contradicts or
 nothing has verified yet; settled values are toolchain-derived or measured.
 
-## Backlog (24)
+## Backlog (25)
 
 | Constant | Value | Provenance | Verification | Note |
 |----------|-------|------------|--------------|------|
@@ -28,6 +28,7 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `stream_switch.local_slave_fifo_depth` | 4 | doc-specified | unverified | AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field) and the per-channel MM2S output FIFO; part of the contradicted per-hop sum. |
 | `stream_switch.local_master_fifo_depth` | 2 | doc-specified | unverified | AM020 ch.2 'local master ports ... 2-deep FIFO'. |
 | `stream_switch.external_master_fifo_depth` | 4 | doc-specified | unverified | AM020 ch.2 'external ports ... 4-deep FIFO' (does not say master or slave); part of the contradicted per-hop sum. |
+| `stream_switch.switch_fifo_depth` | 16 | doc-specified | unverified | AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through FIFO:0 absorbs +21 words (core source) / +20 (DMA source) on silicon (gen_stream_absorb_probe.py, r4d3 rig). |
 | `stream_switch.local_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2 '3-cycle latency and 6-deep FIFO'; the 6-deep half has no field. |
 | `stream_switch.local_to_external_latency` | 4 | doc-specified | unverified | AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for. |
 | `stream_switch.external_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2. UNREAD: the ext->local path uses the local->local latency (equal value, 3, hides it). |

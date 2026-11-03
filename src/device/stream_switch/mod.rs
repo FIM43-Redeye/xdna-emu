@@ -443,8 +443,32 @@ impl StreamSwitch {
         self.step_impl(false)
     }
 
+    /// Carry words through the switch's FIFO: master port FIFO:n to slave port FIFO:n (the
+    /// k-th FIFO master pairs with the k-th FIFO slave), one word per cycle while the slave
+    /// has room. The FIFO itself is the master port's 16-deep buffer (`STREAM_SWITCH_FIFO_DEPTH`).
+    fn advance_switch_fifos(&mut self) -> usize {
+        let masters = self.masters.iter().enumerate().filter(|(_, p)| p.port_type == PortType::Fifo);
+        let slaves = self.slaves.iter().enumerate().filter(|(_, p)| p.port_type == PortType::Fifo);
+        let pairs: Vec<(usize, usize)> = masters.zip(slaves).map(|((m, _), (s, _))| (m, s)).collect();
+        let mut moved = 0;
+        for (m, s) in pairs {
+            if self.masters[m].has_data() && self.slaves[s].can_accept() {
+                if let Some((data, tlast)) = self.masters[m].pop_with_tlast() {
+                    self.slaves[s].push_with_tlast(data, tlast);
+                    moved += 1;
+                }
+            }
+        }
+        moved
+    }
+
     fn step_impl(&mut self, advance: bool) -> usize {
         let mut words_forwarded = 0;
+
+        // The switch FIFO hands a word on one cycle after the route delivered it.
+        if advance {
+            words_forwarded += self.advance_switch_fifos();
+        }
 
         // Phase 1: Advance pipeline -- deliver words that have completed
         // traversal. ONCE per cycle (first pass only); the second pass within a

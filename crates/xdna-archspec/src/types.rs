@@ -1367,6 +1367,11 @@ pub struct StreamSwitchTiming {
     /// a route ending in an external master holds more in flight than one
     /// ending in a local master.
     pub external_master_fifo_depth: u8,
+    /// The stream switch's FIFO (words): the one FIFO joining master port FIFO:0 to slave port
+    /// FIFO:0 (AM020 ch.2:74, "16-deep and 34 bit"). A flow routed through it holds this many
+    /// words. Silicon absorbs 21 more words (core source) through it than around it; the
+    /// remaining 5 are the extra switch hop the route takes.
+    pub switch_fifo_depth: u8,
     /// Local slave to local master latency in cycles.
     pub local_to_local_latency: u8,
     /// Local slave to external master latency in cycles.
