@@ -85,7 +85,10 @@ cargo test --lib
 ./scripts/emu-bridge-test.sh --trace=pc-anchored ...  # add PC-anchored cycle trace comparison
 
 # ISA test harness (generate -> suite build -> hw -> emu -> compare -> analyze;
-# 200 cases: 177 single-instruction batches + 23 two-core cascade/stream pairs)
+# 195 cases: 177 single-instruction batches, 17 two-core cascade/stream pairs whose consumers
+# store every beat and its status, and a last batch of mov.dN delay tests and observability
+# variants). The analyzer fails a test point that checked nothing (payload all zero, or the
+# same for inputs that should differ) even where EMU == HW.
 ./scripts/isa-test.sh [--seed N] [--filter PAT] [--tag NAME]
 python3 tools/isa-test-analyze.py build/isa-suite       # re-analyze the last run
 
