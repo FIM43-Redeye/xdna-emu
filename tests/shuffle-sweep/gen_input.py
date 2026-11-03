@@ -9,9 +9,13 @@ When a shuffle output byte contains value N, it came from input byte N.
 import struct
 import sys
 
+def identity_input() -> bytes:
+    return bytes(range(128))
+
+
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else "input.bin"
-    data = bytes(range(128))
+    data = identity_input()
     with open(out_path, "wb") as f:
         f.write(data)
     print(f"Wrote {len(data)} bytes to {out_path}")

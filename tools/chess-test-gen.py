@@ -296,6 +296,23 @@ def dir_name(i: ChessIntrinsic) -> str:
     return _sanitize_dirname(f"{i.name}__{param_part}")
 
 
+def unique_name(taken: dict[str, str], name: str, namespace: str, code: str) -> str | None:
+    """Case name for a kernel whose natural name may already be `taken` (name -> kernel text).
+
+    The header declares some overloads twice (once more inside me_primitive); the retired
+    layout let the later directory overwrite the earlier one. An identical repeat gets None
+    (dropped); a different kernel under the same name is kept, qualified by its namespace.
+    """
+    if name not in taken:
+        return name
+    if taken[name] == code:
+        return None
+    qualified = _sanitize_dirname(f"{namespace or 'global'}__{name}")
+    if qualified in taken:
+        raise ValueError(f"chess test name {qualified!r} still collides")
+    return qualified
+
+
 def _sanitize_dirname(name: str) -> str:
     """Replace characters that are problematic in filesystem paths."""
     # "unsigned char" -> "unsigned_char", etc.
@@ -418,13 +435,12 @@ class SkippedChessIntrinsic:
     reason: str
 
 
-def generate_all(
+def collect_chess_kernels(
     opns_path: str,
     types_path: str,
-    out_dir: str,
     iss_types_path: str | None = None,
-) -> tuple[list[GeneratedChessTest], list[SkippedChessIntrinsic]]:
-    """Full pipeline: stubs -> preprocess -> walk -> filter -> generate files.
+) -> tuple[list[tuple[GeneratedChessTest, str]], list[SkippedChessIntrinsic]]:
+    """Full pipeline: stubs -> preprocess -> walk -> filter -> generate kernel text.
 
     Parameters
     ----------
@@ -432,8 +448,6 @@ def generate_all(
         Path to me_chess_opns.h (the Chess operations header).
     types_path:
         Path to me_chess_types.h (chessTraitsOf specializations).
-    out_dir:
-        Root output directory.  One subdirectory per generated test.
     iss_types_path:
         Optional path to me_iss_types.h.  When provided, ISS property
         comments are parsed and merged with chessTraitsOf types.  ISS fills
@@ -441,7 +455,7 @@ def generate_all(
 
     Returns
     -------
-    (generated, skipped) lists suitable for manifest construction.
+    ([(test, kernel.cc text)], skipped).
     """
     # Import here rather than at module top to keep the dependency optional
     # when running unit tests that do not need the full pipeline.
@@ -459,10 +473,8 @@ def generate_all(
     combined = stubs + "\n" + clean
     intrinsics = walk_ast(combined, annotations)
 
-    generated: list[GeneratedChessTest] = []
+    kernels: list[tuple[GeneratedChessTest, str]] = []
     skipped: list[SkippedChessIntrinsic] = []
-
-    os.makedirs(out_dir, exist_ok=True)
 
     # Types that xchesscc knows natively: chessTraitsOf types + C builtins.
     # Functions using types outside this set (ISS-internal types like w32,
@@ -493,8 +505,6 @@ def generate_all(
             continue
 
         dname = dir_name(i)
-        test_dir = os.path.join(out_dir, dname)
-        os.makedirs(test_dir, exist_ok=True)
 
         # Compute buffer sizes (ref outputs excluded from input, included in output).
         in_size = sum(psize for _, psize, is_ref in i.params if not is_ref)
@@ -504,27 +514,66 @@ def generate_all(
         in_size = max(4, in_size)
         out_size = max(4, out_size)
 
-        # Write kernel.cc (Chess-native calling convention).
+        # kernel.cc text (Chess-native calling convention).
         kernel_code = generate_chess_kernel_cc(
             i.name, i.namespace, i.return_type, i.params,
         )
-        Path(os.path.join(test_dir, "kernel.cc")).write_text(kernel_code)
 
-        # Write aie.mlir (shared template from Peano path).
-        mlir_code = generate_aie_mlir(in_size, out_size)
-        Path(os.path.join(test_dir, "aie.mlir")).write_text(mlir_code)
+        dname = unique_name(dict((g.name, code) for g, code in kernels), dname,
+                            i.namespace, kernel_code)
+        if dname is None:
+            skipped.append(SkippedChessIntrinsic(
+                name=i.name, namespace=i.namespace, reason="duplicate declaration"))
+            continue
 
-        generated.append(GeneratedChessTest(
+        kernels.append((GeneratedChessTest(
             name=dname,
             func_name=i.name,
             namespace=i.namespace,
             in_size=in_size,
             out_size=out_size,
-        ))
+        ), kernel_code))
+
+    return kernels, skipped
+
+
+def generate_suite(opns_path: str, types_path: str, suite_dir: str,
+                   iss_types_path: str | None = None, *, seed: int = 42) -> tuple[int, int]:
+    """Write the Chess instruction-test suite (one case per intrinsic) for the suite runner.
+
+    Returns (generated, skipped) counts. Never calls a compiler or XRT.
+    """
+    from cxx_suite import CxxKernel, write_cxx_suite
+    kernels, skipped = collect_chess_kernels(opns_path, types_path, iss_types_path)
+    write_cxx_suite(
+        suite_dir, "instr-chess", "chess-test-gen.py", "chess",
+        [CxxKernel(g.name, code, g.in_size, g.out_size,
+                   meta={"func_name": g.func_name, "namespace": g.namespace})
+         for g, code in kernels],
+        seed=seed, skipped=[asdict(x) for x in skipped])
+    return len(kernels), len(skipped)
+
+
+def generate_all(
+    opns_path: str,
+    types_path: str,
+    out_dir: str,
+    iss_types_path: str | None = None,
+) -> tuple[list[GeneratedChessTest], list[SkippedChessIntrinsic]]:
+    """Legacy layout for scripts/instr-test.sh --chess (kernel.cc + aie.mlir per test,
+    test_host.cpp, manifest.json). Superseded by `generate_suite`; goes away with that script."""
+    kernels, skipped = collect_chess_kernels(opns_path, types_path, iss_types_path)
+    os.makedirs(out_dir, exist_ok=True)
+    for g, kernel_code in kernels:
+        test_dir = os.path.join(out_dir, g.name)
+        os.makedirs(test_dir, exist_ok=True)
+        Path(os.path.join(test_dir, "kernel.cc")).write_text(kernel_code)
+        Path(os.path.join(test_dir, "aie.mlir")).write_text(
+            generate_aie_mlir(g.in_size, g.out_size))
+    generated = [g for g, _ in kernels]
 
     # Write shared test_host.cpp (identical to Peano path).
-    host_code = generate_test_host_cpp()
-    Path(os.path.join(out_dir, "test_host.cpp")).write_text(host_code)
+    Path(os.path.join(out_dir, "test_host.cpp")).write_text(generate_test_host_cpp())
 
     # Write manifest.json.
     manifest = {
@@ -566,7 +615,16 @@ def main() -> None:
         default="build/chess-instr-tests",
         help="Output directory (default: %(default)s)",
     )
+    parser.add_argument("--suite-dir",
+                        help="Write a harness suite here instead (python3 -m harness suite ...)")
+    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed for --suite-dir")
     args = parser.parse_args()
+
+    if args.suite_dir:
+        n, n_skipped = generate_suite(args.opns_header, args.types_header, args.suite_dir,
+                                      iss_types_path=args.iss_types_header, seed=args.seed)
+        print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
+        return
 
     generated, skipped = generate_all(
         args.opns_header, args.types_header, args.out_dir,

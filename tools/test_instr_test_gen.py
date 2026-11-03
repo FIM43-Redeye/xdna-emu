@@ -430,3 +430,40 @@ def int_aie2_event0 : ClangBuiltin<"__builtin_aiev2_event0">, AIE2EventIntrinsic
     assert len(manifest["generated"]) == 1
     assert len(manifest["skipped"]) == 1
     assert manifest["generated"][0]["name"] == "vbroadcast32_I512"
+
+
+# ---------------------------------------------------------------------------
+# Suite output (harness/suite.py layout)
+# ---------------------------------------------------------------------------
+
+TD_ONE_KERNEL = """\
+class AIEV2VBCST32I512
+     : DefaultAttrsIntrinsic<[llvm_v16i32_ty], [llvm_i32_ty], [IntrNoMem]>;
+class AIE2EventIntrinsic
+    : DefaultAttrsIntrinsic<[], [llvm_i32_ty], [IntrHasSideEffects, IntrNoMem]>;
+def int_aie2_vbroadcast32_I512 : ClangBuiltin<"__builtin_aiev2_vbroadcast32_I512">, AIEV2VBCST32I512;
+def int_aie2_event0 : ClangBuiltin<"__builtin_aiev2_event0">, AIE2EventIntrinsic;
+"""
+
+
+def test_generate_suite_writes_a_peano_case_per_intrinsic(tmp_path):
+    from harness import suite as S
+    td = tmp_path / "t.td"
+    td.write_text(TD_ONE_KERNEL)
+    assert instr_test_gen.generate_suite(str(td), str(tmp_path / "s")) == (1, 1)
+    s = S.load_suite(tmp_path / "s")
+    assert s.name == "instr-peano" and s.cases == ("vbroadcast32_I512",)
+    t = s.topology("vbroadcast32_I512")
+    assert t.compiler == "peano"
+    assert "__builtin_aiev2_vbroadcast32_I512" in t.cores[0].source.read_text()
+    assert [b.size_bytes for b in t.cores[0].args] == [4, 64]
+    assert s.case_meta("vbroadcast32_I512")["builtin"] == "__builtin_aiev2_vbroadcast32_I512"
+    assert s.meta["skipped"][0]["name"] == "int_aie2_event0"
+
+
+def test_generate_suite_calls_no_compiler_and_leaves_no_legacy_files(tmp_path):
+    td = tmp_path / "t.td"
+    td.write_text(TD_ONE_KERNEL)
+    instr_test_gen.generate_suite(str(td), str(tmp_path / "s"))
+    names = {p.name for p in (tmp_path / "s").rglob("*")}
+    assert not names & {"aie.mlir", "test_host.cpp", "manifest.json", "kernel.o"}

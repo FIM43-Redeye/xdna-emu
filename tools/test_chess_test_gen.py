@@ -730,3 +730,48 @@ class w64;              // property( 64 bit   signed );'''
         assert types["v32w32"] == 1024
         assert types["v512w8"] == 4096
         assert len(types) >= 100
+
+
+class TestChessSuite:
+    """generate_suite wires the collected kernels into a Chess suite (no compiler, no clang walk)."""
+
+    def _gen(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "chess_test_gen", Path(__file__).parent / "chess-test-gen.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["chess_test_gen"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_generate_suite_writes_chess_cases(self, tmp_path, monkeypatch):
+        from harness import suite as S
+        g = self._gen()
+        test = g.GeneratedChessTest("abs__v16int32", "abs", "", 64, 64)
+        skip = g.SkippedChessIntrinsic("foo", "", "why")
+        monkeypatch.setattr(g, "collect_chess_kernels",
+                            lambda *a, **k: ([(test, "// abs\n")], [skip]))
+        assert g.generate_suite("o.h", "t.h", str(tmp_path / "s")) == (1, 1)
+        s = S.load_suite(tmp_path / "s")
+        assert s.name == "instr-chess" and s.cases == ("abs__v16int32",)
+        assert s.topology("abs__v16int32").compiler == "chess"
+        assert s.case_meta("abs__v16int32")["func_name"] == "abs"
+        assert s.meta["skipped"][0]["reason"] == "why"
+
+
+class TestUniqueName:
+    def _gen(self):
+        return TestChessSuite()._gen()
+
+    def test_fresh_name_is_kept(self):
+        assert self._gen().unique_name({}, "abs__v16int32", "", "k") == "abs__v16int32"
+
+    def test_identical_repeat_is_dropped(self):
+        assert self._gen().unique_name({"select__bool": "k"}, "select__bool", "", "k") is None
+
+    def test_different_kernel_keeps_both_qualified_by_namespace(self):
+        g = self._gen()
+        assert g.unique_name({"ext__x": "a"}, "ext__x", "me_primitive", "b") == "me_primitive__ext__x"
+        assert g.unique_name({"ext__x": "a"}, "ext__x", "", "b") == "global__ext__x"

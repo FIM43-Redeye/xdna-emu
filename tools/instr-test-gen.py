@@ -529,20 +529,15 @@ class SkippedIntrinsic:
     reason: str
 
 
-def generate_all(td_path: str, out_dir: str) -> tuple[list[GeneratedTest], list[SkippedIntrinsic]]:
-    """Main entry point: parse TD file, generate all test artifacts.
-
-    Returns (generated, skipped) lists for manifest construction.
-    """
+def collect_kernels(td_path: str) -> tuple[list[tuple[GeneratedTest, str]], list[SkippedIntrinsic]]:
+    """Parse the TD file; return each generatable intrinsic's test with its kernel.cc text."""
     td_text = Path(td_path).read_text()
 
     classes = parse_class_defs(td_text)
     defs = parse_intrinsic_defs(td_text)
 
-    generated: list[GeneratedTest] = []
+    kernels: list[tuple[GeneratedTest, str]] = []
     skipped: list[SkippedIntrinsic] = []
-
-    os.makedirs(out_dir, exist_ok=True)
 
     for name, defn in sorted(defs.items()):
         class_def = classes.get(defn.class_name)
@@ -565,23 +560,40 @@ def generate_all(td_path: str, out_dir: str) -> tuple[list[GeneratedTest], list[
         in_size = max(4, in_size)
         out_size = max(4, out_size)
 
-        sname = short_name(name)
-        test_dir = os.path.join(out_dir, sname)
-        os.makedirs(test_dir, exist_ok=True)
-
-        # Write kernel.cc
         kernel_code = generate_kernel_cc(defn.builtin, class_def.ret_types[0],
-                                          class_def.arg_types)
+                                         class_def.arg_types)
+        kernels.append((GeneratedTest(name=short_name(name), builtin=defn.builtin,
+                                      in_size=in_size, out_size=out_size), kernel_code))
+    return kernels, skipped
+
+
+def generate_suite(td_path: str, suite_dir: str, *, seed: int = 42) -> tuple[int, int]:
+    """Write the Peano instruction-test suite (one case per intrinsic) for the suite runner.
+
+    Returns (generated, skipped) counts. Never calls a compiler or XRT.
+    """
+    from cxx_suite import CxxKernel, write_cxx_suite
+    kernels, skipped = collect_kernels(td_path)
+    write_cxx_suite(
+        suite_dir, "instr-peano", "instr-test-gen.py", "peano",
+        [CxxKernel(g.name, code, g.in_size, g.out_size, meta={"builtin": g.builtin})
+         for g, code in kernels],
+        seed=seed, skipped=[asdict(x) for x in skipped])
+    return len(kernels), len(skipped)
+
+
+def generate_all(td_path: str, out_dir: str) -> tuple[list[GeneratedTest], list[SkippedIntrinsic]]:
+    """Legacy layout for scripts/instr-test.sh (kernel.cc + aie.mlir per test, test_host.cpp,
+    manifest.json). Superseded by `generate_suite`; goes away with that script."""
+    kernels, skipped = collect_kernels(td_path)
+    os.makedirs(out_dir, exist_ok=True)
+    for g, kernel_code in kernels:
+        test_dir = os.path.join(out_dir, g.name)
+        os.makedirs(test_dir, exist_ok=True)
         Path(os.path.join(test_dir, "kernel.cc")).write_text(kernel_code)
-
-        # Write aie.mlir
-        mlir_code = generate_aie_mlir(in_size, out_size)
-        Path(os.path.join(test_dir, "aie.mlir")).write_text(mlir_code)
-
-        generated.append(GeneratedTest(
-            name=sname, builtin=defn.builtin,
-            in_size=in_size, out_size=out_size,
-        ))
+        Path(os.path.join(test_dir, "aie.mlir")).write_text(
+            generate_aie_mlir(g.in_size, g.out_size))
+    generated = [g for g, _ in kernels]
 
     # Write shared test_host.cpp
     host_code = generate_test_host_cpp()
@@ -606,7 +618,15 @@ def main():
                         help="Path to IntrinsicsAIE2.td")
     parser.add_argument("--out-dir", default="build/instr-tests",
                         help="Output directory (default: build/instr-tests)")
+    parser.add_argument("--suite-dir",
+                        help="Write a harness suite here instead (python3 -m harness suite ...)")
+    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed for --suite-dir")
     args = parser.parse_args()
+
+    if args.suite_dir:
+        n, n_skipped = generate_suite(args.td, args.suite_dir, seed=args.seed)
+        print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
+        return
 
     generated, skipped = generate_all(args.td, args.out_dir)
 
