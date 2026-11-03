@@ -103,6 +103,16 @@ python3 -m harness suite compare <suite> r1 e1        # byte-exact per buffer, e
 # ISA-style kernels address p0 = in, p1 = out: isa_suite always gives a single-core kernel an input
 # (>= 4 bytes). An out-only core gets out in p0 and p1 is stale tile state on silicon (EMU: poison).
 
+# C++ kernels (Peano or Chess): a `.cc` core source; the compiler is the topology's `compiler`
+# ("peano" clang++ --target=aie2-none-unknown-elf -O2, or "chess" xchesscc_wrapper aie2, AIE2
+# only), because aiecc links per package. The entry symbol is renamed at compile time (-D), not
+# with objcopy: a Chess object breaks under objcopy. Suite generators (never compile or run):
+python3 tools/instr-test-gen.py --td ../llvm-aie/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <suite>  # Peano, 76 cases
+python3 tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h \
+    --types-header .../me_chess_types.h --iss-types-header .../me_iss_types.h --suite-dir <suite>   # Chess, 4234 cases
+python3 tests/shuffle-sweep/gen_suite.py <suite>        # one Chess case; analyze.py reads runs/<tag>/shuffle-sweep/core.out.bin
+# Chess compiles ~6 s of wall per case at -j16 (xchesscc runs twice per case); build it in slices with --only.
+
 # Standalone Rust binaries
 cargo run --release --bin trace-compare -- ...   # HW vs EMU events JSON diff
 cargo run --release --bin export-isa             # dump TableGen ISA tables
