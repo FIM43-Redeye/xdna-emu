@@ -175,6 +175,21 @@ mod tests {
         }
     }
 
+    /// TableGen register-class widths: the 20-bit classes of the pointer, modifier and special
+    /// registers, 32 for the scalar GPRs, LC, the shift, control and status registers.
+    #[test]
+    fn register_widths_come_from_the_narrowest_class() {
+        let model = load_from_generated().register_model;
+        let w = |n: &str| model.register_width_bits(n);
+        for n in ["p0", "p7", "m0", "dn3", "dj7", "dc5", "LS", "LE", "DP", "lr", "SP", "CORE_ID"] {
+            assert_eq!(w(n), Some(20), "{n}");
+        }
+        for n in ["r0", "r31", "LC", "s0", "s3", "crSat", "crRnd", "srCarry", "srSS0"] {
+            assert_eq!(w(n), Some(32), "{n}");
+        }
+        assert_eq!(w("no_such_reg"), None);
+    }
+
     /// Composite format metadata was extracted from TableGen.
     #[test]
     fn test_composite_formats() {

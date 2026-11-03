@@ -750,6 +750,9 @@ pub struct RegisterClassDef {
     pub members: Vec<String>,
     /// Register alignment in bits (e.g., 32, 256).
     pub alignment: u16,
+    /// Width of one register of the class in bits (TableGen `RegInfo.RegSize`): 32 for the
+    /// scalar classes, 20 for the p / m / dn / dj / dc classes and the 20-bit special registers.
+    pub reg_size_bits: u16,
     /// Parent classes from the def line.
     pub parents: Vec<String>,
 }
@@ -761,6 +764,38 @@ pub struct RegisterModel {
     pub registers: HashMap<String, RegisterDef>,
     /// All register classes, indexed by class name.
     pub classes: HashMap<String, RegisterClassDef>,
+}
+
+impl RegisterModel {
+    /// The leaf registers of a class: its members, with member classes expanded.
+    fn leaf_registers<'a>(&'a self, class: &'a RegisterClassDef, out: &mut Vec<&'a str>, depth: u8) {
+        for member in &class.members {
+            match self.classes.get(member) {
+                Some(inner) if depth < 8 => self.leaf_registers(inner, out, depth + 1),
+                Some(_) => {}
+                None => out.push(member),
+            }
+        }
+    }
+
+    /// The width in bits TableGen gives a register: the narrowest `RegInfo.RegSize` among the
+    /// classes that contain it. A register sits in wider "as 32 bit" classes too (a pointer
+    /// moves through a scalar class), so the narrowest is its own width. TableGen states a
+    /// register class width, not a register width: a register only as narrow as its class
+    /// (`s0` is in a 32-bit class; silicon keeps 6 bits).
+    pub fn register_width_bits(&self, name: &str) -> Option<u16> {
+        let mut leaves = Vec::new();
+        self.classes
+            .values()
+            .filter(|c| c.reg_size_bits > 0)
+            .filter(|c| {
+                leaves.clear();
+                self.leaf_registers(c, &mut leaves, 0);
+                leaves.contains(&name)
+            })
+            .map(|c| c.reg_size_bits)
+            .min()
+    }
 }
 
 // ============================================================================

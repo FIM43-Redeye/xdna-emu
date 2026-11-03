@@ -59,6 +59,8 @@ pub struct BuildRegisterClassDef {
     pub name: String,
     pub members: Vec<String>,
     pub alignment: u16,
+    /// Width of one register of the class in bits (`RegInfo.RegSize`); 0 when TableGen gives none.
+    pub reg_size_bits: u16,
     pub parents: Vec<String>,
 }
 
@@ -1044,16 +1046,31 @@ fn load_register_model(td_file: &Path, include_paths: &[&Path]) -> Result<BuildR
             continue;
         }
         let alignment = record.int_value("Alignment").unwrap_or(0) as u16;
+        let reg_size_bits = class_reg_size_bits(&record);
         let mut parents = Vec::new();
         for class in &["RegisterClass", "AIE2RegisterClass"] {
             if record.subclass_of(class) {
                 parents.push(class.to_string());
             }
         }
-        classes.insert(name.clone(), BuildRegisterClassDef { name, members, alignment, parents });
+        classes
+            .insert(name.clone(), BuildRegisterClassDef { name, members, alignment, reg_size_bits, parents });
     }
 
     Ok(BuildRegisterModel { registers, classes })
+}
+
+/// `RegInfos` is a `RegInfoByHwMode` whose first object is a `RegInfo { RegSize, .. }`: the
+/// width of one register of the class (the 20-bit classes of p / m / dn / dj / dc and the
+/// special registers give 20, the scalar classes 32).
+fn class_reg_size_bits(class: &tblgen::Record<'_>) -> u16 {
+    let size = || -> Option<i64> {
+        let by_mode: tblgen::Record = class.value("RegInfos").ok()?.init.as_def().ok()?.into();
+        let objects = by_mode.value("Objects").ok()?.init.as_list().ok()?;
+        let first: tblgen::Record = objects.iter().next()?.as_def().ok()?.into();
+        first.int_value("RegSize").ok()
+    };
+    size().unwrap_or(0) as u16
 }
 
 // ============================================================================

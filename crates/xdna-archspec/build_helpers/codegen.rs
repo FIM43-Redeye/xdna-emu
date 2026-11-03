@@ -137,6 +137,7 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
         )
         .unwrap();
         writeln!(code, "        alignment: {},", cls.alignment).unwrap();
+        writeln!(code, "        reg_size_bits: {},", cls.reg_size_bits).unwrap();
         writeln!(
             code,
             "        parents: vec![{}],",
