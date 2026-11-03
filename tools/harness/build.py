@@ -111,47 +111,55 @@ def _run(cmd: list[str], cwd: Path | None, log: Path, what: str) -> None:
         raise BuildError(f"{what} failed (exit {r.returncode}); log: {log}")
 
 
-def _assemble(src: Path, dest: Path, log: Path, compiler: str) -> None:
+def _assemble(src: Path, dest: Path, log: Path, compiler: str, rename=None) -> None:
     _run([_peano_tool("llvm-mc"), "--triple=aie2", "--filetype=obj",
           "-o", str(dest), str(src)], None, log, f"assembling {src.name}")
 
 
-def _llc(src: Path, dest: Path, log: Path, compiler: str) -> None:
+def _llc(src: Path, dest: Path, log: Path, compiler: str, rename=None) -> None:
     _run([_peano_tool("llc"), "-mtriple=aie2", "--issue-limit=1", "-filetype=obj",
           "-o", str(dest), str(src)], None, log, f"compiling {src.name}")
 
 
-def cxx_command(compiler: str, src: Path, dest: Path) -> list[str]:
-    """The command that compiles a C++ kernel with the package's compiler."""
+def cxx_command(compiler: str, src: Path, dest: Path,
+                rename: tuple[str, str] | None = None) -> list[str]:
+    """The command that compiles a C++ kernel with the package's compiler.
+
+    `rename = (old, new)` gives the entry point its unique linker symbol at compile time
+    (`-Dold=new`): a Chess object carries symbol-keyed metadata, so renaming it afterwards
+    with llvm-objcopy breaks the xbridge link."""
+    define = [f"-D{rename[0]}={rename[1]}"] if rename else []
     if compiler == "peano":
-        return [_peano_tool("clang++"), *PEANO_CXX_FLAGS, "-c", str(src), "-o", str(dest)]
+        return [_peano_tool("clang++"), *PEANO_CXX_FLAGS, *define, "-c", str(src), "-o", str(dest)]
     if compiler == "chess":
         wrapper = shutil.which("xchesscc_wrapper")
         if wrapper is None:
             raise BuildError("xchesscc_wrapper not found on PATH (Chess needs the aietools env)")
-        return [wrapper, "aie2", "-c", str(src), "-o", str(dest)]
+        return [wrapper, "aie2", *define, "-c", str(src), "-o", str(dest)]
     raise BuildError(f"no C++ compiler named {compiler!r}")
 
 
-def _compile_cxx(src: Path, dest: Path, log: Path, compiler: str) -> None:
+def _compile_cxx(src: Path, dest: Path, log: Path, compiler: str, rename=None) -> None:
     # Chess writes listings and scratch beside its cwd; give every kernel a private one so
     # parallel builds never collide and nothing leaks into the package.
     scratch = Path(tempfile.mkdtemp(prefix="cxx-", dir=dest.parent))
     try:
         built = scratch / "kernel.o"       # Chess drops its listing next to the output
-        _run(cxx_command(compiler, src.resolve(), built), scratch, log,
+        _run(cxx_command(compiler, src.resolve(), built, rename), scratch, log,
              f"compiling {src.name} ({compiler})")
         shutil.move(built, dest)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _copy_object(src: Path, dest: Path, log: Path, compiler: str) -> None:
+def _copy_object(src: Path, dest: Path, log: Path, compiler: str, rename=None) -> None:
     shutil.copyfile(src, dest)
 
 
-# source suffix -> function(src, dest object, log, compiler) producing a relocatable AIE2 object
+# source suffix -> function(src, dest object, log, compiler, rename) producing a relocatable AIE2
+# object; kinds in RENAMES_AT_COMPILE take the symbol rename themselves, the rest get objcopy.
 SOURCE_KINDS = {".s": _assemble, ".ll": _llc, ".cc": _compile_cxx, ".o": _copy_object}
+RENAMES_AT_COMPILE = {".cc"}
 
 
 def _build_object(core, phase_dir: Path, compiler: str = "peano") -> None:
@@ -164,10 +172,11 @@ def _build_object(core, phase_dir: Path, compiler: str = "peano") -> None:
     if make is None:
         raise BuildError(f"core {core.name!r}: unsupported source type {src.suffix!r} "
                          f"(one of {', '.join(SOURCE_KINDS)})")
-    make(src, dest, log, compiler)
-    _run([_peano_tool("llvm-objcopy"), "--redefine-sym",
-          f"{core.symbol}={kernel_symbol(core)}", str(dest)],
-         None, log.with_suffix(".objcopy.log"), f"renaming symbol in {dest.name}")
+    rename = (core.symbol, kernel_symbol(core))
+    make(src, dest, log, compiler, rename)
+    if src.suffix not in RENAMES_AT_COMPILE:
+        _run([_peano_tool("llvm-objcopy"), "--redefine-sym", f"{rename[0]}={rename[1]}", str(dest)],
+             None, log.with_suffix(".objcopy.log"), f"renaming symbol in {dest.name}")
 
 
 def _git_rev() -> str:

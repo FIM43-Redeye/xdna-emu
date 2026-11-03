@@ -111,12 +111,13 @@ def cxx_package(tmp_path, compiler):
 
 def test_cxx_command_per_compiler():
     from harness.build import cxx_command
-    peano = cxx_command("peano", Path("k.cc"), Path("k.o"))
+    peano = cxx_command("peano", Path("k.cc"), Path("k.o"), rename=("test_kernel", "k_a"))
+    assert "-Dtest_kernel=k_a" in peano
     assert peano[0].endswith("clang++")
     assert "--target=aie2-none-unknown-elf" in peano and "-O2" in peano and "-c" in peano
-    chess = cxx_command("chess", Path("k.cc"), Path("k.o"))
+    chess = cxx_command("chess", Path("k.cc"), Path("k.o"), rename=("test_kernel", "k_a"))
     assert chess[0].endswith("xchesscc_wrapper") and chess[1] == "aie2"
-    assert chess[-3:] == ["-c", "k.cc", "-o"] or "k.o" in chess
+    assert "-Dtest_kernel=k_a" in chess and chess[-2:] == ["-o", "k.o"] and "k.cc" in chess
 
 
 def test_aiecc_flags_follow_the_compiler():
@@ -137,6 +138,7 @@ def test_cxx_source_is_compiled_with_peano(tmp_path):
     from harness.emit import kernel_symbol
     core = cxx_package(tmp_path, "peano").cores[0]
     assert f" T {kernel_symbol(core)}" in nm and "test_kernel" not in nm   # renamed to the core's symbol
+    assert not (pkg.phase_dirs[0] / "a.o.objcopy.log").exists()   # renamed at compile time
     assert "clang++" in (pkg.phase_dirs[0] / "a.o.log").read_text()
 
 
@@ -145,6 +147,10 @@ def test_cxx_source_is_compiled_with_peano(tmp_path):
 def test_cxx_source_is_compiled_with_chess(tmp_path):
     pkg = build_package(cxx_package(tmp_path, "chess"), tmp_path / "out", run_aiecc=False)
     assert (pkg.phase_dirs[0] / "a.o").is_file()
+    # a Chess object keeps symbol-keyed metadata; objcopy-renaming it breaks the xbridge link
+    nm = subprocess.run([peano("llvm-nm"), str(pkg.phase_dirs[0] / "a.o")],
+                        capture_output=True, text=True).stdout
+    assert " T k_a" in nm and "test_kernel" not in nm
     assert "xchesscc_wrapper" in (pkg.phase_dirs[0] / "a.o.log").read_text()
     assert not list(pkg.phase_dirs[0].glob("*.lst"))      # Chess scratch stays out of the package
 
