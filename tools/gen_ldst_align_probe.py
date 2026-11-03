@@ -165,6 +165,18 @@ def families() -> list[Family]:
                          idx_imm=False, pstm_imm=False, pstm_m=False, idx_dj=False, conv=True,
                          pre=("vlda wl2, [p0, #64]", "vbcst.32 x4, r5"), dump=("vst wl2, [p4, #0]",),
                          rec=32))
+    # the same gathers with a different address in every lane (lane value = swept address + 37,
+    # +70, +101 for lanes 1..3 and 5..7, so a lane depending on its neighbour shows)
+    mix = ("movxm r14, #37", "movxm r15, #70", "movxm r13, #101", "nop", "nop", "nop", "nop",
+           "add r14, r5, r14", "add r15, r5, r15", "add r13, r5, r13", "nop", "nop", "nop", "nop",
+           "vbcst.32 x4, r5", *["nop"] * 6)
+    for lane, reg in ((1, "r14"), (2, "r15"), (3, "r13"), (5, "r13"), (6, "r14"), (7, "r15")):
+        mix += (f"mov r29, #{lane}", "nop", "nop", "nop", f"vinsert.32 x4, x4, r29, {reg}", *["nop"] * 6)
+    for w in (16, 32, 64):
+        for half in ("lo", "hi"):
+            out.append(F(f"lutmix_4x{w}_{half}", "ld", f"vldb.4x{w}.{half}", "wl2, wl4", 8, lut=True,
+                         idx_imm=False, pstm_imm=False, pstm_m=False, idx_dj=False, conv=True,
+                         pre=("vlda wl2, [p0, #64]", *mix), dump=("vst wl2, [p4, #0]",), rec=32))
     out.append(F("conv_ld", "ld", "vlda.conv.fp32.bf16", "bml0", 32, imm=32, conv=True,
                  dims=D23, **LD_BM))
     for dst, src, nbytes in (("s16", "s8", 32), ("d16", "d8", 32), ("s8", "s4", 16), ("d8", "d4", 16)):
@@ -231,7 +243,9 @@ def build_cases(fams: list[Family] | None = None) -> list[Case]:
         if f.plain:
             add("plain", "[p2]", n_full, 1, 0, 0, 0)
         if f.lut:
-            add("lut", "", n_full, 1, 0, 0, 0)
+            # the gather addresses are swept over 64 bytes at two window positions
+            add("lut", "", 64, 1, 0, 0, 0)
+            add("lut_far", "", 64, 1, 192, 0, 0)
         if f.idx_imm:
             add("imm0", "[p2, #0]", n_full, 1, 0, 0, 0)
         if f.pstm_imm:
@@ -451,6 +465,38 @@ def verify_natural(res: CaseResult) -> list[str]:  # noqa: C901
             want_d = 0
         if d != want_d:
             bad.append(f"i={i}: pointer delta {d}, want {want_d} (unmasked)")
+    return bad
+
+
+def lut_lane_offsets(fam_key: str) -> list[int]:
+    """Offsets added to the swept address in the four lanes a 4x gather uses (lo: lanes 0..3,
+    hi: lanes 4..7); the plain probe broadcasts the address, the `lutmix` probe offsets it."""
+    if "lutmix" not in fam_key:
+        return [0, 0, 0, 0]
+    return [0, 101, 37, 70] if fam_key.endswith("_hi") else [0, 37, 70, 101]
+
+
+def lut_expected_lane(v: int, lane: int, element_bits: int) -> bytes:
+    """Silicon model of one 4x gather lane (fits every probe record on Phoenix): the lane's
+    32-bit address `v` is reduced to the element granule (mask 4, 8, 16 bytes for 16, 32, 64
+    bit), the low five bits are halved, odd lanes read the other 16-byte bank (bit 4 set), and
+    the 8-byte read stops at its 16-byte row: bytes past it read as zero."""
+    mask = {16: 3, 32: 7, 64: 15}[element_bits]
+    eff = (v & ~31) | (((v & 31) & ~mask) >> 1) | (0x10 if lane % 2 else 0)
+    return bytes(((eff + k) & 0xFF) if (eff & 15) + k < 16 else 0 for k in range(8))
+
+
+def verify_lut(res: CaseResult) -> list[str]:
+    c = res.case
+    bits = int(c.fam.key.split("_4x")[1][:2])
+    offs = lut_lane_offsets(c.fam.key)
+    bad = []
+    for row in load_landing(res):
+        for lane in range(4):
+            want = lut_expected_lane(row["addr"] + offs[lane], lane, bits)
+            got = row["rec"][8 * lane:8 * lane + 8]
+            if got != want:
+                bad.append(f"i={row['i']} lane {lane} addr {row['addr'] + offs[lane]}: {got.hex()}, want {want.hex()}")
     return bad
 
 
