@@ -217,6 +217,11 @@ _SKIP_PREFIXES = (
     "__promy_",     # internal compiler promotion primitives
 )
 
+# Blocking stream / cascade reads: with no producer feeding the core they never return, and
+# every one costs a TDR on silicon (24 in the first sweep). The Peano generator skips the same
+# family (INFRA_PATTERNS). A producer-fed version belongs in a two-core pair, not here.
+_BLOCKING_READ_PREFIXES = ("get_ss", "get_scd")
+
 # Property words from chess_property(...) that flag a function as untestable.
 _SKIP_PROPERTY_WORDS = frozenset({
     "dont_care",
@@ -266,6 +271,10 @@ def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
     for prefix in _SKIP_PREFIXES:
         if i.name.startswith(prefix):
             return ("skipped", f"name prefix: {prefix}")
+
+    for prefix in _BLOCKING_READ_PREFIXES:
+        if i.name.startswith(prefix):
+            return ("skipped", f"blocking stream/cascade read needs a producer: {prefix}")
 
     # 6. _conf functions require immediate (compile-time constant) operands
     # that cannot be loaded from a buffer at runtime.  The non-_conf variants

@@ -775,3 +775,24 @@ class TestUniqueName:
         g = self._gen()
         assert g.unique_name({"ext__x": "a"}, "ext__x", "me_primitive", "b") == "me_primitive__ext__x"
         assert g.unique_name({"ext__x": "a"}, "ext__x", "", "b") == "global__ext__x"
+
+
+class TestStreamReadsSkipped:
+    """Blocking stream/cascade reads hang the core when nothing feeds them (24 TDRs in the first
+    silicon sweep of the Chess suite); the Peano generator skips the same family."""
+
+    def test_classify_skips_blocking_reads(self):
+        g = TestChessSuite()._gen()
+        for name in ("get_ss", "get_ss_v16int32", "get_scd_v16acc32", "get_scd_hi", "get_scd__int"):
+            i = g.ChessIntrinsic(name=name, namespace="", return_type="int", return_size=4,
+                                 params=[], is_inline=True, properties=[], storage_params=[],
+                                 overload_index=0, source_line=0)
+            status, reason = g.classify_chess_intrinsic(i)
+            assert status == "skipped" and "producer" in reason, name
+
+    def test_classify_keeps_ordinary_getters(self):
+        g = TestChessSuite()._gen()
+        i = g.ChessIntrinsic(name="get_real", namespace="", return_type="int", return_size=4,
+                             params=[], is_inline=True, properties=[], storage_params=[],
+                                 overload_index=0, source_line=0)
+        assert g.classify_chess_intrinsic(i)[0] == "generated"
