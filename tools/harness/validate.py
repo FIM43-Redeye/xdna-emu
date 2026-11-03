@@ -26,8 +26,11 @@ from .device_model import (
 from .topology import Cascade, Core, CoreStream, Topology
 
 
-# Chess joins with the C++ source kind; aiecc needs `--xchesscc --xbridge` for it.
-SUPPORTED_COMPILERS = ("peano",)
+# aiecc picks the linker per package (`--xchesscc --xbridge` or not), hence one compiler
+# per topology. The Chess install here covers AIE2 only (no AIE2P); mlir-aie names AIE2
+# devices `npu1*` (AGENTS.md "Target facts").
+SUPPORTED_COMPILERS = ("peano", "chess")
+CHESS_DEVICE_PREFIXES = ("npu1",)
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,10 @@ def validate(topology: Topology, device: DeviceModel) -> list[ValidationError]:
         err("unsupported_compiler",
             f"compiler {topology.compiler!r} is not supported (one of "
             f"{', '.join(SUPPORTED_COMPILERS)})", topology.compiler)
+    elif topology.compiler == "chess" and not device.name.startswith(CHESS_DEVICE_PREFIXES):
+        err("chess_aie2_only",
+            f"Chess is available for AIE2 only ({', '.join(p + '*' for p in CHESS_DEVICE_PREFIXES)}), "
+            f"not {device.name!r}", device.name)
 
     placed = _check_cores(topology, device, err)
     for core in placed:

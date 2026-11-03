@@ -89,11 +89,73 @@ def test_ll_source_is_compiled_with_llc(tmp_path):
 
 
 def test_unknown_source_suffix_names_the_supported_kinds(tmp_path):
-    src = tmp_path / "k.cc"
+    src = tmp_path / "k.cpp"
     src.write_text("")
-    t = Topology("cc", (Core("a", TileRef(0, 2), src),), device="auto")
-    with pytest.raises(BuildError, match=r"unsupported source type '\.cc'.*\.s.*\.ll.*\.o"):
+    t = Topology("cpp", (Core("a", TileRef(0, 2), src),), device="auto")
+    with pytest.raises(BuildError, match=r"unsupported source type '\.cpp'.*\.s.*\.ll.*\.cc.*\.o"):
         build_package(t, tmp_path / "out", run_aiecc=False)
+
+
+# -- C++ kernels: the compiler is the package's --------------------------------
+
+CXX_KERNEL = ('#include <stdint.h>\nextern "C" void test_kernel(const int32_t *in, int32_t *out)'
+              ' { out[0] = in[0] + 1; }\n')
+
+
+def cxx_package(tmp_path, compiler):
+    src = tmp_path / "k.cc"
+    src.write_text(CXX_KERNEL)
+    return Topology("cxx", (Core("a", TileRef(0, 2), src, args=(
+        Buffer("in", "in", 64), Buffer("out", "out", 64))),), device="npu1", compiler=compiler)
+
+
+def test_cxx_command_per_compiler():
+    from harness.build import cxx_command
+    peano = cxx_command("peano", Path("k.cc"), Path("k.o"))
+    assert peano[0].endswith("clang++")
+    assert "--target=aie2-none-unknown-elf" in peano and "-O2" in peano and "-c" in peano
+    chess = cxx_command("chess", Path("k.cc"), Path("k.o"))
+    assert chess[0].endswith("xchesscc_wrapper") and chess[1] == "aie2"
+    assert chess[-3:] == ["-c", "k.cc", "-o"] or "k.o" in chess
+
+
+def test_aiecc_flags_follow_the_compiler():
+    from harness.build import aiecc_flags
+    assert "--xchesscc=false" in aiecc_flags("peano") and "--xbridge=false" in aiecc_flags("peano")
+    assert "--xchesscc" in aiecc_flags("chess") and "--xbridge" in aiecc_flags("chess")
+    assert "--xchesscc=false" not in aiecc_flags("chess")
+    for c in ("peano", "chess"):
+        assert "--get-xclbin" in aiecc_flags(c) and "--get-npu-insts" in aiecc_flags(c)
+
+
+@pytest.mark.skipif(not (peano("clang++") and peano("llvm-objcopy")), reason="Peano clang++ unavailable")
+def test_cxx_source_is_compiled_with_peano(tmp_path):
+    pkg = build_package(cxx_package(tmp_path, "peano"), tmp_path / "out", run_aiecc=False)
+    obj = pkg.phase_dirs[0] / "a.o"
+    assert obj.is_file()
+    nm = subprocess.run([peano("llvm-nm"), str(obj)], capture_output=True, text=True).stdout
+    from harness.emit import kernel_symbol
+    core = cxx_package(tmp_path, "peano").cores[0]
+    assert f" T {kernel_symbol(core)}" in nm and "test_kernel" not in nm   # renamed to the core's symbol
+    assert "clang++" in (pkg.phase_dirs[0] / "a.o.log").read_text()
+
+
+@pytest.mark.skipif(not shutil.which("xchesscc_wrapper") or not peano("llvm-objcopy"),
+                    reason="Chess (xchesscc_wrapper) unavailable")
+def test_cxx_source_is_compiled_with_chess(tmp_path):
+    pkg = build_package(cxx_package(tmp_path, "chess"), tmp_path / "out", run_aiecc=False)
+    assert (pkg.phase_dirs[0] / "a.o").is_file()
+    assert "xchesscc_wrapper" in (pkg.phase_dirs[0] / "a.o.log").read_text()
+    assert not list(pkg.phase_dirs[0].glob("*.lst"))      # Chess scratch stays out of the package
+
+
+def test_inputs_hash_covers_compiler_and_its_tools(tmp_path):
+    import dataclasses
+    from harness.build import compute_inputs_hash, _workspace
+    t = cxx_package(tmp_path, "peano")
+    root = _workspace()
+    peano_hash = compute_inputs_hash(t, ["m"], root)
+    assert peano_hash != compute_inputs_hash(dataclasses.replace(t, compiler="chess"), ["m"], root)
 
 
 # -- inputs hash and reuse -----------------------------------------------------

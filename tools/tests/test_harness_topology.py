@@ -111,10 +111,30 @@ def test_dict_without_compiler_key_means_peano():
     assert topology_from_dict(d).compiler == "peano"
 
 
-def test_validator_rejects_other_compilers():
+def test_validator_rejects_unknown_compilers():
     from harness.validate import validate_topology
-    t = Topology("t", (Core("c", TileRef(0, 2), Path("c.s")),), device="auto", compiler="chess")
+    t = Topology("t", (Core("c", TileRef(0, 2), Path("c.s")),), device="auto", compiler="gcc")
     assert "unsupported_compiler" in {e.code for e in validate_topology(t)}
+
+
+def test_validator_accepts_chess_on_aie2():
+    from harness.validate import validate_topology
+    t = Topology("t", (Core("c", TileRef(0, 2), Path("c.cc")),), device="npu1", compiler="chess")
+    assert validate_topology(t) == []
+
+
+def test_validator_rejects_chess_beyond_aie2():
+    from harness.validate import validate_topology
+    t = Topology("t", (Core("c", TileRef(0, 2), Path("c.cc")),), device="npu2", compiler="chess")
+    assert "chess_aie2_only" in {e.code for e in validate_topology(t)}
+
+
+def test_a_core_cannot_pick_its_own_compiler():
+    """aiecc links per package, so mixed compilers are unrepresentable, not just rejected."""
+    d = to_dict(Topology("t", (Core("c", TileRef(0, 2), Path("c.cc")),)))
+    d["cores"][0]["compiler"] = "chess"
+    with pytest.raises(TopologyFormatError, match="unknown key"):
+        topology_from_dict(d)
 
 
 # -- relative sources resolve against the topology file ----------------------
