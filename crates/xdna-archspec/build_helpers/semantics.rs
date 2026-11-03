@@ -635,7 +635,10 @@ impl BuildInstrRecord {
             .collect();
 
         let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
-        let is_sp_relative = self.uses.iter().any(|u| u == "SP");
+        // TableGen `Uses = [SP]`, or an `[sp, ...]` operand in the assembly string:
+        // `VST_128_ag_spill` is the one spill record without the attribute, and it decoded with
+        // a bare immediate (a 128-bit spill store went to a wrong address).
+        let is_sp_relative = self.uses.iter().any(|u| u == "SP") || self.asm_string.contains("[sp,");
         let (dual_et, dual_ft) = infer_dual_element_types(&self.name);
         let element_type = dual_et.or_else(|| infer_element_type(&self.mnemonic));
         let from_type = dual_ft;

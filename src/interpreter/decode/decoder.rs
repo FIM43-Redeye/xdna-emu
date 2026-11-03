@@ -1243,6 +1243,28 @@ mod tests {
         assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)), "mov destination should be r20");
     }
 
+    /// `vst.128 wl0, [sp, #-0x40]` (bytes from llvm-objdump of the ldst-align probe): the
+    /// stack-relative 128-bit store must decode to a QuadWord store at `Memory { sp, -64 }`.
+    #[test]
+    fn test_vst_128_sp_relative_decode() {
+        use crate::interpreter::bundle::MemWidth;
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping: llvm-aie not found");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+        let bundle = decoder.decode(&[0xd9, 0x40, 0xff, 0x0f], 0xcf8).expect("decode vst.128 [sp]");
+        let st = bundle.slot(SlotIndex::Store).expect("Store slot");
+        eprintln!("vst.128 sp: {:?} sources={:?} dest={:?}", st.semantic, st.sources, st.dest);
+        assert_eq!(st.mem_width, MemWidth::QuadWord);
+        assert!(st
+            .sources
+            .iter()
+            .any(|o| matches!(o, Operand::Memory { base, offset } if *base == crate::interpreter::state::SP_PTR_INDEX && *offset == -64)));
+    }
+
     /// Decode regression for the Half-B SRS capture kernel's two key
     /// instructions (`vec_srs_i32`, real bytes from llvm-objdump):
     ///   - `st q0, [p1], #0x10`  -> 128-bit QuadWord store, q-mask source.
