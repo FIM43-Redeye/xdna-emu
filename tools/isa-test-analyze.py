@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """Analyze ISA test results at the test-point level.
 
-Reads the manifest and per-batch binary outputs (hw vs emu) to produce
-a per-instruction, per-test-point pass/fail report.  Groups results by
-instruction name and category for actionable accuracy metrics.
+Reads an ISA suite (harness/suite.py layout, written by isa-test-gen.py) and two run
+tags, one on hardware and one on the emulator, and compares each test point's slices of
+the cases' output buffers. Produces a per-instruction, per-test-point pass/fail report,
+grouped by instruction name and category.
 
 Usage:
-    python3 tools/isa-test-analyze.py [--results-dir DIR] [--manifest PATH]
-    python3 tools/isa-test-analyze.py --category vector   # filter by category
-    python3 tools/isa-test-analyze.py --failing            # only show failures
-    python3 tools/isa-test-analyze.py --summary            # one-line-per-instruction
+    python3 tools/isa-test-analyze.py SUITE_DIR [HW_TAG EMU_TAG]   # default: the `last` run
+    python3 tools/isa-test-analyze.py SUITE_DIR --category vector-mac
+    python3 tools/isa-test-analyze.py SUITE_DIR --failing           # only show failures
+    python3 tools/isa-test-analyze.py SUITE_DIR --summary           # one-line-per-instruction
 """
 
 import argparse
-import json
-import os
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from harness import suite as S
 
 
 # Instruction name -> category mapping (prefix-based).
@@ -110,58 +112,72 @@ def categorize(name: str) -> str:
     return "other"
 
 
-def compare_test_point(hw_data: bytes, emu_data: bytes,
-                       out_offset: int, out_size: int) -> Optional[bool]:
-    """Compare a single test point's output bytes.
+def compare_test_point(hw_slices: list[bytes], emu_slices: list[bytes]) -> Optional[bool]:
+    """Compare one test point's slices (the same slice list for both backends).
 
-    Returns True if match, False if mismatch, None if the test point
+    Returns True if every slice matches, False if any differs, None if a slice
     falls outside the available data (can't compare).
     """
-    end = out_offset + out_size
-    if end > len(hw_data) or end > len(emu_data):
-        return None  # out of bounds -- skip this test point
-    hw_slice = hw_data[out_offset:end]
-    emu_slice = emu_data[out_offset:end]
-    return hw_slice == emu_slice
+    for hw, emu in zip(hw_slices, emu_slices):
+        if hw is None or emu is None:
+            return None
+    return hw_slices == emu_slices
 
 
-def load_batch_data(results_dir: str, batch_idx: int):
-    """Load hw and emu binary output for a batch."""
-    hw_path = os.path.join(results_dir, f"batch_{batch_idx}_hw.bin")
-    emu_path = os.path.join(results_dir, f"batch_{batch_idx}_emu.bin")
-    hw_data = open(hw_path, "rb").read() if os.path.exists(hw_path) else None
-    emu_data = open(emu_path, "rb").read() if os.path.exists(emu_path) else None
-    return hw_data, emu_data
+def _slice_of(data: bytes, offset: int, size: int) -> Optional[bytes]:
+    return data[offset:offset + size] if offset + size <= len(data) else None
 
 
-def analyze(manifest_path: str, results_dir: str, category_filter: str = None,
-            failing_only: bool = False, summary_mode: bool = False):
+def _read(suite: S.Suite, tag: str, case: str, test: dict) -> Optional[list[Optional[bytes]]]:
+    """The bytes of each of the test point's slices, or None if a file is missing."""
+    out = []
+    for sl in test["slices"]:
+        p = S.output_path(suite.path, tag, case, sl["core"], sl["buffer"])
+        if not p.is_file():
+            return None
+        out.append(_slice_of(p.read_bytes(), sl["offset"], sl["size"]))
+    return out
+
+
+def last_tags(suite_dir: Path) -> tuple[str, str]:
+    """The (hw, emu) tags of the last run, from the `last` pointer scripts/isa-test.sh writes."""
+    p = Path(suite_dir) / "last"
+    if not p.is_file():
+        raise S.SuiteError(f"{p} not found: pass HW_TAG and EMU_TAG, or run scripts/isa-test.sh")
+    run = p.read_text().strip()
+    return f"hw-{run}", f"emu-{run}"
+
+
+@dataclass(frozen=True)
+class Totals:
+    passed: int
+    failed: int
+    skipped_cases: int
+
+
+def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = None,
+            failing_only: bool = False, summary_mode: bool = False) -> Totals:
     """Run the full analysis."""
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-
-    # Per-instruction aggregation.
     # instr_name -> {"pass": int, "fail": int, "total": int, "details": [...]}
     instr_stats = defaultdict(lambda: {"pass": 0, "fail": 0, "total": 0, "details": []})
     category_stats = defaultdict(lambda: {"pass": 0, "fail": 0})
-    skipped_batches = 0
+    skipped_cases = 0
     total_points = 0
 
-    for batch in manifest["batches"]:
-        batch_idx = batch["batch_index"]
-        tests = batch.get("tests", [])
+    for case in suite.cases:
+        tests = suite.case_meta(case).get("tests", [])
         if not tests:
             continue
-
-        # Pair batches (cascade/stream) require --multi-tile mode.
-        # Don't count them as skipped in single-tile results.
-        source_type = batch.get("source_type", "assembly")
-        if source_type in ("cascade_pair", "stream_pair"):
-            continue
-
-        hw_data, emu_data = load_batch_data(results_dir, batch_idx)
-        if hw_data is None or emu_data is None:
-            skipped_batches += 1
+        batch_idx = suite.case_meta(case)["batch_index"]
+        usable = True
+        for test in tests:
+            hw = _read(suite, hw_tag, case, test)
+            emu = _read(suite, emu_tag, case, test)
+            if hw is None or emu is None:
+                usable = False
+                break
+        if not usable:
+            skipped_cases += 1
             continue
 
         for test in tests:
@@ -171,11 +187,8 @@ def analyze(manifest_path: str, results_dir: str, category_filter: str = None,
             if category_filter and cat != category_filter:
                 continue
 
-            out_offset = test["out_offset"]
-            out_size = test["out_size"]
-
-            passed = compare_test_point(hw_data, emu_data, out_offset, out_size)
-
+            passed = compare_test_point(_read(suite, hw_tag, case, test),
+                                        _read(suite, emu_tag, case, test))
             if passed is None:
                 # Test point falls outside available data -- skip it.
                 continue
@@ -208,8 +221,8 @@ def analyze(manifest_path: str, results_dir: str, category_filter: str = None,
     print(f"Total test points: {total_points}")
     print(f"  PASS: {total_pass} ({100*total_pass/max(total_points,1):.1f}%)")
     print(f"  FAIL: {total_fail} ({100*total_fail/max(total_points,1):.1f}%)")
-    if skipped_batches:
-        print(f"  Skipped batches (missing data): {skipped_batches}")
+    if skipped_cases:
+        print(f"  Skipped cases (missing data): {skipped_cases}")
     print()
 
     # Category summary.
@@ -257,15 +270,14 @@ def analyze(manifest_path: str, results_dir: str, category_filter: str = None,
             if len(stats["details"]) > 3:
                 print(f"    ... and {len(stats['details']) - 3} more")
 
-    return total_pass, total_fail
+    return Totals(total_pass, total_fail, skipped_cases)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze ISA test results at test-point level")
-    parser.add_argument("--results-dir", default=None,
-                        help="Directory with batch_N_{hw,emu}.bin files")
-    parser.add_argument("--manifest", default=None,
-                        help="Path to manifest.json")
+    parser.add_argument("suite_dir", help="the ISA suite directory (isa-test-gen.py --suite-dir)")
+    parser.add_argument("hw_tag", nargs="?", help="hardware run tag (default: the last run)")
+    parser.add_argument("emu_tag", nargs="?", help="emulator run tag")
     parser.add_argument("--category", default=None,
                         help="Filter by category (e.g., 'vector-mac', 'scalar-alu')")
     parser.add_argument("--failing", action="store_true",
@@ -273,39 +285,21 @@ def main():
     parser.add_argument("--summary", action="store_true",
                         help="One line per instruction (no combo details)")
     args = parser.parse_args()
+    if bool(args.hw_tag) != bool(args.emu_tag):
+        parser.error("give both HW_TAG and EMU_TAG, or neither")
 
-    # Auto-detect paths.
-    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    manifest = args.manifest or os.path.join(project_dir, "build/isa-tests/manifest.json")
-
-    if args.results_dir:
-        results_dir = args.results_dir
-    else:
-        # Prefer 'latest' directory (the working results folder).
-        latest = os.path.join(project_dir, "build/isa-test-results/latest")
-        if os.path.isdir(latest):
-            results_dir = latest
-        else:
-            # Fall back to most recent dated archive.
-            import glob
-            candidates = sorted(glob.glob(
-                os.path.join(project_dir, "build/isa-test-results/[0-9]*")))
-            if candidates:
-                results_dir = candidates[-1]
-            else:
-                print("ERROR: No results directory found. Run isa-test.sh first.",
-                      file=sys.stderr)
-                sys.exit(1)
-
-    if not os.path.exists(manifest):
-        print(f"ERROR: Manifest not found at {manifest}", file=sys.stderr)
+    try:
+        suite = S.load_suite(args.suite_dir)
+        hw_tag, emu_tag = (args.hw_tag, args.emu_tag) if args.hw_tag else last_tags(suite.path)
+    except S.SuiteError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Manifest: {manifest}")
-    print(f"Results:  {results_dir}")
+    print(f"Suite: {suite.path}")
+    print(f"Tags:  {hw_tag} (hw) vs {emu_tag} (emu)")
     print()
 
-    analyze(manifest, results_dir, args.category, args.failing, args.summary)
+    analyze(suite, hw_tag, emu_tag, args.category, args.failing, args.summary)
 
 
 if __name__ == "__main__":

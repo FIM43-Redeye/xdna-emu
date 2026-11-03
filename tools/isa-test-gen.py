@@ -5674,6 +5674,20 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     return manifest
 
 
+def generate_suite(isa_json_path: str, suite_dir: str, seed: int) -> dict:
+    """Generate every batch and write them as a harness suite (see isa_suite.py).
+
+    The batch sources go through a scratch directory: the suite's case directories
+    are their only home.  Returns the manifest.
+    """
+    import tempfile
+    import isa_suite
+    with tempfile.TemporaryDirectory(prefix="isa-gen-") as scratch:
+        manifest = generate_all(isa_json_path, scratch)
+        isa_suite.write_isa_suite(manifest, scratch, suite_dir, seed)
+    return manifest
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -5699,6 +5713,18 @@ def main():
         "--summary",
         action="store_true",
         help="Print classification summary only (no file generation)",
+    )
+    parser.add_argument(
+        "--suite-dir",
+        default=None,
+        help="Write a harness suite (one case per batch) here instead of loose "
+             "files under --out-dir; scripts/isa-test.sh uses this",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="PRNG seed of the input data (with --suite-dir; default 42)",
     )
     args = parser.parse_args()
 
@@ -5752,7 +5778,11 @@ def main():
             print(f"  {instr['name']:40s} [{instr['slot']:4s}] {sname:20s} outputs={out_names}")
         return
 
-    manifest = generate_all(args.isa_json, args.out_dir)
+    if args.suite_dir:
+        manifest = generate_suite(args.isa_json, args.suite_dir, args.seed)
+        args.out_dir = args.suite_dir
+    else:
+        manifest = generate_all(args.isa_json, args.out_dir)
 
     testable = manifest['testable_instructions']
     skipped = manifest['skipped_instructions']
