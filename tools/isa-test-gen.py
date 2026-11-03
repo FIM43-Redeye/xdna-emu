@@ -1462,7 +1462,8 @@ def _vector_store(reg_name: str, ptr: str, offset: int) -> list[str]:
     ]
 
 
-def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[str]:
+def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int,
+                       raw_accumulator: bool = False) -> list[str]:
     """Generate store instructions for a register to memory.
 
     Args:
@@ -1517,6 +1518,16 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
                 + [f"  vsrs.s16.s32 wh{idx}, bmh{idx}, s3"]
                 + _nop_sled(4)
                 + _vector_store(f"wh{idx}", ptr, offset + 32)
+            )
+        elif raw_accumulator and (reg_name.startswith("bml") or reg_name.startswith("bmh")):
+            # The accumulator's own bits (through x4), not an SRS to 16 bits: a float
+            # conversion's result saturates or vanishes through an integer SRS.
+            return (
+                [f"  // store accumulator {reg_name}: raw, through x4"]
+                + [f"  vmov x4, {reg_name}"]
+                + _nop_sled(8)
+                + _vector_store("wl4", ptr, offset)
+                + _vector_store("wh4", ptr, offset + 32)
             )
         elif reg_name.startswith("bml") or reg_name.startswith("bmh"):
             idx = reg_name[3:]
@@ -1693,6 +1704,8 @@ def _substitute_asm(asm_string: str, regs: dict[str, str],
 # never is one; vclr writes zeros, so its destination must hold something first.
 ZERO_SOURCE_INSTRS = ("EQZ", "NEZ", "VEQZ_8", "VEQZ_16", "VEQZ_32")
 PRELOAD_OUTPUT_INSTRS = ("VCLR_vclr", "VCLR_vclr_BF")
+# fp32 conversion into an accumulator: read the accumulator's bits back, not an integer SRS of it.
+RAW_READOUT_INSTRS = ("VCONV_FP32_BF16",)
 
 
 def _zero_inputs(op_by_name: dict, asm_op_names: list, output_names: set, regs: dict) -> list[str]:
@@ -1907,7 +1920,8 @@ def generate_test_point(
                                 "wide_y", "vector1024", "sparse_qx", "quad") else 4
         cur_out_offset = _align(cur_out_offset, align)
         reg = regs.get(op["name"], "r0")
-        store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
+        store_lines = _store_instruction(reg, kind, "p1", cur_out_offset,
+                                         raw_accumulator=bool(regs.get("_raw_readout")))
         lines.extend(store_lines)
         cur_out_offset += _operand_size(op, name)
 
@@ -5668,6 +5682,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     for instr in all_instrs:
         flag = ("_zero_sources" if instr["name"] in ZERO_SOURCE_INSTRS else
                 "_preload_output" if instr["name"] in PRELOAD_OUTPUT_INSTRS else
+                "_raw_readout" if instr["name"] in RAW_READOUT_INSTRS else
                 "_observe_sp" if instr["name"] == "PADDA_sp_imm" else None)
         if flag:
             strategy, _ = classify_with_strategies(instr)

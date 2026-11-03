@@ -4481,6 +4481,14 @@ class TestHollowSingleTileFixes:
         plain = self._point("VCLR_vclr", {"dst": "cm2"})
         assert not any("x11" in l for l in plain)
 
+    def test_vconv_variant_reads_the_accumulator_raw(self):
+        pt = self._point("VCONV_FP32_BF16", {"dst": "bml0", "src": "wl0", "_raw_readout": True})
+        assert "vmov x4, bml0" in pt and not any(l.startswith("vsrs") for l in pt)
+        assert [l for l in pt if l.startswith("vst")][-2:] == [
+            l for l in pt if l.startswith("vst") and l.startswith(("vst wl4", "vst wh4"))][-2:]
+        plain = self._point("VCONV_FP32_BF16", {"dst": "bml0", "src": "wl0"})
+        assert any(l.startswith("vsrs") for l in plain) and "vmov x4, bml0" not in plain
+
     def test_variants_are_extra_test_points_in_the_last_batch(self, tmp_path):
         isa_json = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
         manifest = generate_all(isa_json, str(tmp_path / "t"))
@@ -4489,6 +4497,7 @@ class TestHollowSingleTileFixes:
         assert variants["EQZ"] == "_zero_sources"
         assert variants["VCLR_vclr"] == "_preload_output"
         assert variants["PADDA_sp_imm"] == "_observe_sp"
+        assert variants["VCONV_FP32_BF16"] == "_raw_readout"
         assert next(t for t in last if t["instruction"] == "VCLR_vclr")["zero_expected"]
 
 
