@@ -21,6 +21,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -222,6 +223,11 @@ _SKIP_PREFIXES = (
 # family (INFRA_PATTERNS). A producer-fed version belongs in a two-core pair, not here.
 _BLOCKING_READ_PREFIXES = ("get_ss", "get_scd")
 
+# set_xl / set_yhl / set_cll ...: write one part of a wider register and return the whole. The
+# other parts are whatever the register held, so the result is not a function of the arguments
+# (silicon: they differ with the case that ran before). Not testable as pure intrinsics.
+_PARTIAL_REGISTER_SET = re.compile(r"^set_[xybc][lh]{1,2}$")
+
 # Property words from chess_property(...) that flag a function as untestable.
 _SKIP_PROPERTY_WORDS = frozenset({
     "dont_care",
@@ -271,6 +277,9 @@ def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
     for prefix in _SKIP_PREFIXES:
         if i.name.startswith(prefix):
             return ("skipped", f"name prefix: {prefix}")
+
+    if _PARTIAL_REGISTER_SET.match(i.name):
+        return ("skipped", "partial register set: the unwritten parts are undefined")
 
     for prefix in _BLOCKING_READ_PREFIXES:
         if i.name.startswith(prefix):

@@ -796,3 +796,21 @@ class TestStreamReadsSkipped:
                              params=[], is_inline=True, properties=[], storage_params=[],
                                  overload_index=0, source_line=0)
         assert g.classify_chess_intrinsic(i)[0] == "generated"
+
+
+class TestPartialRegisterSets:
+    def _intr(self, g, name):
+        return g.ChessIntrinsic(name=name, namespace="me_primitive", return_type="v64uint8",
+                                return_size=64, params=[("v32uint8", 32, False)], is_inline=True,
+                                properties=[], storage_params=[], overload_index=0, source_line=0)
+
+    def test_set_of_one_register_part_is_skipped(self):
+        g = TestChessSuite()._gen()
+        for name in ("set_xl", "set_xh", "set_yll", "set_yhl", "set_cll", "set_chh", "set_bl"):
+            status, reason = g.classify_chess_intrinsic(self._intr(g, name))
+            assert status == "skipped" and "undefined" in reason, name
+
+    def test_set_of_a_whole_vector_is_kept(self):
+        g = TestChessSuite()._gen()
+        for name in ("set_v16int32", "set_128b"):
+            assert g.classify_chess_intrinsic(self._intr(g, name))[0] == "generated", name
