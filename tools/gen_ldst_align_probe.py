@@ -92,6 +92,7 @@ class Family:
     idx_dj: bool = True
     dims: tuple[str, ...] = ()  # "2d" / "3d" forms that exist
     plain: bool = False        # only the bare [p] form exists
+    sp_imm: int = 0            # nonzero: the stack-relative spill form [sp, #imm] exists
     lut: bool = False          # 4-way gather: the addresses come from a vector register
     conv: bool = False         # result bytes are a conversion of the source (no raw identity)
 
@@ -127,29 +128,29 @@ def families() -> list[Family]:
     F = Family
     out = [
         # scalar stores
-        F("st_w", "st", "st", "r8", 4, imm=4, dims=D23),
+        F("st_w", "st", "st", "r8", 4, imm=4, sp_imm=-64, dims=D23),
         F("st_s16", "st", "st.s16", "r8", 2, imm=2, dims=D23, pstm_m=True),
         F("st_s8", "st", "st.s8", "r8", 1, imm=1, dims=D23),
         # scalar loads
-        F("lda_w", "ld", "lda", "r3", 4, imm=4, dims=D23, **LD_R),
+        F("lda_w", "ld", "lda", "r3", 4, imm=4, sp_imm=-64, dims=D23, **LD_R),
         F("lda_s16", "ld", "lda.s16", "r3", 2, imm=2, conv=True, dims=D23, **LD_R),
         F("lda_u16", "ld", "lda.u16", "r3", 2, imm=2, conv=True, dims=D23, **LD_R),
         F("lda_s8", "ld", "lda.s8", "r3", 1, imm=1, conv=True, dims=D23, **LD_R),
         F("lda_u8", "ld", "lda.u8", "r3", 1, imm=1, conv=True, dims=D23, **LD_R),
         # 128-bit
-        F("st_q", "st", "st", "q1", 16, imm=16, dims=D23),
-        F("lda_q", "ld", "lda", "q0", 16, imm=16, dims=D23, **LD_Q),
-        F("vst_128", "st", "vst.128", "wl0", 16, imm=32, dims=D23),
+        F("st_q", "st", "st", "q1", 16, imm=16, sp_imm=-64, dims=D23),
+        F("lda_q", "ld", "lda", "q0", 16, imm=16, sp_imm=-64, dims=D23, **LD_Q),
+        F("vst_128", "st", "vst.128", "wl0", 16, imm=32, sp_imm=-64, dims=D23),
         F("vlda_128", "ld", "vlda.128", "wl2", 16, imm=32, idx_imm=False, pstm_imm=False,
           pstm_m=False, idx_dj=False, plain=True, **LD_W),
         F("vldb_128", "ld", "vldb.128", "wl2", 16, imm=32, idx_imm=False, pstm_imm=False,
           dims=D23, **LD_W),
         # 256-bit
-        F("vst_w", "st", "vst", "wl0", 32, imm=32, dims=D23),
-        F("vst_am", "st", "vst", "amll0", 32, imm=32, dims=D23),
-        F("vlda_w", "ld", "vlda", "wl2", 32, imm=32, dims=D23, **LD_W),
+        F("vst_w", "st", "vst", "wl0", 32, imm=32, sp_imm=-64, dims=D23),
+        F("vst_am", "st", "vst", "amll0", 32, imm=32, sp_imm=-64, dims=D23),
+        F("vlda_w", "ld", "vlda", "wl2", 32, imm=32, sp_imm=-64, dims=D23, **LD_W),
         F("vldb_w", "ld", "vldb", "wl2", 32, imm=32, dims=D23, **LD_W),
-        F("vlda_am", "ld", "vlda", "amll0", 32, imm=32, dims=D23, **LD_AM),
+        F("vlda_am", "ld", "vlda", "amll0", 32, imm=32, sp_imm=-64, dims=D23, **LD_AM),
     ]
     # fused loads: vlda.ups.<acc>.<src> (all read 32 bytes), vlda.conv, vldb.unpack
     for acc, src, dst, ld in (("s32", "s16", "bml0", LD_BM), ("s32", "d16", "bml0", LD_BM),
@@ -207,6 +208,7 @@ class Case:
     mod_step: int
     addr: str                  # the address operand text
     dim: str = ""              # "" | "2d" | "3d": which instruction variant
+    sp_imm: int = 0            # nonzero: the access is [sp, #sp_imm]; sp (not p2) is swept
 
     @property
     def stride(self) -> int:
@@ -237,11 +239,14 @@ def build_cases(fams: list[Family] | None = None) -> list[Case]:
         base = STORE_BASE if f.kind == "st" else CENTER
         sec_n = max(4, min(13, n_full // SECONDARY_STEP + 1))
 
-        def add(form, addr, n, step, start, mod0, mods, dim=""):
-            cases.append(Case(f"{f.key}.{form}", f, form, n, step, base + start, mod0, mods, addr, dim))
+        def add(form, addr, n, step, start, mod0, mods, dim="", sp_imm=0):
+            cases.append(Case(f"{f.key}.{form}", f, form, n, step, base + start, mod0, mods, addr,
+                              dim, sp_imm))
 
         if f.plain:
             add("plain", "[p2]", n_full, 1, 0, 0, 0)
+        if f.sp_imm:   # stack-relative: sp is swept so that sp + imm walks the usual window
+            add("spill", f"[sp, #{f.sp_imm}]", n_full, 1, -f.sp_imm, 0, 0, sp_imm=f.sp_imm)
         if f.lut:
             # the gather addresses are swept over 64 bytes at two window positions
             add("lut", "", 64, 1, 0, 0, 0)
@@ -295,7 +300,8 @@ def out_bytes(cases: list[Case]) -> int:
 def kernel_asm(cases: list[Case], tag: str = "k") -> str:
     body: list[str] = []
     # header: the real pointers
-    body += ["  mov r2, p0", "  mov r3, p1", *_nops(3), "  st r2, [p1, #0]", "  st r3, [p1, #4]"]
+    body += ["  mov r2, p0", "  mov r3, p1", "  mov r28, sp", *_nops(3), "  st r2, [p1, #0]",
+             "  st r3, [p1, #4]"]
     # constants and sources: data in x0, marker in x1, scalar data r8, scalar marker r9, zero r10
     body += ["  vlda wl0, [p0, #0]", "  vlda wh0, [p0, #32]",
              "  vlda wl1, [p0, #64]", "  vlda wh1, [p0, #96]",
@@ -327,7 +333,8 @@ def kernel_asm(cases: list[Case], tag: str = "k") -> str:
                  "  mov r4, p1", *_nops(2), "  add r4, r4, r6", *_nops(2), "  mov p4, r4",
                  f"  movxm r0, #{c.n}", *_nops(4)]
         body += [".p2align 4", f"{label}:"]
-        body += ["  mov p2, r5", "  mov m0, r7", "  mov dj0, r7"]
+        ptr = "sp" if c.sp_imm else "p2"
+        body += [f"  mov {ptr}, r5", "  mov m0, r7", "  mov dj0, r7"]
         if c.dim:   # counts and sizes of the dimensions in use are zero: the step is the modifier
             body += ["  mov dn0, r10", "  mov dc0, r10", "  mov dn4, r10", "  mov dc4, r10"]
         body += _nops(NOPS)
@@ -336,7 +343,7 @@ def kernel_asm(cases: list[Case], tag: str = "k") -> str:
         if f.pre:
             body += _nops(NOPS + 2)
         body += [f"  {f.op(c.addr, c.dim)}", *_nops(NOPS + 6)]
-        body += ["  mov r6, p2", *_nops(3), "  sub r6, r6, r5", *_nops(2),
+        body += [f"  mov r6, {ptr}", *_nops(3), "  sub r6, r6, r5", *_nops(2),
                  "  st r6, [p3, #0]", "  padda [p3], #4"]
         for ln in f.dump:           # (dump lines that need latency carry their own nops)
             body += [f"  {ln}"]
@@ -348,6 +355,8 @@ def kernel_asm(cases: list[Case], tag: str = "k") -> str:
         body += [f"  movxm r11, #{total_step}", f"  movxm r12, #{c.mod_step}", *_nops(2),
                  "  add r5, r5, r11", "  add r7, r7, r12"]
         body += ["  add r0, r0, #-1", *_nops(2), f"  jnz r0, #{label}", *_nops(5)]
+        if c.sp_imm:
+            body += ["  mov sp, r28", *_nops(3)]
     return _frame(body)
 
 
@@ -414,7 +423,7 @@ def store_landing(res: CaseResult) -> list[dict]:
         changed = [j for j, b in enumerate(rec) if b != MARKER]
         ptr = res.case.ptr_start + i * res.case.ptr_step
         mod = res.case.mod_start + i * res.case.mod_step
-        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0),
+        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0) + res.case.sp_imm,
                          first=changed[0] if changed else None,
                          last=changed[-1] if changed else None,
                          count=len(changed), data=bytes(rec[j] for j in changed),
@@ -430,7 +439,7 @@ def load_landing(res: CaseResult) -> list[dict]:
         rec = res.record(i)
         ptr = res.case.ptr_start + i * res.case.ptr_step
         mod = res.case.mod_start + i * res.case.mod_step
-        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0),
+        rows.append(dict(i=i, ptr=ptr, mod=mod, addr=ptr + (mod if "dj" in res.case.form else 0) + res.case.sp_imm,
                          rec=rec, first=rec[0], delta=res.deltas[i]))
     return rows
 
@@ -565,7 +574,7 @@ def layout_fingerprint() -> str:
     for c in build_cases():
         f = c.fam
         h.update(repr((c.name, c.form, c.n, c.ptr_step, c.ptr_start, c.mod_start, c.mod_step,
-                       c.addr, c.dim, f.kind, f.op(c.addr, c.dim), f.width, f.pre, f.dump,
+                       c.addr, c.dim, c.sp_imm, f.kind, f.op(c.addr, c.dim), f.width, f.pre, f.dump,
                        f.imm, f.rec, f.conv)).encode())
     return h.hexdigest()[:16]
 
