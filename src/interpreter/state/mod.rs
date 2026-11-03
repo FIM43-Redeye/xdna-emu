@@ -28,6 +28,7 @@
 
 mod registers;
 pub mod write_collision;
+pub mod scalar_collision;
 mod event_trace;
 mod timing_context;
 mod context;

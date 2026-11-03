@@ -46,8 +46,8 @@ pub mod slot_layout;
 pub use encoding::{detect_format, is_nop_encoding, BundleFormat, SlotMask, NOP_ENCODINGS};
 pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, FormatTable, SlotType};
 pub use slot::{
-    AccReadPort, BranchCondition, ElementType, MemWidth, Operand, PortUse, PostModify, Predicate,
-    SelectVariant, ShufflePattern, SlotIndex, SlotOp,
+    AccReadPort, BranchCondition, ScalarDefPort, ScalarFile, ElementType, MemWidth, Operand, PortUse,
+    PostModify, Predicate, SelectVariant, ShufflePattern, SlotIndex, SlotOp,
 };
 
 /// A decoded VLIW instruction bundle.

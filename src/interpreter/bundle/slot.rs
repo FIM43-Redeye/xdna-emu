@@ -340,6 +340,31 @@ pub struct AccReadPort {
     pub secondary: Option<u16>,
 }
 
+/// The scalar register files that have separate write behavior: a write collides only with
+/// writes to the same file (see `state::scalar_collision`). The schedule lists one unit for
+/// both r and s writers; the files are told apart by the destination register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarFile {
+    R,
+    S,
+    P,
+    M,
+    Dn,
+    Dj,
+    Dc,
+}
+
+/// A scalar-file result of an instruction: the units its itinerary holds in the cycle before
+/// the result lands, and when that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarDefPort {
+    pub file: ScalarFile,
+    /// Cycles from issue to the cycle the result lands (the def's operand cycle).
+    pub land: u8,
+    /// Unit indices held in the cycle before it lands.
+    pub units: SmallVec<[u16; 4]>,
+}
+
 /// Register-file port facts of an instruction, from its resolved itinerary (see
 /// `decode::ports`). Everything is a unit index or a property derived from unit indices: the
 /// emulator names no unit.
@@ -354,6 +379,8 @@ pub struct PortUse {
     /// Reads an accumulator and writes through a non-primary write port of its file. Inferred
     /// from silicon: such an instruction steals the accumulator read port of a late reader.
     pub mover: bool,
+    /// The scalar-file results (r, s, p, m, dn, dj, dc) and the units that carry them.
+    pub scalar_defs: SmallVec<[ScalarDefPort; 1]>,
 }
 
 /// Accumulator source use cycle of the MAC family (II_VMAC/II_VACC `operand_cycles[1]`), assumed
