@@ -495,6 +495,50 @@ def observed_granule(res: CaseResult) -> dict:
     return out
 
 
+def layout_fingerprint() -> str:
+    """Hash of everything that fixes how a captured output must be read: the layout constants,
+    the buffer contents, and every case (name, sweep, address text, record size, op text)
+    with its packing. A manifest records it; readers refuse a mismatch."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(repr((MARKER, DATA_OFF, MARK_OFF, WIN_OFF, WIN_BYTES, CENTER, HDR_BYTES, SLOT,
+                   STORE_BASE, OUT_BUDGET, SECONDARY_STEP, NOPS)).encode())
+    h.update(in_bytes())
+    for c in build_cases():
+        f = c.fam
+        h.update(repr((c.name, c.form, c.n, c.ptr_step, c.ptr_start, c.mod_start, c.mod_step,
+                       c.addr, c.dim, f.kind, f.op(c.addr, c.dim), f.width, f.pre, f.dump,
+                       f.imm, f.rec, f.conv)).encode())
+    return h.hexdigest()[:16]
+
+
+def _git_rev() -> str:
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+class ManifestMismatch(RuntimeError):
+    pass
+
+
+def load_manifest(path: Path) -> list[dict]:
+    """Kernel list of a generation's manifest; raises ManifestMismatch unless it was written by
+    a generator with the same `layout_fingerprint` (old captures would be silently misread)."""
+    m = json.loads(Path(path).read_text())
+    if not isinstance(m, dict) or "layout_fingerprint" not in m:
+        raise ManifestMismatch(f"{path}: no layout_fingerprint (written by an older generator); "
+                               "regenerate and recapture, or stamp it after checking by hand")
+    if m["layout_fingerprint"] != layout_fingerprint():
+        raise ManifestMismatch(f"{path}: layout {m['layout_fingerprint']} (generator "
+                               f"{m.get('generator_rev')}), current generator is "
+                               f"{layout_fingerprint()} ({_git_rev()})")
+    return m["kernels"]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -512,7 +556,9 @@ def main(argv=None) -> int:
         t = topology(name, grp, out)
         (out / f"{name}.json").write_text(json.dumps(to_dict(t), indent=2) + "\n")
         manifest.append(dict(name=name, cases=[c.name for c in grp], out_bytes=out_bytes(grp)))
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (out / "manifest.json").write_text(json.dumps(
+        dict(layout_fingerprint=layout_fingerprint(), generator_rev=_git_rev(), kernels=manifest),
+        indent=2) + "\n")
     print(f"{len(groups)} kernel(s), {sum(len(g) for g in groups)} case(s)")
     return 0
 
