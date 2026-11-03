@@ -175,19 +175,29 @@ def _read_variants(suite: S.Suite, tag: str, case: str, test: dict) -> list[byte
     return groups
 
 
-def hollow_reason(payload: bytes, variants: list[bytes], siblings: list[bytes]) -> Optional[str]:
+def hollow_reason(payload: bytes, variants: list[bytes], siblings: list[bytes],
+                  declared: bool = True) -> Optional[str]:
     """Why a test point looked at nothing, or None if it did look.
 
     A test point is hollow when the hardware payload is the pre-run fill (all zero), or when
     it is the same across what should be different inputs: the test point's own declared
     variants, or every test point of its instruction (`siblings`, itself included).  Such a
     test passes while checking nothing: both backends can agree on a constant.
+
+    `declared` is whether the test point names its payload (the pair tests and the delay
+    tests do).  A test point that does not is one operand combination of an instruction with
+    several: one zero result among others is a legitimate outcome (a comparison that came out
+    false, `sub r, r, r`), so for those the all-zero rule applies to the instruction, when none
+    of its test points produced anything.
     """
-    if not any(payload):
-        return "payload is all zero (the pre-run fill)"
+    if declared:
+        if not any(payload):
+            return "payload is all zero (the pre-run fill)"
+    elif siblings and not any(any(s) for s in siblings):
+        return f"payload is all zero for all {len(siblings)} of the instruction's test points"
     if len(variants) > 1 and len(set(variants)) == 1:
         return f"payload identical across its {len(variants)} variants"
-    if len(siblings) > 1 and len(set(siblings)) == 1:
+    if len(siblings) > 1 and len(set(siblings)) == 1 and any(payload):
         return f"payload identical across the instruction's {len(siblings)} test points"
     return None
 
@@ -251,7 +261,8 @@ def analyze(suite: S.Suite, hw_tag: str, emu_tag: str, category_filter: str = No
 
             hw_payload = _read_payload(suite, hw_tag, case, test)
             hollow = (hollow_reason(hw_payload, _read_variants(suite, hw_tag, case, test),
-                                    hw_by_instr[name]) if hw_payload is not None else None)
+                                    hw_by_instr[name], declared="payload" in test)
+                      if hw_payload is not None else None)
             if hollow:
                 hollow_found.append((name, batch_idx, hollow))
                 passed = False

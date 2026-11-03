@@ -350,6 +350,21 @@ class TestHollowGuard:
         res = ANALYZER.analyze(self._suite(tmp_path / "v", [self._pair(self.CONSUMER, variants)], varied), "hw-t", "emu-t")
         assert (res.passed, res.hollow) == (1, 0)
 
+    def test_a_zero_among_other_results_of_an_instruction_is_not_hollow(self, tmp_path):
+        """An undeclared test point is one combination of its instruction: false is an answer."""
+        data = {"batch_000": {("core", "out"): bytes(16) + bytes(range(1, 33))}}
+        a = _single(0)
+        a["tests"] = [{**t, "instruction": "EQ"} for t in a["tests"]]
+        res = ANALYZER.analyze(self._suite(tmp_path, [a], data), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (2, 0)
+
+    def test_an_instruction_whose_every_result_is_zero_is_hollow(self, tmp_path):
+        data = {"batch_000": {("core", "out"): bytes(48)}}
+        a = _single(0)
+        a["tests"] = [{**t, "instruction": "EQZ"} for t in a["tests"]]
+        res = ANALYZER.analyze(self._suite(tmp_path, [a], data), "hw-t", "emu-t")
+        assert (res.passed, res.hollow) == (0, 2)
+
     def test_every_test_point_of_an_instruction_identical_is_hollow(self, tmp_path):
         same = {"batch_000": {("core", "out"): b"\x05" * 48}, "batch_001": {("core", "out"): b"\x05" * 48}}
         a, b = _single(0), _single(1)
@@ -366,7 +381,9 @@ class TestHollowGuard:
         assert (res.passed, res.hollow) == (2, 0)
 
     def test_hollow_reason_unit(self):
-        assert ANALYZER.hollow_reason(b"\0\0", [], [b"\0\0"]).startswith("payload is all zero")
+        assert ANALYZER.hollow_reason(b"\0\0", [], [b"\0\0"]).startswith("payload is all zero (")
+        assert ANALYZER.hollow_reason(b"\0\0", [], [b"\0\0", b"\0\0"], declared=False).startswith("payload is all zero for all 2")
+        assert ANALYZER.hollow_reason(b"\0\0", [], [b"\0\0", b"\1\0"], declared=False) is None
         assert ANALYZER.hollow_reason(b"\1", [b"a", b"a"], []).startswith("payload identical across its 2")
         assert ANALYZER.hollow_reason(b"\1", [], [b"a", b"a", b"a"]).startswith("payload identical across the instruction's 3")
         assert ANALYZER.hollow_reason(b"\1", [b"a", b"b"], [b"a", b"b"]) is None
