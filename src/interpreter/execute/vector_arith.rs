@@ -1726,31 +1726,26 @@ impl VectorAlu {
             return;
         }
 
-        // Integer acc64 mode (silicon: the sign extends through the high word); acc32 mode:
-        // independent 32-bit negation per lane half.
-        let acc64 = Self::int_acc_is_64(conf);
-        // shift16 shifts the source left by 16 before the negation (silicon).
-        let shift = if (conf >> 10) & 1 != 0 { 16 } else { 0 };
-        let neg_pair = |word: u64| -> u64 {
-            if zero_acc {
-                return 0;
-            }
-            if acc64 {
-                return (word as i64).wrapping_shl(shift).wrapping_neg() as u64;
-            }
-            let lane = |x: u32| (x as i32).wrapping_shl(shift).wrapping_neg() as u32 as u64;
-            lane(word as u32) | (lane((word >> 32) as u32) << 32)
-        };
-        if is_wide {
-            let mut result = ctx.accumulator.read_wide(acc_reg);
-            result.iter_mut().for_each(|w| *w = neg_pair(*w));
-            ctx.queue_acc_write(Operand::AccumReg(dst_reg), result, false);
-        } else {
-            let mut result = [0u64; 16];
-            result[..8].copy_from_slice(&ctx.accumulator.read(acc_reg));
-            result[..8].iter_mut().for_each(|w| *w = neg_pair(*w));
-            ctx.queue_acc_write(Operand::AccumReg(dst_reg), result, true);
-        }
+        // Integer vneg is the adder with one operand: it reads its source at operand cycle 3
+        // like the adds, and lands its result at the itinerary's definition cycle. acc64 mode
+        // (silicon: the sign extends through the high word) and acc32 mode (independent 32-bit
+        // negation per lane half) and shift16 (source shifted left by 16 first) are applied by
+        // `acc_add_sub_lane_pair`.
+        let timing = op.acc_source_timing(0);
+        ctx.queue_pending_acc_add(
+            acc_reg,
+            acc_reg,
+            dst_reg,
+            true,
+            false,
+            zero_acc,
+            (conf >> 10) & 1 != 0,
+            is_wide,
+            false,
+            Self::int_acc_is_64(conf),
+            true,
+            [timing, timing],
+        );
     }
 }
 
@@ -2525,6 +2520,34 @@ mod tests {
         ctx.advance_vector_bundle();
         let out = ctx.accumulator.read_wide(6);
         std::array::from_fn(|i| (out[i / 2] >> (32 * (i % 2))) as u32)
+    }
+
+    /// A late-landing accumulator load (`vlda.am` issued a few bundles before) is seen by an
+    /// integer `vneg`: like the adds, it reads its source at operand cycle 3, not at issue. Found
+    /// by the Peano `ACC1024_acc32_neg_conf` instruction test (silicon negated the loaded data,
+    /// the emulator the stale register).
+    #[test]
+    fn int_vneg_reads_its_source_at_the_operand_cycle() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        let mut ctx = make_ctx();
+        ctx.accumulator.write_wide(2, [0xdead_beef; 16]);
+        ctx.scalar.write(0, 0); // acc32 lanes, no shift
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Neg)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(6))
+            .with_source(Operand::AccumReg(2))
+            .with_source(Operand::ScalarReg(0));
+        op.accum_width = Some(AccumWidth::Full);
+        ctx.result_latency = 5;
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        ctx.accumulator.write_wide(2, [0x0000_0005_0000_0007; 16]); // the load lands before cycle 3
+        ctx.bundle_seq += 3;
+        ctx.advance_vector_bundle();
+        ctx.process_pending_acc_adds();
+        ctx.bundle_seq += 8;
+        ctx.advance_vector_bundle();
+        let out = ctx.accumulator.read_wide(6);
+        assert_eq!(out[0], (-5i32 as u32 as u64) << 32 | (-7i32 as u32 as u64));
     }
 
     fn check_int_acc_rows(rows: &[(SemanticOp, u32, bool, [u32; 8])]) {

@@ -1887,7 +1887,9 @@ impl ExecutionContext {
                 (a1 as i64).wrapping_shl(shift)
             };
             let v1 = if pa.negate_acc1 { v1.wrapping_neg() } else { v1 };
-            let v2 = if pa.negate_acc2 {
+            let v2 = if pa.unary {
+                0
+            } else if pa.negate_acc2 {
                 (a2 as i64).wrapping_neg()
             } else {
                 a2 as i64
@@ -1902,7 +1904,9 @@ impl ExecutionContext {
                 (x1 as i32).wrapping_shl(shift)
             };
             let v1 = if pa.negate_acc1 { v1.wrapping_neg() } else { v1 };
-            let v2 = if pa.negate_acc2 {
+            let v2 = if pa.unary {
+                0
+            } else if pa.negate_acc2 {
                 (x2 as i32).wrapping_neg()
             } else {
                 x2 as i32

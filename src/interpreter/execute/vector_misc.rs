@@ -12,6 +12,9 @@ use xdna_archspec::aie2::isa::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 
+/// Control register index of crVaddSign (`register_map::operand_from_reg_name`).
+const CR_VADD_SIGN: u8 = 0;
+
 impl VectorAlu {
     /// Vector shuffle with pattern.
     #[allow(dead_code)]
@@ -537,6 +540,17 @@ impl VectorAlu {
     /// and break the consumer that was scheduled to read the LDA value first.
     pub(super) fn execute_vector_extract(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         const VEXTRACT_TO_GPR_LATENCY: u64 = 2;
+        // The dynamic forms (`vextract.d8` / `.d16`) take their signedness from crVaddSign bit 0,
+        // read when the instruction issues; the decoder labels every `.dN` unsigned.
+        let is_dynamic = op
+            .encoding_name
+            .as_deref()
+            .is_some_and(|n| n.contains(".d8") || n.contains(".d16"));
+        let et = match (is_dynamic, ctx.control_reg_raw(CR_VADD_SIGN) & 1 != 0, et) {
+            (true, true, ElementType::UInt8) => ElementType::Int8,
+            (true, true, ElementType::UInt16) => ElementType::Int16,
+            _ => et,
+        };
         if op.is_wide_vector {
             // VEXTRACT operates on a full 512-bit source.
             // Cannot use fallback (execute_half twice) because the second
@@ -1038,6 +1052,39 @@ mod tests {
     }
 
     /// Element 8 of i32 lives in word index 8 (the high 256-bit half).
+    /// `vextract.d8` / `vextract.d16` take their signedness from crVaddSign bit 0 (silicon,
+    /// Peano `vextract_elem{8,16}_I512` probes: sign 0 and 2 zero-extend, 1 and 3 sign-extend).
+    #[test]
+    fn vextract_dynamic_sign_follows_crvaddsign() {
+        let run = |name: &str, et: ElementType, sign: u32| -> u32 {
+            let mut ctx = make_ctx();
+            ctx.vector.write_wide(0, [0x8584_8382; 16]);
+            ctx.scalar.write(5, 1); // element 1: 0x83 / 0x8584
+            ctx.set_control_reg_raw(0, sign);
+            let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::VectorExtract)
+                .as_vector(et)
+                .with_dest(Operand::ScalarReg(1))
+                .with_source(Operand::VectorReg(0))
+                .with_source(Operand::ScalarReg(5));
+            op.is_wide_vector = true;
+            op.encoding_name = Some(name.to_string());
+            assert!(VectorAlu::execute(&op, &mut ctx));
+            ctx.flush_pending_writes();
+            ctx.scalar.read(1)
+        };
+        for sign in [0, 2] {
+            assert_eq!(run("vextract.d8", ElementType::UInt8, sign), 0x83);
+            assert_eq!(run("vextract.d16", ElementType::UInt16, sign), 0x8584);
+        }
+        for sign in [1, 3] {
+            assert_eq!(run("vextract.d8", ElementType::UInt8, sign), 0xffff_ff83);
+            assert_eq!(run("vextract.d16", ElementType::UInt16, sign), 0xffff_8584);
+        }
+        // the explicit-sign forms ignore the register
+        assert_eq!(run("vextract.s8", ElementType::Int8, 0), 0xffff_ff83);
+        assert_eq!(run("vextract.u8", ElementType::UInt8, 1), 0x83);
+    }
+
     #[test]
     fn test_extract_wide_element_high_half() {
         let mut src = [0u32; 16];
