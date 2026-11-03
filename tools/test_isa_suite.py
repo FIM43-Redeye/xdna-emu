@@ -67,6 +67,19 @@ def _sources(*batches):
 
 
 class TestBuildCase:
+    def test_assembly_batch_without_input_still_gets_an_input_buffer(self):
+        # Kernels address p0 = in, p1 = out. A core with only an out buffer receives the out
+        # buffer in p0 and leaves p1 as whatever the tile held from its previous kernel:
+        # silicon then happened to store into the right place (stale p1 from an earlier
+        # batch) while the emulator, which starts clean, stored nowhere and returned zeros.
+        b = _single(in_size=0)
+        case = isa_suite.build_case(b, _sources(b), SEED)
+        (core,) = case.topology.cores
+        inp, out = core.args
+        assert (inp.name, inp.direction, inp.size_bytes) == ("in", "in", 4)
+        assert (out.name, out.direction) == ("out", "out")
+        assert inp.data == prng_bytes(4, SEED)
+
     def test_assembly_batch_is_one_core_at_row_2(self):
         b = _single()
         case = isa_suite.build_case(b, _sources(b), SEED)

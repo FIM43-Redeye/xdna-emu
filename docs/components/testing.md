@@ -100,6 +100,8 @@ python3 -m harness suite hw      <suite> r1           # serial; the first timeou
 python3 -m harness suite emu     <suite> e1 -j 8      # FFI .so rebuilt once, then parallel
 python3 -m harness suite compare <suite> r1 e1        # byte-exact per buffer, exit 1 on mismatch
 # results: <suite>/runs/<tag>/<case>/<core>.<buffer>.bin + run.json; tags are never overwritten
+# ISA-style kernels address p0 = in, p1 = out: isa_suite always gives a single-core kernel an input
+# (>= 4 bytes). An out-only core gets out in p0 and p1 is stale tile state on silicon (EMU: poison).
 
 # Standalone Rust binaries
 cargo run --release --bin trace-compare -- ...   # HW vs EMU events JSON diff

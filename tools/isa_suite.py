@@ -60,8 +60,18 @@ def _suffix(filename: str) -> str:
     return Path(filename).suffix
 
 
-def _buffers(in_size: int, out_size: int, seed: int) -> tuple[Buffer, ...]:
+# Single-core kernels address p0 = input, p1 = output. A core given only an out buffer gets it
+# in p0 and p1 keeps whatever the tile held from its previous kernel (silicon retains registers
+# across runs; the emulator starts clean), so such a kernel stores into the right place on
+# silicon only by accident. Hence every single-core kernel gets an input, at least this big.
+MIN_KERNEL_INPUT_BYTES = 4
+
+
+def _buffers(in_size: int, out_size: int, seed: int, min_in: int = 0) -> tuple[Buffer, ...]:
+    """`min_in` > 0 pads the input up to that size; 0 keeps a zero input absent (pair cores
+    are written for the out-only convention, out in p0)."""
     bufs = []
+    in_size = max(in_size, min_in)
     if in_size:
         bufs.append(Buffer("in", "in", in_size, data=prng_bytes(in_size, seed)))
     bufs.append(Buffer("out", "out", out_size))
@@ -80,7 +90,8 @@ def build_case(batch: dict[str, Any], sources: dict[str, str], seed: int) -> Isa
     if kind in ("assembly", "llvm_ir"):
         src = f"kernel{_suffix(batch['filename'])}"
         core = Core("core", TileRef(0, CONSUMER_ROW), Path(src),
-                    args=_buffers(batch["in_size"], batch["out_size"], seed))
+                    args=_buffers(batch["in_size"], batch["out_size"], seed,
+                                    min_in=MIN_KERNEL_INPUT_BYTES))
         topo = Topology(name, (core,))
         files = {src: _source(sources, batch["filename"], batch)}
         tests = [{**t, "slices": [_slice("core", t["out_offset"], t["out_size"])]}
