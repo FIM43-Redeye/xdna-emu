@@ -177,12 +177,28 @@ impl InstructionDecoder {
 
         let def_cycle = (ffi_result.res_num_defs >= 1 && ffi_result.res_num_operand_cycles >= 1)
             .then(|| ffi_result.res_operand_cycle[0]);
+        // Every register def with its resolved result cycle, in MI order (the extracted
+        // `dest` and `extra_defs` drop non-writable defs, so they cannot be aligned with the
+        // cycles).
+        let defs: Vec<(Operand, i16)> = ffi_result
+            .defs()
+            .iter()
+            .take(ffi_result.res_num_operand_cycles as usize)
+            .enumerate()
+            .filter_map(|(i, d)| match d {
+                DecodedOperand::Reg { name, .. } => {
+                    Some((operand_from_reg_name(name)?.operand, ffi_result.res_operand_cycle[i]))
+                }
+                DecodedOperand::Imm(_) => None,
+            })
+            .collect();
         let ports = self.port_model.port_use(
             &ffi_result.res_stages,
             def_cycle,
             dest.as_ref(),
             &sources,
             &source_forward,
+            &defs,
         );
 
         // Build a minimal DecodedInstr with empty raw operands (we don't need

@@ -42,6 +42,8 @@ mod operand_extraction;
 pub mod ports;
 #[cfg(test)]
 mod ports_goldens;
+#[cfg(test)]
+mod scalar_ports_goldens;
 mod slot_builder;
 pub(crate) mod composite;
 pub mod crossref;

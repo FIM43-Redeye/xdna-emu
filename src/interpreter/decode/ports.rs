@@ -27,7 +27,11 @@ use xdna_archspec::aie2::isa::reservation::{held_units, reservations};
 use xdna_archspec::aie2::isa::TblgenOutput;
 
 use super::register_map::classify_reg_name;
-use crate::interpreter::bundle::{AccReadPort, Operand, PortUse};
+use crate::interpreter::bundle::{AccReadPort, Operand, PortUse, ScalarDefPort, ScalarFile};
+use crate::interpreter::state::{
+    MOD_BASE_D3D, MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, NUM_SCALAR_GPRS, NUM_SHIFT_REGS, SHIFT_REG_BASE,
+    SP_PTR_INDEX,
+};
 
 /// The register files an instruction can write through a collision-modelled port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,25 @@ impl RegFile {
     }
     fn bit(self) -> u8 {
         1 << self as u8
+    }
+}
+
+impl ScalarFile {
+    /// The scalar register file of a destination operand; `None` for registers outside the
+    /// seven files (link/loop registers, status registers, the stack pointer, descriptors).
+    pub fn of_operand(op: &Operand) -> Option<Self> {
+        match *op {
+            Operand::ScalarReg(r) if (r as usize) < NUM_SCALAR_GPRS => Some(Self::R),
+            Operand::ScalarReg(r) if (SHIFT_REG_BASE..SHIFT_REG_BASE + NUM_SHIFT_REGS).contains(&r) => {
+                Some(Self::S)
+            }
+            Operand::PointerReg(p) if p != SP_PTR_INDEX => Some(Self::P),
+            Operand::ModifierReg(r) if r < MOD_BASE_DN => Some(Self::M),
+            Operand::ModifierReg(r) if r < MOD_BASE_DJ => Some(Self::Dn),
+            Operand::ModifierReg(r) if r < MOD_BASE_DC => Some(Self::Dj),
+            Operand::ModifierReg(r) if r < MOD_BASE_D3D => Some(Self::Dc),
+            _ => None,
+        }
     }
 }
 
@@ -133,6 +156,27 @@ impl PortModel {
         self.last.contains(&Some(unit))
     }
 
+    /// The scalar-file results of an instruction: for each def operand `(operand, result cycle)`
+    /// in a scalar register file, the units held in the cycle before the result lands. Which of
+    /// them is the write port is not decided here: two results collide when they share a unit
+    /// and a file (`state::scalar_collision`), so the read port a mover also holds is harmless.
+    fn scalar_defs(held: &[(u16, u32, bool)], defs: &[(Operand, i16)]) -> SmallVec<[ScalarDefPort; 1]> {
+        defs.iter()
+            .filter_map(|(operand, cycle)| {
+                let file = ScalarFile::of_operand(operand)?;
+                let land = u8::try_from(*cycle).ok().filter(|c| *c >= 1)?;
+                let mut units: SmallVec<[u16; 4]> = held
+                    .iter()
+                    .filter(|(_, offset, reserved)| *offset + 1 == land as u32 && !reserved)
+                    .map(|(u, _, _)| *u)
+                    .collect();
+                units.sort_unstable();
+                units.dedup();
+                (!units.is_empty()).then_some(ScalarDefPort { file, land, units })
+            })
+            .collect()
+    }
+
     /// Port facts of one decoded instruction.
     ///
     /// `def_cycle` is the resolved itinerary cycle of the first result, `source_forward` the
@@ -144,9 +188,11 @@ impl PortModel {
         dest: Option<&Operand>,
         sources: &[Operand],
         source_forward: &[(u8, xdna_archspec::aie2::Bypass)],
+        defs: &[(Operand, i16)],
     ) -> PortUse {
         let held = held_units(stages);
         let mut out = PortUse::default();
+        out.scalar_defs = Self::scalar_defs(&held, defs);
 
         // Accumulator read: units held (not merely reserved) in the cycle of the first
         // accumulator source's use.

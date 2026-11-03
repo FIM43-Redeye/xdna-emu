@@ -58,6 +58,8 @@ pub use registers::{
     SPARSE_OF_REG_INDEX,
     COMPR_UF_REG_INDEX,
     SS_STATUS_REG_INDEX,
+    SHIFT_REG_BASE,
+    NUM_SHIFT_REGS,
     MS_STATUS_REG_INDEX,
     SP_PTR_INDEX,
     // q-register views in the ControlReg index space.

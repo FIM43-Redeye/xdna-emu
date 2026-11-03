@@ -54,7 +54,10 @@ pub const SPARSE_OF_REG_INDEX: u8 = 38;
 /// Sparse-load underflow status (`srCompr_uf`): set by a pop or peek that runs the ring low,
 /// cleared by writing it.
 pub const COMPR_UF_REG_INDEX: u8 = 39;
-// 40-43 are the SRS shift registers s0-s3.
+/// First of the four SRS shift registers s0-s3 in the scalar index space (40..=43).
+pub const SHIFT_REG_BASE: u8 = 40;
+/// Number of shift registers.
+pub const NUM_SHIFT_REGS: u8 = 4;
 /// Stream-switch read status (`srSS0`): bit 1 = the last `mov SS` read took a word, bit 0 = that
 /// word carried TLAST. A non-blocking read of an empty stream leaves bit 1 clear and bit 0 at the
 /// last word's TLAST.
