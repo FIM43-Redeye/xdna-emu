@@ -146,3 +146,21 @@ def test_run_record_roundtrip(tmp_path):
 def test_run_record_ok_when_all_phases_return_zero():
     rec = RunRecord("r", "hw", "t", "g", None, (PhaseResult(0, 0, 0.1, "l"),), (), ())
     assert rec.ok
+
+
+def test_run_record_timed_out_is_a_timeout_phase_not_any_failure():
+    ok = PhaseResult(0, 0, 0.1, "l")
+    assert not RunRecord("r", "hw", "t", "g", None, (ok,), (), ()).timed_out
+    assert not RunRecord("r", "hw", "t", "g", None, (PhaseResult(0, 3, 0.1, "l"),), (), ()).timed_out
+    assert RunRecord("r", "hw", "t", "g", None, (PhaseResult(0, -1, 60.0, "l"),), (), ()).timed_out
+
+
+def test_run_record_package_hash_roundtrips_and_old_records_still_read(tmp_path):
+    rec = RunRecord("r", "hw", "t", "g", None, (PhaseResult(0, 0, 0.1, "l"),), ("a.b.bin",), (),
+                    package_hash="abc")
+    write_run_record(tmp_path, rec)
+    assert read_run_record(tmp_path).package_hash == "abc"
+    d = json.loads((tmp_path / "run.json").read_text())
+    del d["package_hash"]
+    (tmp_path / "run.json").write_text(json.dumps(d))
+    assert read_run_record(tmp_path).package_hash == ""

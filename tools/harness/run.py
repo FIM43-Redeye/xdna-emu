@@ -47,6 +47,7 @@ REPO = Path(__file__).resolve().parents[2]
 XRT = "/opt/xilinx/xrt"
 KERNEL_NAME = "MLIR_AIE"
 MIN_BO_BYTES = 4
+TIMEOUT_RC = -1                  # PhaseResult.returncode of a phase that hit its timeout
 
 
 class RunError(RuntimeError):
@@ -136,10 +137,15 @@ class RunRecord:
     phases: tuple[PhaseResult, ...]
     outputs: tuple[str, ...]
     inputs: tuple[dict, ...]
+    package_hash: str = ""           # the build's `inputs_hash`: which package produced this
 
     @property
     def ok(self) -> bool:
         return bool(self.phases) and all(p.returncode == 0 for p in self.phases)
+
+    @property
+    def timed_out(self) -> bool:
+        return any(p.returncode == TIMEOUT_RC for p in self.phases)
 
 
 def write_run_record(out_dir: Path, rec: RunRecord) -> None:
@@ -226,15 +232,21 @@ def _env(backend: str, runtime: str) -> dict[str, str]:
 
 
 def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | None = None,
-                timeout: float | None = None, rebuild_ffi: bool = True) -> RunRecord:
-    """Run every phase of the package at `pkg_dir`; outputs land in `<pkg_dir>/<tag>/`."""
+                timeout: float | None = None, rebuild_ffi: bool = True,
+                out_dir: str | Path | None = None, host: str | Path | None = None) -> RunRecord:
+    """Run every phase of the package at `pkg_dir`.
+
+    Outputs land in `out_dir`, default `<pkg_dir>/<tag>/`. `host` is a prebuilt
+    test_host (a suite builds one for all its packages); default builds one inside
+    `pkg_dir`.
+    """
     if backend not in ("hw", "emu"):
         raise RunError(f"backend must be 'hw' or 'emu', not {backend!r}")
     pkg_dir = Path(pkg_dir).resolve()
     manifest_path = pkg_dir / "manifest.json"
     if not manifest_path.is_file():
         raise RunError(f"{pkg_dir} is not a built package (no manifest.json)")
-    out_dir = pkg_dir / tag
+    out_dir = Path(out_dir) if out_dir is not None else pkg_dir / tag
     if (out_dir / "run.json").exists():
         raise RunError(f"{out_dir} already holds a run; recorded evidence is never overwritten, "
                        f"pick another tag")
@@ -246,7 +258,7 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
 
     so_mtime = build_ffi(runtime) if backend == "emu" and rebuild_ffi else (
         ffi_so_path(runtime).stat().st_mtime if backend == "emu" else None)
-    host = build_test_host(pkg_dir)
+    host = Path(host) if host is not None else build_test_host(pkg_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     env = _env(backend, runtime)
 
@@ -268,7 +280,7 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
             r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
             rc, text = r.returncode, r.stdout + r.stderr
         except subprocess.TimeoutExpired as e:
-            rc, text = -1, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
+            rc, text = TIMEOUT_RC, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
         wall = time.monotonic() - t0
         log.write_text(text)
         results.append(PhaseResult(i, rc, round(wall, 3), log.name))
@@ -280,6 +292,7 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
             outputs.append(name)
 
     rec = RunRecord(tag, backend, topology.name, git_rev(), so_mtime, tuple(results),
-                    tuple(outputs), tuple(input_sources(topology)))
+                    tuple(outputs), tuple(input_sources(topology)),
+                    manifest.get("inputs_hash", ""))
     write_run_record(out_dir, rec)
     return rec
