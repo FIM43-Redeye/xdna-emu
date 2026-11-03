@@ -92,6 +92,19 @@ fn load_latency_for_address(_addr: u32) -> u64 {
 /// Memory unit for load/store operations.
 pub struct MemoryUnit;
 
+/// Address one lane of a `vldb.4x*` gather reads, from the lane's 32-bit value `v`.
+///
+/// `align_mask` is the element granule in bytes minus one's complement (`!3` for 4x16, `!7`
+/// for 4x32, `!15` for 4x64). Silicon (Phoenix, `build/experiments/ldst-align`, gen5 / gen6lut
+/// / gen6mix, fitting 64 addresses x 2 window positions x 3 sizes x lo/hi x per-lane
+/// addresses): the bits above bit 4 pass through, the low five bits are reduced to the
+/// granule and halved, and an odd lane sets bit 4 (the other 16-byte bank). The old model
+/// (`v & mask`, no halving) only agrees for 32-byte-aligned lane values. Bits of `v` above 9
+/// and cross-tile values were not swept.
+pub(crate) fn lut_lane_address(v: u32, lane: usize, align_mask: u32) -> u32 {
+    (v & !31) | (((v & 31) & align_mask) >> 1) | if lane % 2 == 1 { 0x10 } else { 0 }
+}
+
 impl MemoryUnit {
     /// Execute a memory operation.
     ///
@@ -585,11 +598,11 @@ impl MemoryUnit {
     ///
     /// Semantics (hardware-observed):
     ///   1. Extract 4 addresses from the source register's lo/hi half
-    ///   2. Mask each for alignment: 4x16=0xFFFFFFFC, 4x32=0xFFFFFFF8,
-    ///      4x64=0xFFFFFFF0
-    ///   3. OR 0x10 onto odd-indexed addresses (indices 1 and 3) for
-    ///      memory bank interleaving
-    ///   4. Read 64 bits from each of the 4 effective addresses
+    ///   2. Reduce each to its lane address ([`lut_lane_address`]): the element
+    ///      granule mask (4x16 -> 4, 4x32 -> 8, 4x64 -> 16 bytes), the low five bits
+    ///      halved, bit 4 set on odd lanes (bank interleave)
+    ///   4. Read 64 bits from each of the 4 effective addresses; bytes past the
+    ///      16-byte row of the address read as zero
     ///   5. Pack results into the 256-bit destination register
     ///
     /// The bank interleave (`|0x10`) ensures parallel access to different
@@ -639,15 +652,10 @@ impl MemoryUnit {
             [src_data[0], src_data[1], src_data[2], src_data[3]]
         };
 
-        // Apply alignment mask, then bank-interleave odd indices.
-        let eff_addrs = [
-            raw_addrs[0] & align_mask,
-            (raw_addrs[1] & align_mask) | 0x10,
-            raw_addrs[2] & align_mask,
-            (raw_addrs[3] & align_mask) | 0x10,
-        ];
+        let eff_addrs: [u32; 4] =
+            std::array::from_fn(|lane| lut_lane_address(raw_addrs[lane], lane, align_mask));
 
-        // Read 64 bits from each effective address.
+        // Read 64 bits from each effective address; bytes past the 16-byte row read as zero.
         let latency = LATENCY_MEMORY as u64;
         let mut result = [0u32; 8];
         for i in 0..4 {
@@ -669,10 +677,13 @@ impl MemoryUnit {
             };
 
             if offset + 7 < mem.len() {
-                result[i * 2] =
-                    u32::from_le_bytes([mem[offset], mem[offset + 1], mem[offset + 2], mem[offset + 3]]);
-                result[i * 2 + 1] =
-                    u32::from_le_bytes([mem[offset + 4], mem[offset + 5], mem[offset + 6], mem[offset + 7]]);
+                let row_left = 16 - (offset & 15);
+                let mut lane_bytes = [0u8; 8];
+                for (k, b) in lane_bytes.iter_mut().enumerate().take(row_left.min(8)) {
+                    *b = mem[offset + k];
+                }
+                result[i * 2] = u32::from_le_bytes(lane_bytes[0..4].try_into().unwrap());
+                result[i * 2 + 1] = u32::from_le_bytes(lane_bytes[4..8].try_into().unwrap());
             }
         }
 
@@ -3659,5 +3670,60 @@ mod tests {
         ctx.flush_pending_writes();
         // 0x101 + 3 = 0x104: the second word. Masking the base first would give 0x100 + 3 = 0x103 -> 0x100.
         assert_eq!(ctx.scalar.read(0), 0xBBBB_BBBB);
+    }
+
+    // ---- vldb.4x* gathers (silicon: build/experiments/ldst-align gen5 / gen6lut / gen6mix) ----
+
+    #[test]
+    fn a_gather_lane_halves_the_low_five_address_bits_per_element_granule() {
+        // gen6lut lut_4x16_lo: 32-byte aligned base, swept 0..63 -> even-lane landing offsets
+        // 0,0,0,0,2,2,2,2,..14,14,14,14, then 32 at +32
+        for k in 0..32u32 {
+            assert_eq!(lut_lane_address(0x4200 + k, 0, !3), 0x4200 + (k & !3) / 2, "4x16 +{k}");
+        }
+        assert_eq!(lut_lane_address(0x4220, 0, !3), 0x4220);
+        // lut_4x32_lo: groups of 8 -> 0, 4, 8, 12; lut_4x64_lo: groups of 16 -> 0, 8
+        assert_eq!(lut_lane_address(0x4200 + 9, 0, !7), 0x4200 + 4);
+        assert_eq!(lut_lane_address(0x4200 + 25, 0, !7), 0x4200 + 12);
+        assert_eq!(lut_lane_address(0x4200 + 17, 0, !15), 0x4200 + 8);
+        assert_eq!(lut_lane_address(0x4200 + 15, 0, !15), 0x4200);
+    }
+
+    #[test]
+    fn an_odd_gather_lane_reads_the_other_sixteen_byte_bank() {
+        // lane1 / lane3 landing = lane0 landing + 16 in every sweep
+        assert_eq!(lut_lane_address(0x4200, 1, !15), 0x4210);
+        assert_eq!(lut_lane_address(0x4200 + 4, 3, !3), 0x4210 + 2);
+        assert_eq!(lut_lane_address(0x4200 + 4, 2, !3), 0x4200 + 2);
+    }
+
+    #[test]
+    fn a_gather_read_stops_at_the_sixteen_byte_row() {
+        // gen6mix lutmix_4x16_lo i=14 lane 2: bytes ca cb cc cd ce cf then zeros (row ends at 0xd0)
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        for i in 0..0x100usize {
+            tile.data_memory_mut()[0x4000 + i] = i as u8;
+        }
+        // lane value giving eff = 0x40ca: (v & !31) | (((v & 31) & !3) >> 1) with v = 0x40c0 + 20
+        let v = 0x40c0 + 20;
+        assert_eq!(lut_lane_address(v, 0, !3), 0x40ca);
+        let mut src = [0u32; 8];
+        src[0] = v;
+        ctx.vector.write(4, src);
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(4));
+        op.encoding_name = Some("vldb.4x16.lo".to_string());
+        // the decoder resolves a local data address from the 20-bit value: 0x70000 | offset
+        let mut local = ctx.vector.read(4);
+        local[0] |= 0x70000;
+        ctx.vector.write(4, local);
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None));
+        ctx.flush_pending_writes();
+        let got = ctx.vector.read(2);
+        let lane0: Vec<u8> = got[0..2].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(lane0, vec![0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0, 0]);
     }
 }
