@@ -5,7 +5,7 @@ The single-tile collision probe (gen_collision_probe.py) derives every (A, B, ga
 TableGen reservations put two instructions on one resource in one cycle, runs each pair
 bundle-exact with controls and solo references, and records both destinations. This tool
 runs the same machinery with the cascade reads (`vmov x/bml/bmh, SCD`) in the catalogue
-(COLLISION_CASCADE=1) and keeps the pairs that contain one:
+(gen_collision_probe.enable_cascade()) and keeps the pairs that contain one:
 
   * consumer core (0,2): the generated kernel, unchanged, plus a cascade prologue that enables
     SCD and waits for the producer to fill the cascade;
@@ -24,14 +24,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import struct
 import sys
 from pathlib import Path
 
-os.environ["COLLISION_CASCADE"] = "1"
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
@@ -86,6 +84,7 @@ def topology_for(d: Path, kernel: dict) -> Topology:
 
 def cmd_generate(a) -> int:
     d = Path(a.dir).resolve()
+    cp.enable_cascade()
     cp.ANY_KEYS.update(CASCADE_KEYS)
     m = cp.generate(str(d), a.limit)
     for k in m["kernels"]:

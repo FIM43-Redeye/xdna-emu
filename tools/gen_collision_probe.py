@@ -394,17 +394,28 @@ CATALOGUE_2D = [
     Ins("vbcstshfl16_x", "vbcstshfl.16 {DW}, r12, r29", None, (), "x"),
 ]
 # Cascade reads (step 7): the SCD word is the source, so these need a producer core feeding the
-# cascade (tools/gen_cascade_collision_probe.py). Present only with COLLISION_CASCADE=1, so the
-# single-tile probes keep their catalogue.
-CASCADE = os.environ.get("COLLISION_CASCADE") == "1"
+# cascade (tools/gen_cascade_collision_probe.py). They join the generating catalogue only after
+# enable_cascade(), so the single-tile probes keep theirs; BY_KEY always knows them, so the record
+# tools read cascade probe dirs too.
+CASCADE = False
 CATALOGUE_CASCADE = [
     Ins("vmov_x_scd", "vmov {DW}, SCD", None, (), "x"),
     Ins("vmov_bm_scd", "vmov bml{D}, SCD", None, (), "bml"),
     Ins("vmov_bmh_scd", "vmov bmh{D}, SCD", None, (), "bmh"),
 ]
 NEW_KEYS = {i.key for i in CATALOGUE_2B}
-CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D + (CATALOGUE_CASCADE if CASCADE else [])
-BY_KEY = {i.key: i for i in CATALOGUE}
+CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D
+BY_KEY = {i.key: i for i in CATALOGUE + CATALOGUE_CASCADE}
+
+
+def enable_cascade() -> None:
+    """Generate two-core cascade probes: the cascade reads join the catalogue and every kernel
+    gets the cascade prologue. Idempotent. A switch made at import time (it was an environment
+    variable) depended on which caller imported this module first."""
+    global CASCADE, CATALOGUE
+    if not CASCADE:
+        CASCADE = True
+        CATALOGUE = CATALOGUE + CATALOGUE_CASCADE
 W_DEST = {"A": ("x8", "wl8", "wh8"), "B": ("x4", "wl4", "wh4")}     # (x, wl, wh name) per role
 W_FAMILY = ("x", "wl", "wh")        # destinations that live in the W register file
 Q_DEST = {"A": "q0", "B": "q2"}                          # q1 and q3 hold the masks

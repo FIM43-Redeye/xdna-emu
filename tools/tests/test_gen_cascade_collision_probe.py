@@ -28,6 +28,17 @@ def test_cascade_catalogue_present_and_pairs_derive():
         assert k in g.cp.BY_KEY
 
 
+def test_cascade_reads_join_the_catalogue_only_when_enabled(monkeypatch):
+    # Start single-tile and restore the module afterwards, whichever test imported it first.
+    monkeypatch.setattr(g.cp, "CASCADE", False)
+    monkeypatch.setattr(g.cp, "CATALOGUE", [i for i in g.cp.CATALOGUE if i.key not in g.CASCADE_KEYS])
+    single = len(g.cp.CATALOGUE)
+    g.cp.enable_cascade()
+    g.cp.enable_cascade()
+    assert g.cp.CASCADE
+    assert [i.key for i in g.cp.CATALOGUE[single:]] == g.CASCADE_KEYS
+
+
 def test_alignment_guard_refuses_an_unaligned_label(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "label_addresses", lambda pkg: {".Lcascwait": 0x48E})
     with pytest.raises(SystemExit):

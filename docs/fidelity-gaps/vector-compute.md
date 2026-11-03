@@ -193,7 +193,7 @@ sense of this section.
 Derivation. TableGen's `II_VMOV_CASCADE_READ` = `[EmptyCycles<1>, AvoidSemaphore<6>, EmptyCycles<5>,
 PrefixCycle<W_WA_PORT>, SimpleCycle<CM_WM_PORT>]` (latency 7): `collision-check ops` gives
 `W_WA_PORT:6, CM_WM_PORT:6` plus the reserved `SEMAPHORE:1..6`. The register-port side puts it in the same
-design space as every other writer, so `tools/gen_collision_probe.py` (with `COLLISION_CASCADE=1`, three
+design space as every other writer, so `tools/gen_collision_probe.py` (after `enable_cascade()`, three
 catalogue entries `vmov {x,bml,bmh}, SCD`) derives its pairs: 317 pair points against 88 catalogue
 instructions, 634 controls, 375 solo/zero references, config `sep` and `dstshare`.
 
