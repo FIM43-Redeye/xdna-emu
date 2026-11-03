@@ -421,8 +421,8 @@ impl MemoryUnit {
                 }
                 if width == MemWidth::QuadWord {
                     // 128-bit store: write only lower 4 words (16 bytes).
-                    let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
-                    Self::write_vector_to_memory(tile, addr, half, neighbors, view);
+                    let quad = [data[0], data[1], data[2], data[3]];
+                    Self::write_quad_to_memory(tile, addr, quad, neighbors, view);
                 } else {
                     Self::write_vector_to_memory(tile, addr, *data, neighbors, view);
                 }
@@ -1316,8 +1316,8 @@ impl MemoryUnit {
                 );
             }
             if op.mem_width == MemWidth::QuadWord {
-                let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
-                Self::write_vector_to_memory(tile, addr, half, neighbors, view);
+                let quad = [data[0], data[1], data[2], data[3]];
+                Self::write_quad_to_memory(tile, addr, quad, neighbors, view);
             } else {
                 Self::write_vector_to_memory(tile, addr, *data, neighbors, view);
             }
@@ -2037,6 +2037,30 @@ impl MemoryUnit {
         // Local tile write
         let mem = tile.data_memory_mut();
         Self::write_vector_to_slice(mem, offset, value);
+    }
+
+    /// Write a 128-bit value (16 bytes) with cross-tile routing. Only the 16 bytes are
+    /// touched: a 128-bit store must not clear the 16 bytes after it (silicon, `vst_128` /
+    /// `st_q` probes in `build/experiments/ldst-align`: 16 bytes change, no more).
+    pub fn write_quad_to_memory(
+        tile: &mut Tile,
+        addr: u32,
+        value: [u32; 4],
+        neighbors: Option<&mut NeighborMemory>,
+        _view: Option<&NeighborView>,
+    ) {
+        let (quadrant, offset) = decode_data_address(addr);
+        let data: Vec<u8> = value.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if quadrant != MemoryQuadrant::Local {
+            if let Some(nbr) = neighbors {
+                nbr.buffer_write(quadrant, offset, &data);
+                return;
+            }
+        }
+        let mem = tile.data_memory_mut();
+        if offset + 16 <= mem.len() {
+            mem[offset..offset + 16].copy_from_slice(&data);
+        }
     }
 
     /// Write 8 x u32 to a memory slice at the given byte offset.
