@@ -92,9 +92,13 @@ pub fn write_would_stall(tile: &Tile) -> bool {
     tile.stream_output_len(CORE_PORT) >= STREAM_FIFO_DEPTH
 }
 
-/// Words the core's output FIFO holds before a blocking write stalls (a non-blocking write
-/// is refused instead). The depth is a modelling choice, not a measurement.
-const STREAM_FIFO_DEPTH: usize = 4;
+/// Words the core's output buffer holds before a blocking write stalls (a non-blocking write is
+/// refused instead): 1. AM020 ch.2:143 gives the core's AXI4-Stream interface no FIFO, so this is
+/// the hand-off register to the Core slave port, whose own 4-deep FIFO is the buffering. Pinned by
+/// silicon: a core streaming into a held DMA on its own tile writes 26 words before it stalls
+/// (EMU 27 at depth 1, 30 at the former depth 4), `tools/experiments/r4d3_egress_race.py --source
+/// core`. The per-hop growth (EMU 14 words, silicon 8) is the separate stream-switch residual.
+const STREAM_FIFO_DEPTH: usize = 1;
 
 /// Cycles from a `mov r, SS` issue to its destination register (II_MOV_SS, operand 0 in
 /// AIE2Schedule.td).
