@@ -93,6 +93,7 @@ class Family:
     dims: tuple[str, ...] = ()  # "2d" / "3d" forms that exist
     plain: bool = False        # only the bare [p] form exists
     sp_imm: int = 0            # nonzero: the stack-relative spill form [sp, #imm] exists
+    sparse: bool = False       # reset the sparse stream at the swept pointer, then peek it
     lut: bool = False          # 4-way gather: the addresses come from a vector register
     conv: bool = False         # result bytes are a conversion of the source (no raw identity)
 
@@ -178,6 +179,14 @@ def families() -> list[Family]:
             out.append(F(f"lutmix_4x{w}_{half}", "ld", f"vldb.4x{w}.{half}", "wl2, wl4", 8, lut=True,
                          idx_imm=False, pstm_imm=False, pstm_m=False, idx_dj=False, conv=True,
                          pre=("vlda wl2, [p0, #64]", *mix), dump=("vst wl2, [p4, #0]",), rec=32))
+    # sparse stream: reset fetches the line at the swept pointer, a peek through a copy of the
+    # pointer shows which bytes the unit read (qwl0 = {wl0, ql0}); the mask half is not dumped
+    for w in (4, 8, 16):
+        out.append(F(f"sparse_{w}", "ld", f"vldb.sparse.reset.{w}", "", 32, sparse=True, plain=True,
+                     idx_imm=False, pstm_imm=False, pstm_m=False, idx_dj=False, conv=True,
+                     pre=("vlda wl0, [p0, #64]", "vlda wh0, [p0, #96]", "mov p5, p2", *["nop"] * 6),
+                     dump=(*["nop"] * 8, f"vldb.sparse.peek.{w} qwl0, [p5]", *["nop"] * 12,
+                           "vst wl0, [p4, #0]", "vst wh0, [p4, #32]")))
     out.append(F("conv_ld", "ld", "vlda.conv.fp32.bf16", "bml0", 32, imm=32, conv=True,
                  dims=D23, **LD_BM))
     for dst, src, nbytes in (("s16", "s8", 32), ("d16", "d8", 32), ("s8", "s4", 16), ("d8", "d4", 16)):
@@ -234,7 +243,8 @@ def sweep_count(width: int) -> int:
 
 def build_cases(fams: list[Family] | None = None) -> list[Case]:
     cases: list[Case] = []
-    for f in fams if fams is not None else families():
+    # the sparse probes clobber wl0/wh0 (the store-data registers): they run last
+    for f in sorted(fams if fams is not None else families(), key=lambda f: f.sparse):
         n_full = sweep_count(f.width)
         base = STORE_BASE if f.kind == "st" else CENTER
         sec_n = max(4, min(13, n_full // SECONDARY_STEP + 1))
