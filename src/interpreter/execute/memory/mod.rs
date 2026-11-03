@@ -1383,6 +1383,20 @@ impl MemoryUnit {
     /// the same effective address the load actually accesses, instead of
     /// re-deriving an approximation that drops the modifier-register offset.
     pub(crate) fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        Self::align_to_access(op, Self::address_sum(op, ctx))
+    }
+
+    /// The address a load or store actually touches: the effective address (base plus index or
+    /// immediate) rounded down to the access width, `op.mem_width`, which comes from TableGen.
+    /// Silicon drops the low log2(width) bits of every scalar and vector access (see
+    /// `docs/fidelity-gaps/addressing.md`, "Unaligned accesses"); the pointer register keeps
+    /// them, and the mask applies to the sum, not to the base.
+    fn align_to_access(op: &SlotOp, addr: u32) -> u32 {
+        addr & !(u32::from(op.mem_width.bytes()) - 1)
+    }
+
+    /// Base plus index or immediate, before the alignment mask (see [`get_address`]).
+    fn address_sum(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // Search all sources for Memory operand (encapsulates ptr+offset, already scaled).
         // For stores, the data source may precede the address operand.
         for src in &op.sources {
@@ -1466,6 +1480,11 @@ impl MemoryUnit {
     /// `CycleAccurateExecutor::record_memory_access` so the recorded address
     /// matches the address the store actually writes to.
     pub(crate) fn get_store_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        Self::align_to_access(op, Self::store_address_sum(op, ctx))
+    }
+
+    /// Store address before the alignment mask (see [`get_store_address`]).
+    fn store_address_sum(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // First check for Memory operand anywhere (encapsulates ptr+offset)
         for src in &op.sources {
             if let Operand::Memory { base, offset } = src {
@@ -3492,5 +3511,153 @@ mod tests {
             test_value,
             "Cross-tile load must complete at LATENCY_MEMORY cycles, same as local"
         );
+    }
+
+    // ---- address alignment ----
+    //
+    // Silicon evidence: build/experiments/ldst-align (tools/gen_ldst_align_probe.py, HW r1 == r2).
+    // Every access drops the low log2(width) bits of its effective address: a word at +3 reads
+    // the word at +0, a 256-bit store at +63 writes at +32 (the step-5 finding was +48 -> +32).
+    // The mask applies to the sum of base and index; the pointer keeps its low bits through
+    // a post-modify.
+
+    fn load_scalar(width: MemWidth, ctx: &mut ExecutionContext, tile: &mut Tile, addr: u32) -> u32 {
+        ctx.pointer.write(0, addr);
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(width)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        MemoryUnit::execute(&op, ctx, tile, None, None);
+        ctx.flush_pending_writes();
+        ctx.scalar.read(0)
+    }
+
+    #[test]
+    fn a_word_load_at_an_unaligned_address_reads_the_aligned_word() {
+        // silicon lda_w.imm0: addresses 33..35 read the block at 32
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0xDDCC_BBAA);
+        tile.write_data_u32(0x104, 0x4433_2211);
+        for off in 0..4 {
+            assert_eq!(load_scalar(MemWidth::Word, &mut ctx, &mut tile, 0x100 + off), 0xDDCC_BBAA);
+        }
+        assert_eq!(load_scalar(MemWidth::Word, &mut ctx, &mut tile, 0x104), 0x4433_2211);
+    }
+
+    #[test]
+    fn a_halfword_load_drops_one_address_bit_and_a_byte_load_none() {
+        // silicon lda_u16.imm0 (385 reads 384, 387 reads 386) and lda_u8.imm0 (every byte exact)
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0x4433_2211);
+        assert_eq!(load_scalar(MemWidth::HalfWord, &mut ctx, &mut tile, 0x101), 0x2211);
+        assert_eq!(load_scalar(MemWidth::HalfWord, &mut ctx, &mut tile, 0x103), 0x4433);
+        assert_eq!(load_scalar(MemWidth::Byte, &mut ctx, &mut tile, 0x103), 0x44);
+        assert_eq!(load_scalar(MemWidth::Byte, &mut ctx, &mut tile, 0x101), 0x22);
+    }
+
+    #[test]
+    fn a_word_store_at_an_unaligned_address_writes_the_aligned_word() {
+        // silicon st_w.imm0: addresses 33..35 write bytes 32..35 in order
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.scalar.write(1, 0x0403_0201);
+        ctx.pointer.write(0, 0x207);
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_dest(Operand::ScalarReg(1))
+            .with_source(Operand::PointerReg(0));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        assert_eq!(tile.read_data_u32(0x204), Some(0x0403_0201));
+        assert_eq!(tile.read_data_u32(0x208), Some(0));
+    }
+
+    #[test]
+    fn a_256_bit_vector_store_at_plus_63_lands_at_plus_32() {
+        // silicon vst_w.imm0: addresses 32..63 write the block at 32, in order
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        let data = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        ctx.vector.write(4, data);
+        ctx.pointer.write(2, 0xB20 + 31);
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::PointerReg(2));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        assert_eq!(MemoryUnit::read_vector_from_memory(&tile, 0xB20, None, None), data);
+        assert_eq!(tile.read_data_u32(0xB40), Some(0), "nothing lands past the block");
+    }
+
+    #[test]
+    fn a_256_bit_vector_load_at_plus_17_reads_the_block_at_plus_0() {
+        // silicon vlda_w.imm0 / vldb_w.imm0
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        let data = [9u32, 8, 7, 6, 5, 4, 3, 2];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x400, data, None, None);
+        ctx.pointer.write(0, 0x411);
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(0));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.vector.read(0), data);
+    }
+
+    #[test]
+    fn a_128_bit_store_drops_four_address_bits() {
+        // silicon vst_128.imm0 / st_q.imm0: addresses 48..63 write the block at 48
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.vector.write(4, [1, 2, 3, 4, 0xEE, 0xEE, 0xEE, 0xEE]);
+        ctx.pointer.write(2, 0xB30 + 15);
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::QuadWord)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::PointerReg(2));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        assert_eq!(tile.read_data_u32(0xB30), Some(1));
+        assert_eq!(tile.read_data_u32(0xB3C), Some(4));
+        assert_eq!(tile.read_data_u32(0xB40), Some(0));
+    }
+
+    #[test]
+    fn a_post_modify_keeps_the_unaligned_pointer() {
+        // silicon *.pstm_imm / *.pstm_m / *.pstm_2d: pointer after = pointer before + step, unmasked
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0x1234_5678);
+        ctx.pointer.write(0, 0x103);
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Immediate(4))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.scalar.read(0), 0x1234_5678);
+        assert_eq!(ctx.pointer.read(0), 0x107);
+    }
+
+    #[test]
+    fn the_mask_applies_to_the_sum_of_base_and_index() {
+        // silicon *.dj_mix: base 32+5i with index 5; the block is that of base + index
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0xAAAA_AAAA);
+        tile.write_data_u32(0x104, 0xBBBB_BBBB);
+        ctx.pointer.write(0, 0x101);
+        ctx.modifier.write(0, 3);
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0))
+            .with_source(Operand::ModifierReg(0));
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None);
+        ctx.flush_pending_writes();
+        // 0x101 + 3 = 0x104: the second word. Masking the base first would give 0x100 + 3 = 0x103 -> 0x100.
+        assert_eq!(ctx.scalar.read(0), 0xBBBB_BBBB);
     }
 }

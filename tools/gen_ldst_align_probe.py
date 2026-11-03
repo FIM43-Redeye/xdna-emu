@@ -92,6 +92,7 @@ class Family:
     idx_dj: bool = True
     dims: tuple[str, ...] = ()  # "2d" / "3d" forms that exist
     plain: bool = False        # only the bare [p] form exists
+    lut: bool = False          # 4-way gather: the addresses come from a vector register
     conv: bool = False         # result bytes are a conversion of the source (no raw identity)
 
     def op(self, addr: str, dim: str = "") -> str:
@@ -99,6 +100,8 @@ class Family:
         if dim:
             head, _, rest = mn.partition(".")
             mn = f"{head}.{dim}" + (f".{rest}" if rest else "")
+        if not addr:
+            return f"{mn} {self.ops}"
         return f"{mn} {self.ops}, {addr}" if self.ops else f"{mn} {addr}"
 
 
@@ -155,6 +158,13 @@ def families() -> list[Family]:
                               ("s64", "s16", "cm0", LD_CM), ("s64", "d16", "cm0", LD_CM)):
         out.append(F(f"ups_{acc}_{src}", "ld", f"vlda.ups.{acc}.{src}", f"{dst}, s0", 32, imm=32,
                      conv=True, dims=D23, **ld))
+    # 4-way LUT gathers: the source vector (x4) broadcasts the swept address to all four lanes
+    for w in (16, 32, 64):
+        for half in ("lo", "hi"):
+            out.append(F(f"lut_4x{w}_{half}", "ld", f"vldb.4x{w}.{half}", "wl2, wl4", 8, lut=True,
+                         idx_imm=False, pstm_imm=False, pstm_m=False, idx_dj=False, conv=True,
+                         pre=("vlda wl2, [p0, #64]", "vbcst.32 x4, r5"), dump=("vst wl2, [p4, #0]",),
+                         rec=32))
     out.append(F("conv_ld", "ld", "vlda.conv.fp32.bf16", "bml0", 32, imm=32, conv=True,
                  dims=D23, **LD_BM))
     for dst, src, nbytes in (("s16", "s8", 32), ("d16", "d8", 32), ("s8", "s4", 16), ("d8", "d4", 16)):
@@ -220,6 +230,8 @@ def build_cases(fams: list[Family] | None = None) -> list[Case]:
 
         if f.plain:
             add("plain", "[p2]", n_full, 1, 0, 0, 0)
+        if f.lut:
+            add("lut", "", n_full, 1, 0, 0, 0)
         if f.idx_imm:
             add("imm0", "[p2, #0]", n_full, 1, 0, 0, 0)
         if f.pstm_imm:
