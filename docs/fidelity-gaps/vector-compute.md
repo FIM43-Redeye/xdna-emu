@@ -742,7 +742,7 @@ spills) exposed:
 
 | Gap | Model vs hardware | Status |
 |---|---|---|
-| unaligned fused loads | all captured addresses are 32-byte multiples; the emulator reads from any byte address | open; not captured, to avoid an alignment fault on the shared box |
+| unaligned fused loads | silicon rounds the address down to 32 bytes (`vlda.ups`, `vlda.conv`, `vldb.unpack`, 328-case probe); the emulator does the same | resolved: [`addressing.md`](addressing.md), "Unaligned accesses" |
 | `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write |
 | how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed |
 | descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) |

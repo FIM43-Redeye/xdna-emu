@@ -2,7 +2,7 @@
 class: addressing
 subsystem: AIE2 address generation -- the 2D / 3D descriptor post-modify (`[p], d`) of every load and store
 posture: resolved -- one rule, pinned on silicon for every TableGen family; the residuals are unobserved corners, not unvalidated model
-status: resolved (rule, descriptor layout, classification); open: count-write latency, descriptors d4..d7 as 2D operands, unaligned and cross-tile accesses
+status: resolved (rule, descriptor layout, classification, unaligned accesses); open: count-write latency, descriptors d4..d7 as 2D operands, cross-tile accesses, vldb.compr
 ---
 
 # Addressing (2D / 3D descriptor post-modify)
@@ -67,6 +67,59 @@ Findings:
   immediate write is consistent with all 9,456 records. The exact latency is not pinned: it needs
   a read of the count in the bundle right after the access, which the compiler does not emit.
 
+## Unaligned accesses (NPU1 silicon)
+
+Probe: `tools/gen_ldst_align_probe.py` (one hand-written core through the topology harness;
+tests in `tools/tests/test_gen_ldst_align_probe.py`). Every instruction family is swept byte
+by byte across a window; stores go to a marker-filled buffer and the bytes that changed are
+read back, loads read a window whose byte is its index and are dumped through an aligned
+store. 328 cases over 42 kernels, run twice on silicon (identical), 0 driver resets. Data:
+`build/experiments/ldst-align/gen8` (`r1`, `r2`; `e1`/`e2` are the emulator), checked by
+`verify.py` (rule) and `diffhw.py` (emulator against silicon). llvm-aie states no rule (only a
+comment at `AIE2GenFixupInstrInfo.td:592`, "128-bits vectors are 128-bits aligned in memory").
+
+**One rule for every load and store:** the access touches the effective address rounded down to
+its width. The data is not rotated or split; nothing faults.
+
+| Family | Width (bytes) |
+|---|---|
+| `st` / `lda` word | 4 |
+| `st.s16`, `lda.s16`, `lda.u16` | 2 |
+| `st.s8`, `lda.s8`, `lda.u8` | 1 (exact) |
+| `st q`, `lda q`, `vst.128`, `vlda.128`, `vldb.128` | 16 |
+| `vst`, `vlda`, `vldb` (w and accumulator halves), `vlda.ups.*`, `vlda.conv.*`, `vldb.unpack.*`, `vst.srs.*`, `vst.pack.*`, `vst.conv.*` | 32 |
+
+Example: a `vst` at base+48 lands at base+32 (the step-5 finding); a word store at +3 writes the
+word at +0.
+
+- **Pointer update.** `[p], #imm`, `[p], m` and `[p], d` (2D and 3D) leave the pointer at
+  old + step, low bits kept. The mask applies to the access only.
+- **Indexed forms.** `[p, dj]`: the mask applies to the sum of base and index, not to the base.
+  Immediate offsets are multiples of the width, so the two cannot be told apart there.
+- **Stack-relative.** `[sp, #imm]` follows the same rule; `sp` is unchanged.
+- **Emulator.** `MemoryUnit::get_address` / `get_store_address` round down by the decoded
+  `mem_width`, which comes from TableGen; the bank and watch accounting sees the masked address.
+
+Three further things the probe found:
+
+- **`vldb.4x16/32/64.lo/hi` (LUT gathers) have their own rule**, not floor-to-width. For a lane
+  with 32-bit value `v` and granule mask `M` (4, 8, 16 bytes for 16, 32, 64 bit):
+  `eff = (v & ~31) | (((v & 31) & ~M) >> 1) | (odd lane ? 0x10 : 0)`. The read is 8 bytes and
+  bytes past the 16-byte row of `eff` read as zero. It fits 64 addresses x two window positions
+  x three sizes x lo and hi x distinct per-lane addresses exactly. The previous emulator model
+  (`v & M`, no halving, no row cut) was right only for 32-byte-aligned lane values.
+  `lut_lane_address` in `memory/mod.rs`.
+- **`vldb.sparse.*` fetches a 32-byte aligned block**, rotated to start at the pointer rounded
+  down to a word; bytes past the block end wrap to its start (`sparse_fetch_line`). Stream
+  position follows the pointer at word granularity.
+- **A 128-bit store wrote 32 bytes in the emulator**, zeroing the 16 bytes after it. Silicon
+  changes 16. Fixed (`write_quad_to_memory`). `VST_128_ag_spill` also lacks TableGen
+  `Uses = [SP]`, so it decoded as a bare immediate; the sp-relative test now also checks the
+  assembly string.
+
+Not probed: `vldb.compr.*` (unmodelled), `lda.tm` / `st.tm`, cross-tile addresses, stale ring
+bytes after a sparse line (see Open).
+
 ## Emulator design
 
 - **Classification from TableGen.** `AddressingMode::TwoDim` / `ThreeDim` are recognised from the
@@ -122,5 +175,8 @@ Findings:
 | count-write latency | at most two bundles (observed); not pinned lower |
 | `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise |
 | counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured |
-| unaligned and cross-tile accesses | all captured addresses are aligned and local |
+| cross-tile accesses | all captured addresses are local |
+| `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed |
+| `vldb.4x*` lane values with bits above 9 set | the probe swept a 1 KiB window; the lane model passes the high bits through |
+| bytes a sparse peek reads past the first fetched line | they come from stale ring slots; silicon and the emulator differ there (sparse_4 / sparse_8, 16 of 64 records, the last 2 bytes of each) |
 | Chess emits `padds [sp], #imm` (stack adjust in the store slot) around spills in some register-pressure shapes | llvm-aie defines the `ag_pstm_sp_imm` stack adjust only for the A and B load units (`PADDA_sp_imm`, `PADDB_sp_imm`), so its disassembler, and the emulator with it, rejects the bundle (`St DECODE FAIL`). A one-def llvm-aie fix (`PADDS_sp_imm`) is being proposed upstream; built against it, the original `vec_agu_srs_d` d8 form decodes and passes on EMU. Until it lands, that form stays reshaped to avoid the spill. A decode sweep of every Chess listing on hand (`decode-sweep`) found no other undecodable encoding. Not an addressing-rule gap |

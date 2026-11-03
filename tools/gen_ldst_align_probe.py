@@ -519,6 +519,13 @@ def verify_lut(res: CaseResult) -> list[str]:
     return bad
 
 
+def verify_sparse(res: CaseResult) -> list[str]:
+    """The sparse reset advances its pointer by one line (32 bytes) and keeps the low bits; the
+    record content has its own model in the emulator (`sparse_fetch_line`) and is compared
+    against silicon by `diffhw.py`, not here."""
+    return [f"i={i}: pointer delta {d}, want 32" for i, d in enumerate(res.deltas) if d != 32]
+
+
 def _pow2_ceil(n: int) -> int:
     return 1 << (n - 1).bit_length()
 

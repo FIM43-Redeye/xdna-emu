@@ -74,8 +74,9 @@ Probe-design findings (silicon):
   due_read_would_stall, complete_due_read}`; tests in `execute/cascade.rs`. Before this the
   EMU stalled at the vmov and wrote the destination immediately. Not probed: the per-side
   split of the 2-word buffer, and the release latency from word arrival to the held bundle.
-- `vst` clears the low 5 address bits on silicon (a store at +48 landed at +32);
-  the emulator stores at the unaligned address (permissive). Not chased.
+- `vst` clears the low 5 address bits on silicon (a store at +48 landed at +32). Derived for
+  the whole load/store family and fixed in the emulator: see "Unaligned accesses" in
+  [`addressing.md`](addressing.md).
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
 
