@@ -307,4 +307,27 @@ mod execution {
         assert_eq!(run_sat(6), 0x8000_0000_0000_0000, "crSat written before the issue+7 read");
         assert_eq!(run_sat(7), 0x6d45_2000_0000_0000, "written after it: wraps");
     }
+
+    /// A control register written in the same bundle as its reader is read old: Chess
+    /// pipelines a record loop with the next record's `movx crSat` beside this record's
+    /// `vups` (dynsign `chess_ups_*` silicon: the vups converts with the old crSat).
+    #[test]
+    fn a_same_bundle_control_write_is_not_seen() {
+        let mut rig = Rig::new();
+        rig.ctx.vector.write(0, [0xffff; 8]); // lane 0 = 0xffff, lane 1 = 0
+        rig.ctx.scalar.write(40 + 3, 16); // s3
+        let mut b = rig.bundle(&VUPS_S32_D16);
+        b.set_slot(
+            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+                .with_dest(Operand::ControlReg(9))
+                .with_source(Operand::Immediate(1)),
+        );
+        rig.exec.execute(&b, &mut rig.ctx, &mut rig.tile);
+        rig.settle(4);
+        assert_eq!(rig.ctx.accumulator.read(1)[0] as u32, 0xffff_0000, "old crSat 0: wraps");
+        assert_eq!(rig.ctx.srs_config.saturation_mode, 1, "the write lands at the end of the bundle");
+        rig.run(&VUPS_S32_D16);
+        rig.settle(4);
+        assert_eq!(rig.ctx.accumulator.read(1)[0] as u32, 0x7fff_ffff, "next bundle saturates");
+    }
 }

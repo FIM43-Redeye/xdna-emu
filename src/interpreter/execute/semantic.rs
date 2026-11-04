@@ -283,26 +283,10 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
             ctx.modifier.write(*r, value);
             ctx.log_scalar_write(operand, value);
         }
+        // crVaddSign .. crUnpackSign: lands at the end of the bundle (write_control_reg).
+        Operand::ControlReg(id) if *id < 16 => ctx.write_control_reg(*id, value),
         Operand::ControlReg(id) => {
-            // Control register write: update SRS/UPS config.
-            // Hardware register IDs from AIE2GenRegisterInfo.td via archspec.
             match *id {
-                // The widths come from register_widths (TableGen class, silicon where it narrows).
-                ctrl_regs::CR_SAT => {
-                    let kept = value & widths().control_mask(*id);
-                    ctx.srs_config.saturation_mode = kept as u8;
-                    log::trace!("crSat = {} (raw 0x{:X})", kept, value);
-                }
-                ctrl_regs::CR_RND => {
-                    let kept = value & widths().control_mask(*id);
-                    ctx.srs_config.rounding_mode = kept as u8;
-                    log::trace!("crRnd = {} (raw 0x{:X})", kept, value);
-                }
-                ctrl_regs::CR_SRS_SIGN => {
-                    let kept = value & widths().control_mask(*id);
-                    ctx.srs_config.srs_sign = kept != 0;
-                    log::trace!("crSRSSign = {} (raw 0x{:X})", kept, value);
-                }
                 // Mask registers q0-q3: ControlReg(16..19).
                 // Scalar write sets the low 32 bits (clears upper bits).
                 16..=19 => {

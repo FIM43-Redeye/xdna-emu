@@ -536,6 +536,9 @@ pub struct ExecutionContext {
     /// stores the value, a read returns it; instructions that use such a register
     /// resolve its meaning themselves (see `xdna_archspec::aie2::unpack::UnpackSign`).
     control_raw: [u32; 16],
+    /// Control-register writes made inside the current bundle; they land at its end, so a
+    /// reader in the same bundle sees the old value (see `write_control_reg`).
+    pending_control_writes: Vec<(u8, u32)>,
 }
 
 /// Which register to use as stack pointer.
@@ -685,6 +688,7 @@ impl ExecutionContext {
             pending_ups_loads: Vec::new(),
             srs_config: SrsConfig::default(),
             control_raw: [0; 16],
+            pending_control_writes: Vec::new(),
         }
     }
 
@@ -903,6 +907,7 @@ impl ExecutionContext {
     /// VLIW parallel semantics where all operations execute "simultaneously".
     #[inline]
     pub fn begin_bundle(&mut self) {
+        self.land_control_writes();
         self.scalar_snapshot = Some(self.scalar.clone());
         self.pointer_snapshot = Some(self.pointer.clone());
         self.modifier_snapshot = Some(self.modifier.clone());
@@ -923,6 +928,7 @@ impl ExecutionContext {
     #[inline]
     pub fn end_bundle(&mut self) {
         self.scalar_snapshot = None;
+        self.land_control_writes();
         self.pointer_snapshot = None;
         self.modifier_snapshot = None;
         self.vector.end_bundle();
@@ -1565,6 +1571,40 @@ impl ExecutionContext {
             ctrl_regs::CR_SAT => self.srs_config.saturation_mode as u32,
             _ => self.control_reg_raw(id),
         }
+    }
+
+    /// Write control register `id` (0..16) as a `mov`/`movx` does. Inside a bundle the write
+    /// lands at the bundle's end: every reader issued in the same bundle sees the old value
+    /// (the control registers are read at operand cycle 1; Chess pipelines a record loop with
+    /// the next record's `movx crSat` beside this record's `vups`, and silicon converts with
+    /// the old crSat, dynsign `chess_ups_*`). Outside a bundle it lands at once.
+    pub fn write_control_reg(&mut self, id: u8, value: u32) {
+        if self.scalar_snapshot.is_some() {
+            self.pending_control_writes.push((id, value));
+        } else {
+            self.apply_control_write(id, value);
+        }
+    }
+
+    fn land_control_writes(&mut self) {
+        for (id, value) in std::mem::take(&mut self.pending_control_writes) {
+            self.apply_control_write(id, value);
+        }
+    }
+
+    /// crSat, crRnd and crSRSSign feed the SRS configuration, every other one is kept raw;
+    /// each keeps the bits its register holds (register_widths: TableGen, narrowed where
+    /// silicon narrows).
+    fn apply_control_write(&mut self, id: u8, value: u32) {
+        use xdna_archspec::aie2::registers::ctrl_regs;
+        let kept = value & super::register_widths::widths().control_mask(id);
+        match id {
+            ctrl_regs::CR_SAT => self.srs_config.saturation_mode = kept as u8,
+            ctrl_regs::CR_RND => self.srs_config.rounding_mode = kept as u8,
+            ctrl_regs::CR_SRS_SIGN => self.srs_config.srs_sign = kept != 0,
+            _ => self.set_control_reg_raw(id, value),
+        }
+        log::trace!("control register {id} = 0x{kept:X} (raw 0x{value:X})");
     }
 
     /// Raw value of an unmodelled control register (0 until written).
