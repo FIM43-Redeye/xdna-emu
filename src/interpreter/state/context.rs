@@ -980,11 +980,10 @@ impl ExecutionContext {
     /// start of that cycle).
     ///
     /// Used for:
-    /// - Memory loads (latency 7): `queue_scalar_load()` / `queue_vector_load()`
+    /// - Scalar-file loads (latency 7): `queue_scalar_load()`
     /// - Pointer register writes (latency 1): `queue_pointer_write()`
     ///
-    /// At branch boundaries, `delay_pending_writes(1)` adds an extra cycle
-    /// to model the loss of forwarding when the pipeline is flushed.
+    /// A taken branch delays none of them (silicon: `tools/gen_vec_load_timing_probe.py branch`).
     pub fn queue_scalar_load(&mut self, dest: Operand, value: u32, latency: u64) {
         let scalar_log_id = self.log_scalar_write(&dest, value);
         self.pending_writes.push(PendingWrite {
@@ -1300,14 +1299,9 @@ impl ExecutionContext {
     ///
     /// Pointer register writes from MOV/MOVXM/PADDA/PADDB have latency 1
     /// in the scheduling model (II_MOV_P, II_PADDA). The write becomes
-    /// visible in the next sequential bundle.
-    ///
-    /// At branch boundaries (delay slot -> branch target), forwarding is
-    /// unavailable. `delay_pending_writes(1)` is called to push the write
-    /// one cycle later, so the branch target's first instruction reads
-    /// the pre-write value. This matches observed hardware behavior where
-    /// Peano generates "prologue stores" that rely on pointer registers
-    /// not being ready at function entry.
+    /// visible in the next issued bundle, across a taken branch too: silicon
+    /// (`tools/gen_vec_load_timing_probe.py branch`, `j`/`jnz`/`jl`/`ret`) shows a
+    /// move in the last delay slot read by the target's first bundle.
     pub fn queue_pointer_write(&mut self, reg: u8, value: u32, latency: u64) {
         if reg == super::registers::SP_PTR_INDEX {
             // Dedicated SP -- write immediately, no pipeline delay
@@ -1326,19 +1320,6 @@ impl ExecutionContext {
             phantom: None,
             scalar_log_id,
         });
-    }
-
-    /// Delay all pending writes by the specified number of cycles.
-    ///
-    /// Called when a branch is taken (delay slots exhausted, PC redirected)
-    /// to model the loss of forwarding at pipeline flush boundaries.
-    /// On real hardware, the pipeline flush means that results from the
-    /// last delay slot instruction(s) are not forwarded to the branch
-    /// target's first instruction, adding effective latency.
-    pub fn delay_pending_writes(&mut self, extra_cycles: u64) {
-        for pw in &mut self.pending_writes {
-            pw.ready_cycle += extra_cycles;
-        }
     }
 
     /// Flush all pending writes immediately, ignoring cycle timing.
@@ -3249,34 +3230,6 @@ mod tests {
         assert!(ctx.pending_writes.is_empty());
     }
 
-    #[test]
-    fn test_delay_pending_writes_extends_forwarding_window() {
-        // delay_pending_writes(1) at a branch boundary should push
-        // the ready_cycle of all pending writes, extending the window
-        // during which forwarding is active.
-        let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(7, 0);
-
-        ctx.cycles = 10;
-        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=17
-
-        // Simulate branch taken: delay by 1
-        ctx.delay_pending_writes(1); // ready=18
-
-        // At cycle 17: should NOT be committed yet (was delayed to 18)
-        ctx.cycles = 17;
-        ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0, "Delayed write should not commit at original ready_cycle");
-        // Forward also should not work (ready_cycle is 18)
-        assert_eq!(ctx.pointer_read(7), 0, "Before delayed ready_cycle, forward should return old value");
-
-        // At cycle 18: ready -- forward and commit
-        ctx.cycles = 18;
-        assert_eq!(ctx.pointer_read(7), 0x78000, "At delayed ready_cycle, forward should return value");
-        ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0x78000);
-    }
-
     // =====================================================================
     // Save/Restore Pattern (memcpy scenario)
     // =====================================================================
@@ -3327,31 +3280,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pointer_forwarding_survives_branch_delay() {
-        // Full memcpy scenario with branch:
-        // 1. lda p7, [sp, #-32] at cycle 50 (latency 7, ready=57)
-        // 2. ret at cycle 54 (5 delay slots from cycle 50)
-        // 3. delay_pending_writes(1) when branch takes effect: ready=58
-        // 4. mov p2, p7 at cycle 55 (at branch target)
-        //
-        // At step 4, p7 should be forwarded from the pending load.
+    fn test_pointer_load_across_a_taken_branch_keeps_its_latency() {
+        // A restore `lda p7` issued before a `ret`: the taken branch adds nothing (silicon,
+        // `tools/gen_vec_load_timing_probe.py branch`), the load lands at issue + 7.
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(7, 0); // clobbered value (frame ptr)
-
-        // Step 1: lda p7 restore
         ctx.cycles = 50;
         ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=57
-
-        // Step 2-3: Branch taken after delay slots
-        ctx.delay_pending_writes(1); // ready=58
-
-        // Step 4: At cycle 55 (before ready_cycle 58), reads old clobbered value
-        ctx.cycles = 55;
-        assert_eq!(ctx.pointer_read(7), 0, "Before ready_cycle, p7 should return old (clobbered) value");
-
-        // At ready_cycle 58: forwarding works
-        ctx.cycles = 58;
-        assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, p7 should be forwarded from pending load");
+        ctx.cycles = 56;
+        assert_eq!(ctx.pointer_read(7), 0, "before ready_cycle p7 reads the old value");
+        ctx.cycles = 57;
+        assert_eq!(ctx.pointer_read(7), 0x78000, "at ready_cycle p7 is forwarded from the load");
     }
 
     #[test]
@@ -3413,8 +3352,8 @@ mod tests {
         // 2. Call memcpy (jl): delay slot 4 does `mov p2, p7` -> p2 = 0x78000
         // 3. memcpy: save p7 to stack, clobber with sp, padda, loop body
         // 4. memcpy epilogue: `lda p7, [sp, #-32]` (deferred, latency 7)
-        // 5. `ret lr`: 5 delay slots, then delay_pending_writes(1)
-        // 6. Back in caller: arithmetic + jnz loop back + its delay_pending_writes(1)
+        // 5. `ret lr`: 5 delay slots
+        // 6. Back in caller: arithmetic + jnz loop back
         // 7. Second call to memcpy: delay slot 4 reads p7 -> must be 0x78000
         //
         // If this test fails, the pipeline mechanism is broken.
@@ -3467,25 +3406,19 @@ mod tests {
         ctx.cycles = 101;
         // (5 delay slots execute at cycles 102-106)
 
-        // Last delay slot at cycle 106
+        // Last delay slot at cycle 106: the load is still in flight
         ctx.cycles = 106;
-        // After branch takes effect: delay_pending_writes(1)
-        ctx.delay_pending_writes(1); // p7 ready: 107 -> 108
-
-        // === Phase 6: Back at caller (return point) ===
-        ctx.cycles = 107;
-        ctx.commit_pending_writes(); // p7 ready=108 > 107, NOT committed
-                                     // Before ready_cycle: reads old clobbered value
+        ctx.commit_pending_writes(); // p7 ready=107 > 106, NOT committed
         assert_eq!(
             ctx.pointer_read(7),
             0x70040,
             "Before ready_cycle, p7 should read clobbered value (from padda)"
         );
 
-        // At ready_cycle 108: forward works and commit applies
-        ctx.cycles = 108;
+        // === Phase 6: Back at caller (return point), the load's ready cycle ===
+        ctx.cycles = 107;
         assert_eq!(ctx.pointer_read(7), 0x78000, "At ready_cycle, p7 should be forwarded");
-        ctx.commit_pending_writes(); // p7 ready=108 <= 108, COMMITTED!
+        ctx.commit_pending_writes(); // p7 ready=107 <= 107, COMMITTED!
         assert_eq!(ctx.pointer.read(7), 0x78000, "p7 committed in register file after return");
         assert!(
             ctx.pending_writes
@@ -3496,7 +3429,7 @@ mod tests {
 
         // === Phase 7: Several instructions in caller (no p7 writes) ===
         // rel, add, ltu, add, xor, xor, or at cycles 107-114
-        for c in 109..=115 {
+        for c in 108..=115 {
             ctx.cycles = c;
             ctx.commit_pending_writes(); // no-op for p7
         }
@@ -3504,9 +3437,6 @@ mod tests {
         // === Phase 8: jnz loop back (second branch) ===
         ctx.cycles = 116; // jnz
                           // 5 delay slots at 117-121
-        ctx.cycles = 121;
-        // Branch takes effect - delay_pending_writes(1) on empty queue
-        ctx.delay_pending_writes(1); // no-op (p7 already committed)
 
         // === Phase 9: Back at loop start ===
         ctx.cycles = 122;
@@ -3523,37 +3453,6 @@ mod tests {
         ctx.cycles = 135;
         let p7_second_call = ctx.pointer_read(7);
         assert_eq!(p7_second_call, 0x78000, "CRITICAL: p7 must be 0x78000 at second memcpy call");
-    }
-
-    #[test]
-    fn test_multiple_delay_pending_writes_dont_corrupt() {
-        // Regression test: two branches in sequence, only the first
-        // has a pending p7 write. The second delay_pending_writes(1)
-        // must not corrupt or duplicate anything.
-        let mut ctx = ExecutionContext::new();
-
-        // Queue a p7 load at cycle 50
-        ctx.cycles = 50;
-        ctx.queue_scalar_load(Operand::PointerReg(7), 0xDEAD, 7); // ready=57
-
-        // First branch: delay_pending_writes(1) → ready=58
-        ctx.delay_pending_writes(1);
-
-        // p7 commits at cycle 58
-        ctx.cycles = 58;
-        ctx.commit_pending_writes();
-        assert_eq!(ctx.pointer.read(7), 0xDEAD);
-        assert!(ctx.pending_writes.is_empty(), "Queue should be empty");
-
-        // Second branch: delay_pending_writes(1) on empty queue
-        ctx.cycles = 70;
-        ctx.delay_pending_writes(1); // no-op
-        assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 unchanged by second delay");
-
-        // Third branch: still OK
-        ctx.cycles = 80;
-        ctx.delay_pending_writes(1);
-        assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 still correct");
     }
 
     /// VLIW: a vector-register write during a bundle must NOT be visible to

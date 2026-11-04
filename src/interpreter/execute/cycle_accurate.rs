@@ -1637,40 +1637,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delay_pending_writes_at_branch_boundary() {
-        // When delay_pending_writes(1) is called at a branch boundary,
-        // pointer writes from the last delay slot need an extra cycle.
-        // This test verifies the mechanism directly on ExecutionContext.
-        let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(1, 0xDEAD);
-
-        // Simulate movxm p1, #0x70400 at cycle 5 (last delay slot)
-        ctx.cycles = 5;
-        ctx.queue_pointer_write(1, 0x70400, 1); // ready_cycle = 6
-
-        // Branch taken: delay pending writes by 1 extra cycle
-        ctx.delay_pending_writes(1); // ready_cycle becomes 7
-
-        // At cycle 6 (branch target first instruction): commit should NOT apply
-        ctx.cycles = 6;
-        ctx.commit_pending_writes();
-        assert_eq!(
-            ctx.pointer.read(1),
-            0xDEAD,
-            "Pointer write should NOT be visible at branch target (cycle 6)"
-        );
-
-        // At cycle 7 (branch target second instruction): commit SHOULD apply
-        ctx.cycles = 7;
-        ctx.commit_pending_writes();
-        assert_eq!(
-            ctx.pointer.read(1),
-            0x70400,
-            "Pointer write should be visible one cycle after branch target"
-        );
-    }
-
-    #[test]
     fn test_pointer_write_sequential_latency_one() {
         // In sequential (non-branch) code, pointer writes should have latency 1:
         // movxm p1, #addr at cycle C → p1 available at cycle C+1.

@@ -260,9 +260,7 @@ pub(super) fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 /// Three categories:
 /// - Scalar: immediate write to register file.
 /// - Pointer/modifier: deferred write with pipeline latency 1. The value
-///   becomes visible in the next sequential bundle. At branch boundaries,
-///   `delay_pending_writes()` adds an extra cycle, modeling the loss of
-///   pipeline forwarding after a branch flush.
+///   becomes visible in the next issued bundle (a taken branch adds nothing).
 /// - Vector/accum: valid destinations, but writes are handled by VectorAlu.
 ///   Only reaches here if a scalar semantic op has vector operands (misclassification).
 /// - Non-writable (Immediate, Lock, etc.): should never reach here after decoder

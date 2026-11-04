@@ -397,7 +397,6 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
-                    ctx.delay_pending_writes(1);
                 } else {
                     if let Some(info) = ctx.check_hardware_loop(pc) {
                         let cycle = ctx.cycles;
@@ -420,7 +419,6 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
-                    ctx.delay_pending_writes(1);
                 } else {
                     if let Some(info) = ctx.check_hardware_loop(pc) {
                         let cycle = ctx.cycles;
@@ -677,7 +675,6 @@ where
                 // Check if pending branch should now be taken
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
-                    ctx.delay_pending_writes(1);
                 } else {
                     if let Some(info) = ctx.check_hardware_loop(pc) {
                         let cycle = ctx.cycles;
@@ -703,7 +700,6 @@ where
                 // Check if this was a back-to-back branch and delay slots exhausted
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
-                    ctx.delay_pending_writes(1);
                 } else {
                     if let Some(info) = ctx.check_hardware_loop(pc) {
                         let cycle = ctx.cycles;
@@ -729,7 +725,6 @@ where
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
-                    ctx.delay_pending_writes(1);
                 } else {
                     if let Some(info) = ctx.check_hardware_loop(pc) {
                         let cycle = ctx.cycles;
@@ -1089,6 +1084,56 @@ mod tests {
         let mut tile = Tile::compute(0, 2);
         assert!(tile.write_program(0, program));
         tile
+    }
+
+    /// Silicon (`tools/gen_vec_load_timing_probe.py branch`, `build/experiments/harness/ldvec/br2`
+    /// and `br3`, r1 == r2): a taken branch delays no in-flight write. A load issued with `j` is
+    /// read at the target from distance 7 like anywhere else, and a pointer move in the last delay
+    /// slot is read by the target's first bundle.
+    ///
+    /// ```text
+    /// 0x00  lda r4, [p5, #0] ; j #0x20
+    /// 0x0a  nop x4
+    /// 0x12  movxm p4, #0x1234        (last delay slot)
+    /// 0x18  nops ; nopm              (alignment, never executed)
+    /// 0x20  mov r16, p4              (distance 1 from the move)
+    /// 0x24  mov r18, r4              (distance 7 from the load)
+    /// ```
+    const BRANCH_PROGRAM: [u8; 48] = [
+        0xbb, 0x20, 0x00, 0x00, 0x04, 0x00, 0x00, 0x08, 0x51, 0xa0, // lda ; j
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, // nop x4
+        0x55, 0x68, 0x64, 0x18, 0x00, 0x00, // movxm p4, #0x1234
+        0x03, 0x80, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, // nops ; nopm
+        0x59, 0x76, 0x08, 0x1c, // mov r16, p4
+        0x59, 0x16, 0x82, 0x1c, // mov r18, r4
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, // nop x4
+    ];
+
+    fn run_branch_program(internal: bool) -> ExecutionContext {
+        let mut interpreter = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = make_tile_with_program(&BRANCH_PROGRAM);
+        tile.data_memory_mut()[0x400..0x404].copy_from_slice(&0xABCDu32.to_le_bytes());
+        ctx.pointer.write(5, 0x70400);
+        ctx.pointer.write(4, 0x1111);
+        ctx.scalar.write(4, 0x2222);
+        for _ in 0..10 {
+            if internal {
+                interpreter.step_with_mem_locks(&mut ctx, &mut tile, None, None, None);
+            } else {
+                interpreter.step(&mut ctx, &mut tile);
+            }
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_taken_branch_delays_no_write_in_flight() {
+        for internal in [false, true] {
+            let ctx = run_branch_program(internal);
+            assert_eq!(ctx.scalar.read(16), 0x1234, "pointer move, distance 1 (internal={internal})");
+            assert_eq!(ctx.scalar.read(18), 0xABCD, "load, distance 7 (internal={internal})");
+        }
     }
 
     #[test]
