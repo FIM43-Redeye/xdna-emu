@@ -1173,9 +1173,10 @@ mod tests {
 
         executor.execute(&make_bundle(vec![mov, ups]), &mut ctx, &mut tile);
 
-        // The UPS samples the shift at issue+6 (II_VLDA_UPS operand cycle 7);
-        // issue empty bundles to reach the read bundle.
-        for _ in 0..6 {
+        // The UPS samples the shift at issue+6 (II_VLDA_UPS operand cycle 7)
+        // and crSat at issue+7 (cycle 8), then converts; issue empty bundles
+        // past both.
+        for _ in 0..7 {
             executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
         }
 
@@ -1225,7 +1226,8 @@ mod tests {
         ups.is_vector = true;
 
         // Bundle 0: the UPS load. Bundles 1-4: nops. Bundle 5: MOV s0,#1
-        // (commits before the issue+6 sample). Bundle 6: sample lands.
+        // (commits before the issue+6 sample). Bundle 6: shift sampled.
+        // Bundle 7: crSat sampled, conversion lands.
         executor.execute(&make_bundle(vec![ups]), &mut ctx, &mut tile);
         for _ in 0..4 {
             executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
@@ -1234,6 +1236,7 @@ mod tests {
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::Immediate(1));
         executor.execute(&make_bundle(vec![mov]), &mut ctx, &mut tile);
+        executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
         executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
 
         let acc = ctx.accumulator.read(0);

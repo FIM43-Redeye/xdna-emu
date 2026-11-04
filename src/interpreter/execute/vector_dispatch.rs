@@ -53,7 +53,11 @@ impl VectorAlu {
         // forms record in MemoryUnit.
         let record_key = super::fuzz_recorder::key_parts(semantic, op, ctx);
 
-        let et = op.element_type.unwrap_or(ElementType::Int32);
+        // A `d` form takes its signedness from its sign control register (see dynamic_sign).
+        let et = super::dynamic_sign::resolve(
+            op.element_type.unwrap_or(ElementType::Int32),
+            super::dynamic_sign::signed_now(op, ctx),
+        );
 
         log::trace!(
             "[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",

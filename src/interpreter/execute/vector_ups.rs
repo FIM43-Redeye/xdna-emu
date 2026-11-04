@@ -78,7 +78,7 @@ fn truncate(val: i64, bits: u32) -> i64 {
 ///
 /// 1. Extend input to `bits_in` width (sign-extend if signed, zero-extend if unsigned).
 /// 2. Left-shift by `shift`.
-/// 3. If `saturate` is true, clamp to the signed range of `bits_out`.
+/// 3. If `saturate` is true (crSat nonzero), clamp to the signed range of `bits_out`.
 /// 4. Truncate to `bits_out` width.
 pub fn ups_lane(value: i64, shift: u32, bits_in: u32, bits_out: u32, saturate: bool) -> i64 {
     ups_lane_signed(value, shift, bits_in, bits_out, saturate, true)
@@ -108,20 +108,18 @@ pub fn ups_lane_signed(
         }
     };
 
-    // Left-shift for scaling into the wider accumulator.
-    let shifted = extended.wrapping_shl(shift);
+    // Left-shift for scaling into the wider accumulator, exactly: the 6-bit shift register
+    // takes a 32-bit lane up to 2^95, past i64.
+    let shifted = (extended as i128) << shift.min(63);
 
-    // Optional saturation to the output range.
+    // Optional saturation to the signed range of the output lane (silicon, dynsign probes:
+    // any nonzero crSat clamps, and never symmetrically).
     let saturated = if saturate {
-        let (vmin, vmax) = if bits_out >= 64 {
-            (i64::MIN, i64::MAX)
-        } else {
-            (-(1i64 << (bits_out - 1)), (1i64 << (bits_out - 1)) - 1)
-        };
-        shifted.max(vmin).min(vmax)
+        let (vmin, vmax) = (-(1i128 << (bits_out - 1)), (1i128 << (bits_out - 1)) - 1);
+        shifted.clamp(vmin, vmax)
     } else {
         shifted
-    };
+    } as i64;
 
     // Truncate to output width with sign extension.
     truncate(saturated, bits_out)
@@ -206,7 +204,13 @@ fn pack_lane(dst: &mut [u32; 8], index: u32, lane_bits: u32, value: i64) {
 ///
 /// For the common 32-bit accumulator modes (8->32 and 16->32), the full
 /// result fits in 256 bits (8 x u32).
-pub fn ups_vector(src: &[u32; 8], shift: u32, from_type: ElementType, to_type: ElementType) -> [u32; 8] {
+pub fn ups_vector(
+    src: &[u32; 8],
+    shift: u32,
+    from_type: ElementType,
+    to_type: ElementType,
+    saturate: bool,
+) -> [u32; 8] {
     let bits_in = from_type.bits() as u32;
     let bits_out = to_type.bits() as u32;
     let lanes = 256 / bits_in;
@@ -225,7 +229,7 @@ pub fn ups_vector(src: &[u32; 8], shift: u32, from_type: ElementType, to_type: E
 
     for i in 0..out_lanes {
         let val = extract_lane(src, i, bits_in);
-        let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+        let out = ups_lane_signed(val, shift, bits_in, bits_out, saturate, signed_input);
         pack_lane(&mut result, i, bits_out, out);
     }
 
@@ -247,6 +251,7 @@ pub fn ups_vector_to_acc(
     shift: u32,
     from_type: ElementType,
     to_type: ElementType,
+    saturate: bool,
 ) -> [u64; 8] {
     let bits_in = from_type.bits() as u32;
     let bits_out = to_type.bits() as u32;
@@ -259,7 +264,7 @@ pub fn ups_vector_to_acc(
         let in_lanes = (256 / bits_in).min(16);
         for i in 0..in_lanes {
             let val = extract_lane(src, i, bits_in);
-            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, saturate, signed_input);
             let out_u32 = (out as u64) & 0xFFFF_FFFF;
             let word_idx = (i / 2) as usize;
             if i % 2 == 0 {
@@ -273,7 +278,7 @@ pub fn ups_vector_to_acc(
         let in_lanes = (256 / bits_in).min(8);
         for i in 0..in_lanes {
             let val = extract_lane(src, i, bits_in);
-            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, saturate, signed_input);
             result[i as usize] = out as u64;
         }
     }
@@ -295,6 +300,7 @@ pub fn ups_vector_to_acc_wide(
     shift: u32,
     from_type: ElementType,
     to_type: ElementType,
+    saturate: bool,
 ) -> [u64; 16] {
     let bits_in = from_type.bits() as u32;
     let bits_out = to_type.bits() as u32;
@@ -307,7 +313,7 @@ pub fn ups_vector_to_acc_wide(
         let in_lanes = (256 / bits_in).min(32);
         for i in 0..in_lanes {
             let val = extract_lane(src, i, bits_in);
-            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, saturate, signed_input);
             let out_u32 = (out as u64) & 0xFFFF_FFFF;
             let word_idx = (i / 2) as usize;
             if i % 2 == 0 {
@@ -321,7 +327,7 @@ pub fn ups_vector_to_acc_wide(
         let in_lanes = (256 / bits_in).min(16);
         for i in 0..in_lanes {
             let val = extract_lane(src, i, bits_in);
-            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, saturate, signed_input);
             result[i as usize] = out as u64;
         }
     }
@@ -354,12 +360,23 @@ impl VectorAlu {
         }
     }
 
+    /// The source lane type of a register `vups` and whether it saturates: a `d` form takes
+    /// its signedness from crUPSSign, and any nonzero crSat saturates. II_VUPS reads both at
+    /// operand cycle 1, at issue (AIE2Schedule.td).
+    fn ups_source_type_and_saturation(op: &SlotOp, ctx: &ExecutionContext) -> (ElementType, bool) {
+        let from = super::dynamic_sign::resolve(
+            op.from_type.unwrap_or(ElementType::Int16),
+            super::dynamic_sign::signed_now(op, ctx),
+        );
+        (from, ctx.srs_config.saturation_mode != 0)
+    }
+
     /// Narrow UPS path: widen narrow vector lanes into 512-bit accumulator.
     fn execute_ups_narrow(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let src = Self::get_vector_source(op, ctx, 0);
         let shift = Self::get_shift_amount(op, ctx);
-        let from = op.from_type.unwrap_or(ElementType::Int16);
-        let acc_result = ups_vector_to_acc(&src, shift, from, et);
+        let (from, saturate) = Self::ups_source_type_and_saturation(op, ctx);
+        let acc_result = ups_vector_to_acc(&src, shift, from, et, saturate);
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
                 Self::queue_ups_acc_write(ctx, *r, &acc_result);
@@ -388,7 +405,7 @@ impl VectorAlu {
     /// Wide UPS path: widen to 1024-bit accumulator (w2c or x2c).
     fn execute_ups_wide(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let shift = Self::get_shift_amount(op, ctx);
-        let from = op.from_type.unwrap_or(ElementType::Int16);
+        let (from, saturate) = Self::ups_source_type_and_saturation(op, ctx);
         let is_half =
             matches!(op.accum_width, Some(crate::interpreter::decode::register_map::AccumWidth::Half));
 
@@ -397,14 +414,14 @@ impl VectorAlu {
                 // w2c path: narrow source (256-bit wl) fills full
                 // 1024-bit cm register via 4:1 upshift.
                 let src = Self::get_vector_source(op, ctx, 0);
-                ups_vector_to_acc_wide(&src, shift, from, et)
+                ups_vector_to_acc_wide(&src, shift, from, et, saturate)
             } else {
                 // x2c path: wide source (512-bit x-reg), UPS each half.
                 let src = Self::get_wide_vec_source(op, ctx, 0);
                 let src_lo: [u32; 8] = src[..8].try_into().unwrap();
                 let src_hi: [u32; 8] = src[8..].try_into().unwrap();
-                let acc_lo = ups_vector_to_acc(&src_lo, shift, from, et);
-                let acc_hi = ups_vector_to_acc(&src_hi, shift, from, et);
+                let acc_lo = ups_vector_to_acc(&src_lo, shift, from, et, saturate);
+                let acc_hi = ups_vector_to_acc(&src_hi, shift, from, et, saturate);
                 let mut wide = [0u64; 16];
                 wide[..8].copy_from_slice(&acc_lo);
                 wide[8..].copy_from_slice(&acc_hi);
@@ -427,7 +444,7 @@ impl VectorAlu {
             // Half UPS (bml/bmh): narrow source -> single 512-bit
             // accum register.
             let src = Self::get_vector_source(op, ctx, 0);
-            let acc_result = ups_vector_to_acc(&src, shift, from, et);
+            let acc_result = ups_vector_to_acc(&src, shift, from, et, saturate);
             match &op.dest {
                 Some(Operand::AccumReg(r)) => {
                     Self::queue_ups_acc_write(ctx, *r, &acc_result);
@@ -603,7 +620,7 @@ mod tests {
             pack_lane(&mut src, i, 8, i as i64);
         }
 
-        let result = ups_vector(&src, 0, ElementType::Int8, ElementType::Int32);
+        let result = ups_vector(&src, 0, ElementType::Int8, ElementType::Int32, false);
 
         // With 32-bit output, only 8 lanes fit in 256 bits.
         for i in 0..8u32 {
@@ -620,7 +637,7 @@ mod tests {
             pack_lane(&mut src, i, 8, 5);
         }
 
-        let result = ups_vector(&src, 4, ElementType::Int8, ElementType::Int32);
+        let result = ups_vector(&src, 4, ElementType::Int8, ElementType::Int32, false);
 
         for i in 0..8u32 {
             let val = extract_lane(&result, i, 32);
@@ -636,7 +653,7 @@ mod tests {
             pack_lane(&mut src, i, 16, (i as i64) + 1);
         }
 
-        let result = ups_vector(&src, 8, ElementType::Int16, ElementType::Int32);
+        let result = ups_vector(&src, 8, ElementType::Int16, ElementType::Int32, false);
 
         // 32-bit output: 8 lanes fit in 256 bits
         for i in 0..8u32 {
@@ -654,7 +671,7 @@ mod tests {
             pack_lane(&mut src, i, 8, -5);
         }
 
-        let result = ups_vector(&src, 2, ElementType::Int8, ElementType::Int32);
+        let result = ups_vector(&src, 2, ElementType::Int8, ElementType::Int32, false);
 
         for i in 0..8u32 {
             let val = extract_lane(&result, i, 32);
@@ -717,7 +734,7 @@ mod tests {
             0x000E_000D,
             0x0010_000F,
         ];
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32, false);
         // Lane 0=1, lane 1=2 -> acc[0] = 1 | (2<<32)
         assert_eq!(acc[0], 1 | (2u64 << 32), "acc[0]");
         assert_eq!(acc[1], 3 | (4u64 << 32), "acc[1]");
@@ -734,7 +751,7 @@ mod tests {
         // vups.s32.s16 with shift=0 and negative input: -1 in i16 = 0xFFFF.
         // -1 as i32 = 0xFFFF_FFFF. Two per u64 = 0xFFFF_FFFF_FFFF_FFFF.
         let src = [0xFFFF_FFFF_u32; 8]; // all 16 lanes = -1 as i16
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32, false);
         for i in 0..8usize {
             // Both lo and hi halves are 0xFFFF_FFFF (i.e. -1 as u32).
             assert_eq!(acc[i], 0xFFFF_FFFF_FFFF_FFFF, "lane pair {}", i);
@@ -746,7 +763,7 @@ mod tests {
         // vups.s64.s32 with shift=0: 8 input lanes of 32-bit -> 8 x 64-bit.
         // Acc64 mode: one value per u64 word.
         let src = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int32, ElementType::Int64);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int32, ElementType::Int64, false);
         for i in 0..8 {
             assert_eq!(acc[i], (i + 1) as u64, "lane {}", i);
         }
@@ -760,7 +777,7 @@ mod tests {
         for i in 0..32u32 {
             pack_lane(&mut src, i, 8, (i + 1) as i64);
         }
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int8, ElementType::Int32);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int8, ElementType::Int32, false);
         // 16 acc32 lanes, packed 2 per u64.
         for pair in 0..8usize {
             let lo = (pair * 2 + 1) as u64;
@@ -780,7 +797,7 @@ mod tests {
             src[byte_idx as usize] |= (i + 1) << shift_amt;
         }
 
-        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::UInt8, ElementType::Int32);
+        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::UInt8, ElementType::Int32, false);
 
         // 32 acc32 lanes packed as 16 u64 words, two i32 per u64.
         for pair in 0..16usize {
@@ -802,7 +819,7 @@ mod tests {
             src[word_idx] |= (val as u32) << shift_amt;
         }
 
-        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::Int16, ElementType::Int64);
+        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::Int16, ElementType::Int64, false);
 
         for i in 0..16usize {
             let expected = (-(i as i64) - 1) as u64;
@@ -838,7 +855,7 @@ mod integration_tests {
             0x000E_000D,
             0x0010_000F,
         ];
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32, false);
         ctx.accumulator.write(0, acc);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
@@ -873,7 +890,7 @@ mod integration_tests {
             0x201F1E1D,
         ];
 
-        let acc_wide = ups_vector_to_acc_wide(&src, 0, ElementType::Int8, ElementType::Int32);
+        let acc_wide = ups_vector_to_acc_wide(&src, 0, ElementType::Int8, ElementType::Int32, false);
         assert!(acc_wide.iter().any(|&v| v != 0), "UPS produced all zeros");
 
         let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
@@ -897,7 +914,7 @@ mod integration_tests {
         assert_eq!(packed, src, "wide s8.s32 UPS->SRS round-trip failed");
 
         // Also test with non-zero shift
-        let acc_shifted = ups_vector_to_acc_wide(&src, 4, ElementType::Int8, ElementType::Int32);
+        let acc_shifted = ups_vector_to_acc_wide(&src, 4, ElementType::Int8, ElementType::Int32, false);
         let acc_s_lo: [u64; 8] = acc_shifted[..8].try_into().unwrap();
         let acc_s_hi: [u64; 8] = acc_shifted[8..].try_into().unwrap();
         let res_s_lo =

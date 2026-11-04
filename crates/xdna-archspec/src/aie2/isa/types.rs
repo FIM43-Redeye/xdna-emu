@@ -530,6 +530,25 @@ impl ElementType {
                 | ElementType::Int64
         )
     }
+
+    /// The integer type of the same width with the given signedness; floats are returned
+    /// unchanged. Used by the `d` forms, whose signedness is a run-time control-register value.
+    pub fn with_signedness(self, signed: bool) -> Self {
+        use ElementType::*;
+        match (self, signed) {
+            (Int4 | UInt4, true) => Int4,
+            (Int4 | UInt4, false) => UInt4,
+            (Int8 | UInt8, true) => Int8,
+            (Int8 | UInt8, false) => UInt8,
+            (Int16 | UInt16, true) => Int16,
+            (Int16 | UInt16, false) => UInt16,
+            (Int32 | UInt32, true) => Int32,
+            (Int32 | UInt32, false) => UInt32,
+            (Int64 | UInt64, true) => Int64,
+            (Int64 | UInt64, false) => UInt64,
+            (BFloat16 | Float32, _) => self,
+        }
+    }
 }
 
 /// Branch condition codes.
@@ -1094,5 +1113,18 @@ mod tests {
         assert!(!ElementType::UInt4.is_signed());
         assert!(ElementType::Int64.is_signed());
         assert!(!ElementType::UInt64.is_signed());
+    }
+
+    #[test]
+    fn with_signedness_flips_integers_and_keeps_floats() {
+        use ElementType::*;
+        for (u, s) in [(UInt4, Int4), (UInt8, Int8), (UInt16, Int16), (UInt32, Int32), (UInt64, Int64)] {
+            assert_eq!(u.with_signedness(true), s);
+            assert_eq!(s.with_signedness(false), u);
+            assert_eq!(u.with_signedness(false), u);
+            assert_eq!(s.with_signedness(true), s);
+        }
+        assert_eq!(BFloat16.with_signedness(false), BFloat16);
+        assert_eq!(Float32.with_signedness(true), Float32);
     }
 }

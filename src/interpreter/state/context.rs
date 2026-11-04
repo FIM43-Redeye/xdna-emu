@@ -276,8 +276,11 @@ pub struct PendingAccAdd {
 /// modes 1-7 produced the unshifted input). The load data, destination, and
 /// element types are resolved at issue; only the shift amount is sampled at
 /// issue+6, one bundle before the cycle-7 boundary (same rationale as
-/// PendingUnpack). Plain register II_VUPS reads its shift at issue and is
-/// not deferred.
+/// PendingUnpack). The `d` forms read crUPSSign at the same operand cycle 7,
+/// and every form reads crSat at operand cycle 8 (`[9,7,1,1,/*srUPS_of*/8,
+/// /*crSat*/8,/*crUPSSign*/7]`): Chess and Peano both write crUPSSign and
+/// crSat in the load's shadow, after the vlda.ups. Plain register II_VUPS
+/// reads its shift, sign and crSat at issue and is not deferred.
 #[derive(Debug, Clone)]
 pub struct PendingUpsLoad {
     /// Vector data loaded from memory at issue.
@@ -286,8 +289,14 @@ pub struct PendingUpsLoad {
     pub shift_reg: u8,
     /// Destination accumulator register.
     pub dest_reg: u8,
-    /// Input element type.
+    /// Input element type as decoded (a `d` form decodes unsigned).
     pub from: xdna_archspec::aie2::isa::ElementType,
+    /// Sign control register of a `d` form (crUPSSign), sampled with the shift.
+    pub sign_reg: Option<u8>,
+    /// Shift amount and resolved input type, once sampled at `ready_bundle`.
+    pub sampled: Option<(u32, xdna_archspec::aie2::isa::ElementType)>,
+    /// Issued-bundle count at which crSat is read (operand cycle 8).
+    pub sat_bundle: u64,
     /// Output (accumulator lane) element type.
     pub to: xdna_archspec::aie2::isa::ElementType,
     /// Half (bml/bmh, 512-bit) vs full cm (1024-bit) destination.
@@ -306,6 +315,10 @@ pub struct PendingUpsLoad {
 /// VLDA.UPS shift-register read latency in issued bundles (operand cycle 7,
 /// sampled one bundle before the boundary; see PendingUpsLoad).
 const VLDA_UPS_SHIFT_READ_LATENCY: u64 = 6;
+
+/// VLDA.UPS crSat read latency in issued bundles (operand cycle 8, sampled one
+/// bundle before the boundary; see PendingUpsLoad).
+const VLDA_UPS_SAT_READ_LATENCY: u64 = 7;
 
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
@@ -1542,6 +1555,18 @@ impl ExecutionContext {
         self.pending_stores.is_empty()
     }
 
+    /// A control register as an instruction reads it: crRnd, crSat and crSRSSign live in the
+    /// SRS configuration, every other one is kept raw.
+    pub fn control_reg(&self, id: u8) -> u32 {
+        use xdna_archspec::aie2::registers::ctrl_regs;
+        match id {
+            ctrl_regs::CR_RND => self.srs_config.rounding_mode as u32,
+            ctrl_regs::CR_SRS_SIGN => self.srs_config.srs_sign as u32,
+            ctrl_regs::CR_SAT => self.srs_config.saturation_mode as u32,
+            _ => self.control_reg_raw(id),
+        }
+    }
+
     /// Raw value of an unmodelled control register (0 until written).
     pub fn control_reg_raw(&self, id: u8) -> u32 {
         self.control_raw[(id & 0xF) as usize]
@@ -1803,6 +1828,7 @@ impl ExecutionContext {
         shift_reg: u8,
         dest_reg: u8,
         from: xdna_archspec::aie2::isa::ElementType,
+        sign_reg: Option<u8>,
         to: xdna_archspec::aie2::isa::ElementType,
         is_half: bool,
     ) {
@@ -1811,6 +1837,9 @@ impl ExecutionContext {
             shift_reg,
             dest_reg,
             from,
+            sign_reg,
+            sampled: None,
+            sat_bundle: self.bundle_seq + VLDA_UPS_SAT_READ_LATENCY,
             to,
             is_half,
             issue_bundle: self.bundle_seq,
@@ -1830,24 +1859,37 @@ impl ExecutionContext {
             return;
         }
         let current = self.bundle_seq;
+        // Stage 7: the shift and (for a `d` form) crUPSSign.
+        let mut pending = std::mem::take(&mut self.pending_ups_loads);
+        for pu in pending
+            .iter_mut()
+            .filter(|pu| pu.sampled.is_none() && pu.ready_bundle <= current)
+        {
+            let shift = self.scalar_read(pu.shift_reg);
+            let signed = pu.sign_reg.map(|id| self.control_reg(id) & 1 != 0);
+            pu.sampled = Some((shift, crate::interpreter::execute::dynamic_sign::resolve(pu.from, signed)));
+        }
+        // Stage 8: crSat, then the conversion.
         let mut ready: Vec<PendingUpsLoad> = Vec::new();
-        self.pending_ups_loads.retain(|pu| {
-            if pu.ready_bundle <= current {
+        pending.retain(|pu| {
+            if pu.sampled.is_some() && pu.sat_bundle <= current {
                 ready.push(pu.clone());
                 false
             } else {
                 true
             }
         });
+        self.pending_ups_loads = pending;
         ready.sort_by_key(|pu| pu.ready_bundle);
         for pu in ready {
             use crate::interpreter::execute::vector_ups::{ups_vector_to_acc, ups_vector_to_acc_wide};
-            let shift = self.scalar_read(pu.shift_reg);
+            let (shift, from) = pu.sampled.expect("sampled at stage 7");
+            let saturate = self.srs_config.saturation_mode != 0;
             let mut acc = [0u64; 16];
             if pu.is_half {
-                acc[..8].copy_from_slice(&ups_vector_to_acc(&pu.vec_data, shift, pu.from, pu.to));
+                acc[..8].copy_from_slice(&ups_vector_to_acc(&pu.vec_data, shift, from, pu.to, saturate));
             } else {
-                acc = ups_vector_to_acc_wide(&pu.vec_data, shift, pu.from, pu.to);
+                acc = ups_vector_to_acc_wide(&pu.vec_data, shift, from, pu.to, saturate);
             }
             self.set_write_tag(pu.tag);
             self.queue_acc_write_timed(

@@ -150,7 +150,10 @@ impl VectorAlu {
                 // beside a 64-bit-lane partner shifts the OR-ed bus as 64-bit lanes and returns
                 // the low 32 bits of each, whatever its own element type (probe9/probe11).
                 let mut from = v.from_type.unwrap_or(ElementType::Int32);
-                let mut to = v.element_type.unwrap_or(ElementType::Int16);
+                let mut to = super::dynamic_sign::resolve(
+                    v.element_type.unwrap_or(ElementType::Int16),
+                    super::dynamic_sign::signed_now(v, ctx),
+                );
                 if from.bits() < 64 && p.from_type.is_some_and(|t| t.bits() == 64) {
                     from = ElementType::Int64;
                     to = if to.is_signed() {

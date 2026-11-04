@@ -75,6 +75,7 @@
 //! let result = executor.execute(&bundle, &mut ctx, &mut tile);
 //! ```
 
+pub(crate) mod dynamic_sign;
 mod vector_dispatch;
 mod vector_helpers;
 mod vector_arith;

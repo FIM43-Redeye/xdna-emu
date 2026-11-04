@@ -12,9 +12,6 @@ use xdna_archspec::aie2::isa::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 
-/// Control register index of crVaddSign (`register_map::operand_from_reg_name`).
-const CR_VADD_SIGN: u8 = 0;
-
 impl VectorAlu {
     /// Vector shuffle with pattern.
     #[allow(dead_code)]
@@ -540,17 +537,8 @@ impl VectorAlu {
     /// and break the consumer that was scheduled to read the LDA value first.
     pub(super) fn execute_vector_extract(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         const VEXTRACT_TO_GPR_LATENCY: u64 = 2;
-        // The dynamic forms (`vextract.d8` / `.d16`) take their signedness from crVaddSign bit 0,
-        // read when the instruction issues; the decoder labels every `.dN` unsigned.
-        let is_dynamic = op
-            .encoding_name
-            .as_deref()
-            .is_some_and(|n| n.contains(".d8") || n.contains(".d16"));
-        let et = match (is_dynamic, ctx.control_reg_raw(CR_VADD_SIGN) & 1 != 0, et) {
-            (true, true, ElementType::UInt8) => ElementType::Int8,
-            (true, true, ElementType::UInt16) => ElementType::Int16,
-            _ => et,
-        };
+        // `vextract.dN` arrives with `et` already signed by crVaddSign (dynamic_sign, in the
+        // dispatcher).
         if op.is_wide_vector {
             // VEXTRACT operates on a full 512-bit source.
             // Cannot use fallback (execute_half twice) because the second
@@ -1068,6 +1056,14 @@ mod tests {
                 .with_source(Operand::ScalarReg(5));
             op.is_wide_vector = true;
             op.encoding_name = Some(name.to_string());
+            // The `d` forms list crVaddSign in their TableGen `Uses`.
+            if name.contains(".d") {
+                op = op.with_implicit_regs([xdna_archspec::aie2::isa::ImplicitReg {
+                    reg_class: "crVaddSign".to_string(),
+                    reg_num: 0,
+                    is_use: true,
+                }]);
+            }
             assert!(VectorAlu::execute(&op, &mut ctx));
             ctx.flush_pending_writes();
             ctx.scalar.read(1)

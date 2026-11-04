@@ -244,17 +244,7 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
             // Scalar read of an accumulator: extract lane 0 (low 32 bits).
             ctx.accumulator.read(*r)[0] as u32
         }
-        Operand::ControlReg(id) => {
-            if *id == ctrl_regs::CR_RND {
-                ctx.srs_config.rounding_mode as u32
-            } else if *id == ctrl_regs::CR_SRS_SIGN {
-                ctx.srs_config.srs_sign as u32
-            } else if *id == ctrl_regs::CR_SAT {
-                ctx.srs_config.saturation_mode as u32
-            } else {
-                ctx.control_reg_raw(*id)
-            }
-        }
+        Operand::ControlReg(id) => ctx.control_reg(*id),
         _ => 0,
     }
 }

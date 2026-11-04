@@ -999,17 +999,21 @@ impl MemoryUnit {
                 // 1142-1448). Defer the conversion so the shift is sampled
                 // at the stage-7 bundle. Immediate shifts have no register
                 // to sample and convert at issue.
+                // A `d` form's crUPSSign is read with the shift, crSat a cycle later.
+                let sign_reg = super::dynamic_sign::sign_register(op);
                 if let Some(s) = Self::get_shift_scalar_reg(op) {
-                    ctx.queue_pending_ups_load(vec_data, s, *r, from, to, is_half);
+                    ctx.queue_pending_ups_load(vec_data, s, *r, from, sign_reg, to, is_half);
                 } else {
                     let shift = Self::get_shift_amount(op, ctx);
+                    let from = super::dynamic_sign::resolve(from, super::dynamic_sign::signed_now(op, ctx));
+                    let saturate = ctx.srs_config.saturation_mode != 0;
                     let mut acc = [0u64; 16];
                     if is_half {
                         acc[..8].copy_from_slice(&super::vector_ups::ups_vector_to_acc(
-                            &vec_data, shift, from, to,
+                            &vec_data, shift, from, to, saturate,
                         ));
                     } else {
-                        acc = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to);
+                        acc = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to, saturate);
                     }
                     ctx.queue_acc_write(Operand::AccumReg(*r), acc, is_half);
                 }
@@ -1107,7 +1111,11 @@ impl MemoryUnit {
         let acc_reg = Self::get_acc_source(op);
         let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int32);
-        let to = op.element_type.unwrap_or(ElementType::Int16);
+        // A `d` form's output signedness is crSRSSign (II_VST_SRS: operand cycle 1, at issue).
+        let to = super::dynamic_sign::resolve(
+            op.element_type.unwrap_or(ElementType::Int16),
+            super::dynamic_sign::signed_now(op, ctx),
+        );
 
         // Half (bml/bmh) -> 512-bit single register, narrow SRS.
         // Full/None (cm) -> 1024-bit wide pair, SRS each half and pack.
@@ -3293,8 +3301,9 @@ mod tests {
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
 
         // The UPS shift register is sampled at issue+6 (II_VLDA_UPS operand
-        // cycle 7); advance the bundle clock and process the deferred load.
-        ctx.bundle_seq += 6;
+        // cycle 7) and crSat at issue+7 (operand cycle 8); advance the bundle
+        // clock past both and process the deferred load.
+        ctx.bundle_seq += 7;
         ctx.process_pending_ups_loads();
 
         // Verify accumulator has non-zero data
@@ -3367,7 +3376,7 @@ mod tests {
         MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None, None);
 
         // Stage-7 shift sample: advance and process the deferred UPS load.
-        ctx.bundle_seq += 6;
+        ctx.bundle_seq += 7;
         ctx.process_pending_ups_loads();
 
         // SRS with s0 = 0 (unchanged)
@@ -3438,7 +3447,7 @@ mod tests {
         assert!(handled, "post-increment vlda.ups must be handled by the fused-load path");
 
         // Stage-7 shift sample: advance and process the deferred UPS load.
-        ctx.bundle_seq += 6;
+        ctx.bundle_seq += 7;
         ctx.process_pending_ups_loads();
 
         // Accumulator holds the loaded int32 values (widened to acc64), not zeros.
