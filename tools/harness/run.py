@@ -197,16 +197,23 @@ def build_test_host(pkg_dir: Path) -> Path:
     mlir_aie = Path(os.environ.get("MLIR_AIE") or workspace() / "mlir-aie")
     test_lib = mlir_aie / "build" / "runtime_lib" / "x86_64" / "test_lib"
     cpp, exe = pkg_dir / "test_host.cpp", pkg_dir / "test_host"
-    cpp.write_text(_instr_gen().generate_test_host_cpp())
+    # Rewrite (and so rebuild) only on a change: runs on one suite share this host, and a
+    # rebuild under a running suite makes its next launch fail (EACCES on a half-written exe).
+    src = _instr_gen().generate_test_host_cpp()
+    if not cpp.is_file() or cpp.read_text() != src:
+        cpp.write_text(src)
     if not exe.exists() or exe.stat().st_mtime < cpp.stat().st_mtime:
+        tmp = exe.with_name(f".test_host.{os.getpid()}")
         r = subprocess.run(
-            ["clang++", str(cpp), "-o", str(exe), "-std=c++17", "-Wall",
+            ["clang++", str(cpp), "-o", str(tmp), "-std=c++17", "-Wall",
              "-I", f"{test_lib}/include", "-I", f"{XRT}/include",
              "-L", f"{test_lib}/lib", "-L", f"{XRT}/lib",
              "-ltest_utils", "-lxrt_coreutil", "-lrt", "-lstdc++"],
             capture_output=True, text=True)
         if r.returncode:
+            tmp.unlink(missing_ok=True)
             raise RunError(f"building test_host failed:\n{r.stderr[-1500:]}")
+        tmp.replace(exe)        # atomic: a concurrent launch sees the old exe or the new one
     return exe
 
 

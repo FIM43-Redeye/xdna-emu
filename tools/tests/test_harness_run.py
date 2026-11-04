@@ -164,3 +164,23 @@ def test_run_record_package_hash_roundtrips_and_old_records_still_read(tmp_path)
     del d["package_hash"]
     (tmp_path / "run.json").write_text(json.dumps(d))
     assert read_run_record(tmp_path).package_hash == ""
+
+
+# -- shared test_host -------------------------------------------------------------
+
+def test_test_host_is_rebuilt_only_when_its_source_changes(tmp_path, monkeypatch):
+    import harness.run as R
+    builds = []
+
+    def fake_run(cmd, **kw):
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_text("exe")
+        builds.append(out)
+        return R.subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    monkeypatch.setattr(R, "workspace", lambda: tmp_path)
+    exe = R.build_test_host(tmp_path)
+    assert exe.read_text() == "exe" and len(builds) == 1
+    assert builds[0] != exe                      # built aside, then renamed into place
+    R.build_test_host(tmp_path)
+    assert len(builds) == 1                      # unchanged source: no rewrite, no rebuild
