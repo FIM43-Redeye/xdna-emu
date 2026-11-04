@@ -113,8 +113,8 @@ test_kernel:
   add r7, r7, r7
   or r6, r6, r7
 
-  // r8 = 0 (for zeroing)
-  mov r8, #0
+  // r15 = 0 (for zeroing)
+  mov r15, #0
 
   // ====== TEST 1: Identity (A=1 i16, B=1 i8, mask=0x33) ======
 
@@ -313,24 +313,24 @@ test_kernel:
   // Store B to scratch: bytes {1,2,3,4,5,6,7,8} then zeros
   st r9,  [p0, #0]
   st r10, [p0, #4]
-  st r8,  [p0, #8]
-  st r8,  [p0, #12]
-  st r8,  [p0, #16]
-  st r8,  [p0, #20]
-  st r8,  [p0, #24]
-  st r8,  [p0, #28]
+  st r15,  [p0, #8]
+  st r15,  [p0, #12]
+  st r15,  [p0, #16]
+  st r15,  [p0, #20]
+  st r15,  [p0, #24]
+  st r15,  [p0, #28]
   nop
   vlda wl0, [p0, #0]
 
   // Upper half all zeros
-  st r8, [p0, #0]
-  st r8, [p0, #4]
-  st r8, [p0, #8]
-  st r8, [p0, #12]
-  st r8, [p0, #16]
-  st r8, [p0, #20]
-  st r8, [p0, #24]
-  st r8, [p0, #28]
+  st r15, [p0, #0]
+  st r15, [p0, #4]
+  st r15, [p0, #8]
+  st r15, [p0, #12]
+  st r15, [p0, #16]
+  st r15, [p0, #20]
+  st r15, [p0, #24]
+  st r15, [p0, #28]
   nop
   vlda wh0, [p0, #0]
 

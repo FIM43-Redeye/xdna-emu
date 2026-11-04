@@ -7,6 +7,16 @@ at the bit level, focusing on sub-bf16 mantissa bits [15:0].
 
 import struct
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from charz_suites import read_outputs, suite_input  # noqa: E402
+
+CASE = "bf16-subprec"
+# The kernel stores test i at i * TEST_STRIDE: 32 bytes SRS shift=16 then 32 bytes shift=0
+# (16 fp32 lanes of bml0), the rest of the 128-byte slot is not written.
+TEST_STRIDE = 128
+LANES = 16
 
 def reconstruct_fp32(hi16, lo16):
     """Reconstruct fp32 from SRS shift=16 (upper) and shift=0 (lower)."""
@@ -33,7 +43,7 @@ def analyze_test(test_num, input_data, hw_data, emu_data, config_name):
     print(f"{'='*70}")
 
     diffs = 0
-    for lane in range(8):  # bml0 has 8 fp32 lanes
+    for lane in range(LANES):  # bml0 has 16 fp32 lanes
         hw_fp32 = reconstruct_fp32(hw_hi[lane], hw_lo[lane])
         emu_fp32 = reconstruct_fp32(emu_hi[lane], emu_lo[lane])
 
@@ -72,53 +82,53 @@ def analyze_test(test_num, input_data, hw_data, emu_data, config_name):
             f_val = struct.unpack('f', struct.pack('I', hw_fp32))[0]
             print(f"  Lane {lane}: MATCH  0x{hw_fp32:08X} ({f_val:.6g})")
 
-    print(f"\n  Summary: {diffs} lanes differ out of 8")
+    print(f"\n  Summary: {diffs} lanes differ out of {LANES}")
     return diffs
 
+TEST_NAMES = [
+    "Dense 4x8x4 (config=0x1d) -- ISA-test failing input",
+    "Element-wise 16x2x1 (config=0x3d) -- same input",
+    "Dense 4x8x4 -- rounding boundary inputs",
+    "Dense 4x8x4 -- mixed-sign cancellation",
+]
+
+
+def input_offset(test: int) -> int:
+    """Tests 1 and 2 share the first input vector; tests 3 and 4 take the next two."""
+    return 0 if test < 2 else (test - 1) * 128
+
+
 def main():
-    if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} input.bin hw_output.bin emu_output.bin")
+    if len(sys.argv) < 3:
+        print(f"Usage: {sys.argv[0]} input.bin hw_output.bin emu_output.bin\n"
+              f"       {sys.argv[0]} --suite <suite_dir> <hw_tag> <emu_tag>")
         sys.exit(1)
 
-    with open(sys.argv[1], 'rb') as f:
-        input_data = f.read()
-    with open(sys.argv[2], 'rb') as f:
-        hw_output = f.read()
-    with open(sys.argv[3], 'rb') as f:
-        emu_output = f.read()
+    input_data = suite_input(sys.argv[1:], CASE)
+    outs = read_outputs(sys.argv[1:] if input_data is not None else sys.argv[2:], CASE)
+    if input_data is None:
+        input_data = Path(sys.argv[1]).read_bytes()
+    hw_output, emu_output = outs[0], outs[1]
 
     print(f"Input:  {len(input_data)} bytes")
     print(f"HW out: {len(hw_output)} bytes")
     print(f"EMU out: {len(emu_output)} bytes")
 
-    num_tests = len(input_data) // 128
-    test_names = [
-        "Dense 4x8x4 (config=0x1d) -- ISA-test failing input",
-        "Element-wise 16x2x1 (config=0x3d) -- same input",
-        "Dense 4x8x4 -- rounding boundary inputs",
-        "Dense 4x8x4 -- mixed-sign cancellation",
-    ]
-
     total_diffs = 0
-    for i in range(min(num_tests, len(hw_output) // 64)):
-        in_off = (i // 2) * 128 if i < 2 else (i - 1) * 128  # Tests 1&2 share input
-        hw_off = i * 64
-        emu_off = i * 64
-
-        config_name = test_names[i] if i < len(test_names) else f"Test {i+1}"
-
-        in_slice = input_data[in_off:in_off+128]
-        hw_slice = hw_output[hw_off:hw_off+64]
-        emu_slice = emu_output[emu_off:emu_off+64]
-
+    for i in range(len(TEST_NAMES)):
+        off = i * TEST_STRIDE
+        hw_slice, emu_slice = hw_output[off:off + 64], emu_output[off:off + 64]
         if len(hw_slice) < 64 or len(emu_slice) < 64:
             break
-
-        total_diffs += analyze_test(i + 1, in_slice, hw_slice, emu_slice, config_name)
+        in_off = input_offset(i)
+        total_diffs += analyze_test(i + 1, input_data[in_off:in_off + 128], hw_slice, emu_slice,
+                                    TEST_NAMES[i])
 
     print(f"\n{'='*70}")
     print(f"TOTAL: {total_diffs} differing lanes across all tests")
     print(f"{'='*70}")
+    return total_diffs
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(1 if main() else 0)

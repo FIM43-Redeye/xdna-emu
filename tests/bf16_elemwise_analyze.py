@@ -3,6 +3,8 @@
 
 Usage:
     python3 tests/bf16_elemwise_analyze.py <hw_output.bin> [emu_output.bin]
+    python3 tests/bf16_elemwise_analyze.py --suite <suite_dir> <hw_tag> [emu_tag]
+(the suite form reads runs/<tag>/bf16-elemwise/core.out.bin of a tools/charz_suites.py suite)
 
 Decodes the output from bf16_elemwise_characterizer.s to determine
 the A-side and B-side element permutation for variant=1 (config=0x3d)
@@ -23,7 +25,12 @@ Output layout (192 bytes):
 
 import struct
 import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from charz_suites import read_outputs  # noqa: E402
+
+CASE = "bf16-elemwise"
 
 # Sidon set: all pairwise sums are unique, all values are bf16-exact.
 SIDON = [1, 2, 4, 8, 13, 21, 31, 45, 66, 81, 97, 123, 148, 182,
@@ -31,6 +38,20 @@ SIDON = [1, 2, 4, 8, 13, 21, 31, 45, 66, 81, 97, 123, 148, 182,
          1080, 1288, 1456, 1640, 1896, 2032, 2400]
 
 assert len(SIDON) == 32
+
+
+def bf16_bits(val: float) -> int:
+    return struct.unpack(">I", struct.pack(">f", float(val)))[0] >> 16
+
+
+def bf16_pack(values) -> bytes:
+    return b"".join(struct.pack("<H", bf16_bits(v)) for v in values)
+
+
+def build_input() -> bytes:
+    """The 256-byte input: [Sidon][ones][ones][Sidon], each 32 bf16 values."""
+    sidon, ones = bf16_pack(SIDON), bf16_pack([1.0] * 32)
+    return sidon + ones + ones + sidon
 
 
 def reconstruct_fp32_lanes(data: bytes, hi_offset: int, lo_offset: int, count: int = 16) -> list[float]:
@@ -76,11 +97,11 @@ def find_sidon_pair(target: float) -> list[tuple[int, int]]:
 
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <hw_output.bin> [emu_output.bin]")
+        print(__doc__)
         sys.exit(1)
 
-    hw = open(sys.argv[1], "rb").read()
-    emu = open(sys.argv[2], "rb").read() if len(sys.argv) > 2 else None
+    outs = read_outputs(sys.argv[1:], CASE)
+    hw, emu = outs[0], (outs[1] if len(outs) > 1 else None)
 
     print("=" * 72)
     print("bf16 Element-Wise Characterizer Analysis")

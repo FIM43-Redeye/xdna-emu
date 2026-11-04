@@ -3,6 +3,7 @@
 
 Usage:
     python3 tests/vldb_4x_analyze.py <hw_output.bin> [emu_output.bin]
+    python3 tests/vldb_4x_analyze.py --suite <suite_dir> <hw_tag> [emu_tag]
 
 The characterizer (vldb_4x_characterizer.s) writes 8 test results to the
 output buffer. This script reads the output and compares against predicted
@@ -22,7 +23,12 @@ Output layout:
 
 import struct
 import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from charz_suites import read_outputs  # noqa: E402
+
+CASE = "vldb-4x"
 
 def fill_prng(n: int, seed: int = 42) -> bytes:
     """Deterministic PRNG matching test_host.cpp."""
@@ -59,16 +65,33 @@ def predict_gather(input_data: bytes, base_addr: int, addrs: list[int],
     return result
 
 
+def lut_lane_address(v: int, lane: int, align_mask: int) -> int:
+    """The silicon rule for one gather lane (src/interpreter/execute/memory/mod.rs, fitted by
+    the ldst-align probes): bits above 4 pass through, the low five bits are reduced to the
+    granule and halved, an odd lane sets bit 4 (the other 16-byte bank)."""
+    return (v & ~31) | (((v & 31) & align_mask) >> 1) | (0x10 if lane % 2 else 0)
+
+
+def predict_gather_lut(input_data: bytes, base_addr: int, addrs: list[int],
+                       align_mask: int) -> list[int]:
+    """Gather result under `lut_lane_address`: 8 bytes per lane, zero past the 16-byte row."""
+    result = []
+    for lane, v in enumerate(addrs):
+        eff = lut_lane_address(v, lane, align_mask & 0x1F)
+        row_end = (eff & ~15) + 16
+        chunk = bytes(input_data[a - base_addr] if 0 <= a - base_addr < len(input_data) and a < row_end
+                      else 0 for a in range(eff, eff + 8))
+        result.extend(struct.unpack("<2I", chunk))
+    return result
+
+
 def main():
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <hw_output.bin> [emu_output.bin]")
+        print(__doc__)
         sys.exit(1)
 
-    hw_path = sys.argv[1]
-    emu_path = sys.argv[2] if len(sys.argv) > 2 else None
-
-    hw = open(hw_path, "rb").read()
-    emu = open(emu_path, "rb").read() if emu_path else None
+    outs = read_outputs(sys.argv[1:], CASE)
+    hw, emu = outs[0], (outs[1] if len(outs) > 1 else None)
     input_data = fill_prng(256)
 
     # Test 7: address vector -- tells us the actual p0 base address
@@ -96,6 +119,7 @@ def main():
         hw_result = read_u32s(hw, out_off, 8)
         predicted = predict_gather(input_data, base_addr, addrs, align_mask)
         match = hw_result == predicted
+        lut = predict_gather_lut(input_data, base_addr, addrs, align_mask)
 
         print(f"--- {name} (align mask 0x{align_mask:08x}) ---")
         print(f"  Addresses:  {hex_words(addrs)}")
@@ -106,6 +130,7 @@ def main():
         print(f"  HW result:  {hex_words(hw_result)}")
         print(f"  Predicted:  {hex_words(predicted)}")
         print(f"  Match: {match}")
+        print(f"  Silicon LUT rule: {hex_words(lut)}  match: {hw_result == lut}")
 
         if not match:
             # Try to identify where each 64-bit chunk came from

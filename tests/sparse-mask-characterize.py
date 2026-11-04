@@ -21,12 +21,28 @@ Acc layout: lane = row*8 + col, so lanes 0-7 = row 0, lanes 8-15 = row 1, etc.
 import argparse
 import struct
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from charz_suites import read_outputs  # noqa: E402
+
+CASE = "sparse-mask"
 
 
 def analyze(path: str, label: str):
     with open(path, "rb") as f:
-        data = f.read()
+        report(f.read(), label)
 
+
+def active_inner_positions(data: bytes) -> list[list[int]]:
+    """Per mask pattern 0..15, the active inner positions of each of the 8 columns (row 0).
+
+    Every active position adds 0x10 * 0x10 >> 4 = 16 to the SRS output (see the module doc).
+    """
+    return [[v // 16 for v in struct.unpack_from("<8h", data, p * 64)] for p in range(16)]
+
+
+def report(data: bytes, label: str):
     if len(data) < 1024:
         print(f"ERROR: expected >= 1024 bytes, got {len(data)}")
         sys.exit(1)
@@ -60,6 +76,11 @@ def analyze(path: str, label: str):
         cols = " ".join(f"{v:4d}" for v in row0)
         print(f"{mask_str:>8s}  {cols}")
 
+    print()
+    print("=== Active inner positions per column (row 0 / 16) ===")
+    for p, cols in enumerate(active_inner_positions(data)):
+        print(f"0b{p:04b}  {cols}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sparse mask characterization")
@@ -67,7 +88,13 @@ if __name__ == "__main__":
                         help="(No longer needed -- kernel is self-contained)")
     parser.add_argument("--analyze-hw", metavar="PATH", help="Analyze HW output")
     parser.add_argument("--analyze-emu", metavar="PATH", help="Analyze EMU output")
+    parser.add_argument("--suite", nargs="+", metavar=("DIR", "TAG"),
+                        help="tools/charz_suites.py suite dir followed by the run tag(s) to analyze")
     args = parser.parse_args()
+
+    if args.suite:
+        for tag, data in zip(args.suite[1:], read_outputs(["--suite", *args.suite], CASE)):
+            report(data, tag)
 
     if args.gen_input:
         print("Input generation no longer needed (kernel constructs data internally)")
@@ -75,5 +102,5 @@ if __name__ == "__main__":
         analyze(args.analyze_hw, "Hardware")
     if args.analyze_emu:
         analyze(args.analyze_emu, "Emulator")
-    if not any([args.gen_input, args.analyze_hw, args.analyze_emu]):
+    if not any([args.gen_input, args.analyze_hw, args.analyze_emu, args.suite]):
         parser.print_help()
