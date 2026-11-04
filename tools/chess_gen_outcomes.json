@@ -1,0 +1,278 @@
+{
+ "bfloat16_to_int__v16bfloat16_uint6_t_uint5_t": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "concat_y_w__v16bfloat16_v16bfloat16_v16bfloat16_v16bfloat16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v16int16_v16int16_v16int16_v16int16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v16uint16_v16uint16_v16uint16_v16uint16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v32int8_v32int8_v32int8_v32int8": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v32uint8_v32uint8_v32uint8_v32uint8": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v4cfloat_v4cfloat_v4cfloat_v4cfloat": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v4cint32_v4cint32_v4cint32_v4cint32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v64int4_v64int4_v64int4_v64int4": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v64uint4_v64uint4_v64uint4_v64uint4": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v8cbfloat16_v8cbfloat16_v8cbfloat16_v8cbfloat16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v8cint16_v8cint16_v8cint16_v8cint16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v8float_v8float_v8float_v8float": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v8int32_v8int32_v8int32_v8int32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_w__v8uint32_v8uint32_v8uint32_v8uint32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v128int4_v128int4": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v128uint4_v128uint4": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v16cbfloat16_v16cbfloat16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v16cint16_v16cint16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v16float_v16float": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v16int32_v16int32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v16uint32_v16uint32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v32bfloat16_v32bfloat16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v32int16_v32int16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v32uint16_v32uint16": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v64int8_v64int8": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v64uint8_v64uint8": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v8cfloat_v8cfloat": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "concat_y_x__v8cint32_v8cint32": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid patterns'; no instruction forms a y register from these operands, for any element type"
+ },
+ "lsrs__v16acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "lsrs__v16acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "lsrs__v32acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "lsrs__v4cacc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "lsrs__v8acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "lsrs__v8cacc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "mcd_write__v16acc32_uint1_t": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "shiftl_elem__v8cint32_cint32_w64": {
+  "outcome": "internal-error",
+  "reason": "xchesscc aborts with 'Internal error: opn_type() : ISGoperation not found' (cint32 element shift): the header declares an operation Chess's own instruction table lacks"
+ },
+ "shiftr_elem__v8cint32_cint32_w64": {
+  "outcome": "internal-error",
+  "reason": "xchesscc aborts with 'Internal error: opn_type() : ISGoperation not found' (cint32 element shift): the header declares an operation Chess's own instruction table lacks"
+ },
+ "srs__v16accfloat_uint4_t_uint5_t": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "srs__v8caccfloat_uint4_t_uint5_t": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ssrs__v16acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ssrs__v32acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ssrs__v8cacc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "sticky_select__bool_uint1_t_uint1_t": {
+  "outcome": "no-instruction",
+  "reason": "Chess code selection: 'no valid assignments' (a status-register select primitive, not a callable operation)"
+ },
+ "ulsrs__v16acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ulsrs__v16acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ulsrs__v32acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ulsrs__v8acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2b__v16int16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2b__v16uint16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2b__v4cint32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2b__v8int32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2b__v8uint32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2c__v16int16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2c__v16uint16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2c__v32int8_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2c__v32uint8_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_w2c__v8cint16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_x2c__v16int32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_x2c__v16uint32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_x2c__v32int16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_x2c__v32uint16_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ups_x2c__v8cint32_uint6_t_uint1_t_uint1_t_uint2_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ussrs__v16acc64_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "ussrs__v32acc32_uint6_t_uint1_t_uint1_t_uint2_t_uint4_t_bool": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "vabs8__v64int8_uint1_t_uint5_t_mask64": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "vabs8__v64uint8_uint1_t_uint5_t_mask64": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "vadd8__v64int8_v64int8_uint1_t_uint5_t_mask64_mask64": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ },
+ "vadd8__v64uint8_v64uint8_uint1_t_uint5_t_mask64_mask64": {
+  "outcome": "no-instruction",
+  "reason": "me_primitive raw form: Chess code selection reports 'no valid patterns', also with every uintN_t operand a compile-time constant (310 constant combinations over the 39 such signatures, all rejected); only the user-level overloads have patterns"
+ }
+}

@@ -17,7 +17,7 @@ import argparse
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 # Add amd-unified-software site-packages for clang.cindex if needed.
@@ -28,6 +28,10 @@ if _clang_site.is_dir() and str(_clang_site) not in sys.path:
     sys.path.append(str(_clang_site))
 
 import clang.cindex
+
+from chess_preprocess import (
+    compiled_in_function_names, parse_emulated_accuracy, undefined_accuracy_variant,
+)
 
 
 
@@ -84,6 +88,10 @@ class ChessIntrinsic:
     storage_params: list[str]
     overload_index: int
     source_line: int
+    # clang diagnostics (errors) located in the declaration's signature. clang recovers from
+    # an unknown type name by substituting int, so without this an ISS-internal operation
+    # (v32w32, pmode_t, ...) is indistinguishable from a real int operation.
+    signature_errors: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +123,13 @@ def walk_ast(
     tu = index.parse(
         "chess_opns.cpp",
         unsaved_files=[("chess_opns.cpp", source)],
-        args=["-std=c++17", "-fsyntax-only"],
+        # clang stops reporting after 20 errors by default; the header has thousands.
+        args=["-std=c++17", "-fsyntax-only", "-ferror-limit=0"],
     )
+    errors_by_line: dict[int, list[str]] = {}
+    for d in tu.diagnostics:
+        if d.severity >= clang.cindex.Diagnostic.Error and d.location.line:
+            errors_by_line.setdefault(d.location.line, []).append(d.spelling)
 
     results: list[ChessIntrinsic] = []
     # Track how many overloads we have seen per (namespace, name) pair.
@@ -151,6 +164,16 @@ def walk_ast(
                     psize = max(0, ptype_obj.get_canonical().get_size())
                     params.append((ptype, psize, is_ref_output))
 
+            sig_first = cursor.extent.start.line
+            sig_last = cursor.extent.end.line
+            if is_inline:
+                # a definition: the signature ends where the body opens
+                brace = next((t for t in cursor.get_tokens() if t.spelling == "{"), None)
+                if brace is not None:
+                    sig_last = brace.location.line
+            sig_errors = [msg for n in range(sig_first, sig_last + 1)
+                          for msg in errors_by_line.get(n, [])]
+
             ann = annotations.get(name)
             props = list(ann.properties) if ann else []
             storage = list(ann.storage_params) if ann else []
@@ -170,6 +193,7 @@ def walk_ast(
                 storage_params=storage,
                 overload_index=ov_idx,
                 source_line=line,
+                signature_errors=sig_errors,
             ))
             return  # do not descend into function body
 
@@ -227,10 +251,24 @@ _SKIP_PROPERTY_WORDS = frozenset({
 })
 
 
-def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
+@dataclass(frozen=True)
+class HeaderFacts:
+    """What the other Chess headers say about the declarations in me_chess_opns.h."""
+
+    # function names me_chess_llvm.h declares (what Chess compiles against); None = unknown
+    compiled_in: frozenset[str] | None = None
+    # the <op>_<mode>_accuracy_<level> family me_vmult_float_emulated.h defines
+    accuracy_ops: frozenset[str] = frozenset()
+    accuracy_modes: frozenset[str] = frozenset()
+
+
+def classify_chess_intrinsic(i: ChessIntrinsic,
+                             facts: HeaderFacts | None = None) -> tuple[str, str]:
     """Decide whether to generate a test for *i*.
 
     Returns ``("generated", "")`` or ``("skipped", reason_str)``.
+
+    *facts* carries what the other Chess headers say (see HeaderFacts); None skips those checks.
 
     Skip criteria (in order):
     1. Any property word in *_SKIP_PROPERTY_WORDS*.
@@ -239,6 +277,20 @@ def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
     4. Any parameter with size <= 0.
     5. Name starts with a skip prefix.
     """
+    # 0. The declaration does not parse as written (unknown types: ISS-internal operations).
+    if i.signature_errors:
+        return ("skipped", f"unresolved declaration: {i.signature_errors[0]}")
+
+    if facts is not None:
+        if facts.compiled_in is not None and i.name not in facts.compiled_in:
+            return ("skipped", "not declared in me_chess_llvm.h (compiled out there, "
+                               "e.g. #if 0//not yet): Chess cannot call it")
+        if undefined_accuracy_variant(i.name, facts.accuracy_ops, facts.accuracy_modes):
+            return ("skipped", "declared //?? UNDEFINED and no vendor header or library "
+                               "defines it (me_vmult_float_emulated.h defines only "
+                               f"{'/'.join(sorted(facts.accuracy_ops))} for this mode): "
+                               "link fails with an undefined symbol")
+
     # 1. Property-based skip.
     for word in i.properties:
         if word in _SKIP_PROPERTY_WORDS:
@@ -323,7 +375,33 @@ def unique_name(taken: dict[str, str], name: str, namespace: str, code: str) -> 
 def _sanitize_dirname(name: str) -> str:
     """Replace characters that are problematic in filesystem paths."""
     # "unsigned char" -> "unsigned_char", etc.
-    return name.replace(" ", "_")
+    return name.replace(" ", "_").replace("::", "_")
+
+
+# ---------------------------------------------------------------------------
+# Immediate operands and recorded Chess verdicts
+# ---------------------------------------------------------------------------
+
+OUTCOMES_PATH = Path(__file__).with_name("chess_gen_outcomes.json")
+
+# What Chess did with a signature when it was compiled:
+#   no-instruction  no instruction implements this signature, with constants either
+#   internal-error  Chess's own instruction table lacks an operation its header declares
+OUTCOME_KINDS = ("no-instruction", "internal-error")
+
+
+def load_outcomes(path: Path) -> dict[str, tuple[str, str]]:
+    """Read the recorded Chess verdicts: {case name: (outcome, reason)}."""
+    import json
+    raw = json.loads(Path(path).read_text())
+    out = {}
+    for name, entry in raw.items():
+        if entry.get("outcome") not in OUTCOME_KINDS:
+            raise ValueError(f"{name}: outcome must be one of {OUTCOME_KINDS}")
+        if not entry.get("reason", "").strip():
+            raise ValueError(f"{name}: a recorded verdict needs a reason")
+        out[name] = (entry["outcome"], entry["reason"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +472,7 @@ def generate_chess_kernel_cc(
     call_args = []
     in_idx = 0
     ref_idx = 0
-    for _idx, (_ptype, _psize, is_ref) in enumerate(params):
+    for idx, (ptype, _psize, is_ref) in enumerate(params):
         if is_ref:
             call_args.append(ref_outputs[ref_idx][0])
             ref_idx += 1
@@ -440,12 +518,27 @@ class SkippedChessIntrinsic:
     name: str
     namespace: str
     reason: str
+    case: str = ""   # the case name the declaration would have had (overloads share `name`)
+
+
+def header_facts(opns_path: str, llvm_path: str | None = None) -> HeaderFacts:
+    """Read the sibling Chess headers the classifier needs; missing files leave a check off."""
+    opns = Path(opns_path)
+    llvm = Path(llvm_path) if llvm_path else opns.with_name("me_chess_llvm.h")
+    compiled_in = (frozenset(compiled_in_function_names(llvm.read_text()))
+                   if llvm.is_file() else None)
+    emulated = opns.parent.parent / "me_vmult_float_emulated.h"
+    ops, modes = (parse_emulated_accuracy(emulated.read_text())
+                  if emulated.is_file() else (set(), set()))
+    return HeaderFacts(compiled_in, frozenset(ops), frozenset(modes))
 
 
 def collect_chess_kernels(
     opns_path: str,
     types_path: str,
     iss_types_path: str | None = None,
+    llvm_path: str | None = None,
+    outcomes_path: str | Path | None = None,
 ) -> tuple[list[tuple[GeneratedChessTest, str]], list[SkippedChessIntrinsic]]:
     """Full pipeline: stubs -> preprocess -> walk -> filter -> generate kernel text.
 
@@ -460,25 +553,35 @@ def collect_chess_kernels(
         comments are parsed and merged with chessTraitsOf types.  ISS fills
         gaps only -- chessTraitsOf takes precedence via ``setdefault``.
 
+    llvm_path:
+        Path to me_chess_llvm.h, the header Chess compiles against (default: beside
+        *opns_path*); declarations it does not carry are skipped. The emulation header
+        me_vmult_float_emulated.h (one directory up) is read the same way.
+
+    outcomes_path:
+        Recorded Chess verdicts (OUTCOMES_PATH by default; "" for none).
+
     Returns
     -------
     ([(test, kernel.cc text)], skipped).
     """
     # Import here rather than at module top to keep the dependency optional
     # when running unit tests that do not need the full pipeline.
-    from chess_type_stubs import parse_all_types, generate_stub_header
+    from chess_type_stubs import parse_all_types, parse_types_header, generate_stub_header
     from chess_preprocess import preprocess_chess_header
 
     types_text = Path(types_path).read_text()
     iss_text = Path(iss_types_path).read_text() if iss_types_path else None
     traits = parse_all_types(types_text, iss_text)
-    stubs = generate_stub_header(traits)
+    _native_traits, aliases = parse_types_header(types_text)
+    stubs = generate_stub_header(traits, aliases)
 
     opns_text = Path(opns_path).read_text()
     clean, annotations = preprocess_chess_header(opns_text)
 
     combined = stubs + "\n" + clean
     intrinsics = walk_ast(combined, annotations)
+    facts = header_facts(opns_path, llvm_path)
 
     kernels: list[tuple[GeneratedChessTest, str]] = []
     skipped: list[SkippedChessIntrinsic] = []
@@ -486,15 +589,20 @@ def collect_chess_kernels(
     # Types that xchesscc knows natively: chessTraitsOf types + C builtins.
     # Functions using types outside this set (ISS-internal types like w32,
     # mmode_t, pmode_t) cannot be compiled by xchesscc and are skipped.
-    from chess_type_stubs import BUILTIN_C_TYPES, parse_chess_traits
-    chess_native_types = set(parse_chess_traits(types_text).keys()) | BUILTIN_C_TYPES
+    from chess_type_stubs import BUILTIN_C_TYPES
+    chess_native_types = set(_native_traits) | set(aliases) | BUILTIN_C_TYPES
+
+    outcomes = load_outcomes(OUTCOMES_PATH) if outcomes_path is None else (
+        load_outcomes(outcomes_path) if outcomes_path else {})
+
+    def skip(i: ChessIntrinsic, reason: str) -> None:
+        skipped.append(SkippedChessIntrinsic(
+            name=i.name, namespace=i.namespace, reason=reason, case=dir_name(i)))
 
     for i in intrinsics:
-        status, reason = classify_chess_intrinsic(i)
+        status, reason = classify_chess_intrinsic(i, facts)
         if status == "skipped":
-            skipped.append(SkippedChessIntrinsic(
-                name=i.name, namespace=i.namespace, reason=reason,
-            ))
+            skip(i, reason)
             continue
 
         # Skip functions using ISS-internal types that xchesscc cannot
@@ -505,36 +613,33 @@ def collect_chess_kernels(
         iss_only = [t for t in all_types
                     if t not in chess_native_types and t != "void"]
         if iss_only:
-            skipped.append(SkippedChessIntrinsic(
-                name=i.name, namespace=i.namespace,
-                reason=f"ISS-internal type(s): {', '.join(sorted(set(iss_only)))}",
-            ))
+            skip(i, f"ISS-internal type(s): {', '.join(sorted(set(iss_only)))}")
             continue
 
         dname = dir_name(i)
+        verdict = outcomes.get(dname)
+        if verdict:
+            skip(i, f"{verdict[0]}: {verdict[1]}")
+            continue
 
-        # Compute buffer sizes (ref outputs excluded from input, included in output).
+        # Buffer sizes: ref outputs are not inputs but are outputs.
         in_size = sum(psize for _, psize, is_ref in i.params if not is_ref)
-        ref_out_sizes = sum(psize for _, psize, is_ref in i.params if is_ref)
-        out_size = i.return_size + ref_out_sizes
+        out_size = i.return_size + sum(psize for _, psize, is_ref in i.params if is_ref)
         # Minimum 4 bytes for each buffer (at least one i32 slot).
         in_size = max(4, in_size)
         out_size = max(4, out_size)
 
         # kernel.cc text (Chess-native calling convention).
-        kernel_code = generate_chess_kernel_cc(
-            i.name, i.namespace, i.return_type, i.params,
-        )
+        kernel_code = generate_chess_kernel_cc(i.name, i.namespace, i.return_type, i.params)
 
-        dname = unique_name(dict((g.name, code) for g, code in kernels), dname,
-                            i.namespace, kernel_code)
-        if dname is None:
-            skipped.append(SkippedChessIntrinsic(
-                name=i.name, namespace=i.namespace, reason="duplicate declaration"))
+        case_name = unique_name(dict((g.name, code) for g, code in kernels), dname,
+                                i.namespace, kernel_code)
+        if case_name is None:
+            skip(i, "duplicate declaration")
             continue
 
         kernels.append((GeneratedChessTest(
-            name=dname,
+            name=case_name,
             func_name=i.name,
             namespace=i.namespace,
             in_size=in_size,
@@ -545,13 +650,15 @@ def collect_chess_kernels(
 
 
 def generate_suite(opns_path: str, types_path: str, suite_dir: str,
-                   iss_types_path: str | None = None, *, seed: int = 42) -> tuple[int, int]:
+                   iss_types_path: str | None = None, *, seed: int = 42,
+                   outcomes_path: str | Path | None = None) -> tuple[int, int]:
     """Write the Chess instruction-test suite (one case per intrinsic) for the suite runner.
 
     Returns (generated, skipped) counts. Never calls a compiler or XRT.
     """
     from cxx_suite import CxxKernel, write_cxx_suite
-    kernels, skipped = collect_chess_kernels(opns_path, types_path, iss_types_path)
+    kernels, skipped = collect_chess_kernels(
+        opns_path, types_path, iss_types_path, outcomes_path=outcomes_path)
     write_cxx_suite(
         suite_dir, "instr-chess", "chess-test-gen.py", "chess",
         [CxxKernel(g.name, code, g.in_size, g.out_size,
@@ -584,12 +691,17 @@ def main() -> None:
         default=None,
         help="Path to me_iss_types.h for additional ISS type coverage (optional)",
     )
+    parser.add_argument(
+        "--outcomes", default=None,
+        help="recorded Chess verdicts (default: tools/chess_gen_outcomes.json)",
+    )
     parser.add_argument("--suite-dir", required=True, help="Suite directory to write")
     parser.add_argument("--seed", type=int, default=42, help="input PRNG seed")
     args = parser.parse_args()
 
     n, n_skipped = generate_suite(args.opns_header, args.types_header, args.suite_dir,
-                                  iss_types_path=args.iss_types_header, seed=args.seed)
+                                  iss_types_path=args.iss_types_header, seed=args.seed,
+                                  outcomes_path=args.outcomes)
     print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
 
 

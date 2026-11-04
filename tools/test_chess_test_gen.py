@@ -445,6 +445,191 @@ v16acc64 mul_2x8_8x8(v32int16 a, int sgn_x, v64uint8 b, int sgn_y);
         assert intrinsics[0].return_size == 0
 
 
+class TestSignatureErrors:
+    """clang recovers from an unknown type name by substituting int; the walker must not
+    let that pass for a real signature (it made ISS-internal ops look like int ops)."""
+
+    def test_unknown_param_type_is_recorded(self):
+        src = "int prom(v32w32, int);\n"
+        (i,) = chess_test_gen.walk_ast(src, {})
+        assert i.signature_errors and "v32w32" in i.signature_errors[0]
+
+    def test_unknown_return_type_is_recorded(self):
+        src = "namespace me_primitive {\nstruct dint2 { char c[8]; };\n}\nme_primitive::dint f(int);\n"
+        (i,) = chess_test_gen.walk_ast(src, {})
+        assert i.signature_errors
+
+    def test_multiline_signature(self):
+        src = "int\nprom(int,\n   v32w32);\n"
+        (i,) = chess_test_gen.walk_ast(src, {})
+        assert i.signature_errors
+
+    def test_error_in_body_is_not_a_signature_error(self):
+        src = "struct s { char c[4]; };\ninline s g(int a)\n{\n  bogus_t x;\n  return s();\n}\n"
+        (i,) = chess_test_gen.walk_ast(src, {})
+        assert i.signature_errors == []
+
+    def test_clean_declaration_has_none(self):
+        (i,) = chess_test_gen.walk_ast("int f(int);\n", {})
+        assert i.signature_errors == []
+
+    def test_error_limit_does_not_hide_later_declarations(self):
+        # clang stops reporting after 20 errors by default
+        src = "\n".join(f"int f{n}(bad_t{n});" for n in range(40)) + "\n"
+        assert all(i.signature_errors for i in chess_test_gen.walk_ast(src, {}))
+
+    def test_classifier_skips_with_reason(self):
+        i = TestChessFilter()._make()
+        i.signature_errors = ["unknown type name 'v32w32'"]
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped" and "v32w32" in reason
+
+
+class TestScalarTypeDecls:
+    """Scalar types that chessTraitsOf does not cover (bfloat16 is commented out there) are
+    declared as `class T; // property(...)` in the types header."""
+
+    def test_bit_property_with_trailing_words(self):
+        text = "class bfloat16; // property( 16 bit /*sign_magnitude*/ 8 exp_bits );"
+        assert parse_iss_property_comments(text)["bfloat16"] == 16
+
+    def test_complex_of_c_type(self):
+        text = "class cint16; // property( complex short );\nclass cfloat; // property( complex float );"
+        t = parse_iss_property_comments(text)
+        assert t["cint16"] == 32 and t["cfloat"] == 64
+
+    def test_complex_of_declared_type(self):
+        text = ("class bfloat16; // property( 16 bit sign_magnitude );\n"
+                "class cbfloat16; // property( complex bfloat16 );")
+        assert parse_iss_property_comments(text)["cbfloat16"] == 32
+
+    def test_namespaced_struct_and_alias(self):
+        from chess_type_stubs import parse_namespaced_structs, parse_type_aliases, generate_stub_header
+        text = """namespace me_primitive {
+    struct dint chess_property(keep_in_registers) {
+        unsigned low;
+        int high;
+        typedef VBit<64, false> BitType;
+        inline dint(int, unsigned);
+    };
+}
+typedef struct me_primitive::dint float64;
+"""
+        assert parse_namespaced_structs(text) == {"me_primitive::dint": 64}
+        assert parse_type_aliases(text) == {"float64": "me_primitive::dint"}
+        h = generate_stub_header({"me_primitive::dint": 64}, {"float64": "me_primitive::dint"})
+        assert "namespace me_primitive { struct dint { char _data[8]; }; }" in h
+        assert "typedef me_primitive::dint float64;" in h
+
+
+class TestCompiledIn:
+    """Chess compiles me_chess_llvm.h, not me_chess_opns.h; the operations it parks under
+    `#if 0//not yet` have no callable declaration."""
+
+    def test_if_zero_region_is_dropped(self):
+        from chess_preprocess import compiled_in_function_names
+        text = "int a(int);\n#if 0//not yet\nint b(int);\n#endif\nint c(int);\n"
+        assert compiled_in_function_names(text) == {"a", "c"}
+
+    def test_nested_region_stays_dropped(self):
+        from chess_preprocess import compiled_in_function_names
+        text = "#if 0\n#ifdef X\nint b(int);\n#endif\nint d(int);\n#endif\nint c(int);\n"
+        assert compiled_in_function_names(text) == {"c"}
+
+    def test_else_of_if_zero_is_live(self):
+        from chess_preprocess import compiled_in_function_names
+        text = "#if 0\nint a(int);\n#else\nint b(int);\n#endif\n"
+        assert compiled_in_function_names(text) == {"b"}
+
+    def test_c_only_region_is_dropped(self):
+        from chess_preprocess import compiled_in_function_names
+        text = "#ifndef __cplusplus\nint a(int);\n#endif\n#ifdef __cplusplus\nint b(int);\n#endif\n"
+        assert compiled_in_function_names(text) == {"b"}
+
+    def test_unknown_condition_keeps_both_sides(self):
+        from chess_preprocess import compiled_in_function_names
+        text = "#ifdef FOO\nint a(int);\n#else\nint b(int);\n#endif\n"
+        assert compiled_in_function_names(text) == {"a", "b"}
+
+    def test_hidden_operation_is_skipped_with_reason(self):
+        i = TestChessFilter()._make(name="int32_to_float64")
+        H = chess_test_gen.HeaderFacts
+        status, reason = chess_test_gen.classify_chess_intrinsic(i, H(frozenset({"abs"})))
+        assert status == "skipped" and "me_chess_llvm.h" in reason
+        status, _ = chess_test_gen.classify_chess_intrinsic(i, H(frozenset({"int32_to_float64"})))
+        assert status == "generated"
+
+
+class TestUndefinedAccuracyVariants:
+    EMULATED = """
+#define _MUL_MAC_TYPE(RET, DATAX, DATAY, MODE, TYPE)  \\
+  _INLINE inline RET mul_##MODE##_accuracy_##TYPE(DATAX v1, DATAY v2) { return 0; }  \\
+  _INLINE inline RET mac_##MODE##_accuracy_##TYPE(DATAX v1, DATAY v2, RET acc) { return 0; }  \\
+  _INLINE inline RET msc_##MODE##_accuracy_##TYPE(DATAX v1, DATAY v2, RET acc) { return 0; }
+#define _INSTANTIATE_ACCURACY(ACCURACY)  \\
+  _MUL_MAC_TYPE(v16accfloat, v16float, v16float, elem_16, ACCURACY)  \\
+  _MUL_MAC_TYPE(v16accfloat, v32float, v32float, 4x8_8x4, ACCURACY)
+_INSTANTIATE_ACCURACY(low)
+"""
+
+    def test_parse(self):
+        from chess_preprocess import parse_emulated_accuracy
+        assert parse_emulated_accuracy(self.EMULATED) == (
+            {"mul", "mac", "msc"}, {"elem_16", "4x8_8x4"})
+
+    def test_classification(self):
+        from chess_preprocess import parse_emulated_accuracy, undefined_accuracy_variant as u
+        ops, modes = parse_emulated_accuracy(self.EMULATED)
+        assert u("negmul_elem_16_accuracy_low", ops, modes)
+        assert u("addmsc_4x8_8x4_accuracy_safe", ops, modes)
+        assert not u("mac_elem_16_accuracy_fast", ops, modes)
+        assert not u("negmul_elem_8_accuracy_low", ops, modes)   # another mode: not ours to judge
+        assert not u("negmul_elem_16", ops, modes)
+
+    def test_skipped_with_reason(self):
+        i = TestChessFilter()._make(name="negmul_elem_16_accuracy_low")
+        f = chess_test_gen.HeaderFacts(None, frozenset({"mul"}), frozenset({"elem_16"}))
+        status, reason = chess_test_gen.classify_chess_intrinsic(i, f)
+        assert status == "skipped" and "UNDEFINED" in reason
+
+
+class TestRecordedOutcomes:
+    """Chess's verdict on a signature (no instruction, internal error) can
+    only be learned by compiling it; the verdicts live in a checked-in file."""
+
+    def test_load_outcomes(self, tmp_path):
+        f = tmp_path / "o.json"
+        f.write_text('{"a__int": {"outcome": "no-instruction", "reason": "r"}}')
+        assert chess_test_gen.load_outcomes(f) == {"a__int": ("no-instruction", "r")}
+
+    def test_unknown_outcome_rejected(self, tmp_path):
+        f = tmp_path / "o.json"
+        f.write_text('{"a": {"outcome": "bogus", "reason": "r"}}')
+        with pytest.raises(ValueError):
+            chess_test_gen.load_outcomes(f)
+
+    def test_reason_required(self, tmp_path):
+        f = tmp_path / "o.json"
+        f.write_text('{"a": {"outcome": "no-instruction", "reason": ""}}')
+        with pytest.raises(ValueError):
+            chess_test_gen.load_outcomes(f)
+
+    def test_shipped_file_is_valid(self):
+        chess_test_gen.load_outcomes(chess_test_gen.OUTCOMES_PATH)
+
+    def test_every_shipped_verdict_is_applied(self):
+        """A verdict naming no declaration is stale (the generator renamed or dropped it)."""
+        from pathlib import Path
+        isg = chess_test_gen._npu_work / "amd-unified-software/aietools/data/aie_ml/lib/isg"
+        if not (isg / "me_chess_opns.h").exists():
+            pytest.skip("aietools not available")
+        kernels, skipped = chess_test_gen.collect_chess_kernels(
+            str(isg / "me_chess_opns.h"), str(isg / "me_chess_types.h"))
+        applied = {s.case for s in skipped if s.reason.split(":")[0] in chess_test_gen.OUTCOME_KINDS}
+        recorded = set(chess_test_gen.load_outcomes(chess_test_gen.OUTCOMES_PATH))
+        assert recorded == applied
+
+
 class TestChessReferenceParams:
     """Tests for reference output parameters, memcpy buffer access, and pointer skipping."""
 

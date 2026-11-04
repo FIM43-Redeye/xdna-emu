@@ -51,8 +51,23 @@ _BITS_SIZEOF = re.compile(
 
 # Matches: class NAME; // property( N bit [un]signed );
 _ISS_SCALAR = re.compile(
-    r'class\s+(\w+)\s*;\s*//\s*property\(\s*(\d+)\s+bit\s+(?:un)?signed\s*\)'
+    r'class\s+(\w+)\s*;\s*//\s*property\(\s*(\d+)\s+bit\b'
 )
+
+# Matches: class NAME; // property( complex ELEM );  (two ELEMs)
+_ISS_COMPLEX = re.compile(
+    r'class\s+(\w+)\s*;\s*//\s*property\(\s*complex\s+(\w+)\s*\)'
+)
+
+# Target widths of the C types a complex property can be built from.
+_C_ELEMENT_BITS = {"short": 16, "int": 32, "float": 32, "char": 8, "long long": 64}
+
+# `namespace NS { struct T ... { unsigned low; int high; ... }; }` and `typedef struct NS::T A;`
+_NS_STRUCT = re.compile(
+    r'namespace\s+(\w+)\s*\{\s*struct\s+(\w+)[^{;]*\{(.*?)\n\s*\};', re.DOTALL)
+_STRUCT_MEMBER = re.compile(r'^\s*(unsigned|int|short|unsigned short|float)\s+\w+\s*;', re.MULTILINE)
+_TYPE_ALIAS = re.compile(r'^typedef\s+struct\s+([\w:]+)\s+(\w+)\s*;', re.MULTILINE)
+_MEMBER_BITS = {"unsigned": 32, "int": 32, "short": 16, "unsigned short": 16, "float": 32}
 
 # Matches: class NAME; // property( vector ELEM[COUNT] );
 _ISS_VECTOR = re.compile(
@@ -76,6 +91,13 @@ def parse_iss_property_comments(text: str) -> dict[str, int]:
     for m in _ISS_SCALAR.finditer(text):
         name, bits = m.group(1), int(m.group(2))
         types[name] = bits
+
+    # Complex scalars are two elements of a C type or of an already-sized type.
+    for m in _ISS_COMPLEX.finditer(text):
+        name, elem = m.group(1), m.group(2)
+        bits = _C_ELEMENT_BITS.get(elem, types.get(elem))
+        if bits is not None:
+            types[name] = 2 * bits
 
     # Second pass: resolve vector types.
     unresolved: list[tuple[str, str, int]] = []
@@ -102,15 +124,48 @@ def parse_iss_property_comments(text: str) -> dict[str, int]:
     return types
 
 
+def parse_namespaced_structs(text: str) -> dict[str, int]:
+    """Parse plain structs declared inside a namespace, returning {"ns::T": bits}.
+
+    Only the data members count (the BitType typedef and constructors do not); a struct with
+    a member of a type outside _MEMBER_BITS is left out rather than guessed at.
+    """
+    out: dict[str, int] = {}
+    for m in _NS_STRUCT.finditer(text):
+        members = [mm.group(1) for mm in _STRUCT_MEMBER.finditer(m.group(3))]
+        if members:
+            out[f"{m.group(1)}::{m.group(2)}"] = sum(_MEMBER_BITS[t] for t in members)
+    return out
+
+
+def parse_type_aliases(text: str) -> dict[str, str]:
+    """Parse `typedef struct NS::T Alias;` lines, returning {Alias: "NS::T"}."""
+    return {m.group(2): m.group(1) for m in _TYPE_ALIAS.finditer(text)}
+
+
+def parse_types_header(types_text: str) -> tuple[dict[str, int], dict[str, str]]:
+    """Every type the Chess types header itself defines: ({name: bits}, {alias: target}).
+
+    chessTraitsOf covers most; `class T; // property(...)` declarations fill the scalars it
+    leaves out (bfloat16, the complex types); plain structs in a namespace (dint) and the
+    typedefs naming them (float64) come from their definitions.
+    """
+    traits = parse_chess_traits(types_text)
+    for name, bits in parse_iss_property_comments(types_text).items():
+        traits.setdefault(name, bits)
+    traits.update(parse_namespaced_structs(types_text))
+    return traits, parse_type_aliases(types_text)
+
+
 def parse_all_types(
     types_text: str,
     iss_text: str | None = None,
 ) -> dict[str, int]:
-    """Parse chessTraitsOf types and optionally merge ISS property types.
+    """Parse the Chess types header and optionally merge ISS property types.
 
-    ISS types fill gaps only -- chessTraitsOf takes precedence.
+    ISS types fill gaps only -- the types header takes precedence.
     """
-    traits = parse_chess_traits(types_text)
+    traits, _aliases = parse_types_header(types_text)
     if iss_text is not None:
         iss_types = parse_iss_property_comments(iss_text)
         for name, bits in iss_types.items():
@@ -172,7 +227,7 @@ def parse_chess_traits(text: str) -> dict[str, int]:
     return traits
 
 
-def generate_stub_header(traits: dict[str, int]) -> str:
+def generate_stub_header(traits: dict[str, int], aliases: dict[str, str] | None = None) -> str:
     """Generate a C header with sized struct stubs for each Chess type.
 
     Built-in C types (int, float, etc.) are skipped because the compiler
@@ -197,7 +252,15 @@ def generate_stub_header(traits: dict[str, int]) -> str:
         # Round up to at least 1 byte; most types are byte-aligned but
         # ISS types like u1 (1 bit) and pmode_t (26 bits) are not.
         byte_size = max(1, (bits + 7) // 8)
-        lines.append(f"struct {type_name} {{ char _data[{byte_size}]; }};  // {bits} bits")
+        if "::" in type_name:
+            ns, bare = type_name.rsplit("::", 1)
+            lines.append(f"namespace {ns} {{ struct {bare} {{ char _data[{byte_size}]; }}; }}"
+                         f"  // {bits} bits")
+        else:
+            lines.append(f"struct {type_name} {{ char _data[{byte_size}]; }};  // {bits} bits")
+
+    for alias, target in sorted((aliases or {}).items()):
+        lines.append(f"typedef {target} {alias};")
 
     lines.append("")
     return "\n".join(lines)

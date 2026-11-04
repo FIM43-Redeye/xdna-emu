@@ -133,7 +133,7 @@ AIE2 only) because aiecc links per package. The entry symbol is renamed at compi
 | Accumulator collisions (single core, and cascade on two cores) | `tools/gen_collision_probe.py generate <dir>`, `tools/gen_cascade_collision_probe.py <dir>`; older probe directories convert with `tools/probe_to_suite.py` | `tools/analyze_collision_probe.py check\|report\|summary <dir> [hw emu]`, `tools/collision_points.py`, `tools/diff_probe_points.py <dir> <hw> <emu>` |
 | Load/store alignment | `tools/gen_ldst_align_probe.py generate <dir>` | the analysis functions in the same file (`# -- analysis` section; a pure function of a case's output bytes) |
 | C++ intrinsics, Peano (76 cases) | `tools/instr-test-gen.py --td <llvm-aie>/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <dir>` | EMU against HW with `suite compare` |
-| C++ intrinsics, Chess (4234 cases) | `tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h --types-header .../me_chess_types.h [--iss-types-header .../me_iss_types.h] --suite-dir <dir>` | EMU against HW with `suite compare` |
+| C++ intrinsics, Chess (~3770 cases) | `tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h --types-header .../me_chess_types.h [--iss-types-header .../me_iss_types.h] --suite-dir <dir>` | EMU against HW with `suite compare` |
 | Shuffle network sweep (one Chess case) | `tests/shuffle-sweep/gen_suite.py <dir>` | `tests/shuffle-sweep/analyze.py <dir>/runs/<tag>/shuffle-sweep/core.out.bin` |
 | Characterizers (`tests/*.s`: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*), five cases | `tools/charz_suites.py <dir>` | `python3 tests/<name>.py --suite <dir> r1 [e1]` |
 
@@ -141,7 +141,10 @@ Chess compiles at about 6 s of wall per case at `-j16` (xchesscc runs twice per 
 the Chess suite in slices with `--only`. `XDNA_EMU_CHESS_WRAPPER="<command> [args]"` prefixes
 every Chess invocation (the `xchesscc_wrapper` compile and the Chess package's aiecc) with a
 launcher such as a compile cache or server; it must run the command unchanged, and it is not
-part of the package's inputs hash. Some Chess cases do not compile; the Peano `*_conf` MAC
+part of the package's inputs hash. Every declaration in `me_chess_opns.h` either builds or is
+listed with a reason in the suite's `meta.skipped` (the generator reads `me_chess_llvm.h` and
+`me_vmult_float_emulated.h` to drop declarations Chess cannot call; Chess verdicts that only a
+compile can reveal are recorded in `tools/chess_gen_outcomes.json`). The Peano `*_conf` MAC
 intrinsics take a random configuration word, which the emulator models in full
 ([mac-conf](../fidelity-gaps/mac-conf.md)).
 

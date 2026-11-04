@@ -179,3 +179,68 @@ def preprocess_chess_header(text: str) -> tuple[str, dict[str, ChessAnnotation]]
     text = re.sub(r'\bVBITzCONSTEXPR\b', 'inline', text)
 
     return text, annotations
+
+
+_CONDITIONAL = re.compile(r'#\s*(if|ifdef|ifndef|else|elif|endif)\b(.*)')
+
+
+def compiled_in_text(text: str) -> str:
+    """The part of a Chess C++ header that a C++ compile actually sees.
+
+    Drops `#if 0 ... #endif` regions (the generator parks not-yet-supported operations
+    there: `#if 0//not yet`) and `#ifndef __cplusplus` regions. Every other conditional is
+    kept on both sides: over-approximating the visible text only ever keeps a declaration.
+    """
+    out: list[str] = []
+    # frame: [branch is live, the opening condition is statically false]
+    stack: list[list[bool]] = []
+    for line in text.split('\n'):
+        m = _CONDITIONAL.match(line.strip())
+        if m:
+            directive = m.group(1)
+            arg = re.sub(r'/\*.*?\*/|//.*', '', m.group(2)).strip()
+            if directive in ('if', 'ifdef', 'ifndef'):
+                static_false = ((directive == 'if' and arg == '0')
+                                or (directive == 'ifndef' and arg == '__cplusplus'))
+                stack.append([not static_false, static_false])
+            elif directive == 'else' and stack:
+                # only the else of a statically-false condition becomes live, and an
+                # unknown condition stays live on both sides
+                stack[-1][0] = True
+            elif directive == 'elif' and stack:
+                stack[-1][0] = True
+            elif directive == 'endif' and stack:
+                stack.pop()
+            continue
+        if all(frame[0] for frame in stack):
+            out.append(line)
+    return '\n'.join(out)
+
+
+def compiled_in_function_names(text: str) -> set[str]:
+    """Every identifier followed by `(` in the compiled-in part of the header."""
+    return set(re.findall(r'\b(\w+)\s*\(', compiled_in_text(text)))
+
+
+def parse_emulated_accuracy(text: str) -> tuple[set[str], set[str]]:
+    """What me_vmult_float_emulated.h defines for the `<op>_<mode>_accuracy_<level>` family.
+
+    The header builds the family from a macro, `_MUL_MAC_TYPE(RET, X, Y, MODE, level)`: its
+    body names the operations it defines (`mul_##MODE##_accuracy_##TYPE`), and each use
+    names a mode. Returns ({operations}, {modes}). me_chess_opns.h declares more operations
+    per mode than the macro defines (negmul, addmac, addmsc), marked `//?? UNDEFINED`.
+    """
+    macro = re.search(r'#define _MUL_MAC_TYPE\(.*?\)(.*?)(?=\n#(?:if|undef|define|endif)|\n_INSTANTIATE)',
+                      text, re.DOTALL)
+    ops = set(re.findall(r'\binline\s+\w+\s+(\w+?)_##MODE##_accuracy_##TYPE\(',
+                         macro.group(1))) if macro else set()
+    modes = set(re.findall(r'_MUL_MAC_TYPE\(\s*\w+\s*,\s*\w+\s*,\s*\w+\s*,\s*(\w+)\s*,\s*ACCURACY\s*\)',
+                           text))
+    return ops, modes
+
+
+def undefined_accuracy_variant(name: str, ops: set[str], modes: set[str]) -> bool:
+    """True when *name* is `<op>_<mode>_accuracy_<level>` for an emulated mode but an
+    operation the emulation header does not define."""
+    m = re.fullmatch(r'(\w+?)_(\w+)_accuracy_(?:low|fast|safe)', name)
+    return bool(m) and m.group(2) in modes and m.group(1) not in ops
