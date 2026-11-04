@@ -2609,7 +2609,7 @@ mod tests {
 
     #[test]
     fn peek_bank_demand_does_not_mutate_context_and_reports_banks() {
-        let (exec, bundle, ctx) = fixture_scalar_load_at(0x0410);
+        let (exec, bundle, ctx) = fixture_scalar_load_at(0x70410);
         let before_pc = ctx.pc();
         let before_cycles = ctx.cycles;
 
@@ -2652,7 +2652,7 @@ mod tests {
         // NOT skip vector ops.
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(0, 0x400);
+        ctx.pointer.write(0, 0x70400);
 
         let mut load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
             .with_mem_width(MemWidth::Vector256)
@@ -2696,7 +2696,7 @@ mod tests {
     fn peek_bank_demand_covers_store_ops() {
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(1, 0x0410);
+        ctx.pointer.write(1, 0x70410);
         ctx.scalar.write(0, 0xDEADBEEF);
 
         let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
@@ -2733,8 +2733,8 @@ mod tests {
         // 16-byte word (0x400..0x40F) -> physical bank 0 for both.
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(0, 0x400); // load address
-        ctx.pointer.write(1, 0x404); // store address -- same physical bank
+        ctx.pointer.write(0, 0x70400); // load address
+        ctx.pointer.write(1, 0x70404); // store address -- same physical bank
         ctx.scalar.write(2, 0xDEADBEEF);
 
         let bundle = make_bundle(vec![
@@ -2778,8 +2778,8 @@ mod tests {
         // ports issuing in the same cycle.
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(0, 0x400); // load address -> physical bank 0
-        ctx.pointer.write(1, 0x410); // store address -> physical bank 1
+        ctx.pointer.write(0, 0x70400); // load address -> physical bank 0
+        ctx.pointer.write(1, 0x70410); // store address -> physical bank 1
         ctx.scalar.write(2, 0xDEADBEEF);
 
         let bundle = make_bundle(vec![
@@ -2816,8 +2816,8 @@ mod tests {
         // roughly 1:1 MEMORY_STALL:CONFLICT ratio, not an unbounded stall.
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
-        ctx.pointer.write(0, 0x400); // load  -> physical bank 0
-        ctx.pointer.write(1, 0x404); // store -> physical bank 0 (same 16-byte word)
+        ctx.pointer.write(0, 0x70400); // load  -> physical bank 0
+        ctx.pointer.write(1, 0x70404); // store -> physical bank 0 (same 16-byte word)
         ctx.scalar.write(2, 0xDEADBEEF);
 
         let bundle = make_bundle(vec![

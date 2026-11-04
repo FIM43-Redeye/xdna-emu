@@ -686,15 +686,15 @@ impl MemoryUnit {
                 }
             };
 
-            if offset + 7 < mem.len() {
-                let row_left = 16 - (offset & 15);
-                let mut lane_bytes = [0u8; 8];
-                for (k, b) in lane_bytes.iter_mut().enumerate().take(row_left.min(8)) {
-                    *b = mem[offset + k];
-                }
-                result[i * 2] = u32::from_le_bytes(lane_bytes[0..4].try_into().unwrap());
-                result[i * 2 + 1] = u32::from_le_bytes(lane_bytes[4..8].try_into().unwrap());
+            // The row cut keeps the read inside the 16-byte row, so the last bytes of memory
+            // read like any other row end.
+            let row_left = 16 - (offset & 15);
+            let mut lane_bytes = [0u8; 8];
+            for (k, b) in lane_bytes.iter_mut().enumerate().take(row_left.min(8)) {
+                *b = mem.get(offset + k).copied().unwrap_or(0);
             }
+            result[i * 2] = u32::from_le_bytes(lane_bytes[0..4].try_into().unwrap());
+            result[i * 2 + 1] = u32::from_le_bytes(lane_bytes[4..8].try_into().unwrap());
         }
 
         log::trace!(
@@ -3774,6 +3774,77 @@ mod tests {
         let got = ctx.vector.read(2);
         let lane0: Vec<u8> = got[0..2].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(lane0, vec![0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0, 0]);
+    }
+
+    #[test]
+    fn a_gather_lane_ignores_address_bits_above_seventeen() {
+        // build/experiments/harness/load4x/wrap3 lut_alias: the lane value XORed with
+        // 0x40000 / 0x80000 / 0xC0000 / 0x100000 / 0xF00000 / 0x80000000 / 0xFFF00000 reads
+        // the same local bytes as the plain 0x7xxxx value (168 lanes)
+        let mut tile = make_tile();
+        for i in 0..0x40usize {
+            tile.data_memory_mut()[0x4000 + i] = 0x80 | i as u8;
+        }
+        for alias in [0u32, 0x4_0000, 0x8_0000, 0xC_0000, 0x10_0000, 0x8000_0000, 0xFFF0_0000] {
+            let mut ctx = make_ctx();
+            let mut src = [0u32; 8];
+            src[0] = 0x7_4000 ^ alias;
+            src[1] = 0x7_4000 ^ alias; // odd lane: + 0x10
+            ctx.vector.write(4, src);
+            let mut op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+                .as_vector(ElementType::Int32)
+                .with_dest(Operand::VectorReg(2))
+                .with_source(Operand::VectorReg(4));
+            op.encoding_name = Some("vldb.4x64.lo".to_string());
+            assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None));
+            ctx.flush_pending_writes();
+            let got = ctx.vector.read(2);
+            assert_eq!(got[0], u32::from_le_bytes([0x80, 0x81, 0x82, 0x83]), "alias {alias:#x}");
+            assert_eq!(got[2], u32::from_le_bytes([0x90, 0x91, 0x92, 0x93]), "alias {alias:#x}");
+        }
+    }
+
+    #[test]
+    fn a_gather_lane_at_the_last_bytes_of_memory_reads_them() {
+        // wrap3 lut_alias far^*.4x16.hi lane 3: eff 0x7fffe returns the last two bytes, then zeros
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.data_memory_mut()[0xFFFE] = 0xAB;
+        tile.data_memory_mut()[0xFFFF] = 0xCD;
+        let mut src = [0u32; 8];
+        src[3] = 0x7_FFFF; // odd lane, granule 4: eff = 0x7ffe0 | 0x0e | 0x10
+        ctx.vector.write(4, src);
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(4));
+        op.encoding_name = Some("vldb.4x16.lo".to_string());
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None, None));
+        ctx.flush_pending_writes();
+        let got = ctx.vector.read(2);
+        assert_eq!(got[6], 0xCDAB);
+        assert_eq!(got[7], 0);
+    }
+
+    #[test]
+    fn the_direction_is_address_bits_sixteen_and_seventeen() {
+        // wrap3 lut_alias / ptr_alias: 0x3xxxx, 0xBxxxx, 0xFxxxx read the tile's own memory,
+        // 0x2xxxx, 0xAxxxx, 0xExxxx the north neighbour; bits 18 and up are not decoded
+        for (addr, quadrant) in [
+            (0x7_4000u32, MemoryQuadrant::Local),
+            (0x3_4000, MemoryQuadrant::Local),
+            (0xB_4000, MemoryQuadrant::Local),
+            (0xF_FFFF, MemoryQuadrant::Local),
+            (0x2_4000, MemoryQuadrant::North),
+            (0xE_4000, MemoryQuadrant::North),
+            (0x1_0000, MemoryQuadrant::West),
+            (0xD_4530, MemoryQuadrant::West),
+            (0x0_0000, MemoryQuadrant::South),
+            (0x8_4000, MemoryQuadrant::South),
+            (0xFFF7_4008, MemoryQuadrant::Local),
+        ] {
+            assert_eq!(decode_data_address(addr), (quadrant, (addr & 0xFFFF) as usize), "{addr:#x}");
+        }
     }
 
     #[test]

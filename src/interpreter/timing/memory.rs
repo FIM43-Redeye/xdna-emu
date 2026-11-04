@@ -114,8 +114,11 @@ impl MemoryQuadrant {
     /// row parity. This function currently handles AIE2 only; checkerboard
     /// support would extend the East arm to check row parity.
     ///
-    /// Addresses below DATA_MEM_ADDR (0x40000) fall back to Local since
-    /// the core AGU should not generate them for data access.
+    /// Only the two bits above the memory offset are decoded: `CardDir = 4 | ((address >>
+    /// shift) & 3)`, so 0x00000-0x3FFFF and 0x80000 and up alias the four directions and bits
+    /// 18..31 are ignored. Silicon (Phoenix, `build/experiments/harness/load4x` wrap3 probe):
+    /// gather lanes with bits 18..31 set and pointer loads and stores at 0x3xxxx / 0xBxxxx /
+    /// 0xFxxxx reach the tile's own memory, 0x2xxxx / 0xAxxxx / 0xExxxx the north neighbour.
     ///
     /// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
     #[inline]
@@ -138,8 +141,7 @@ impl MemoryQuadrant {
             // -- timing tests using such models won't exercise cross-tile.
             None => return Self::Local,
         };
-        let bank_size = 1u32 << map.data_mem_shift;
-        let card_dir = (address / bank_size) as u8;
+        let card_dir = SOUTH | ((address >> map.data_mem_shift) & 3) as u8;
         match card_dir {
             SOUTH => Self::South,
             WEST => Self::West,
@@ -156,7 +158,7 @@ impl MemoryQuadrant {
                     Self::Local
                 }
             }
-            _ => Self::Local,
+            _ => unreachable!("4 | two bits is 4..=7"),
         }
     }
 
@@ -651,7 +653,7 @@ mod tests {
     fn test_access_latency() {
         let model = MemoryModel::new();
 
-        let access = MemoryAccess::load(0x00, 4);
+        let access = MemoryAccess::load(0x70000, 4);
         let latency = model.access_latency(&access);
         assert_eq!(latency, BASE_LATENCY);
     }
@@ -810,9 +812,12 @@ mod tests {
         assert_eq!(MemoryQuadrant::from_address(0x60000), MemoryQuadrant::North);
         assert_eq!(MemoryQuadrant::from_address(0x6FFFF), MemoryQuadrant::North);
 
-        // Addresses below DATA_MEM_ADDR (0x40000) fall back to Local
-        assert_eq!(MemoryQuadrant::from_address(0x00000), MemoryQuadrant::Local);
+        // Only the two bits above the memory offset are decoded (silicon, load4x wrap3
+        // probe): 0x00000 is south, 0x3FFFF local, and bits 18 and up are ignored
+        assert_eq!(MemoryQuadrant::from_address(0x00000), MemoryQuadrant::South);
         assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::Local);
+        assert_eq!(MemoryQuadrant::from_address(0xE_4000), MemoryQuadrant::North);
+        assert_eq!(MemoryQuadrant::from_address(0x8005_0440), MemoryQuadrant::West);
     }
 
     #[test]
