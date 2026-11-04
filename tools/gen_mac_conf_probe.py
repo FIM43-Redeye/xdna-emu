@@ -262,7 +262,8 @@ def plan_repro(rng, suite_dir=None):
     return out
 
 
-REPRO_SUITE = "/home/triple/npu-work/xdna-emu/build/experiments/harness/macconf/modes"
+# The `modes` probe run whose single mismatching tile the repro replays (experiment output, gitignored).
+REPRO_SUITE = Path(__file__).resolve().parents[1] / "build/experiments/harness/macconf/modes"
 REPRO_CASE = "modes__addmsc__00"
 REPRO_CONF = 0x622706
 
