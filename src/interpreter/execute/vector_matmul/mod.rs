@@ -37,7 +37,7 @@ use helpers::*;
 use sparse::{Image, SparseCombine};
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
-use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig, Multiplier};
+use crate::interpreter::execute::vector_config::{MatMulConfig, Multiplier};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::matmul::MacOpKind;
@@ -62,9 +62,6 @@ pub struct PendingMatmul {
     config: MatMulConfig,
     /// Second accumulator merge: None, Some(false)=AddMac, Some(true)=SubMac.
     acc2_sub: Option<bool>,
-    /// Dense integer vnegmac/vnegmsc: the whole result is negated, so the accumulator input
-    /// enters negated (silicon: -(acc + A*B) and -(acc - A*B)).
-    negate_acc: bool,
     acc_src: u8,
     acc2_reg: u8,
     acc_dest: u8,
@@ -179,17 +176,9 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // stale/poison contents into the result. Mac/MatMulSub/NegMatMul/AddMac/
     // SubMac (the VMAC family) keep the config-driven accumulate behavior.
     //
-    // vnegmac (NegMatMul) and vnegmsc (NegMul) do take an accumulator: dense integer silicon gives
-    // -(acc + A*B) and -(acc - A*B) (collisions/neg), so the accumulator input is negated and only
-    // the fresh vnegmul zeroes it. The float and sparse forms keep the old rule.
-    let negate_acc = matches!(semantic, SemanticOp::NegMul | SemanticOp::NegMatMul)
-        && qx.is_none()
-        && !config.bfloat
-        && op.encoding_name.as_deref().is_some_and(|n| {
-            let n = n.to_ascii_lowercase();
-            n.contains("negmac") || n.contains("negmsc")
-        });
-    if matches!(semantic, SemanticOp::MatMul | SemanticOp::NegMul) && !negate_acc {
+    // The integer forms get their accumulator handling from the post-adder (`combine_integer`);
+    // the fresh bf16 forms drop the accumulator here.
+    if config.bfloat && matches!(semantic, SemanticOp::MatMul | SemanticOp::NegMul) {
         config.accumulate = false;
     }
 
@@ -344,7 +333,6 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         b_present,
         config,
         acc2_sub,
-        negate_acc,
         acc_src,
         // acc2 register only exists for AddMac/SubMac; resolving it on other
         // forms would log a spurious missing-AccumReg error (VMUL has none).
@@ -458,50 +446,7 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         queue_result(ctx, p, acc);
         return;
     }
-    if p.negate_acc {
-        match p.config.acc_width {
-            AccWidth::Acc32 => acc.iter_mut().for_each(|w| {
-                *w = ((*w as u32 as i32).wrapping_neg() as u32 as u64)
-                    | (((*w >> 32) as u32 as i32).wrapping_neg() as u32 as u64) << 32
-            }),
-            AccWidth::Acc64 => acc.iter_mut().for_each(|w| *w = (*w as i64).wrapping_neg() as u64),
-        }
-    }
-    matmul_config_driven(&mut acc, &a[..], &b[..], &p.config);
-
-    // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
-    if let (Some(is_sub), Some(src_acc)) = (p.acc2_sub, acc2) {
-        let n = if p.is_half { 8 } else { 16 };
-        match p.config.acc_width {
-            AccWidth::Acc32 => {
-                // Acc32: two i32 values per u64, added independently.
-                for i in 0..n {
-                    let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                    let a_hi = (acc[i] >> 32) as u32;
-                    let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
-                    let s_hi = (src_acc[i] >> 32) as u32;
-                    let (r_lo, r_hi) = if is_sub {
-                        (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
-                    } else {
-                        (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
-                    };
-                    acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                }
-            }
-            AccWidth::Acc64 => {
-                // Acc64: full 64-bit add/sub on each u64 lane.
-                for i in 0..n {
-                    acc[i] = if is_sub {
-                        acc[i].wrapping_sub(src_acc[i])
-                    } else {
-                        acc[i].wrapping_add(src_acc[i])
-                    };
-                }
-            }
-        }
-    }
-
-    queue_result(ctx, p, acc);
+    unreachable!("an integer MAC always carries its post-adder description")
 }
 
 /// Complete deferred MAC-family instructions whose stage-3 accumulator read
@@ -1040,6 +985,7 @@ fn matmul_i32xi16(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::execute::vector_config::AccWidth;
 
     // -----------------------------------------------------------------------
     // MatMul value differential vs independent oracles
