@@ -38,6 +38,7 @@ use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use xdna_archspec::aie2::isa::SemanticOp;
+use xdna_archspec::aie2::matmul::MacOpKind;
 
 /// A MAC-family instruction awaiting its accumulator source read.
 ///
@@ -284,7 +285,20 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let (operands, sparse_integer, b_present) = match qx {
         None => {
             let (a, b) = get_two_vec512(op, ctx);
-            ((widen(&a), widen(&b)), None, None)
+            // Every integer MAC, dense or sparse, is a zero-accumulator multiply followed by the
+            // same post-adder (`sparse::combine_integer`).
+            let combine = if config.bfloat {
+                None
+            } else {
+                match integer_combine(op, semantic, conf_val) {
+                    Some(c) => Some(c),
+                    None => {
+                        log::warn!("[NOT MODELED] {:?}: integer MAC with no op kind", op.encoding_name);
+                        return false;
+                    }
+                }
+            };
+            ((widen(&a), widen(&b)), combine, None)
         }
         Some((qx_pos, qx_index)) => {
             match sample_sparse(op, ctx, &config, conf_val, is_bf16, qx_pos, qx_index) {
@@ -545,6 +559,25 @@ fn sample_sparse(
         Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
     };
     Some(((a, b), combine, present))
+}
+
+/// The post-adder description of an integer MAC: the op kind from the record name (the
+/// mnemonic stem), or from the semantic when the op carries no name.
+fn integer_combine(op: &SlotOp, semantic: SemanticOp, conf_val: u32) -> Option<SparseCombine> {
+    let kind = match op.encoding_name.as_deref().and_then(sparse::op_kind_of) {
+        Some(k) => k,
+        None => match semantic {
+            SemanticOp::MatMul => MacOpKind::Mul,
+            SemanticOp::NegMul => MacOpKind::NegMul,
+            SemanticOp::Mac => MacOpKind::Mac,
+            SemanticOp::MatMulSub => MacOpKind::Msc,
+            SemanticOp::NegMatMul => MacOpKind::NegMac,
+            SemanticOp::AddMac => MacOpKind::AddMac,
+            SemanticOp::SubMac => MacOpKind::SubMac,
+            _ => return None,
+        },
+    };
+    Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
 }
 
 /// Scan sources for the last ScalarReg operand (the config register).
