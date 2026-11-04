@@ -5,7 +5,7 @@
 // Output: 48 x 64 bytes = 3072 bytes, one 512-bit result per mode.
 //
 // Compile with Chess: xchesscc_wrapper aie2 -c shuffle_sweep.cc -o shuffle_sweep.o
-// Package with aiecc.py for NPU execution.
+// Package it as a suite case (gen_suite.py) for NPU execution.
 //
 // Cleanroom: observes hardware behavior of shuffle intrinsic on owned hardware.
 

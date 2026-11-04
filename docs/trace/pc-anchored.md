@@ -37,7 +37,7 @@ python3 ~/npu-work/xdna-emu/tools/mlir-trace-inject.py \
   --trace-mode event_pc \
   --core-grounding "PERF_CNT_0,INSTR_EVENT_0,INSTR_EVENT_1" \
   --perfcnt-period 1024
-aiecc.py --xchesscc --xbridge ../add_one_using_dma.traced.mlir
+aiecc --xchesscc --xbridge ../add_one_using_dma.traced.mlir
 
 # 2. Run the sweep (produces sweep-manifest.json + per-batch traces).
 python3 ~/npu-work/xdna-emu/tools/trace-sweep.py \

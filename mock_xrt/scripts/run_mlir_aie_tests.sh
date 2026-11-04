@@ -27,7 +27,7 @@ MLIR_AIE_BIN="${MLIR_AIE_BUILD}/bin"
 MLIR_AIE_PYTHON="${MLIR_AIE_ROOT}/install/python:${MLIR_AIE_ROOT}/build/python"
 MLIR_AIE_VENV="${MLIR_AIE_ROOT}/ironenv"
 PEANO_INSTALL_DIR="${MLIR_AIE_VENV}/lib/python3.13/site-packages/llvm-aie"
-AIECC="${MLIR_AIE_BIN}/aiecc.py"
+AIECC="${AIECC:-${MLIR_AIE_ROOT}/install/bin/aiecc}"   # C++ driver (aiecc.py was removed upstream)
 AIE_OPT="${MLIR_AIE_BIN}/aie-opt"
 
 # We use our own test_utils.h (drop-in replacement for mlir-aie's)
@@ -150,7 +150,7 @@ discover_tests() {
 }
 
 # Prepare a test by generating missing instruction files
-# Uses mlir-aie toolchain (aie-opt, aiecc.py)
+# Uses mlir-aie toolchain (aie-opt, aiecc)
 prepare_test() {
     local test_name="$1"
     local source_dir="${MLIR_AIE_ROOT}/${test_name}"
@@ -183,7 +183,7 @@ prepare_test() {
         # Step 2: Generate ctrlpkt.bin and aie_run_seq.bin
         PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH}" \
         PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
-        "${MLIR_AIE_VENV}/bin/python3" "$AIECC" --no-xchesscc --no-xbridge \
+        "$AIECC" --no-xchesscc --no-xbridge \
             --device-name=main \
             --aie-generate-ctrlpkt --ctrlpkt-name=ctrlpkt.bin \
             --aie-generate-npu-insts --npu-insts-name=aie_run_seq.bin \
@@ -205,7 +205,7 @@ prepare_test() {
 
         PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH}" \
         PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
-        "${MLIR_AIE_VENV}/bin/python3" "$AIECC" --no-xchesscc --no-xbridge \
+        "$AIECC" --no-xchesscc --no-xbridge \
             --aie-generate-npu-insts --npu-insts-name=insts.bin \
             aie_arch.mlir 2>&1
 
@@ -308,7 +308,7 @@ run_test() {
             # List what instruction files ARE needed for this test
             local needed=""
             if grep -q "aie_run_seq.bin\|ctrlpkt" "${MLIR_AIE_ROOT}/${test_name}/run.lit" 2>/dev/null; then
-                needed="(needs: aiecc.py --aie-generate-ctrlpkt --aie-generate-npu-insts)"
+                needed="(needs: aiecc --aie-generate-ctrlpkt --aie-generate-npu-insts)"
             elif grep -q "insts.elf" "${MLIR_AIE_ROOT}/${test_name}/run.lit" 2>/dev/null; then
                 needed="(has insts.elf but may need conversion)"
             fi

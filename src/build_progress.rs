@@ -54,7 +54,7 @@ fn extract_build_diagnostic(error: &str) -> String {
             }
         }
 
-        // Python exception (aiecc.py or build script failure)
+        // Python exception (build script failure)
         // Match common Python error classes at start of line.
         if trimmed.starts_with("ModuleNotFoundError:")
             || trimmed.starts_with("ImportError:")
@@ -1151,7 +1151,7 @@ mod tests {
         let log = "\
 Peano build step 3/3 failed (exit 250):
 --- step 3/3 ---
-aiecc.py ...
+aiecc ...
 --- stderr ---
 LLVM ERROR: unable to legalize instruction: %89:_(<4 x s8>) = G_ADD %88:_, %13:_
 PLEASE submit a bug report";
@@ -1177,7 +1177,7 @@ aie_arch.mlir:42:5: error: 'aie.tile' op column index out of range";
 Build step 1/1 failed (exit 1):
 --- stderr ---
 Traceback (most recent call last):
-  File \"aiecc.py\", line 5
+  File \"build.py\", line 5
 ModuleNotFoundError: No module named 'aie'";
         let diag = extract_build_diagnostic(log);
         assert!(diag.starts_with("Python:"), "got: {}", diag);

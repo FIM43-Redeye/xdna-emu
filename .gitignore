@@ -34,7 +34,7 @@ tools/txn-poll-probe/.cache/
 tools/telemetry-probe/build/
 tools/telemetry-probe/.cache/
 
-# aiecc.py per-MLIR project directories (created next to .mlir input/output)
+# aiecc per-MLIR project directories (created next to .mlir input/output)
 aie.mlir.prj/
 aie_traced.mlir.prj/
 test-traced-verify.mlir.prj/
@@ -58,7 +58,7 @@ stdout
 # Documentation drafts (not ready for commit)
 CURRENT-REFACTOR.md
 
-# Scratch outputs from manual aiecc.py / chess runs at repo root
+# Scratch outputs from manual aiecc / chess runs at repo root
 /Release/
 /k*.o
 /k*.o.lst
