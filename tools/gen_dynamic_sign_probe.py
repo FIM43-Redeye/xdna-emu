@@ -30,6 +30,7 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cxx_suite import CxxKernel, write_cxx_suite  # noqa: E402
@@ -94,7 +95,7 @@ class Form:
     rec_out: int            # output bytes per record (multiple of 64)
     body: str               # C++ statements; `p` = record input, `o` = record output (int32_t *)
     records: tuple          # tuple of record-builder arguments
-    build: object           # (rng, *record) -> bytes of length rec_in
+    build: Callable[..., bytes]  # (rng, *record) -> bytes of length rec_in
 
 
 def kernel_source(form: Form, n: int) -> str:
