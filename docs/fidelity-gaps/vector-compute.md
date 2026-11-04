@@ -89,9 +89,55 @@ WAW the later-landing write wins (`vmul.f`: the load wins from `s = 0`; int MAC,
 now ordinary accumulator-file writes (`ExecutionContext::queue_accum_load` ->
 `queue_lanes_write`, def 7, no bypass); EMU == silicon on all 2724 points;
 `execute/acc_load_timing_goldens.rs` replays thresholds through the executor. `vlda.conv` already
-followed the rule. The one change in behaviour beyond the rule: an accumulator load in flight across a
-taken branch no longer gets the scalar loads' extra branch cycle (`delay_pending_writes`), like every
-other accumulator write.
+followed the rule. (The extra branch cycle it no longer got was itself wrong: see "Loads across a taken
+branch" below.)
+
+**Vector loads (2026-11-04).** The vector-register loads were still committed by the wall-clock load
+queue. `tools/gen_vec_load_timing_probe.py generate` swept every form (`vlda`/`vldb` into `wl`/`wh`,
+`vlda` post-modify, `vldb.2d`, `vlda.128`, `vldb.unpack`, the `vldb.4x` gather) against 15 readers of
+the loaded register (`vst`, `vadd.32`, `vmov` w/x/bm, MAC X and Y operands int and bf16, `vups`,
+`vconv`, `vpack`, `vextract`, a gather's address register) and as one of two writers of it against 10
+writers (`--waw`); `build/experiments/harness/ldvec/vt2`, 62 kernels, 3101 points, silicon r1 == r2.
+Every reader sees every load from distance 7: all vector reads are use cycle 1 and every vector load's
+result cycle is 7, so this is the vector file's ordinary rule (`visible_at`). Of two writes the
+later-landing one wins. The loads are now ordinary in-flight vector-file writes on the issued-bundle
+clock (`ExecutionContext::queue_vector_load` -> `VectorRegisterFile::queue_write`, no bypass), the
+load-commit phantoms are gone, and the gather reads its address register like any reader (it used to
+force-commit every pending write, scalar loads included). Only mask (`q`) loads keep the load queue.
+Same-cycle ties and same-bundle schedules are where the old path differed (31 points); the rules
+silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, both r1 == r2):
+
+- *The B load channel.* `vldb` and its forms (post-modify, 2D/3D, `.unpack`, `.4x`; `.sparse` unprobed)
+  hold no write unit in the tables. Silicon puts their result on the bus of the vector file's last
+  write port (W_WM) outside its rule 1: landing in one cycle with a W_WM write on the same register
+  and bank, the two are ORed; a write through the first port (W_WA: `vlda`, `vpack`, `vsrs`, `vconv`)
+  beats it on that bank; writes to other registers or the other bank are untouched. `vlda` instead
+  wins a W_WM tie by rule 2. Rule 3 of `state::write_collision`; `PortUse::b_channel` is derived in
+  `decode::ports` (a vector-file load with no write unit at its result cycle).
+- *Gather read port.* A `vldb.4x` in one bundle with a `vst` of a W register or a `vpack` (the other
+  W_RS_PORT holders that read in its cycle): both read the OR of the gather's address register and the
+  other's W source (the `vst` data register, the low half of the `vpack` source), so the store writes
+  the OR and the gather gathers from the ORed addresses. Two non-gather W_RS holders (`vpack` with a
+  `vst`) do not interact. `VectorRegisterFile::arm_wired_or`.
+- *Gather load unit.* A `vldb.4x` in one bundle with any load-unit-A load (`vlda` w, `vlda am`,
+  `vlda.ups`, `lda`): that load reads memory at the gather's address instead of its own; the gather
+  is unaffected. Which lane's address it takes is open (the probe's lanes were equal; the model uses
+  the first lane of the gathered half). `ExecutionContext::override_load_address`.
+
+Both gather rules: `MemoryUnit::arm_gather_hazards`. EMU == silicon on all four suites;
+`execute/vec_load_timing_goldens.rs` replays them through the executor.
+
+**Loads across a taken branch (2026-11-04).** The emulator delayed every load-queue write by one cycle
+when a branch took effect (`delay_pending_writes`), on the test path `CoreInterpreter::step` always and
+on the production path only for back-to-back branches. `gen_vec_load_timing_probe.py branch` issues a
+load at each bundle from 3 before a branch through its 5 delay slots and reads it with eight readers
+at the target: scalar (`lda r`, store and `mov` readers), pointer (`lda p`), vector (`vlda`, `vldb`,
+store and `vmov` readers), accumulator (`vlda amll`, `vst` and `vadd.f` readers), plus pointer moves,
+`padda` and a scalar ALU write as latency-1 controls, under `j`, taken and not-taken `jnz`, `jl` and
+`ret` (`ldvec/br2`, `br3`: 77 kernels, 837 points, r1 == r2). A taken branch delays nothing: every
+reader sees the load from distance 7 (5 for the accumulator use-3 reader), and a pointer move in the
+last delay slot is read by the target's first bundle. The delay is gone (`a_taken_branch_delays_no_
+write_in_flight` runs both step paths).
 
 **Resource collisions (MODELLED 2026-11-01; open items listed at the end).** Compilers never
 emit a schedule that holds one TableGen unit twice in a cycle, but a hand-written schedule can, and
@@ -277,7 +323,10 @@ the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
   one silicon arbitrates on. The model treats the pair as the write-port collision it is.
 - Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
   (`W_RS`, the third write port). (`vlda.am` quarters were probed 2026-11-04, see "Accumulator
-  loads".)
+  loads"; the vector loads, the B load channel and the gather's same-bundle hazards were probed
+  2026-11-04, see "Vector loads". Open there: which gather lane's address a load-unit-A load takes,
+  whether its own post-modify still applies, `vldb.sparse` ties, and B-channel ties against two
+  same-port writers at once.)
 - Unconfirmed extrapolations listed under "Inferred" above.
 - Collisions the tables forbid on units that are not an accumulator or vector register-file port
   (pointer, modifier and scalar ports, the part-word store unit) are not modelled; Chess uses them
