@@ -1699,13 +1699,22 @@ def _substitute_asm(asm_string: str, regs: dict[str, str],
     return result
 
 
-# Instructions whose ordinary combinations cannot show a non-zero result, and the variant that
-# can (extra_tests): a comparison with zero says yes only for a zero source and random data
-# never is one; vclr writes zeros, so its destination must hold something first.
+# Instructions whose ordinary combinations cannot show a non-zero result, and the variant test
+# point that can (added after the instruction's ordinary ones, see variant_flag): a comparison
+# with zero says yes only for a zero source and random data never is one; vclr writes zeros, so
+# its destination must hold something first.
 ZERO_SOURCE_INSTRS = ("EQZ", "NEZ", "VEQZ_8", "VEQZ_16", "VEQZ_32")
 PRELOAD_OUTPUT_INSTRS = ("VCLR_vclr", "VCLR_vclr_BF")
 # fp32 conversion into an accumulator: read the accumulator's bits back, not an integer SRS of it.
 RAW_READOUT_INSTRS = ("VCONV_FP32_BF16",)
+VARIANT_FLAGS = ("_zero_sources", "_preload_output", "_raw_readout")
+
+
+def variant_flag(name: str) -> Optional[str]:
+    """The regs flag of the observability variant an instruction gets, or None."""
+    return ("_zero_sources" if name in ZERO_SOURCE_INSTRS else
+            "_preload_output" if name in PRELOAD_OUTPUT_INSTRS else
+            "_raw_readout" if name in RAW_READOUT_INSTRS else None)
 
 
 def _zero_inputs(op_by_name: dict, asm_op_names: list, output_names: set, regs: dict) -> list[str]:
@@ -1818,7 +1827,7 @@ def generate_test_point(
     lines.extend(_nop_sled(LOAD_LATENCY))
 
     # A comparison with zero only ever answers yes for a zero source (random data never
-    # is one): the extra tests (extra_tests) zero the inputs.
+    # is one): the variant test point (variant_flag) zeroes the inputs.
     if regs.get("_zero_sources"):
         lines.extend(_zero_inputs(op_by_name, asm_op_names, output_names, regs))
 
@@ -4868,12 +4877,9 @@ class PointerArithStrategy(TestStrategy):
 class PaddaSpStrategy(TestStrategy):
     """Tests `padda [sp], $imm` -- SP pointer increment.
 
-    `padda [sp], $imm` adds imm to the stack pointer.  The observing test (`_observe_sp`)
-    stores how far sp moved after the pointer-write latency and restores it from r8 (the copy
-    build_mega_program keeps).  The ordinary combination moves p6 around and reads it back,
-    which the instruction never touches (sp is not p6), so it passes by comparing a
-    constant; it stays only so the batches around it keep their bytes, and
-    `extra_tests` adds the observing one.
+    `padda [sp], $imm` adds imm to the stack pointer.  The test stores how far sp moved
+    after the pointer-write latency and restores it from r8 (the copy build_mega_program
+    keeps).  Reading p6 back would observe nothing: sp is not p6.
 
     Only handles padda [sp]; paddb [sp] is blocked by llvm-mc #858.
     """
@@ -4904,38 +4910,16 @@ class PaddaSpStrategy(TestStrategy):
 
         out_offset = _align(out_offset, 4)
 
-        if regs.get("_observe_sp"):
-            lines.append(f"  mov r13, sp")
-            lines.append(f"  padda [sp], #{regs.get('imm', '32')}")
-            lines.extend(_nop_sled(LOAD_LATENCY))
-            # Store how far sp moved (the absolute value depends on the stack's place),
-            # then restore it from the prologue's copy.
-            lines.append(f"  mov r14, sp")
-            lines.append(f"  sub r14, r14, r13")
-            lines.extend(_nop_sled(1))
-            lines.extend(_scalar_store("r14", "p1", out_offset))
-            lines.append(f"  mov sp, r8")
-            lines.append("")
-            return "\n".join(lines)
-
-        # Save current p6 (SP) to r13 so we can restore it later.
-        # mov r13, p6 uses the mv slot (MOV_mv_scl).
-        lines.append(f"  mov r13, p6")
-
-        # Set p6 to 0 so the result is deterministic.
-        lines.append(f"  movxm p6, #0")
-
-        # Execute padda [sp], #imm.
-        imm = regs.get("imm", "32")
-        lines.append(f"  padda [sp], #{imm}")
-
-        # Read back p6 (now = 0 + imm*32) and store to output.
-        lines.append(f"  mov r14, p6")
+        lines.append(f"  mov r13, sp")
+        lines.append(f"  padda [sp], #{regs.get('imm', '32')}")
+        lines.extend(_nop_sled(LOAD_LATENCY))
+        # Store how far sp moved (the absolute value depends on the stack's place),
+        # then restore it from the prologue's copy.
+        lines.append(f"  mov r14, sp")
+        lines.append(f"  sub r14, r14, r13")
+        lines.extend(_nop_sled(1))
         lines.extend(_scalar_store("r14", "p1", out_offset))
-
-        # Restore p6.
-        lines.append(f"  mov p6, r13")
-
+        lines.append(f"  mov sp, r8")
         lines.append("")
         return "\n".join(lines)
 
@@ -5722,10 +5706,10 @@ MAX_OUT_BUFFER_BYTES = 32768  # 32KB -- conservative half of 64KB
 
 
 def _variant_meta(regs: dict) -> dict:
-    """`variant` names the observability flag of an extra test point; a cleared register
+    """`variant` names the observability flag of a variant test point; a cleared register
     (`_preload_output`) makes zero its expected answer, which the hollow guard must not
     mistake for a test that saw nothing."""
-    flags = [k for k in regs if k.startswith("_") and k != "_combo_idx"]
+    flags = [k for k in regs if k in VARIANT_FLAGS]
     if not flags:
         return {}
     meta = {"variant": flags[0]}
@@ -5902,17 +5886,18 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 delay_specs.append((instr, combo_idx, regs, delay_strategy))
 
     # Variants that make instructions observable which their ordinary combinations are not
-    # (see ZERO_SOURCE_INSTRS): one test point each, in the same standalone batch.  They
-    # sit apart so the ordinary batches keep their bytes.
+    # (see ZERO_SOURCE_INSTRS): one more test point each, placed after the instruction's
+    # ordinary ones so it packs into the same batch.
     for instr in all_instrs:
-        flag = ("_zero_sources" if instr["name"] in ZERO_SOURCE_INSTRS else
-                "_preload_output" if instr["name"] in PRELOAD_OUTPUT_INSTRS else
-                "_raw_readout" if instr["name"] in RAW_READOUT_INSTRS else
-                "_observe_sp" if instr["name"] == "PADDA_sp_imm" else None)
+        flag = variant_flag(instr["name"])
         if flag:
             strategy, _ = classify_with_strategies(instr)
-            regs = {**strategy.generate_combos(instr)[0], flag: True, "_combo_idx": 0}
-            delay_specs.append((instr, 0, regs, strategy))
+            combos = strategy.generate_combos(instr)
+            regs = {**combos[0], flag: True, "_combo_idx": len(combos)}
+            last = max((n for n, spec in enumerate(test_point_specs)
+                        if spec[0]["name"] == instr["name"]), default=None)
+            assert last is not None, f"{instr['name']}: variant without ordinary test points"
+            test_point_specs.insert(last + 1, (instr, len(combos), regs, strategy))
 
     # Scalar write-port collision tests (ScalarCollisionStrategy): standalone batches after the
     # delay batch, so every earlier batch keeps its bytes.
@@ -6005,6 +5990,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 "in_size": in_size,
                 "out_offset": batch_out_offset,
                 "out_size": out_size,
+                **_variant_meta(regs),
             })
 
             batch_in_offset += in_size
@@ -6218,7 +6204,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         })
         batch_idx += 1
 
-    # Delay tests and observability variants: one standalone assembly batch; then the
+    # Delay tests: one standalone assembly batch; then the
     # collision tests in as many standalone batches as program memory needs (they declare
     # their payload).
     def emit_standalone(specs, declare_payload):

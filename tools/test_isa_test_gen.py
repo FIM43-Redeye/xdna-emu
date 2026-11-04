@@ -2978,7 +2978,7 @@ class TestPaddaSpStrategy:
     def test_observing_test_measures_how_far_sp_moved_and_restores_it(self):
         """sp (not p6) is what padda [sp] changes: measure the move after the latency, restore sp."""
         strategy = isa_test_gen.PaddaSpStrategy()
-        regs = {**strategy.generate_combos(self._make_padda_sp())[0], "_observe_sp": True}
+        regs = strategy.generate_combos(self._make_padda_sp())[0]
         asm = strategy.generate_test_point(self._make_padda_sp(), regs, in_offset=0, out_offset=0)
         lines = [l.strip() for l in asm.split("\n") if l.strip() and not l.strip().startswith("//")]
         i = lines.index("padda [sp], #32")
@@ -2989,15 +2989,8 @@ class TestPaddaSpStrategy:
         assert lines[-1] == "mov sp, r8"
         assert "p6" not in asm
 
-    def test_ordinary_combination_is_unchanged(self):
-        """It moves p6, which padda [sp] does not touch; kept so neighbouring batches keep their bytes."""
-        strategy = isa_test_gen.PaddaSpStrategy()
-        regs = strategy.generate_combos(self._make_padda_sp())[0]
-        asm = strategy.generate_test_point(self._make_padda_sp(), regs, in_offset=0, out_offset=0)
-        assert "movxm p6, #0" in asm and "mov r14, p6" in asm
-
     def test_reads_back_modified_sp(self):
-        """Should store the modified p6 value to the output buffer."""
+        """Should store how far sp moved to the output buffer."""
         strategy = isa_test_gen.PaddaSpStrategy()
         regs = strategy.generate_combos(self._make_padda_sp())[0]
         asm = strategy.generate_test_point(self._make_padda_sp(), regs,
@@ -4622,19 +4615,40 @@ class TestHollowSingleTileFixes:
         plain = self._point("VCONV_FP32_BF16", {"dst": "bml0", "src": "wl0"})
         assert any(l.startswith("vsrs") for l in plain) and "vmov x4, bml0" not in plain
 
-    def test_variants_are_extra_test_points_in_the_delay_batch(self, tmp_path):
-        """The delay tests and the variants share one standalone batch; the collision batches
-        follow it."""
+    def test_variants_pack_into_the_batch_of_their_instruction(self, tmp_path):
+        """A variant is one more test point right after its instruction's ordinary ones, packed
+        into an ordinary batch (not a batch of its own)."""
         isa_json = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
         manifest = generate_all(isa_json, str(tmp_path / "t"))
-        last = next(b for b in reversed(manifest["batches"])
-                    if any("variant" in t for t in b["tests"]))["tests"]
-        variants = {t["instruction"]: t["variant"] for t in last if "variant" in t}
-        assert variants["EQZ"] == "_zero_sources"
-        assert variants["VCLR_vclr"] == "_preload_output"
-        assert variants["PADDA_sp_imm"] == "_observe_sp"
-        assert variants["VCONV_FP32_BF16"] == "_raw_readout"
-        assert next(t for t in last if t["instruction"] == "VCLR_vclr")["zero_expected"]
+        expected = {"EQZ": "_zero_sources", "VCLR_vclr": "_preload_output",
+                    "VCONV_FP32_BF16": "_raw_readout"}
+        for name, flag in expected.items():
+            homes = [(b, t) for b in manifest["batches"] for t in b["tests"] if t["instruction"] == name]
+            variant = [(b, t) for b, t in homes if t.get("variant") == flag]
+            assert len(variant) == 1, name
+            vb, vt = variant[0]
+            ordinary = [(b, t) for b, t in homes if "variant" not in t]
+            assert ordinary
+            # right after the last ordinary point: its batch, or the next when that one was full
+            last_b = max(b["batch_index"] for b, t in ordinary)
+            assert vb["batch_index"] in (last_b, last_b + 1), name
+            assert vt["combo_index"] not in [t["combo_index"] for b, t in ordinary]
+            if vb["batch_index"] == last_b:
+                assert vb["tests"].index(vt) > max(vb["tests"].index(t) for b, t in ordinary if b is vb)
+            assert vb["source_type"] == "assembly" and len(vb["tests"]) > 1
+        assert next(t for b, t in homes_of(manifest, "VCLR_vclr") if "variant" in t)["zero_expected"]
+
+    def test_padda_sp_has_one_observing_test_point_and_no_p6_read(self, tmp_path):
+        isa_json = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        manifest = generate_all(isa_json, str(tmp_path / "t"))
+        pts = homes_of(manifest, "PADDA_sp_imm")
+        assert len(pts) == 1 and "variant" not in pts[0][1]
+        src = (tmp_path / "t" / pts[0][0]["filename"]).read_text()
+        assert "mov r13, sp" in src and "mov r14, p6" not in src
+
+
+def homes_of(manifest, name):
+    return [(b, t) for b in manifest["batches"] for t in b["tests"] if t["instruction"] == name]
 
 
 class TestBranchLlJzTaken:
