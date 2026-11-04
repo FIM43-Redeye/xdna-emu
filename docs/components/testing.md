@@ -134,6 +134,7 @@ AIE2 only) because aiecc links per package. The entry symbol is renamed at compi
 | Load/store alignment | `tools/gen_ldst_align_probe.py generate <dir>` | the analysis functions in the same file (`# -- analysis` section; a pure function of a case's output bytes) |
 | C++ intrinsics, Peano (76 cases) | `tools/instr-test-gen.py --td <llvm-aie>/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <dir>` | EMU against HW with `suite compare` |
 | C++ intrinsics, Chess (~3770 cases) | `tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h --types-header .../me_chess_types.h [--iss-types-header .../me_iss_types.h] --suite-dir <dir>` | EMU against HW with `suite compare` |
+| Run-time sign of the `d` forms (UPS, SRS, crVaddSign ops; Peano and Chess suites) | `tools/gen_dynamic_sign_probe.py --suite-dir <dir>` (writes `<dir>/peano` and `<dir>/chess`) | EMU against HW with `suite compare`; per-record layout in each case's `meta` |
 | Shuffle network sweep (one Chess case) | `tests/shuffle-sweep/gen_suite.py <dir>` | `tests/shuffle-sweep/analyze.py <dir>/runs/<tag>/shuffle-sweep/core.out.bin` |
 | Characterizers (`tests/*.s`: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*), five cases | `tools/charz_suites.py <dir>` | `python3 tests/<name>.py --suite <dir> r1 [e1]` |
 

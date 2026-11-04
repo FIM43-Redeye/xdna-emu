@@ -345,8 +345,51 @@ SRS shift of 16 on the signed f32 bit pattern (sign-magnitude, rounded by value)
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| SRS paths other than int32 -> int16, signed | unsigned, 8-bit, 32-bit and 64-bit-accumulator outputs reuse the same lane function but have no dedicated silicon capture beyond the fuzzer's 28/28 match | `srs_lane` callers in `vector_srs.rs` | open: extend `vector_kernel_specs.py` |
-| `crSat` value 2 | not captured; modelled as symmetric-without-saturate (bit 1 only), which clamps nothing | `SrsConfig::saturate` / `symmetric_saturate` | open |
+| SRS paths other than int32 -> int16, signed | unsigned and signed 8/16/32-bit outputs of 32- and 64-bit accumulators, register `vsrs` and fused `vst.srs`, every `crSat`, shifts 0/1/4/8/15: exact against silicon (dynsign probe suite, see "Run-time sign") | `srs_lane` callers in `vector_srs.rs` | **RESOLVED** 2026-11-04 for those shifts and `crRnd` 0 (the `crRnd` sweep above is int16 only) |
+| `crSat` value 2 | saturates exactly like 3 (symmetric for a signed output, `[0, umax]` for an unsigned one) | `SrsConfig::saturate` / `symmetric_saturate` | **RESOLVED** 2026-11-04 (dynsign probe suite, every `d` SRS form) |
+
+## Run-time sign (`d` forms) and UPS saturation
+
+Several vector instructions have an `s` form, signed by encoding, and a `d` form that reads its
+sign at run time from the control register its TableGen record lists in `Uses`:
+
+| Register | Forms | Read at (AIE2Schedule.td) |
+|----------|-------|---------------------------|
+| crUPSSign | `vups.s32.d8/.d16`, `vups.s64.d16/.d32` (w2b, w2c, x2c), `vlda[.2d/.3d].ups.*.d*` | `vups`: cycle 1; `vlda.ups`: cycle 7, with the shift |
+| crSRSSign | `vsrs.dN.*`, `vsrsm.dN.*`, `vst[.2d/.3d].srs.dN.*` | cycle 1 |
+| crVaddSign | `vabs_gtz`, `vlt`, `vge`, `vmax_lt`, `vmin_ge`, `vmaxdiff_lt`, `vsub_lt`, `vsub_ge` (`.d8/.d16/.d32`), `vextract.d8/.d16/.d32/.d64` | cycle 1 |
+| crPackSign / crUnpackSign | `vpack` / `vunpack` `d` forms | see the pack and unpack sections |
+
+**Rule** (`src/interpreter/execute/dynamic_sign.rs`). The decoder labels a `d` lane type unsigned;
+the op's sign register comes from its decoded implicit uses, and when its bit 0 is set the unsigned
+type fields become signed (the source for UPS, the output for SRS, the lanes for the crVaddSign
+ops). Only bit 0 counts: sign words 2 and 0xFFFFFFFE behave as 0, 3 and 0xFFFFFFFF as 1.
+
+**UPS saturation.** Any nonzero `crSat` (1, 2 or 3) clamps the shifted lane to the signed range of
+the accumulator lane, never symmetrically (lane `0x8000 << 16` signed with `crSat` 3 gives
+`0x80000000`); `crSat` 0 keeps the low bits. The shift is exact up to the 6-bit maximum (a 32-bit
+lane shifted by 63 overflows the 64-bit lane and saturates). `vlda.ups` reads crSat at cycle 8,
+one after the sign and shift; Chess and Peano both write crUPSSign and crSat in the load's shadow.
+
+**Control-register writes land at the end of their bundle**: a reader issued in the same bundle sees
+the old value (Chess pipelines a record loop with the next record's `movx crSat` beside this
+record's `vups`; silicon converts with the old value).
+
+**Evidence.** `tools/gen_dynamic_sign_probe.py` writes a Peano suite (68 cases: every UPS form as
+fused `vlda.ups` and as register `vups` including x2c, every SRS form as `vsrs` and fused
+`vst.srs`, the eight crVaddSign ops at 8/16/32 bits, `vextract` at all four widths) and a Chess
+suite (6 cases, register `vups` w2b/w2c in a software-pipelined loop), sweeping six sign words,
+8 shifts per UPS width, 5 per SRS form, all four `crSat` values and edge-rich lanes:
+5808 records, HW r1 == r2 and EMU == HW on all of them, plus the 26 chess-full cases that showed
+the gap (`lups`, `sups`, `ups_to_*`, `abs`, `gtz`, `abs_gtz` with a run-time sign).
+
+| Gap | Model vs hardware | Where | Status / rationale |
+|-----|-------------------|-------|--------------------|
+| `d` forms of UPS, SRS and the crVaddSign ops | all zero-extended / unsigned regardless of the register (only `vextract.d8/.d16` followed crVaddSign) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 |
+| UPS saturation | not modelled (always wrapped) | `ups_lane_signed` | **RESOLVED** 2026-11-04 |
+| `vlda.2d/.3d.ups.*.d*`, `vst.2d/.3d.srs.d*`, `vsrsm.d*` | same code path and `Uses` entry as the probed forms; no compiler emitted them for the probes | `dynamic_sign.rs` | open: unprobed |
+| `srUPS_of` / `srSRS_of` | the overflow status bits the saturating forms set are not modelled | | open |
+| Exact read cycle of crUPSSign and crSat for `vlda.ups` | taken from the itinerary (7 and 8); the probes only show compiler schedules agree | `PendingUpsLoad` | open: a hand-scheduled late-write probe would pin it |
 
 ## bf16 multiply-accumulate datapath (`vmul.f`, `vmac.f`, `vmsc.f`, `vaddmac.f`, ...)
 
