@@ -84,38 +84,8 @@ cargo test --lib
 ./scripts/emu-bridge-test.sh --sweep            # add event sweep across all tiles
 ./scripts/emu-bridge-test.sh --trace=pc-anchored ...  # add PC-anchored cycle trace comparison
 
-# ISA test harness (generate -> suite build -> hw -> emu -> compare -> analyze;
-# 195 cases: 177 single-instruction batches, 17 two-core cascade/stream pairs whose consumers
-# store every beat and its status, and a last batch of mov.dN delay tests and observability
-# variants). The analyzer fails a test point that checked nothing (payload all zero, or the
-# same for inputs that should differ) even where EMU == HW.
+# ISA suite and every other kernel suite: see "Kernel Suites" below
 ./scripts/isa-test.sh [--seed N] [--filter PAT] [--tag NAME]
-python3 tools/isa-test-analyze.py build/isa-suite       # re-analyze the last run
-
-# Kernel suites (hand-written kernels we run ourselves; probes and the ISA tests)
-# A suite is a directory of cases (tools/harness/suite.py); generators write it, never run it.
-export PYTHONPATH=tools
-python3 -m harness suite build   <suite>              # parallel; unchanged packages are reused (content hash)
-python3 -m harness suite hw      <suite> r1           # serial; the first timeout aborts the run
-python3 -m harness suite emu     <suite> e1 -j 8      # FFI .so rebuilt once, then parallel
-python3 -m harness suite compare <suite> r1 e1        # byte-exact per buffer, exit 1 on mismatch
-python3 -m harness suite hw      <suite> d5 --repeat 5   # every case 5x back to back (repeats 2..5 in <case>/repeat_<k>/);
-python3 -m harness suite repeats <suite> d5              #   exit 1 if any case's repeats differ; `repeats` lists the bytes
-# results: <suite>/runs/<tag>/<case>/<core>.<buffer>.bin + run.json; tags are never overwritten
-# ISA-style kernels address p0 = in, p1 = out: isa_suite always gives a single-core kernel an input
-# (>= 4 bytes). An out-only core gets out in p0 and p1 is stale tile state on silicon (EMU: poison).
-
-# C++ kernels (Peano or Chess): a `.cc` core source; the compiler is the topology's `compiler`
-# ("peano" clang++ --target=aie2-none-unknown-elf -O2, or "chess" xchesscc_wrapper aie2, AIE2
-# only), because aiecc links per package. The entry symbol is renamed at compile time (-D), not
-# with objcopy: a Chess object breaks under objcopy. Suite generators (never compile or run):
-python3 tools/instr-test-gen.py --td ../llvm-aie/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <suite>  # Peano, 76 cases
-python3 tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h \
-    --types-header .../me_chess_types.h --iss-types-header .../me_iss_types.h --suite-dir <suite>   # Chess, 4234 cases
-python3 tests/shuffle-sweep/gen_suite.py <suite>        # one Chess case; analyze.py reads runs/<tag>/shuffle-sweep/core.out.bin
-# Characterizer kernels (tests/*.s: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*):
-python3 tools/charz_suites.py <suite>                    # one suite, five cases; analyzers: python3 tests/<name>.py --suite <suite> r1 [e1]
-# Chess compiles ~6 s of wall per case at -j16 (xchesscc runs twice per case); build it in slices with --only.
 
 # Standalone Rust binaries
 cargo run --release --bin trace-compare -- ...   # HW vs EMU events JSON diff
@@ -123,6 +93,68 @@ cargo run --release --bin export-isa             # dump TableGen ISA tables
 cargo run --release --bin npu-archspec           # archspec inspector
 cargo run --release --bin vcd-compare -- ...     # aiesimulator VCD diff (--features analysis)
 ```
+
+## Kernel Suites (`tools/harness`)
+
+Every kernel we write ourselves (ISA tests, timing and collision probes, C++ instruction
+tests, characterizers) runs through one runner. A **suite** is a directory of cases
+(`tools/harness/suite.py`): each case is a topology (cores, tiles, buffers, objectfifos or
+stream/cascade links, one or more phases) plus its sources. **Generators only write suites;
+they never compile or run anything.** The runner builds (aiecc, per package, unchanged
+packages reused by content hash), runs on silicon (serial: the NPU is single-tenant) or in
+the emulator (parallel), and compares byte for byte.
+
+```bash
+export PYTHONPATH=tools
+python3 -m harness suite build   <suite>               # parallel; --only CASE.. restricts
+python3 -m harness suite hw      <suite> r1            # serial; the first timeout aborts the run
+python3 -m harness suite emu     <suite> e1 -j 8       # FFI .so rebuilt once, then parallel
+python3 -m harness suite compare <suite> r1 e1         # per buffer; exit 1 on mismatch
+python3 -m harness suite hw      <suite> d5 --repeat 5 # every case 5x back to back
+python3 -m harness suite repeats <suite> d5            # exit 1 if a case's repeats differ
+```
+
+Results land in `<suite>/runs/<tag>/<case>/<core>.<buffer>.bin` plus `run.json`; tags are
+never overwritten. Comparing two hardware tags (`compare <suite> r1 r2`) is the determinism
+check; `--repeat N` does the same within one tag (repeats 2..N sit in `<case>/repeat_<k>/`).
+HW-only work is just not running `emu`. ISA-style single-core kernels address p0 = in,
+p1 = out, and `isa_suite` always gives such a kernel an input of at least 4 bytes (an
+out-only core gets out in p0, and p1 is stale tile state on silicon).
+
+C++ kernels use a `.cc` core source; the compiler is a property of the topology
+(`peano`: clang++ `--target=aie2-none-unknown-elf -O2`; `chess`: `xchesscc_wrapper aie2`,
+AIE2 only) because aiecc links per package. The entry symbol is renamed at compile time
+(`-D`), not with objcopy, which breaks Chess objects.
+
+| Suite | Generator | Analyzer |
+|-------|-----------|----------|
+| ISA: one case per batch of single-instruction tests; cascade and stream batches are two-core cases | `scripts/isa-test.sh` (wraps `tools/isa-test-gen.py`; the whole generate, build, hw, emu, compare, analyze chain) | `tools/isa-test-analyze.py <suite> [hw emu]`: per test point, and fails any that checked nothing (payload all zero, or the same for inputs that should differ) even where EMU == HW |
+| Accumulator read/write timing | `tools/gen_acc_timing_probe.py generate <dir>` | `tools/analyze_acc_timing.py <dir> <tag> [--compare TAG]` |
+| Accumulator collisions (single core, and cascade on two cores) | `tools/gen_collision_probe.py generate <dir>`, `tools/gen_cascade_collision_probe.py <dir>`; older probe directories convert with `tools/probe_to_suite.py` | `tools/analyze_collision_probe.py check\|report\|summary <dir> [hw emu]`, `tools/collision_points.py`, `tools/diff_probe_points.py <dir> <hw> <emu>` |
+| Load/store alignment | `tools/gen_ldst_align_probe.py generate <dir>` | the analysis functions in the same file (`# -- analysis` section; a pure function of a case's output bytes) |
+| C++ intrinsics, Peano (76 cases) | `tools/instr-test-gen.py --td <llvm-aie>/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <dir>` | EMU against HW with `suite compare` |
+| C++ intrinsics, Chess (4234 cases) | `tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h --types-header .../me_chess_types.h [--iss-types-header .../me_iss_types.h] --suite-dir <dir>` | EMU against HW with `suite compare` |
+| Shuffle network sweep (one Chess case) | `tests/shuffle-sweep/gen_suite.py <dir>` | `tests/shuffle-sweep/analyze.py <dir>/runs/<tag>/shuffle-sweep/core.out.bin` |
+| Characterizers (`tests/*.s`: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*), five cases | `tools/charz_suites.py <dir>` | `python3 tests/<name>.py --suite <dir> r1 [e1]` |
+
+Chess compiles at about 6 s of wall per case at `-j16` (xchesscc runs twice per case): build
+the Chess suite in slices with `--only`. Some Chess cases do not compile and some Peano
+`*_conf` MAC intrinsics take a random configuration word the emulator has no geometry for
+(not modelled); `suite compare` shows which.
+
+Typical newcomer sequence for a new instruction-level check:
+
+```bash
+export PYTHONPATH=tools
+./scripts/isa-test.sh --filter VMOV --tag try1         # generate + build + hw + emu + compare + analyze
+python3 tools/isa-test-analyze.py build/isa-suite --failing
+```
+
+**Determinism check.** `harness suite hw <suite> d5 --repeat 5` followed by
+`harness suite repeats <suite> d5` replaces the old shell loops. On the ISA suite it is how
+nondeterministic instructions were found (the cycle counter `MOV_CNTR` is skipped by the
+generator for that reason; cold-start state leaking across launches was fixed by resetting
+the compress and sparse state and clearing the MAC destination in the kernels).
 
 ## Test Validation Architecture
 

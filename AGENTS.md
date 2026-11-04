@@ -82,6 +82,8 @@ cargo run -- <subcommand> ...                    # bare `xdna-emu` opens the GUI
 ./scripts/run-tests.sh [--lib]                   # all tests / library only
 ./scripts/emu-bridge-test.sh                     # bridge suite (needs XRT + NPU)
 ./scripts/emu-bridge-test.sh --no-hw add_one     # quick EMU-only
+./scripts/isa-test.sh                            # ISA suite: generate, run HW + EMU, compare, analyze
+python3 -m harness suite ...                     # run any other kernel suite (PYTHONPATH=tools)
 cargo build -p xdna-emu-ffi                      # rebuild the FFI .so
 ./scripts/rebuild-plugin.sh [--release]          # full plugin build + install
 ```
@@ -92,6 +94,9 @@ cargo build -p xdna-emu-ffi                      # rebuild the FFI .so
   use needs `cargo build -p xdna-emu-ffi`. A stale `.so` causes phantom bugs.
 - Don't run the same cargo invocation twice concurrently (debug and release
   together are fine).
+- **Kernels we write ourselves** (ISA tests, probes, C++ instruction tests,
+  characterizers) all run through one suite runner, `tools/harness`; the
+  generators and commands are in [testing](docs/components/testing.md).
 - **Bridge tests are the real validation target**: `test.exe -> XRT -> plugin
   -> emulator`. Every test compiles with both compilers; Chess is ground truth,
   Peano failures are informational. Results land in

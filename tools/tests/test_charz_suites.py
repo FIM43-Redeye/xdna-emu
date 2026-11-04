@@ -39,10 +39,10 @@ def test_generate_writes_one_case_per_characterizer(tmp_path):
 
 
 def test_inputs_are_what_the_retired_scripts_fed():
-    # run-sparse-*.sh and run_vldb_4x_characterizer.sh: `test_host --seed 42`
+    # the retired sparse and vldb-4x runners: `test_host --seed 42`
     assert C.CHARACTERIZERS[0].input() == prng_bytes(32, 42)
     assert C.CHARACTERIZERS[4].input() == vldb.fill_prng(256, 42)
-    # run_bf16_elemwise_characterizer.sh: [Sidon][ones][ones][Sidon] as bf16
+    # the retired bf16 element-wise runner: [Sidon][ones][ones][Sidon] as bf16
     data = C.CHARACTERIZERS[2].input()
     assert len(data) == 256 and data[:8] == struct.pack("<4H", 0x3F80, 0x4000, 0x4080, 0x4100)
     assert data[64:128] == data[128:192] == struct.pack("<H", 0x3F80) * 32 and data[192:] == data[:64]

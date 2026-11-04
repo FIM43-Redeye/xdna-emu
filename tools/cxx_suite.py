@@ -7,7 +7,7 @@ at (0,2), ABI `(in, out)` as `extern "C" void test_kernel(const int32_t *in, int
 result in `core.out.bin`. The compiler is the suite's (aiecc links per package).
 
 Inputs default to the `test_host --seed` PRNG stream of the suite seed, spelled out as
-buffer data, so a rerun feeds the kernels what the retired scripts/instr-test.sh did.
+buffer data, so a rerun feeds the kernels what the retired shell runner did.
 """
 from __future__ import annotations
 
