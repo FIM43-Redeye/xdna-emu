@@ -23,7 +23,7 @@ pub(super) type Image = [u32; 32];
 /// dynZeroAccum, accShift, dynMulNeg, dynAcc0Neg, dynAcc1Neg; pinned by a test below).
 const ZERO_ACC1: u32 = 1 << 0;
 const SHIFT16: u32 = 1 << 10;
-const SUB_MUL: u32 = 1 << 11;
+pub(super) const SUB_MUL: u32 = 1 << 11;
 const SUB_ACC1: u32 = 1 << 12;
 const SUB_ACC2: u32 = 1 << 13;
 

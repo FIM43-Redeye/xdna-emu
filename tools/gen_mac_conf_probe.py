@@ -227,6 +227,46 @@ def plan_termneg(rng):
     return out
 
 
+MODES_CODES = [2, 3, 18, 19, 17, 77, 69, 16, 32, 33, 34, 66, 98, 127, 84]   # float conf, complex, idle (am0/am1/am2/am3)
+
+
+def plan_modes(rng):
+    """The flags of the post-adder on the modes the flags plan does not cover: every kind, random flags."""
+    out = []
+    for kind in KINDS:
+        confs = []
+        for code in MODES_CODES:
+            for _ in range(24):
+                confs.append(code << 1 | rng.getrandbits(1) << 0 | rng.getrandbits(2) << 8 | rng.getrandbits(4) << 10
+                             | rng.getrandbits(8) << 16)
+        out += cases_for(kind, "modes", confs, rng)
+    return out
+
+
+def plan_repro(rng, suite_dir=None):
+    """Replays the operands of one `modes` tile (the single EMU != HW tile) under flag variations."""
+    import json
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from analyze_mac_conf_probe import tile_data
+    src = Path(REPRO_SUITE)
+    meta, tiles = tile_data(src, "r1", REPRO_CASE)
+    t = next(t for t in tiles if t["conf"] == REPRO_CONF)
+    ops = dict(a=t["a"], b=t["b"], c1=t["acc1"], c2=t["acc2"])
+    out = []
+    for kind in ("addmsc", "mul", "msc", "addmac"):
+        confs = []
+        for tn in (REPRO_CONF >> 16 & 0xFF, 0):
+            for flags in range(16):
+                confs.append((REPRO_CONF & 0xFF00FFFF & ~(0xF << 10)) | flags << 10 | tn << 16)
+        out += cases_for(kind, "repro", confs, rng, operands=lambda i: ops)
+    return out
+
+
+REPRO_SUITE = "/home/triple/npu-work/xdna-emu/build/experiments/harness/macconf/modes"
+REPRO_CASE = "modes__addmsc__00"
+REPRO_CONF = 0x622706
+
+
 def plan_upper(rng):
     out = []
     bits = [14, 15] + list(range(16, 32))
@@ -249,7 +289,7 @@ def plan_random(rng):
     return out
 
 
-PLANS = {"termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
+PLANS = {"repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
 
 
 def main():

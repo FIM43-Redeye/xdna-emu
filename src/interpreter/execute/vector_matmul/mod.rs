@@ -422,6 +422,15 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
         let mut product_config = p.config;
         product_config.accumulate = false;
         product_config.subtract = false;
+        let mut combine = *combine;
+        if p.config.multiplier == Multiplier::FloatConf {
+            // The float-conf multiplier applies the instruction's product sign itself, before
+            // the 14-bit wrap, so the post-adder must not negate the sum again.
+            product_config.negate_products =
+                combine.signs.product_negated ^ (combine.config_word & sparse::SUB_MUL != 0);
+            combine.signs.product_negated = false;
+            combine.config_word &= !sparse::SUB_MUL;
+        }
         matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
         let acc1 = read_acc_full(ctx, p.acc_src, p.is_half, p.acc_use_bypass[0]);
         let acc2 = p.acc2_sub.map(|_| read_acc2(ctx, p));
@@ -429,9 +438,9 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
             &acc1,
             acc2.as_ref(),
             &product,
-            p.config.shape.lanes() as usize,
+            p.config.accumulator_lanes() as usize,
             p.config.acc_width,
-            combine,
+            &combine,
         );
         queue_result(ctx, p, result);
         return;
@@ -759,8 +768,9 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &Ma
                 // The low bytes of 16-bit elements, the product kept to 14 signed bits.
                 let a_val = extract_element_512(a, element_offset(ia, 16), 16, false) & 0xFF;
                 let b_val = extract_element_512(b, element_offset(ib, 16), 16, false) & 0xFF;
-                let product = sign_extend(a_val * b_val, 14);
-                sum += if negated(lane, term, 0) { -product } else { product };
+                let negate = negated(lane, term, 0) ^ config.negate_products;
+                let raw = a_val * b_val;
+                sum += sign_extend(if negate { -raw } else { raw }, 14);
                 continue;
             }
             let a_val = extract_element_512(a, element_offset(ia, bits_x), bits_x, config.x_signed);

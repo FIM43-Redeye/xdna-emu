@@ -98,6 +98,9 @@ pub struct MatMulConfig {
     pub bits_y: u32,
     /// Config-word `term_neg` field (bits 23:16): sign controls of the post-adder's term slots.
     pub term_neg: u8,
+    /// The float-conf multiplier negates every product before it is wrapped to 14 bits (the
+    /// instruction's own sign, `msc` / `negmul` / ..., folded with `sub_mul` by the caller).
+    pub negate_products: bool,
     /// Which bit negates which partial product, for the geometry (`None`: no rule, the field has
     /// no effect on this mode).
     pub term_neg_rule: Option<TermNegRule>,
@@ -177,6 +180,7 @@ impl MatMulConfig {
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
             term_neg: 0,
+            negate_products: false,
             term_neg_rule: None,
             multiplier: Multiplier::Array,
         })
@@ -231,6 +235,7 @@ impl MatMulConfig {
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
             term_neg: 0,
+            negate_products: false,
             term_neg_rule: None,
             multiplier: Multiplier::Array,
         })
@@ -355,6 +360,16 @@ impl MatMulConfig {
         Some(config)
     }
 
+    /// Accumulator lanes the instruction writes: the multiplier's lanes, except in the float
+    /// conf mode, where the other 16 lanes see the accumulator inputs and a zero product.
+    pub fn accumulator_lanes(&self) -> u32 {
+        if self.multiplier == Multiplier::FloatConf {
+            32
+        } else {
+            self.shape.lanes()
+        }
+    }
+
     fn from_entry(entry: &GeometryEntry, multiplier: Multiplier) -> Self {
         let (a_type, b_type) = element_types_from_entry(entry);
         Self {
@@ -377,6 +392,7 @@ impl MatMulConfig {
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
             term_neg: 0,
+            negate_products: false,
             term_neg_rule: None,
             multiplier,
         }
