@@ -141,9 +141,9 @@ Chess compiles at about 6 s of wall per case at `-j16` (xchesscc runs twice per 
 the Chess suite in slices with `--only`. `XDNA_EMU_CHESS_WRAPPER="<command> [args]"` prefixes
 every Chess invocation (the `xchesscc_wrapper` compile and the Chess package's aiecc) with a
 launcher such as a compile cache or server; it must run the command unchanged, and it is not
-part of the package's inputs hash. Some Chess cases do not compile and some Peano
-`*_conf` MAC intrinsics take a random configuration word the emulator has no geometry for
-(not modelled); `suite compare` shows which.
+part of the package's inputs hash. Some Chess cases do not compile; the Peano `*_conf` MAC
+intrinsics take a random configuration word, which the emulator models in full
+([mac-conf](../fidelity-gaps/mac-conf.md)).
 
 Typical newcomer sequence for a new instruction-level check:
 

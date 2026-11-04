@@ -510,7 +510,7 @@ replaced by the shared lane (`float_vneg_is_not_a_bare_sign_flip`).
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | fp32 add/neg result latency | `vadd.f` reads its accumulators at use cycle 3 and its result is visible from issue + 7 (`II_VACCf` def 6); both pinned by the timing probe | `PendingAccAdd` | closed |
-| integer accumulator add/sub config bits | `execute_acc_add_sub` decoded integer `sub_acc1`/`sub_acc2` from bits 11/12 (bit 11 is `dynMulNeg`); TableGen's `VecConf` and the constants Chess emits for `add_conf` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | fixed from TableGen (one layout for integer and float, silicon-confirmed on the float forms); integer variants not captured on silicon |
+| integer accumulator add/sub config bits | `execute_acc_add_sub` decoded integer `sub_acc1`/`sub_acc2` from bits 11/12 (bit 11 is `dynMulNeg`); TableGen's `VecConf` and the constants Chess emits for `add_conf` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | fixed from TableGen; integer variants silicon-confirmed 2026-11-03 (`accops`, [mac-conf](mac-conf.md)); integer `vneg` also honours bit 12 |
 | float vector-register add/sub gate | `float_addsub_not_modeled` (x/w float `Add`/`Sub`/`SubLt`/`SubGe`) is unreachable: no TableGen encoding pairs those semantics with a float element type | `vector_arith.rs` | guard only; `float_add_sub_is_reachable_only_through_the_accumulator_family` asserts it |
 
 ## Wide VSHIFT / VSHIFT_ALIGN (512-bit x registers)
@@ -638,8 +638,8 @@ sgn_x, so `uu` is the base word and `ss` adds `0x300`):
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| silent drop of a config word with no geometry | `execute_matmul` logged an error and returned "handled" with the destination unwritten | `vector_matmul/mod.rs` | fixed: reports the op unhandled with a "[NOT MODELED]" warning (`a_config_word_with_no_geometry_is_unhandled_and_writes_nothing`); today every mode the header builds has a geometry, so only a config word outside the header can reach it |
-| mode forms beyond mul/mac/msc | only `vmul`, `vmac`, `vmsc` were captured per mode; `vnegmul`/`vnegmac`/`vaddmac`/`vsubmac`... run the same lane map with the instruction-level sign and second-accumulator handling the matmul modes already have, but no capture of these modes pins them | `execute_matmul` | open: no silicon evidence beyond mul/mac/msc |
+| config word with no geometry | silicon multiplies nothing for a key no mode uses (every product zero, accumulator inputs still added); the emulator now does the same | `vector_matmul/mod.rs`, `Multiplier::Idle` | closed 2026-11-03, see [mac-conf](mac-conf.md) |
+| mode forms beyond mul/mac/msc | every kind (`vnegmul` ... `vsubmsc`) runs the shared post-adder on every mode; the `flags`/`modes` probes pin all kinds on the int8, int16, complex, float-conf and idle modes | `execute_matmul` | closed 2026-11-03, see [mac-conf](mac-conf.md) |
 | mode result latency | the modes use the itinerary def cycle of their instruction (the integer MAC family 5, visible from issue + 6), the same rule the timing probe pins for the dense and sparse MACs | `execute_matmul` | closed |
 
 ## Unpack: fused `vldb.unpack.*` and standalone `vunpack.*`
