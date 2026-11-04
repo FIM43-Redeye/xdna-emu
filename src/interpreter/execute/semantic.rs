@@ -65,7 +65,6 @@ use crate::interpreter::state::register_widths::widths;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use xdna_archspec::aie2::isa::SemanticOp;
-use xdna_archspec::aie2::registers::ctrl_regs;
 
 /// Execute a SlotOp using its SemanticOp if available.
 ///
@@ -928,6 +927,7 @@ mod tests {
     use crate::interpreter::bundle::SlotIndex;
     use crate::interpreter::bundle::SelectVariant;
     use xdna_archspec::aie2::isa::ImplicitReg;
+    use xdna_archspec::aie2::registers::ctrl_regs;
     use smallvec::smallvec;
 
     // ===== register widths: what a move reads back (silicon: bugs/widths probe) =====
