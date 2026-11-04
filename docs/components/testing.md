@@ -138,7 +138,10 @@ AIE2 only) because aiecc links per package. The entry symbol is renamed at compi
 | Characterizers (`tests/*.s`: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*), five cases | `tools/charz_suites.py <dir>` | `python3 tests/<name>.py --suite <dir> r1 [e1]` |
 
 Chess compiles at about 6 s of wall per case at `-j16` (xchesscc runs twice per case): build
-the Chess suite in slices with `--only`. Some Chess cases do not compile and some Peano
+the Chess suite in slices with `--only`. `XDNA_EMU_CHESS_WRAPPER="<command> [args]"` prefixes
+every Chess invocation (the `xchesscc_wrapper` compile and the Chess package's aiecc) with a
+launcher such as a compile cache or server; it must run the command unchanged, and it is not
+part of the package's inputs hash. Some Chess cases do not compile and some Peano
 `*_conf` MAC intrinsics take a random configuration word the emulator has no geometry for
 (not modelled); `suite compare` shows which.
 

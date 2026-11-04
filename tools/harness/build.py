@@ -19,6 +19,8 @@ The aiecc invocation is the one scripts/isa-test.sh uses; the compiler picks the
 (`aiecc_flags`): Peano passes `--xchesscc=false --xbridge=false`, Chess `--xchesscc --xbridge`.
 Tool paths come from the environment the workspace activates
 (`PEANO_INSTALL_DIR`, `PATH`); the manifest records them workspace-relative.
+`$XDNA_EMU_CHESS_WRAPPER` (shell words) prefixes every Chess invocation, the
+`xchesscc_wrapper` compile and the Chess package's aiecc (see `chess_wrapper`).
 
 Reuse: with `reuse=True` a package whose inputs hash the same as the one on disk is
 not rebuilt. The hash covers the topology (sources by content), the emitted MLIR of
@@ -32,6 +34,7 @@ import functools
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +60,23 @@ def aiecc_flags(compiler: str) -> tuple[str, ...]:
 
 
 AIECC_FLAGS = aiecc_flags("peano")
+
+CHESS_WRAPPER_ENV = "XDNA_EMU_CHESS_WRAPPER"
+
+
+def chess_wrapper() -> list[str]:
+    """Command prefix for every Chess invocation, from `$XDNA_EMU_CHESS_WRAPPER` split into
+    shell words (unset or blank: none). It is for launchers that run the given command
+    unchanged (a compile cache or server, a CPU or memory limiter), so it is not a build
+    input and stays out of the inputs hash."""
+    return shlex.split(os.environ.get(CHESS_WRAPPER_ENV, ""))
+
+
+def aiecc_command(compiler: str, exe: str) -> list[str]:
+    """The aiecc invocation for a package; a Chess package's aiecc runs Chess on the cores,
+    so it gets the Chess wrapper."""
+    prefix = chess_wrapper() if compiler == "chess" else []
+    return [*prefix, exe, *aiecc_flags(compiler), "aie.mlir"]
 
 
 class BuildError(RuntimeError):
@@ -135,7 +155,7 @@ def cxx_command(compiler: str, src: Path, dest: Path,
         wrapper = shutil.which("xchesscc_wrapper")
         if wrapper is None:
             raise BuildError("xchesscc_wrapper not found on PATH (Chess needs the aietools env)")
-        return [wrapper, "aie2", *define, "-c", str(src), "-o", str(dest)]
+        return [*chess_wrapper(), wrapper, "aie2", *define, "-c", str(src), "-o", str(dest)]
     raise BuildError(f"no C++ compiler named {compiler!r}")
 
 
@@ -310,7 +330,7 @@ def build_package(topology: Topology, out_dir: str | Path, *, run_aiecc: bool = 
             exe = aiecc_path()
             if exe is None:
                 raise BuildError("aiecc not found on PATH")
-            _run([exe, *aiecc_flags(topology.compiler), "aie.mlir"], pdir, pdir / "aiecc.log",
+            _run(aiecc_command(topology.compiler, exe), pdir, pdir / "aiecc.log",
                  f"aiecc for {topology.name} phase {ph.index}")
         phase_dirs.append(pdir)
 

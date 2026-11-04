@@ -129,6 +129,64 @@ def test_aiecc_flags_follow_the_compiler():
         assert "--get-xclbin" in aiecc_flags(c) and "--get-npu-insts" in aiecc_flags(c)
 
 
+# -- Chess wrapper hook ($XDNA_EMU_CHESS_WRAPPER) ------------------------------
+
+@pytest.fixture
+def fake_chess(tmp_path, monkeypatch):
+    """A stand-in xchesscc_wrapper on PATH, so command shapes are testable without aietools."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    w = bindir / "xchesscc_wrapper"
+    w.write_text("#!/bin/sh\nexit 0\n")
+    w.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return str(w)
+
+
+def test_chess_wrapper_prefixes_the_chess_compile(fake_chess, monkeypatch):
+    from harness.build import cxx_command
+    monkeypatch.setenv("XDNA_EMU_CHESS_WRAPPER", "/opt/launch --quiet")
+    cmd = cxx_command("chess", Path("k.cc"), Path("k.o"), rename=("test_kernel", "k_a"))
+    assert cmd[:3] == ["/opt/launch", "--quiet", fake_chess] and cmd[3] == "aie2"
+    assert cmd[-2:] == ["-o", "k.o"]
+
+
+def test_chess_wrapper_prefixes_aiecc_only_for_chess(monkeypatch):
+    from harness.build import aiecc_command, aiecc_flags
+    monkeypatch.setenv("XDNA_EMU_CHESS_WRAPPER", "/opt/launch")
+    assert aiecc_command("chess", "/x/aiecc") == ["/opt/launch", "/x/aiecc", *aiecc_flags("chess"), "aie.mlir"]
+    assert aiecc_command("peano", "/x/aiecc") == ["/x/aiecc", *aiecc_flags("peano"), "aie.mlir"]
+
+
+@pytest.mark.skipif(not peano("clang++"), reason="Peano clang++ unavailable")
+def test_chess_wrapper_leaves_peano_alone(monkeypatch):
+    from harness.build import cxx_command
+    monkeypatch.setenv("XDNA_EMU_CHESS_WRAPPER", "/opt/launch")
+    assert cxx_command("peano", Path("k.cc"), Path("k.o"))[0].endswith("clang++")
+
+
+def test_unset_or_empty_chess_wrapper_adds_nothing(fake_chess, monkeypatch):
+    from harness.build import aiecc_command, cxx_command
+    for value in (None, "", "   "):
+        if value is None:
+            monkeypatch.delenv("XDNA_EMU_CHESS_WRAPPER", raising=False)
+        else:
+            monkeypatch.setenv("XDNA_EMU_CHESS_WRAPPER", value)
+        assert cxx_command("chess", Path("k.cc"), Path("k.o"))[0] == fake_chess
+        assert aiecc_command("chess", "/x/aiecc")[0] == "/x/aiecc"
+
+
+def test_chess_wrapper_is_not_a_build_input(tmp_path, monkeypatch):
+    # the wrapper runs the same command (a launcher, cache or server); packages built with
+    # and without it are interchangeable, so reuse must not depend on it
+    from harness.build import compute_inputs_hash, _workspace
+    t = cxx_package(tmp_path, "chess")
+    monkeypatch.delenv("XDNA_EMU_CHESS_WRAPPER", raising=False)
+    plain = compute_inputs_hash(t, ["m"], _workspace())
+    monkeypatch.setenv("XDNA_EMU_CHESS_WRAPPER", "/opt/launch --quiet")
+    assert compute_inputs_hash(t, ["m"], _workspace()) == plain
+
+
 @pytest.mark.skipif(not (peano("clang++") and peano("llvm-objcopy")), reason="Peano clang++ unavailable")
 def test_cxx_source_is_compiled_with_peano(tmp_path):
     pkg = build_package(cxx_package(tmp_path, "peano"), tmp_path / "out", run_aiecc=False)
