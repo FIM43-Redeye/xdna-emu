@@ -27,6 +27,14 @@ Backends
 - `emu`: `XDNA_EMU=1`, `XDNA_EMU_RUNTIME` (default debug), `XDNA_EMU_DIR` = this
   checkout. The FFI `.so` is rebuilt first (a stale `.so` causes phantom bugs)
   and its mtime goes in the run record.
+
+Scrub (scrub.py)
+----------------
+With a `Scrub`, a hardware run launches the scrub package before EVERY phase (each phase is
+its own launch, and silicon carries core registers from one launch into the next), checks its
+marker outputs and logs it as `phase_<i>.scrub.log`; an emulator run sets
+`XDNA_EMU_CORE_INIT` so every core starts from the same values. The record's `scrub` names
+the pattern ("" = no scrub).
 """
 from __future__ import annotations
 
@@ -41,6 +49,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .scrub import Scrub, marker_problems
 from .topology import Buffer, Core, Topology, topology_from_dict
 
 REPO = Path(__file__).resolve().parents[2]
@@ -48,6 +57,7 @@ XRT = "/opt/xilinx/xrt"
 KERNEL_NAME = "MLIR_AIE"
 MIN_BO_BYTES = 4
 TIMEOUT_RC = -1                  # PhaseResult.returncode of a phase that hit its timeout
+SCRUB_MARKER_RC = -2             # the scrub before the phase ran but left no marker
 
 
 class RunError(RuntimeError):
@@ -138,6 +148,7 @@ class RunRecord:
     outputs: tuple[str, ...]
     inputs: tuple[dict, ...]
     package_hash: str = ""           # the build's `inputs_hash`: which package produced this
+    scrub: str = ""                  # scrub pattern the run started from ("" = none)
 
     @property
     def ok(self) -> bool:
@@ -220,10 +231,13 @@ def build_ffi(runtime: str = "debug") -> float:
     return ffi_so_path(runtime).stat().st_mtime
 
 
-def _env(backend: str, runtime: str) -> dict[str, str]:
+def _env(backend: str, runtime: str, scrub: Scrub | None = None) -> dict[str, str]:
     env = dict(os.environ)
+    env.pop("XDNA_EMU_CORE_INIT", None)
     if backend == "emu":
         env.update(XDNA_EMU="1", XDNA_EMU_RUNTIME=runtime, XDNA_EMU_DIR=str(REPO))
+        if scrub is not None:
+            env["XDNA_EMU_CORE_INIT"] = scrub.name
     else:
         env.pop("XDNA_EMU", None)
         env.pop("XDNA_EMU_RUNTIME", None)
@@ -233,12 +247,13 @@ def _env(backend: str, runtime: str) -> dict[str, str]:
 
 def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | None = None,
                 timeout: float | None = None, rebuild_ffi: bool = True,
-                out_dir: str | Path | None = None, host: str | Path | None = None) -> RunRecord:
+                out_dir: str | Path | None = None, host: str | Path | None = None,
+                scrub: Scrub | None = None) -> RunRecord:
     """Run every phase of the package at `pkg_dir`.
 
     Outputs land in `out_dir`, default `<pkg_dir>/<tag>/`. `host` is a prebuilt
     test_host (a suite builds one for all its packages); default builds one inside
-    `pkg_dir`.
+    `pkg_dir`. `scrub`: see the module docstring (hardware needs `scrub.pkg_dir`).
     """
     if backend not in ("hw", "emu"):
         raise RunError(f"backend must be 'hw' or 'emu', not {backend!r}")
@@ -259,8 +274,10 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
     so_mtime = build_ffi(runtime) if backend == "emu" and rebuild_ffi else (
         ffi_so_path(runtime).stat().st_mtime if backend == "emu" else None)
     host = Path(host) if host is not None else build_test_host(pkg_dir)
+    if scrub is not None and backend == "hw" and scrub.pkg_dir is None:
+        raise RunError("a hardware scrub needs the built scrub package")
     out_dir.mkdir(parents=True, exist_ok=True)
-    env = _env(backend, runtime)
+    env = _env(backend, runtime, scrub)
 
     results: list[PhaseResult] = []
     outputs: list[str] = []
@@ -275,6 +292,11 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
                "-i", str(pdir / "insts.bin"), "--in-size", str(in_size),
                "--out-size", str(out_size), "--in-file", str(in_bin), "--out-file", str(out_bin)]
         log = out_dir / f"phase_{i}.log"
+        if scrub is not None and backend == "hw":
+            failed = _run_scrub(scrub, host, env, out_dir, i, timeout)
+            if failed is not None:
+                results.append(failed)
+                break
         t0 = time.monotonic()
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -293,6 +315,38 @@ def run_package(pkg_dir: str | Path, backend: str, tag: str, *, runtime: str | N
 
     rec = RunRecord(tag, backend, topology.name, git_rev(), so_mtime, tuple(results),
                     tuple(outputs), tuple(input_sources(topology)),
-                    manifest.get("inputs_hash", ""))
+                    manifest.get("inputs_hash", ""), scrub.name if scrub else "")
     write_run_record(out_dir, rec)
     return rec
+
+
+def _run_scrub(scrub: Scrub, host: Path, env: dict[str, str], out_dir: Path, phase: int,
+               timeout: float) -> PhaseResult | None:
+    """Launch the scrub package before phase `phase`; None when it ran and every scrub core
+    stored its marker, else the PhaseResult that stops the run (log `phase_<i>.scrub.log`)."""
+    manifest = json.loads((scrub.pkg_dir / "manifest.json").read_text())
+    topology = topology_from_dict(manifest["topology"])
+    (ph,) = manifest["plan"]["phases"]           # a scrub is one launch
+    tmp_in, tmp_out = out_dir / f"phase_{phase}.scrub.in.bin", out_dir / f"phase_{phase}.scrub.out.bin"
+    tmp_in.write_bytes(pack_phase_inputs(topology, ph))
+    pdir = scrub.pkg_dir / "phase_0"
+    cmd = [str(host), "-x", str(pdir / "aie.xclbin"), "-k", KERNEL_NAME, "-i", str(pdir / "insts.bin"),
+           "--in-size", str(max(ph["host_in_bytes"], MIN_BO_BYTES)),
+           "--out-size", str(max(ph["host_out_bytes"], MIN_BO_BYTES)),
+           "--in-file", str(tmp_in), "--out-file", str(tmp_out)]
+    log = out_dir / f"phase_{phase}.scrub.log"
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+        rc, text = r.returncode, r.stdout + r.stderr
+    except subprocess.TimeoutExpired as e:
+        rc, text = TIMEOUT_RC, f"TIMEOUT after {timeout}s\n{e.stdout or ''}{e.stderr or ''}"
+    wall = round(time.monotonic() - t0, 3)
+    if rc == 0:
+        problems = marker_problems(unpack_phase_outputs(ph, tmp_out.read_bytes()), scrub.out_marker)
+        if problems:
+            rc, text = SCRUB_MARKER_RC, text + "\nscrub marker check failed: " + "; ".join(problems)
+    log.write_text(f"{scrub.name} before phase {phase}\n{text}")
+    tmp_in.unlink(missing_ok=True)
+    tmp_out.unlink(missing_ok=True)
+    return None if rc == 0 else PhaseResult(phase, rc, wall, log.name)

@@ -21,6 +21,12 @@ recorded as skipped, with the reason, instead of being run. Any other failure is
 recorded and the run continues. EMU runs rebuild the FFI `.so` once, then go in
 parallel.
 
+Both run kinds scrub by default (scrub.py): on silicon the scrub package runs on the case's
+tiles before each phase, in the emulator every core starts from the same values, so a case
+that reads a register it never wrote gives the same output on both and in any order.
+`scrub=False` (`--no-scrub`) turns it off, for persistence experiments. The run summary and
+every run record name the pattern (`scrub`); `compare` warns when two tags differ in it.
+
 `suite.json` `meta` is the analyzer's suite-level data (record sizes, catalogues...).
 `hw_checks` names pre-flight checks that refuse a package on silicon (see `HW_CHECKS`).
 """
@@ -40,6 +46,7 @@ from .emit import kernel_object
 from .build import BuildError, _peano_tool, build_package
 from .run import (RunError, build_ffi, build_test_host, git_rev, output_file_name,
                   read_run_record, run_package)
+from .scrub import Scrub, ScrubKernel, case_tiles, load_scrub_kernel, scrub_key, write_scrub_case
 from .topology import Buffer, Core, TileRef, Topology, load_topology, to_dict
 
 SUITE_FORMAT = 1
@@ -292,8 +299,26 @@ def _run_case(suite: Suite, case: str, backend: str, tag: str, host: Path,
     return CaseOutcome(case, "ok", "", wall)
 
 
+class _HwScrubs:
+    """The suite's scrub packages, one per device and tile set, built on first use."""
+
+    def __init__(self, suite: Suite, kernel: ScrubKernel):
+        self.suite, self.kernel, self.built = suite, kernel, {}
+
+    def for_case(self, case: str) -> Scrub:
+        topo = self.suite.topology(case)
+        tiles = case_tiles(topo)
+        key = scrub_key(topo.device, tiles)
+        if key not in self.built:
+            base = self.suite.path / "scrub" / key
+            t = write_scrub_case(self.kernel, base / "case", topo.device, tiles)
+            pkg = build_package(t, base / "pkg", reuse=True)
+            self.built[key] = Path(pkg.out_dir)
+        return Scrub(self.kernel.name, self.kernel.out_marker, self.built[key])
+
+
 def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
-           timeout: float | None = None, repeat: int = 1) -> list[CaseOutcome]:
+           timeout: float | None = None, repeat: int = 1, scrub: bool = True) -> list[CaseOutcome]:
     """Run the selected cases on silicon, one at a time; the first timeout stops the run.
 
     `repeat` N > 1 runs each case N times back to back: repeat 1 lands in the plain
@@ -306,6 +331,8 @@ def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
     cases = select(suite, only)
     out = _prepare_tag(suite, tag)
     host = build_test_host(_host_dir(suite))
+    kernel = load_scrub_kernel() if scrub else None
+    scrubs = _HwScrubs(suite, kernel) if kernel else None
     outcomes: list[CaseOutcome] = []
     aborted = None
     try:
@@ -314,9 +341,16 @@ def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
             if problems:
                 outcomes.append(CaseOutcome(case, "refused", "; ".join(problems)))
                 continue
-            o = _run_case(suite, case, "hw", tag, host, timeout=timeout)
+            sc = None
+            if scrubs is not None:
+                try:
+                    sc = scrubs.for_case(case)
+                except (BuildError, OSError, ValueError) as e:
+                    outcomes.append(CaseOutcome(case, "failed", f"scrub package: {e}"))
+                    continue
+            o = _run_case(suite, case, "hw", tag, host, timeout=timeout, scrub=sc)
             if o.good and repeat > 1:
-                o = _repeat_case(suite, case, tag, host, timeout, repeat, o)
+                o = _repeat_case(suite, case, tag, host, timeout, repeat, o, sc)
             outcomes.append(o)
             if o.status == "timeout":
                 aborted = {"case": case, "reason": "hardware timeout; the NPU may be wedged, "
@@ -324,7 +358,8 @@ def run_hw(suite: Suite, tag: str, *, only: Iterable[str] | None = None,
                 outcomes += [CaseOutcome(c, "skipped", f"run aborted at {case}") for c in cases[i + 1:]]
                 break
     finally:
-        _write_summary(out, suite, "hw", tag, outcomes, aborted, {"repeat": repeat})
+        _write_summary(out, suite, "hw", tag, outcomes, aborted,
+                       {"repeat": repeat, "scrub": kernel.name if kernel else None})
     return outcomes
 
 
@@ -334,12 +369,12 @@ def repeat_dir(suite_dir: Path, tag: str, case: str, k: int) -> Path:
 
 
 def _repeat_case(suite: Suite, case: str, tag: str, host: Path, timeout: float | None,
-                 repeat: int, first: CaseOutcome) -> CaseOutcome:
+                 repeat: int, first: CaseOutcome, scrub: Scrub | None = None) -> CaseOutcome:
     wall, agree = first.wall_seconds, True
     base = runs_dir(suite.path, tag) / case
     for k in range(2, repeat + 1):
         o = _run_case(suite, case, "hw", tag, host, out_dir=repeat_dir(suite.path, tag, case, k),
-                      timeout=timeout)
+                      timeout=timeout, scrub=scrub)
         wall += o.wall_seconds
         if not o.good:
             return CaseOutcome(case, o.status, f"repeat {k}: {o.detail}", wall)
@@ -349,8 +384,10 @@ def _repeat_case(suite: Suite, case: str, tag: str, host: Path, timeout: float |
 
 def run_emu(suite: Suite, tag: str, *, only: Iterable[str] | None = None, jobs: int | None = None,
             runtime: str | None = None, rebuild_ffi: bool = True,
-            timeout: float | None = None) -> list[CaseOutcome]:
+            timeout: float | None = None, scrub: bool = True) -> list[CaseOutcome]:
     """Run the selected cases on the emulator in parallel (FFI `.so` rebuilt once first)."""
+    kernel = load_scrub_kernel() if scrub else None
+    sc = Scrub(kernel.name, kernel.out_marker) if kernel else None
     cases = select(suite, only)
     out = _prepare_tag(suite, tag)
     runtime = runtime or os.environ.get("XDNA_EMU_RUNTIME", "debug")
@@ -361,10 +398,11 @@ def run_emu(suite: Suite, tag: str, *, only: Iterable[str] | None = None, jobs: 
         with cf.ThreadPoolExecutor(jobs or os.cpu_count() or 1) as ex:
             outcomes = list(ex.map(
                 lambda c: _run_case(suite, c, "emu", tag, host, runtime=runtime,
-                                    rebuild_ffi=False, timeout=timeout), cases))
+                                    rebuild_ffi=False, timeout=timeout, scrub=sc), cases))
     finally:
         _write_summary(out, suite, "emu", tag, outcomes, None,
-                       {"runtime": runtime, "ffi_rebuilt": rebuild_ffi, "ffi_so_mtime": so_mtime})
+                       {"runtime": runtime, "ffi_rebuilt": rebuild_ffi, "ffi_so_mtime": so_mtime,
+                        "scrub": kernel.name if kernel else None})
     return outcomes
 
 
@@ -423,6 +461,21 @@ def compare_runs(suite: Suite, tag_a: str, tag_b: str, *,
                                 + (f" (sizes {len(a)} vs {len(b)})" if len(a) != len(b) else ""))
         results.append(CaseComparison(case, "differs" if problems else "identical", "; ".join(problems)))
     return results
+
+
+def run_scrub(suite: Suite, tag: str) -> str | None:
+    """The scrub pattern a run started from (None: no scrub, or a run older than the scrub)."""
+    p = runs_dir(suite.path, tag) / "summary.json"
+    return json.loads(p.read_text()).get("scrub") if p.is_file() else None
+
+
+def scrub_warning(suite: Suite, tag_a: str, tag_b: str) -> str | None:
+    """A line to print when two runs did not start from the same core state."""
+    a, b = run_scrub(suite, tag_a), run_scrub(suite, tag_b)
+    if a == b:
+        return None
+    return (f"warning: {tag_a} scrub={a or 'none'}, {tag_b} scrub={b or 'none'}: lanes a case "
+            f"never writes are not comparable")
 
 
 # -- repeat report -------------------------------------------------------------

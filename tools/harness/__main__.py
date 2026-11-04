@@ -5,9 +5,9 @@
   python3 -m tools.harness emu   <pkg_dir> <tag> [--release]
 
   python3 -m harness suite build   <suite_dir> [--only CASE ...] [-j N]
-  python3 -m harness suite hw      <suite_dir> <tag> [--only ...] [--timeout S] [--repeat N]
+  python3 -m harness suite hw      <suite_dir> <tag> [--only ...] [--timeout S] [--repeat N] [--no-scrub]
   python3 -m harness suite repeats <suite_dir> <tag> [--only ...]
-  python3 -m harness suite emu     <suite_dir> <tag> [--only ...] [-j N] [--release] [--no-rebuild]
+  python3 -m harness suite emu     <suite_dir> <tag> [--only ...] [-j N] [--release] [--no-rebuild] [--no-scrub]
   python3 -m harness suite compare <suite_dir> <tag_a> <tag_b> [--only ...]
 
 (or `PYTHONPATH=tools python3 -m harness ...`). A suite (suite.py) is a directory of cases;
@@ -57,6 +57,9 @@ def main(argv=None) -> int:
             p.add_argument("-j", type=int, default=None, help="parallel jobs (default: all cores)")
         if name in ("hw", "emu"):
             p.add_argument("--timeout", type=float, default=None, help="seconds per phase")
+        if name in ("hw", "emu"):
+            p.add_argument("--no-scrub", action="store_true",
+                           help="do not start the cases from the scrub pattern (persistence experiments)")
         if name == "hw":
             p.add_argument("--repeat", type=int, default=1, metavar="N",
                            help="run every case N times and report whether all repeats agree")
@@ -89,6 +92,9 @@ def suite_main(args) -> int:
         suite = S.load_suite(args.suite_dir)
         if args.suite_cmd == "compare":
             res = S.compare_runs(suite, args.tag_a, args.tag_b, only=args.only)
+            warn = S.scrub_warning(suite, args.tag_a, args.tag_b)
+            if warn:
+                print(warn)
             print(S.format_comparison(res, args.tag_a, args.tag_b))
             return 0 if all(r.identical for r in res) else 1
         if args.suite_cmd == "build":
@@ -99,14 +105,16 @@ def suite_main(args) -> int:
             print(S.format_repeat_report(rows, args.tag))
             return 0 if all(r.agree for r in rows) else 1
         elif args.suite_cmd == "hw":
-            out = S.run_hw(suite, args.tag, only=args.only, timeout=args.timeout, repeat=args.repeat)
+            out = S.run_hw(suite, args.tag, only=args.only, timeout=args.timeout, repeat=args.repeat,
+                           scrub=not args.no_scrub)
             print(S.format_outcomes(out, f"hw {args.tag}"))
             if any(o.agree is False for o in out):
                 return 1
         else:
             out = S.run_emu(suite, args.tag, only=args.only, jobs=args.j,
                             runtime="release" if args.release else None,
-                            rebuild_ffi=not args.no_rebuild, timeout=args.timeout)
+                            rebuild_ffi=not args.no_rebuild, timeout=args.timeout,
+                            scrub=not args.no_scrub)
             print(S.format_outcomes(out, f"emu {args.tag}"))
     except (S.SuiteError, BuildError, RunError, TopologyFormatError) as e:
         print(f"error: {e}", file=sys.stderr)

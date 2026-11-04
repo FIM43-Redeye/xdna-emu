@@ -107,6 +107,9 @@ class FakeRuns:
         monkeypatch.setattr(S, "run_package", self.run)
         monkeypatch.setattr(S, "build_test_host", lambda d: Path(d) / "test_host")
         monkeypatch.setattr(S, "build_ffi", lambda runtime: 123.0)
+        # the scrub package is test_harness_scrub's subject; never build one here
+        monkeypatch.setattr(S._HwScrubs, "for_case",
+                            lambda self, case: S.Scrub("scrub-test", 0, Path("scrubpkg")))
 
     def run(self, pkg, backend, tag, *, out_dir, host, **kw):
         case = Path(pkg).name
