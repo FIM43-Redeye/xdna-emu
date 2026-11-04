@@ -215,3 +215,25 @@ fn an_a_channel_load_beside_a_gather_reads_at_the_gather_address() {
     // the gather itself is unaffected
     assert_eq!(reg(&[(0, VLDB_4X), (0, VLDA_WL4_ALT)], WL5), reg(&[(0, VLDB_4X)], WL5));
 }
+
+#[test]
+fn the_redirected_load_takes_one_row_from_each_of_the_first_two_lanes() {
+    // hz3 (`g4x_lo_mix`): lanes addressing different items; the low row comes from lane 0, the
+    // high row from lane 1 (whose address the gather offsets by 16, the bank interleave)
+    let decoder = InstructionDecoder::load_default();
+    let (mut ctx, mut tile) = start_state();
+    let mut lanes = [LOCAL_BASE + GATHER_AT; 8];
+    lanes[0] = LOCAL_BASE + LOAD_AT;
+    lanes[1] = LOCAL_BASE + P0_AT + 96;
+    ctx.vector.write(WL9, lanes);
+    let mut executor = CycleAccurateExecutor::new();
+    let mut bundle = VliwBundle::empty();
+    bundle.set_slot(op(&decoder, &VLDB_4X));
+    bundle.set_slot(op(&decoder, &VLDA_WL4_ALT));
+    executor.execute(&bundle, &mut ctx, &mut tile);
+    for _ in 0..12 {
+        executor.execute(&VliwBundle::empty(), &mut ctx, &mut tile);
+    }
+    let (lo, hi) = (words_at(&tile, LOAD_AT), words_at(&tile, P0_AT + 96 + 16));
+    assert_eq!(ctx.vector.read_store(WL4), [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]);
+}

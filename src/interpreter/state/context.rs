@@ -438,9 +438,10 @@ pub struct ExecutionContext {
     /// Loads have a 7-cycle pipeline latency (AIE2Schedule.td). The write to
     /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
-    /// `(slot, address)`: the load in `slot` reads memory at `address` this bundle instead of its
-    /// own (a load-unit collision with a `vldb.4x` gather; `MemoryUnit::arm_gather_hazards`).
-    load_address_overrides: SmallVec<[(u8, u32); 2]>,
+    /// `(slot, rows)`: the load in `slot` reads its two 16-byte rows at `rows` this bundle instead
+    /// of at its own address (a load-unit collision with a `vldb.4x` gather;
+    /// `MemoryUnit::arm_gather_hazards`).
+    load_address_overrides: SmallVec<[(u8, [u32; 2]); 2]>,
 
     /// Result latency (itinerary `operand_cycles[0]`) of the slot op currently
     /// being executed, set by the bundle executor before each slot dispatch.
@@ -999,13 +1000,14 @@ impl ExecutionContext {
         });
     }
 
-    /// Make the load in `slot` read memory at `address` for the rest of this bundle.
-    pub fn override_load_address(&mut self, slot: u8, address: u32) {
-        self.load_address_overrides.push((slot, address));
+    /// Make the load in `slot` read its low 16-byte row at `rows[0]` and its high one at
+    /// `rows[1]` for the rest of this bundle.
+    pub fn override_load_address(&mut self, slot: u8, rows: [u32; 2]) {
+        self.load_address_overrides.push((slot, rows));
     }
 
-    /// The address the load in `slot` reads this bundle instead of its own, if any.
-    pub fn load_address_override(&self, slot: u8) -> Option<u32> {
+    /// The rows the load in `slot` reads this bundle instead of its own, if any.
+    pub fn load_address_override(&self, slot: u8) -> Option<[u32; 2]> {
         self.load_address_overrides.iter().find(|(s, _)| *s == slot).map(|(_, a)| *a)
     }
 

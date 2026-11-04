@@ -317,7 +317,7 @@ impl MemoryUnit {
         );
         // Handle vector loads specially
         if width == MemWidth::Vector256 {
-            let vec_data = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            let vec_data = Self::read_load_line(op, ctx, tile, addr, neighbors, view);
             if crate::debug::watch::is_watched(addr as u64, 32) {
                 let dest_str = op.dest.as_ref().map(|d| format!("{:?}", d)).unwrap_or_default();
                 crate::debug::watch::log_core_load(
@@ -492,7 +492,7 @@ impl MemoryUnit {
             let full = Self::read_vector_from_memory(tile, addr, neighbors, view);
             [full[0], full[1], full[2], full[3], 0, 0, 0, 0]
         } else {
-            Self::read_vector_from_memory(tile, addr, neighbors, view)
+            Self::read_load_line(op, ctx, tile, addr, neighbors, view)
         };
 
         if crate::debug::watch::is_watched(
@@ -600,6 +600,18 @@ impl MemoryUnit {
         }
     }
 
+    /// Element granule mask of a gather mnemonic (lower case): 4x16 -> 4, 4x32 -> 8, 4x64 -> 16
+    /// bytes.
+    fn gather_align_mask(lower: &str) -> u32 {
+        if lower.contains("4x64") {
+            0xFFFF_FFF0
+        } else if lower.contains("4x32") {
+            0xFFFF_FFF8
+        } else {
+            0xFFFF_FFFC // 4x16
+        }
+    }
+
     /// Execute 4-way LUT load (VLDB_4x16/32/64 LO/HI).
     ///
     /// These instructions perform 4-way parallel memory reads for LUT
@@ -648,13 +660,7 @@ impl MemoryUnit {
         let lower = name.to_ascii_lowercase();
         let is_hi = lower.contains("hi");
 
-        let align_mask: u32 = if lower.contains("4x64") {
-            0xFFFF_FFF0
-        } else if lower.contains("4x32") {
-            0xFFFF_FFF8
-        } else {
-            0xFFFF_FFFC // 4x16
-        };
+        let align_mask = Self::gather_align_mask(&lower);
 
         // Extract 4 addresses from lo or hi half of source register.
         let raw_addrs = if is_hi {
@@ -905,7 +911,7 @@ impl MemoryUnit {
     /// Load 256 bits from memory at the op's address. Shared by fused load handlers.
     fn fused_load_vector(op: &SlotOp, ctx: &mut ExecutionContext, tile: &Tile) -> [u32; 8] {
         let addr = Self::get_address(op, ctx);
-        Self::read_vector_from_memory(tile, addr, None, None)
+        Self::read_load_line(op, ctx, tile, addr, None, None)
     }
 
     /// Get shift amount from operands (immediate or scalar register).
@@ -1419,10 +1425,33 @@ impl MemoryUnit {
     /// the same effective address the load actually accesses, instead of
     /// re-deriving an approximation that drops the modifier-register offset.
     pub(crate) fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        let addr = ctx
-            .load_address_override(op.slot as u8)
-            .unwrap_or_else(|| Self::address_sum(op, ctx));
+        let own = Self::address_sum(op, ctx);
+        let addr = match ctx.load_address_override(op.slot as u8) {
+            // the 16-byte row the access falls in comes from the gather, the offset is its own
+            Some(rows) => (rows[usize::from(own & 16 != 0)] & !15) | (own & 15),
+            None => own,
+        };
         Self::align_to_access(op, addr)
+    }
+
+    /// The 256 bits a load reads at `addr` (from [`get_address`]): its two 16-byte rows, which a
+    /// same-bundle gather may redirect (see [`arm_gather_hazards`]).
+    fn read_load_line(
+        op: &SlotOp,
+        ctx: &ExecutionContext,
+        tile: &Tile,
+        addr: u32,
+        mut neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> [u32; 8] {
+        match ctx.load_address_override(op.slot as u8) {
+            Some(rows) if op.mem_width == MemWidth::Vector256 => {
+                let lo = Self::read_vector_from_memory(tile, rows[0] & !15, neighbors.as_deref_mut(), view);
+                let hi = Self::read_vector_from_memory(tile, rows[1] & !15, neighbors, view);
+                [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+            }
+            _ => Self::read_vector_from_memory(tile, addr, neighbors, view),
+        }
     }
 
     /// Same-bundle hazards of a `vldb.4x` gather, which TableGen forbids by reservation and
@@ -1433,8 +1462,10 @@ impl MemoryUnit {
     /// * the unit of the gather's address read (the W store-data read port): the two share the
     ///   read, and each sees the OR of the gather's address register and the other's first W
     ///   source (a `vst`'s data register, the low half of a `vpack` source);
-    /// * a unit of a later cycle (load unit A): the other instruction's load reads memory at the
-    ///   gather's address, the first lane of the half it gathers, instead of its own.
+    /// * a unit of a later cycle (load unit A): the other instruction's load reads its two 16-byte
+    ///   rows where the gather reads its first two lanes (the low row at the first lane's address,
+    ///   the high one at the second's, both reduced like the gather's own lane addresses), keeping
+    ///   only its offset within the row.
     ///
     /// Call once per issued bundle before the slots execute, with the register files' clocks
     /// advanced.
@@ -1469,13 +1500,12 @@ impl MemoryUnit {
                 ctx.vector.arm_wired_or(p.slot as u8, p_src, addr_vec);
                 addr_vec = std::array::from_fn(|k| addr_vec[k] | p_val[k]);
             }
-            let hi = g
-                .encoding_name
-                .as_deref()
-                .is_some_and(|n| n.to_ascii_lowercase().contains("hi"));
-            let lane0 = addr_vec[if hi { 4 } else { 0 }];
+            let name = g.encoding_name.as_deref().unwrap_or("").to_ascii_lowercase();
+            let first = if name.contains("hi") { 4 } else { 0 };
+            let mask = Self::gather_align_mask(&name);
+            let rows = [0, 1].map(|lane| lut_lane_address(addr_vec[first + lane], lane, mask));
             for p in partners(false) {
-                ctx.override_load_address(p.slot as u8, lane0);
+                ctx.override_load_address(p.slot as u8, rows);
             }
         }
     }
