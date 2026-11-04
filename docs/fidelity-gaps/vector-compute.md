@@ -120,11 +120,14 @@ silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, bo
   the OR and the gather gathers from the ORed addresses. Two non-gather W_RS holders (`vpack` with a
   `vst`) do not interact. `VectorRegisterFile::arm_wired_or`.
 - *Gather load unit.* A `vldb.4x` in one bundle with any load-unit-A load (`vlda` w, `vlda am`,
-  `vlda.ups`, `lda`): that load reads memory at the gather's address instead of its own; the gather
-  is unaffected. Which lane's address it takes is open (the probe's lanes were equal; the model uses
-  the first lane of the gathered half). `ExecutionContext::override_load_address`.
+  `vlda.ups`, `lda`): that load reads its low 16-byte row at the gather's first lane address and its
+  high row at the second (`ldvec/hz3`, lanes addressing different items: a `vlda` got 16 bytes of
+  each, an `lda` the word of lane 0, for `.hi` lanes 4 and 5), both reduced like the gather's own lane
+  addresses (the second carries the bank-interleave offset of 16); the gather is unaffected.
+  `ExecutionContext::override_load_address`. Unprobed: a load whose own address is not row-aligned
+  (the model keeps its offset within the row), and whether its post-modify still applies.
 
-Both gather rules: `MemoryUnit::arm_gather_hazards`. EMU == silicon on all four suites;
+Both gather rules: `MemoryUnit::arm_gather_hazards`. EMU == silicon on all five suites (`vt2`, `tie1`, `hz2`, `hz3`, and the branch suites below);
 `execute/vec_load_timing_goldens.rs` replays them through the executor.
 
 **Loads across a taken branch (2026-11-04).** The emulator delayed every load-queue write by one cycle
@@ -324,9 +327,8 @@ the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
 - Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
   (`W_RS`, the third write port). (`vlda.am` quarters were probed 2026-11-04, see "Accumulator
   loads"; the vector loads, the B load channel and the gather's same-bundle hazards were probed
-  2026-11-04, see "Vector loads". Open there: which gather lane's address a load-unit-A load takes,
-  whether its own post-modify still applies, `vldb.sparse` ties, and B-channel ties against two
-  same-port writers at once.)
+  2026-11-04, see "Vector loads". Open there: a redirected load's own offset and post-modify,
+  `vldb.sparse` ties, and B-channel ties against two same-port writers at once.)
 - Unconfirmed extrapolations listed under "Inferred" above.
 - Collisions the tables forbid on units that are not an accumulator or vector register-file port
   (pointer, modifier and scalar ports, the part-word store unit) are not modelled; Chess uses them
