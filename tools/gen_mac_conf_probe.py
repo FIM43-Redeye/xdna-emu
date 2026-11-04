@@ -330,6 +330,50 @@ def plan_sparse(rng):
     return out
 
 
+ACC_KINDS = {
+    "add_acc": ("add_acc", 2), "sub_acc": ("sub_acc", 2), "negadd_acc": ("negadd_acc", 2),
+    "negsub_acc": ("negsub_acc", 2), "neg_acc32": ("ACC1024_acc32_neg_conf", 1), "neg_acc64": ("ACC1024_acc64_neg_conf", 1),
+}
+
+
+def acc_kernel(kind: str, tiles: int) -> str:
+    builtin, n = ACC_KINDS[kind]
+    call = f"__builtin_aiev2_{builtin}(c1, c2, conf)" if n == 2 else f"__builtin_aiev2_{builtin}(c1, conf)"
+    return f"""// Auto-generated (gen_mac_conf_probe.py accops): {kind} over {tiles} tiles with a per-tile conf word
+#define NOCPP
+#include <stdint.h>
+
+extern "C" {{
+void test_kernel(const int32_t *restrict in, int32_t *restrict out) {{
+    for (int t = 0; t < {tiles}; t++) {{
+        const int32_t *p = in + t * {TILE_IN // 4};
+        v16acc64 c1 = *(const v16acc64 *)(p + 32);
+        v16acc64 c2 = *(const v16acc64 *)(p + 64);
+        int32_t conf = p[96];
+        v16acc64 r = {call};
+        *(v16acc64 *)(out + t * {TILE_OUT // 4}) = r;
+    }}
+}}
+}} // extern "C"
+"""
+
+
+def plan_accops(rng):
+    """The accumulator-only integer instructions (vadd, vsub, vnegadd, vnegsub, vneg) under every conf field."""
+    out = []
+    for kind in ACC_KINDS:
+        confs = [am << 1 | z | sh << 10 | m << 11 | a1 << 12 | a2 << 13
+                 for am in range(4) for z in (0, 1) for sh in (0, 1) for m in (0, 1) for a1 in (0, 1) for a2 in (0, 1)]
+        confs += [rng.getrandbits(32) for _ in range(64)]
+        for k, start in enumerate(range(0, len(confs), TILES_PER_CASE)):
+            chunk = confs[start:start + TILES_PER_CASE]
+            data = b"".join(tile_bytes(rng, c) for c in chunk)
+            out.append(CxxKernel(name=f"accops__{kind}__{k:02d}", source=acc_kernel(kind, len(chunk)),
+                                 in_size=len(data), out_size=TILE_OUT * len(chunk), input_bytes=data,
+                                 meta={"plan": "accops", "kind": kind, "confs": chunk}))
+    return out
+
+
 def plan_upper(rng):
     out = []
     bits = [14, 15] + list(range(16, 32))
@@ -352,7 +396,7 @@ def plan_random(rng):
     return out
 
 
-PLANS = {"sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
+PLANS = {"accops": plan_accops, "sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
 
 
 def main():

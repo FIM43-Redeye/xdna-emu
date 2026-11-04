@@ -1731,12 +1731,15 @@ impl VectorAlu {
         // (silicon: the sign extends through the high word) and acc32 mode (independent 32-bit
         // negation per lane half) and shift16 (source shifted left by 16 first) are applied by
         // `acc_add_sub_lane_pair`.
+        // Config bit 12 (dynAcc0Neg) inverts the instruction's negation, as it does on the float
+        // form (silicon: plan `accops` of tools/gen_mac_conf_probe.py, every conf field).
+        let sub_acc1 = (conf >> 12) & 1 != 0;
         let timing = op.acc_source_timing(0);
         ctx.queue_pending_acc_add(
             acc_reg,
             acc_reg,
             dst_reg,
-            true,
+            !sub_acc1,
             false,
             zero_acc,
             (conf >> 10) & 1 != 0,
@@ -2485,6 +2488,32 @@ mod tests {
         assert_eq!(lane(1), 0, "+0 stays +0");
         assert_eq!(lane(2), 0xbf80_0000);
         assert_eq!(lane(3), 0xff80_0001, "NaN is re-encoded with its sign flipped");
+    }
+
+    /// Integer `vneg`: config bit 12 (dynAcc0Neg) inverts the negation, so the source passes
+    /// through unchanged (NPU1, plan `accops` of tools/gen_mac_conf_probe.py, acc32 and acc64).
+    #[test]
+    fn integer_vneg_config_bit_12_inverts_the_negation() {
+        use crate::interpreter::decode::register_map::AccumWidth;
+        for (conf, want) in [(0u32, -5i32 as u32), (1 << 12, 5u32)] {
+            let mut ctx = make_ctx();
+            ctx.accumulator.write_wide(2, [5u64 | 5 << 32; 16]);
+            ctx.scalar.write(0, conf);
+            let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Neg)
+                .as_vector(ElementType::Int32)
+                .with_dest(Operand::AccumReg(4))
+                .with_source(Operand::AccumReg(2))
+                .with_source(Operand::ScalarReg(0));
+            op.accum_width = Some(AccumWidth::Full);
+            ctx.result_latency = 5;
+            assert!(VectorAlu::execute(&op, &mut ctx));
+            ctx.bundle_seq += 3;
+            ctx.advance_vector_bundle();
+            ctx.process_pending_acc_adds();
+            ctx.bundle_seq += 5;
+            ctx.advance_vector_bundle();
+            assert_eq!(ctx.accumulator.read_wide(4)[0] as u32, want, "conf {conf:#x}");
+        }
     }
 
     /// Silicon records of the integer accumulator add/sub/neg family
