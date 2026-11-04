@@ -166,6 +166,8 @@ def main():
     print(f"  HW result:  {hex_words(hw8)}")
     print(f"  Predicted:  {hex_words(predicted8)}")
     print(f"  Match: {match8}")
+    lut8 = predict_gather_lut(input_data, base_addr, [base_addr] * 4, 0xFFFFFFF8)
+    print(f"  Silicon LUT rule: {hex_words(lut8)}  match: {hw8 == lut8}")
     if emu:
         emu8 = read_u32s(emu, 224, 8)
         print(f"  EMU result: {hex_words(emu8)}")

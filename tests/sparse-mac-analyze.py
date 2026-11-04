@@ -8,7 +8,9 @@ Output: 2 tests x 64 bytes, each 32 x int16 (SRS shift 0 of the accumulator, i16
 rows=2 inner=16 cols=8):
     test 1  identity: A = i16 1, B = i8 1, mask 0x33..; the kernel header expects 8 in every lane
     test 2  counting: A = 1, B compressed = 1..8; column 0 expects 36
-With two results the second is compared lane by lane against the first.
+The header's expectations are stale: silicon (and the emulator) give 8 on the even lanes
+only (odd lanes 0) and 1,1,3,4,5,5,7,8 per row for the counting test; they are printed so a change
+in either shows. With two results the second is compared lane by lane against the first.
 """
 import struct
 import sys
@@ -31,8 +33,8 @@ def decode(data: bytes) -> list[tuple[int, ...]]:
 
 
 def header_expectations(tests: list[tuple[int, ...]]) -> dict[str, bool]:
-    return {"identity: every lane == 8": all(v == EXPECT_IDENTITY_LANE for v in tests[0]),
-            "counting: lane 0 == 36": tests[1][0] == EXPECT_COUNTING_COL0}
+    return {"kernel header expects identity: every lane == 8": all(v == EXPECT_IDENTITY_LANE for v in tests[0]),
+            "kernel header expects counting: lane 0 == 36": tests[1][0] == EXPECT_COUNTING_COL0}
 
 
 def main(argv: list[str]) -> int:

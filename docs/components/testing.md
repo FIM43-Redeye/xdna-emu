@@ -99,6 +99,8 @@ python3 -m harness suite build   <suite>              # parallel; unchanged pack
 python3 -m harness suite hw      <suite> r1           # serial; the first timeout aborts the run
 python3 -m harness suite emu     <suite> e1 -j 8      # FFI .so rebuilt once, then parallel
 python3 -m harness suite compare <suite> r1 e1        # byte-exact per buffer, exit 1 on mismatch
+python3 -m harness suite hw      <suite> d5 --repeat 5   # every case 5x back to back (repeats 2..5 in <case>/repeat_<k>/);
+python3 -m harness suite repeats <suite> d5              #   exit 1 if any case's repeats differ; `repeats` lists the bytes
 # results: <suite>/runs/<tag>/<case>/<core>.<buffer>.bin + run.json; tags are never overwritten
 # ISA-style kernels address p0 = in, p1 = out: isa_suite always gives a single-core kernel an input
 # (>= 4 bytes). An out-only core gets out in p0 and p1 is stale tile state on silicon (EMU: poison).
@@ -111,6 +113,8 @@ python3 tools/instr-test-gen.py --td ../llvm-aie/llvm/include/llvm/IR/Intrinsics
 python3 tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h \
     --types-header .../me_chess_types.h --iss-types-header .../me_iss_types.h --suite-dir <suite>   # Chess, 4234 cases
 python3 tests/shuffle-sweep/gen_suite.py <suite>        # one Chess case; analyze.py reads runs/<tag>/shuffle-sweep/core.out.bin
+# Characterizer kernels (tests/*.s: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*):
+python3 tools/charz_suites.py <suite>                    # one suite, five cases; analyzers: python3 tests/<name>.py --suite <suite> r1 [e1]
 # Chess compiles ~6 s of wall per case at -j16 (xchesscc runs twice per case); build it in slices with --only.
 
 # Standalone Rust binaries

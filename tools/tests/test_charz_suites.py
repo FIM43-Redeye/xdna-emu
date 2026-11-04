@@ -176,7 +176,7 @@ def test_sparse_mac_expectations_and_compare(capsys):
     count = struct.pack("<32h", *([36] + [0] * 31))
     good = ident + count
     assert smac.header_expectations(smac.decode(good)) == {
-        "identity: every lane == 8": True, "counting: lane 0 == 36": True}
+        "kernel header expects identity: every lane == 8": True, "kernel header expects counting: lane 0 == 36": True}
     assert smac.decode(good + b"pad")[1][0] == 36
     with pytest.raises(ValueError):
         smac.decode(good[:100])
