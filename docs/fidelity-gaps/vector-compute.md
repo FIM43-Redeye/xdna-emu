@@ -56,6 +56,7 @@ pairs, the 64 forwarded pairs all exactly one less). Every row agrees with Table
 | `vmov cm,cm` / `bm,bm` / `bm,x` | II_VMOV_CM / VMOV_X_BM_XM | 2 | none | 3 | `vmov x,bm` / `cm,cm` / `bm,bm` | II_VMOV_X / VMOV_CM | 1 | none |
 | `vups` | II_VUPS | 3 | none | 4 | `vst` of `amll..amhh` | II_VST_AM | 1 | none |
 | `vlda.ups` | II_VLDA_UPS | 9 | none | 10 | `vconv` | II_VCONV | 1 | none |
+| `vlda am` (quarter), `vlda.conv` | II_VLDA_AM / VLDA_CONV | 7 | none | 8 | | | | |
 
 The old per-kernel patches this replaces (sparse MACs reading their accumulators at issue, sparse
 `vaddmac.f` landing at 6 against the dense 7, `vmov cm,cm` landing at `result_latency`) were each a
@@ -71,6 +72,26 @@ with the itineraries. Silicon was run twice and is bit-identical (165 kernels, 9
 `thresholds_r1.json`, `FIT.md`; emulator runs `e2` and `e3`; at threshold level `compare_r1_e2.txt` shows 0 of 494 pairs differ, byte level see below).
 `src/interpreter/state/acc_timing_golden.rs` replays the ~370 measured thresholds against the
 register file.
+
+**Accumulator loads (2026-11-04).** Plain `vlda amll` / `vlda amlh` were not producers in that probe,
+and the emulator committed them like scalar loads, straight into the register file at issue + 7: one
+bundle early against the rule for a MAC reader (use 3) and on the wrong side of a same-bundle float
+MAC result (both landed in one bundle and the MAC won). The Chess complex-float `mac_elem_8` /
+`msc_elem_8` kernels schedule exactly that (`vlda amlh0, [p7, #32] ; vmul.f bml0, ..` then the
+final `vadd.f` reads `bml0` expecting the loaded accumulator), so EMU lost lanes 8..15 of the
+accumulator input. The probe grew `vlda_amll`, `vlda_amlh`, `vlda_conv` producers and write-after-write
+points (`--waw A:B`, A issued `s` bundles after B, references at `s = +-14`): directory
+`build/experiments/harness/cfloat/ldtiming` (37 kernels, 2228 points, silicon r1 == r2), plus
+`ldtiming2` (two narrow `vmov am, q` subjects as controls, 8 kernels, 496 points, r1 == r2). Every
+threshold is the rule with def 7: MAC/`vadd` readers from distance 5, use-1 readers from 7, and in
+WAW the later-landing write wins (`vmul.f`: the load wins from `s = 0`; int MAC, `vclr`: `-1`;
+`vmov bm`/`cm`: `-4`; `vups`: `-3`; `vlda.ups`: `+2`), the later-issued one on a tie. The loads are
+now ordinary accumulator-file writes (`ExecutionContext::queue_accum_load` ->
+`queue_lanes_write`, def 7, no bypass); EMU == silicon on all 2724 points;
+`execute/acc_load_timing_goldens.rs` replays thresholds through the executor. `vlda.conv` already
+followed the rule. The one change in behaviour beyond the rule: an accumulator load in flight across a
+taken branch no longer gets the scalar loads' extra branch cycle (`delay_pending_writes`), like every
+other accumulator write.
 
 **Resource collisions (MODELLED 2026-11-01; open items listed at the end).** Compilers never
 emit a schedule that holds one TableGen unit twice in a cycle, but a hand-written schedule can, and
@@ -142,8 +163,19 @@ them.
    its own element type. A 64-bit-lane `vsrsm` beside a 32-bit-lane partner is its own normal case.
    Pinned at two shifts (4 and 9) over all pairs.
 
-Producers that were written at issue are timed now: `vlda.conv` lands at its itinerary cycle (6)
-like every other accumulator producer.
+Producers that were written at issue are timed now: `vlda.conv` lands at its itinerary cycle (7)
+like every other accumulator producer, and so do the plain `vlda am` loads (2026-11-04, see
+"Accumulator loads" above).
+
+*Narrow odd-bank writers in the accumulator file* (2026-11-04). In rule 1 a narrow (single-chunk)
+accumulator writer on an odd bank also drives lane 1 of its port, with or without a cascade read:
+a `vlda amlh0` or `vmov amlh0, q1` issued after a `vlda.ups` / `vups` of `bml0` and landing in the
+same cycle puts its data in both banks of `bml0` (on bank 0, `amll0`, it leaves lane 1 alone). The
+vector file keeps the plain rule (a narrow `wh` writer does not, probe6). Evidence:
+`cfloat/ldtiming` (`vlda_amlh` vs `vlda_ups` at `s = +2`) and `cfloat/ldtiming2` (`vmov_amlh_q` vs
+`vups` at `+1`, vs `vlda_ups` at `+7`); the legacy collision probes stay exact (see the sweep line in
+`build/experiments/harness/PROGRESS-cfloat-mac.md`). It subsumes rule 2 of the cascade section for
+accumulator destinations.
 
 *Inferred, not read off the tables* (silicon-derived predicates, each pinned by a test to exactly the
 observed set): the mover predicate; the "secondary read unit" (highest-indexed unit held in the read
@@ -224,6 +256,9 @@ collision probes stay exact (see the sweep line in `build/experiments/cascade-co
 bundle after the vmov, destination visible 7 issued bundles after it, no interlock) is in
 core-compute-timing.md.
 
+(2026-11-04: rule 2 holds in the accumulator file without a cascade read too, see "Narrow odd-bank
+writers in the accumulator file" above; it stays as written for `x` destinations.)
+
 Open within this section: rule 2 is an observation about narrow odd-bank writers beside a cascade read;
 the probe cannot say whether the cause is the narrow writer's lane or the read's second chunk, and only
 the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
@@ -241,7 +276,8 @@ the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
   colliding on the UPS unit collide on the write port at the same instant and no probe can tell which
   one silicon arbitrates on. The model treats the pair as the write-port collision it is.
 - Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
-  (`W_RS`, the third write port) and `vlda.am` quarters (via the load commit).
+  (`W_RS`, the third write port). (`vlda.am` quarters were probed 2026-11-04, see "Accumulator
+  loads".)
 - Unconfirmed extrapolations listed under "Inferred" above.
 - Collisions the tables forbid on units that are not an accumulator or vector register-file port
   (pointer, modifier and scalar ports, the part-word store unit) are not modelled; Chess uses them
@@ -486,7 +522,8 @@ issue + 7); see "Accumulator read/write timing".
 | `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | no silicon capture (Chess/Peano emit no bf16 intrinsic for them) | `execute_matmul` bf16 gate | gated "[NOT MODELED]" |
 | sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed |
 | `vaddmac.f` / `vaddmsc.f` latency | dense and sparse both def 6, visible from issue + 7, pinned by the timing probe at controlled distances | `execute_matmul` latency | closed |
-| fp32-input MAC (emulated through bf16 splits in aie_api) | not examined; the per-term rounding grid is derived for bf16 products | n/a | open |
+| fp32-input MAC (emulated through bf16 splits in aie_api / the Chess `_accuracy_*` routines) | the split chain (`vconv.bf16.fp32` of an fp32 accumulator, `vmsc.f` residuals against 1.0, `vmul.f` cross products, `vadd.f` sums) is the bf16 datapath above applied in sequence; nothing split-specific is needed | `bf16::mac_lane`, `vector_float.rs` | **closed 2026-11-04**: the Chess intrinsic suite's fp32-via-bf16 cases (`*_accuracy_{safe,fast,low}`, real and complex, random bit patterns with Inf/NaN inputs) are EMU == silicon on 55 of 57; the 4 cfloat `mac`/`msc_elem_8` cases that differed were the `vlda am` timing (above), and the remaining 2 (`mul_2x8_8x2_accuracy_{safe,fast}`) read an uninitialized accumulator (next row) |
+| Chess `mul_2x8_8x2(v16float, v16cfloat)` (plain and `_accuracy_*`) | the compiled kernel reads `bmh0` before writing it (`vmov x1, bmh0` near entry) and the garbage reaches every output lane through the bf16 split, so the result depends on the previous kernel's leftover accumulator state: silicon gives a different output for the same input after a different predecessor (`cfloat/seven` vs the full suite run); EMU fills registers with `XDNA_EMU_REG_INIT` (default `0xDEADBEEF`) | n/a (undefined input) | **not an emulator gap**; the cases are not a function of their inputs |
 | other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space |
 
 ## fp32 accumulator add/sub/neg (`vadd.f`, `vsub.f`, `vnegadd.f`, `vnegsub.f`, `vneg.f`)
