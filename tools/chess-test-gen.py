@@ -30,7 +30,8 @@ if _clang_site.is_dir() and str(_clang_site) not in sys.path:
 import clang.cindex
 
 from chess_preprocess import (
-    compiled_in_function_names, parse_emulated_accuracy, undefined_accuracy_variant,
+    address_operands, compiled_in_function_names, parse_emulated_accuracy,
+    undefined_accuracy_variant,
 )
 
 
@@ -260,6 +261,8 @@ class HeaderFacts:
     # the <op>_<mode>_accuracy_<level> family me_vmult_float_emulated.h defines
     accuracy_ops: frozenset[str] = frozenset()
     accuracy_modes: frozenset[str] = frozenset()
+    # intrinsic signature -> index of its address operand (me.h + me_chess.lib)
+    address_operands: dict[str, int] = field(default_factory=dict)
 
 
 def classify_chess_intrinsic(i: ChessIntrinsic,
@@ -355,6 +358,11 @@ def dir_name(i: ChessIntrinsic) -> str:
     return _sanitize_dirname(f"{i.name}__{param_part}")
 
 
+def signature(i: ChessIntrinsic) -> str:
+    """The me_chess.lib spelling of a declaration: `v32int8 load_4x16_lo(v8int32)`."""
+    return f"{i.return_type} {i.name}({','.join(p for p, _, _ in i.params)})"
+
+
 def unique_name(taken: dict[str, str], name: str, namespace: str, code: str) -> str | None:
     """Case name for a kernel whose natural name may already be `taken` (name -> kernel text).
 
@@ -405,6 +413,38 @@ def load_outcomes(path: Path) -> dict[str, tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Address operands
+# ---------------------------------------------------------------------------
+
+# An address operand (a vldb.4x gather's lane vector) gets addresses into a table the kernel's
+# own input carries, never random words: those read whatever the tile, a neighbour or no
+# memory at all holds (silicon wraps them into the 20-bit core address space; see
+# docs/fidelity-gaps/addressing.md). Lane k = table + LUT_LANE_OFFSETS[k % 8]: the first and
+# last byte of the table, both 16-byte banks, odd granules and row ends.
+LUT_TABLE_BYTES = 256
+LUT_LANE_OFFSETS = (0, 31, 78, 103, 130, 175, 224, 255)
+
+
+@dataclass(frozen=True)
+class AddressOperand:
+    arg: int            # parameter index
+    lanes: int          # 32-bit address lanes in the operand
+    table_offset: int   # byte offset of the table in the input buffer
+
+
+def address_input(in_size: int, address: list[tuple[int, AddressOperand]], seed: int) -> bytes:
+    """Input buffer of an address-operand case: the suite's PRNG bytes, with each address
+    operand's lanes replaced by their table offsets (the kernel adds the table's address)."""
+    import struct
+    from harness.run import prng_bytes
+    data = bytearray(prng_bytes(in_size, seed))
+    for in_off, a in address:
+        offs = [LUT_LANE_OFFSETS[k % len(LUT_LANE_OFFSETS)] for k in range(a.lanes)]
+        struct.pack_into(f"<{a.lanes}i", data, in_off, *offs)
+    return bytes(data)
+
+
+# ---------------------------------------------------------------------------
 # kernel.cc generator (Chess-native)
 # ---------------------------------------------------------------------------
 
@@ -413,6 +453,7 @@ def generate_chess_kernel_cc(
     namespace: str,
     return_type: str,
     params: list[tuple[str, int, bool]],
+    address: dict[int, AddressOperand] | None = None,
 ) -> str:
     """Generate kernel.cc that calls one Chess-native intrinsic.
 
@@ -427,7 +468,11 @@ def generate_chess_kernel_cc(
     with xchesscc.  Non-const lvalue reference parameters (``is_ref_output``)
     are zero-initialized locals passed by reference; their values are written
     to the output buffer after the return value.
+
+    *address* maps a parameter index to its AddressOperand: that operand's 32-bit lanes are
+    read from the input as table offsets and the table's run-time address is added to each.
     """
+    address = address or {}
     qualified_name = f"{namespace}::{func_name}" if namespace else func_name
 
     # Separate input params from reference output params.
@@ -461,7 +506,18 @@ def generate_chess_kernel_cc(
     in_byte_offset = 0
     for arg_name, ptype, psize in input_params:
         lines.append(f"    {ptype} {arg_name};")
-        lines.append(f"    memcpy(&{arg_name}, (const char *)in + {in_byte_offset}, sizeof({ptype}));")
+        a = address.get(int(arg_name[3:]))
+        if a is None:
+            lines.append(f"    memcpy(&{arg_name}, (const char *)in + {in_byte_offset}, sizeof({ptype}));")
+        else:
+            lanes = f"lanes{a.arg}"
+            lines += [
+                f"    int32_t {lanes}[{a.lanes}];",
+                f"    memcpy({lanes}, (const char *)in + {in_byte_offset}, sizeof({lanes}));",
+                f"    for (int k = 0; k < {a.lanes}; ++k)",
+                f"        {lanes}[k] += (int32_t)(long)((const char *)in + {a.table_offset});",
+                f"    memcpy(&{arg_name}, {lanes}, sizeof({ptype}));",
+            ]
         in_byte_offset += psize
 
     # Declare reference output locals (zero-initialized).
@@ -510,6 +566,8 @@ class GeneratedChessTest:
     namespace: str
     in_size: int
     out_size: int
+    # (input byte offset, operand) of each address operand; empty for ordinary cases
+    address: list[tuple[int, AddressOperand]] = field(default_factory=list)
 
 
 @dataclass
@@ -530,7 +588,10 @@ def header_facts(opns_path: str, llvm_path: str | None = None) -> HeaderFacts:
     emulated = opns.parent.parent / "me_vmult_float_emulated.h"
     ops, modes = (parse_emulated_accuracy(emulated.read_text())
                   if emulated.is_file() else (set(), set()))
-    return HeaderFacts(compiled_in, frozenset(ops), frozenset(modes))
+    me_h, lib = opns.parent.parent / "me.h", opns.with_name("me_chess.lib")
+    addr = (address_operands(me_h.read_text(), lib.read_text())
+            if me_h.is_file() and lib.is_file() else {})
+    return HeaderFacts(compiled_in, frozenset(ops), frozenset(modes), addr)
 
 
 def collect_chess_kernels(
@@ -629,8 +690,21 @@ def collect_chess_kernels(
         in_size = max(4, in_size)
         out_size = max(4, out_size)
 
+        address: list[tuple[int, AddressOperand]] = []
+        addr_idx = facts.address_operands.get(signature(i))
+        if addr_idx is not None:
+            ptype, psize, is_ref = i.params[addr_idx]
+            if is_ref or psize % 4:
+                skip(i, f"address operand {ptype} is not a vector of 32-bit addresses")
+                continue
+            table_offset = -(-in_size // 32) * 32     # the gathers want a 32-byte aligned table
+            in_off = sum(ps for _, ps, r in i.params[:addr_idx] if not r)
+            address = [(in_off, AddressOperand(addr_idx, psize // 4, table_offset))]
+            in_size = table_offset + LUT_TABLE_BYTES
+
         # kernel.cc text (Chess-native calling convention).
-        kernel_code = generate_chess_kernel_cc(i.name, i.namespace, i.return_type, i.params)
+        kernel_code = generate_chess_kernel_cc(i.name, i.namespace, i.return_type, i.params,
+                                               address={a.arg: a for _, a in address})
 
         case_name = unique_name(dict((g.name, code) for g, code in kernels), dname,
                                 i.namespace, kernel_code)
@@ -644,6 +718,7 @@ def collect_chess_kernels(
             namespace=i.namespace,
             in_size=in_size,
             out_size=out_size,
+            address=address,
         ), kernel_code))
 
     return kernels, skipped
@@ -662,7 +737,13 @@ def generate_suite(opns_path: str, types_path: str, suite_dir: str,
     write_cxx_suite(
         suite_dir, "instr-chess", "chess-test-gen.py", "chess",
         [CxxKernel(g.name, code, g.in_size, g.out_size,
-                   meta={"func_name": g.func_name, "namespace": g.namespace})
+                   input_bytes=address_input(g.in_size, g.address, seed) if g.address else None,
+                   meta={"func_name": g.func_name, "namespace": g.namespace,
+                         **({"address_operands": [
+                             {"arg": a.arg, "in_offset": off, "lanes": a.lanes,
+                              "table_offset": a.table_offset, "table_bytes": LUT_TABLE_BYTES,
+                              "lane_offsets": list(LUT_LANE_OFFSETS)}
+                             for off, a in g.address]} if g.address else {})})
          for g, code in kernels],
         seed=seed, skipped=[asdict(x) for x in skipped])
     return len(kernels), len(skipped)

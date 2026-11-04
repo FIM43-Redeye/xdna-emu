@@ -244,3 +244,74 @@ def undefined_accuracy_variant(name: str, ops: set[str], modes: set[str]) -> boo
     operation the emulation header does not define."""
     m = re.fullmatch(r'(\w+?)_(\w+)_accuracy_(?:low|fast|safe)', name)
     return bool(m) and m.group(2) in modes and m.group(1) not in ops
+
+
+# ---------------------------------------------------------------------------
+# Address operands (me.h + me_chess.lib)
+# ---------------------------------------------------------------------------
+
+_PV_OPEN = re.compile(r"^\s*#\s*(?:ifdef\s+__programmers_view__|if\s+defined\s*\(\s*__programmers_view__\s*\))")
+_PV_OPEN_NOT = re.compile(r"^\s*#\s*ifndef\s+__programmers_view__")
+_PRIM_DECL = re.compile(r"^\s*(\w+)\s+(\w+)\s*\(([^)]*)\)")
+
+
+def _param_types(params: str) -> list[str]:
+    """`v8w32 a, u1 off` -> ['v8w32', 'u1']: the type is the first word of each parameter."""
+    return [p.split()[0] for p in params.split(",") if p.strip()]
+
+
+def address_operand_primitives(me_h: str) -> dict[str, int]:
+    """Primitives whose operand is a vector of data-memory addresses, as the processor model
+    me.h states it: a `__programmers_view__` block whose hardware branch declares an address
+    primitive `<ret> <stem>_address(T, ...)` (the address-generation step) holds, in its
+    programmer's-view branch, the operations that take that operand T. Returns the mangled
+    primitive name (`<ret>_<name>_<param types>`, the me_chess.lib `prm` spelling) -> the
+    index of the T parameter."""
+    out: dict[str, int] = {}
+    branch: str | None = None          # None outside a block, else "pv" / "hw"
+    decls: dict[str, list[tuple[str, str, list[str]]]] = {"pv": [], "hw": []}
+
+    def close() -> None:
+        operand_types = {ps[0] for ret, name, ps in decls["hw"] if name.endswith("_address") and ps}
+        for ret, name, ps in decls["pv"]:
+            for idx, t in enumerate(ps):
+                if t in operand_types:
+                    out["_".join([ret, name, *ps])] = idx
+                    break
+
+    for line in me_h.splitlines():
+        if _PV_OPEN.match(line) or _PV_OPEN_NOT.match(line):
+            branch = "pv" if _PV_OPEN.match(line) else "hw"
+            decls = {"pv": [], "hw": []}
+        elif branch and re.match(r"^\s*#\s*else\b", line):
+            branch = "hw" if branch == "pv" else "pv"
+        elif branch and re.match(r"^\s*#\s*endif\b", line):
+            close()
+            branch = None
+        elif branch:
+            m = _PRIM_DECL.match(line)
+            if m:
+                decls[branch].append((m.group(1), m.group(2), _param_types(m.group(3))))
+    return out
+
+
+_LIB_ENTRY = re.compile(r"fnm\s*:\s*\"[^\"]*\"\s*'([^']*)'\s*;.*?prm\s*:\s*\(([^)]*)\)", re.S)
+
+
+def intrinsic_primitives(lib: str) -> dict[str, tuple[str, ...]]:
+    """me_chess.lib: intrinsic signature (`v32int8 load_4x16_lo(v8int32)`) -> the primitives it
+    promotes to (its `prm` list)."""
+    out: dict[str, tuple[str, ...]] = {}
+    for entry in lib.split("\n}"):
+        m = _LIB_ENTRY.search(entry)
+        if m:
+            out[" ".join(m.group(1).split())] = tuple(m.group(2).split())
+    return out
+
+
+def address_operands(me_h: str, lib: str) -> dict[str, int]:
+    """Intrinsic signature -> index of its address operand, for every intrinsic that promotes
+    to exactly one address-operand primitive (a promotion maps the operands in order)."""
+    prims = address_operand_primitives(me_h)
+    return {sig: prims[prm[0]] for sig, prm in intrinsic_primitives(lib).items()
+            if len(prm) == 1 and prm[0] in prims}

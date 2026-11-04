@@ -999,3 +999,117 @@ class TestPartialRegisterSets:
         g = TestChessSuite()._gen()
         for name in ("set_v16int32", "set_128b"):
             assert g.classify_chess_intrinsic(self._intr(g, name))[0] == "generated", name
+
+
+class TestAddressOperands:
+    """Intrinsics whose operand is a vector of addresses (the vldb.4x gathers) read memory
+    the kernel never wrote when the operand is random. The processor model says which:
+    me.h declares the address primitive (`load_4x_address`) in the hardware branch of a
+    `__programmers_view__` block whose programmer's-view branch holds the operations taking
+    that operand; me_chess.lib maps each intrinsic to its primitive."""
+
+    ME_H = """
+#ifdef __programmers_view__
+    w32 extend_sign(w8)  property(promotion_conversion_alternate);
+#else
+    w32 extend_sign08(w32, u4 );
+#endif
+#ifdef __programmers_view__
+    v8w32 load_4x(v8w32, u1, u2);
+    v8w32 load_4x16_lo(v8w32) property(programmers_view);
+    v8w32 load_4x64_hi(v8w32) property(programmers_view);
+#else
+    v4w32 load_4x_address(v8w32, u1, u2);
+#endif
+    v8w32 other(v8w32);
+"""
+
+    LIB = """
+// v32int8 load_4x16_lo(v8int32)
+__me_detail__v32int8_load_4x16_lo_v8int32 : user_defined, promoted {
+    fnm : "load_4x16_lo" 'v32int8 load_4x16_lo(v8int32)';
+    arg : ( v32int8:r v8int32:i );
+    prm : ( v8w32_load_4x16_lo_v8w32 );
+}
+
+// int delay1(int)
+__int_delay1_int : user_defined, promoted {
+    fnm : "delay1" 'int delay1(int)';
+    arg : ( int:r int:i );
+    prm : ( w32_delay1_w32 );
+}
+"""
+
+    def test_address_primitives_come_from_the_programmers_view_block(self):
+        from chess_preprocess import address_operand_primitives
+        got = address_operand_primitives(self.ME_H)
+        assert got == {"v8w32_load_4x_v8w32_u1_u2": 0, "v8w32_load_4x16_lo_v8w32": 0,
+                       "v8w32_load_4x64_hi_v8w32": 0}
+
+    def test_lib_maps_signatures_to_primitives(self):
+        from chess_preprocess import intrinsic_primitives
+        got = intrinsic_primitives(self.LIB)
+        assert got["v32int8 load_4x16_lo(v8int32)"] == ("v8w32_load_4x16_lo_v8w32",)
+        assert got["int delay1(int)"] == ("w32_delay1_w32",)
+
+    def test_address_operands_by_signature(self):
+        from chess_preprocess import address_operands
+        assert address_operands(self.ME_H, self.LIB) == {"v32int8 load_4x16_lo(v8int32)": 0}
+
+    def _intr(self, name="load_4x16_lo", ret="v32int8", params=(("v8int32", 32, False),)):
+        return chess_test_gen.ChessIntrinsic(
+            name=name, namespace="me_detail", return_type=ret, return_size=32,
+            params=list(params), is_inline=False, properties=[], storage_params=[],
+            overload_index=0, source_line=1)
+
+    def test_signature_spelling_matches_the_lib(self):
+        assert chess_test_gen.signature(self._intr()) == "v32int8 load_4x16_lo(v8int32)"
+
+    def test_kernel_points_every_lane_into_the_table(self):
+        lut = chess_test_gen.AddressOperand(arg=0, lanes=8, table_offset=32)
+        k = chess_test_gen.generate_chess_kernel_cc(
+            "load_4x16_lo", "me_detail", "v32int8", [("v8int32", 32, False)], address={0: lut})
+        assert "lanes0[k] += (int32_t)(long)((const char *)in + 32);" in k
+        assert "memcpy(&arg0, lanes0, sizeof(v8int32));" in k
+        assert "me_detail::load_4x16_lo(arg0)" in k
+
+    def test_offsets_cover_the_table_edges_and_stay_inside_it(self):
+        offs = chess_test_gen.LUT_LANE_OFFSETS
+        assert offs[0] == 0 and max(offs) == chess_test_gen.LUT_TABLE_BYTES - 1
+        # the gather lane rule keeps a lane inside the 32-byte block of its offset
+        for k, o in enumerate(offs):
+            for mask in (~3, ~7, ~15):
+                eff = (o & ~31) | (((o & 31) & mask) >> 1) | (16 if k % 2 else 0)
+                assert 0 <= eff < chess_test_gen.LUT_TABLE_BYTES
+
+    def test_input_carries_the_offsets_then_the_table(self):
+        lut = chess_test_gen.AddressOperand(arg=0, lanes=8, table_offset=32)
+        data = chess_test_gen.address_input(32 + chess_test_gen.LUT_TABLE_BYTES,
+                                            [(0, lut)], seed=42)
+        import struct
+        assert list(struct.unpack_from("<8i", data, 0)) == list(chess_test_gen.LUT_LANE_OFFSETS)
+        assert len(data) == 32 + chess_test_gen.LUT_TABLE_BYTES
+        assert data[32:] != bytes(chess_test_gen.LUT_TABLE_BYTES)
+
+    def test_real_headers_mark_exactly_the_gathers(self):
+        isg = chess_test_gen._npu_work / "amd-unified-software/aietools/data/aie_ml/lib/isg"
+        if not (isg / "me_chess_opns.h").exists():
+            pytest.skip("aietools not available")
+        facts = chess_test_gen.header_facts(str(isg / "me_chess_opns.h"))
+        names = sorted(sig.split()[1].split("(")[0] for sig in facts.address_operands)
+        assert len(facts.address_operands) == 12
+        assert set(names) == {f"load_4x{w}_{h}" for w in (16, 32, 64) for h in ("lo", "hi")}
+
+    def test_collected_gather_case_has_a_table_and_metadata(self):
+        isg = chess_test_gen._npu_work / "amd-unified-software/aietools/data/aie_ml/lib/isg"
+        if not (isg / "me_chess_opns.h").exists():
+            pytest.skip("aietools not available")
+        kernels, _ = chess_test_gen.collect_chess_kernels(
+            str(isg / "me_chess_opns.h"), str(isg / "me_chess_types.h"))
+        by = {g.name: (g, code) for g, code in kernels}
+        g, code = by["load_4x16_lo__v8int32"]
+        assert g.in_size == 32 + chess_test_gen.LUT_TABLE_BYTES
+        assert [a.arg for _, a in g.address] == [0]
+        assert "lanes0[k] +=" in code
+        # an ordinary case is untouched
+        assert by["abs__v16int32"][0].address == []
