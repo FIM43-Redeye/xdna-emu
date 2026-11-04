@@ -290,7 +290,8 @@ pub struct SrsConfig {
     pub rounding_mode: u8,
 
     /// Saturation mode (crSat) -- hardware field [1:0] of Core_CR.
-    /// 0 = no saturation (truncate), 1 = saturate, 3 = symmetric saturate.
+    /// 0 = no saturation (truncate), 1 = saturate, 2 and 3 = symmetric saturate (SRS;
+    /// UPS saturates on any nonzero value, never symmetric; pack has its own table).
     pub saturation_mode: u8,
 
     /// SRS sign mode (crSRSSign) -- hardware bit [17] of Core_CR.
@@ -313,12 +314,13 @@ impl Default for SrsConfig {
 }
 
 impl SrsConfig {
-    /// Whether saturation is enabled (mode bits [0] set).
+    /// Whether SRS saturates: any nonzero mode. Silicon (dynsign probe, every `vsrs.dN` /
+    /// `vst.srs.dN` form): crSat = 2 saturates exactly like 3, symmetric for a signed output.
     pub fn saturate(&self) -> bool {
-        self.saturation_mode & 0x1 != 0
+        self.saturation_mode & 0x3 != 0
     }
 
-    /// Whether symmetric saturation is enabled (mode bits [1] set).
+    /// Whether symmetric saturation is enabled (mode bit [1] set).
     pub fn symmetric_saturate(&self) -> bool {
         self.saturation_mode & 0x2 != 0
     }
@@ -327,6 +329,15 @@ impl SrsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srs_saturates_on_every_nonzero_crsat_and_mode_2_is_symmetric() {
+        let cfg = |m| SrsConfig { rounding_mode: 0, saturation_mode: m, srs_sign: true };
+        assert!(!cfg(0).saturate());
+        assert!(cfg(1).saturate() && !cfg(1).symmetric_saturate());
+        assert!(cfg(2).saturate() && cfg(2).symmetric_saturate());
+        assert!(cfg(3).saturate() && cfg(3).symmetric_saturate());
+    }
 
     #[test]
     fn branch_target_resumes_at_fetch_line_start() {
