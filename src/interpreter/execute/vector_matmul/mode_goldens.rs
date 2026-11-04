@@ -212,18 +212,21 @@ fn matches_silicon_on_every_held_out_lane() {
     assert!(total >= 8 * 112 * 4 * 3 * 16, "only {total} held-out lanes replayed");
 }
 
-/// A config word whose (amode, bmode, variant) names no geometry is reported
-/// unhandled, with the destination left exactly as it was, instead of being
-/// claimed handled with nothing written.
+/// A config word whose (amode, bmode, variant) names no mode multiplies nothing: `vmul` writes
+/// zeros and `vmac` returns its accumulator input (silicon, plan `codes` of
+/// `tools/gen_mac_conf_probe.py`, every one of the 128 keys).
 #[test]
-fn a_config_word_with_no_geometry_is_unhandled_and_writes_nothing() {
-    let mut ctx = ExecutionContext::new();
-    ctx.accumulator.write_wide(0, [0x1111_2222_3333_4444u64; 16]);
-    ctx.vector.write_wide(0, [0x0101_0101u32; 16]);
-    ctx.vector.write_wide(2, [0x0101_0101u32; 16]);
-    // (3, 3, 7) is no mode the header builds.
-    ctx.scalar.write(5, (3 << 1) | (3 << 3) | (7 << 5) | (1 << 8) | (1 << 9));
-    assert!(!execute_matmul(&stage_op(0), &mut ctx), "an unmodelled config word must report unhandled");
-    ctx.force_commit_all_pending();
-    assert_eq!(ctx.accumulator.read_wide(0), [0x1111_2222_3333_4444u64; 16]);
+fn an_unused_key_multiplies_nothing() {
+    let acc = [0x1111_2222_3333_4444u64; 16];
+    for (stage, want) in [(0, [0u64; 16]), (1, acc)] {
+        let mut ctx = ExecutionContext::new();
+        ctx.accumulator.write_wide(0, acc);
+        ctx.vector.write_wide(0, [0x0101_0101u32; 16]);
+        ctx.vector.write_wide(2, [0x0101_0101u32; 16]);
+        // (3, 3, 7) is no mode.
+        ctx.scalar.write(5, (3 << 1) | (3 << 3) | (7 << 5) | (1 << 8) | (1 << 9));
+        assert!(execute_matmul(&stage_op(stage), &mut ctx));
+        ctx.force_commit_all_pending();
+        assert_eq!(ctx.accumulator.read_wide(0), want, "stage {stage}");
+    }
 }

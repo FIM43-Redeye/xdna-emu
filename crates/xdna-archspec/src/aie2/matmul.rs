@@ -1296,4 +1296,78 @@ mod tests {
             }
         }
     }
+
+    /// Every dense integer mode (header and silicon-only) has a term-negation rule whose bits stay
+    /// inside the 8-bit field for every lane and term, and every sparse mode but the unprobed
+    /// 4-bit one has one.
+    #[test]
+    fn term_neg_rules_cover_the_modes_and_stay_in_the_field() {
+        for (amode, bmode, cmode, entry) in CONFIG_GEOMETRY_TABLE.iter().chain(SILICON_GEOMETRY_TABLE) {
+            if entry.bfloat {
+                continue;
+            }
+            let Some(rule) = term_neg_rule(*amode, *bmode, *cmode) else {
+                assert_eq!((*amode, *bmode, *cmode), (0, 0, 1), "no rule for ({amode}, {bmode}, {cmode})");
+                continue;
+            };
+            // A sparse mode's term is the stored row, half the logical inner dimension.
+            let terms = if entry.sparse {
+                entry.shape.terms() / 2
+            } else {
+                entry.shape.terms()
+            };
+            for lane in 0..entry.shape.lanes() {
+                for term in 0..terms {
+                    assert!(rule.bit(lane, term, 0) < 8 && rule.bit(lane, term, 1) < 8);
+                }
+            }
+        }
+        // bmode 1 is bmode 3 under a 64-bit accumulator.
+        assert_eq!(term_neg_rule(1, 1, 1), term_neg_rule(1, 3, 1));
+    }
+
+    /// The rules read off silicon: `bit = (lane % classes) * (8 / classes) + slot`.
+    #[test]
+    fn term_neg_bits_follow_the_silicon_slots() {
+        let r = |k: (u32, u32, u32)| term_neg_rule(k.0, k.1, k.2).unwrap();
+        // int8 x int8 4x8x8: even lanes bits 0-3, odd lanes 4-7; terms 0,2 / 4,6 / 1,3 / 5,7 share a bit.
+        let t = |lane| (0..8).map(|term| r((0, 1, 0)).bit(lane, term, 0)).collect::<Vec<_>>();
+        assert_eq!(t(0), [0, 2, 0, 2, 1, 3, 1, 3]);
+        assert_eq!(t(1), [4, 6, 4, 6, 5, 7, 5, 7]);
+        // int16 x int16 acc32 4x2x8: four lane classes of two bits.
+        assert_eq!(
+            [r((0, 3, 0)).bit(0, 1, 0), r((0, 3, 0)).bit(3, 0, 0), r((0, 3, 0)).bit(5, 1, 0)],
+            [1, 6, 3]
+        );
+        // int32 x int16: a low and a high half per term, two terms.
+        assert_eq!(
+            (0..2)
+                .flat_map(|t| (0..2).map(move |h| r((1, 0, 0)).bit(0, t, h)))
+                .collect::<Vec<_>>(),
+            [0, 2, 1, 3]
+        );
+        // complex 16-bit: bit k negates term k, lane parity picks the nibble.
+        assert_eq!([r((1, 3, 4)).bit(0, 3, 0), r((1, 3, 4)).bit(1, 3, 0)], [3, 7]);
+        // sparse 16-bit: the stored row is the term.
+        assert_eq!(r((1, 3, 5)).bit(1, 2, 0), 6);
+    }
+
+    /// The complex modes: the real lane pairs re*re with im*im, the imaginary lane re*im with im*re.
+    #[test]
+    fn complex_elem_lane_map() {
+        let s = MacShape::ComplexElem { sets: 2 };
+        assert_eq!((s.lanes(), s.terms(), s.operand_extent()), (16, 4, (32, 32)));
+        // complex lane 3 (accumulator lanes 6, 7), set 1.
+        assert_eq!([s.operand_indices(6, 2), s.operand_indices(6, 3)], [(22, 22), (23, 23)]);
+        assert_eq!([s.operand_indices(7, 2), s.operand_indices(7, 3)], [(22, 23), (23, 22)]);
+        assert_eq!(MacShape::ComplexElem { sets: 1 }.operand_extent(), (16, 16));
+    }
+
+    #[test]
+    fn dense_integer_geometry_aliases_and_adds_the_silicon_modes() {
+        assert_eq!(dense_integer_geometry(1, 1, 1).unwrap().shape, entry(1, 3, 1).shape);
+        assert!(matches!(dense_integer_geometry(1, 0, 1).unwrap().shape, MacShape::ComplexElem { sets: 1 }));
+        assert!(dense_integer_geometry(0, 0, 1).is_none(), "a sparse mode is not a dense geometry");
+        assert!(dense_integer_geometry(3, 0, 0).is_none());
+    }
 }

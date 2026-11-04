@@ -22,6 +22,8 @@
 
 mod helpers;
 #[cfg(test)]
+mod conf_goldens;
+#[cfg(test)]
 mod mode_goldens;
 mod sparse;
 #[cfg(test)]
@@ -1598,7 +1600,7 @@ mod tests {
     use crate::interpreter::state::ExecutionContext;
 
     /// Build a minimal SlotOp for a MAC-family instruction.
-    fn make_mac_op(
+    pub(super) fn make_mac_op(
         semantic: SemanticOp,
         a_vreg: u8,
         b_vreg: u8,

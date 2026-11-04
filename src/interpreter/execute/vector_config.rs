@@ -484,17 +484,103 @@ mod tests {
         }
     }
 
-    /// A config word whose fields name no geometry is rejected (the executor
-    /// then reports the op unhandled instead of dropping it).
+    /// bf16 configs still reject a variant no float mode uses; every integer word parses.
     #[test]
-    fn a_config_word_with_no_geometry_is_rejected() {
-        // (3, 3, 7) is not a header key.
-        assert!(MatMulConfig::from_config_word((3 << 1) | (3 << 3) | (7 << 5), false).is_none());
-        // Integer fields never reach the bf16 geometries, nor the reverse.
-        assert!(MatMulConfig::from_config_word((2 << 1) | (3 << 3), false).is_none());
+    fn bf16_variants_without_a_geometry_are_rejected() {
         assert!(MatMulConfig::from_config_word(1 << 5, true).is_some());
         assert!(MatMulConfig::from_config_word(0, true).is_some()); // bf16 variant 0 is the dense tile
         assert!(MatMulConfig::from_config_word(3 << 5, true).is_none());
+    }
+
+    fn word(amode: u32, bmode: u32, cmode: u32) -> u32 {
+        (amode << 1) | (bmode << 3) | (cmode << 5)
+    }
+
+    /// A key no mode uses selects the idle multiplier (zero products), 64-bit lanes under amode 1.
+    #[test]
+    fn an_unused_key_selects_the_idle_multiplier() {
+        for (amode, bmode, cmode, lanes) in [(0, 0, 7, 32), (0, 3, 2, 32), (1, 0, 3, 16), (1, 2, 7, 16)] {
+            let c = MatMulConfig::from_config_word(word(amode, bmode, cmode), false).unwrap();
+            assert_eq!(c.multiplier, Multiplier::Idle, "({amode}, {bmode}, {cmode})");
+            assert_eq!(c.shape.lanes(), lanes);
+        }
+    }
+
+    /// With a 64-bit accumulator, bmode 1 is the same multiplier mode as bmode 3.
+    #[test]
+    fn amode_one_bmode_one_is_bmode_three() {
+        for cmode in 0..8 {
+            let a = MatMulConfig::from_config_word(word(1, 1, cmode), false).unwrap();
+            let b = MatMulConfig::from_config_word(word(1, 3, cmode), false).unwrap();
+            assert_eq!(
+                (a.shape, a.bits_x, a.bits_y, a.multiplier),
+                (b.shape, b.bits_x, b.bits_y, b.multiplier)
+            );
+        }
+        // ... but not with a 32-bit accumulator (8x8 against 16x16).
+        let a = MatMulConfig::from_config_word(word(0, 1, 0), false).unwrap();
+        let b = MatMulConfig::from_config_word(word(0, 3, 0), false).unwrap();
+        assert_ne!((a.bits_x, a.bits_y), (b.bits_x, b.bits_y));
+    }
+
+    /// amode 2 and 3 select the float multiplier on an integer instruction, whatever bmode is;
+    /// cmode 0 is the 4x8x4 tile, cmode 1 the 16-lane pair form, the others are idle.
+    #[test]
+    fn float_amodes_select_the_float_conf_multiplier() {
+        for amode in [2, 3] {
+            for bmode in 0..4 {
+                let c0 = MatMulConfig::from_config_word(word(amode, bmode, 0), false).unwrap();
+                assert_eq!(
+                    (c0.multiplier, c0.shape),
+                    (Multiplier::FloatConf, MacShape::Matmul { rows: 4, inner: 8, cols: 4 })
+                );
+                let c1 = MatMulConfig::from_config_word(word(amode, bmode, 1), false).unwrap();
+                assert_eq!(
+                    (c1.multiplier, c1.shape),
+                    (Multiplier::FloatConf, MacShape::Elementwise { lanes: 16, k: 2 })
+                );
+                assert_eq!(c1.accumulator_lanes(), 32);
+                assert_eq!(
+                    MatMulConfig::from_config_word(word(amode, bmode, 2), false).unwrap().multiplier,
+                    Multiplier::Idle
+                );
+            }
+        }
+    }
+
+    /// The two complex modes the header does not build.
+    #[test]
+    fn complex_modes_parse() {
+        let c = MatMulConfig::from_config_word(word(1, 0, 1), false).unwrap();
+        assert_eq!(
+            (c.shape, c.bits_x, c.bits_y, c.acc_width),
+            (MacShape::ComplexElem { sets: 1 }, 32, 16, AccWidth::Acc64)
+        );
+        for bmode in [1, 3] {
+            let c = MatMulConfig::from_config_word(word(1, bmode, 4), false).unwrap();
+            assert_eq!((c.shape, c.bits_x, c.bits_y), (MacShape::ComplexElem { sets: 2 }, 16, 16));
+        }
+    }
+
+    /// Every field of the word lands where `VecConf` puts it; the reserved bits (15:14, 31:24) read nothing.
+    #[test]
+    fn every_conf_field_is_decoded_from_its_bit() {
+        let base = word(0, 1, 0);
+        let c = MatMulConfig::from_config_word(
+            base | 1 | 1 << 8 | 1 << 11 | 1 << 12 | 1 << 13 | 0xA5 << 16,
+            false,
+        )
+        .unwrap();
+        assert!(!c.accumulate && c.y_signed && !c.x_signed && c.subtract && c.sub_acc1 && c.sub_acc2);
+        assert_eq!(c.term_neg, 0xA5);
+        let c = MatMulConfig::from_config_word(base | 1 << 9, false).unwrap();
+        assert!(c.accumulate && c.x_signed && !c.y_signed && c.term_neg == 0);
+        let reserved = MatMulConfig::from_config_word(base | 3 << 14 | 0xFF << 24, false).unwrap();
+        let plain = MatMulConfig::from_config_word(base, false).unwrap();
+        assert_eq!(
+            (reserved.term_neg, reserved.subtract, reserved.sub_acc1, reserved.sub_acc2, reserved.accumulate),
+            (plain.term_neg, plain.subtract, plain.sub_acc1, plain.sub_acc2, plain.accumulate)
+        );
     }
 
     /// Integer elementwise, convolution and 2-channel modes parse, with the
