@@ -41,7 +41,7 @@
 #[cfg(feature = "aiesim")]
 mod aiesim;
 mod async_errors;
-mod backend;
+pub mod backend;
 mod classify;
 mod config;
 pub mod context;
@@ -270,8 +270,32 @@ pub(crate) fn select_backend(
                     .to_string())
             }
         }
-        other => Err(format!("XDNA_BACKEND={other}: unknown backend")),
+        other => registered_backend(other)
+            .ok_or_else(|| format!("XDNA_BACKEND={other}: unknown backend"))
+            .and_then(|factory| factory()),
     }
+}
+
+/// Builds a backend for [`register_backend`].
+pub type BackendFactory = fn() -> Result<Box<dyn crate::backend::NpuBackend>, String>;
+
+static REGISTERED_BACKENDS: Mutex<Vec<(&'static str, BackendFactory)>> = Mutex::new(Vec::new());
+
+/// Make `XDNA_BACKEND=<name>` select a backend provided by an out-of-tree
+/// platform crate linked into the same library. A later registration of the
+/// same name replaces the earlier one; the built-in names cannot be replaced.
+pub fn register_backend(name: &'static str, factory: BackendFactory) {
+    let mut backends = REGISTERED_BACKENDS.lock().unwrap();
+    backends.retain(|(existing, _)| *existing != name);
+    backends.push((name, factory));
+}
+
+fn registered_backend(name: &str) -> Option<BackendFactory> {
+    REGISTERED_BACKENDS
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|&(existing, factory)| (existing == name).then_some(factory))
 }
 
 /// Create a new emulator instance.
@@ -1130,6 +1154,47 @@ mod tests {
             xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1()
         })
         .is_err());
+    }
+
+    #[test]
+    fn select_backend_uses_a_registered_factory() {
+        fn interpreter() -> Result<Box<dyn crate::backend::NpuBackend>, String> {
+            Ok(Box::new(crate::backend::InterpreterBackend::new(
+                xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1(),
+            )))
+        }
+        fn failing() -> Result<Box<dyn crate::backend::NpuBackend>, String> {
+            Err("platform backend refused".to_string())
+        }
+        register_backend("test-registered", interpreter);
+        register_backend("test-failing", failing);
+        let never = || -> xdna_emu_core::interpreter::engine::InterpreterEngine {
+            panic!("a registered backend must not build the default interpreter")
+        };
+        assert!(select_backend("test-registered", never).is_ok());
+        assert_eq!(select_backend("test-failing", never).err().unwrap(), "platform backend refused");
+        assert!(select_backend("test-unregistered", never).is_err());
+    }
+
+    #[test]
+    fn set_command_regmap_validates_its_pointers() {
+        unsafe {
+            assert_eq!(
+                execution::xdna_emu_set_command_regmap(std::ptr::null_mut(), std::ptr::null(), 0),
+                XdnaEmuResult::InvalidHandle
+            );
+            with_handle(|h| {
+                assert_eq!(
+                    execution::xdna_emu_set_command_regmap(h, std::ptr::null(), 1),
+                    XdnaEmuResult::NullPointer
+                );
+                let words = [3u32, 0, 0x1000];
+                assert_eq!(
+                    execution::xdna_emu_set_command_regmap(h, words.as_ptr(), 3),
+                    XdnaEmuResult::Success
+                );
+            });
+        }
     }
 
     // =====================================================================

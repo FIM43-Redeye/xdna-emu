@@ -60,6 +60,12 @@ public:
     virtual void assign_partition(uint8_t /*start_col*/,
                                   uint32_t /*num_tiles*/) {}
 
+    /// Pass the submission's ERT command register map (the kernel
+    /// arguments as the host packed them) to the emulator before
+    /// `execute_from_device`.  No-op if the library lacks the symbol.
+    virtual void set_command_regmap(const uint32_t* /*words*/,
+                                    uint32_t /*count*/) {}
+
     // -- Buffer management ---------------------------------------------------
 
     /// Allocate a host-visible buffer.  Returns the device address.

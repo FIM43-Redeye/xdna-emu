@@ -812,6 +812,9 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       // starting at offset 0x00.
       uint32_t bo_start = (sc.pkt->opcode == ERT_START_CU) ? 0x14 : 0x00;
       auto* regmap = reinterpret_cast<const uint8_t*>(regmap_begin);
+      if (sc.pkt->opcode == ERT_START_CU)
+        m_transport->set_command_regmap(regmap_begin,
+                                        static_cast<uint32_t>(regmap_end - regmap_begin));
 
       uint32_t arg_idx = 0;
       uint32_t valid_bo_count = 0;

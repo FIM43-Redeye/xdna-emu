@@ -111,6 +111,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_reset_context_      = resolve_required<fn_reset_context>("xdna_emu_reset_context");
     sym_set_start_col_      = resolve_optional<fn_set_start_col>("xdna_emu_set_start_col");
     sym_assign_partition_   = resolve_optional<fn_assign_partition>("xdna_emu_assign_partition");
+    sym_set_command_regmap_ = resolve_optional<fn_set_command_regmap>("xdna_emu_set_command_regmap");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
@@ -219,6 +220,16 @@ void emu_transport_inprocess::assign_partition(uint8_t start_col,
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_assign_partition_(emu_, start_col, num_tiles);
     check(rc, "assign_partition");
+}
+
+void emu_transport_inprocess::set_command_regmap(const uint32_t* words,
+                                                 uint32_t count)
+{
+    if (!sym_set_command_regmap_)
+        return;  // Older emulator builds: the host-buffer list carries the BOs.
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    Result rc = sym_set_command_regmap_(emu_, words, count);
+    check(rc, "set_command_regmap");
 }
 
 // ---------------------------------------------------------------------------

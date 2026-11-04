@@ -4,8 +4,6 @@
 
 use std::slice;
 
-use xdna_emu_core::npu::NpuInstructionStream;
-
 use super::{XdnaEmuHandle, XdnaEmuResult, XdnaEmuExecStatus, XdnaEmuHaltReason};
 
 /// Execute NPU instructions.
@@ -32,24 +30,51 @@ pub unsafe extern "C" fn xdna_emu_execute_npu_instructions(
     let handle = &mut *handle;
     let instr_slice = slice::from_raw_parts(instr_data, instr_size as usize);
 
-    // Parse instruction stream
-    let stream = match NpuInstructionStream::parse(instr_slice) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("Failed to parse NPU instructions: {}", e);
-            return XdnaEmuResult::ParseError;
+    // Load instructions for execution in xdna_emu_run().
+    match handle.backend.load_instruction_bytes(instr_slice) {
+        Ok(count) => {
+            log::info!("Executing {} NPU instructions", count);
+            XdnaEmuResult::Success
         }
-    };
-
-    log::info!("Executing {} NPU instructions", stream.instructions().len());
-
-    // Load instructions for interleaved execution in xdna_emu_run().
-    if let Err(e) = handle.backend.execute_npu_instructions(&stream) {
-        log::error!("execute_npu_instructions: {}", e);
-        crate::set_last_error(e);
-        return XdnaEmuResult::ExecutionError;
+        Err(crate::backend::ConfigError::Parse(e)) => {
+            log::error!("Failed to parse NPU instructions: {}", e);
+            XdnaEmuResult::ParseError
+        }
+        Err(crate::backend::ConfigError::Apply(e)) => {
+            log::error!("execute_npu_instructions: {}", e);
+            crate::set_last_error(e);
+            XdnaEmuResult::ExecutionError
+        }
     }
+}
 
+/// Hand the backend the submission's ERT command register map: the kernel
+/// arguments exactly as the host packed them. Callers that decode an
+/// `ERT_START_CU` packet pass its regmap before
+/// `xdna_emu_execute_npu_instructions`; backends that patch addresses from
+/// the host-buffer list ignore it.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `words` must point to at least `count` u32 values
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_set_command_regmap(
+    handle: *mut XdnaEmuHandle,
+    words: *const u32,
+    count: u32,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if words.is_null() && count > 0 {
+        return XdnaEmuResult::NullPointer;
+    }
+    let regmap = if count == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(words, count as usize)
+    };
+    (*handle).backend.set_command_regmap(regmap);
     XdnaEmuResult::Success
 }
 

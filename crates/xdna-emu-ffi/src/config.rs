@@ -128,11 +128,29 @@ pub(crate) fn place_partition(backend: &mut dyn crate::backend::NpuBackend) -> u
 
 /// Apply PDI data to the emulator device.  This is the ONE golden path
 /// for device configuration -- both `load_xclbin` and `load_pdi` converge
-/// here.  Finds CDO within the bootgen container, parses it, and applies
-/// it to the device.
+/// here.  The backend decides how a PDI configures it; the in-process
+/// backends extract and apply its CDO ([`parse_pdi_cdo`]).
 pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmuResult {
     log::info!("apply_pdi_data: {} bytes, head={:02x?}", data.len(), &data[..data.len().min(16)]);
+    match handle.backend.apply_pdi(data) {
+        Ok(()) => XdnaEmuResult::Success,
+        Err(crate::backend::ConfigError::Parse(msg)) => {
+            log::error!("{}", msg);
+            set_last_error(msg);
+            XdnaEmuResult::ParseError
+        }
+        Err(crate::backend::ConfigError::Apply(e)) => {
+            let msg = format!("Failed to apply PDI: {}", e);
+            log::error!("{}", msg);
+            set_last_error(msg);
+            XdnaEmuResult::ExecutionError
+        }
+    }
+}
 
+/// Locate and parse the CDO inside a PDI bootgen container (raw CDO at
+/// offset 0 when there is no bootgen header).
+pub(crate) fn parse_pdi_cdo(data: &[u8]) -> Result<Cdo<'_>, String> {
     // Find CDO within bootgen container.
     let cdo_offset = match find_cdo_offset(data) {
         Some(off) => {
@@ -147,15 +165,12 @@ pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmu
     };
 
     // Parse CDO.
-    let cdo = match Cdo::parse(&data[cdo_offset..]) {
+    match Cdo::parse(&data[cdo_offset..]) {
         Ok(c) => {
             log::info!("  CDO: {} command words", c.command_length_words());
-            c
+            Ok(c)
         }
         Err(e) => {
-            let msg =
-                format!("Failed to parse CDO from PDI ({} bytes, offset {}): {}", data.len(), cdo_offset, e);
-            log::error!("{}", msg);
             if data.len() >= 8 {
                 log::error!(
                     "  At offset {}: {:02x?}",
@@ -163,20 +178,9 @@ pub(super) fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmu
                     &data[cdo_offset..data.len().min(cdo_offset + 20)]
                 );
             }
-            set_last_error(msg);
-            return XdnaEmuResult::ParseError;
+            Err(format!("Failed to parse CDO from PDI ({} bytes, offset {}): {}", data.len(), cdo_offset, e))
         }
-    };
-
-    // Apply CDO to device.
-    if let Err(e) = handle.backend.apply_cdo(&cdo) {
-        let msg = format!("Failed to apply CDO: {}", e);
-        log::error!("{}", msg);
-        set_last_error(msg);
-        return XdnaEmuResult::ExecutionError;
     }
-
-    XdnaEmuResult::Success
 }
 
 /// Load a raw PDI (Programmable Device Image) into the emulator.
@@ -352,15 +356,8 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
     }
 
     let handle = &mut *handle;
-    // Non-interpreter backends (aiesim) ungate partition columns themselves via
-    // the cluster's CDO replay (Column_Clock_Control writes), so the
-    // firmware-emulation hook is a no-op there -- only the in-process
-    // interpreter needs the explicit ungate.
-    let Some(device) = handle.backend.as_interpreter_mut().map(|i| i.device_mut()) else {
-        return 0;
-    };
-    let total_cols = device.cols();
-    let total_rows = device.array.rows() as u32;
+    let total_cols = handle.backend.cols();
+    let total_rows = handle.backend.rows() as u32;
     // AIE2 layout: row 0 = shim, row 1 = memtile, rows 2.. = compute.
     // Matches the discriminator in clock_control's `clock_tile_kind_from_row`.
     let compute_rows = total_rows.saturating_sub(2);
@@ -387,9 +384,11 @@ pub unsafe extern "C" fn xdna_emu_assign_partition(
         return -3;
     }
 
-    device.assign_partition_columns(start_col, num_col as u8);
+    // The interpreter ungates the columns here; aiesim's CDO replay ungates
+    // them itself; other backends bring the partition up their own way.
+    handle.backend.assign_partition(start_col, num_col as u8);
     log::debug!(
-        "xdna_emu_assign_partition: ungated {} cols [{}..{}] (num_tiles={}, compute_rows={})",
+        "xdna_emu_assign_partition: {} cols [{}..{}] (num_tiles={}, compute_rows={})",
         num_col,
         start_col,
         end,

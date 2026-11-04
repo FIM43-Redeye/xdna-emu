@@ -26,20 +26,28 @@ on_first_open() const
   //                           dlopen.
   //   XDNA_EMU_DIR         -- optional explicit path override; honored as-is
   //                           with no further fallbacks.
+  //   XDNA_EMU_LIB         -- optional path of the library itself (any
+  //                           library that exports the xdna_emu_* C ABI);
+  //                           wins over everything else, no fallbacks.
   //
   // Resolution order:
+  //   0. XDNA_EMU_LIB verbatim.
   //   1. XDNA_EMU_DIR + XDNA_EMU_RUNTIME -- $XDNA_EMU_DIR/target/<profile>/libxdna_emu.so
   //   2. Profile-named lib in the standard search path --
   //      libxdna_emu_debug.so or libxdna_emu_release.so (installed as symlinks
   //      in /opt/xilinx/xrt/lib/ by rebuild-plugin.sh).
   //   3. Plain libxdna_emu.so via ldconfig/LD_LIBRARY_PATH (legacy fallback).
+  const char* lib_env = std::getenv("XDNA_EMU_LIB");
   const char* dir_env = std::getenv("XDNA_EMU_DIR");
   const char* runtime_env = std::getenv("XDNA_EMU_RUNTIME");
   std::string profile = "debug";  // default
   if (runtime_env && std::string(runtime_env) == "release")
     profile = "release";
 
-  if (dir_env && dir_env[0] != '\0') {
+  if (lib_env && lib_env[0] != '\0') {
+    EMU_INFO("Loading emulator library: %s (XDNA_EMU_LIB override)", lib_env);
+    m_transport = emu_transport::create_inprocess(lib_env);
+  } else if (dir_env && dir_env[0] != '\0') {
     // Explicit override: use it verbatim, no fallbacks.
     std::string lib_path = std::string(dir_env) + "/target/" + profile +
                            "/libxdna_emu.so";

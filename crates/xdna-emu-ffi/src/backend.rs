@@ -53,7 +53,19 @@ pub trait RunObserver {
     fn on_async_errors(&mut self, records: &[AmdxdnaAsyncError]);
 }
 
+/// Why a configuration or submission step was rejected: malformed input, or
+/// input the backend could not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    Parse(String),
+    Apply(String),
+}
+
 /// The operations the FFI performs that are common to every backend.
+///
+/// Public so an out-of-tree platform crate can provide a backend through
+/// [`crate::register_backend`]. The defaults of the PDI, instruction and
+/// partition methods are the host-side paths the in-process backends share.
 pub trait NpuBackend {
     // --- configuration ---
     // Cdo is lifetime-generic (`Cdo<'a>`); the elided `<'_>` keeps the trait
@@ -61,6 +73,33 @@ pub trait NpuBackend {
     fn apply_cdo(&mut self, cdo: &Cdo<'_>) -> Result<(), String>;
     fn set_start_col(&mut self, start_col: u8);
     fn load_elf_bytes(&mut self, col: usize, row: usize, data: &[u8]) -> Result<u32, String>;
+
+    /// Configure the device from a PDI (a bootgen container holding a CDO).
+    /// Default: locate and parse the CDO and apply it through `apply_cdo`.
+    fn apply_pdi(&mut self, pdi: &[u8]) -> Result<(), ConfigError> {
+        let cdo = crate::config::parse_pdi_cdo(pdi).map_err(ConfigError::Parse)?;
+        self.apply_cdo(&cdo).map_err(ConfigError::Apply)
+    }
+
+    /// Bring up a partition of `num_cols` columns starting at physical
+    /// `start_col` for a new submission. Default: nothing, for backends whose
+    /// configuration stream already does it.
+    fn assign_partition(&mut self, _start_col: u8, _num_cols: u8) {}
+
+    /// Load one submission's runtime-sequence bytes. Default: parse them and
+    /// hand the stream to `execute_npu_instructions`. Returns the instruction
+    /// count for logging.
+    fn load_instruction_bytes(&mut self, bytes: &[u8]) -> Result<usize, ConfigError> {
+        let stream = xdna_emu_core::npu::NpuInstructionStream::parse(bytes).map_err(ConfigError::Parse)?;
+        let count = stream.instructions().len();
+        self.execute_npu_instructions(&stream).map_err(ConfigError::Apply)?;
+        Ok(count)
+    }
+
+    /// The submission's ERT command register map (the kernel arguments as
+    /// the host packed them), when the caller has one. Default: ignored; the
+    /// runtime-sequence executor patches addresses from the host-buffer list.
+    fn set_command_regmap(&mut self, _regmap: &[u32]) {}
 
     // --- host memory (tier-2) ---
     fn host_memory_mut(&mut self) -> &mut HostMemory;
@@ -130,6 +169,9 @@ impl NpuBackend for InterpreterBackend {
     }
     fn load_elf_bytes(&mut self, col: usize, row: usize, data: &[u8]) -> Result<u32, String> {
         self.engine.load_elf_bytes(col, row, data)
+    }
+    fn assign_partition(&mut self, start_col: u8, num_cols: u8) {
+        self.engine.device_mut().assign_partition_columns(start_col, num_cols);
     }
     fn host_memory_mut(&mut self) -> &mut HostMemory {
         self.engine.host_memory_mut()
