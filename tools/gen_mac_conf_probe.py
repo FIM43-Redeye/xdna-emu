@@ -267,6 +267,69 @@ REPRO_CASE = "modes__addmsc__00"
 REPRO_CONF = 0x622706
 
 
+# Sparse term_neg probe (Chess intrinsics: conf = base | sgn_y << 8 with sgn_x = 0, so any bit of the
+# conf above bit 7 can be set through sgn_y). (intrinsic, A type, A bytes/elem, rows, inner, B sparse type,
+# B data byte pattern, mask bits per unit)
+SPARSE_GEOMS = {
+    "2x8_8x8": ("mul_2x8_8x8", "v32int16", 2, 2, 8, "v64int16_sparse", 0x01, 2),
+    "2x16_16x8": ("mul_2x16_16x8", "v32int16", 2, 2, 16, "v128int8_sparse", 0x01, 1),
+    "4x16_16x8": ("mul_4x16_16x8", "v64int8", 1, 4, 16, "v128int8_sparse", 0x01, 1),
+}
+SPARSE_TILE_IN = 192
+
+
+def sparse_kernel(name, tiles):
+    intr, atype, _, _, _, btype, _, _ = SPARSE_GEOMS[name]
+    return f"""// Auto-generated (gen_mac_conf_probe.py sparse): {intr}, conf above bit 7 through sgn_y
+#define NOCPP
+#include <stdint.h>
+#include <string.h>
+
+extern "C" {{
+void test_kernel(const int32_t *restrict in, int32_t *restrict out) {{
+    for (int t = 0; t < {tiles}; t++) {{
+        const char *p = (const char *)in + t * {SPARSE_TILE_IN};
+        {atype} a;
+        memcpy(&a, p, sizeof(a));
+        {btype} b;
+        memcpy(&b, p + 64, sizeof(b));
+        int sgn_y;
+        memcpy(&sgn_y, p + 144, sizeof(int));
+        auto r = {intr}(a, 0, b, sgn_y);
+        memcpy((char *)out + t * 128, &r, 128);
+    }}
+}}
+}} // extern "C"
+"""
+
+
+def plan_sparse(rng):
+    out = []
+    for name, (intr, atype, abytes, rows, inner, btype, bpat, mbpu) in SPARSE_GEOMS.items():
+        nelem = 64 // abytes
+        data = bytes([bpat, 0] * 32) if abytes == 2 and name == "2x8_8x8" else bytes([bpat] * 64)
+        tiles = []
+        for pat in (0, 1):
+            if mbpu == 2:
+                mask = bytes([0x0F if pat == 0 else 0xF0] * 16)
+            else:
+                mask = bytes([0x33 if pat == 0 else 0xCC] * 16)
+            for i in range(nelem):
+                a = bytearray(64)
+                a[i * abytes] = 1
+                for bit in [None] + list(range(8)):
+                    conf_hi = 0 if bit is None else (1 << (16 + bit)) >> 8
+                    tiles.append((bytes(a), data + mask, conf_hi))
+        per = 48
+        for k, start in enumerate(range(0, len(tiles), per)):
+            chunk = tiles[start:start + per]
+            buf = b"".join((a + bm + struct.pack("<I", ch)).ljust(SPARSE_TILE_IN, b"\0") for a, bm, ch in chunk)
+            out.append(CxxKernel(name=f"sparse_{name}__{k:02d}", source=sparse_kernel(name, len(chunk)),
+                                 in_size=len(buf), out_size=128 * len(chunk), input_bytes=buf,
+                                 meta={"plan": "sparse", "geom": name, "tiles": [[i, ch] for _, _, ch in chunk]}))
+    return out
+
+
 def plan_upper(rng):
     out = []
     bits = [14, 15] + list(range(16, 32))
@@ -289,7 +352,7 @@ def plan_random(rng):
     return out
 
 
-PLANS = {"repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
+PLANS = {"sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
 
 
 def main():
@@ -300,7 +363,8 @@ def main():
     args = ap.parse_args()
     rng = random.Random(args.seed)
     kernels = PLANS[args.plan](rng)
-    write_cxx_suite(args.suite_dir, f"macconf-{args.plan}", "tools/gen_mac_conf_probe.py", "peano",
+    write_cxx_suite(args.suite_dir, f"macconf-{args.plan}", "tools/gen_mac_conf_probe.py",
+                    "chess" if args.plan == "sparse" else "peano",
                     kernels, meta={"plan": args.plan, "seed": args.seed})
     print(f"{len(kernels)} cases -> {args.suite_dir}")
 

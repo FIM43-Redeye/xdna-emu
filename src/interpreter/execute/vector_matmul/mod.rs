@@ -431,7 +431,11 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
             combine.signs.product_negated = false;
             combine.config_word &= !sparse::SUB_MUL;
         }
-        matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
+        if let Some((layout, mask)) = &combine.operand {
+            product = sparse::sparse_product(&a[..], &b[..], &product_config, layout, *mask);
+        } else {
+            matmul_config_driven(&mut product, &a[..], &b[..], &product_config);
+        }
         let acc1 = read_acc_full(ctx, p.acc_src, p.is_half, p.acc_use_bypass[0]);
         let acc2 = p.acc2_sub.map(|_| read_acc2(ctx, p));
         let result = sparse::combine_integer(
@@ -573,7 +577,11 @@ fn sample_sparse(
         None
     } else {
         let kind = sparse::op_kind_of(name)?;
-        Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
+        Some(SparseCombine {
+            signs: kind.term_signs()?,
+            operand: Some((layout, mask)),
+            config_word: conf_val,
+        })
     };
     Some(((a, b), combine, present))
 }
@@ -594,7 +602,7 @@ fn integer_combine(op: &SlotOp, semantic: SemanticOp, conf_val: u32) -> Option<S
             _ => return None,
         },
     };
-    Some(SparseCombine { signs: kind.term_signs()?, config_word: conf_val })
+    Some(SparseCombine { signs: kind.term_signs()?, operand: None, config_word: conf_val })
 }
 
 /// Scan sources for the last ScalarReg operand (the config register).

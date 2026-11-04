@@ -31,6 +31,8 @@ const SUB_ACC2: u32 = 1 << 13;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SparseCombine {
     pub signs: MacTermSigns,
+    /// The sparse operand's layout and mask, `None` for a dense MAC.
+    pub operand: Option<(SparseLayout, u128)>,
     /// The raw config word (its control bits are sampled at issue).
     pub config_word: u32,
 }
@@ -107,6 +109,56 @@ pub(super) fn present_elements(layout: &SparseLayout, mask: u128) -> u128 {
         }
     }
     present
+}
+
+/// The product sum of a sparse MAC, lane by lane. Same sums as the dense multiply on the expanded
+/// B image, but each product is negated by the config word's `term_neg` bit of its *stored* B row
+/// (the term-negation slots follow the stored data, `TermNegRule`).
+pub(super) fn sparse_product(
+    a: &[u32],
+    b: &[u32],
+    config: &crate::interpreter::execute::vector_config::MatMulConfig,
+    layout: &SparseLayout,
+    mask: u128,
+) -> Acc1024 {
+    use super::helpers::extract_element_512;
+    let (rows, inner, cols) = config.shape.matmul_dims().expect("a sparse geometry is a matrix tile");
+    let element_offset = |index: u32, bits: u32| {
+        if bits == 4 {
+            index as usize
+        } else {
+            (index * (bits / 8)) as usize
+        }
+    };
+    let mut out = [0u64; 16];
+    for lane in 0..rows * cols {
+        let (r, c) = (lane / cols, lane % cols);
+        let mut sum = 0i64;
+        for k in 0..inner {
+            let a_val = extract_element_512(
+                a,
+                element_offset(r * inner + k, config.bits_x),
+                config.bits_x,
+                config.x_signed,
+            );
+            let b_val = extract_element_512(
+                b,
+                element_offset(k * cols + c, config.bits_y),
+                config.bits_y,
+                config.y_signed,
+            );
+            let product = a_val * b_val;
+            let stored_row = layout
+                .stored_unit(mask, k, c / layout.elements_per_unit)
+                .map_or(0, |unit| unit / layout.unit_cols);
+            let negated = config
+                .term_neg_rule
+                .is_some_and(|rule| config.term_neg >> rule.bit(lane, stored_row, 0) & 1 != 0);
+            sum += if negated { -product } else { product };
+        }
+        write_acc_wide(&mut out, lane as usize, sum, config.acc_width);
+    }
+    out
 }
 
 /// Combine the product sum `product` (a zero-accumulator multiply) with the accumulator inputs

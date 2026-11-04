@@ -397,6 +397,8 @@ pub enum SlotRule {
     Terms8,
     /// `2 * (term >> 1 & 1) + (term >> 3 & 1)`: 16-term lanes.
     Terms16,
+    /// `2 * (term & 1) + (term >> 2 & 1)`: the 8 stored rows of the sparse 8-bit mode.
+    StoredRows8,
     /// `2 * half + term`: a 32-bit A element is a low and a high 16-bit half.
     HalfTerm,
 }
@@ -423,6 +425,7 @@ impl TermNegRule {
             SlotRule::TermParity => 2 * (term & 1),
             SlotRule::Terms8 => ((term >> 2) & 1) + 2 * (term & 1),
             SlotRule::Terms16 => 2 * ((term >> 1) & 1) + ((term >> 3) & 1),
+            SlotRule::StoredRows8 => 2 * (term & 1) + ((term >> 2) & 1),
             SlotRule::HalfTerm => 2 * half + term,
         };
         (lane % self.lane_classes) * (8 / self.lane_classes) + slot
@@ -439,7 +442,7 @@ pub const fn float_conf_term_neg_rule(cmode: u32) -> Option<TermNegRule> {
 }
 
 /// The term-negation rule of a dense integer config key (after [`canonical_key`]), `None` for
-/// keys whose multiplier output is zero or that were not probed (sparse modes).
+/// keys whose multiplier output is zero and for the unprobed 4-bit sparse mode.
 pub fn term_neg_rule(amode: u32, bmode: u32, cmode: u32) -> Option<TermNegRule> {
     use SlotRule::*;
     let (lane_classes, slot) = match canonical_key(amode, bmode, cmode) {
@@ -453,6 +456,12 @@ pub fn term_neg_rule(amode: u32, bmode: u32, cmode: u32) -> Option<TermNegRule> 
         (1, 0, 0) | (1, 0, 1) => (2, HalfTerm),
         (1, 2, 0) | (1, 2, 1) => (2, TermPair),
         (1, 3, 0..=4) => (2, Term),
+        // The sparse modes (a sparse instruction only; `tools/gen_mac_conf_probe.py sparse`): the
+        // "term" is the stored row of B that feeds the product (`SparseLayout::stored_unit / unit_cols`),
+        // not the logical inner index. The 4-bit sparse mode (0, 0, 1) was not probed.
+        (0, 1, 5) => (2, StoredRows8),
+        (1, 2, 2) => (2, TermPair),
+        (1, 3, 5) => (2, Term),
         _ => return None,
     };
     Some(TermNegRule { lane_classes, slot })
