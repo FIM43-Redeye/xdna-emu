@@ -751,6 +751,9 @@ pub struct PipelineStage {
 pub struct RegisterDef {
     /// Register name as used in assembly (e.g., "r0", "p3", "lr", "m5").
     pub name: String,
+    /// TableGen `AsmName`, the spelling the assembler accepts (`ls` for the def `LS`); the def
+    /// name where no `AsmName` is given.
+    pub asm_name: String,
     /// Hardware encoding value (from `bits<16> HWEncoding`).
     pub hw_encoding: u16,
     /// Parent classes from the def line (e.g., ["AIE2GPReg", "DwarfRegNum"]).

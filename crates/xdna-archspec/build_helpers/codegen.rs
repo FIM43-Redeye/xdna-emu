@@ -104,6 +104,7 @@ pub fn generate_tablegen_file(output: &BuildTblgenOutput, out_dir: &Path) {
         let reg = &output.register_model.registers[*name];
         writeln!(code, "    reg_registers.insert({:?}.to_string(), RegisterDef {{", name).unwrap();
         writeln!(code, "        name: {:?}.to_string(),", reg.name).unwrap();
+        writeln!(code, "        asm_name: {:?}.to_string(),", reg.asm_name).unwrap();
         writeln!(code, "        hw_encoding: {},", reg.hw_encoding).unwrap();
         writeln!(
             code,

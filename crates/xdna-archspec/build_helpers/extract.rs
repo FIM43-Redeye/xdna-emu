@@ -50,6 +50,8 @@ pub struct BuildItineraryInfo {
 /// Register definition (build-time version).
 pub struct BuildRegisterDef {
     pub name: String,
+    /// TableGen `AsmName`: how the assembler spells it (`ls` for def `LS`).
+    pub asm_name: String,
     pub hw_encoding: u16,
     pub parents: Vec<String>,
 }
@@ -1022,7 +1024,12 @@ fn load_register_model(td_file: &Path, include_paths: &[&Path]) -> Result<BuildR
             }
         }
 
-        registers.insert(name.clone(), BuildRegisterDef { name, hw_encoding, parents });
+        let asm_name = record
+            .string_value("AsmName")
+            .ok()
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| name.clone());
+        registers.insert(name.clone(), BuildRegisterDef { name, asm_name, hw_encoding, parents });
     }
 
     let mut classes: HashMap<String, BuildRegisterClassDef> = HashMap::new();
