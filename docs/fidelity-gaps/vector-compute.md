@@ -444,7 +444,10 @@ every addressing mode). Silicon (`src/interpreter/execute/status_flags.rs`):
 - **Sticky**: an in-range conversion leaves it set; only a `mov` to the register clears it.
 - **Visible** to a `mov rX, srY_of` issued 3 bundles after an SRS (`vsrs`, `vsrsm`, `vst.srs`:
   the itinerary's def cycle agrees), and at the UPS's accumulator result cycle: 3 bundles after a
-  `vups`, 9 after a `vlda.ups` (the itinerary says 1 and 8).
+  `vups`, 9 after a `vlda.ups` (the itinerary says 1 and 8). A `mov` that writes the register one
+  bundle before the flag is visible lands after it and wins; one issued a bundle earlier is
+  overridden by the flag (`tools/gen_flag_clear_probe.py`: `vsrs`, `vst.srs`, `vups`, `vlda.ups`,
+  clears at 0..11 bundles, HW r1 == r2, EMU == HW).
 
 Evidence: `tools/gen_sat_flags_probe.py`, 174 assembly cases over 74 forms (every SRS and UPS
 shape, `s` and `d`, every addressing mode of the fused load and store, `vsrsm`, x2c), 5356
