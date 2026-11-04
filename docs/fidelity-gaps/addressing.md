@@ -2,7 +2,7 @@
 class: addressing
 subsystem: AIE2 address generation -- the 2D / 3D descriptor post-modify (`[p], d`) of every load and store
 posture: resolved -- one rule, pinned on silicon for every TableGen family; the residuals are unobserved corners, not unvalidated model
-status: resolved (rule, descriptor layout, classification, unaligned accesses); open: count-write latency, descriptors d4..d7 as 2D operands, cross-tile accesses, vldb.compr
+status: resolved (rule, descriptor layout, classification, unaligned accesses, address-bit decode); open: count-write latency, descriptors d4..d7 as 2D operands, west/south accesses, vldb.compr
 ---
 
 # Addressing (2D / 3D descriptor post-modify)
@@ -117,8 +117,36 @@ Three further things the probe found:
   `Uses = [SP]`, so it decoded as a bare immediate; the sp-relative test now also checks the
   assembly string.
 
-Not probed: `vldb.compr.*` (unmodelled), `lda.tm` / `st.tm`, cross-tile addresses, stale ring
-bytes after a sparse line (see Open).
+Not probed: `vldb.compr.*` (unmodelled), `lda.tm` / `st.tm`, stale ring bytes after a sparse
+line (see Open).
+
+## Which address bits pick the memory (NPU1 silicon)
+
+Gather lanes are full 32-bit values, so a `vldb.4x*` operand can carry any address bits; the
+Chess suite's random lanes (`me_detail::load_4x*`, 12 cases) read memory the kernel never
+wrote. The probe `tools/gen_lut_addr_probe.py` (suite `build/experiments/harness/load4x/wrap3`,
+HW r1 == r2, no TDR) sets the bits on purpose against regions the kernel itself filled (its
+input window, the top 512 bytes of its memory, a window it stores into the north neighbour):
+
+- **Only bits 16-17 select the direction** (3 own memory, 2 north, 1 west, 0 south); bits 18
+  to 31 are ignored. `0x3xxxx`, `0xBxxxx`, `0xFxxxx` and `0xFFF7xxxx` read the tile's own
+  memory, `0x2xxxx`, `0xAxxxx`, `0xExxxx` the north neighbour. 168 of 168 gather lanes.
+- **Pointer accesses decode the same way** (`vlda`, `vldb`, `lda`, `vst` through a 20-bit
+  pointer at those aliases): 28 of 28.
+- **Bits 5-15 pass through** (lanes across the whole 64 KiB, the last row at `0x7fffe` included,
+  with the usual cut at the 16-byte row end).
+- **Emulator.** `MemoryQuadrant::from_address` takes `4 | ((addr >> 16) & 3)`; it used to read
+  `addr / 0x10000` as a byte and called everything outside 4..6 local, so north aliases read
+  the own memory. A gather lane in the last 16-byte row of memory read zeros (a whole-element
+  bounds check); it now reads the row like any other. EMU == HW on both probe cases.
+- **The generator** (`tools/chess-test-gen.py`) now points every address operand into a
+  256-byte table in the kernel's own input (see `docs/components/testing.md`).
+
+Memory nobody in the kernel wrote (case `lut_unwritten`) is deterministic on one machine but is
+not the kernel's: the west quadrant of a column-1 tile is the DPU-reserved column 0 and returns
+its contents; the south quadrant of row 2 (the memory tile row, no core memory) returns stale
+port data (bytes of the last west read or the last north store, never the `vldb` issued just
+before). See Open.
 
 ## Emulator design
 
@@ -175,8 +203,7 @@ bytes after a sparse line (see Open).
 | count-write latency | at most two bundles (observed); not pinned lower |
 | `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise |
 | counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured |
-| cross-tile accesses | all captured addresses are local |
+| west and south accesses with no memory behind them | silicon returns column-0 contents (west of column 1) and stale port data (south of row 2, no core memory there); the emulator returns zeros for a missing neighbour. Deterministic per machine but not the kernel's data; the port-latch rule is unprobed (`load4x/wrap3` `lut_unwritten`) |
 | `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed |
-| `vldb.4x*` lane values with bits above 9 set | the probe swept a 1 KiB window; the lane model passes the high bits through |
 | bytes a sparse peek reads past the first fetched line | they come from stale ring slots; silicon and the emulator differ there (sparse_4 / sparse_8, 16 of 64 records, the last 2 bytes of each) |
 | Chess emits `padds [sp], #imm` (stack adjust in the store slot) around spills in some register-pressure shapes | llvm-aie defines the `ag_pstm_sp_imm` stack adjust only for the A and B load units (`PADDA_sp_imm`, `PADDB_sp_imm`), so its disassembler, and the emulator with it, rejects the bundle (`St DECODE FAIL`). A one-def llvm-aie fix (`PADDS_sp_imm`) is being proposed upstream; built against it, the original `vec_agu_srs_d` d8 form decodes and passes on EMU. Until it lands, that form stays reshaped to avoid the spill. A decode sweep of every Chess listing on hand (`decode-sweep`) found no other undecodable encoding. Not an addressing-rule gap |

@@ -132,6 +132,7 @@ AIE2 only) because aiecc links per package. The entry symbol is renamed at compi
 | Accumulator read/write timing | `tools/gen_acc_timing_probe.py generate <dir>` | `tools/analyze_acc_timing.py <dir> <tag> [--compare TAG]` |
 | Accumulator collisions (single core, and cascade on two cores) | `tools/gen_collision_probe.py generate <dir>`, `tools/gen_cascade_collision_probe.py <dir>`; older probe directories convert with `tools/probe_to_suite.py` | `tools/analyze_collision_probe.py check\|report\|summary <dir> [hw emu]`, `tools/collision_points.py`, `tools/diff_probe_points.py <dir> <hw> <emu>` |
 | Load/store alignment | `tools/gen_ldst_align_probe.py generate <dir>` | the analysis functions in the same file (`# -- analysis` section; a pure function of a case's output bytes) |
+| Address-bit decode (gather lanes and pointers at aliased, high-bit and neighbour addresses) | `tools/gen_lut_addr_probe.py generate <dir>` | `tools/gen_lut_addr_probe.py analyze <dir> <tag> <case>` (decodes where each lane read from) |
 | C++ intrinsics, Peano (76 cases) | `tools/instr-test-gen.py --td <llvm-aie>/llvm/include/llvm/IR/IntrinsicsAIE2.td --suite-dir <dir>` | EMU against HW with `suite compare` |
 | C++ intrinsics, Chess (~3770 cases) | `tools/chess-test-gen.py --opns-header $AIETOOLS_DIR/data/aie_ml/lib/isg/me_chess_opns.h --types-header .../me_chess_types.h [--iss-types-header .../me_iss_types.h] --suite-dir <dir>` | EMU against HW with `suite compare` |
 | Run-time sign of the `d` forms (UPS, SRS, crVaddSign ops; Peano and Chess suites) | `tools/gen_dynamic_sign_probe.py --suite-dir <dir>` (writes `<dir>/peano` and `<dir>/chess`) | EMU against HW with `suite compare`; per-record layout in each case's `meta` |
@@ -149,7 +150,10 @@ launcher such as a compile cache or server; it must run the command unchanged, a
 part of the package's inputs hash. Every declaration in `me_chess_opns.h` either builds or is
 listed with a reason in the suite's `meta.skipped` (the generator reads `me_chess_llvm.h` and
 `me_vmult_float_emulated.h` to drop declarations Chess cannot call; Chess verdicts that only a
-compile can reveal are recorded in `tools/chess_gen_outcomes.json`). The Peano `*_conf` MAC
+compile can reveal are recorded in `tools/chess_gen_outcomes.json`). An operand that is a vector of
+addresses (the `vldb.4x*` gathers, found from me.h's `load_4x_address` block and me_chess.lib)
+is filled with offsets into a 256-byte table after the arguments, plus the table's run-time
+address, so the gather reads the kernel's own input; the case metadata records the layout. The Peano `*_conf` MAC
 intrinsics take a random configuration word, which the emulator models in full
 ([mac-conf](../fidelity-gaps/mac-conf.md)).
 

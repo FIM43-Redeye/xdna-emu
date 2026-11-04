@@ -99,8 +99,9 @@ pub struct MemoryUnit;
 /// / gen6mix, fitting 64 addresses x 2 window positions x 3 sizes x lo/hi x per-lane
 /// addresses): the bits above bit 4 pass through, the low five bits are reduced to the
 /// granule and halved, and an odd lane sets bit 4 (the other 16-byte bank). The old model
-/// (`v & mask`, no halving) only agrees for 32-byte-aligned lane values. Bits of `v` above 9
-/// and cross-tile values were not swept.
+/// (`v & mask`, no halving) only agrees for 32-byte-aligned lane values. The higher bits pass
+/// through; which of them pick the memory is [`decode_data_address`]'s rule (bits 16-17, the
+/// rest ignored; `build/experiments/harness/load4x` wrap3).
 pub(crate) fn lut_lane_address(v: u32, lane: usize, align_mask: u32) -> u32 {
     (v & !31) | (((v & 31) & align_mask) >> 1) | if lane % 2 == 1 { 0x10 } else { 0 }
 }
