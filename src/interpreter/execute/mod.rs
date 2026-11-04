@@ -191,3 +191,5 @@ mod tests {
         assert_eq!(ctx.scalar.read(2), 30);
     }
 }
+#[cfg(test)]
+mod acc_load_timing_goldens;

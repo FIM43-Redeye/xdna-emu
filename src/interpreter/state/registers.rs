@@ -644,6 +644,7 @@ impl VectorRegisterFile {
                     reg: w.reg as u16,
                     data: w.orig,
                     cascade: tag.cascade_read,
+                    acc_file: false,
                 }
             })
             .collect();
@@ -1185,6 +1186,7 @@ impl AccumulatorRegisterFile {
                     reg: w.reg as u16,
                     data,
                     cascade: tag.cascade_read,
+                    acc_file: true,
                 });
                 owner.push((i, q));
             }

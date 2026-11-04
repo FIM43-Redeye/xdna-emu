@@ -24,7 +24,8 @@
 //!    own ordinal, else from lane 0, and goes to the
 //!    register of the latest-issued writer that targets bank `p`; the chunks of earlier writers
 //!    on that bank are dropped. Banks nobody targets are untouched. A port with a single writer
-//!    passes through unchanged.
+//!    passes through unchanged. In the accumulator file (and beside a cascade read in either
+//!    file) a narrow writer on an odd bank drives lane 1 as well as lane 0.
 //! 2. **Different ports, same landing cycle.** Only chunks on the same register and the same
 //!    bank conflict: the lower-indexed port wins, with its own data. Chunks on different
 //!    registers both land, even on the same bank.
@@ -65,6 +66,13 @@ pub struct Chunk {
     pub data: [u32; 8],
     /// The chunk belongs to a cascade read ([`WriteTag::cascade_read`]).
     pub cascade: bool,
+    /// The chunk is written to the accumulator file, where a narrow (single-chunk) writer on an
+    /// odd bank also drives lane 1 of its port. Silicon (`gen_acc_timing_probe.py --waw`,
+    /// `build/experiments/harness/cfloat/ldtiming*`): a later-issued `vlda amlh0` or
+    /// `vmov amlh0, q1` landing with a `vups` / `vlda.ups` of the whole `bml0` puts its data in
+    /// both banks of `bml0`; on bank 0 (`amll0`) it leaves bank 1 alone. In the vector file a
+    /// narrow `wh` writer does not (collision probe6).
+    pub acc_file: bool,
 }
 
 /// What happens to one input chunk.
@@ -102,13 +110,14 @@ fn resolve_port(chunks: &[Chunk], port: u16, out: &mut [Landing]) {
         return;
     }
     let on_port = || chunks.iter().enumerate().filter(|(_, c)| c.port == port);
-    // Beside a cascade read a narrow writer on an odd bank also drives lane 1 (see
-    // `WriteTag::cascade_read`); otherwise lane k belongs to ordinal k alone.
+    // In the accumulator file, and in either file beside a cascade read, a narrow writer on an
+    // odd bank also drives lane 1 (see `Chunk::acc_file`, `WriteTag::cascade_read`); otherwise
+    // lane k belongs to ordinal k alone.
     let cascade_present = on_port().any(|(_, c)| c.cascade);
     let chunks_of = |w: u64| on_port().filter(|(_, c)| c.writer == w).count();
     let drives = |c: &Chunk, k: u8| {
         c.ordinal == k
-            || (cascade_present
+            || ((cascade_present || c.acc_file)
                 && k == 1
                 && !c.cascade
                 && c.ordinal == 0
@@ -155,7 +164,16 @@ mod tests {
 
     /// A chunk whose 256 bits are recognisable: every word is `tag`.
     fn chunk(writer: u64, port: u16, ordinal: u8, bank: u8, reg: u16, tag: u32) -> Chunk {
-        Chunk { writer, port, ordinal, bank, reg, data: [tag; 8], cascade: false }
+        Chunk {
+            writer,
+            port,
+            ordinal,
+            bank,
+            reg,
+            data: [tag; 8],
+            cascade: false,
+            acc_file: false,
+        }
     }
 
     fn lands(l: &Landing) -> Option<u32> {
@@ -194,6 +212,25 @@ mod tests {
         let plain = [chunk(1, 0, 0, 0, 4, 0xA0), chunk(1, 0, 1, 1, 4, 0xA1), chunk(2, 0, 0, 3, 11, 0xB0)];
         let r = resolve(&plain);
         assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), Some(0xA1), Some(0xB0)]);
+    }
+
+    // Silicon (`gen_acc_timing_probe.py --waw`, cfloat/ldtiming and ldtiming2: `vlda amlh0` or
+    // `vmov amlh0, q1` issued after a `vlda.ups` / `vups` of `bml0`, landing in the same cycle on
+    // CM_WM_PORT): in the accumulator file a narrow writer on an odd bank also drives lane 1, so
+    // both banks of `bml0` take its data; on bank 0 it leaves lane 1 to the earlier writer.
+    #[test]
+    fn in_the_accumulator_file_a_narrow_odd_bank_writer_drives_lane_one() {
+        let acc =
+            |writer, ordinal, bank, tag| Chunk { acc_file: true, ..chunk(writer, 0, ordinal, bank, 0, tag) };
+        let ups = [acc(1, 0, 0, 0xA0), acc(1, 1, 1, 0xA1)];
+        let r = resolve(&[ups[0], ups[1], acc(2, 0, 1, 0xB0)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), None, Some(0xB0)]);
+        let r = resolve(&[ups[0], ups[1], acc(2, 0, 0, 0xB0)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [None, Some(0xA1), Some(0xB0)]);
+        // the same chunks in the vector file: lane 1 stays the earlier writer's
+        let r =
+            resolve(&[chunk(1, 0, 0, 0, 0, 0xA0), chunk(1, 0, 1, 1, 0, 0xA1), chunk(2, 0, 0, 1, 0, 0xB0)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0xB0), None, Some(0xA1)]);
     }
 
     #[test]

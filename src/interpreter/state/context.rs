@@ -1001,7 +1001,15 @@ impl ExecutionContext {
         });
     }
 
-    /// Queue an accumulator load with width metadata for quarter/half/full writes.
+    /// Queue an accumulator load (`vlda am`, `vlda bm`) with width metadata for quarter/half/full
+    /// writes.
+    ///
+    /// The result is an ordinary in-flight write of the accumulator file with the load's itinerary
+    /// result cycle (II_VLDA_AM: 7), not a wall-clock load commit: silicon times it by the file's
+    /// one visibility rule like every MAC result, so a reader with use cycle 3 sees it from distance
+    /// 5 and of two writes landing in one register the later-landing one wins (a load issued with a
+    /// float MAC to the same register lands after it). Probe: `tools/gen_acc_timing_probe.py`
+    /// (`vlda_amll`, `vlda_amlh` producers and `--waw`).
     pub fn queue_accum_load(
         &mut self,
         dest: Operand,
@@ -1010,33 +1018,21 @@ impl ExecutionContext {
         latency: u64,
     ) {
         use crate::interpreter::decode::register_map::AccumWidth;
-        let phantom = match dest {
-            Operand::AccumReg(r) => {
-                let (lanes, mask) = match width {
-                    AccumWidth::QuarterLow => (0, 0x0F),
-                    AccumWidth::QuarterHigh => (4, 0xF0),
-                    // a 256-bit load into a bm half writes the low quarter and zeroes the rest
-                    _ => (0, 0xFF),
-                };
-                let mut lanes_u64 = [0u64; 8];
-                for k in 0..4 {
-                    lanes_u64[lanes + k] = value[2 * k] as u64 | (value[2 * k + 1] as u64) << 32;
-                }
-                let l_def = self.write_tag.map_or(1, |t| (t.land - self.bundle_seq).clamp(1, 255) as u8);
-                self.accumulator.register_phantom(r, lanes_u64, mask, l_def)
-            }
-            _ => None,
+        let Operand::AccumReg(r) = dest else {
+            panic!("accumulator load into {dest:?}");
         };
-        self.pending_writes.push(PendingWrite {
-            dest,
-            scalar_value: 0,
-            vec_value: Some(value),
-            accum_width: Some(width),
-            ready_cycle: self.cycles + latency,
-            issued_cycle: self.cycles,
-            phantom,
-            scalar_log_id: None,
-        });
+        let (lanes, mask) = match width {
+            AccumWidth::QuarterLow => (0, 0x0F),
+            AccumWidth::QuarterHigh => (4, 0xF0),
+            // a 256-bit load into a bm half writes the low quarter and zeroes the rest
+            _ => (0, 0xFF),
+        };
+        let mut lanes_u64 = [0u64; 8];
+        for k in 0..4 {
+            lanes_u64[lanes + k] = value[2 * k] as u64 | (value[2 * k + 1] as u64) << 32;
+        }
+        let l_def = self.write_tag.map_or(latency, |t| t.land - self.bundle_seq).clamp(1, 255) as u8;
+        self.accumulator.queue_lanes_write(r, lanes_u64, mask, l_def, Bypass::No);
     }
 
     /// Queue an accumulator result of the instruction being executed: a `bm` half (`is_half`,

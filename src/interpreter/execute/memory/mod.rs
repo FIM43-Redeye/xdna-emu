@@ -1031,7 +1031,7 @@ impl MemoryUnit {
     }
 
     /// Queue the converted `bm` half of a `vlda.conv` at the instruction's itinerary result
-    /// latency (II_VLDA_CONV: operand cycle 6), like every other accumulator producer, so that a
+    /// latency (II_VLDA_CONV: operand cycle 7), like every other accumulator producer, so that a
     /// reader sees the old value until then and a colliding write lands in its own cycle.
     fn queue_conv_acc_write(ctx: &mut ExecutionContext, reg: u8, acc: [u64; 8]) {
         let mut wide = [0u64; 16];
