@@ -6,7 +6,7 @@
     python3 -m harness suite hw    <suite_dir> r1
     python3 tests/shuffle-sweep/analyze.py <suite_dir>/runs/r1/shuffle-sweep/core.out.bin
 
-Replaces run.sh: the input is the 128-byte identity pattern (gen_input.py), the output the
+The input is the 128-byte identity pattern (gen_input.py), the output the
 48 x 64-byte routing table analyze.py reads. The kernel is Chess-only (it declares the
 `shuffle` intrinsic itself), so the case is a Chess package.
 """

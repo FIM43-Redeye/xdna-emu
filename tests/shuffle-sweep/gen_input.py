@@ -6,19 +6,6 @@ This maps directly to the two 512-bit vectors A (0-63) and B (64-127).
 When a shuffle output byte contains value N, it came from input byte N.
 """
 
-import struct
-import sys
 
 def identity_input() -> bytes:
     return bytes(range(128))
-
-
-def main():
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "input.bin"
-    data = identity_input()
-    with open(out_path, "wb") as f:
-        f.write(data)
-    print(f"Wrote {len(data)} bytes to {out_path}")
-
-if __name__ == "__main__":
-    main()

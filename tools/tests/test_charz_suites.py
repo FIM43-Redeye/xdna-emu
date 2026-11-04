@@ -48,11 +48,8 @@ def test_inputs_are_what_the_retired_scripts_fed():
     assert data[64:128] == data[128:192] == struct.pack("<H", 0x3F80) * 32 and data[192:] == data[:64]
 
 
-def test_subprec_input_is_the_old_gen_script_output(tmp_path):
-    out = tmp_path / "in.bin"
-    r = subprocess.run([sys.executable, str(TESTS / "bf16_sub_precision_gen.py"), str(out)],
-                       capture_output=True, text=True)
-    assert r.returncode == 0 and out.read_bytes() == subprec_gen.build_input() and len(out.read_bytes()) == 384
+def test_subprec_input_is_384_bytes():
+    assert len(subprec_gen.build_input()) == 384
 
 
 def test_no_kernel_touches_the_reserved_r8_as_scratch():
@@ -79,20 +76,18 @@ def test_kernel_assembles(char, tmp_path):
 
 # -- reading results --------------------------------------------------------------
 
-def test_read_outputs_takes_suite_tags_or_plain_files(tmp_path):
+def test_read_outputs_takes_suite_tags(tmp_path):
     C.generate(tmp_path)
     for tag, byte in (("r1", b"\x01"), ("e1", b"\x02")):
         p = S.output_path(tmp_path, tag, "vldb-4x")
         p.parent.mkdir(parents=True)
         p.write_bytes(byte * 4)
     assert C.read_outputs(["--suite", str(tmp_path), "r1", "e1"], "vldb-4x") == [b"\x01" * 4, b"\x02" * 4]
-    f = tmp_path / "x.bin"
-    f.write_bytes(b"abc")
-    assert C.read_outputs([str(f)], "vldb-4x") == [b"abc"]
     assert C.suite_input(["--suite", str(tmp_path), "r1"], "vldb-4x") == prng_bytes(256, 42)
-    assert C.suite_input([str(f)], "vldb-4x") is None
     with pytest.raises(SystemExit):
         C.read_outputs(["--suite", str(tmp_path)], "vldb-4x")
+    with pytest.raises(SystemExit):
+        C.read_outputs([str(tmp_path / "x.bin")], "vldb-4x")
 
 
 # -- analyzers ------------------------------------------------------------------------
@@ -127,7 +122,7 @@ def test_bf16_elemwise_recovers_the_index_pairs_and_verifies_the_cross_check(cap
     assert "Lane  3: A[ 6], A[ 7]" in text
 
 
-def test_subprec_reads_each_test_at_its_128_byte_slot(capsys):
+def test_subprec_reads_each_test_at_its_128_byte_slot(capsys, tmp_path):
     inp = subprec_gen.build_input()
     hw = bytearray(512)
     for t in range(4):
@@ -137,12 +132,14 @@ def test_subprec_reads_each_test_at_its_128_byte_slot(capsys):
     emu[1 * 128 + 2 * 15] ^= 0x01              # test 2, lane 15, high half: needs all 16 lanes read
     assert subprec_an.analyze_test(4, inp[128:256], bytes(hw[384:448]), bytes(emu[384:448]), "t") == 1
     capsys.readouterr()
-    import io
+    C.generate(tmp_path)
+    for tag, data in (("r1", hw), ("e1", emu)):
+        p = S.output_path(tmp_path, tag, "bf16-subprec")
+        p.parent.mkdir(parents=True)
+        p.write_bytes(bytes(data))
     old = sys.argv
     try:
-        d = Path(__import__("tempfile").mkdtemp())
-        (d / "i").write_bytes(inp); (d / "h").write_bytes(bytes(hw)); (d / "e").write_bytes(bytes(emu))
-        sys.argv = ["x", str(d / "i"), str(d / "h"), str(d / "e")]
+        sys.argv = ["x", "--suite", str(tmp_path), "r1", "e1"]
         assert subprec_an.main() == 2
     finally:
         sys.argv = old
@@ -171,7 +168,7 @@ def test_vldb_lut_prediction_cuts_the_row_and_zero_fills():
     assert out == list(struct.unpack("<2I", data[0x0E:0x10] + bytes(6)))
 
 
-def test_sparse_mac_expectations_and_compare(capsys):
+def test_sparse_mac_expectations_and_compare(capsys, tmp_path):
     ident = struct.pack("<32h", *[8] * 32)
     count = struct.pack("<32h", *([36] + [0] * 31))
     good = ident + count
@@ -181,9 +178,11 @@ def test_sparse_mac_expectations_and_compare(capsys):
     with pytest.raises(ValueError):
         smac.decode(good[:100])
     bad = ident + struct.pack("<32h", *([35] + [0] * 31))
-    import tempfile
-    d = Path(tempfile.mkdtemp())
-    (d / "a").write_bytes(good); (d / "b").write_bytes(bad)
-    assert smac.main([str(d / "a"), str(d / "b")]) == 1
+    C.generate(tmp_path)
+    for tag, data in (("a", good), ("b", bad)):
+        p = S.output_path(tmp_path, tag, "sparse-mac")
+        p.parent.mkdir(parents=True)
+        p.write_bytes(data)
+    assert smac.main(["--suite", str(tmp_path), "a", "b"]) == 1
     assert "lane  0: second=     35  first=     36" in capsys.readouterr().out
-    assert smac.main([str(d / "a")]) == 0
+    assert smac.main(["--suite", str(tmp_path), "a"]) == 0

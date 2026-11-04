@@ -2,8 +2,6 @@
 """Generate single-instruction test kernels from llvm-aie intrinsic definitions."""
 
 import argparse
-import json
-import os
 import re
 import sys
 from dataclasses import dataclass, asdict
@@ -311,51 +309,6 @@ def generate_kernel_cc(
     return "\n".join(lines)
 
 
-def generate_aie_mlir(in_size_bytes: int, out_size_bytes: int) -> str:
-    """Generate single-tile MLIR that wraps test_kernel via link_with.
-
-    Follows the pattern from add_one_func_link_with_chess/aie.mlir.
-    Buffer sizes are parameterized per intrinsic.
-    """
-    in_elems = max(1, in_size_bytes // 4)   # memref<Nxi32>
-    out_elems = max(1, out_size_bytes // 4)
-
-    return f"""\
-module {{
-  aie.device(npu1_1col) {{
-    %tile_0_0 = aie.tile(0, 0)
-    %tile_0_2 = aie.tile(0, 2)
-
-    aie.objectfifo @of_in(%tile_0_0, {{%tile_0_2}}, 2 : i32) : !aie.objectfifo<memref<{in_elems}xi32>>
-    aie.objectfifo @of_out(%tile_0_2, {{%tile_0_0}}, 2 : i32) : !aie.objectfifo<memref<{out_elems}xi32>>
-
-    func.func private @test_kernel(memref<{in_elems}xi32>, memref<{out_elems}xi32>) attributes {{link_with = "kernel.o"}}
-
-    aie.core(%tile_0_2) {{
-      %elem_in = aie.objectfifo.acquire @of_in(Consume, 1) : memref<{in_elems}xi32>
-      %elem_out = aie.objectfifo.acquire @of_out(Produce, 1) : memref<{out_elems}xi32>
-
-      func.call @test_kernel(%elem_in, %elem_out) : (memref<{in_elems}xi32>, memref<{out_elems}xi32>) -> ()
-
-      aie.objectfifo.release @of_in(Consume, 1)
-      aie.objectfifo.release @of_out(Produce, 1)
-      aie.end
-    }}
-
-    aie.runtime_sequence(%in : memref<{in_elems}xi32>, %buf : memref<{in_elems}xi32>, %out : memref<{out_elems}xi32>) {{
-      %c0 = arith.constant 0 : i64
-      %c1 = arith.constant 1 : i64
-      %c_in  = arith.constant {in_elems} : i64
-      %c_out = arith.constant {out_elems} : i64
-      aiex.npu.dma_memcpy_nd(%out[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c_out][%c0,%c0,%c0,%c1]) {{metadata = @of_out, id = 1 : i64}} : memref<{out_elems}xi32>
-      aiex.npu.dma_memcpy_nd(%in[%c0,%c0,%c0,%c0][%c1,%c1,%c1,%c_in][%c0,%c0,%c0,%c1])  {{metadata = @of_in,  id = 0 : i64, issue_token = true}} : memref<{in_elems}xi32>
-      aiex.npu.dma_wait {{symbol = @of_out}}
-    }}
-  }}
-}}
-"""
-
-
 def generate_test_host_cpp() -> str:
     """Generate the shared test_host.cpp.
 
@@ -582,58 +535,18 @@ def generate_suite(td_path: str, suite_dir: str, *, seed: int = 42) -> tuple[int
     return len(kernels), len(skipped)
 
 
-def generate_all(td_path: str, out_dir: str) -> tuple[list[GeneratedTest], list[SkippedIntrinsic]]:
-    """Legacy layout for scripts/instr-test.sh (kernel.cc + aie.mlir per test, test_host.cpp,
-    manifest.json). Superseded by `generate_suite`; goes away with that script."""
-    kernels, skipped = collect_kernels(td_path)
-    os.makedirs(out_dir, exist_ok=True)
-    for g, kernel_code in kernels:
-        test_dir = os.path.join(out_dir, g.name)
-        os.makedirs(test_dir, exist_ok=True)
-        Path(os.path.join(test_dir, "kernel.cc")).write_text(kernel_code)
-        Path(os.path.join(test_dir, "aie.mlir")).write_text(
-            generate_aie_mlir(g.in_size, g.out_size))
-    generated = [g for g, _ in kernels]
-
-    # Write shared test_host.cpp
-    host_code = generate_test_host_cpp()
-    Path(os.path.join(out_dir, "test_host.cpp")).write_text(host_code)
-
-    # Write manifest.json
-    manifest = {
-        "generated": [asdict(g) for g in generated],
-        "skipped": [asdict(s) for s in skipped],
-    }
-    Path(os.path.join(out_dir, "manifest.json")).write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
-
-    return generated, skipped
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate single-instruction test kernels from IntrinsicsAIE2.td")
+        description="Generate the single-instruction Peano test suite from IntrinsicsAIE2.td "
+                    "(run it with: python3 -m harness suite build|hw|emu|compare <dir>)")
     parser.add_argument("--td", required=True,
                         help="Path to IntrinsicsAIE2.td")
-    parser.add_argument("--out-dir", default="build/instr-tests",
-                        help="Output directory (default: build/instr-tests)")
-    parser.add_argument("--suite-dir",
-                        help="Write a harness suite here instead (python3 -m harness suite ...)")
-    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed for --suite-dir")
+    parser.add_argument("--suite-dir", required=True, help="Suite directory to write")
+    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed")
     args = parser.parse_args()
 
-    if args.suite_dir:
-        n, n_skipped = generate_suite(args.td, args.suite_dir, seed=args.seed)
-        print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
-        return
-
-    generated, skipped = generate_all(args.td, args.out_dir)
-
-    print(f"Generated: {len(generated)} tests")
-    print(f"Skipped:   {len(skipped)} intrinsics")
-    for s in skipped:
-        print(f"  SKIP {s.name}: {s.reason}")
+    n, n_skipped = generate_suite(args.td, args.suite_dir, seed=args.seed)
+    print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
 
 
 if __name__ == "__main__":

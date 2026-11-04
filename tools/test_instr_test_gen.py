@@ -27,10 +27,9 @@ from instr_test_gen import (
     map_llvm_type,
     classify_intrinsic,
     generate_kernel_cc,
-    generate_aie_mlir,
     generate_test_host_cpp,
-    generate_all,
     short_name,
+    collect_kernels,
 )
 
 # ---------------------------------------------------------------------------
@@ -258,36 +257,6 @@ def test_generate_kernel_accumulator_return():
 
 
 # ---------------------------------------------------------------------------
-# Task 4: MLIR template generator tests
-# ---------------------------------------------------------------------------
-
-def test_generate_mlir_basic():
-    """Single scalar arg, vector return."""
-    mlir = generate_aie_mlir(in_size_bytes=4, out_size_bytes=64)
-    # Must have proper MLIR structure
-    assert "aie.device(npu1_1col)" in mlir
-    assert "aie.tile(0, 0)" in mlir
-    assert "aie.tile(0, 2)" in mlir
-    assert '@test_kernel' in mlir
-    assert 'link_with = "kernel.o"' in mlir
-    assert "@of_in" in mlir
-    assert "@of_out" in mlir
-    assert "aie.objectfifo.acquire" in mlir
-    assert "aie.objectfifo.release" in mlir
-    assert "aiex.npu.dma_memcpy_nd" in mlir
-    assert "aiex.npu.dma_wait" in mlir
-
-def test_generate_mlir_buffer_sizes():
-    """Buffer sizes match argument types."""
-    # 128 bytes in (two v16int32), 64 bytes out (one v16int32)
-    mlir = generate_aie_mlir(in_size_bytes=128, out_size_bytes=64)
-    # Input fifo element: 128/4 = 32 i32s
-    assert "memref<32xi32>" in mlir
-    # Output fifo element: 64/4 = 16 i32s
-    assert "memref<16xi32>" in mlir
-
-
-# ---------------------------------------------------------------------------
 # Task 5: Host test harness generator tests
 # ---------------------------------------------------------------------------
 
@@ -391,11 +360,11 @@ def test_generate_kernel_no_stringh_without_sub4():
 
 
 # ---------------------------------------------------------------------------
-# Task 10: generate_all integration test
+# collect_kernels integration test
 # ---------------------------------------------------------------------------
 
-def test_generate_all_creates_expected_structure(tmp_path):
-    """Exercise generate_all() with a synthetic TD snippet."""
+def test_collect_kernels_splits_generated_and_skipped(tmp_path):
+    """Exercise collect_kernels() with a synthetic TD snippet."""
     td_content = """\
 class AIEV2VBCST32I512
      : DefaultAttrsIntrinsic<[llvm_v16i32_ty], [llvm_i32_ty], [IntrNoMem]>;
@@ -409,27 +378,14 @@ def int_aie2_event0 : ClangBuiltin<"__builtin_aiev2_event0">, AIE2EventIntrinsic
 """
     td_file = tmp_path / "test.td"
     td_file.write_text(td_content)
-    out_dir = tmp_path / "out"
 
-    generated, skipped = generate_all(str(td_file), str(out_dir))
+    kernels, skipped = collect_kernels(str(td_file))
 
     # One generatable intrinsic, one skipped (side effects)
-    assert len(generated) == 1
+    assert len(kernels) == 1
     assert len(skipped) == 1
-    assert generated[0].name == "vbroadcast32_I512"
-
-    # Directory structure
-    assert (out_dir / "vbroadcast32_I512" / "kernel.cc").exists()
-    assert (out_dir / "vbroadcast32_I512" / "aie.mlir").exists()
-    assert (out_dir / "test_host.cpp").exists()
-    assert (out_dir / "manifest.json").exists()
-
-    # Manifest is valid JSON with correct counts
-    import json
-    manifest = json.loads((out_dir / "manifest.json").read_text())
-    assert len(manifest["generated"]) == 1
-    assert len(manifest["skipped"]) == 1
-    assert manifest["generated"][0]["name"] == "vbroadcast32_I512"
+    assert kernels[0][0].name == "vbroadcast32_I512"
+    assert "__builtin_aiev2_vbroadcast32_I512" in kernels[0][1]
 
 
 # ---------------------------------------------------------------------------

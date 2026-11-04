@@ -10,16 +10,10 @@ The full pipeline:
   3. Combine stubs + clean source, walk AST with clang.cindex -> ChessIntrinsic
      records
   4. Classify each intrinsic (skip/generate)
-  5. Emit kernel.cc + aie.mlir per generated intrinsic
-
-The aie.mlir and test_host.cpp templates are shared with the Peano path --
-they are imported from instr-test-gen.py via importlib (the module name
-contains a hyphen, so a normal import statement cannot be used).
+  5. Emit one suite case (kernel .cc) per generated intrinsic via cxx_suite
 """
 
 import argparse
-import importlib
-import json
 import os
 import re
 import sys
@@ -35,11 +29,6 @@ if _clang_site.is_dir() and str(_clang_site) not in sys.path:
 
 import clang.cindex
 
-# Load the Peano generator to reuse generate_aie_mlir and generate_test_host_cpp.
-# The module name has a hyphen so we must use importlib rather than 'import'.
-_peano = importlib.import_module("instr-test-gen")
-generate_aie_mlir = _peano.generate_aie_mlir
-generate_test_host_cpp = _peano.generate_test_host_cpp
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +340,7 @@ def generate_chess_kernel_cc(
 
     The generated kernel follows the same input/output buffer convention as the
     Peano path (instr-test-gen.py:generate_kernel_cc) so that the same
-    test_host.cpp and aie.mlir can be reused:
+    suite host program and topology apply:
 
     - Input buffer: ``const int32_t *restrict in``
     - Output buffer: ``int32_t *restrict out``
@@ -572,39 +561,6 @@ def generate_suite(opns_path: str, types_path: str, suite_dir: str,
     return len(kernels), len(skipped)
 
 
-def generate_all(
-    opns_path: str,
-    types_path: str,
-    out_dir: str,
-    iss_types_path: str | None = None,
-) -> tuple[list[GeneratedChessTest], list[SkippedChessIntrinsic]]:
-    """Legacy layout for scripts/instr-test.sh --chess (kernel.cc + aie.mlir per test,
-    test_host.cpp, manifest.json). Superseded by `generate_suite`; goes away with that script."""
-    kernels, skipped = collect_chess_kernels(opns_path, types_path, iss_types_path)
-    os.makedirs(out_dir, exist_ok=True)
-    for g, kernel_code in kernels:
-        test_dir = os.path.join(out_dir, g.name)
-        os.makedirs(test_dir, exist_ok=True)
-        Path(os.path.join(test_dir, "kernel.cc")).write_text(kernel_code)
-        Path(os.path.join(test_dir, "aie.mlir")).write_text(
-            generate_aie_mlir(g.in_size, g.out_size))
-    generated = [g for g, _ in kernels]
-
-    # Write shared test_host.cpp (identical to Peano path).
-    Path(os.path.join(out_dir, "test_host.cpp")).write_text(generate_test_host_cpp())
-
-    # Write manifest.json.
-    manifest = {
-        "generated": [asdict(g) for g in generated],
-        "skipped": [asdict(s) for s in skipped],
-    }
-    Path(os.path.join(out_dir, "manifest.json")).write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
-
-    return generated, skipped
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -628,29 +584,13 @@ def main() -> None:
         default=None,
         help="Path to me_iss_types.h for additional ISS type coverage (optional)",
     )
-    parser.add_argument(
-        "--out-dir",
-        default="build/chess-instr-tests",
-        help="Output directory (default: %(default)s)",
-    )
-    parser.add_argument("--suite-dir",
-                        help="Write a harness suite here instead (python3 -m harness suite ...)")
-    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed for --suite-dir")
+    parser.add_argument("--suite-dir", required=True, help="Suite directory to write")
+    parser.add_argument("--seed", type=int, default=42, help="input PRNG seed")
     args = parser.parse_args()
 
-    if args.suite_dir:
-        n, n_skipped = generate_suite(args.opns_header, args.types_header, args.suite_dir,
-                                      iss_types_path=args.iss_types_header, seed=args.seed)
-        print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
-        return
-
-    generated, skipped = generate_all(
-        args.opns_header, args.types_header, args.out_dir,
-        iss_types_path=args.iss_types_header,
-    )
-
-    print(f"Generated: {len(generated)} tests")
-    print(f"Skipped:   {len(skipped)} intrinsics")
+    n, n_skipped = generate_suite(args.opns_header, args.types_header, args.suite_dir,
+                                  iss_types_path=args.iss_types_header, seed=args.seed)
+    print(f"Suite {args.suite_dir}: {n} cases, {n_skipped} intrinsics skipped")
 
 
 if __name__ == "__main__":

@@ -129,25 +129,3 @@ def build_input() -> bytes:
         output += pack_bf16_register(x0)
         output += pack_bf16_register(x2)
     return bytes(output)
-
-
-def main():
-    out_path = sys.argv[1] if len(sys.argv) > 1 else 'input.bin'
-    output = build_input()
-    with open(out_path, 'wb') as f:
-        f.write(output)
-
-    print(f"Generated {len(output)} bytes ({len(output)//128} test vectors) -> {out_path}")
-
-    for i, (x0, x2) in enumerate(vectors()):
-        print(f"\nTest {i+1}:")
-        print(f"  x0[0:7] = {[f'0x{v:04X}' for v in x0[:8]]}")
-        print(f"  x2[0:7] = {[f'0x{v:04X}' for v in x2[:8]]}")
-        # Dense lane (0,0): A[0..7] dot B[0,4,8,...,28]
-        b_indices = [k * 4 for k in range(8)]
-        print(f"  Lane(0,0) A: {[f'0x{v:04X}' for v in x0[:8]]}")
-        print(f"  Lane(0,0) B: {[f'0x{x2[j]:04X}' for j in b_indices]}")
-
-
-if __name__ == '__main__':
-    main()

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Analyze the sparse MAC probe (sparse-mac-probe.s).
 
-    python3 tests/sparse-mac-analyze.py <output.bin> [<output2.bin>]
     python3 tests/sparse-mac-analyze.py --suite <suite_dir> <tag> [<tag2>]
 
 Output: 2 tests x 64 bytes, each 32 x int16 (SRS shift 0 of the accumulator, i16xi8 sparse

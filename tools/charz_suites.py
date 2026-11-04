@@ -102,22 +102,17 @@ def generate(suite_dir: str | Path) -> None:
 def read_outputs(argv: list[str], case: str) -> list[bytes]:
     """The result files an analyzer was asked about.
 
-    `--suite DIR TAG [TAG2 ...]` reads the case's output of each tag from the runner's
-    layout; otherwise the arguments are plain result files (any run of the kernel).
+    `--suite DIR TAG [TAG2 ...]` reads the case's output of each tag from the runner's layout.
     """
-    if argv and argv[0] == "--suite":
-        if len(argv) < 3:
-            raise SystemExit("usage: --suite <suite_dir> <tag> [<tag> ...]")
-        suite = S.load_suite(argv[1])
-        return [suite.output(t, case).read_bytes() for t in argv[2:]]
-    return [Path(a).read_bytes() for a in argv]
+    if len(argv) < 3 or argv[0] != "--suite":
+        raise SystemExit("usage: --suite <suite_dir> <tag> [<tag> ...]")
+    suite = S.load_suite(argv[1])
+    return [suite.output(t, case).read_bytes() for t in argv[2:]]
 
 
-def suite_input(argv: list[str], case: str) -> bytes | None:
-    """The case's input buffer when `argv` is in `--suite` form, else None."""
-    if argv and argv[0] == "--suite":
-        return S.load_suite(argv[1]).topology(case).cores[0].args[0].data
-    return None
+def suite_input(argv: list[str], case: str) -> bytes:
+    """The case's input buffer, for `argv` in `--suite` form."""
+    return S.load_suite(argv[1]).topology(case).cores[0].args[0].data
 
 
 if __name__ == "__main__":

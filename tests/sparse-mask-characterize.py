@@ -29,11 +29,6 @@ from charz_suites import read_outputs  # noqa: E402
 CASE = "sparse-mask"
 
 
-def analyze(path: str, label: str):
-    with open(path, "rb") as f:
-        report(f.read(), label)
-
-
 def active_inner_positions(data: bytes) -> list[list[int]]:
     """Per mask pattern 0..15, the active inner positions of each of the 8 columns (row 0).
 
@@ -84,23 +79,9 @@ def report(data: bytes, label: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Sparse mask characterization")
-    parser.add_argument("--gen-input", metavar="PATH",
-                        help="(No longer needed -- kernel is self-contained)")
-    parser.add_argument("--analyze-hw", metavar="PATH", help="Analyze HW output")
-    parser.add_argument("--analyze-emu", metavar="PATH", help="Analyze EMU output")
-    parser.add_argument("--suite", nargs="+", metavar=("DIR", "TAG"),
+    parser.add_argument("--suite", nargs="+", metavar=("DIR", "TAG"), required=True,
                         help="tools/charz_suites.py suite dir followed by the run tag(s) to analyze")
     args = parser.parse_args()
 
-    if args.suite:
-        for tag, data in zip(args.suite[1:], read_outputs(["--suite", *args.suite], CASE)):
-            report(data, tag)
-
-    if args.gen_input:
-        print("Input generation no longer needed (kernel constructs data internally)")
-    if args.analyze_hw:
-        analyze(args.analyze_hw, "Hardware")
-    if args.analyze_emu:
-        analyze(args.analyze_emu, "Emulator")
-    if not any([args.gen_input, args.analyze_hw, args.analyze_emu, args.suite]):
-        parser.print_help()
+    for tag, data in zip(args.suite[1:], read_outputs(["--suite", *args.suite], CASE)):
+        report(data, tag)

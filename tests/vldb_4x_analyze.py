@@ -2,7 +2,6 @@
 """Analyze VLDB_4x characterizer output.
 
 Usage:
-    python3 tests/vldb_4x_analyze.py <hw_output.bin> [emu_output.bin]
     python3 tests/vldb_4x_analyze.py --suite <suite_dir> <hw_tag> [emu_tag]
 
 The characterizer (vldb_4x_characterizer.s) writes 8 test results to the

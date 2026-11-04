@@ -100,14 +100,11 @@ def input_offset(test: int) -> int:
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} input.bin hw_output.bin emu_output.bin\n"
-              f"       {sys.argv[0]} --suite <suite_dir> <hw_tag> <emu_tag>")
+        print(f"Usage: {sys.argv[0]} --suite <suite_dir> <hw_tag> <emu_tag>")
         sys.exit(1)
 
     input_data = suite_input(sys.argv[1:], CASE)
-    outs = read_outputs(sys.argv[1:] if input_data is not None else sys.argv[2:], CASE)
-    if input_data is None:
-        input_data = Path(sys.argv[1]).read_bytes()
+    outs = read_outputs(sys.argv[1:], CASE)
     hw_output, emu_output = outs[0], outs[1]
 
     print(f"Input:  {len(input_data)} bytes")

@@ -2,9 +2,8 @@
 """Analyze bf16 element-wise characterizer output.
 
 Usage:
-    python3 tests/bf16_elemwise_analyze.py <hw_output.bin> [emu_output.bin]
     python3 tests/bf16_elemwise_analyze.py --suite <suite_dir> <hw_tag> [emu_tag]
-(the suite form reads runs/<tag>/bf16-elemwise/core.out.bin of a tools/charz_suites.py suite)
+(reads runs/<tag>/bf16-elemwise/core.out.bin of a tools/charz_suites.py suite)
 
 Decodes the output from bf16_elemwise_characterizer.s to determine
 the A-side and B-side element permutation for variant=1 (config=0x3d)
