@@ -62,13 +62,13 @@ def run_checker(obj):
 
 def check(d):
     s = suite.load_suite(d)
-    manifest = s.manifest()
     bad = []
     stats = {"pair": [0, 0], "control": [0, 0], "ref": [0, 0]}
     flagged_units = {}
-    for k in manifest["kernels"]:
-        owners = bundle_owners(s.kernel_source(k["name"]))
-        nb, cols = run_checker(s.kernel_object(k["name"]))
+    for k in s.case_entries():
+        core = s.topology(k["name"]).cores[0]
+        owners = bundle_owners(core.source)
+        nb, cols = run_checker(s.core_object(k["name"], core))
         assert 0 <= nb - len(owners) <= 2, (k["name"], nb, len(owners))
         by_point = {}
         for c in cols:
@@ -129,15 +129,14 @@ def ref_key(kind, ins_key, r, dom):
 
 
 def load_points(d, tag):
-    """(manifest, points by id with their record bytes)"""
+    """points by id with their record bytes"""
     s = suite.load_suite(d)
-    manifest = s.manifest()
     pts = {}
-    for k in manifest["kernels"]:
+    for k in s.case_entries():
         data = s.output(tag, k["name"]).read_bytes()
         for i, p in enumerate(k["points"]):
             pts[p["id"]] = (p, data[i * REC:(i + 1) * REC], k["dom"])
-    return manifest, pts
+    return pts
 
 
 def own_output(p, ins, r, rec, slot):
@@ -150,8 +149,8 @@ def own_output(p, ins, r, rec, slot):
 
 
 def classify(d, hw_tag, emu_tag=None):
-    manifest, hw = load_points(d, hw_tag)
-    emu = load_points(d, emu_tag)[1] if emu_tag else None
+    hw = load_points(d, hw_tag)
+    emu = load_points(d, emu_tag) if emu_tag else None
     refs = {}
     for pid, (p, rec, dom) in hw.items():
         if p["kind"].startswith("ref"):

@@ -140,17 +140,8 @@ class Suite:
         """Each case's `case.json` with its `name`, in suite order (what a probe analyzer iterates)."""
         return [{"name": c, **self.case_meta(c)} for c in self.cases]
 
-    def manifest(self) -> dict[str, Any]:
-        """Probe-analyzer view: the suite `meta` plus `kernels` = every case's `case.json` with its name."""
-        return {**self.meta, "kernels": self.case_entries()}
-
-    def kernel_source(self, case: str) -> Path:
-        """The first (for probes: only) core's source file."""
-        return self.topology(case).cores[0].source
-
-    def kernel_object(self, case: str) -> Path:
-        """The first core's built object, once `suite build` has run."""
-        core = self.topology(case).cores[0]
+    def core_object(self, case: str, core: Core) -> Path:
+        """The core's built object, once `suite build` has run."""
         return pkg_dir(self.path, case) / "phase_0" / kernel_object(core)
 
     def output(self, tag: str, case: str) -> Path:

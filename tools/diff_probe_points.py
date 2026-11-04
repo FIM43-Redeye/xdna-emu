@@ -26,10 +26,9 @@ def main():
     a = ap.parse_args()
     d = os.path.abspath(a.dir)
     s = suite.load_suite(d)
-    m = s.manifest()
-    rec = m.get("record_bytes", 320)
+    rec = s.meta.get("record_bytes", 320)
     tot, bad = collections.Counter(), collections.Counter()
-    for k in m["kernels"]:
+    for k in s.case_entries():
         hw = s.output(a.hw, k["name"]).read_bytes()
         try:
             emu = s.output(a.emu, k["name"]).read_bytes()

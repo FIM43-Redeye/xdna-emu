@@ -62,13 +62,13 @@ def main(argv=None):
     args = ap.parse_args(argv)
     d = os.path.abspath(args.dir)
     s = suite.load_suite(d)
-    manifest = s.manifest()
     flagged, differing, cross = {}, {}, []
     total = 0
-    for k in manifest["kernels"]:
+    for k in s.case_entries():
         name = k["name"]
-        owner = bundle_points(s.kernel_source(name))
-        out = subprocess.run([CHECKER, "elf", s.kernel_object(name)],
+        core = s.topology(name).cores[0]
+        owner = bundle_points(core.source)
+        out = subprocess.run([CHECKER, "elf", s.core_object(name, core)],
                              capture_output=True, text=True, check=True).stdout
         head = out.splitlines()[0]
         nb = int(re.search(r"bundles (\d+)", head).group(1))

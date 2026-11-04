@@ -136,10 +136,10 @@ def main(argv=None):
     ap.add_argument("--compare", metavar="TAG", help="compare the thresholds with another run, e.g. the emulator")
     args = ap.parse_args(argv)
     d = os.path.abspath(args.dir)
-    m = suite.load_suite(d).manifest()
-    pairs = group_pairs(m["kernels"], args.tag, d)
+    kernels = suite.load_suite(d).case_entries()
+    pairs = group_pairs(kernels, args.tag, d)
     if args.compare:
-        return compare(pairs, group_pairs(m["kernels"], args.compare, d), args.tag, args.compare)
+        return compare(pairs, group_pairs(kernels, args.compare, d), args.tag, args.compare)
     out = {}
     for (p, c), pts in pairs.items():
         res = analyze_pair(pts)
