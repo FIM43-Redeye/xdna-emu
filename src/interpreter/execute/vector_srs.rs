@@ -71,13 +71,7 @@ pub fn srs_lane(
 ) -> i64 {
     debug_assert!((1..=64).contains(&output_bits));
     let rounded = shift_round(value as i128, shift, mode);
-
-    let (min, max) = if signed_output {
-        let min = -(1i128 << (output_bits - 1));
-        (if symmetric_saturate { min + 1 } else { min }, (1i128 << (output_bits - 1)) - 1)
-    } else {
-        (0, (1i128 << output_bits) - 1)
-    };
+    let (min, max) = srs_range(signed_output, output_bits, symmetric_saturate);
 
     if saturate {
         return rounded.clamp(min, max) as i64;
@@ -89,6 +83,55 @@ pub fn srs_lane(
         (low_bits - (1i128 << output_bits)) as i64
     } else {
         low_bits as i64
+    }
+}
+
+/// The output range of an SRS lane: the symmetric modes drop the signed minimum.
+fn srs_range(signed_output: bool, output_bits: u32, symmetric: bool) -> (i128, i128) {
+    if signed_output {
+        let min = -(1i128 << (output_bits - 1));
+        (if symmetric { min + 1 } else { min }, (1i128 << (output_bits - 1)) - 1)
+    } else {
+        (0, (1i128 << output_bits) - 1)
+    }
+}
+
+/// Whether an SRS lane raises `srSRS_of`: its shifted and rounded value lies outside the
+/// output range, whether or not crSat clamps it (silicon, satflags probe suite). The range of
+/// the symmetric modes excludes the signed minimum.
+pub fn srs_lane_overflows(
+    value: i64,
+    shift: u32,
+    signed_output: bool,
+    output_bits: u32,
+    symmetric: bool,
+    mode: RoundingMode,
+) -> bool {
+    let (min, max) = srs_range(signed_output, output_bits, symmetric);
+    !(min..=max).contains(&shift_round(value as i128, shift, mode))
+}
+
+/// Whether any integer lane of an SRS of `acc` (one 512-bit half) raises `srSRS_of`: 16
+/// 32-bit lanes (two per word) or 8 64-bit ones, as `vector_srs_from_acc` converts them.
+/// Floating-point outputs never do.
+pub fn srs_overflows(
+    acc: &[u64; 8],
+    shift: u32,
+    from: ElementType,
+    to: ElementType,
+    cfg: &SrsConfig,
+) -> bool {
+    if matches!(to, ElementType::BFloat16 | ElementType::Float32) {
+        return false;
+    }
+    let mode = RoundingMode::from_raw(cfg.rounding_mode).unwrap_or(RoundingMode::PosInf);
+    let (signed, bits, sym) = (to.is_signed(), to.bits() as u32, cfg.symmetric_saturate());
+    let over = |v: i64| srs_lane_overflows(v, shift, signed, bits.min(32), sym, mode);
+    if from.bits() >= 64 {
+        acc.iter().any(|w| over(*w as i64))
+    } else {
+        acc.iter()
+            .any(|w| over(*w as u32 as i32 as i64) || over((*w >> 32) as u32 as i32 as i64))
     }
 }
 
@@ -196,7 +239,8 @@ impl VectorAlu {
         let acc_reg = Self::get_acc_source(op);
         let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int32);
-        let result = Self::vector_srs(ctx, acc_reg, shift, from, et);
+        let acc = ctx.accumulator.read(acc_reg);
+        let result = Self::srs_flagged(ctx, &acc, shift, from, et);
         Self::write_vector_dest(op, ctx, result);
         true
     }
@@ -217,8 +261,8 @@ impl VectorAlu {
             let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
             let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
 
-            let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
-            let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
+            let result_lo = Self::srs_flagged(ctx, &acc_lo, shift, from, et);
+            let result_hi = Self::srs_flagged(ctx, &acc_hi, shift, from, et);
 
             // Pack the two halves contiguously. For reduction SRS
             // (e.g., s8 from s32, s16 from s64), each half only fills
@@ -255,25 +299,26 @@ impl VectorAlu {
             // SRS 8 lanes, write to 256-bit w-register.
             let (from, et) = ctx.srs_mode_override(op.slot as u8).unwrap_or((from, et));
             let acc = ctx.accumulator.read(acc_reg);
-            let result = Self::vector_srs_from_acc(&acc, shift, from, et, &ctx.srs_config);
+            let result = Self::srs_flagged(ctx, &acc, shift, from, et);
             Self::write_vector_dest(op, ctx, result);
         }
         true
     }
 
-    /// Shift-Round-Saturate: convert accumulator lanes to narrower vector output.
-    ///
-    /// Thin wrapper that reads the accumulator register and delegates to
-    /// `vector_srs_from_acc` for the actual conversion logic.
-    fn vector_srs(
-        ctx: &ExecutionContext,
-        acc_reg: u8,
+    /// SRS of one 512-bit accumulator half that also raises `srSRS_of` when a lane overflows
+    /// (visible `SRS_OF_VISIBLE_AT` bundles after the issue; see `status_flags`).
+    pub(crate) fn srs_flagged(
+        ctx: &mut ExecutionContext,
+        acc: &[u64; 8],
         shift: u32,
-        from_type: ElementType,
-        to_type: ElementType,
+        from: ElementType,
+        to: ElementType,
     ) -> [u32; 8] {
-        let acc = ctx.accumulator.read(acc_reg);
-        Self::vector_srs_from_acc(&acc, shift, from_type, to_type, &ctx.srs_config)
+        if srs_overflows(acc, shift, from, to, &ctx.srs_config) {
+            let at = ctx.bundle_seq + super::status_flags::SRS_OF_VISIBLE_AT;
+            ctx.raise_status_flag(crate::interpreter::state::SRS_OF_REG_INDEX, at);
+        }
+        Self::vector_srs_from_acc(acc, shift, from, to, &ctx.srs_config)
     }
 
     /// Core SRS logic operating on accumulator data directly.
@@ -291,7 +336,7 @@ impl VectorAlu {
     /// Float types (BFloat16, Float32) are handled inline since they bypass
     /// the integer rounding pipeline.
     ///
-    /// Used by the narrow `vector_srs`, wide SRS handler, and fused `vst.srs`.
+    /// Used by the SRS handlers (through `srs_flagged`) and the fused `vst.srs`.
     pub(crate) fn vector_srs_from_acc(
         acc: &[u64; 8],
         shift: u32,
@@ -819,6 +864,32 @@ mod lane_tests {
         assert_eq!(srs16(-40000, true, true), -32767);
         assert_eq!(srs16(-32768, true, true), -32767);
         assert_eq!(srs16(-32767, true, true), -32767);
+    }
+
+    /// srSRS_of: outside the output range after the shift and rounding, before any clamp.
+    #[test]
+    fn a_lane_overflows_when_its_rounded_value_leaves_the_output_range() {
+        assert!(!srs_lane_overflows(32767, 0, true, 16, false, Floor));
+        assert!(srs_lane_overflows(32768, 0, true, 16, false, Floor));
+        assert!(!srs_lane_overflows(-32768, 0, true, 16, false, Floor));
+        assert!(srs_lane_overflows(-32768, 0, true, 16, true, Floor), "symmetric range");
+        assert!(srs_lane_overflows(-1, 0, false, 8, false, Floor), "unsigned");
+        assert!(!srs_lane_overflows(255, 0, false, 8, false, Floor));
+        // 0x7fff8 >> 4 is 0x7fff; rounding half up carries it to 0x8000.
+        assert!(!srs_lane_overflows(0x7fff8, 4, true, 16, false, Floor));
+        assert!(srs_lane_overflows(0x7fff8, 4, true, 16, false, PosInf));
+        // Lane selection: a 64-bit half has 8 lanes, a 32-bit one 16 (two per word).
+        let cfg = SrsConfig::default();
+        let mut acc = [0u64; 8];
+        acc[7] = 0x1_0000_0000;
+        assert!(srs_overflows(&acc, 0, ElementType::Int64, ElementType::Int32, &cfg));
+        assert!(
+            !srs_overflows(&acc, 0, ElementType::Int32, ElementType::Int16, &cfg),
+            "high word is lane 15 = 1"
+        );
+        acc[7] = 0x8000_0000_0000;
+        assert!(srs_overflows(&acc, 0, ElementType::Int32, ElementType::Int16, &cfg));
+        assert!(!srs_overflows(&acc, 0, ElementType::Int32, ElementType::BFloat16, &cfg));
     }
 
     #[test]

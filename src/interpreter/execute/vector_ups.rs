@@ -96,21 +96,9 @@ pub fn ups_lane_signed(
     saturate: bool,
     signed_input: bool,
 ) -> i64 {
-    // Extend input to its declared width.
-    let extended = if signed_input {
-        truncate(value, bits_in)
-    } else {
-        // Zero-extend: mask to bits_in width without sign extension.
-        if bits_in >= 64 {
-            value
-        } else {
-            value & ((1i64 << bits_in) - 1)
-        }
-    };
-
-    // Left-shift for scaling into the wider accumulator, exactly: the 6-bit shift register
-    // takes a 32-bit lane up to 2^95, past i64.
-    let shifted = (extended as i128) << shift.min(63);
+    // Extend the input to its declared width and shift it into the wider accumulator, exactly:
+    // the 6-bit shift register takes a 32-bit lane up to 2^95, past i64.
+    let shifted = ups_shifted(value, shift, bits_in, signed_input);
 
     // Optional saturation to the signed range of the output lane (silicon, dynsign probes:
     // any nonzero crSat clamps, and never symmetrically).
@@ -123,6 +111,35 @@ pub fn ups_lane_signed(
 
     // Truncate to output width with sign extension.
     truncate(saturated, bits_out)
+}
+
+/// The UPS lane value before any clamp: `value` extended per `signed_input`, shifted exactly.
+fn ups_shifted(value: i64, shift: u32, bits_in: u32, signed_input: bool) -> i128 {
+    let extended = if signed_input {
+        truncate(value, bits_in)
+    } else if bits_in >= 64 {
+        value
+    } else {
+        value & ((1i64 << bits_in) - 1)
+    };
+    (extended as i128) << shift.min(63)
+}
+
+/// Whether a UPS lane raises `srUPS_of`: its shifted value lies outside the signed range of
+/// the accumulator lane, whether or not crSat clamps it (silicon, satflags probe suite).
+pub fn ups_lane_overflows(value: i64, shift: u32, bits_in: u32, bits_out: u32, signed_input: bool) -> bool {
+    let v = ups_shifted(value, shift, bits_in, signed_input);
+    !(-(1i128 << (bits_out - 1))..=(1i128 << (bits_out - 1)) - 1).contains(&v)
+}
+
+/// Whether any lane of a UPS of the 256-bit `src` raises `srUPS_of`. The lanes converted are
+/// those that fit the destination: a 512-bit `bm` half, or a 1024-bit `cm` (`wide`, w2c).
+pub fn ups_overflows(src: &[u32; 8], shift: u32, from: ElementType, to: ElementType, wide: bool) -> bool {
+    let (bits_in, bits_out) = (from.bits() as u32, to.bits() as u32);
+    let lanes = (256 / bits_in).min(if wide { 1024 } else { 512 } / bits_out);
+    (0..lanes).any(|i| {
+        ups_lane_overflows(extract_lane(src, i, bits_in), shift, bits_in, bits_out, from.is_signed())
+    })
 }
 
 /// Extract lane `index` from a packed 256-bit vector represented as `[u32; 8]`.
@@ -371,12 +388,29 @@ impl VectorAlu {
         (from, ctx.srs_config.saturation_mode != 0)
     }
 
+    /// Raise `srUPS_of` if a lane of this UPS overflows: visible at the instruction's
+    /// accumulator result cycle (see `status_flags`).
+    pub(crate) fn raise_ups_of(
+        ctx: &mut ExecutionContext,
+        src: &[u32; 8],
+        shift: u32,
+        from: ElementType,
+        to: ElementType,
+        wide: bool,
+    ) {
+        if ups_overflows(src, shift, from, to, wide) {
+            let at = ctx.bundle_seq + ctx.result_latency as u64;
+            ctx.raise_status_flag(crate::interpreter::state::UPS_OF_REG_INDEX, at);
+        }
+    }
+
     /// Narrow UPS path: widen narrow vector lanes into 512-bit accumulator.
     fn execute_ups_narrow(op: &SlotOp, ctx: &mut ExecutionContext, et: ElementType) -> bool {
         let src = Self::get_vector_source(op, ctx, 0);
         let shift = Self::get_shift_amount(op, ctx);
         let (from, saturate) = Self::ups_source_type_and_saturation(op, ctx);
         let acc_result = ups_vector_to_acc(&src, shift, from, et, saturate);
+        Self::raise_ups_of(ctx, &src, shift, from, et, false);
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
                 Self::queue_ups_acc_write(ctx, *r, &acc_result);
@@ -414,6 +448,7 @@ impl VectorAlu {
                 // w2c path: narrow source (256-bit wl) fills full
                 // 1024-bit cm register via 4:1 upshift.
                 let src = Self::get_vector_source(op, ctx, 0);
+                Self::raise_ups_of(ctx, &src, shift, from, et, true);
                 ups_vector_to_acc_wide(&src, shift, from, et, saturate)
             } else {
                 // x2c path: wide source (512-bit x-reg), UPS each half.
@@ -422,6 +457,8 @@ impl VectorAlu {
                 let src_hi: [u32; 8] = src[8..].try_into().unwrap();
                 let acc_lo = ups_vector_to_acc(&src_lo, shift, from, et, saturate);
                 let acc_hi = ups_vector_to_acc(&src_hi, shift, from, et, saturate);
+                Self::raise_ups_of(ctx, &src_lo, shift, from, et, false);
+                Self::raise_ups_of(ctx, &src_hi, shift, from, et, false);
                 let mut wide = [0u64; 16];
                 wide[..8].copy_from_slice(&acc_lo);
                 wide[8..].copy_from_slice(&acc_hi);
@@ -445,6 +482,7 @@ impl VectorAlu {
             // accum register.
             let src = Self::get_vector_source(op, ctx, 0);
             let acc_result = ups_vector_to_acc(&src, shift, from, et, saturate);
+            Self::raise_ups_of(ctx, &src, shift, from, et, false);
             match &op.dest {
                 Some(Operand::AccumReg(r)) => {
                     Self::queue_ups_acc_write(ctx, *r, &acc_result);
@@ -464,6 +502,25 @@ impl VectorAlu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// srUPS_of: the shifted lane leaves the signed accumulator range, whatever crSat does.
+    #[test]
+    fn a_ups_lane_overflows_past_the_signed_accumulator_range() {
+        assert!(!ups_lane_overflows(0x8000, 16, 16, 32, true), "-32768 << 16 fits");
+        assert!(ups_lane_overflows(0x8000, 16, 16, 32, false), "32768 << 16 does not");
+        assert!(!ups_lane_overflows(0x7fff, 16, 16, 32, false));
+        assert!(ups_lane_overflows(1, 63, 32, 64, true), "the 6-bit shift past the lane");
+        let mut src = [0u32; 8];
+        src[7] = 0x8000_0000; // lane 15 of 16-bit lanes, lane 7 of 32-bit lanes
+        assert!(ups_overflows(&src, 16, ElementType::UInt16, ElementType::Int32, false));
+        assert!(!ups_overflows(&src, 16, ElementType::Int16, ElementType::Int32, false));
+        // A bm half takes 8 64-bit lanes of a 32-bit source; a cm takes the same 8.
+        assert!(ups_overflows(&src, 32, ElementType::UInt32, ElementType::Int64, false));
+        src[7] = 0;
+        src[5] = 0x80; // byte lane 20 (of 32): converted only by the 1024-bit w2c form
+        assert!(!ups_overflows(&src, 24, ElementType::UInt8, ElementType::Int32, false));
+        assert!(ups_overflows(&src, 24, ElementType::UInt8, ElementType::Int32, true));
+    }
 
     // -- sign_extend tests --
 

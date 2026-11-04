@@ -265,7 +265,7 @@ pub struct PendingAccAdd {
     pub acc_read: Option<crate::interpreter::bundle::AccReadPort>,
 }
 
-/// A deferred fused `vlda.ups` awaiting its stage-7 shift-register read.
+/// A deferred fused `vlda.ups` awaiting its stage-7 register reads.
 ///
 /// II_VLDA_UPS (AIE2Schedule.td) reads its shift S-register at operand
 /// cycle 7, not at issue (OperandCycles `[9,7,1,1,...]`: acc dest at 9,
@@ -274,13 +274,14 @@ pub struct PendingAccAdd {
 /// AFTER the vlda.ups it controls. Sampling at issue read the stale shift
 /// (verified against NPU1 silicon, vector fuzzer seeds 1142-1448: upshift
 /// modes 1-7 produced the unshifted input). The load data, destination, and
-/// element types are resolved at issue; only the shift amount is sampled at
-/// issue+6, one bundle before the cycle-7 boundary (same rationale as
-/// PendingUnpack). The `d` forms read crUPSSign at the same operand cycle 7,
-/// and every form reads crSat at operand cycle 8 (`[9,7,1,1,/*srUPS_of*/8,
-/// /*crSat*/8,/*crUPSSign*/7]`): Chess and Peano both write crUPSSign and
-/// crSat in the load's shadow, after the vlda.ups. Plain register II_VUPS
-/// reads its shift, sign and crSat at issue and is not deferred.
+/// element types are resolved at issue; the shift, crUPSSign (a `d` form) and
+/// crSat are sampled at issue+6, one bundle before the cycle-7 boundary (same
+/// rationale as PendingUnpack). Silicon pins all three to the same bundle
+/// (satflags upsread probe, every addressing mode: a write issued 5 bundles
+/// after the load is seen, one issued 6 bundles after is not), although the
+/// itinerary puts crSat a cycle later (`/*crSat*/8`). Chess and Peano write
+/// them in the load's shadow. Plain register II_VUPS reads its shift, sign and
+/// crSat at issue and is not deferred.
 #[derive(Debug, Clone)]
 pub struct PendingUpsLoad {
     /// Vector data loaded from memory at issue.
@@ -293,32 +294,24 @@ pub struct PendingUpsLoad {
     pub from: xdna_archspec::aie2::isa::ElementType,
     /// Sign control register of a `d` form (crUPSSign), sampled with the shift.
     pub sign_reg: Option<u8>,
-    /// Shift amount and resolved input type, once sampled at `ready_bundle`.
-    pub sampled: Option<(u32, xdna_archspec::aie2::isa::ElementType)>,
-    /// Issued-bundle count at which crSat is read (operand cycle 8).
-    pub sat_bundle: u64,
     /// Output (accumulator lane) element type.
     pub to: xdna_archspec::aie2::isa::ElementType,
     /// Half (bml/bmh, 512-bit) vs full cm (1024-bit) destination.
     pub is_half: bool,
     /// Issue bundle, accumulator result operand cycle and result bypass class of the instruction:
-    /// the converted accumulator is timed from the issue, not from the shift read.
+    /// the converted accumulator is timed from the issue, not from the register reads.
     pub issue_bundle: u64,
     pub l_def: u8,
     pub def_bypass: Bypass,
-    /// Issued-bundle count at which the shift register is read.
+    /// Issued-bundle count at which the shift, sign and crSat are read.
     pub ready_bundle: u64,
     /// Write tag of the instruction, restored when the destination is queued.
     pub tag: Option<WriteTag>,
 }
 
-/// VLDA.UPS shift-register read latency in issued bundles (operand cycle 7,
-/// sampled one bundle before the boundary; see PendingUpsLoad).
-const VLDA_UPS_SHIFT_READ_LATENCY: u64 = 6;
-
-/// VLDA.UPS crSat read latency in issued bundles (operand cycle 8, sampled one
+/// VLDA.UPS register read latency in issued bundles (operand cycle 7, sampled one
 /// bundle before the boundary; see PendingUpsLoad).
-const VLDA_UPS_SAT_READ_LATENCY: u64 = 7;
+const VLDA_UPS_READ_LATENCY: u64 = 6;
 
 /// Maximum loop-body byte span for which the LE-bundle partial-word store is
 /// flushed on the zero-overhead-loop back-edge.
@@ -517,6 +510,10 @@ pub struct ExecutionContext {
     /// (see PendingUpsLoad).
     pending_ups_loads: Vec<PendingUpsLoad>,
 
+    /// Overflow status flags raised by a conversion and not yet visible: (status register
+    /// index, issued-bundle count from which a reader sees it). See execute::status_flags.
+    pending_status_flags: Vec<(u8, u64)>,
+
     // === Vector Control Registers ===
     /// SRS/UPS control register state.
     ///
@@ -642,6 +639,10 @@ impl ExecutionContext {
         // The stream status registers read 0 before any stream access (silicon).
         scalar.write(super::registers::SS_STATUS_REG_INDEX, 0);
         scalar.write(super::registers::MS_STATUS_REG_INDEX, 0);
+        // The status flags start clear (a 1-bit register cannot hold the sentinel).
+        scalar.write(super::registers::SRS_OF_REG_INDEX, 0);
+        scalar.write(super::registers::UPS_OF_REG_INDEX, 0);
+        scalar.write(super::registers::CARRY_REG_INDEX, 0);
 
         Self {
             pc: 0,
@@ -686,6 +687,7 @@ impl ExecutionContext {
             pending_acc_adds: Vec::new(),
             pending_matmuls: Vec::new(),
             pending_ups_loads: Vec::new(),
+            pending_status_flags: Vec::new(),
             srs_config: SrsConfig::default(),
             control_raw: [0; 16],
             pending_control_writes: Vec::new(),
@@ -808,16 +810,30 @@ impl ExecutionContext {
         Some(LoopBoundaryInfo { lc_before: lc, lc_after: new_lc, le_pc: le })
     }
 
-    /// Get the condition flags.
+    /// Get the condition flags. The carry is the `srCarry` status register, read as an
+    /// instruction reads it (the old value inside the bundle that writes it).
     #[inline]
     pub fn flags(&self) -> Flags {
-        self.flags
+        Flags { c: self.carry(), ..self.flags }
     }
 
-    /// Set the condition flags.
+    /// Set the condition flags; the carry goes to `srCarry`.
     #[inline]
     pub fn set_flags(&mut self, flags: Flags) {
         self.flags = flags;
+        self.set_carry(flags.c);
+    }
+
+    /// `srCarry` as an instruction issued now reads it.
+    #[inline]
+    pub fn carry(&self) -> bool {
+        self.scalar_read(super::registers::CARRY_REG_INDEX) & 1 != 0
+    }
+
+    /// Write `srCarry` (visible to readers issued from the next bundle on).
+    #[inline]
+    pub fn set_carry(&mut self, carry: bool) {
+        self.scalar.write(super::registers::CARRY_REG_INDEX, carry as u32);
     }
 
     /// Get the stack pointer value.
@@ -1855,9 +1871,9 @@ impl ExecutionContext {
         std::mem::take(&mut self.pending_matmuls)
     }
 
-    /// Queue a fused `vlda.ups` for its stage-7 shift-register read (see
+    /// Queue a fused `vlda.ups` for its stage-7 register reads (see
     /// [`PendingUpsLoad`]). Load data and destination are resolved at issue;
-    /// only the shift amount is sampled at issue+6.
+    /// the shift, sign and crSat are sampled at issue+6.
     pub fn queue_pending_ups_load(
         &mut self,
         vec_data: [u32; 8],
@@ -1874,16 +1890,40 @@ impl ExecutionContext {
             dest_reg,
             from,
             sign_reg,
-            sampled: None,
-            sat_bundle: self.bundle_seq + VLDA_UPS_SAT_READ_LATENCY,
             to,
             is_half,
             issue_bundle: self.bundle_seq,
             l_def: self.result_latency,
             def_bypass: self.result_bypass,
-            ready_bundle: self.bundle_seq + VLDA_UPS_SHIFT_READ_LATENCY,
+            ready_bundle: self.bundle_seq + VLDA_UPS_READ_LATENCY,
             tag: self.write_tag,
         });
+    }
+
+    /// Raise a sticky overflow status flag (`srSRS_of`, `srUPS_of`) for readers issued at or
+    /// after bundle `visible_at` (an issued-bundle count, as `bundle_seq`).
+    pub fn raise_status_flag(&mut self, reg: u8, visible_at: u64) {
+        self.pending_status_flags.push((reg, visible_at));
+    }
+
+    /// OR the raised status flags whose bundle has come into their registers. Call once per
+    /// issued bundle, before slot execution, so the bundle's readers see them.
+    pub fn process_pending_status_flags(&mut self) {
+        if self.pending_status_flags.is_empty() {
+            return;
+        }
+        let current = self.bundle_seq;
+        let mut pending = std::mem::take(&mut self.pending_status_flags);
+        pending.retain(|&(reg, at)| {
+            if at <= current {
+                let v = self.scalar.read(reg);
+                self.scalar.write(reg, v | 1);
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_status_flags = pending;
     }
 
     /// Sample the shift register for pending vlda.ups conversions that
@@ -1895,37 +1935,38 @@ impl ExecutionContext {
             return;
         }
         let current = self.bundle_seq;
-        // Stage 7: the shift and (for a `d` form) crUPSSign.
-        let mut pending = std::mem::take(&mut self.pending_ups_loads);
-        for pu in pending
-            .iter_mut()
-            .filter(|pu| pu.sampled.is_none() && pu.ready_bundle <= current)
-        {
-            let shift = self.scalar_read(pu.shift_reg);
-            let signed = pu.sign_reg.map(|id| self.control_reg(id) & 1 != 0);
-            pu.sampled = Some((shift, crate::interpreter::execute::dynamic_sign::resolve(pu.from, signed)));
-        }
-        // Stage 8: crSat, then the conversion.
+        // Stage 7: the shift, crUPSSign (a `d` form) and crSat, then the conversion.
         let mut ready: Vec<PendingUpsLoad> = Vec::new();
-        pending.retain(|pu| {
-            if pu.sampled.is_some() && pu.sat_bundle <= current {
+        self.pending_ups_loads.retain(|pu| {
+            if pu.ready_bundle <= current {
                 ready.push(pu.clone());
                 false
             } else {
                 true
             }
         });
-        self.pending_ups_loads = pending;
         ready.sort_by_key(|pu| pu.ready_bundle);
         for pu in ready {
             use crate::interpreter::execute::vector_ups::{ups_vector_to_acc, ups_vector_to_acc_wide};
-            let (shift, from) = pu.sampled.expect("sampled at stage 7");
+            let shift = self.scalar_read(pu.shift_reg);
+            let signed = pu.sign_reg.map(|id| self.control_reg(id) & 1 != 0);
+            let from = crate::interpreter::execute::dynamic_sign::resolve(pu.from, signed);
             let saturate = self.srs_config.saturation_mode != 0;
             let mut acc = [0u64; 16];
             if pu.is_half {
                 acc[..8].copy_from_slice(&ups_vector_to_acc(&pu.vec_data, shift, from, pu.to, saturate));
             } else {
                 acc = ups_vector_to_acc_wide(&pu.vec_data, shift, from, pu.to, saturate);
+            }
+            // srUPS_of: visible at the accumulator result cycle (status_flags).
+            if crate::interpreter::execute::vector_ups::ups_overflows(
+                &pu.vec_data,
+                shift,
+                from,
+                pu.to,
+                !pu.is_half,
+            ) {
+                self.raise_status_flag(super::UPS_OF_REG_INDEX, pu.issue_bundle + pu.l_def as u64);
             }
             self.set_write_tag(pu.tag);
             self.queue_acc_write_timed(
@@ -2276,11 +2317,11 @@ impl StateAccess for ExecutionContext {
     }
 
     fn flags(&self) -> Flags {
-        self.flags
+        ExecutionContext::flags(self)
     }
 
     fn set_flags(&mut self, flags: Flags) {
-        self.flags = flags;
+        ExecutionContext::set_flags(self, flags)
     }
 }
 

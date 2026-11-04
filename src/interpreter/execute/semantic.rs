@@ -384,58 +384,54 @@ fn execute_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
-    let result = a.wrapping_add(b);
+    let (result, carry) = a.overflowing_add(b);
     write_dest(op, ctx, result);
-    // AIE2: ADD sets the Carry flag (C). Z/N/V computed by branch logic.
-    ctx.set_flags(Flags::from_add(a, b, result));
+    define_carry(op, ctx, carry);
     true
 }
 
 fn execute_sub(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
-    let result = a.wrapping_sub(b);
+    let (result, borrow) = a.overflowing_sub(b);
     write_dest(op, ctx, result);
-    // AIE2: SUB sets the Carry flag (C). Z/N/V computed by branch logic.
-    ctx.set_flags(Flags::from_sub(a, b, result));
+    define_carry(op, ctx, borrow);
     true
 }
 
-/// Add with carry: result = a + b + carry_in. Sets C, V, Z, N flags.
+/// Add with carry: result = a + b + srCarry; srCarry = the carry out.
 fn execute_adc(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
-    let carry_in = if ctx.flags().c { 1u32 } else { 0u32 };
-    let (r1, c1) = a.overflowing_add(b);
-    let (result, c2) = r1.overflowing_add(carry_in);
-    write_dest(op, ctx, result);
-    let mut flags = Flags::from_result(result);
-    flags.c = c1 || c2;
-    let a_sign = (a as i32) < 0;
-    let b_sign = (b as i32) < 0;
-    let r_sign = (result as i32) < 0;
-    flags.v = (a_sign == b_sign) && (a_sign != r_sign);
-    ctx.set_flags(flags);
+    let sum = a as u64 + b as u64 + ctx.carry() as u64;
+    write_dest(op, ctx, sum as u32);
+    define_carry(op, ctx, sum >> 32 != 0);
     true
 }
 
-/// Subtract with borrow: result = a - b - borrow_in. Sets C, V, Z, N flags.
-/// ARM convention: C=1 means no borrow, C=0 means borrow occurred.
+/// Subtract with borrow: result = a - b - srCarry; srCarry = the borrow (silicon: the flag is
+/// a borrow in and out, not ARM's inverted carry).
 fn execute_sbc(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
-    let borrow_in = if ctx.flags().c { 0u32 } else { 1u32 };
-    let (r1, b1) = a.overflowing_sub(b);
-    let (result, b2) = r1.overflowing_sub(borrow_in);
-    write_dest(op, ctx, result);
-    let mut flags = Flags::from_result(result);
-    flags.c = !(b1 || b2); // C=0 means borrow
-    let a_sign = (a as i32) < 0;
-    let b_sign = (b as i32) < 0;
-    let r_sign = (result as i32) < 0;
-    flags.v = (a_sign != b_sign) && (a_sign != r_sign);
-    ctx.set_flags(flags);
+    let borrow_in = ctx.carry() as u32;
+    write_dest(op, ctx, a.wrapping_sub(b).wrapping_sub(borrow_in));
+    define_carry(op, ctx, (a as u64) < b as u64 + borrow_in as u64);
     true
+}
+
+/// Whether the op's TableGen record defines srCarry (`Defs = [srCarry]`): only those
+/// instructions write it (silicon, satflags carry probe: `add.nc`, compares, logic and shifts
+/// leave it alone).
+pub(super) fn defines_carry(op: &SlotOp) -> bool {
+    op.implicit_regs.iter().any(|r| !r.is_use && r.reg_class == "srCarry")
+}
+
+/// Write srCarry for an instruction that defines it.
+pub(super) fn define_carry(op: &SlotOp, ctx: &mut ExecutionContext, carry: bool) {
+    if defines_carry(op) {
+        ctx.set_carry(carry);
+    }
 }
 
 fn execute_mul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
@@ -807,12 +803,8 @@ fn execute_abs(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let result = (a as i32).wrapping_abs() as u32;
     write_dest(op, ctx, result);
-    // AIE2: ABS sets the Carry flag (Defs=[srCarry] in TableGen)
-    // Carry is set if the input was negative (negation occurred)
-    let was_negative = (a as i32) < 0;
-    let mut flags = ctx.flags();
-    flags.c = was_negative;
-    ctx.set_flags(flags);
+    // srCarry = the sign of the source (silicon).
+    define_carry(op, ctx, (a as i32) < 0);
     true
 }
 
@@ -820,9 +812,8 @@ fn execute_neg(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let result = (a as i32).wrapping_neg() as u32;
     write_dest(op, ctx, result);
-    // AIE2: NEG is equivalent to SUB(0, a), sets Carry flag
-    // Using SUB semantics: C = (0 >= a) in unsigned, i.e., C = (a == 0)
-    ctx.set_flags(Flags::from_sub(0, a, result));
+    // As SUB(0, a): the borrow, for an instruction that defines srCarry.
+    define_carry(op, ctx, a != 0);
     true
 }
 
@@ -838,7 +829,9 @@ fn execute_cmp(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
     let result = a.wrapping_sub(b);
-    ctx.set_flags(Flags::from_sub(a, b, result));
+    // Z/N/V for the flag-based branch conditions; srCarry (the borrow) only if defined.
+    ctx.set_flags(Flags { c: ctx.carry(), ..Flags::from_sub(a, b, result) });
+    define_carry(op, ctx, a < b);
     true
 }
 
@@ -1433,7 +1426,8 @@ mod tests {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, (-42i32) as u32);
 
-        let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Abs);
+        let mut op =
+            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Abs).with_implicit_regs(carry_def());
         op.sources = smallvec![Operand::ScalarReg(1)];
         op.dest = Some(Operand::ScalarReg(3));
 
@@ -1691,8 +1685,8 @@ mod tests {
     #[test]
     fn test_execute_sbc_with_borrow() {
         let mut ctx = make_test_context();
-        // C=0 means borrow occurred, so borrow_in=1
-        ctx.set_flags(Flags { z: false, n: false, c: false, v: false });
+        // The flag is the borrow (silicon, satflags carry probe): 1 subtracts one more.
+        ctx.set_flags(Flags { z: false, n: false, c: true, v: false });
         ctx.scalar.write(1, 30);
         ctx.scalar.write(2, 10);
 
@@ -1835,7 +1829,7 @@ mod tests {
     // --- Tests migrated from scalar.rs (unique coverage not in above tests) ---
 
     #[test]
-    fn test_add_overflow_sets_carry_and_zero() {
+    fn test_add_overflow_sets_carry() {
         let mut ctx = make_test_context();
         ctx.scalar.write(0, 0xFFFF_FFFF);
         ctx.scalar.write(1, 1);
@@ -1846,8 +1840,18 @@ mod tests {
             .with_source(Operand::ScalarReg(1));
         execute_semantic(&op, &mut ctx);
         assert_eq!(ctx.scalar_read(2), 0);
+        assert!(!ctx.flags().c, "an op whose record does not define srCarry leaves it");
+        execute_semantic(&op.with_implicit_regs(carry_def()), &mut ctx);
         assert!(ctx.flags().c); // Carry set
-        assert!(ctx.flags().z); // Zero set
+    }
+
+    /// `Defs = [srCarry]`, as the decoder attaches it from TableGen.
+    fn carry_def() -> [xdna_archspec::aie2::isa::ImplicitReg; 1] {
+        [xdna_archspec::aie2::isa::ImplicitReg {
+            reg_class: "srCarry".to_string(),
+            reg_num: 0,
+            is_use: false,
+        }]
     }
 
     #[test]

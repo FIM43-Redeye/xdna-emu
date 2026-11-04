@@ -64,9 +64,8 @@ pub const NUM_SHIFT_REGS: u8 = 4;
 pub const SS_STATUS_REG_INDEX: u8 = 44;
 /// Stream-switch write status (`srMS0`): bit 0 = the last non-blocking write was accepted.
 pub const MS_STATUS_REG_INDEX: u8 = 45;
-// Status registers a `mov` reaches that nothing in the emulator sets yet (no producer for the
-// carry, the SRS / UPS overflow or the floating-point flags): plain slots that keep what was
-// written, masked to their silicon width.
+// Status registers kept as plain slots masked to their silicon width. The carry and the SRS /
+// UPS overflow flags have producers (execute::status_flags); the floating-point flags do not yet.
 /// `srCarry`.
 pub const CARRY_REG_INDEX: u8 = 46;
 /// `srSRS_of`.

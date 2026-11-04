@@ -76,6 +76,7 @@
 //! ```
 
 pub(crate) mod dynamic_sign;
+pub(crate) mod status_flags;
 mod vector_dispatch;
 mod vector_helpers;
 mod vector_arith;

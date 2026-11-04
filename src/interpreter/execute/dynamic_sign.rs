@@ -263,8 +263,9 @@ mod execution {
         assert_eq!(run(true), 0x7fff_ff00, "signed: -256 stays, 0x10000 -> 0x7fff");
     }
 
-    /// vlda.ups reads crUPSSign with its shift at operand cycle 7 (issue+6) and crSat at
-    /// operand cycle 8 (issue+7): Chess and Peano write both in the load's shadow. Lane 0 is
+    /// vlda.ups reads crUPSSign, crSat and its shift together, in the bundle at issue+6 (silicon,
+    /// satflags upsread probe: a write 5 bundles after the load is seen, 6 is not; the itinerary
+    /// puts crSat a cycle later): Chess and Peano write them in the load's shadow. Lane 0 is
     /// the `lups` chess-full value 0x846d4520 << 7 (silicon: 0xffffffc2_36a29000 signed).
     #[test]
     fn vlda_ups_reads_its_sign_and_saturation_late() {
@@ -304,8 +305,8 @@ mod execution {
             rig.settle(10 - after);
             rig.ctx.accumulator.read(1)[0]
         };
-        assert_eq!(run_sat(6), 0x8000_0000_0000_0000, "crSat written before the issue+7 read");
-        assert_eq!(run_sat(7), 0x6d45_2000_0000_0000, "written after it: wraps");
+        assert_eq!(run_sat(5), 0x8000_0000_0000_0000, "crSat written before the issue+6 read");
+        assert_eq!(run_sat(6), 0x6d45_2000_0000_0000, "written after it: wraps");
     }
 
     /// A control register written in the same bundle as its reader is read old: Chess

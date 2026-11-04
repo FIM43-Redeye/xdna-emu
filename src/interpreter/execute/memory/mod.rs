@@ -1015,6 +1015,7 @@ impl MemoryUnit {
                     } else {
                         acc = super::vector_ups::ups_vector_to_acc_wide(&vec_data, shift, from, to, saturate);
                     }
+                    super::VectorAlu::raise_ups_of(ctx, &vec_data, shift, from, to, !is_half);
                     ctx.queue_acc_write(Operand::AccumReg(*r), acc, is_half);
                 }
             }
@@ -1126,7 +1127,7 @@ impl MemoryUnit {
 
         if is_half {
             let acc = ctx.accumulator.read(acc_reg);
-            let narrowed = super::VectorAlu::vector_srs_from_acc(&acc, shift, from, to, &ctx.srs_config);
+            let narrowed = super::VectorAlu::srs_flagged(ctx, &acc, shift, from, to);
 
             let to_bits = to.bits() as usize;
             let from_bits = from.bits() as usize;
@@ -1149,8 +1150,8 @@ impl MemoryUnit {
             let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
             let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
 
-            let result_lo = super::VectorAlu::vector_srs_from_acc(&acc_lo, shift, from, to, &ctx.srs_config);
-            let result_hi = super::VectorAlu::vector_srs_from_acc(&acc_hi, shift, from, to, &ctx.srs_config);
+            let result_lo = super::VectorAlu::srs_flagged(ctx, &acc_lo, shift, from, to);
+            let result_hi = super::VectorAlu::srs_flagged(ctx, &acc_hi, shift, from, to);
 
             // Pack the two halves. For reduction SRS (e.g., Acc32->i8),
             // each half only fills a fraction of its 8-word result.

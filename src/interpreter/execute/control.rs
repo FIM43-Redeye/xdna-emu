@@ -166,10 +166,12 @@ impl ControlUnit {
                         // Critical: when dest != source, we must decrement the
                         // source value, not re-read the dest register.
                         if let Some(Operand::ScalarReg(r)) = &op.dest {
-                            let decremented = (test_val - 1) as u32;
+                            let decremented = test_val.wrapping_sub(1) as u32;
                             ctx.write_scalar(*r, decremented);
                             log::debug!("JNZD: r{} = {} - 1 = {}", r, test_val, decremented);
                         }
+                        // srCarry: the carry out of source + (-1), i.e. the source was nonzero.
+                        super::semantic::define_carry(op, ctx, test_val != 0);
                         test_val != 0
                     }
                     // For other conditions, check flags

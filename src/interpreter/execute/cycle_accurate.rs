@@ -828,6 +828,9 @@ impl CycleAccurateExecutor {
         // bundle arrived and write their converted accumulators.
         ctx.process_pending_ups_loads();
 
+        // Overflow status flags whose visibility bundle arrived (srSRS_of, srUPS_of).
+        ctx.process_pending_status_flags();
+
         ctx.begin_bundle();
         if bundle
             .active_slots()
