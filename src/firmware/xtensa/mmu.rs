@@ -11,16 +11,22 @@
 //! # Model
 //!
 //! The ITLB has 7 ways and the DTLB 10 [RM 4.6.5, p.159; 4.6.5.3,
-//! p.163-164]. Ways 0-3 are the autorefill ways (4 KB pages); way 4 has a
-//! page size chosen by xTLBCFG; ways 5 and 6 are the *variable* ways of
-//! RC-2009.0 and later (software-written, size by xTLBCFG; way 6 is
-//! pre-loaded at reset to identity-map all of memory); DTLB ways 7-9 hold a
-//! single 4 KB entry each. The *fixed* form of ways 5/6 and the 8-entry
-//! refill-way variant are not modelled: no supported core uses them.
+//! p.163-164]. Ways 0-3 are the autorefill ways (4 KB pages, four or eight
+//! entries each per the core's NIREFILLENTRIES / NDREFILLENTRIES, see
+//! [`RefillEntries`]); way 4 has a page size chosen by xTLBCFG; ways 5 and 6
+//! are the *variable* ways of RC-2009.0 and later (software-written, size by
+//! xTLBCFG; way 6 is pre-loaded at reset to identity-map all of memory);
+//! DTLB ways 7-9 hold a single 4 KB entry each. The *fixed* form of ways 5/6
+//! is not modelled: no supported core uses it.
 //!
 //! An entry has no valid bit; ASID 0 means invalid [RM 4.6.1.1, p.141].
 //! The ring of an entry is not stored: it is the position of the entry's
 //! ASID within RASID [RM 4.6.1.2, p.143].
+//!
+//! Overlapping matches always raise the MultiHit cause [RM 4.6.2.2, p.147]:
+//! the manual gives no way priority over another, so software that wants a
+//! smaller mapping inside a way-6 region must first invalidate the way-6
+//! entry, as real reset code does.
 //!
 //! The MMU never writes EXCVADDR or EXCCAUSE. A failed translation returns a
 //! [`TranslationFault`] and the CPU, which owns those registers, raises the
@@ -68,27 +74,32 @@ pub mod cause {
     pub const STORE_PROHIBITED: u32 = 29;
 }
 
-/// How overlapping matches that involve way 6 are resolved.
-///
-/// The manual calls overlapping matches illegal; implementations "may"
-/// detect them [RM 4.6.1.1, p.139] and the TLB-lookup description says the
-/// condition "currently raises" a MultiHit exception [RM 4.6.2.2, p.147].
-/// It gives no way a lower priority than another, so the yielding policy is a
-/// platform choice, not a manual rule.
+/// Autorefill entries in one TLB, the configuration parameters
+/// NIREFILLENTRIES / NDREFILLENTRIES [RM Table 4-105, p.159]. They are split
+/// evenly over ways 0-3, so each refill way holds four or eight entries and is
+/// indexed by `vaddr[13:12]` or `vaddr[14:12]` [RM Fig. 4-33, p.166].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverlapPolicy {
-    /// Any two matching entries raise the MultiHit cause [RM 4.6.2.2, p.147].
-    Strict,
-    /// A match in way 6 is used only when no other way matches; two or more
-    /// matches among the other ways still raise MultiHit. Applies to normal
-    /// lookups, the PTE-address lookup during refill, and probes.
-    Way6Yields,
+pub enum RefillEntries {
+    /// 16 entries: four per refill way.
+    Sixteen,
+    /// 32 entries: eight per refill way.
+    ThirtyTwo,
+}
+
+impl RefillEntries {
+    /// Entries in each of ways 0-3.
+    pub const fn per_way(self) -> usize {
+        match self {
+            RefillEntries::Sixteen => 4,
+            RefillEntries::ThirtyTwo => 8,
+        }
+    }
 }
 
 /// The per-core knobs of the MMU Option.
 ///
-/// Everything else the manual lets a core vary (refill-way entry count,
-/// fixed ways 5/6) is unsupported; see the module documentation.
+/// The other configuration the manual allows (fixed ways 5/6) is
+/// unsupported; see the module documentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MmuConfig {
     /// Attribute written into every way-6 entry at reset, in both TLBs.
@@ -98,13 +109,20 @@ pub struct MmuConfig {
     /// fetch, which would make the first fetch after reset fault. Attribute
     /// 3 (the same bypass with fetch allowed) is the self-consistent reading.
     pub way6_reset_attribute: u8,
-    /// Multi-hit resolution policy.
-    pub overlap: OverlapPolicy,
+    /// NIREFILLENTRIES: ITLB autorefill entries.
+    pub itlb_refill_entries: RefillEntries,
+    /// NDREFILLENTRIES: DTLB autorefill entries.
+    pub dtlb_refill_entries: RefillEntries,
 }
 
 impl MmuConfig {
-    /// Manual behaviour wherever the manual is clear.
-    pub const GENERIC: MmuConfig = MmuConfig { way6_reset_attribute: 3, overlap: OverlapPolicy::Strict };
+    /// Manual behaviour wherever the manual is clear, with the smaller of the
+    /// two refill sizes.
+    pub const GENERIC: MmuConfig = MmuConfig {
+        way6_reset_attribute: 3,
+        itlb_refill_entries: RefillEntries::Sixteen,
+        dtlb_refill_entries: RefillEntries::Sixteen,
+    };
 }
 
 impl Default for MmuConfig {
@@ -160,7 +178,8 @@ impl TlbEntry {
 
 const ITLB_WAYS: usize = 7;
 const DTLB_WAYS: usize = 10;
-/// Most entries any way holds (way 6).
+/// Most entries any way holds (way 6, and refill ways under
+/// [`RefillEntries::ThirtyTwo`]).
 pub const MAX_WAY_ENTRIES: usize = 8;
 /// Autorefill ways are 0..=3 [RM 4.6.5.3, p.163].
 const REFILL_WAYS: u8 = 4;
@@ -240,10 +259,15 @@ impl Mmu {
         }
     }
 
-    /// Entries in `way` [RM 4.6.5.3, p.163-164].
-    fn entry_count(way: u8) -> usize {
+    /// Entries in `way` of `tlb` [RM 4.6.5.3, p.163-164; Table 4-105,
+    /// p.159].
+    fn entry_count(&self, tlb: Tlb, way: u8) -> usize {
         match way {
-            0..=5 => 4,
+            0..=3 => match tlb {
+                Tlb::Instruction => self.config.itlb_refill_entries.per_way(),
+                Tlb::Data => self.config.dtlb_refill_entries.per_way(),
+            },
+            4 | 5 => 4,
             6 => 8,
             _ => 1,
         }
@@ -275,14 +299,14 @@ impl Mmu {
 
     /// Slot selected by `vaddr`: `vaddr[P+I-1 .. P]` [RM 4.6.1.1, p.141].
     fn slot_of(&self, tlb: Tlb, way: u8, vaddr: u32) -> usize {
-        let n = Self::entry_count(way);
+        let n = self.entry_count(tlb, way);
         ((vaddr >> self.page_bits(tlb, way)) as usize) & (n - 1)
     }
 
     /// Mask of the "VPN without index" bits, `[31 : P+I]`, which an entry
     /// must match [RM 4.6.1.1, p.141].
     fn tag_mask(&self, tlb: Tlb, way: u8) -> u32 {
-        let index_bits = Self::entry_count(way).trailing_zeros();
+        let index_bits = self.entry_count(tlb, way).trailing_zeros();
         let low = self.page_bits(tlb, way) + index_bits;
         if low >= 32 {
             0
@@ -346,7 +370,7 @@ impl Mmu {
     /// Read-only view of one entry for diagnostics and tests; out-of-range
     /// `way`/`slot` read as an invalid entry.
     pub fn entry(&self, tlb: Tlb, way: usize, slot: usize) -> TlbEntry {
-        if way >= Self::way_count(tlb) || slot >= Self::entry_count(way as u8) {
+        if way >= Self::way_count(tlb) || slot >= self.entry_count(tlb, way as u8) {
             return TlbEntry::INVALID;
         }
         self.ways(tlb)[way][slot]
@@ -383,18 +407,12 @@ impl Mmu {
         (out, n)
     }
 
-    /// Resolve overlapping matches under the configured policy. `Ok(None)` is
-    /// a miss; `Err(())` is a multi-hit.
+    /// The single matching entry. `Ok(None)` is a miss; `Err(())` is a
+    /// multi-hit [RM 4.6.2.2, p.147].
     fn resolve(&self, tlb: Tlb, vaddr: u32) -> Result<Option<Hit>, ()> {
-        let (hits, mut n) = self.matches(tlb, vaddr);
-        let mut hits: Vec<Hit> = hits[..n].iter().flatten().copied().collect();
-        if self.config.overlap == OverlapPolicy::Way6Yields && n > 1 {
-            hits.retain(|h| h.way != 6);
-            n = hits.len();
-        }
-        match n {
-            0 => Ok(None),
-            1 => Ok(Some(hits[0])),
+        match self.matches(tlb, vaddr) {
+            (_, 0) => Ok(None),
+            (hits, 1) => Ok(hits[0]),
             _ => Err(()),
         }
     }
@@ -727,12 +745,27 @@ mod tests {
         }
     }
 
-    fn way6_yields() -> Mmu {
-        Mmu::new(MmuConfig { way6_reset_attribute: 3, overlap: OverlapPolicy::Way6Yields })
-    }
-
     fn generic() -> Mmu {
         Mmu::new(MmuConfig::GENERIC)
+    }
+
+    /// Generic MMU with the reset way-6 entries cleared, so an installed
+    /// entry is the only match for its address.
+    fn cleared() -> Mmu {
+        let mut m = generic();
+        clear_way6(&mut m);
+        m
+    }
+
+    /// Way 6 cleared, with the given refill-entry counts.
+    fn cleared_with(itlb: RefillEntries, dtlb: RefillEntries) -> Mmu {
+        let mut m = Mmu::new(MmuConfig {
+            itlb_refill_entries: itlb,
+            dtlb_refill_entries: dtlb,
+            ..MmuConfig::GENERIC
+        });
+        clear_way6(&mut m);
+        m
     }
 
     /// Invalidate the eight reset way-6 entries of both TLBs (valid while
@@ -761,7 +794,8 @@ mod tests {
 
     #[test]
     fn reset_way6_identity_maps_everything() {
-        for m in [generic(), way6_yields()] {
+        {
+            let m = generic();
             for kind in [AccessKind::Fetch, AccessKind::Load, AccessKind::Store] {
                 for va in [0x1234_5678, 0xE000_0010, 0xFFFF_FFFC, 0] {
                     let t = m.lookup(va, kind, 0).unwrap();
@@ -775,7 +809,7 @@ mod tests {
 
     #[test]
     fn reset_way6_attribute_is_configurable() {
-        let m = Mmu::new(MmuConfig { way6_reset_attribute: 2, overlap: OverlapPolicy::Strict });
+        let m = Mmu::new(MmuConfig { way6_reset_attribute: 2, ..MmuConfig::GENERIC });
         // The manual's attribute 2: load/store but no fetch.
         assert!(m.lookup(0x1000, AccessKind::Load, 0).is_ok());
         assert_eq!(m.lookup(0x1000, AccessKind::Fetch, 0), Err(fault(cause::INST_FETCH_PROHIBITED, 0x1000)));
@@ -829,7 +863,7 @@ mod tests {
 
     #[test]
     fn dtlb_way7_installs_and_translates() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_entry(D, 0x4000_1000 | 7, 0x0009_0000 | 3);
         let t = m.lookup(0x4000_1ABC, AccessKind::Load, 0).unwrap();
         assert_eq!((t.paddr, t.page_size, t.way), (0x0009_0ABC, 0x1000, 7));
@@ -845,22 +879,33 @@ mod tests {
     }
 
     #[test]
-    fn way6_yields_does_not_hide_two_other_matches() {
-        let mut m = way6_yields();
+    fn two_matches_outside_way6_multihit() {
+        let mut m = cleared();
         m.write_entry(D, 0x4000_1000 | 7, 0x0009_0000 | 3);
         m.write_entry(D, 0x4000_1000 | 8, 0x0009_0000 | 3);
         assert_eq!(m.lookup(0x4000_1ABC, AccessKind::Load, 0), Err(fault(25, 0x4000_1ABC)));
     }
 
     #[test]
+    fn a_more_specific_entry_does_not_override_way6() {
+        // No way has priority over another [RM 4.6.1.1, p.139]: an entry that
+        // overlaps a live way-6 entry multi-hits, however small its page.
+        let mut m = generic();
+        m.write_entry(I, 0x0000_0000 | 4, 0x0000_0000 | 3);
+        assert_eq!(m.lookup(0x0000_0100, AccessKind::Fetch, 0), Err(fault(17, 0x0000_0100)));
+        m.invalidate_entry(I, 0x0000_0006);
+        assert_eq!(m.lookup(0x0000_0100, AccessKind::Fetch, 0).unwrap().way, 4);
+    }
+
+    #[test]
     fn way4_4mb_itlb() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_tlbcfg(I, 0x0001_0000);
         m.write_entry(I, 0x12C0_0000 | 4, 0x2000_0000 | 3);
         let t = m.lookup(0x12C1_2345, AccessKind::Fetch, 0).unwrap();
         assert_eq!((t.paddr, t.page_size, t.way), (0x2001_2345, 0x40_0000, 4));
-        // Index 2 of the same 4 MB way holds nothing: falls through to way 6.
-        assert_eq!(m.lookup(0x1281_2345, AccessKind::Fetch, 0).unwrap().way, 6);
+        // Index 2 of the same 4 MB way holds nothing.
+        assert_eq!(m.lookup(0x1281_2345, AccessKind::Fetch, 0), Err(fault(16, 0x1281_2345)));
         assert_eq!(m.read_entry_virtual(I, 0x12C0_0004), 0x1200_0001);
         assert_eq!(m.read_entry_translation(I, 0x12C0_0004), 0x2000_0003);
     }
@@ -868,7 +913,7 @@ mod tests {
     #[test]
     fn way4_page_sizes() {
         for (code, bits) in [(0u32, 20u32), (1, 22), (2, 24), (3, 26)] {
-            let mut m = way6_yields();
+            let mut m = cleared();
             m.write_tlbcfg(D, code << 16);
             let size = 1u32 << bits;
             m.write_entry(D, 0x8000_0000 | 4, 0x1000_0000 | 3);
@@ -879,7 +924,7 @@ mod tests {
 
     #[test]
     fn itlb_way_field_ignores_bit3() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_tlbcfg(I, 0x0001_0000);
         m.write_entry(I, 0x12C0_0000 | 0xC, 0x2000_0000 | 3);
         let t = m.lookup(0x12C1_2345, AccessKind::Fetch, 0).unwrap();
@@ -888,7 +933,7 @@ mod tests {
 
     #[test]
     fn way5_128mb_dtlb_and_256mb() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_entry(D, 0xD800_0005, 0x0800_0003);
         let t = m.lookup(0xDFFF_FFFC, AccessKind::Store, 0).unwrap();
         assert_eq!((t.paddr, t.page_size, t.way), (0x0FFF_FFFC, 0x800_0000, 5));
@@ -934,6 +979,70 @@ mod tests {
         assert!(m.lookup(0x0044_3000, AccessKind::Load, 0).is_err());
         // 0x0040_4000 has index 0.
         assert!(m.lookup(0x0040_4000, AccessKind::Load, 0).is_err());
+    }
+
+    #[test]
+    fn four_entry_refill_ways_alias_pages_four_apart() {
+        let mut m = cleared();
+        m.write_entry(D, 0x0040_3000 | 2, 0x0A00_0000 | 3);
+        m.write_entry(D, 0x0040_7000 | 2, 0x0B00_0000 | 3);
+        // Both pages index slot 3; the second write replaced the first.
+        assert_eq!(m.lookup(0x0040_3000, AccessKind::Load, 0), Err(fault(24, 0x0040_3000)));
+        assert_eq!(m.lookup(0x0040_7000, AccessKind::Load, 0).unwrap().paddr, 0x0B00_0000);
+        assert_eq!(m.entry(D, 2, 7), TlbEntry::INVALID, "a 4-entry way has no slot 7");
+    }
+
+    #[test]
+    fn thirty_two_entry_refill_ways_use_three_index_bits() {
+        // NDREFILLENTRIES = 32: eight entries per way, index vaddr[14:12]
+        // [RM Table 4-105, p.159; Fig. 4-33, p.166].
+        let mut m = cleared_with(RefillEntries::Sixteen, RefillEntries::ThirtyTwo);
+        m.write_entry(D, 0x0040_3000 | 2, 0x0A00_0000 | 3);
+        m.write_entry(D, 0x0040_7000 | 2, 0x0B00_0000 | 3);
+        let t = m.lookup(0x0040_3FFC, AccessKind::Load, 0).unwrap();
+        assert_eq!((t.paddr, t.way, t.slot), (0x0A00_0FFC, 2, 3));
+        let t = m.lookup(0x0040_7000, AccessKind::Load, 0).unwrap();
+        assert_eq!((t.paddr, t.way, t.slot), (0x0B00_0000, 2, 7));
+        // Same index 3, different tag (bit 15).
+        assert_eq!(m.lookup(0x0040_B000, AccessKind::Load, 0), Err(fault(24, 0x0040_B000)));
+        // The VPN read back excludes all three index bits [RM Fig. 4-35, p.169].
+        assert_eq!(m.read_entry_virtual(D, 0x0040_7000 | 2), 0x0040_0001);
+        assert_eq!(m.read_entry_translation(D, 0x0040_7000 | 2), 0x0B00_0003);
+        assert_eq!(m.entry(D, 2, 7).paddr, 0x0B00_0000);
+    }
+
+    #[test]
+    fn refill_entry_count_is_configured_per_tlb() {
+        let mut m = cleared_with(RefillEntries::ThirtyTwo, RefillEntries::Sixteen);
+        for page in 0..8u32 {
+            let va = 0x0880_0000 + page * 0x1000;
+            m.write_entry(I, va, (0x0002_0000 + page * 0x1000) | 5);
+            m.write_entry(D, va, (0x0002_0000 + page * 0x1000) | 3);
+        }
+        for page in 0..8u32 {
+            let va = 0x0880_0000 + page * 0x1000 + 0x10;
+            let pa = 0x0002_0000 + page * 0x1000 + 0x10;
+            assert_eq!(m.lookup(va, AccessKind::Fetch, 0).map(|t| t.paddr), Ok(pa), "ITLB page {page}");
+            let d = m.lookup(va, AccessKind::Load, 0).map(|t| t.paddr);
+            if page < 4 {
+                assert_eq!(d, Err(fault(24, va)), "DTLB page {page} was replaced");
+            } else {
+                assert_eq!(d, Ok(pa), "DTLB page {page}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalidate_on_an_eight_entry_way_clears_only_the_indexed_slot() {
+        let mut m = cleared_with(RefillEntries::Sixteen, RefillEntries::ThirtyTwo);
+        for slot in 0..8u32 {
+            m.write_entry(D, 0x0040_0000 + slot * 0x1000, 0x0100_0000 | 3);
+        }
+        m.invalidate_entry(D, 0x0040_6000);
+        for slot in 0..8u32 {
+            let ok = m.lookup(0x0040_0000 + slot * 0x1000, AccessKind::Load, 0).is_ok();
+            assert_eq!(ok, slot != 6, "slot {slot}");
+        }
     }
 
     #[test]
@@ -1034,12 +1143,7 @@ mod tests {
     // -- 10.5 Invalidate -----------------------------------------------
 
     #[test]
-    fn invalidate_falls_back_to_way6_or_misses() {
-        let mut m = way6_yields();
-        m.write_entry(D, 0x4000_1000 | 7, 0x0009_0000 | 3);
-        m.invalidate_entry(D, 0x4000_1000 | 7);
-        assert_eq!(m.lookup(0x4000_1ABC, AccessKind::Load, 0).unwrap().way, 6);
-
+    fn invalidate_makes_the_entry_miss() {
         let mut g = generic();
         clear_way6(&mut g);
         g.write_entry(D, 0x4000_1000 | 7, 0x0009_0000 | 3);
@@ -1204,20 +1308,24 @@ mod tests {
         assert_eq!(m.read_ptevaddr(0x0040_3123), 0x8000_100C);
     }
 
-    // -- 10.7 Way-6 policy ---------------------------------------------
-
     #[test]
-    fn way6_yields_to_a_more_specific_entry_even_if_it_is_stricter() {
-        let mut m = way6_yields();
-        m.write_entry(D, 0x4000_1000 | 7, 0x0009_0000); // attribute 0: read-only
-        assert_eq!(m.lookup(0x4000_1000, AccessKind::Store, 0), Err(fault(29, 0x4000_1000)));
-        let t = m.lookup(0x4000_2000, AccessKind::Store, 0).unwrap();
-        assert_eq!(t.way, 6);
+    fn refill_into_thirty_two_entry_ways_uses_three_index_bits() {
+        let mut m = cleared_with(RefillEntries::Sixteen, RefillEntries::ThirtyTwo);
+        m.write_ptevaddr(0x8000_0000);
+        m.write_entry(D, 0x8000_1000 | 8, 0x0010_0000 | 3);
+        let mut bus = PteBus::default();
+        // PTE for page 0x0040_7000 sits at PTEBase | (0x407 << 2) = 0x8000_101C.
+        bus.ptes.insert(0x0010_001C, 0x0ABC_D000 | 3);
+        let t = m.translate(&mut bus, 0x0040_7123, AccessKind::Load, 0).unwrap();
+        assert_eq!((t.paddr, t.slot), (0x0ABC_D123, 7));
+        assert!(t.way < 4);
     }
+
+    // -- 10.7 Way 6 -----------------------------------------------------
 
     #[test]
     fn no_refill_with_way6_intact() {
-        let mut m = way6_yields();
+        let mut m = generic();
         let mut bus = PteBus::default();
         for va in [0u32, 0x1234_5678, 0xFFFF_FFFC, 0x8000_0000] {
             for kind in [AccessKind::Fetch, AccessKind::Load, AccessKind::Store] {
@@ -1228,10 +1336,10 @@ mod tests {
     }
 
     #[test]
-    fn refill_pte_lookup_follows_the_overlap_policy() {
-        // Way6Yields: the PTE page is covered by way 6 alone, so the walk succeeds
-        // using it. Generic would multi-hit if another way also matched.
-        let mut m = way6_yields();
+    fn refill_pte_lookup_may_use_way6() {
+        // The PTE page is covered by DTLB way-6 entry 0 alone, so the walk
+        // reads through it.
+        let mut m = generic();
         for n in 0..8u32 {
             if n != 0 {
                 m.invalidate_entry(D, (n << 29) | 6);
@@ -1245,24 +1353,43 @@ mod tests {
         assert_eq!(t.paddr, 0x0777_7010);
     }
 
+    #[test]
+    fn refill_pte_lookup_multihit_is_a_refill_error() {
+        // A multi-hit on the PTE address is "an error of any sort during the
+        // automatic refill" [RM 4.6.5.9, p.174]: the access takes its miss.
+        let mut m = generic();
+        for n in 0..8u32 {
+            if n != 0 {
+                m.invalidate_entry(D, (n << 29) | 6);
+            }
+            m.invalidate_entry(I, (n << 29) | 6);
+        }
+        m.write_ptevaddr(0x0040_0000);
+        m.write_entry(D, 0x0040_1000 | 8, 0x0040_1000 | 3);
+        let mut bus = PteBus::default();
+        bus.ptes.insert(0x0040_0000 + ((0x0050_0000u32 >> 12) << 2), 0x0777_7000 | 3);
+        assert_eq!(m.translate(&mut bus, 0x0050_0010, AccessKind::Fetch, 0), Err(fault(16, 0x0050_0010)));
+        assert!(bus.reads.borrow().is_empty());
+    }
+
     // -- 10.8 Probe ----------------------------------------------------
 
     #[test]
     fn probe_reports_hit_and_way() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_entry(D, 0x4000_1000 | 7, 0x0009_0000 | 3);
         assert_eq!(m.probe(D, 0x4000_1ABC, 0), Ok(0x4000_1000 | 0x10 | 7));
     }
 
     #[test]
     fn probe_result_is_a_valid_instruction_operand() {
-        let mut m = way6_yields();
+        let mut m = cleared();
         m.write_tlbcfg(I, 0x0001_0000);
         m.write_entry(I, 0x12C0_0000 | 4, 0x2000_0000 | 3);
         let p = m.probe(I, 0x12C1_2345, 0).unwrap();
         assert_eq!(p, 0x12C1_2000 | 0x8 | 4);
         m.invalidate_entry(I, p);
-        assert_eq!(m.lookup(0x12C1_2345, AccessKind::Fetch, 0).unwrap().way, 6);
+        assert_eq!(m.lookup(0x12C1_2345, AccessKind::Fetch, 0), Err(fault(16, 0x12C1_2345)));
     }
 
     #[test]
