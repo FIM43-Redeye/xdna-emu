@@ -1747,7 +1747,8 @@ impl MemoryUnit {
         operand.map_or(0, |src| match src {
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,
             Operand::PointerReg(r) => ctx.pointer_read(*r) as u64,
-            Operand::ModifierReg(r) => ctx.modifier_read(*r) as u64,
+            // A stored m / dj register is sign-extended like a moved one (silicon, harness/scrub).
+            Operand::ModifierReg(r) => ctx.modifier_read_as_scalar(*r) as u64,
             Operand::VectorReg(r) => {
                 // Store data: NoBypass consumer (see read_store_data_wide).
                 let vec = ctx.vector.read_store(*r);
@@ -2201,6 +2202,22 @@ mod tests {
 
     fn make_tile() -> Tile {
         Tile::compute(0, 2)
+    }
+
+    /// Silicon stores m and dj sign-extended, dn and dc zero-extended, exactly as a move reads
+    /// them (harness/scrub: `st m0` of a scrubbed 0xB8BFB reads back 0xFFFB8BFB).
+    #[test]
+    fn a_stored_modifier_register_is_extended_like_a_moved_one() {
+        use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
+        let mut ctx = make_ctx();
+        for base in [MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC] {
+            ctx.modifier.write(base + 3, 0x8_BFB0);
+        }
+        let st = |r: u8| MemoryUnit::read_store_register(&Operand::ModifierReg(r), &ctx, MemWidth::Word);
+        assert_eq!(st(MOD_BASE_M + 3), 0xFFF8_BFB0);
+        assert_eq!(st(MOD_BASE_DJ + 3), 0xFFF8_BFB0);
+        assert_eq!(st(MOD_BASE_DN + 3), 0x8_BFB0);
+        assert_eq!(st(MOD_BASE_DC + 3), 0x8_BFB0);
     }
 
     #[test]

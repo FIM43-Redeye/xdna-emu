@@ -2136,6 +2136,18 @@ impl ExecutionContext {
         }
     }
 
+    /// A modifier register as a 32-bit scalar value, the way a move out of it or a store of it
+    /// sees it: m and dj sign-extend their 20 bits, p-like dn and dc zero-extend (silicon:
+    /// bugs/widths for the move, harness/scrub for `st m0` / `st dj0`).
+    pub fn modifier_read_as_scalar(&self, reg: u8) -> u32 {
+        let v = self.modifier_read(reg);
+        if super::register_widths::widths().modifier_reads_signed(reg) && v & 0x8_0000 != 0 {
+            v | 0xFFF0_0000
+        } else {
+            v
+        }
+    }
+
     // === Load Forwarding ===
     //
     // AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard.

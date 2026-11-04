@@ -61,7 +61,6 @@
 
 use crate::interpreter::bundle::{Operand, SlotIndex, SlotOp, SelectVariant};
 use super::memory::agu;
-use crate::interpreter::state::register_widths::widths;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use xdna_archspec::aie2::isa::SemanticOp;
@@ -224,14 +223,7 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
         Operand::PointerReg(r) => ctx.pointer_read(*r),
         // A scalar move out of an m / dn / dj / dc register sign-extends its 20 bits (NPU1
         // silicon: `vec_unpack_addr` reads a negative dj back as base + dj and gets base - 32).
-        Operand::ModifierReg(r) => {
-            let v = ctx.modifier_read(*r);
-            if widths().modifier_reads_signed(*r) && v & 0x8_0000 != 0 {
-                v | 0xFFF0_0000
-            } else {
-                v
-            }
-        }
+        Operand::ModifierReg(r) => ctx.modifier_read_as_scalar(*r),
         Operand::Immediate(v) => *v as u32,
         Operand::VectorReg(r) => {
             // Scalar read of a vector register: extract lane 0 (low 32 bits).
