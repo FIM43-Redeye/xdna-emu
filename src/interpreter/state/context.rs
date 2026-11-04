@@ -644,8 +644,24 @@ impl ExecutionContext {
         scalar.write(super::registers::SRS_OF_REG_INDEX, 0);
         scalar.write(super::registers::UPS_OF_REG_INDEX, 0);
         scalar.write(super::registers::CARRY_REG_INDEX, 0);
+        // Reset at every launch on silicon (probe harness/scrub/step1): every status register
+        // reads 0 and le reads 0xFFFFF (beyond program memory, so a stale lc cannot loop).
+        scalar.write(super::registers::FP_FLAGS_REG_INDEX, 0);
+        scalar.write(super::registers::F2I_FLAGS_REG_INDEX, 0);
+        scalar.write(super::registers::F2F_FLAGS_REG_INDEX, 0);
+        scalar.write(super::registers::LE_REG_INDEX, 0xF_FFFF);
+        // ... and every control register reads 0 except the cascade enables, which read 1.
+        let mut control_raw = [0u32; 16];
+        for name in ["crMCDEn", "crSCDEn"] {
+            match crate::interpreter::decode::register_map::classify_reg_name(name).map(|m| m.operand) {
+                Some(crate::interpreter::bundle::slot::Operand::ControlReg(id)) => {
+                    control_raw[id as usize] = 1
+                }
+                other => unreachable!("{name} maps to {other:?}"),
+            }
+        }
 
-        Self {
+        let mut ctx = Self {
             pc: 0,
             flags: Flags::default(),
             scalar,
@@ -691,9 +707,14 @@ impl ExecutionContext {
             pending_ups_loads: Vec::new(),
             pending_status_flags: Vec::new(),
             srs_config: SrsConfig::default(),
-            control_raw: [0; 16],
+            control_raw,
             pending_control_writes: Vec::new(),
+        };
+        // A scrubbed run starts every core from the values the scrub kernel leaves on silicon.
+        if let Some(init) = super::scrub::CoreInit::from_env() {
+            init.apply(&mut ctx);
         }
+        ctx
     }
 
     /// Create a new context with initial stack pointer.

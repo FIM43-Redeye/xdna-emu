@@ -28,6 +28,7 @@
 
 mod registers;
 pub mod register_widths;
+pub mod scrub;
 pub mod write_collision;
 pub mod scalar_collision;
 mod event_trace;

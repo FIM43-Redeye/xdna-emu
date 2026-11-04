@@ -104,5 +104,9 @@ lto = "thin"
 codegen-units = 8
 
 [[bin]]
+name = "scrub-kernel"
+path = "src/bin/scrub_kernel.rs"
+
+[[bin]]
 name = "collision-check"
 path = "src/bin/collision_check.rs"
