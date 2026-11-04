@@ -12,8 +12,7 @@ rust-version = "1.70"
 # [[bin]] targets below are auxiliary tools selected explicitly via --bin.
 default-run = "xdna-emu"
 
-[lib]
-# Build both a Rust library and a C-compatible shared library
+# Rust library only; the C ABI (libxdna_emu.so) is the separate xdna-emu-ffi crate.
 # The cdylib (libxdna_emu.so) provides FFI for mock XRT integration
 crate-type = ["lib"]
 # Doc tests are enabled but should be run via scripts/run-tests.sh for nice priority

@@ -11,7 +11,6 @@
 *~
 
 # Mock XRT build artifacts
-mock_xrt/build/
 
 # NPU runner build artifacts
 tools/npu-runner/build/
