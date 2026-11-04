@@ -66,6 +66,13 @@ pub enum MacShape {
         cols: u32,
         channels: u32,
     },
+    /// Elementwise complex product of 8 complex numbers (`elem_8`, `elem_8_2`): accumulator lane
+    /// `2n + p` (`p = 0` real part, `p = 1` imaginary part of complex lane `n`) sums `2 * sets`
+    /// products. Product `term = 2t + q` multiplies `A[16t + 2n + q]` by `B[16t + 2n + (q ^ p)]`:
+    /// the real lane pairs re*re with im*im, the imaginary lane re*im with im*re; the sign of the
+    /// im*im term (and the conjugations) come from the config word's term-negation bits.
+    /// Not built by the toolchain header; observed on NPU1 silicon (`docs/fidelity-gaps/mac-conf.md`).
+    ComplexElem { sets: u32 },
 }
 
 impl MacShape {
@@ -76,6 +83,7 @@ impl MacShape {
             MacShape::Elementwise { lanes, .. } => lanes,
             MacShape::Conv { outputs, channels, .. } => outputs * channels,
             MacShape::MultiChannel { rows, cols, channels, .. } => rows * cols * channels,
+            MacShape::ComplexElem { .. } => 16,
         }
     }
 
@@ -85,6 +93,7 @@ impl MacShape {
             MacShape::Matmul { inner, .. } | MacShape::MultiChannel { inner, .. } => inner,
             MacShape::Elementwise { k, .. } => k,
             MacShape::Conv { taps, .. } => taps,
+            MacShape::ComplexElem { sets } => 2 * sets,
         }
     }
 
@@ -112,6 +121,11 @@ impl MacShape {
                 let (r, c) = (tile_lane / cols, tile_lane % cols);
                 ((r * inner + term) * channels + ch, (term * cols + c) * channels + ch)
             }
+            MacShape::ComplexElem { .. } => {
+                let (n, p) = (lane / 2, lane % 2);
+                let (t, q) = (term / 2, term % 2);
+                (16 * t + 2 * n + q, 16 * t + 2 * n + (q ^ p))
+            }
         }
     }
 
@@ -133,6 +147,7 @@ impl MacShape {
             MacShape::MultiChannel { rows, inner, cols, channels } => {
                 (rows * inner * channels, inner * cols * channels)
             }
+            MacShape::ComplexElem { sets } => (16 * sets, 16 * sets),
         }
     }
 }
@@ -305,6 +320,142 @@ pub fn geometry_for(amode: u32, bmode: u32, variant: u32) -> Option<&'static Geo
         .iter()
         .find(|(a, b, v, _)| (*a, *b, *v) == (amode, bmode, variant))
         .map(|(_, _, _, entry)| entry)
+}
+
+/// Geometries NPU1 silicon accepts that the header does not build (the complex elementwise
+/// modes Chess's `mul_elem_8*` / `mul_elem_8_2*` use), keyed like [`CONFIG_GEOMETRY_TABLE`].
+/// Derived from one-hot probes (`tools/gen_mac_conf_probe.py onehot`), see
+/// `docs/fidelity-gaps/mac-conf.md`.
+pub const SILICON_GEOMETRY_TABLE: &[(u32, u32, u32, GeometryEntry)] = &[
+    // cint32 x cint16 -> cacc64: A is 16 32-bit elements, B 16 16-bit elements read.
+    (
+        1,
+        0,
+        1,
+        GeometryEntry {
+            bits_x: 32,
+            bits_y: 16,
+            shape: MacShape::ComplexElem { sets: 1 },
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
+    // cint16 x cint16 -> cacc64 over two sets of 8 complex numbers.
+    (
+        1,
+        3,
+        4,
+        GeometryEntry {
+            bits_x: 16,
+            bits_y: 16,
+            shape: MacShape::ComplexElem { sets: 2 },
+            acc_cmb: 2,
+            bfloat: false,
+            sparse: false,
+        },
+    ),
+];
+
+/// The key a 64-bit accumulator mode (`amode` 1) is decoded with: `bmode` 1 (the `16x16_b`
+/// encoding of `VecConf`) selects the same multiplier mode as `bmode` 3.
+pub const fn canonical_key(amode: u32, bmode: u32, cmode: u32) -> (u32, u32, u32) {
+    if amode == 1 && bmode == 1 {
+        (1, 3, cmode)
+    } else {
+        (amode, bmode, cmode)
+    }
+}
+
+/// The dense integer geometry a config key selects on silicon, if any: the header's dense
+/// integer modes and [`SILICON_GEOMETRY_TABLE`], after [`canonical_key`]. Every other key (sparse
+/// modes on a dense instruction, codes no mode uses) makes the multiplier output zero.
+pub fn dense_integer_geometry(amode: u32, bmode: u32, cmode: u32) -> Option<&'static GeometryEntry> {
+    let (am, bm, cm) = canonical_key(amode, bmode, cmode);
+    geometry_for(am, bm, cm).filter(|e| !e.bfloat && !e.sparse).or_else(|| {
+        SILICON_GEOMETRY_TABLE
+            .iter()
+            .find(|(a, b, c, _)| (*a, *b, *c) == (am, bm, cm))
+            .map(|(_, _, _, e)| e)
+    })
+}
+
+/// How the slot of a term within its lane is chosen, see [`TermNegRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRule {
+    /// Slot 0 for every term.
+    Zero,
+    /// `term`.
+    Term,
+    /// `term >> 1`.
+    TermPair,
+    /// `term & 3`.
+    TermMod4,
+    /// `2 * (term & 1)`.
+    TermParity,
+    /// `(term >> 2 & 1) + 2 * (term & 1)`: 8-term lanes.
+    Terms8,
+    /// `2 * (term >> 1 & 1) + (term >> 3 & 1)`: 16-term lanes.
+    Terms16,
+    /// `2 * half + term`: a 32-bit A element is a low and a high 16-bit half.
+    HalfTerm,
+}
+
+/// Which bit of the config word's `term_neg` field (bits 23:16) negates a partial product.
+///
+/// The 8 bits are the sign controls of 8 slots of the post-adder: `bit = (lane % lane_classes) *
+/// (8 / lane_classes) + slot(term, half)`. A bit negates every product (or, for a 32-bit A
+/// element, every half product) in its slot. Read off NPU1 silicon (`tools/gen_mac_conf_probe.py
+/// termneg`, shared operands, each bit alone, EMU == HW on every code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermNegRule {
+    pub lane_classes: u32,
+    pub slot: SlotRule,
+}
+
+impl TermNegRule {
+    pub const fn bit(&self, lane: u32, term: u32, half: u32) -> u32 {
+        let slot = match self.slot {
+            SlotRule::Zero => 0,
+            SlotRule::Term => term,
+            SlotRule::TermPair => term >> 1,
+            SlotRule::TermMod4 => term & 3,
+            SlotRule::TermParity => 2 * (term & 1),
+            SlotRule::Terms8 => ((term >> 2) & 1) + 2 * (term & 1),
+            SlotRule::Terms16 => 2 * ((term >> 1) & 1) + ((term >> 3) & 1),
+            SlotRule::HalfTerm => 2 * half + term,
+        };
+        (lane % self.lane_classes) * (8 / self.lane_classes) + slot
+    }
+}
+
+/// The term-negation rule of the float-conf multiplier mode (`amode` 2 or 3, `cmode` 0 or 1).
+pub const fn float_conf_term_neg_rule(cmode: u32) -> Option<TermNegRule> {
+    match cmode {
+        0 => Some(TermNegRule { lane_classes: 2, slot: SlotRule::TermMod4 }),
+        1 => Some(TermNegRule { lane_classes: 2, slot: SlotRule::Term }),
+        _ => None,
+    }
+}
+
+/// The term-negation rule of a dense integer config key (after [`canonical_key`]), `None` for
+/// keys whose multiplier output is zero or that were not probed (sparse modes).
+pub fn term_neg_rule(amode: u32, bmode: u32, cmode: u32) -> Option<TermNegRule> {
+    use SlotRule::*;
+    let (lane_classes, slot) = match canonical_key(amode, bmode, cmode) {
+        (0, 0, 0) => (2, Terms16),
+        (0, 1, 0) | (0, 1, 3) | (0, 1, 4) => (2, Terms8),
+        (0, 1, 1) => (2, Zero),
+        (0, 1, 2) => (2, TermParity),
+        (0, 2, 0) | (0, 2, 1) => (4, TermPair),
+        (0, 3, 0) => (4, Term),
+        (0, 3, 1) => (4, Zero),
+        (1, 0, 0) | (1, 0, 1) => (2, HalfTerm),
+        (1, 2, 0) | (1, 2, 1) => (2, TermPair),
+        (1, 3, 0..=4) => (2, Term),
+        _ => return None,
+    };
+    Some(TermNegRule { lane_classes, slot })
 }
 
 /// Dense (non-sparse) geometries, in config-key order.

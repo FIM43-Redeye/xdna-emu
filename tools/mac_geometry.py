@@ -82,3 +82,71 @@ def lane_products(g, a, b, sx, sy):
 def pack_lanes(vals, cmb):
     w = 32 * cmb
     return b"".join((v & ((1 << w) - 1)).to_bytes(w // 8, "little") for v in vals)
+
+
+# -- silicon-only geometries (not in the header table) ----------------------------------------
+# kind "ComplexElem": 8 complex lanes (acc64 lane 2n+p); term = 2t+q; A index 16t+2n+q, B index 16t+2n+(q^p).
+# kind "FloatConf": amode >= 2 on the integer multiply: low byte of 16-bit elements, each product wrapped to 14 bits signed.
+def silicon_geometry(code):
+    am, bm, cm = code & 3, (code >> 2) & 3, code >> 4
+    if am == 1 and bm == 1:
+        bm = 3
+    if (am, bm, cm) == (1, 0, 1):
+        return dict(bits_x=32, bits_y=16, kind="ComplexElem", p=dict(sets=1), acc_cmb=2, bfloat=False, sparse=False)
+    if (am, bm, cm) == (1, 3, 4):
+        return dict(bits_x=16, bits_y=16, kind="ComplexElem", p=dict(sets=2), acc_cmb=2, bfloat=False, sparse=False)
+    if am >= 2 and cm == 0:
+        return dict(bits_x=16, bits_y=16, kind="FloatConf", p=dict(rows=4, inner=8, cols=4), acc_cmb=1, bfloat=False, sparse=False)
+    if am >= 2 and cm == 1:
+        return dict(bits_x=16, bits_y=16, kind="FloatConf", p=dict(lanes=16, k=2), acc_cmb=1, bfloat=False, sparse=False)
+    g = load_table().get((am, bm, cm))
+    return g if g and not g["bfloat"] and not g["sparse"] else None
+
+
+def terms_of(g, a, b, sx, sy):
+    """products[lane][term] for any silicon_geometry, as the multiplier array forms them."""
+    k = g["kind"]
+    if k == "ComplexElem":
+        A = elements(a, g["bits_x"], sx)
+        B = elements(b, g["bits_y"], sy)
+        sets = g["p"]["sets"]
+        out = []
+        for lane in range(16):
+            n, pp = divmod(lane, 2)
+            out.append([A[16 * (t // 2) + 2 * n + t % 2] * B[16 * (t // 2) + 2 * n + ((t % 2) ^ pp)] for t in range(2 * sets)])
+        return out
+    if k == "FloatConf":
+        A = list(a[0::2])
+        B = list(b[0::2])
+        p = g["p"]
+        w14 = lambda x: wrap(x, 14)
+        if "rows" in p:
+            return [[w14(A[(l // 4) * 8 + t] * B[t * 4 + l % 4]) for t in range(8)] for l in range(16)] + [[0] for _ in range(16)]
+        return [[w14(A[l + 16 * t] * B[l + 16 * t]) for t in range(2)] for l in range(16)] + [[0] for _ in range(16)]
+    return lane_products(g, a, b, sx, sy)
+
+
+def term_operands(g, a, b, sx, sy):
+    """operands[lane][term] = (A element, B element) for any silicon_geometry except FloatConf."""
+    k = g["kind"]
+    A = elements(a, g["bits_x"], sx)
+    B = elements(b, g["bits_y"], sy)
+    if k == "ComplexElem":
+        sets = g["p"]["sets"]
+        out = []
+        for lane in range(16):
+            n, pp = divmod(lane, 2)
+            out.append([(A[16 * (t // 2) + 2 * n + t % 2], B[16 * (t // 2) + 2 * n + ((t % 2) ^ pp)]) for t in range(2 * sets)])
+        return out
+    lanes, terms = lanes_terms(g)
+    return [[(A[operand_indices(g, l, t)[0]], B[operand_indices(g, l, t)[1]]) for t in range(terms)] for l in range(lanes)]
+
+
+def split_parts(g, a_el, b_el):
+    """The partial products one term's product is formed from. A 32-bit A element is two 16-bit
+    halves (low unsigned, high signed/unsigned as the element); everything else is one part."""
+    if g["bits_x"] == 32:
+        lo = a_el & 0xFFFF
+        hi = a_el >> 16
+        return [lo * b_el, (hi * b_el) << 16]
+    return [a_el * b_el]

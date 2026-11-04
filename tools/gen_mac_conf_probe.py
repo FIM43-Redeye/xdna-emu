@@ -214,15 +214,16 @@ def valid_codes():
 
 
 def plan_termneg(rng):
-    """Each term_neg bit alone, on every valid code: which products does it negate?"""
+    """Each term_neg bit alone, on every valid code, all on one shared operand set per code
+    (so out(base) - out(bit) is twice the negated part)."""
     out = []
     for code in valid_codes():
-        confs = []
+        a = bytes(rng.getrandbits(8) for _ in range(64))
+        b = bytes(rng.getrandbits(8) for _ in range(64))
+        confs = [code << 1 | 3 << 8]
         for bit in range(8):
-            for _ in range(2):
-                confs.append(code << 1 | 3 << 8 | 1 << (16 + bit))
-        confs.append(code << 1 | 3 << 8)
-        out += cases_for("mul", f"termneg{code:03d}", confs, rng)
+            confs.append(code << 1 | 3 << 8 | 1 << (16 + bit))
+        out += cases_for("mul", f"termneg{code:03d}", confs, rng, operands=lambda i, a=a, b=b: dict(a=a, b=b))
     return out
 
 

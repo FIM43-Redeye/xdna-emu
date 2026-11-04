@@ -35,7 +35,7 @@ use helpers::*;
 use sparse::{Image, SparseCombine};
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
-use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
+use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig, Multiplier};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::matmul::MacOpKind;
@@ -147,6 +147,14 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         Operand::SparseQxReg(n) => Some((pos, *n)),
         _ => None,
     });
+    // A sparse geometry on a dense instruction has no sparse operand to read: the multiplier
+    // outputs zero products (silicon, `docs/fidelity-gaps/mac-conf.md`).
+    if qx.is_none() && config.sparse {
+        config = MatMulConfig { sparse: false, ..MatMulConfig::idle((conf_val >> 1) & 3) };
+        config.accumulate = (conf_val & 1) == 0;
+        config.x_signed = (conf_val >> 9) & 1 != 0;
+        config.y_signed = (conf_val >> 8) & 1 != 0;
+    }
     if qx.is_some() != config.sparse {
         log::warn!(
             "[NOT MODELED] {:?}: sparse operand {} but config word 0x{:08x} selects a {} geometry",
@@ -710,9 +718,16 @@ fn element_offset(index: u32, bits: u32) -> usize {
     }
 }
 
+/// The signed value of the low `bits` bits of `v`.
+fn sign_extend(v: i64, bits: u32) -> i64 {
+    (v << (64 - bits)) >> (64 - bits)
+}
+
 /// Config-driven full-width integer multiply: every accumulator lane sums the
 /// products its geometry names (`MacShape::operand_indices`), whatever the
-/// kind (matrix tile, elementwise, convolution, multi-channel).
+/// kind (matrix tile, elementwise, convolution, multi-channel), with the config
+/// word's `term_neg` bits negating the partial products of their slots
+/// (`xdna_archspec::aie2::matmul::TermNegRule`).
 ///
 /// Float (`config.bfloat`) configs take the bf16 datapath.
 pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &MatMulConfig) {
@@ -727,14 +742,48 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &Ma
     if !config.accumulate {
         *acc = [0u64; 16];
     }
+    if config.multiplier == Multiplier::Idle {
+        return;
+    }
+    let negated = |lane: u32, term: u32, half: u32| {
+        config
+            .term_neg_rule
+            .is_some_and(|rule| config.term_neg >> rule.bit(lane, term, half) & 1 != 0)
+    };
 
     for lane in 0..shape.lanes() {
         let mut sum: i64 = 0;
         for term in 0..shape.terms() {
             let (ia, ib) = shape.operand_indices(lane, term);
+            if config.multiplier == Multiplier::FloatConf {
+                // The low bytes of 16-bit elements, the product kept to 14 signed bits.
+                let a_val = extract_element_512(a, element_offset(ia, 16), 16, false) & 0xFF;
+                let b_val = extract_element_512(b, element_offset(ib, 16), 16, false) & 0xFF;
+                let product = sign_extend(a_val * b_val, 14);
+                sum += if negated(lane, term, 0) { -product } else { product };
+                continue;
+            }
             let a_val = extract_element_512(a, element_offset(ia, bits_x), bits_x, config.x_signed);
             let b_val = extract_element_512(b, element_offset(ib, bits_y), bits_y, config.y_signed);
-            sum += a_val * b_val;
+            if bits_x == 32 {
+                // A 32-bit element is multiplied as two 16-bit halves, each with its own sign slot.
+                let (lo, hi) = (a_val & 0xFFFF, a_val >> 16);
+                let lo_product = lo * b_val;
+                let hi_product = (hi * b_val) << 16;
+                sum += if negated(lane, term, 0) {
+                    -lo_product
+                } else {
+                    lo_product
+                };
+                sum += if negated(lane, term, 1) {
+                    -hi_product
+                } else {
+                    hi_product
+                };
+            } else {
+                let product = a_val * b_val;
+                sum += if negated(lane, term, 0) { -product } else { product };
+            }
         }
 
         let out_idx = lane as usize;

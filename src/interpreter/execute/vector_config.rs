@@ -30,7 +30,10 @@
 //! `aiev2_compute_control()` from the same header.
 
 use crate::interpreter::bundle::ElementType;
-use xdna_archspec::aie2::matmul::{dense_geometries, geometry_for, sparse_geometries, GeometryEntry, MacShape};
+use xdna_archspec::aie2::matmul::{
+    canonical_key, dense_geometries, dense_integer_geometry, float_conf_term_neg_rule, geometry_for,
+    sparse_geometries, term_neg_rule, GeometryEntry, MacShape, TermNegRule,
+};
 
 /// Accumulator width mode, determined by `acc_cmb` in the mult mode.
 ///
@@ -93,6 +96,27 @@ pub struct MatMulConfig {
     /// See `bits_x` for rationale. Critical for i8xi4 mode where
     /// `b_type` is Int8 but the actual element width is 4 bits.
     pub bits_y: u32,
+    /// Config-word `term_neg` field (bits 23:16): sign controls of the post-adder's term slots.
+    pub term_neg: u8,
+    /// Which bit negates which partial product, for the geometry (`None`: no rule, the field has
+    /// no effect on this mode).
+    pub term_neg_rule: Option<TermNegRule>,
+    /// What produces the products.
+    pub multiplier: Multiplier,
+}
+
+/// What the multiplier array does under a config word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Multiplier {
+    /// The integer array with the lane map of `shape`.
+    Array,
+    /// `amode` 2 or 3 on an integer instruction (the float multiplier mode): the lane map of
+    /// `shape` over the low byte of 16-bit elements, each product wrapped to 14 bits (signed).
+    /// The result fills 16 32-bit lanes; the rest of the accumulator is zero. Silicon-derived
+    /// (`docs/fidelity-gaps/mac-conf.md`).
+    FloatConf,
+    /// A key no mode uses (or a sparse mode on a dense instruction): every product is zero.
+    Idle,
 }
 
 impl MatMulConfig {
@@ -152,6 +176,9 @@ impl MatMulConfig {
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
+            term_neg: 0,
+            term_neg_rule: None,
+            multiplier: Multiplier::Array,
         })
     }
 
@@ -203,6 +230,9 @@ impl MatMulConfig {
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
+            term_neg: 0,
+            term_neg_rule: None,
+            multiplier: Multiplier::Array,
         })
     }
 
@@ -278,24 +308,60 @@ impl MatMulConfig {
         let variant = (conf >> 5) & 7;
         let sgn_y = ((conf >> 8) & 1) != 0;
         let sgn_x = ((conf >> 9) & 1) != 0;
-        let _shift16 = ((conf >> 10) & 1) != 0;
         let sub0 = ((conf >> 11) & 1) != 0;
         let sub1 = ((conf >> 12) & 1) != 0;
         let sub2 = ((conf >> 13) & 1) != 0;
+        let term_neg = (conf >> 16) as u8;
 
-        let entry = if is_bf16 {
-            lookup_bf16_geometry(variant)
+        let mut config = if is_bf16 {
+            let entry = lookup_bf16_geometry(variant)?;
+            Self::from_entry(entry, Multiplier::Array)
+        } else if amode >= 2 {
+            // The float multiplier mode on an integer instruction; bmode is ignored.
+            let (shape, rule) = match variant {
+                0 => (MacShape::Matmul { rows: 4, inner: 8, cols: 4 }, float_conf_term_neg_rule(0)),
+                1 => (MacShape::Elementwise { lanes: 16, k: 2 }, float_conf_term_neg_rule(1)),
+                _ => return Some(Self::idle(amode)),
+            };
+            let mut c = Self::from_entry(
+                &GeometryEntry { bits_x: 16, bits_y: 16, shape, acc_cmb: 1, bfloat: false, sparse: false },
+                Multiplier::FloatConf,
+            );
+            c.term_neg_rule = rule;
+            c
         } else {
-            lookup_integer_geometry(amode, bmode, variant)
-        }?;
+            // The header's modes (dense and sparse; a sparse one on a dense instruction is
+            // demoted to `Idle` by the caller) and the silicon-only complex modes.
+            let key = canonical_key(amode, bmode, variant);
+            match geometry_for(key.0, key.1, key.2)
+                .filter(|e| !e.bfloat)
+                .or_else(|| dense_integer_geometry(amode, bmode, variant))
+            {
+                Some(entry) => {
+                    let mut c = Self::from_entry(entry, Multiplier::Array);
+                    c.term_neg_rule = term_neg_rule(amode, bmode, variant);
+                    c
+                }
+                None => Self::idle(amode),
+            }
+        };
+        config.accumulate = !zero_acc;
+        config.x_signed = sgn_x;
+        config.y_signed = sgn_y;
+        config.subtract = sub0;
+        config.sub_acc1 = sub1;
+        config.sub_acc2 = sub2;
+        config.term_neg = term_neg;
+        Some(config)
+    }
 
+    fn from_entry(entry: &GeometryEntry, multiplier: Multiplier) -> Self {
         let (a_type, b_type) = element_types_from_entry(entry);
-
-        Some(Self {
+        Self {
             shape: entry.shape,
-            accumulate: !zero_acc,
-            x_signed: sgn_x,
-            y_signed: sgn_y,
+            accumulate: true,
+            x_signed: false,
+            y_signed: false,
             a_type,
             b_type,
             acc_width: if entry.acc_cmb == 2 {
@@ -304,22 +370,32 @@ impl MatMulConfig {
                 AccWidth::Acc32
             },
             bfloat: entry.bfloat,
+            subtract: false,
+            sub_acc1: false,
+            sub_acc2: false,
+            sparse: entry.sparse,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
-            subtract: sub0,
-            sub_acc1: sub1,
-            sub_acc2: sub2,
-            sparse: entry.sparse,
-        })
+            term_neg: 0,
+            term_neg_rule: None,
+            multiplier,
+        }
     }
-}
 
-/// Look up geometry for integer MAC from config word fields.
-///
-/// The extracted table also holds the bfloat16 geometries (amode 2); those
-/// are reached through `lookup_bf16_geometry`, not through integer fields.
-fn lookup_integer_geometry(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
-    geometry_for(amode, bmode, variant).filter(|entry| !entry.bfloat)
+    /// A key that selects no multiplier mode: every product is zero. The accumulator lanes are
+    /// 64-bit under `amode` 1 and 32-bit otherwise.
+    pub fn idle(amode: u32) -> Self {
+        let lanes = if amode == 1 { 16 } else { 32 };
+        let entry = GeometryEntry {
+            bits_x: 8,
+            bits_y: 8,
+            shape: MacShape::Elementwise { lanes, k: 1 },
+            acc_cmb: if amode == 1 { 2 } else { 1 },
+            bfloat: false,
+            sparse: false,
+        };
+        Self::from_entry(&entry, Multiplier::Idle)
+    }
 }
 
 /// aiev2_vmult.h gives every bfloat16 intrinsic amode 2 and bmode 3.
