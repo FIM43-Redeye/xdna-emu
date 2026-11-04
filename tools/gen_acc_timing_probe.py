@@ -21,12 +21,18 @@ directions and two reference points per pair (d = REF_DISTANCE) give the
 all-OLD (WAR) and all-NEW (RAW) records, so no value is computed by a model:
 each output word is classified by comparing it with those two records.
 
+WAW point (signed s): two writers of R, A issued s bundles after B (s = 0 shares one bundle),
+then R is stored. The references s = -REF_DISTANCE (B lands last: OLD) and s = +REF_DISTANCE
+(A lands last: NEW) classify every word; A's value wins exactly when s >= t, t = w_B - w_A plus
+the same-cycle tie. It pins the landing order of writers that have no direct reader in common,
+such as an accumulator load against a MAC result.
+
 The input table (operands, masks, OLD/NEW source patterns) is the same for every
 kernel. A kernel packs several pairs; each point writes one RECORD_BYTES record.
 
 Usage
 -----
-  python3 tools/gen_acc_timing_probe.py generate <out-dir> [--pairs SPEC ...]
+  python3 tools/gen_acc_timing_probe.py generate <out-dir> [--pairs SPEC ...] [--waw A:B ...]
   python3 -m harness suite build|hw|emu|compare <out-dir> ...   (PYTHONPATH=tools)
 """
 
@@ -116,6 +122,9 @@ TABLE_ITEMS = [
     ("U_f", _float_pattern(0x4200)),
     ("NEWX_i", _u32s([0x200 + k if k % 2 == 0 else 0 for k in range(16)])),
     ("NEWX_f", _u32s([(0x3FC0 + k) << 16 for k in range(16)])),
+    # what the accumulator loads (`vlda am`, `vlda.conv`) bring in, distinct from every other source
+    ("LD_i", _u32s([0x9000 + k if k % 2 == 0 else 0 for k in range(16)])),
+    ("LD_f", _u32s([(0x4140 + k) << 16 for k in range(16)])),
 ]
 MASK_ITEMS = [
     ("Q1", bytes((0x5A + 37 * k) & 0xFF for k in range(16))),
@@ -197,6 +206,13 @@ PRODUCERS = [
     Producer("vadd_i", "vadd cm0, cm2, cm4, r1", "i"),
     Producer("vups", "vups.s32.s16 bml0, wl10, s3", None),
     Producer("vlda_ups", "vlda.ups.s32.s16 bml0, s3, [p4, #0]", None),
+    # plain accumulator loads (p5 addresses LD_<dom>): a quarter each, and the fused bf16 convert
+    Producer("vlda_amll", "vlda amll0, [p5, #0]", None),
+    Producer("vlda_amlh", "vlda amlh0, [p5, #32]", None),
+    Producer("vlda_conv", "vlda.conv.fp32.bf16 bml0, [p5, #0]", "f"),
+    # narrow (one-quarter) writers that are not loads, for the write-after-write lane question
+    Producer("vmov_amll_q", "vmov amll0, q1", None),
+    Producer("vmov_amlh_q", "vmov amlh0, q1", None),
 ]
 
 CONSUMERS = [
@@ -310,6 +326,7 @@ def pair_preamble(dom: str) -> list[str]:
     lines += load_vec("wh10", f"NEWX_{dom}", 1)
     # p4 addresses the NEWX item for the fused load-and-ups producer.
     lines += ["  mov p4, p0", f"  padda [p4], #{TABLE_OFFSETS[f'NEWX_{dom}']}"]
+    lines += ["  mov p5, p0", f"  padda [p5], #{TABLE_OFFSETS[f'LD_{dom}']}"]
     lines += nops(LOAD_NOPS)
     return lines
 
@@ -432,6 +449,81 @@ def kernel_text(pairs: list[tuple[str, str]], sweep=None) -> tuple[str, list[dic
     return isa_gen.build_mega_program(test_points, out_size), points
 
 
+# --------------------------------------------------------------------------
+# Write-after-write points
+# --------------------------------------------------------------------------
+
+WAW_DISTANCES = tuple(range(-9, 10))
+# B writers: every one writes R (cm0 or its low half) without reading it.
+WAW_PARTNERS = ("vmul_f_dense", "vmac_f_dense", "vadd_f", "vmul_i_dense", "vmac_i_dense",
+                "vadd_i", "vmov_bm_x", "vmov_bm_bm", "vmov_cm_cm", "vups", "vlda_ups", "vclr_cm")
+# A writers (the subject of a WAW pair): the accumulator loads, and two narrow moves as controls
+WAW_LOADS = ("vlda_amll", "vlda_amlh", "vlda_conv", "vmov_amll_q", "vmov_amlh_q")
+
+
+def waw_dom(a: Producer, b: Producer) -> Optional[str]:
+    if a.dom and b.dom and a.dom != b.dom:
+        return None
+    return a.dom or b.dom or "i"
+
+
+def valid_waw_pairs() -> list[tuple[str, str]]:
+    return [(a, b) for a in WAW_LOADS for b in WAW_PARTNERS
+            if waw_dom(PRODUCER_BY_NAME[a], PRODUCER_BY_NAME[b])]
+
+
+def parse_waw(specs: list[str]) -> list[tuple[str, str]]:
+    """`A:B` pairs with `*` wildcards over WAW_LOADS x WAW_PARTNERS."""
+    out: list[tuple[str, str]] = []
+    for spec in specs:
+        an, bn = spec.split(":")
+        for pair in valid_waw_pairs():
+            if an in ("*", pair[0]) and bn in ("*", pair[1]) and pair not in out:
+                out.append(pair)
+    return out
+
+
+def waw_sweep() -> list[int]:
+    """References first (B last, then A last), then the signed distances."""
+    return [-REF_DISTANCE, REF_DISTANCE] + list(WAW_DISTANCES)
+
+
+def waw_point_lines(a: Producer, b: Producer, s: int, dom: str) -> list[str]:
+    lines = [f"  // ---- point: {a.name} after {b.name} s={s} ----"]
+    lines += load_acc_pair("0", f"OLD_{dom}", "s3")
+    lines += nops(SETTLE_BEFORE)
+    first, second = (b, a) if s >= 0 else (a, b)
+    if s == 0:
+        lines.append(f"  {b.asm} ; {a.asm}")
+    else:
+        lines += ["  " + first.asm] + nops(abs(s) - 1) + ["  " + second.asm]
+    lines += nops(SETTLE_AFTER)
+    for k, q in enumerate(("amll", "amlh", "amhl", "amhh")):
+        lines.append(f"  vst {q}0, [p1, #{32 * k}]")
+    lines += nops(4)
+    lines += ["  padda [p1], #%d" % RECORD_BYTES] + nops(4)
+    return lines
+
+
+def waw_kernel_text(pairs: list[tuple[str, str]]) -> tuple[str, list[dict]]:
+    points: list[dict] = []
+    test_points: list[str] = ["\n".join(prologue())]
+    for an, bn in pairs:
+        a, b = PRODUCER_BY_NAME[an], PRODUCER_BY_NAME[bn]
+        dom = waw_dom(a, b)
+        assert dom, (an, bn)
+        test_points.append("\n".join([f"  // ==== WAW {an} vs {bn} (dom {dom}) ===="]
+                                      + pair_preamble(dom)))
+        for s in waw_sweep():
+            if s == 0 and not can_share_bundle(b.asm, a.asm):
+                continue
+            test_points.append("\n".join(waw_point_lines(a, b, s, dom)))
+            points.append({"producer": an, "consumer": bn, "dir": "WAW", "d": s,
+                           "record": len(points)})
+    out_size = max(4, len(points) * RECORD_BYTES)
+    return isa_gen.build_mega_program(test_points, out_size), points
+
+
 def kernel_geometry(points: list[dict]) -> dict:
     return {"in_size": IN_SIZE, "out_size": max(4, len(points) * RECORD_BYTES)}
 
@@ -456,14 +548,19 @@ def chunk(pairs, size):
     return [pairs[i:i + size] for i in range(0, len(pairs), size)]
 
 
-def generate(out_dir: str, pairs: list[tuple[str, str]], pairs_per_kernel: int) -> dict:
-    """Write a suite (harness/suite.py): one case per kernel, `case.json` = {name, points, sizes}."""
+def generate(out_dir: str, pairs: list[tuple[str, str]], pairs_per_kernel: int,
+             waw_pairs: Optional[list[tuple[str, str]]] = None) -> dict:
+    """Write a suite (harness/suite.py): one case per kernel, `case.json` = {name, points, sizes}.
+    Producer/consumer kernels are `k<n>`, write-after-write kernels `w<n>`."""
     os.makedirs(out_dir, exist_ok=True)
     table = TABLE_BYTES.ljust(IN_SIZE, b"\0")
     kernels = []
-    for k, group in enumerate(chunk(pairs, pairs_per_kernel)):
-        text, points = kernel_text(group)
-        entry = {"name": f"k{k:03d}", "points": points, **kernel_geometry(points)}
+    jobs = [(f"k{k:03d}", kernel_text, g) for k, g in enumerate(chunk(pairs, pairs_per_kernel))]
+    jobs += [(f"w{k:03d}", waw_kernel_text, g)
+             for k, g in enumerate(chunk(waw_pairs or [], pairs_per_kernel))]
+    for name, text_of, group in jobs:
+        text, points = text_of(group)
+        entry = {"name": name, "points": points, **kernel_geometry(points)}
         suite.write_single_core_case(out_dir, entry["name"], text, input_bytes=table,
                                      out_bytes=entry["out_size"], meta=entry)
         kernels.append(entry)
@@ -478,7 +575,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate")
     g.add_argument("out_dir")
-    g.add_argument("--pairs", nargs="+", default=["*:*"])
+    g.add_argument("--pairs", nargs="*", default=["*:*"])
+    g.add_argument("--waw", nargs="*", default=[], metavar="A:B",
+                   help="write-after-write pairs of a load A and a writer B (* wildcards)")
     g.add_argument("--pairs-per-kernel", type=int, default=3)
     sub.add_parser("list")
     args = ap.parse_args(argv)
@@ -486,7 +585,7 @@ def main(argv=None):
         for p, c in valid_pairs():
             print(p, c)
         return 0
-    m = generate(args.out_dir, parse_pairs(args.pairs), args.pairs_per_kernel)
+    m = generate(args.out_dir, parse_pairs(args.pairs), args.pairs_per_kernel, parse_waw(args.waw))
     print(f"{len(m['kernels'])} kernels, "
           f"{sum(len(k['points']) for k in m['kernels'])} points")
     return 0

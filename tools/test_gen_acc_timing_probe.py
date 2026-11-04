@@ -58,6 +58,44 @@ class TestSweep:
         assert f"{c.asm} ; {p.asm}" in war
 
 
+class TestWaw:
+    def test_partners_write_r_without_reading_it(self):
+        for b in gen.WAW_PARTNERS:
+            asm = gen.PRODUCER_BY_NAME[b].asm
+            dest, *srcs = asm.split(None, 1)[1].split(",")
+            assert dest.strip() in ("bml0", "cm0"), asm
+            assert not any(s.strip() in ("bml0", "cm0", "bmh0") for s in srcs), asm
+
+    def test_subjects_write_r_from_their_own_source(self):
+        for a in gen.WAW_LOADS:
+            asm = gen.PRODUCER_BY_NAME[a].asm
+            dest, src = asm.split(None, 1)[1].split(",", 1)
+            assert dest in ("amll0", "amlh0", "bml0") and ("[p5" in src or src.strip() == "q1"), asm
+
+    def test_sweep_has_both_references_first_and_every_signed_distance(self):
+        sw = gen.waw_sweep()
+        assert sw[:2] == [-gen.REF_DISTANCE, gen.REF_DISTANCE]
+        assert set(sw[2:]) == set(range(-9, 10))
+
+    def test_point_orders_the_writers_by_the_sign_of_s(self):
+        a, b = gen.PRODUCER_BY_NAME["vlda_amlh"], gen.PRODUCER_BY_NAME["vmul_f_dense"]
+        later = "\n".join(gen.waw_point_lines(a, b, 3, "f"))
+        assert later.index(b.asm) < later.index(a.asm)
+        assert later[later.index(b.asm):later.index(a.asm)].count("nop") == 2
+        earlier = "\n".join(gen.waw_point_lines(a, b, -2, "f"))
+        assert earlier.index(a.asm) < earlier.index(b.asm)
+        assert f"{b.asm} ; {a.asm}" in "\n".join(gen.waw_point_lines(a, b, 0, "f"))
+
+    def test_float_only_loads_pair_only_with_float_or_neutral_writers(self):
+        pairs = gen.valid_waw_pairs()
+        assert ("vlda_conv", "vmul_i_dense") not in pairs
+        assert ("vlda_conv", "vmul_f_dense") in pairs and ("vlda_amll", "vmul_i_dense") in pairs
+
+    def test_spec_expansion(self):
+        assert gen.parse_waw(["vlda_amlh:vmul_f_dense"]) == [("vlda_amlh", "vmul_f_dense")]
+        assert {b for _, b in gen.parse_waw(["vlda_amll:*"])} == set(gen.WAW_PARTNERS)
+
+
 @pytest.mark.skipif(not os.path.exists(gen.LLVM_MC), reason="llvm-mc not built")
 class TestAssembles:
     def test_a_kernel_with_every_producer_and_consumer_assembles(self):
@@ -73,6 +111,17 @@ class TestAssembles:
                 r = subprocess.run([gen.LLVM_MC, "--triple=aie2", "--filetype=obj", "-o",
                                     os.path.join(tmp, "k.o"), src], capture_output=True, text=True)
                 assert r.returncode == 0, (p, c, r.stderr[:400])
+
+    def test_every_waw_pair_assembles(self):
+        for pair in gen.valid_waw_pairs():
+            text, points = gen.waw_kernel_text([pair])
+            assert len(points) >= len(gen.waw_sweep()) - 1
+            with tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "k.s")
+                open(src, "w").write(text)
+                r = subprocess.run([gen.LLVM_MC, "--triple=aie2", "--filetype=obj", "-o",
+                                    os.path.join(tmp, "k.o"), src], capture_output=True, text=True)
+                assert r.returncode == 0, (pair, r.stderr[:400])
 
 
 class TestAnalysis:
@@ -119,6 +168,26 @@ class TestAnalysis:
         pts += [(self.pt("RAW", d), self.NEW if d >= 3 else self.OLD) for d in range(1, 10)]
         res = an.analyze_pair(pts)
         assert {w["t"] for w in res["words"].values()} == {3}
+
+
+class TestWawAnalysis(TestAnalysis):
+    def waw_sweep(self, threshold):
+        pts = [(self.pt("WAW", -gen.REF_DISTANCE), self.OLD), (self.pt("WAW", gen.REF_DISTANCE), self.NEW)]
+        pts += [(self.pt("WAW", s), self.NEW if s >= threshold else self.OLD) for s in range(-9, 10)]
+        return pts
+
+    def test_waw_threshold_is_the_first_signed_distance_where_a_wins(self):
+        for t in (-2, -1, 0, 1):
+            res = an.analyze_pair(self.waw_sweep(t))
+            assert {w["t"] for w in res["words"].values()} == {t}
+            assert all(w["ok"] for w in res["words"].values())
+
+
+class TestPairKey:
+    def test_waw_points_never_merge_with_a_consumer_of_the_same_name(self):
+        rw = {"producer": "vlda_amll", "consumer": "vmov_cm_cm", "dir": "RAW", "d": 3}
+        waw = {"producer": "vlda_amll", "consumer": "vmov_cm_cm", "dir": "WAW", "d": 3}
+        assert an.pair_key(rw) != an.pair_key(waw)
 
 
 class TestFit:

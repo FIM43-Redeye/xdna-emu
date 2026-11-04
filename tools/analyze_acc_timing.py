@@ -3,7 +3,8 @@
 
 For each (producer, consumer) pair the WAR reference point (d = REF_DISTANCE: the consumer reads
 long before the producer lands) is the all-OLD record and the RAW reference point is the all-NEW
-record. Every other record word is classified against them:
+record; for a write-after-write pair (A, B) the references are s = -REF_DISTANCE (B lands last,
+OLD) and s = +REF_DISTANCE (A lands last, NEW). Every other record word is classified against them:
 
   O  the OLD word        N  the NEW word        .  OLD and NEW coincide (word carries no information)
   X  neither (a mixed or otherwise unexplained value)
@@ -35,7 +36,12 @@ def load_records(d, tag, kernel):
 
 
 def signed_distance(point):
-    return point["d"] if point["dir"] == "RAW" else -point["d"]
+    """RAW: +d, WAR: -d; WAW points carry their signed distance (A after B) in d."""
+    return point["d"] if point["dir"] in ("RAW", "WAW") else -point["d"]
+
+
+def is_reference(point):
+    return abs(point["d"]) == REF_DISTANCE or point["dir"] == "CONLY"
 
 
 def classify(rec, old, new):
@@ -52,13 +58,20 @@ def classify(rec, old, new):
     return "".join(out)
 
 
+def pair_key(point):
+    """(producer, consumer); a write-after-write partner is named `WAW <writer>` so it never merges
+    with the producer/consumer pair of the same two names."""
+    second = point["consumer"]
+    return point["producer"], (f"WAW {second}" if point["dir"] == "WAW" else second)
+
+
 def group_pairs(kernels, tag, d):
     """(producer, consumer) -> list of (point, record) in record order."""
     pairs: dict = {}
     for k in kernels:
         recs = load_records(d, tag, k)
         for pt, rec in zip(k["points"], recs):
-            pairs.setdefault((pt["producer"], pt["consumer"]), []).append((pt, rec))
+            pairs.setdefault(pair_key(pt), []).append((pt, rec))
     return pairs
 
 
@@ -70,11 +83,16 @@ def analyze_pair(points):
             old = rec
         if pt["d"] == REF_DISTANCE and pt["dir"] == "RAW":
             new = rec
+        if pt["dir"] == "WAW" and abs(pt["d"]) == REF_DISTANCE:
+            if pt["d"] < 0:
+                old = rec
+            else:
+                new = rec
     if old is None or new is None:
         return {"error": "missing reference"}
     sweep = sorted(((signed_distance(pt), classify(rec, old, new))
                     for pt, rec in points
-                    if pt["d"] != REF_DISTANCE and pt["dir"] != "CONLY"), key=lambda t: t[0])
+                    if not is_reference(pt)), key=lambda t: t[0])
     informative = [i for i in range(RECORD_WORDS) if old[i] != new[i]]
     words = {}
     for i in informative:
