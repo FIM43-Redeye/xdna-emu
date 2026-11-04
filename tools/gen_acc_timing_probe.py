@@ -122,7 +122,11 @@ TABLE_ITEMS = [
     ("U_f", _float_pattern(0x4200)),
     ("NEWX_i", _u32s([0x200 + k if k % 2 == 0 else 0 for k in range(16)])),
     ("NEWX_f", _u32s([(0x3FC0 + k) << 16 for k in range(16)])),
-    # what the accumulator loads (`vlda am`, `vlda.conv`) bring in, distinct from every other source
+]
+# What the accumulator loads (`vlda am`, `vlda.conv`) bring in, distinct from every other source.
+# Kept out of TABLE_ITEMS (gen_collision_probe.py builds its table from that list) and appended
+# last, so the offsets of every earlier item are unchanged.
+LOAD_ITEMS = [
     ("LD_i", _u32s([0x9000 + k if k % 2 == 0 else 0 for k in range(16)])),
     ("LD_f", _u32s([(0x4140 + k) << 16 for k in range(16)])),
 ]
@@ -141,7 +145,7 @@ def build_table() -> tuple[bytes, dict[str, int]]:
         buf += data
     while len(buf) % 32:
         buf.append(0)
-    for name, data in TABLE_ITEMS:
+    for name, data in TABLE_ITEMS + LOAD_ITEMS:
         offsets[name] = len(buf)
         buf += data
         while len(buf) % 32:
