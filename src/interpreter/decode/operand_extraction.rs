@@ -199,6 +199,7 @@ impl InstructionDecoder {
             &sources,
             &source_forward,
             &defs,
+            encoding.may_load,
         );
 
         // Build a minimal DecodedInstr with empty raw operands (we don't need

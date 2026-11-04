@@ -8,6 +8,10 @@
 //! * the unit that writes its result into the vector or accumulator register file, and
 //! * the unit(s) it holds in the cycle it reads its accumulator source.
 //!
+//! A third property is inferred from the vector-load probes (`tools/gen_vec_load_timing_probe.py`):
+//! a vector-file load whose itinerary holds no write unit at its result cycle (the B load channel)
+//! writes over the bus of the vector file's last write port.
+//!
 //! No unit name appears in this file: units are indices into `TblgenOutput::functional_units`
 //! and every classification below is read off the itinerary tables and the destination register
 //! classes. Two properties are *inferred* from the silicon collision probes (documented in
@@ -189,10 +193,16 @@ impl PortModel {
         sources: &[Operand],
         source_forward: &[(u8, xdna_archspec::aie2::Bypass)],
         defs: &[(Operand, i16)],
+        is_load: bool,
     ) -> PortUse {
         let held = held_units(stages);
         let mut out = PortUse::default();
         out.scalar_defs = Self::scalar_defs(&held, defs);
+        out.held = held
+            .iter()
+            .filter(|(_, _, reserved)| !reserved)
+            .filter_map(|&(u, o, _)| u8::try_from(o).ok().map(|o| (u, o)))
+            .collect();
 
         // Accumulator read: units held (not merely reserved) in the cycle of the first
         // accumulator source's use.
@@ -230,6 +240,9 @@ impl PortModel {
                 cand.dedup();
                 if let [unit] = cand[..] {
                     out.write_port = Some(unit);
+                } else if cand.is_empty() && is_load && file == RegFile::Vector {
+                    out.write_port = self.last[RegFile::Vector as usize];
+                    out.b_channel = out.write_port.is_some();
                 }
             }
             if out.acc_read.is_some() {

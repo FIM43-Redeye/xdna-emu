@@ -37,7 +37,7 @@ use crate::device::state::NeighborView;
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
-use crate::interpreter::state::{ExecutionContext, UnpackSource};
+use crate::interpreter::state::{Bypass, ExecutionContext, UnpackSource};
 use xdna_archspec::aie2::pack::pack_form;
 use xdna_archspec::aie2::sparse_load::sparse_load_form;
 use xdna_archspec::aie2::unpack::unpack_form;
@@ -589,7 +589,7 @@ impl MemoryUnit {
     }
 
     /// Check if this is a VLDB_4x instruction (4-way gather load).
-    fn is_load_4x(op: &SlotOp) -> bool {
+    pub(crate) fn is_load_4x(op: &SlotOp) -> bool {
         if let Some(name) = &op.encoding_name {
             let lower = name.to_ascii_lowercase();
             lower.contains("vldb.4x") || lower.contains("vldb_4x")
@@ -638,10 +638,10 @@ impl MemoryUnit {
             }
         };
 
-        // Commit pending writes so a preceding vlda's data is visible.
-        ctx.force_commit_all_pending();
-
-        let src_data = ctx.vector.read(src_reg);
+        // The address vector is an ordinary vector read (use cycle 1): a load into it is seen
+        // from distance 7 like by any other reader.
+        let (use_cycle, use_bypass) = op.source_forward.first().copied().unwrap_or((1, Bypass::No));
+        let src_data = ctx.vector.read_with(src_reg, use_cycle, use_bypass);
 
         // Parse encoding name for hi/lo and element size.
         let name = op.encoding_name.as_deref().unwrap_or("");
@@ -1419,7 +1419,65 @@ impl MemoryUnit {
     /// the same effective address the load actually accesses, instead of
     /// re-deriving an approximation that drops the modifier-register offset.
     pub(crate) fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        Self::align_to_access(op, Self::address_sum(op, ctx))
+        let addr = ctx
+            .load_address_override(op.slot as u8)
+            .unwrap_or_else(|| Self::address_sum(op, ctx));
+        Self::align_to_access(op, addr)
+    }
+
+    /// Same-bundle hazards of a `vldb.4x` gather, which TableGen forbids by reservation and
+    /// silicon resolves deterministically (`tools/gen_vec_load_timing_probe.py hazard`,
+    /// `build/experiments/harness/ldvec/hz2`). For every other instruction holding one of the
+    /// gather's units in the same cycle:
+    ///
+    /// * the unit of the gather's address read (the W store-data read port): the two share the
+    ///   read, and each sees the OR of the gather's address register and the other's first W
+    ///   source (a `vst`'s data register, the low half of a `vpack` source);
+    /// * a unit of a later cycle (load unit A): the other instruction's load reads memory at the
+    ///   gather's address, the first lane of the half it gathers, instead of its own.
+    ///
+    /// Call once per issued bundle before the slots execute, with the register files' clocks
+    /// advanced.
+    pub fn arm_gather_hazards(ctx: &mut ExecutionContext, ops: &[&SlotOp]) {
+        let first_w = |op: &SlotOp| {
+            op.sources.iter().find_map(|s| {
+                if let Operand::VectorReg(r) = s {
+                    Some(*r)
+                } else {
+                    None
+                }
+            })
+        };
+        for g in ops.iter().copied().filter(|o| Self::is_load_4x(o)) {
+            let Some(g_src) = first_w(g) else { continue };
+            let (g_use, g_bypass) = g.source_forward.first().copied().unwrap_or((1, Bypass::No));
+            let read_offset = g_use.saturating_sub(1);
+            let mut addr_vec = ctx.vector.read_with(g_src, g_use, g_bypass);
+            let partners = |shared_at_read: bool| {
+                ops.iter().copied().filter(move |o| {
+                    o.slot != g.slot
+                        && o.ports.held.iter().any(|&(u, off)| {
+                            g.ports.held.contains(&(u, off)) && (off == read_offset) == shared_at_read
+                        })
+                })
+            };
+            for p in partners(true) {
+                let Some(p_src) = first_w(p) else { continue };
+                let (p_use, p_bypass) = p.source_forward.first().copied().unwrap_or((1, Bypass::No));
+                let p_val = ctx.vector.read_with(p_src, p_use, p_bypass);
+                ctx.vector.arm_wired_or(g.slot as u8, g_src, p_val);
+                ctx.vector.arm_wired_or(p.slot as u8, p_src, addr_vec);
+                addr_vec = std::array::from_fn(|k| addr_vec[k] | p_val[k]);
+            }
+            let hi = g
+                .encoding_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains("hi"));
+            let lane0 = addr_vec[if hi { 4 } else { 0 }];
+            for p in partners(false) {
+                ctx.override_load_address(p.slot as u8, lane0);
+            }
+        }
     }
 
     /// The address a load or store actually touches: the effective address (base plus index or

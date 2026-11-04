@@ -29,6 +29,11 @@
 //! 2. **Different ports, same landing cycle.** Only chunks on the same register and the same
 //!    bank conflict: the lower-indexed port wins, with its own data. Chunks on different
 //!    registers both land, even on the same bank.
+//! 3. **The B load channel.** `vldb` and its forms hold no write port in the tables. In silicon
+//!    their result shares the bus of the vector file's last write port without taking part in
+//!    rule 1: landing with a write through that port on the same register and bank, the two are
+//!    ORed (both chunks carry the OR); with writes to other registers or banks nothing happens;
+//!    against a lower-indexed port rule 2 applies (it loses).
 //!
 //! "Latest-issued" is the issue sequence number of the writing instruction (bundle, then slot
 //! order within a bundle).
@@ -47,6 +52,9 @@ pub struct WriteTag {
     /// `build/experiments/cascade-collisions/probe3`): beside a cascade read, a narrow
     /// (single-chunk) writer on an odd bank also drives lane 1 of the port.
     pub cascade_read: bool,
+    /// The write comes from the B load channel (rule 3 of the module docs); `port` is then the
+    /// write port whose bus it shares.
+    pub b_channel: bool,
 }
 
 /// One 256-bit piece of a register write.
@@ -73,6 +81,8 @@ pub struct Chunk {
     /// both banks of `bml0`; on bank 0 (`amll0`) it leaves bank 1 alone. In the vector file a
     /// narrow `wh` writer does not (collision probe6).
     pub acc_file: bool,
+    /// The chunk comes from the B load channel ([`WriteTag::b_channel`]).
+    pub b_channel: bool,
 }
 
 /// What happens to one input chunk.
@@ -99,17 +109,36 @@ pub fn resolve(chunks: &[Chunk]) -> Vec<Landing> {
 }
 
 fn writers_of(chunks: &[Chunk], port: u16) -> Vec<u64> {
-    let mut w: Vec<u64> = chunks.iter().filter(|c| c.port == port).map(|c| c.writer).collect();
+    let mut w: Vec<u64> = chunks
+        .iter()
+        .filter(|c| c.port == port && !c.b_channel)
+        .map(|c| c.writer)
+        .collect();
     w.sort_unstable();
     w.dedup();
     w
 }
 
 fn resolve_port(chunks: &[Chunk], port: u16, out: &mut [Landing]) {
+    resolve_port_writers(chunks, port, out);
+    // rule 3: a B-channel chunk and a landing chunk of the port on its register and bank are ORed
+    for (i, b) in chunks.iter().enumerate().filter(|(_, c)| c.port == port && c.b_channel) {
+        for j in 0..chunks.len() {
+            let c = &chunks[j];
+            if c.port == port && !c.b_channel && out[j].lands && c.reg == b.reg && c.bank == b.bank {
+                let ored: [u32; 8] = std::array::from_fn(|k| out[i].data[k] | out[j].data[k]);
+                out[i].data = ored;
+                out[j].data = ored;
+            }
+        }
+    }
+}
+
+fn resolve_port_writers(chunks: &[Chunk], port: u16, out: &mut [Landing]) {
     if writers_of(chunks, port).len() < 2 {
         return;
     }
-    let on_port = || chunks.iter().enumerate().filter(|(_, c)| c.port == port);
+    let on_port = || chunks.iter().enumerate().filter(|(_, c)| c.port == port && !c.b_channel);
     // In the accumulator file, and in either file beside a cascade read, a narrow writer on an
     // odd bank also drives lane 1 (see `Chunk::acc_file`, `WriteTag::cascade_read`); otherwise
     // lane k belongs to ordinal k alone.
@@ -173,7 +202,28 @@ mod tests {
             data: [tag; 8],
             cascade: false,
             acc_file: false,
+            b_channel: false,
         }
+    }
+
+    // Silicon (`tools/gen_vec_load_timing_probe.py tie` and `--waw`, harness/ldvec/tie1, vt2):
+    // a `vldb` landing with a move through the last port: ORed on the same register and bank,
+    // untouched elsewhere; the first port beats it.
+    #[test]
+    fn a_b_channel_write_is_ored_with_the_last_port_on_its_register_and_bank() {
+        const WA: u16 = 1;
+        const WM: u16 = 2;
+        let b = |bank, reg, tag| Chunk { b_channel: true, ..chunk(1, WM, 0, bank, reg, tag) };
+        let r = resolve(&[b(0, 8, 0x0100), chunk(2, WM, 0, 0, 8, 0x0003)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0x0103), Some(0x0103)]);
+        // another register on the same bank, the same register on another bank: both intact
+        let r = resolve(&[b(0, 8, 0x0100), chunk(2, WM, 0, 0, 16, 0x0003)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0x0100), Some(0x0003)]);
+        let r = resolve(&[b(0, 8, 0x0100), chunk(2, WM, 0, 1, 9, 0x0003)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [Some(0x0100), Some(0x0003)]);
+        // the first port wins the register bank outright
+        let r = resolve(&[b(0, 8, 0x0100), chunk(2, WA, 0, 0, 8, 0x0003)]);
+        assert_eq!(r.iter().map(lands).collect::<Vec<_>>(), [None, Some(0x0003)]);
     }
 
     fn lands(l: &Landing) -> Option<u32> {

@@ -79,9 +79,6 @@ pub struct PendingWrite {
     /// vs writes from the current bundle (not forwardable -- VLIW semantics
     /// require same-bundle reads to see pre-execution values).
     pub issued_cycle: u64,
-    /// Handle of this load's stand-in in the register file's collision resolver, when the load
-    /// has a collision-modelled write port (see `VectorRegisterFile::register_phantom`).
-    pub phantom: Option<u32>,
     /// Handle of this write in the scalar write-port log (`ExecutionContext::log_scalar_write`),
     /// when its instruction holds a scalar write port: a later-issued write landing through the
     /// same port in the same cycle drops it, one reaching the same register through another
@@ -441,6 +438,9 @@ pub struct ExecutionContext {
     /// Loads have a 7-cycle pipeline latency (AIE2Schedule.td). The write to
     /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
+    /// `(slot, address)`: the load in `slot` reads memory at `address` this bundle instead of its
+    /// own (a load-unit collision with a `vldb.4x` gather; `MemoryUnit::arm_gather_hazards`).
+    load_address_overrides: SmallVec<[(u8, u32); 2]>,
 
     /// Result latency (itinerary `operand_cycles[0]`) of the slot op currently
     /// being executed, set by the bundle executor before each slot dispatch.
@@ -668,6 +668,7 @@ impl ExecutionContext {
             bundle_shift_forward: Vec::new(),
             pending_branch: None,
             pending_writes: Vec::new(),
+            load_address_overrides: SmallVec::new(),
             result_latency: 0,
             result_bypass: Bypass::No,
             write_tag: None,
@@ -943,6 +944,7 @@ impl ExecutionContext {
     /// execution are already committed to the live registers.
     #[inline]
     pub fn end_bundle(&mut self) {
+        self.load_address_overrides.clear();
         self.scalar_snapshot = None;
         self.land_control_writes();
         self.pointer_snapshot = None;
@@ -993,17 +995,38 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            phantom: None,
             scalar_log_id,
         });
     }
 
-    /// Queue a vector load result for deferred register write.
+    /// Make the load in `slot` read memory at `address` for the rest of this bundle.
+    pub fn override_load_address(&mut self, slot: u8, address: u32) {
+        self.load_address_overrides.push((slot, address));
+    }
+
+    /// The address the load in `slot` reads this bundle instead of its own, if any.
+    pub fn load_address_override(&self, slot: u8) -> Option<u32> {
+        self.load_address_overrides.iter().find(|(s, _)| *s == slot).map(|(_, a)| *a)
+    }
+
+    /// Queue a load result into the vector register file (a `w` register), or a 128-bit mask
+    /// load into a `q` register.
+    ///
+    /// A vector-register result is an ordinary in-flight write of the vector file with the load's
+    /// result cycle (`latency`, 7 for every vector load), no bypass, on the issued-bundle clock:
+    /// silicon (`tools/gen_vec_load_timing_probe.py`) shows every vector reader seeing a load from
+    /// distance 7 and two writes of one register resolved like any others (the later-landing one
+    /// wins; same-cycle ties go through the collision resolver, the B load channel included). A
+    /// mask (`q`) result keeps the load-commit queue.
     pub fn queue_vector_load(&mut self, dest: Operand, value: [u32; 8], latency: u64) {
-        let phantom = match dest {
-            Operand::VectorReg(r) => self.vector.register_phantom(r, value),
-            _ => None,
-        };
+        if let Operand::VectorReg(r) = dest {
+            debug_assert!(
+                self.write_tag.is_none_or(|t| t.land == self.bundle_seq + latency),
+                "a tagged load lands at its result cycle"
+            );
+            self.vector.queue_write(r, value, latency.clamp(1, 255) as u8, Bypass::No);
+            return;
+        }
         self.pending_writes.push(PendingWrite {
             dest,
             scalar_value: 0,
@@ -1011,7 +1034,6 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            phantom,
             scalar_log_id: None,
         });
     }
@@ -1110,6 +1132,7 @@ impl ExecutionContext {
             seq: self.write_seq,
             land: self.bundle_seq + self.result_latency as u64,
             cascade_read: false,
+            b_channel: ports.b_channel,
         });
         self.set_write_tag(tag);
     }
@@ -1317,7 +1340,6 @@ impl ExecutionContext {
             accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
-            phantom: None,
             scalar_log_id,
         });
     }
@@ -1346,6 +1368,7 @@ impl ExecutionContext {
         for pw in &writes {
             self.apply_pending_write(pw);
         }
+        self.vector.land_all_pending();
         self.accumulator.land_all_pending();
     }
 
@@ -1415,20 +1438,12 @@ impl ExecutionContext {
             Operand::ModifierReg(r) => self.modifier.write(*r, pw.scalar_value),
             Operand::VectorReg(r) => {
                 if let Some(vec) = &pw.vec_value {
-                    // a collision may have dropped the load or replaced its data
-                    match pw.phantom.and_then(|id| self.vector.take_phantom_verdict(id)) {
-                        None => self.vector.write(*r, *vec),
-                        Some(Some(data)) => self.vector.write(*r, data),
-                        Some(None) => {}
-                    }
+                    self.vector.write(*r, *vec);
                 }
             }
             Operand::AccumReg(r) => {
                 if let Some(vec) = &pw.vec_value {
-                    match pw.phantom.and_then(|id| self.accumulator.take_phantom_verdict(id)) {
-                        None => self.apply_accum_write(*r, vec, pw.accum_width),
-                        Some((value, lanes)) => self.accumulator.write_lanes(*r, &value, lanes),
-                    }
+                    self.apply_accum_write(*r, vec, pw.accum_width);
                 }
             }
             Operand::ControlReg(id) => {

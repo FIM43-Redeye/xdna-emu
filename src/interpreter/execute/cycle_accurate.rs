@@ -840,6 +840,12 @@ impl CycleAccurateExecutor {
             let ops: smallvec::SmallVec<[&SlotOp; 8]> = bundle.active_slots().collect();
             super::VectorAlu::arm_srs_wired_or(ctx, &ops);
         }
+        if bundle.active_slots().any(super::memory::MemoryUnit::is_load_4x)
+            && bundle.active_slots().count() >= 2
+        {
+            let ops: smallvec::SmallVec<[&SlotOp; 8]> = bundle.active_slots().collect();
+            super::memory::MemoryUnit::arm_gather_hazards(ctx, &ops);
+        }
 
         // Same-bundle scalar->shift forwarding. AIE2 writes an S register at
         // pipeline stage E1 but UPS/SRS sample their shift operand at E7
@@ -878,6 +884,7 @@ impl CycleAccurateExecutor {
                 ctx.begin_slot_writes(&op.ports);
                 ctx.set_slot_acc_read(op.ports.acc_read);
                 ctx.accumulator.set_reader_slot(Some(op.slot as u8));
+                ctx.vector.set_reader_slot(Some(op.slot as u8));
                 ctx.record_read_claim(op);
 
                 // Reborrow neighbors for each slot operation
@@ -939,6 +946,7 @@ impl CycleAccurateExecutor {
         ctx.set_srs_partner_units(None);
         ctx.set_srs_mode_override(0, None);
         ctx.accumulator.set_reader_slot(None);
+        ctx.vector.set_reader_slot(None);
 
         ctx.end_bundle();
 

@@ -429,14 +429,7 @@ struct PendingVecWrite {
     orig: [u32; 8],
     /// The resolver dropped this write: another writer took its bank.
     dropped: bool,
-    /// A stand-in for a write that is applied elsewhere (a load commit): it takes part in
-    /// collision resolution but is never visible and never lands here. See `register_phantom`.
-    phantom: Option<u32>,
 }
-
-/// How many bundles past their landing bundle phantom writes stay, for the owner to read the
-/// resolver's verdict.
-const PHANTOM_KEEP_BUNDLES: u64 = 64;
 
 /// Vector register file.
 ///
@@ -463,7 +456,12 @@ pub struct VectorRegisterFile {
     cur_tag: Option<WriteTag>,
     /// `(issue sequence, next ordinal)`: numbers the chunks one instruction queues.
     ordinals: (u64, u8),
-    next_phantom: u32,
+    /// Wired-OR patches for the bundle being issued: `(slot, reg, value)`, a read of `reg` by the
+    /// instruction in `slot` sees `value` ORed in. Armed per bundle by the executor (two readers
+    /// sharing a read port), cleared by `end_bundle`.
+    wired_or: Vec<(u8, u8, [u32; 8])>,
+    /// Slot of the instruction whose reads are being resolved (selects its wired-OR patches).
+    reader_slot: Option<u8>,
 }
 
 impl Default for VectorRegisterFile {
@@ -482,8 +480,21 @@ impl VectorRegisterFile {
             cur_bundle: 0,
             cur_tag: None,
             ordinals: (0, 0),
-            next_phantom: 0,
+            wired_or: Vec::new(),
+            reader_slot: None,
         }
+    }
+
+    /// OR `value` into the reads of `reg` by the instruction in `slot` for the rest of this
+    /// bundle (a `vldb.4x` gather sharing its address read port; see
+    /// `MemoryUnit::arm_gather_hazards`).
+    pub fn arm_wired_or(&mut self, slot: u8, reg: u8, value: [u32; 8]) {
+        self.wired_or.push((slot, reg & 0x1F, value));
+    }
+
+    /// Name the slot whose instruction reads from here on (`None`: any other reader).
+    pub fn set_reader_slot(&mut self, slot: Option<u8>) {
+        self.reader_slot = slot;
     }
 
     /// The committed array reads see: the bundle snapshot if active, else live.
@@ -509,14 +520,11 @@ impl VectorRegisterFile {
         }
         // Apply landed writes in issue order (Vec is push/issue-ordered).
         for w in &self.pending {
-            if w.phantom.is_none() && !w.dropped && w.issue_bundle + w.l_def as u64 <= bundle {
+            if !w.dropped && w.issue_bundle + w.l_def as u64 <= bundle {
                 self.regs[(w.reg & 0x1F) as usize] = w.value;
             }
         }
-        self.pending.retain(|w| match (w.phantom, w.tag) {
-            (Some(_), Some(t)) => t.land + PHANTOM_KEEP_BUNDLES > bundle,
-            _ => w.issue_bundle + w.l_def as u64 > bundle,
-        });
+        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 > bundle);
     }
 
     /// Effective visibility bundle of an in-flight write to a consumer reading
@@ -543,11 +551,17 @@ impl VectorRegisterFile {
         let mut val = self.active()[idx];
         for w in &self.pending {
             if (w.reg & 0x1F) as usize == idx
-                && w.phantom.is_none()
                 && !w.dropped
                 && Self::visible_at(w, use_cycle, use_bypass) <= self.cur_bundle
             {
                 val = w.value;
+            }
+        }
+        for (slot, patched, or) in &self.wired_or {
+            if Some(*slot) == self.reader_slot && *patched as usize == idx {
+                for (word, bits) in val.iter_mut().zip(or) {
+                    *word |= bits;
+                }
             }
         }
         val
@@ -570,6 +584,7 @@ impl VectorRegisterFile {
     #[inline]
     pub fn end_bundle(&mut self) {
         self.snapshot = None;
+        self.wired_or.clear();
     }
 
     /// Queue a vector-register write through the bypass network. `l_def` is the
@@ -592,7 +607,6 @@ impl VectorRegisterFile {
             ordinal,
             orig: value,
             dropped: false,
-            phantom: None,
         });
         self.settle_collisions();
     }
@@ -644,6 +658,7 @@ impl VectorRegisterFile {
                     data: w.orig,
                     cascade: tag.cascade_read,
                     acc_file: false,
+                    b_channel: tag.b_channel,
                 }
             })
             .collect();
@@ -653,36 +668,13 @@ impl VectorRegisterFile {
         }
     }
 
-    /// Enter a stand-in for a write that is applied outside this file (a load commit) so that it
-    /// takes part in collision resolution. Returns the handle for [`phantom_verdict`].
-    pub fn register_phantom(&mut self, reg: u8, value: [u32; 8]) -> Option<u32> {
-        let tag = self.cur_tag?;
-        let id = self.next_phantom;
-        self.next_phantom += 1;
-        let ordinal = self.next_ordinal();
-        self.pending.push(PendingVecWrite {
-            reg: reg & 0x1F,
-            value,
-            issue_bundle: self.cur_bundle,
-            l_def: 1,
-            def_bypass: Bypass::No,
-            tag: Some(tag),
-            ordinal,
-            orig: value,
-            dropped: false,
-            phantom: Some(id),
-        });
-        self.settle_collisions();
-        Some(id)
-    }
-
-    /// Take the resolver's verdict for a phantom (and drop the phantom): the data to write, or
-    /// `None` when another writer took its bank. An unknown handle (expired) means "write as
-    /// computed".
-    pub fn take_phantom_verdict(&mut self, id: u32) -> Option<Option<[u32; 8]>> {
-        let at = self.pending.iter().position(|w| w.phantom == Some(id))?;
-        let w = self.pending.swap_remove(at);
-        Some((!w.dropped).then_some(w.value))
+    /// Land every in-flight write now, in issue order, ignoring timing (test flush).
+    pub fn land_all_pending(&mut self) {
+        for w in std::mem::take(&mut self.pending) {
+            if !w.dropped {
+                self.regs[(w.reg & 0x1F) as usize] = w.value;
+            }
+        }
     }
 
     /// Queue a 512-bit wide write (two consecutive w-registers) through the
@@ -880,8 +872,6 @@ struct PendingAccWrite {
     /// What the instruction computed, before collision resolution.
     orig_value: [u64; 8],
     orig_lanes: u8,
-    /// A stand-in for a write applied elsewhere (a load commit); see `register_phantom`.
-    phantom: Option<u32>,
 }
 
 /// Use cycle of the accumulator source of the stores, SRS, moves and converts
@@ -927,7 +917,6 @@ pub struct AccumulatorRegisterFile {
     cur_tag: Option<WriteTag>,
     /// `(issue sequence, next ordinal)`: numbers the chunks one instruction queues.
     ordinals: (u64, u8),
-    next_phantom: u32,
     /// Wired-OR patches for the bundle being issued: a read of `reg` sees `value` OR-ed in.
     /// Armed per bundle by the executor, cleared by `end_bundle`.
     wired_or: Vec<(u8, u8, [u64; 8])>,
@@ -951,7 +940,6 @@ impl AccumulatorRegisterFile {
             cur_bundle: 0,
             cur_tag: None,
             ordinals: (0, 0),
-            next_phantom: 0,
             wired_or: Vec::new(),
             reader_slot: None,
         }
@@ -1001,14 +989,11 @@ impl AccumulatorRegisterFile {
             return;
         }
         for w in &self.pending {
-            if w.phantom.is_none() && w.issue_bundle + w.l_def as u64 + 1 <= bundle {
+            if w.issue_bundle + w.l_def as u64 + 1 <= bundle {
                 Self::merge_lanes(&mut self.regs[(w.reg as usize) % NUM_ACCUMULATOR_REGS], &w.value, w.lanes);
             }
         }
-        self.pending.retain(|w| match (w.phantom, w.tag) {
-            (Some(_), Some(t)) => t.land + PHANTOM_KEEP_BUNDLES > bundle,
-            _ => w.issue_bundle + w.l_def as u64 + 1 > bundle,
-        });
+        self.pending.retain(|w| w.issue_bundle + w.l_def as u64 + 1 > bundle);
     }
 
     /// The bundle clock (the bundle being issued).
@@ -1031,7 +1016,6 @@ impl AccumulatorRegisterFile {
         let mut val = self.active()[idx];
         for w in &self.pending {
             if (w.reg as usize) % NUM_ACCUMULATOR_REGS == idx
-                && w.phantom.is_none()
                 && Self::visible_from(w, use_bypass) <= read_bundle
             {
                 Self::merge_lanes(&mut val, &w.value, w.lanes);
@@ -1085,7 +1069,7 @@ impl AccumulatorRegisterFile {
             self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = value;
             return;
         }
-        self.push_pending(reg, value, ALL_LANES, issue_bundle, l_def, def_bypass, None);
+        self.push_pending(reg, value, ALL_LANES, issue_bundle, l_def, def_bypass);
     }
 
     /// Queue a write of the lanes in `lanes` only (an `am` quarter move), issued in the current
@@ -1097,7 +1081,7 @@ impl AccumulatorRegisterFile {
             return;
         }
         let issue_bundle = self.cur_bundle;
-        self.push_pending(reg, value, lanes, issue_bundle, l_def, def_bypass, None);
+        self.push_pending(reg, value, lanes, issue_bundle, l_def, def_bypass);
     }
 
     /// Set the write tag stamped on the writes the instruction about to execute queues (`None`:
@@ -1119,7 +1103,6 @@ impl AccumulatorRegisterFile {
         issue_bundle: u64,
         l_def: u8,
         def_bypass: Bypass,
-        phantom: Option<u32>,
     ) {
         let ordinal = match self.cur_tag {
             Some(tag) => {
@@ -1143,7 +1126,6 @@ impl AccumulatorRegisterFile {
             ordinal,
             orig_value: value,
             orig_lanes: lanes,
-            phantom,
         });
         self.settle_collisions();
     }
@@ -1186,6 +1168,7 @@ impl AccumulatorRegisterFile {
                     data,
                     cascade: tag.cascade_read,
                     acc_file: true,
+                    b_channel: tag.b_channel,
                 });
                 owner.push((i, q));
             }
@@ -1204,26 +1187,6 @@ impl AccumulatorRegisterFile {
                     landing.data[2 * k] as u64 | (landing.data[2 * k + 1] as u64) << 32;
             }
         }
-    }
-
-    /// Enter a stand-in for a write applied outside this file (a load commit) so that it takes
-    /// part in collision resolution: `lanes` selects the quarters of `reg` it writes. Returns the
-    /// handle for [`phantom_verdict`](Self::phantom_verdict).
-    pub fn register_phantom(&mut self, reg: u8, value: [u64; 8], lanes: u8, l_def: u8) -> Option<u32> {
-        self.cur_tag?;
-        let id = self.next_phantom;
-        self.next_phantom += 1;
-        let issue = self.cur_bundle;
-        self.push_pending(reg, value, lanes, issue, l_def, Bypass::No, Some(id));
-        Some(id)
-    }
-
-    /// Take the resolver's verdict for a phantom (and drop the phantom): the lanes that still land
-    /// and their values. `None` for an unknown (expired) handle: write as computed.
-    pub fn take_phantom_verdict(&mut self, id: u32) -> Option<([u64; 8], u8)> {
-        let at = self.pending.iter().position(|w| w.phantom == Some(id))?;
-        let w = self.pending.swap_remove(at);
-        Some((w.value, w.lanes))
     }
 
     fn merge_lanes(dst: &mut [u64; 8], src: &[u64; 8], lanes: u8) {
@@ -2026,7 +1989,7 @@ mod tests {
     // --- same-cycle write collisions (see `write_collision`) ---
 
     fn tag(port: u16, seq: u64, land: u64) -> Option<WriteTag> {
-        Some(WriteTag { port, seq, land, cascade_read: false })
+        Some(WriteTag { port, seq, land, cascade_read: false, b_channel: false })
     }
 
     #[test]
@@ -2098,19 +2061,5 @@ mod tests {
         a.set_write_tag(None);
         a.advance_bundle(5);
         assert_eq!(a.read_committed(4), [0xB; 8], "port 0 wins whichever issued last");
-    }
-
-    #[test]
-    fn a_phantom_takes_part_and_reports_the_verdict() {
-        let mut v = VectorRegisterFile::new();
-        v.advance_bundle(0);
-        v.set_write_tag(tag(0, 1, 5));
-        let load = v.register_phantom(8, [0x11; 8]).unwrap();
-        v.advance_bundle(2);
-        v.set_write_tag(tag(0, 2, 5));
-        v.queue_write(4, [0x22; 8], 3, Bypass::No);
-        v.set_write_tag(None);
-        assert_eq!(v.take_phantom_verdict(load), Some(None), "the later writer took the bank");
-        assert_eq!(v.take_phantom_verdict(load), None, "a verdict is taken once");
     }
 }

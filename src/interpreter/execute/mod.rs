@@ -194,3 +194,5 @@ mod tests {
 }
 #[cfg(test)]
 mod acc_load_timing_goldens;
+#[cfg(test)]
+mod vec_load_timing_goldens;

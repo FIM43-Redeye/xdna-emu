@@ -381,6 +381,12 @@ pub struct PortUse {
     pub mover: bool,
     /// The scalar-file results (r, s, p, m, dn, dj, dc) and the units that carry them.
     pub scalar_defs: SmallVec<[ScalarDefPort; 1]>,
+    /// A vector-file load that holds no write port in the tables (the B load channel: `vldb` and
+    /// its forms). `write_port` is then the vector file's last port, whose bus it shares
+    /// (`state::write_collision`, rule 3).
+    pub b_channel: bool,
+    /// Every unit the itinerary holds (not merely reserves), with its cycle offset from issue.
+    pub held: SmallVec<[(u16, u8); 4]>,
 }
 
 /// Accumulator source use cycle of the MAC family (II_VMAC/II_VACC `operand_cycles[1]`), assumed
