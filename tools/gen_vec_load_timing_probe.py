@@ -76,7 +76,10 @@ EXTRA_ITEMS = [
     # the `hi` ones 4..7), written by the kernel prologue: gathers read OLD_i or LDV_i through them
     ("ADDR_OLD", bytes(32)),
     ("ADDR_NEW", bytes(32)),
+    # a different item per lane (ADDR_MIX_TARGETS), for which lane's address a hazard uses
+    ("ADDR_MIX", bytes(32)),
 ]
+ADDR_MIX_TARGETS = ("LDV_i", "X1", "OLD_i", "S_i", "T_i", "U_i", "X0", "X2")
 
 
 def build_table() -> tuple[bytes, dict[str, int]]:
@@ -261,6 +264,9 @@ def address_vectors() -> list[str]:
         lines += point_to("p2", target) + nops(2) + ["  mov r14, p2"]
         lines += point_to("p2", item) + nops(2)
         lines += [f"  st r14, [p2, #{4 * k}]" for k in range(8)]
+    for k, target in enumerate(ADDR_MIX_TARGETS):
+        lines += point_to("p2", target) + nops(2) + ["  mov r14, p2"]
+        lines += point_to("p2", "ADDR_MIX") + nops(2) + [f"  st r14, [p2, #{4 * k}]"]
     return lines + nops(4)
 
 
@@ -447,7 +453,11 @@ HAZARD_FIRSTS = [
     ("g4x16_lo", "vldb.4x16.lo wl5, wl9"),
     ("vpack_x0", "vpack.s8.s16 wl5, x0"),
     ("vldb_plain", "vldb wl5, [p0, #64]"),
+    # wl11 = ADDR_MIX: every lane addresses another item
+    ("g4x_lo_mix", "vldb.4x32.lo wl5, wl11"),
+    ("g4x_hi_mix", "vldb.4x32.hi wl5, wl11"),
 ]
+MIX_SECONDS = ("vst_wl", "vlda_alt", "lda_r9", "vlda_amll")
 # Second instructions: every family-1 reader of R plus two loads into R.
 HAZARD_SECONDS = [(c.name, c.asm, c.out) for c in READERS if not c.gather] + [
     ("vlda_alt", "vlda wl4, [p0, #96]", "none"),
@@ -462,7 +472,7 @@ HAZARD_SECONDS = [(c.name, c.asm, c.out) for c in READERS if not c.gather] + [
 
 def hazard_pairs() -> list[tuple[str, str]]:
     return [(f, s) for f, fa in HAZARD_FIRSTS for s, sa, _ in HAZARD_SECONDS
-            if base.can_share_bundle(fa, sa)]
+            if base.can_share_bundle(fa, sa) and (not f.endswith("_mix") or s in MIX_SECONDS)]
 
 
 def hazard_point_lines(first: Optional[str], second: Optional[tuple], label: str) -> list[str]:
@@ -483,7 +493,8 @@ def hazard_kernel_text(pairs: list[tuple[str, str]]) -> tuple[str, list[dict]]:
     firsts = dict(HAZARD_FIRSTS)
     seconds = {s[0]: s for s in HAZARD_SECONDS}
     points: list[dict] = []
-    test_points = ["\n".join(prologue() + pair_preamble("i"))]
+    test_points = ["\n".join(prologue() + pair_preamble("i") + load_vec("wl11", "ADDR_MIX")
+                             + nops(LOAD_NOPS))]
     for fn, sn in pairs:
         for mode in ("first", "second", "both"):
             f = firsts[fn] if mode in ("first", "both") else None
