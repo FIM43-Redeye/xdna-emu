@@ -391,7 +391,7 @@ sign at run time from the control register its TableGen record lists in `Uses`:
 
 | Register | Forms | Read at (AIE2Schedule.td) |
 |----------|-------|---------------------------|
-| crUPSSign | `vups.s32.d8/.d16`, `vups.s64.d16/.d32` (w2b, w2c, x2c), `vlda[.2d/.3d].ups.*.d*` | `vups`: cycle 1; `vlda.ups`: cycle 7, with the shift |
+| crUPSSign | `vups.s32.d8/.d16`, `vups.s64.d16/.d32` (w2b, w2c, x2c), `vlda[.2d/.3d].ups.*.d*` | `vups`: cycle 1; `vlda.ups`: cycle 7, with the shift and crSat (silicon) |
 | crSRSSign | `vsrs.dN.*`, `vsrsm.dN.*`, `vst[.2d/.3d].srs.dN.*` | cycle 1 |
 | crVaddSign | `vabs_gtz`, `vlt`, `vge`, `vmax_lt`, `vmin_ge`, `vmaxdiff_lt`, `vsub_lt`, `vsub_ge` (`.d8/.d16/.d32`), `vextract.d8/.d16/.d32/.d64` | cycle 1 |
 | crPackSign / crUnpackSign | `vpack` / `vunpack` `d` forms | see the pack and unpack sections |
@@ -404,8 +404,10 @@ ops). Only bit 0 counts: sign words 2 and 0xFFFFFFFE behave as 0, 3 and 0xFFFFFF
 **UPS saturation.** Any nonzero `crSat` (1, 2 or 3) clamps the shifted lane to the signed range of
 the accumulator lane, never symmetrically (lane `0x8000 << 16` signed with `crSat` 3 gives
 `0x80000000`); `crSat` 0 keeps the low bits. The shift is exact up to the 6-bit maximum (a 32-bit
-lane shifted by 63 overflows the 64-bit lane and saturates). `vlda.ups` reads crSat at cycle 8,
-one after the sign and shift; Chess and Peano both write crUPSSign and crSat in the load's shadow.
+lane shifted by 63 overflows the 64-bit lane and saturates). `vlda.ups` (every addressing mode)
+reads crSat in the same bundle as the sign and shift, at issue+6: a write issued 5 bundles after
+the load is seen, one issued 6 bundles after is not (the itinerary's `/*crSat*/8` is a cycle late);
+Chess and Peano both write crUPSSign and crSat in the load's shadow.
 
 **Control-register writes land at the end of their bundle**: a reader issued in the same bundle sees
 the old value (Chess pipelines a record loop with the next record's `movx crSat` beside this
@@ -423,9 +425,41 @@ the gap (`lups`, `sups`, `ups_to_*`, `abs`, `gtz`, `abs_gtz` with a run-time sig
 |-----|-------------------|-------|--------------------|
 | `d` forms of UPS, SRS and the crVaddSign ops | all zero-extended / unsigned regardless of the register (only `vextract.d8/.d16` followed crVaddSign) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 |
 | UPS saturation | not modelled (always wrapped) | `ups_lane_signed` | **RESOLVED** 2026-11-04 |
-| `vlda.2d/.3d.ups.*.d*`, `vst.2d/.3d.srs.d*`, `vsrsm.d*` | same code path and `Uses` entry as the probed forms; no compiler emitted them for the probes | `dynamic_sign.rs` | open: unprobed |
-| `srUPS_of` / `srSRS_of` | the overflow status bits the saturating forms set are not modelled | | open |
-| Exact read cycle of crUPSSign and crSat for `vlda.ups` | taken from the itinerary (7 and 8); the probes only show compiler schedules agree | `PendingUpsLoad` | open: a hand-scheduled late-write probe would pin it |
+| `vlda.2d/.3d.ups.*.d*`, `vst.2d/.3d.srs.d*`, `vsrsm.d*`, `vlda.ups` idx / pstm / pstm_imm | same code path and `Uses` entry as the probed forms: exact against silicon, data and flag (satflags probe, hand-written assembly) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 |
+| `srUPS_of` / `srSRS_of` | not produced | `status_flags.rs` | **RESOLVED** 2026-11-04, see "Status flags" |
+| Exact read cycle of crUPSSign, crSat and the shift for `vlda.ups` | crSat was read a bundle after the sign and shift (itinerary 8 vs 7) | `PendingUpsLoad` | **RESOLVED** 2026-11-04: all three at issue+6 (satflags `upsread` late-write probe, 7 forms x 3 registers x offsets 0..10, HW r1 == r2, EMU == HW) |
+
+## Status flags (`srSRS_of`, `srUPS_of`)
+
+TableGen lists `Defs = [srSRS_of]` on every SRS form (`vsrs`, `vsrsm`, `vst[.2d/.3d].srs`, `s`
+and `d`) and `Defs = [srUPS_of]` on every UPS form (`vups` w2b/w2c/x2c, `vlda[.2d/.3d].ups` in
+every addressing mode). Silicon (`src/interpreter/execute/status_flags.rs`):
+
+- The flag is raised when **any lane** leaves the output range: the shifted value (SRS: shifted
+  and rounded by crRnd) before any clamp. One lane at the start, middle or end is enough.
+- **crSat does not matter**: crSat 0 wraps the data and still raises the flag. The range is the
+  output lane's under the run-time sign of a `d` form (crSRSSign / crUPSSign bit 0); the
+  symmetric SRS modes (crSat 2 and 3) exclude the signed minimum, so a lane landing exactly on it
+  raises the flag there and not under crSat 0/1. UPS has no symmetric range.
+- **Sticky**: an in-range conversion leaves it set; only a `mov` to the register clears it.
+- **Visible** to a `mov rX, srY_of` issued 3 bundles after an SRS (`vsrs`, `vsrsm`, `vst.srs`:
+  the itinerary's def cycle agrees), and at the UPS's accumulator result cycle: 3 bundles after a
+  `vups`, 9 after a `vlda.ups` (the itinerary says 1 and 8).
+
+Evidence: `tools/gen_sat_flags_probe.py`, 174 assembly cases over 74 forms (every SRS and UPS
+shape, `s` and `d`, every addressing mode of the fused load and store, `vsrsm`, x2c), 5356
+records crossing ten operand kinds with every crSat, both signs, two shifts, sticky/overwrite
+pairs from either initial flag and a crRnd sweep. HW r1 == r2 174/174; the analyzer's model
+(`--analyze`) matches 5356/5356; EMU == HW 174/174 (master: flags differed in 3091 records, data
+in none).
+
+TableGen note: the brief for this work flagged `VLDA_UPS_S64_D32_ag_pstm_nrm` as encoding
+`mv_ups_base<1,1>` (the signed encoding) while listing crUPSSign. The llvm-aie checked against
+(12f5fc51) has `mv_ups_base<1, 0>` there, llvm-mc encodes it differently from its `s32` twin, and
+a scripted check finds no `d`/`s` name vs sign-bit mismatch in the file. On silicon the form
+honours crUPSSign: its flag follows the run-time sign in the satflags probe, and in the `upsread`
+probe flipping crUPSSign before its read changes the converted lanes (top-bit-set source lanes
+zero- vs sign-extended).
 
 ## bf16 multiply-accumulate datapath (`vmul.f`, `vmac.f`, `vmsc.f`, `vaddmac.f`, ...)
 

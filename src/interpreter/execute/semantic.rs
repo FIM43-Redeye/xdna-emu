@@ -33,18 +33,18 @@
 //!
 //! | Flag | Hardware? | Storage | Behavior |
 //! |------|-----------|---------|----------|
-//! | **Carry (C)** | YES | SR bit 0 | Set by ADD, SUB, ADC, SBC, ABS, NEG |
+//! | **Carry (C)** | YES | `srCarry` | Set by the TableGen definers (ADD, SUB, ADC, SBC, ABS, JNZD) |
 //! | Zero (Z) | NO | Computed | Branch logic tests register == 0 |
 //! | Negative (N) | NO | Computed | Branch logic tests register < 0 |
 //! | Overflow (V) | NO | Computed | Computed on demand |
 //!
 //! ## Which SemanticOps Set Flags
 //!
-//! **Set Carry (from TableGen Defs=[srCarry]):**
-//! - `ADD`, `SUB` - arithmetic carry/borrow
-//! - `ADC`, `SBC` - add/sub with carry (also Uses=[srCarry])
-//! - `ABS` - carry set if input was negative
-//! - `NEG` - equivalent to SUB(0, x)
+//! **Set Carry (only ops whose TableGen record has Defs=[srCarry]; silicon, see
+//! `status_flags`):**
+//! - `ADD` (and its immediate form), `ADC`, `JNZD` - carry out of the unsigned sum
+//! - `SUB`, `SBC` - the borrow (`SBC` also subtracts the flag as borrow-in)
+//! - `ABS` - the sign of the source
 //!
 //! **Do NOT set flags (preserve Carry):**
 //! - `MUL`, `DIV`, `MOD` - no flag effects

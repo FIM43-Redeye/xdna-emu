@@ -177,11 +177,26 @@ emulator already (from the tile address mask), but `dn`/`dc` sign-extended on a 
 silicon zero-extends (fixed), and `lr`/`LS`/`LE`/`DP`/`sp`, the control and the status registers kept
 32 bits.
 
-Open: six status registers were not modelled at all (`mov srCarry, r6` was dropped, a read gave 0); they
-are now plain slots that keep what a move wrote, masked to their width. **Nothing sets them**: no
-producer exists for `srCarry`, `srSRS_of`, `srUPS_of` (saturation overflow of SRS/UPS) or the
-floating-point flag registers `srFPFlags`/`srF2IFlags`/`srF2FFlags`, so a kernel that reads one after
-the operation that should set it sees 0. The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`,
+Six status registers were not modelled at all (`mov srCarry, r6` was dropped, a read gave 0); they
+are now slots that keep what a move wrote, masked to their width. `srCarry`, `srSRS_of` and
+`srUPS_of` start at 0 and have producers (2026-11-04, `src/interpreter/execute/status_flags.rs`):
+
+- **`srCarry`** is written only by the instructions whose TableGen record lists
+  `Defs = [srCarry]` (`add` register and immediate, `sub`, `adc`, `sbc`, `abs`, `jnzd`); `add.nc`,
+  `mul`, logic, shifts and compares leave it. The add family sets the carry out of the 32-bit
+  unsigned sum (an immediate is sign-extended; `jnzd` adds -1, so its carry is "the source was
+  nonzero"), the subtract family the **borrow** (1 when the subtrahend plus borrow-in exceeds the
+  minuend; `sbc` subtracts the flag as borrow-in: the emulator had ARM's inverted carry), `abs` the
+  sign of its source. It is overwritten, not sticky; a reader in the same bundle sees the old
+  value, the next bundle the new one (`adc`/`sbc` one bundle after `add`/`sub` take its carry).
+  Evidence: `tools/gen_carry_flag_probe.py` (12 cases, 1112 records, edge operands from either
+  carry, chains at 1-3 bundles, ten non-definers), HW r1 == r2, EMU == HW, model check
+  `--analyze` 1112/1112.
+- **`srSRS_of` / `srUPS_of`**: see "Status flags" in [vector-compute](vector-compute.md).
+
+Open: no producer for the floating-point flag registers `srFPFlags`/`srF2IFlags`/`srF2FFlags`
+(out of scope of the status-flag probes), so a kernel that reads one after the operation that
+should set it sees 0. The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`,
 `srSparse_of`) keep their producers.
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
