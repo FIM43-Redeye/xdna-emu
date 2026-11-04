@@ -240,7 +240,7 @@ Options:
                   packs multiple test.exe contexts onto the NPU's columns at
                   once; useful for speed and for probing contention-induced
                   run-to-run variance (e.g. a full corpus at --hw-jobs 1 vs 5).
-  --no-timeout    Run EMU without wall-clock timeout (use for very long runs)
+  --no-timeout    Run EMU without wall-clock timeout (default: EMU_TIMEOUT, 1800 s)
   --with-hw-cycles  Run trace-based HW cycle capture pipeline per HW test;
                     emits cycles.HW.<variant>.txt beside each result.
   --with-cycle-diff Additionally run EMU through the trace pipeline and
@@ -306,6 +306,11 @@ export COMPILERS_STR="${COMPILERS[*]}"
 AIESIM_BRIDGE_SO="${AIESIM_BRIDGE_SO:-${NPU_WORK_DIR:-$(dirname "$EMU_ROOT")}/xdna-emu-priv/aiesim-bridge/build/libxdna_aiesim_bridge.so}"
 AIESIM_DEVICE_JSON="${AIESIM_DEVICE_JSON:-${NPU_WORK_DIR:-$(dirname "$EMU_ROOT")}/xdna-emu-priv/aiesim-bridge/device/NPU1.json}"
 AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-3000}"
+# EMU_TIMEOUT -- wall-clock backstop per EMU test.exe, only for genuinely hung
+#                runs. The longest healthy cases (ctrl_packet_reconfig_*, Peano)
+#                take ~500 s at low load and 527-661 s at load average ~20-28;
+#                the former 600 s cap timed them out. --no-timeout disables it.
+EMU_TIMEOUT="${EMU_TIMEOUT:-1800}"
 # Each aiesim instance is single-threaded (SystemC pins one core) and ~1.2 GB
 # RAM, so the throughput ceiling is cores, not memory. Completion is quiescence-
 # based (not wall-clock), so fanning out to ~nproc is clean: a slow instance
@@ -314,7 +319,7 @@ AIESIM_TIMEOUT="${AIESIM_TIMEOUT:-3000}"
 # time-slice, no throughput gain). Pure simulation (no NPU), so unlike the HW
 # pass there is no hardware-contention reason to serialize.
 AIESIM_JOBS="${AIESIM_JOBS:-$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))}"
-export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT AIESIM_JOBS
+export AIESIM_BRIDGE_SO AIESIM_DEVICE_JSON AIESIM_TIMEOUT AIESIM_JOBS EMU_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Hardware quarantine (tests that cause TDRs, run last + isolated)
@@ -2242,7 +2247,7 @@ run_one_bridge() {
   local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.emu"
   mkdir -p "$trace_out_dir"
 
-  # EMU runaway guard is the 600 s wall-clock timeout below. We deliberately do
+  # EMU runaway guard is the EMU_TIMEOUT wall-clock timeout below. We deliberately do
   # NOT cap the emulator's internal cycle counter from cycles.HW.txt: that
   # scalar is the HW trace event SPAN (~10-70k), while the emulator's absolute
   # cycle counter runs far past it (the active timeline reaches hundreds of
@@ -2250,7 +2255,7 @@ run_one_bridge() {
   # legitimate run. cycles.HW.txt is still produced (run_one_hardware predecode)
   # and feeds the timing report + _classify_cycle_diff; it just no longer gates
   # execution.
-  local _timeout_s=600
+  local _timeout_s="${EMU_TIMEOUT}"
 
   local rc=0
   (
