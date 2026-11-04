@@ -107,12 +107,23 @@ the emulator (parallel), and compares byte for byte.
 ```bash
 export PYTHONPATH=tools
 python3 -m harness suite build   <suite>               # parallel; --only CASE.. restricts
-python3 -m harness suite hw      <suite> r1            # serial; the first timeout aborts the run
+python3 -m harness suite hw      <suite> r1            # serial, scrubbed; the first timeout aborts the run
 python3 -m harness suite emu     <suite> e1 -j 8       # FFI .so rebuilt once, then parallel
 python3 -m harness suite compare <suite> r1 e1         # per buffer; exit 1 on mismatch
 python3 -m harness suite hw      <suite> d5 --repeat 5 # every case 5x back to back
 python3 -m harness suite repeats <suite> d5            # exit 1 if a case's repeats differ
 ```
+
+**Scrub.** Silicon keeps a core's data registers from one launch to the next (only the
+control and status registers and `le` reset), so a case that reads a register it never wrote
+would depend on what ran before it. `suite hw` therefore launches a scrub kernel on the case's
+tiles before every phase (built once per suite and tile set under `<suite>/scrub/`), and `suite
+emu` starts every core from the same values (`XDNA_EMU_CORE_INIT=scrub-v<N>`); `--no-scrub`
+turns both off. The pattern, its register list (from TableGen) and the kernel come from
+`src/interpreter/state/scrub.rs` through the checked-in `tools/harness/scrub_kernel.json`
+(`cargo run --bin scrub-kernel > tools/harness/scrub_kernel.json`; a unit test fails when it is
+stale). Run records and summaries name the pattern (`scrub`), and `compare` warns when two tags
+differ in it. Not scrubbed: `lr`, `sp`, `r16` (the core main restores it), data memory.
 
 Results land in `<suite>/runs/<tag>/<case>/<core>.<buffer>.bin` plus `run.json`; tags are
 never overwritten. Comparing two hardware tags (`compare <suite> r1 r2`) is the determinism
