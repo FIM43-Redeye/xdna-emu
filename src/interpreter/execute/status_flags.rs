@@ -46,6 +46,7 @@ mod execution {
     const MOV_R1_SRS_OF: [u8; 4] = [0x59, 0xb6, 0x46, 0x18]; // mov r1, srSRS_of
     const MOV_R1_UPS_OF: [u8; 4] = [0x59, 0xb6, 0x49, 0x18]; // mov r1, srUPS_of
     const MOV_SRS_OF_R0: [u8; 4] = [0x59, 0x16, 0x50, 0x1b]; // mov srSRS_of, r0
+    const MOV_UPS_OF_R0: [u8; 4] = [0x59, 0x16, 0xd0, 0x1c]; // mov srUPS_of, r0
     const NOP: [u8; 2] = [0x01, 0x00];
 
     struct Rig {
@@ -163,6 +164,22 @@ mod execution {
         assert_eq!(rig.ctx.scalar.read(SRS_OF_REG_INDEX), 0);
     }
 
+    /// A `mov srSRS_of, r0` issued 2 bundles after the vsrs (one before the flag is visible)
+    /// lands after the flag and clears it; one issued a bundle earlier is overridden by it
+    /// (silicon, satflags flagclear probe).
+    #[test]
+    fn a_clear_one_bundle_before_visibility_wins() {
+        for (n, expect) in [(1, 1), (2, 0), (3, 0)] {
+            let mut rig = Rig::new();
+            rig.acc32(0x1_0000, 0);
+            rig.ctx.scalar.write(0, 0);
+            rig.srs(1, true);
+            rig.settle(n - 1);
+            rig.run(&MOV_SRS_OF_R0);
+            assert_eq!(rig.read_at(8, &MOV_R1_SRS_OF), expect, "clear {n} bundles after");
+        }
+    }
+
     /// vups.s32.d16: lane 0x8000 << 16 overflows an unsigned source, not a signed one; the flag
     /// is visible three bundles after the vups (its accumulator result cycle).
     #[test]
@@ -194,6 +211,20 @@ mod execution {
             rig.ctx.set_control_reg_raw(10, 1);
             rig.run(&VLDA_UPS_S64_D32);
             assert_eq!(rig.read_at(k, &MOV_R1_UPS_OF), (k >= 9) as u32, "read {k} bundles later");
+        }
+        // A clear issued 8 bundles after the load (one before visibility) wins; at 7 it loses.
+        for (n, expect) in [(7, 1), (8, 0)] {
+            let mut rig = Rig::new();
+            let base = 0x100usize;
+            rig.tile.data_memory_mut()[base + 0x20..base + 0x24]
+                .copy_from_slice(&0x846d_4520u32.to_le_bytes());
+            rig.ctx.pointer.write(7, 0x70000 + base as u32);
+            rig.ctx.scalar.write(40, 40);
+            rig.ctx.scalar.write(0, 0);
+            rig.run(&VLDA_UPS_S64_D32);
+            rig.settle(n - 1);
+            rig.run(&MOV_UPS_OF_R0);
+            assert_eq!(rig.read_at(8, &MOV_R1_UPS_OF), expect, "clear {n} bundles after");
         }
     }
 }

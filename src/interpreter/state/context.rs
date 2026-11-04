@@ -1906,8 +1906,12 @@ impl ExecutionContext {
         self.pending_status_flags.push((reg, visible_at));
     }
 
-    /// OR the raised status flags whose bundle has come into their registers. Call once per
-    /// issued bundle, before slot execution, so the bundle's readers see them.
+    /// OR the raised status flags into their registers one bundle before they are visible:
+    /// call once per issued bundle after `begin_bundle` (the register snapshot), before slot
+    /// execution. Readers in that bundle still see the old value (the snapshot), readers from
+    /// the next one the flag, and a `mov` to the register in that bundle lands after it and
+    /// wins (silicon, satflags flagclear probe: a clear issued one bundle before visibility
+    /// clears the flag, one issued a bundle earlier is overridden by it).
     pub fn process_pending_status_flags(&mut self) {
         if self.pending_status_flags.is_empty() {
             return;
@@ -1915,7 +1919,7 @@ impl ExecutionContext {
         let current = self.bundle_seq;
         let mut pending = std::mem::take(&mut self.pending_status_flags);
         pending.retain(|&(reg, at)| {
-            if at <= current {
+            if at <= current + 1 {
                 let v = self.scalar.read(reg);
                 self.scalar.write(reg, v | 1);
                 false
