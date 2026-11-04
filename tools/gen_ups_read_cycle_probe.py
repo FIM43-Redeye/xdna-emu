@@ -20,7 +20,6 @@ Unrolled assembly, one case per form.
 from __future__ import annotations
 
 import argparse
-import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
