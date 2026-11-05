@@ -58,7 +58,7 @@ impl InstructionDecoder {
     /// Extract every slot of the bundle starting at `bytes` and report how
     /// each one decodes. NOP-marker slots are omitted.
     pub fn probe_bundle(&self, bytes: &[u8]) -> Vec<SlotProbe> {
-        let extracted = self.extract_bundle_slots(bytes);
+        let extracted = self.extract_bundle_slots(bytes).unwrap_or_default();
         extracted
             .slots
             .iter()
@@ -117,6 +117,7 @@ impl InstructionDecoder {
     /// disassembler rejects are omitted.
     pub fn resolved_ops(&self, bytes: &[u8]) -> Vec<ResolvedOp> {
         self.extract_bundle_slots(bytes)
+            .unwrap_or_default()
             .slots
             .iter()
             .filter_map(|s| {

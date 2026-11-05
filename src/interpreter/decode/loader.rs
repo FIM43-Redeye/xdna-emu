@@ -20,7 +20,7 @@ impl InstructionDecoder {
     pub fn new() -> Self {
         Self {
             index: DecoderIndex::default(),
-            format_table: None,
+            format_table: Default::default(),
             instr_info: Vec::new(),
             port_model: Default::default(),
             decode_count: 0,
@@ -61,15 +61,9 @@ impl InstructionDecoder {
     fn load_from_generated() -> Self {
         let output = xdna_archspec::aie2::isa::load_from_generated();
 
-        // Build data-driven format table from composite format Inst fields
-        let format_table = if output.composite_formats.iter().any(|f| !f.slot_maps.is_empty()) {
-            let table = crate::interpreter::bundle::FormatTable::build(&output.composite_formats);
-            log::info!("Built data-driven format table: {} entries", table.total_entries(),);
-            Some(table)
-        } else {
-            log::warn!("No Inst-derived format layouts; falling back to hand-coded extraction");
-            None
-        };
+        let format_table = crate::interpreter::bundle::FormatTable::build(&output.composite_formats);
+        assert!(format_table.total_entries() > 0, "generated ISA tables carry no composite format layouts");
+        log::info!("Built format table: {} entries", format_table.total_entries());
 
         let port_model = super::ports::PortModel::derive(&output);
         let mut decoder = Self::from_tables(output.encodings_by_slot);
@@ -125,7 +119,7 @@ impl InstructionDecoder {
 
         Self {
             index,
-            format_table: None,
+            format_table: Default::default(),
             instr_info: Vec::new(),
             port_model: Default::default(),
             decode_count: 0,
@@ -137,7 +131,7 @@ impl InstructionDecoder {
     pub fn from_index(index: DecoderIndex) -> Self {
         Self {
             index,
-            format_table: None,
+            format_table: Default::default(),
             instr_info: Vec::new(),
             port_model: Default::default(),
             decode_count: 0,

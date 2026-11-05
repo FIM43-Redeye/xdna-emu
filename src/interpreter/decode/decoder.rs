@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use crate::interpreter::bundle::{ExtractedBundle, Operand, SlotIndex, SlotOp, VliwBundle, extract_slots};
+use crate::interpreter::bundle::{is_zero_padding, ExtractedBundle, Operand, SlotIndex, SlotOp, VliwBundle};
 use crate::interpreter::traits::{DecodeError, Decoder};
 use xdna_archspec::aie2::isa::{DecoderIndex, InstrEncoding, SemanticOp, decoder_ffi};
 
@@ -82,9 +82,9 @@ pub struct InstructionDecoder {
     /// O(1) decoder index (per-slot name-to-encoding lookup).
     pub(super) index: DecoderIndex,
 
-    /// Data-driven VLIW slot extraction table, built from tblgen Inst fields.
-    /// When present, replaces the hand-coded extract_* functions in slot_layout.
-    pub(super) format_table: Option<crate::interpreter::bundle::FormatTable>,
+    /// VLIW slot extraction table, built from the tblgen composite format Inst fields.
+    /// Empty (matches nothing) for decoders constructed without tables.
+    pub(super) format_table: crate::interpreter::bundle::FormatTable,
 
     /// Per-opcode metadata from LLVM's MCInstrDesc + itinerary model.
     /// Indexed by LLVM opcode ID for O(1) lookups. Populated once at init.
@@ -236,24 +236,17 @@ impl InstructionDecoder {
         self.unknown_count = 0;
     }
 
-    /// Extract slot data from a bundle, preferring the data-driven format table
-    /// when available, falling back to the hand-coded extract_slots().
-    pub fn extract_bundle_slots(&self, bytes: &[u8]) -> ExtractedBundle {
+    /// Extract slot data from a bundle through the TableGen-derived format table.
+    ///
+    /// `None` means no composite format matches: a malformed bundle (or the
+    /// zero padding word, see `is_zero_padding`), or a decoder built without
+    /// a format table.
+    pub fn extract_bundle_slots(&self, bytes: &[u8]) -> Option<ExtractedBundle> {
         if bytes.len() < 2 {
-            return ExtractedBundle::new();
+            return None;
         }
         let format = crate::interpreter::bundle::detect_format(bytes);
-
-        // Try the data-driven table first
-        if let Some(ref table) = self.format_table {
-            if let Some(bundle) = table.extract(bytes, format) {
-                return bundle;
-            }
-            // No match in table -- fall through to legacy
-        }
-
-        // Legacy hand-coded path
-        extract_slots(bytes)
+        self.format_table.extract(bytes, format)
     }
 
     /// Get the underlying decoder index.
@@ -319,7 +312,7 @@ impl Decoder for InstructionDecoder {
             };
 
             // Special case: all zeros is a NOP regardless of format marker
-            if word0 == 0 || word0 == 0x15010040 {
+            if is_zero_padding(word0) {
                 // Treat as 4-byte NOP
                 bytes.len().min(4)
             } else {
@@ -332,8 +325,23 @@ impl Decoder for InstructionDecoder {
 
         let mut bundle = VliwBundle::from_raw(&bytes[..effective_size.min(bytes.len())], pc);
 
-        // Extract slots from the bundle (data-driven when available)
-        let extracted = self.extract_bundle_slots(bytes);
+        // Extract slots from the bundle via the format table. A miss is a
+        // malformed bundle, except the zero padding word handled below.
+        let extracted = match self.extract_bundle_slots(bytes) {
+            Some(e) => e,
+            None => {
+                let word0 = if bytes.len() >= 4 {
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+                };
+                if is_zero_padding(word0) {
+                    bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
+                    return Ok(bundle);
+                }
+                return Err(DecodeError::UnknownOpcode { opcode: word0, pc });
+            }
+        };
 
         if log::log_enabled!(log::Level::Trace) {
             static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -460,22 +468,6 @@ impl Decoder for InstructionDecoder {
                     let _ = slot_name; // Suppress unused warning for now
                 }
             }
-        } else {
-            // No slots extracted - treat as unknown
-            let word0 = if bytes.len() >= 4 {
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-            } else {
-                u16::from_le_bytes([bytes[0], bytes[1]]) as u32
-            };
-
-            if word0 == 0 || word0 == 0x15010040 {
-                bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
-            } else {
-                let mut unknown_op = SlotOp::nop(SlotIndex::Scalar0);
-                unknown_op.semantic = None;
-                unknown_op.raw_opcode = Some(word0);
-                bundle.set_slot(unknown_op);
-            }
         }
 
         Ok(bundle)
@@ -501,7 +493,7 @@ impl Decoder for InstructionDecoder {
             };
 
             // All zeros or known NOP patterns: treat as 4-byte
-            if word0 == 0 || word0 == 0x15010040 {
+            if is_zero_padding(word0) {
                 return Ok(4.min(bytes.len() as u8));
             }
         }
@@ -513,6 +505,37 @@ impl Decoder for InstructionDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_padding_decodes_as_four_byte_nop() {
+        let decoder = InstructionDecoder::load_cached();
+        let bundle = decoder.decode(&[0u8; 16], 0).expect("zero padding is a NOP");
+        assert_eq!(bundle.size(), 4);
+    }
+
+    #[test]
+    fn table_miss_is_an_error() {
+        let decoder = InstructionDecoder::load_cached();
+        // Marker 0x9 (Short32) with no composite format fixed bits matching:
+        // an unassigned discriminator.
+        let mut found = None;
+        for hi in 0u32..32 {
+            for mid in 0u32..4 {
+                let word = (hi << 27) | (mid << 4) | 0x9;
+                if found.is_none() && decoder.extract_bundle_slots(&word.to_le_bytes()).is_none() {
+                    found = Some(word);
+                }
+            }
+        }
+        let word = found.expect("some Short32 discriminator is unassigned");
+        assert!(matches!(
+            decoder.decode(&word.to_le_bytes(), 0x40),
+            Err(DecodeError::UnknownOpcode { pc: 0x40, .. })
+        ));
+        // A decoder built without tables matches nothing.
+        let empty = InstructionDecoder::new();
+        assert!(empty.extract_bundle_slots(&word.to_le_bytes()).is_none());
+    }
     use crate::interpreter::bundle::ElementType;
     use smallvec::SmallVec;
     use xdna_archspec::aie2::{Bypass, isa::OperandField};
@@ -534,10 +557,8 @@ mod tests {
         // Random non-NOP word with 32-bit format marker (0x9)
         // This ensures we don't need more bytes than provided
         let bytes = [0xA9, 0xCD, 0xEF, 0x12]; // Low nibble = 0x9 = 32-bit
-        let bundle = decoder.decode(&bytes, 0).expect("Should decode");
-
-        let slot = bundle.slot(SlotIndex::Scalar0).expect("Should have slot");
-        assert!(slot.semantic.is_none(), "Unknown instruction should have semantic: None");
+                                              // No format table: nothing matches, which is an error, not a silent unknown op.
+        assert!(matches!(decoder.decode(&bytes, 0), Err(DecodeError::UnknownOpcode { .. })));
     }
 
     #[test]
@@ -809,7 +830,7 @@ mod tests {
     ) -> Vec<(String, Option<Operand>, Vec<Operand>)> {
         use crate::interpreter::bundle::SlotType;
 
-        let extracted = decoder.extract_bundle_slots(bytes);
+        let extracted = decoder.extract_bundle_slots(bytes).expect("format table match");
         let mut results = Vec::new();
 
         for slot in &extracted.slots {
@@ -847,9 +868,8 @@ mod tests {
             InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
 
         // First, show raw slot extraction
-        use crate::interpreter::bundle::extract_slots;
-        let ext_314 = extract_slots(&add_314_bytes);
-        let ext_one = extract_slots(&add_one_bytes);
+        let ext_314 = decoder.extract_bundle_slots(&add_314_bytes).expect("format table match");
+        let ext_one = decoder.extract_bundle_slots(&add_one_bytes).expect("format table match");
         eprintln!("=== add_314 slot extraction ===");
         for s in &ext_314.slots {
             eprintln!("  {:?}: bits=0x{:010X} (width={})", s.slot_type, s.bits, s.width);
@@ -1689,7 +1709,10 @@ mod tests {
                     if offset + size > code.len() {
                         break;
                     }
-                    let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
+                    let Some(extracted) = decoder.extract_bundle_slots(&code[offset..offset + size]) else {
+                        offset += size;
+                        continue;
+                    };
                     for slot in &extracted.slots {
                         if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                             continue;
@@ -2078,7 +2101,7 @@ mod tests {
 
         // Dump the raw encoding operand fields to see the source operand's
         // declared width/type.
-        let ext = decoder.extract_bundle_slots(&bytes);
+        let ext = decoder.extract_bundle_slots(&bytes).expect("format table match");
         for s in &ext.slots {
             if s.bits == 0 {
                 continue;
