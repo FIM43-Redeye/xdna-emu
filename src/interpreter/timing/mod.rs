@@ -7,8 +7,6 @@
 //! - **Hazard detection**: Register dependency tracking (RAW, WAW, WAR)
 //! - **Pipeline model**: In-flight instruction tracking
 //! - **Synchronization**: Lock contention tracking and timing
-//! - **Deadlock detection**: Circular wait detection for locks
-//! - **Barrier tracking**: Multi-core barrier timing and statistics
 //!
 //! # Architecture
 //!
@@ -18,9 +16,7 @@
 //! - Instruction latency (e.g., multiply = 2 cycles)
 //! - Memory bank conflicts (same bank accessed twice)
 //! - Register hazards (reading a register still being written)
-//! - Structural hazards (resource conflicts between slots)
 //! - Lock contention (waiting for synchronization primitives)
-//! - Barrier synchronization (waiting for all participants)
 //!
 //! # Usage
 //!
@@ -37,18 +33,8 @@ pub mod latency;
 pub mod memory;
 pub mod hazards;
 pub mod sync;
-pub mod deadlock;
-pub mod barrier;
-pub mod slots;
-pub mod arbitration;
 
 pub use latency::{LatencyTable, OperationTiming, LATENCY_MEMORY};
 pub use memory::{MemoryModel, MemoryAccess, BankConflict, AlignmentError, MemoryQuadrant, CROSS_TILE_LATENCY};
 pub use hazards::{HazardDetector, HazardType, HazardStats, Hazard, StallReason};
 pub use sync::{LockTimingState, LockStats, SyncTimingConfig, AggregateStats};
-pub use deadlock::{DeadlockDetector, DeadlockCycle, DeadlockConfig, TileId, LockId};
-pub use barrier::{
-    BarrierTracker, BarrierState, BarrierConfig, BarrierStats, BarrierPhase, BarrierId, AggregateBarrierStats,
-};
-pub use slots::{ExecutionResource, StructuralHazard, check_bundle_conflicts, bundle_structural_penalty};
-pub use arbitration::{MemTileArbiter, ArbiterSource, ArbiterStats};

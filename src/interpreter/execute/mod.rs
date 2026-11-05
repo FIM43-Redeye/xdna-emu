@@ -82,7 +82,6 @@ mod vector_helpers;
 mod vector_arith;
 mod vector_compare;
 mod vector_misc;
-pub mod vector_semantic;
 pub mod vector_pack;
 pub mod vector_permute;
 pub mod vector_srs;

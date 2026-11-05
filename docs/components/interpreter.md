@@ -72,7 +72,6 @@ Execution units implementing instruction semantics.
 | `vector_convert.rs` | Type conversion (int<->float, narrow<->wide) |
 | `vector_float.rs` | Float32/BFloat16 compute helpers (NaN, FTZ, PSA) |
 | `vector_config.rs` | MAC configuration word parsing and geometry tables |
-| `vector_semantic.rs` | SemanticOp-based vector dispatch |
 | `vector_validate.rs` | Cross-checks vector outputs against golden tables |
 | `memory/` | Load/store with post-modify addressing (split into submodules) |
 | `control.rs` | `ControlUnit` -- branches, calls, loops, delay slots |
@@ -93,12 +92,8 @@ Cycle-accurate timing model.
 | `hazards.rs` | `HazardDetector` -- data/structural hazard detection |
 | `memory.rs` | `MemoryModel` -- memory access timing, bank conflicts |
 | `sync.rs` | Synchronization timing (lock acquire/release) |
-| `deadlock.rs` | Deadlock detection for lock operations |
-| `barrier.rs` | Barrier synchronization timing |
-| `slots.rs` | Slot-level timing constraints |
-| `arbitration.rs` | Multi-core resource arbitration |
 
-Note: there is no `barrier.rs` companion file outside `timing/`; the
+Note: the
 old `interpreter::traits` `Flags` abstraction has been folded into the
 register-file types and `TimingContext`.
 
