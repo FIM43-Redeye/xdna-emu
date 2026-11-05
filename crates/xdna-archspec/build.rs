@@ -198,6 +198,7 @@ fn main() {
             extracted.slot_count()
         );
         build_helpers::codegen::generate_tablegen_file(&extracted, &out_dir);
+        build_helpers::codegen::generate_semantic_provenance(&extracted, &out_dir);
         build_helpers::codegen::generate_unpack_forms(&extracted.unpack_forms, &out_dir);
         build_helpers::codegen::generate_sparse_load_forms(&extracted.sparse_load_forms, &out_dir);
         build_helpers::codegen::generate_pack_forms(&extracted.pack_forms, &out_dir);

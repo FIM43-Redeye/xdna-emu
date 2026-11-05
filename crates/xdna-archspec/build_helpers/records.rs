@@ -59,6 +59,11 @@ pub struct BuildOperandField {
     pub operand_type: String,
     pub is_output: bool,
     pub fragments: Vec<BuildFieldFragment>,
+    /// TableGen register/operand class bound to this field in the `ins`/`outs` DAG
+    /// (empty when the field has no DAG binding). Provenance only, not emitted.
+    pub reg_class: String,
+    /// Which rule of `classify_operand_type` produced `operand_type`. Provenance only.
+    pub type_source: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +163,13 @@ pub struct BuildInstrEncoding {
     pub is_ptr_arithmetic: bool,
     pub is_sp_relative: bool,
     pub sched_class: Option<String>,
+    /// Every semantic proposal in pipeline order, as (layer, SemanticOp), including ones a
+    /// later layer overrode. The last entry that set the semantic is the winner.
+    /// Provenance only (written to `semantic_provenance.json`, not into generated code).
+    pub semantic_trail: Vec<(&'static str, String)>,
+    /// Which rule produced each per-instruction fact (`element_type`, `mem_width`,
+    /// `addressing_mode`, ...). Provenance only.
+    pub fact_sources: Vec<(&'static str, &'static str)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +233,8 @@ impl BuildSlotEncoding {
                         operand_type: "OperandType::Unknown".to_string(),
                         is_output: false,
                         fragments: Vec::new(),
+                        reg_class: String::new(),
+                        type_source: "unbound",
                     }
                 } else {
                     let fragments = build_fragments(&bit_pairs);
@@ -232,6 +246,8 @@ impl BuildSlotEncoding {
                         operand_type: "OperandType::Unknown".to_string(),
                         is_output: false,
                         fragments,
+                        reg_class: String::new(),
+                        type_source: "unbound",
                     }
                 }
             })

@@ -408,9 +408,15 @@ fn extract_def_list(record: &tblgen::Record<'_>, field_name: &str) -> Vec<String
 // Pattern records: Pat<> -> semantic string mapping
 // ============================================================================
 
-fn load_pattern_records(td_file: &Path, include_paths: &[&Path]) -> Result<HashMap<String, String>, String> {
+/// Instruction name -> (SemanticOp, rule): the rule is `sdnode` when the pattern's operator is a
+/// generic LLVM SelectionDAG node and `intrinsic` when it went through the hand stem table
+/// `semantic_from_intrinsic`.
+fn load_pattern_records(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<HashMap<String, (String, &'static str)>, String> {
     let keeper = parse_td_file(td_file, include_paths)?;
-    let mut candidates: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+    let mut candidates: HashMap<String, Vec<((String, &'static str), bool)>> = HashMap::new();
 
     for record in keeper.all_derived_definitions("Pattern") {
         let result_instrs = match record.value("ResultInstrs") {
@@ -471,7 +477,7 @@ fn load_pattern_records(td_file: &Path, include_paths: &[&Path]) -> Result<HashM
         candidates.entry(instr_name).or_default().push((semantic, is_simple));
     }
 
-    let mut result: HashMap<String, String> = HashMap::new();
+    let mut result: HashMap<String, (String, &'static str)> = HashMap::new();
     for (instr_name, cands) in &candidates {
         if let Some((op, _)) = cands.iter().find(|(_, is_simple)| *is_simple) {
             result.insert(instr_name.clone(), op.clone());
@@ -693,14 +699,14 @@ fn semantic_from_intrinsic(name: &str) -> Option<String> {
     }
 }
 
-fn extract_semantic_from_dag_init(dag: &tblgen::init::DagInit) -> Option<String> {
+fn extract_semantic_from_dag_init(dag: &tblgen::init::DagInit) -> Option<(String, &'static str)> {
     let op_rec = dag.operator();
     if let Ok(name) = op_rec.name() {
         if let Some(op) = semantic_from_sdnode(&name) {
-            return Some(op);
+            return Some((op, "sdnode"));
         }
         if let Some(op) = semantic_from_intrinsic(&name) {
-            return Some(op);
+            return Some((op, "intrinsic"));
         }
     }
 
@@ -1238,8 +1244,16 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     let mut pattern_upgraded = 0usize;
     for encodings in by_slot.values_mut() {
         for enc in encodings.iter_mut() {
-            if let Some(op) = pattern_map.get(enc.name.as_str()) {
+            if let Some((op, rule)) = pattern_map.get(enc.name.as_str()) {
                 enc.semantic = Some(op.clone());
+                enc.semantic_trail.push((
+                    if *rule == "sdnode" {
+                        "L1_pat_sdnode"
+                    } else {
+                        "L1_pat_intrinsic"
+                    },
+                    op.clone(),
+                ));
                 pattern_upgraded += 1;
             }
         }
@@ -1248,11 +1262,11 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
 
     // Layer 2: Pseudo expansion propagation
     let pseudo_map = load_pseudo_expansion_map(&td_file, &inc_refs).unwrap_or_default();
-    let mut expansion_semantics: HashMap<String, String> = HashMap::new();
+    let mut expansion_semantics: HashMap<String, (String, &'static str)> = HashMap::new();
     for (pseudo_name, concretes) in &pseudo_map {
-        if let Some(op) = pattern_map.get(pseudo_name.as_str()) {
+        if let Some((op, rule)) = pattern_map.get(pseudo_name.as_str()) {
             for concrete in concretes {
-                expansion_semantics.insert(concrete.clone(), op.clone());
+                expansion_semantics.insert(concrete.clone(), (op.clone(), *rule));
             }
         }
     }
@@ -1260,8 +1274,16 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
     for encodings in by_slot.values_mut() {
         for enc in encodings.iter_mut() {
             if enc.semantic.is_none() {
-                if let Some(op) = expansion_semantics.get(enc.name.as_str()) {
+                if let Some((op, rule)) = expansion_semantics.get(enc.name.as_str()) {
                     enc.semantic = Some(op.clone());
+                    enc.semantic_trail.push((
+                        if *rule == "sdnode" {
+                            "L2_pseudo_sdnode"
+                        } else {
+                            "L2_pseudo_intrinsic"
+                        },
+                        op.clone(),
+                    ));
                     pseudo_propagated += 1;
                 }
             }
@@ -1281,6 +1303,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
                     for enc in encodings.iter_mut() {
                         if enc.semantic.is_none() && enc.name == *opcode_name {
                             enc.semantic = Some(op.clone());
+                            enc.semantic_trail.push(("L3_cpp_switch", op.clone()));
                             cpp_propagated += 1;
                         }
                     }
@@ -1301,6 +1324,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
                     for &(prefix, op_str) in ITINERARY_SEMANTICS {
                         if sched.starts_with(prefix) {
                             enc.semantic = Some(op_str.to_string());
+                            enc.semantic_trail.push(("L4_itinerary_table", op_str.to_string()));
                             itinerary_inferred += 1;
                             break;
                         }
@@ -1325,9 +1349,13 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
             let uses_mcd = enc.implicit_regs.iter().any(|r| r.reg_class == "crMCDEn" && r.is_use);
             if uses_scd {
                 enc.semantic = Some("SemanticOp::CascadeRead".to_string());
+                enc.semantic_trail
+                    .push(("L5a_cascade_implicit", "SemanticOp::CascadeRead".to_string()));
                 cascade_overridden += 1;
             } else if uses_mcd {
                 enc.semantic = Some("SemanticOp::CascadeWrite".to_string());
+                enc.semantic_trail
+                    .push(("L5a_cascade_implicit", "SemanticOp::CascadeWrite".to_string()));
                 cascade_overridden += 1;
             }
         }
@@ -1346,6 +1374,7 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
                 if enc.semantic.as_deref() != Some(op.as_str()) {
                     encoding_corrected += 1;
                 }
+                enc.semantic_trail.push(("L5b_name_override", op.clone()));
                 enc.semantic = Some(op);
             }
         }

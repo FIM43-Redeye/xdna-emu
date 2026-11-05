@@ -15,7 +15,7 @@ use super::records::{BuildImplicitReg, BuildInstrEncoding, BuildInstrRecord};
 /// Classify an operand's decode type from the reg_class string.
 ///
 /// Returns a Rust expression string for the `OperandType` constructor.
-pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
+pub fn classify_operand_type(reg_class: &str, field_name: &str) -> (String, &'static str) {
     // 1. Composite register operands
     const COMPOSITE_LOOKUP: &[(&str, &str)] = &[
         ("OP_mLdaScl", "CompositeEncoder::LdaScl"),
@@ -42,18 +42,18 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
     ];
 
     if let Some((_, encoder)) = COMPOSITE_LOOKUP.iter().find(|(name, _)| *name == reg_class) {
-        return format!("OperandType::CompositeRegister({})", encoder);
+        return (format!("OperandType::CompositeRegister({})", encoder), "composite_table");
     }
 
     // 2. Simple register classes
     match reg_class {
-        "eR" => return "OperandType::Register(RegisterKind::Scalar)".to_string(),
-        "eP" => return "OperandType::Register(RegisterKind::Pointer)".to_string(),
-        "eM" => return "OperandType::Register(RegisterKind::ModifierM)".to_string(),
-        "eDN" => return "OperandType::Register(RegisterKind::ModifierDN)".to_string(),
-        "eDJ" => return "OperandType::Register(RegisterKind::ModifierDJ)".to_string(),
-        "eDC" => return "OperandType::Register(RegisterKind::ModifierDC)".to_string(),
-        "mCRm" => return "OperandType::Register(RegisterKind::Control)".to_string(),
+        "eR" => return ("OperandType::Register(RegisterKind::Scalar)".to_string(), "regclass_exact"),
+        "eP" => return ("OperandType::Register(RegisterKind::Pointer)".to_string(), "regclass_exact"),
+        "eM" => return ("OperandType::Register(RegisterKind::ModifierM)".to_string(), "regclass_exact"),
+        "eDN" => return ("OperandType::Register(RegisterKind::ModifierDN)".to_string(), "regclass_exact"),
+        "eDJ" => return ("OperandType::Register(RegisterKind::ModifierDJ)".to_string(), "regclass_exact"),
+        "eDC" => return ("OperandType::Register(RegisterKind::ModifierDC)".to_string(), "regclass_exact"),
+        "mCRm" => return ("OperandType::Register(RegisterKind::Control)".to_string(), "regclass_exact"),
         _ => {}
     }
     // Scalar register subclasses with base offsets:
@@ -67,40 +67,60 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
     // eS = shift registers s0-s3 (scalar, 2-bit index, base=0).
     //   Used by VSRS, VUPS, VSHIFT_ALIGN as shift amount operand.
     match reg_class {
-        "eRS4" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
-        "eRS8" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
-        "eR29" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 29)".to_string(),
-        "eL" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
-        "eS" => return "OperandType::Register(RegisterKind::Scalar)".to_string(),
+        "eRS4" => {
+            return (
+                "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+                "regclass_exact",
+            )
+        }
+        "eRS8" => {
+            return (
+                "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+                "regclass_exact",
+            )
+        }
+        "eR29" => {
+            return (
+                "OperandType::RegisterWithOffset(RegisterKind::Scalar, 29)".to_string(),
+                "regclass_exact",
+            )
+        }
+        "eL" => {
+            return (
+                "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+                "regclass_exact",
+            )
+        }
+        "eS" => return ("OperandType::Register(RegisterKind::Scalar)".to_string(), "regclass_exact"),
         _ => {}
     }
     // Generic eR* subclasses: treat as base scalar (no offset)
     if reg_class.starts_with("eR") {
-        return "OperandType::Register(RegisterKind::Scalar)".to_string();
+        return ("OperandType::Register(RegisterKind::Scalar)".to_string(), "regclass_prefix");
     }
     // Pointer register subclasses
     if reg_class.starts_with("eP") {
-        return "OperandType::Register(RegisterKind::Pointer)".to_string();
+        return ("OperandType::Register(RegisterKind::Pointer)".to_string(), "regclass_prefix");
     }
     // 256-bit vector register subclasses (mWm, mWn, eW*, etc.)
     if reg_class.starts_with("eW") || reg_class.starts_with("mW") {
-        return "OperandType::Register(RegisterKind::Vector256)".to_string();
+        return ("OperandType::Register(RegisterKind::Vector256)".to_string(), "regclass_prefix");
     }
     // 512-bit vector register subclasses (mXm, mXn, mXv, mXw, mXa, mXs, eX*, etc.)
     // All subsets of VEC512 = (add mXm, mXn, mXv, mXw, mXa, mXs)
     if reg_class.starts_with("mX") || reg_class.starts_with("eX") {
-        return "OperandType::Register(RegisterKind::Vector512)".to_string();
+        return ("OperandType::Register(RegisterKind::Vector512)".to_string(), "regclass_prefix");
     }
     // 1024-bit vector register subclasses (eYs = y-registers y2-y5).
     // Used by sparse MAC wide variants for the dense A operand (ys1).
     if reg_class.starts_with("eY") {
-        return "OperandType::Register(RegisterKind::Vector1024)".to_string();
+        return ("OperandType::Register(RegisterKind::Vector1024)".to_string(), "regclass_prefix");
     }
     // mQQX*: sparse composite registers qx0-qx3 (vector data + sparsity mask).
     // Must be checked BEFORE mQQ (accumulator weight queue) since mQQXw
     // starts with mQQ but is NOT an accumulator.
     if reg_class.starts_with("mQQX") || reg_class.starts_with("mQX") {
-        return "OperandType::Register(RegisterKind::SparseQx)".to_string();
+        return ("OperandType::Register(RegisterKind::SparseQx)".to_string(), "regclass_prefix");
     }
     // Accumulator register subclasses (eAM*, mAMm*, eBM*, mBMm*, eCM*, mBMS*, mQQ*)
     if reg_class.starts_with("eAM")
@@ -110,38 +130,38 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
         || reg_class.starts_with("eCM")
         || reg_class.starts_with("mQQ")
     {
-        return "OperandType::Register(RegisterKind::Accumulator)".to_string();
+        return ("OperandType::Register(RegisterKind::Accumulator)".to_string(), "regclass_prefix");
     }
     // Shift register classes: mSs contains shift registers s0-s3 (scalar).
     // Used by VSRS, VUPS, VSHIFT_ALIGN for shift amount operands.
     // NOT stream registers despite the "mS" prefix -- the "m" prefix is
     // llvm-aie's naming convention for "machine" register classes.
     if reg_class.starts_with("mS") {
-        return "OperandType::Register(RegisterKind::Scalar)".to_string();
+        return ("OperandType::Register(RegisterKind::Scalar)".to_string(), "regclass_prefix");
     }
     // Modifier register subclasses
     if reg_class.starts_with("eD") || reg_class.starts_with("eM") {
-        return "OperandType::Register(RegisterKind::ModifierM)".to_string();
+        return ("OperandType::Register(RegisterKind::ModifierM)".to_string(), "regclass_prefix");
     }
 
     // 3. Lock ID fields: always unsigned, regardless of reg_class.
     // Lock IDs are 0-63 (6-bit unsigned).  The field may have an imm6
     // reg_class which parse_immediate_type() would classify as signed.
     if field_name == "id" || field_name == "mLockId" {
-        return "OperandType::LockId".to_string();
+        return ("OperandType::LockId".to_string(), "lockid_fieldname");
     }
 
     // 4. Immediate operands
     if let Some(imm_type) = parse_immediate_type(reg_class) {
-        return imm_type;
+        return (imm_type, "imm_classname");
     }
 
     // 5. Field-name fallback
     if reg_class.is_empty() || reg_class == "?" {
-        return classify_from_field_name(field_name);
+        return (classify_from_field_name(field_name), "fieldname_fallback");
     }
 
-    "OperandType::Unknown".to_string()
+    ("OperandType::Unknown".to_string(), "unknown")
 }
 
 /// Parse immediate type from reg_class name (e.g., "simm7", "imm12x4").
@@ -549,6 +569,64 @@ impl BuildInstrRecord {
         }
     }
 
+    /// Which rule produced each per-instruction fact, for the data-driven ledger
+    /// (`tools/datadriven_ledger.py`). Each value names the rule, so the ledger can tell a
+    /// TableGen record field from a parse of a TableGen name and from a hand table.
+    fn fact_sources(&self, dual_type: bool, has_element_type: bool) -> Vec<(&'static str, &'static str)> {
+        let element_type = if dual_type {
+            "name_tokens"
+        } else if has_element_type {
+            "mnemonic_suffix"
+        } else {
+            "none"
+        };
+        let addressing_mode = match (self.descriptor_class, self.descriptor_operand) {
+            (Some(_), Some(_)) => "tablegen_ag_class",
+            _ if detect_addressing_mode(&self.name) != "AddressingMode::Unknown" => "name_substring",
+            _ => "none",
+        };
+        let mem_width = if !(self.may_load || self.may_store) {
+            "n/a"
+        } else if self.name.to_lowercase().contains("dmv_lda_q")
+            || self.name.to_lowercase().contains("dmv_sts_q")
+        {
+            "name_substring"
+        } else {
+            "mnemonic_substring"
+        };
+        vec![
+            ("element_type", element_type),
+            ("addressing_mode", addressing_mode),
+            ("mem_width", mem_width),
+            ("side_effects", "tablegen_flags"),
+            (
+                "implicit_regs",
+                if self.defs.is_empty() && self.uses.is_empty() {
+                    "none"
+                } else {
+                    "tablegen_defs_uses"
+                },
+            ),
+            (
+                "implicit_reg_num",
+                if self.defs.is_empty() && self.uses.is_empty() {
+                    "none"
+                } else {
+                    "name_digits"
+                },
+            ),
+            (
+                "itinerary",
+                if self.itinerary_class.is_some() {
+                    "tablegen_itinerary"
+                } else {
+                    "none"
+                },
+            ),
+            ("is_vector", "mnemonic_prefix"),
+        ]
+    }
+
     /// Convert to BuildInstrEncoding for code generation.
     ///
     /// Returns None for `isCodeGenOnly` instructions and `isComposite` records.
@@ -570,12 +648,17 @@ impl BuildInstrRecord {
 
         for field in &mut operand_fields {
             if let Some((reg_class, _)) = all_operands.iter().find(|(_, name)| *name == field.name) {
-                field.operand_type = classify_operand_type(reg_class, &field.name);
+                let (operand_type, source) = classify_operand_type(reg_class, &field.name);
+                field.operand_type = operand_type;
+                field.reg_class = reg_class.to_string();
+                field.type_source = source;
                 if field.operand_type.contains("signed: true") {
                     field.signed = true;
                 }
             } else {
-                field.operand_type = classify_operand_type("", &field.name);
+                let (operand_type, source) = classify_operand_type("", &field.name);
+                field.operand_type = operand_type;
+                field.type_source = source;
             }
         }
 
@@ -585,6 +668,7 @@ impl BuildInstrRecord {
         };
 
         // Structural semantic inference from TableGen attributes.
+        let mut semantic_trail: Vec<(&'static str, String)> = Vec::new();
         let semantic = if self.is_move_imm || self.is_move_reg {
             Some("SemanticOp::Copy".to_string())
         } else if self.is_slot_nop {
@@ -599,8 +683,30 @@ impl BuildInstrRecord {
                 &self.parents,
             )
         };
+        if let Some(op) = &semantic {
+            let layer = if self.is_move_imm || self.is_move_reg {
+                "L0_move_flag"
+            } else if self.is_slot_nop {
+                "L0_nop_mnemonic"
+            } else if self.has_delay_slot {
+                "L0_delay_slot_flags"
+            } else if self.may_load || self.may_store {
+                "L0_mayload_maystore"
+            } else {
+                "L0_done_parent_class"
+            };
+            semantic_trail.push((layer, op.clone()));
+        }
 
         let semantic = refine_branch_semantic(&self.mnemonic, semantic);
+        if let Some(op) = &semantic {
+            if semantic_trail.last().map(|(_, o)| o) != Some(op) {
+                semantic_trail.push(("L0_branch_mnemonic", op.clone()));
+            }
+        }
+        if let Some(op) = refine_encoding_semantic(&self.name) {
+            semantic_trail.push(("L0_name_override_early", op));
+        }
         // Apply name-based overrides that are needed for downstream inference
         // (select_variant, etc.) before those inferences run.  The full
         // refine_encoding_semantic pipeline in extract.rs may re-set this
@@ -640,11 +746,14 @@ impl BuildInstrRecord {
         // a bare immediate (a 128-bit spill store went to a wrong address).
         let is_sp_relative = self.uses.iter().any(|u| u == "SP") || self.asm_string.contains("[sp,");
         let (dual_et, dual_ft) = infer_dual_element_types(&self.name);
+        let dual_type = dual_et.is_some();
         let element_type = dual_et.or_else(|| infer_element_type(&self.mnemonic));
         let from_type = dual_ft;
         let branch_condition = infer_branch_condition(&self.mnemonic, semantic.as_deref());
         let select_variant = infer_select_variant(&self.mnemonic, semantic.as_deref());
         let is_ptr_arithmetic = semantic.as_deref() == Some("SemanticOp::PointerAdd");
+
+        let fact_sources = self.fact_sources(dual_type, element_type.is_some());
 
         Some(BuildInstrEncoding {
             name: self.name.clone(),
@@ -672,6 +781,8 @@ impl BuildInstrRecord {
             is_ptr_arithmetic,
             is_sp_relative,
             sched_class: self.itinerary_class.clone(),
+            semantic_trail,
+            fact_sources,
         })
     }
 }

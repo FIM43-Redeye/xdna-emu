@@ -745,3 +745,73 @@ pub fn generate_descriptors(layout: &super::records::BuildDescriptorLayout, out_
     }
     std::fs::write(out_dir.join("gen_descriptors.rs"), code).unwrap();
 }
+
+/// Write `$OUT_DIR/semantic_provenance.json`: per resolved encoding, every semantic layer that
+/// proposed a SemanticOp (in pipeline order), the rule behind each per-instruction fact, and the
+/// operand fields with their TableGen class. Nothing reads it at build or run time; it feeds the
+/// data-driven ledger (`tools/datadriven_ledger.py`), so a migration can measure what still
+/// comes from hand tables.
+pub fn generate_semantic_provenance(output: &BuildTblgenOutput, out_dir: &Path) {
+    let mut slots: Vec<&String> = output.encodings_by_slot.keys().collect();
+    slots.sort();
+    let mut rows = Vec::new();
+    for slot in slots {
+        for enc in &output.encodings_by_slot[slot] {
+            let fields: Vec<serde_json::Value> = enc
+                .operand_fields
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name,
+                        "width": f.width,
+                        "reg_class": f.reg_class,
+                        "operand_type": f.operand_type,
+                        "type_source": f.type_source,
+                    })
+                })
+                .collect();
+            let trail: Vec<serde_json::Value> = enc
+                .semantic_trail
+                .iter()
+                .map(|(layer, op)| serde_json::json!([layer, op]))
+                .collect();
+            let facts: serde_json::Map<String, serde_json::Value> = enc
+                .fact_sources
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect();
+            let implicit: Vec<serde_json::Value> = enc
+                .implicit_regs
+                .iter()
+                .map(|r| serde_json::json!({"reg": r.reg_class, "reg_num": r.reg_num, "is_use": r.is_use}))
+                .collect();
+            rows.push(serde_json::json!({
+                "name": enc.name,
+                "mnemonic": enc.mnemonic,
+                "asm_string": enc.asm_string,
+                "slot": enc.slot,
+                "semantic": enc.semantic,
+                "semantic_trail": trail,
+                "fact_sources": facts,
+                "element_type": enc.element_type,
+                "from_type": enc.from_type,
+                "mem_width": enc.mem_width,
+                "addressing_mode": enc.addressing_mode,
+                "branch_condition": enc.branch_condition,
+                "select_variant": enc.select_variant,
+                "may_load": enc.may_load,
+                "may_store": enc.may_store,
+                "is_vector": enc.is_vector,
+                "is_ptr_arithmetic": enc.is_ptr_arithmetic,
+                "is_sp_relative": enc.is_sp_relative,
+                "sched_class": enc.sched_class,
+                "implicit_regs": implicit,
+                "input_order": enc.input_order,
+                "output_order": enc.output_order,
+                "operand_fields": fields,
+            }));
+        }
+    }
+    let text = serde_json::to_string_pretty(&serde_json::json!({ "encodings": rows })).unwrap();
+    std::fs::write(out_dir.join("semantic_provenance.json"), text).unwrap();
+}
