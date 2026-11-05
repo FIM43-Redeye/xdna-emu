@@ -386,7 +386,10 @@ impl TileArray {
             if tile.stream_switch.has_pending_data() {
                 return true;
             }
-            if !tile.cascade_input.is_empty() || !tile.cascade_output.is_empty() {
+            if !tile.cascade_input.is_empty()
+                || !tile.cascade_wire.is_empty()
+                || !tile.cascade_output.is_empty()
+            {
                 return true;
             }
         }

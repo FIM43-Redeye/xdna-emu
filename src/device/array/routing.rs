@@ -280,96 +280,79 @@ impl TileArray {
     /// from the stream switch fabric. Each compute tile can send cascade data
     /// to one neighbor (South or East) and receive from one neighbor (North or
     /// West), as configured by the accumulator control register at 0x36060.
-    ///
-    /// Uses a two-phase collect-then-apply approach to avoid borrow issues.
-    pub(super) fn route_cascade(&mut self) {
-        let rows = self.rows;
-        let cols = self.cols;
-
-        // Phase 1: Collect pending transfers.
-        // Each entry: (src_idx, dst_col, dst_row)
-        let mut transfers: Vec<(usize, u8, u8)> = Vec::new();
-
-        for col in self.tile_col_start..cols {
-            // Column gate check: skip gated columns for cascade propagation.
-            if !self.clock.is_column_active(col) {
-                continue;
+    /// Runs once at the end of every cycle: MCD -> transit -> SCD, one stage per cycle.
+    pub(crate) fn route_cascade(&mut self) {
+        // Transit -> SCD first, so a word moves one stage per cycle: written in cycle t, in
+        // transit after t, readable from t + 2 (`CASCADE_TRANSIT_CYCLES`). No capacity check:
+        // the producer's credit check (`Tile::cascade_output_full`) already bounds the link.
+        for tile in self.tiles.iter_mut() {
+            while let Some(word) = tile.cascade_wire.pop_front() {
+                tile.cascade_input.push_back(word);
             }
+        }
 
-            for row in 0..rows {
+        let mut transfers: Vec<(usize, usize)> = Vec::new();
+        for col in self.tile_col_start..self.cols {
+            for row in 0..self.rows {
                 if !self.arch.is_valid_tile(col, row) {
                     continue;
                 }
                 let idx = self.tile_index(col, row);
-                let tile = &self.tiles[idx];
-
-                if !tile.is_compute() || !tile.has_cascade_output() {
+                if !self.tiles[idx].has_cascade_output() {
                     continue;
                 }
-
-                // Determine destination based on output direction
-                let (dst_col, dst_row) = match tile.cascade_output_dir {
-                    0 => {
-                        // South: (col, row - 1)
-                        // Shim row has no south neighbor.
-                        if row == SHIM_ROW {
-                            continue;
-                        }
-                        (col, row - 1)
-                    }
-                    1 => {
-                        // East: (col + 1, row)
-                        if col + 1 >= cols {
-                            continue;
-                        }
-                        (col + 1, row)
-                    }
-                    _ => continue,
-                };
-
-                // Verify destination exists and is a compute tile
-                if !self.arch.is_valid_tile(dst_col, dst_row) {
-                    continue;
-                }
-                let dst_idx = self.tile_index(dst_col, dst_row);
-                if !self.tiles[dst_idx].is_compute() {
-                    continue;
-                }
-
-                // Verify destination's input direction matches
-                let dst_input_dir = self.tiles[dst_idx].cascade_input_dir;
-                let expected_dir = match tile.cascade_output_dir {
-                    0 => 0, // South output -> North input (dir=0)
-                    1 => 1, // East output -> West input (dir=1)
-                    _ => continue,
-                };
-                if dst_input_dir != expected_dir {
-                    continue;
-                }
-
-                // Check backpressure: destination SCD FIFO must have room.
-                if !self.tiles[dst_idx].cascade_input_full() {
-                    transfers.push((idx, dst_col, dst_row));
+                if let Some((dc, dr)) = self.cascade_consumer_of(col, row) {
+                    transfers.push((idx, self.tile_index(dc, dr)));
                 }
             }
         }
-
-        // Phase 2: Apply transfers
-        for (src_idx, dst_col, dst_row) in transfers {
-            let dst_idx = self.tile_index(dst_col, dst_row);
-
-            if let Some(data) = self.tiles[src_idx].pop_cascade_output() {
+        for (src_idx, dst_idx) in transfers {
+            while let Some(data) = self.tiles[src_idx].pop_cascade_output() {
                 log::info!(
                     "[CASCADE] Route ({},{}) -> ({},{}) data[0]={:#X}",
                     self.tiles[src_idx].col,
                     self.tiles[src_idx].row,
-                    dst_col,
-                    dst_row,
+                    self.tiles[dst_idx].col,
+                    self.tiles[dst_idx].row,
                     data[0]
                 );
-                self.tiles[dst_idx].push_cascade_input(data);
+                self.tiles[dst_idx].cascade_wire.push_back(data);
             }
         }
+    }
+
+    /// The consumer end of the cascade link leaving compute tile (col, row), if the link is
+    /// complete: the output direction names a compute neighbour (South: row - 1, East: col + 1)
+    /// whose input direction faces back (North = 0, West = 1), and the column is clocked.
+    pub(crate) fn cascade_consumer_of(&self, col: u8, row: u8) -> Option<(u8, u8)> {
+        if !self.clock.is_column_active(col) || !self.arch.is_valid_tile(col, row) {
+            return None;
+        }
+        let tile = &self.tiles[self.tile_index(col, row)];
+        if !tile.is_compute() {
+            return None;
+        }
+        let (dst, expected_input_dir) = match tile.cascade_output_dir {
+            0 if row > SHIM_ROW => ((col, row - 1), 0),
+            1 if col + 1 < self.cols => ((col + 1, row), 1),
+            _ => return None,
+        };
+        if !self.arch.is_valid_tile(dst.0, dst.1) {
+            return None;
+        }
+        let consumer = &self.tiles[self.tile_index(dst.0, dst.1)];
+        (consumer.is_compute() && consumer.cascade_input_dir == expected_input_dir).then_some(dst)
+    }
+
+    /// Refresh the downstream occupancy the producer at (col, row) checks before a `vmov MCD`:
+    /// the words its consumer holds in transit and in its SCD. The coordinator calls this just
+    /// before stepping the producer, after the consumer has stepped in the same cycle.
+    pub(crate) fn refresh_cascade_occupancy(&mut self, col: u8, row: u8) {
+        let occupancy = self
+            .cascade_consumer_of(col, row)
+            .map_or(0, |(dc, dr)| self.tiles[self.tile_index(dc, dr)].cascade_inbound_occupancy());
+        let idx = self.tile_index(col, row);
+        self.tiles[idx].cascade_downstream_occupancy = occupancy;
     }
 
     /// Route all stream data through the NPU stream network.

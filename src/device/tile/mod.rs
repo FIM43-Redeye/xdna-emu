@@ -39,7 +39,7 @@ pub use dma_legacy::{DmaBufferDescriptor, DmaChannel};
 pub use core_state::{CoreState, LegacyStreamPort, CtrlPacketAction};
 pub use xdna_archspec::types::TileKind;
 pub use edge::EdgeDetector;
-pub use streams::{CASCADE_INPUT_DEPTH, CASCADE_OUTPUT_DEPTH, CASCADE_TOTAL_DEPTH, CORE_STREAM_INPUT_DEPTH};
+pub use streams::{CASCADE_TOTAL_DEPTH, CASCADE_TRANSIT_CYCLES, CORE_STREAM_INPUT_DEPTH};
 
 use super::events::EventModuleType;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
@@ -272,7 +272,18 @@ pub struct Tile {
     pub cascade_input: std::collections::VecDeque<[u64; xdna_archspec::aie2::CASCADE_WORDS]>,
 
     /// Cascade output FIFO (MCD). 512-bit width (`CASCADE_WORDS` x u64; AIE2).
+    /// Holds a word only for the cycle it is written in: the link routing moves it on at the
+    /// end of that cycle (see [`CASCADE_TRANSIT_CYCLES`](streams::CASCADE_TRANSIT_CYCLES)).
     pub cascade_output: std::collections::VecDeque<[u64; xdna_archspec::aie2::CASCADE_WORDS]>,
+
+    /// Words in transit to this tile's SCD: left the producer, not yet readable here.
+    pub cascade_wire: std::collections::VecDeque<[u64; xdna_archspec::aie2::CASCADE_WORDS]>,
+
+    /// Words of this tile's outgoing link held downstream (the consumer's transit stage and
+    /// SCD), refreshed by the coordinator just before this core steps, after the consumer has
+    /// stepped in the same cycle. With [`Self::cascade_output`] it is the link occupancy the
+    /// `vmov MCD` credit check sees, so a word the consumer pops frees its slot in that cycle.
+    pub cascade_downstream_occupancy: usize,
 
     /// Cascade input direction: 0=North, 1=West.
     /// From accumulator control register at offset 0x36060 bit 0.
@@ -494,6 +505,8 @@ impl Tile {
             shim_mux_s2mm_masters: vec![None; params.dma_s2mm_channels],
             cascade_input: std::collections::VecDeque::new(),
             cascade_output: std::collections::VecDeque::new(),
+            cascade_wire: std::collections::VecDeque::new(),
+            cascade_downstream_occupancy: 0,
             cascade_input_dir: 0,
             cascade_output_dir: 0,
             core_trace: TraceUnit::new(col, row),

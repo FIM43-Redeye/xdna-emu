@@ -2,22 +2,28 @@
 
 use super::*;
 
-/// Total cascade buffering between a producer's `vmov MCD` and the consumer's
-/// `vmov SCD`, in 512-bit words: 2.
+/// Words a cascade link holds between a producer's `vmov MCD` and the consumer's `vmov SCD`
+/// taking them: 2. A write needs a free slot; a word is in the link from its write until the
+/// consumer takes it (in transit or buffered at the consumer alike).
 ///
-/// Measured on Phoenix silicon with the harness depth probe
-/// (`tools/gen_cascade_probe.py`; consumer idle for 1500-5000 cycles, producer
-/// issues back-to-back MCD writes with a cycle-counter stamp after each): the
-/// third write always stalls until the consumer reads, in 27/27 stalling runs
-/// over South and East pairs, K = 3/8/24 writes and three delays. It matches the
-/// "2-deep" FIFO of AM020. The same probe cannot say where the two words sit
-/// (producer side, consumer side, or the wire), so the split below is a
-/// modelling choice, not a measurement.
+/// Measured on Phoenix silicon. Harness depth probe (`tools/gen_cascade_probe.py`; consumer idle
+/// for 1500-5000 cycles, producer issues back-to-back MCD writes with a cycle-counter stamp after
+/// each): the third write always stalls until the consumer reads, in 27/27 stalling runs over
+/// South and East pairs. Timing probe (`tools/gen_cascade_timing_probe.py`, families `wrel` and
+/// `rt`): a stalled write issues in the very cycle the consumer's hold bundle takes a word, and a
+/// consumer reading back to back after a full link never waits, i.e. the slot is free at once.
+/// Where the two words physically sit is not observable: every probe sees the link as this
+/// credit window plus [`CASCADE_TRANSIT_CYCLES`].
 pub const CASCADE_TOTAL_DEPTH: usize = 2;
-/// Producer-side (MCD) share of [`CASCADE_TOTAL_DEPTH`]; unpinned split.
-pub const CASCADE_OUTPUT_DEPTH: usize = 1;
-/// Consumer-side (SCD) share of [`CASCADE_TOTAL_DEPTH`]; unpinned split.
-pub const CASCADE_INPUT_DEPTH: usize = CASCADE_TOTAL_DEPTH - CASCADE_OUTPUT_DEPTH;
+
+/// Cycles from a `vmov MCD` issuing to its word being readable at the consumer: 2. A word
+/// written in cycle t is taken by a consumer bundle issuing in t + 2 or later, held or not; a
+/// bundle held on an empty SCD issues in the first cycle a word is readable (no restart
+/// penalty). Silicon, `tools/gen_cascade_timing_probe.py` family `rel` (consumer stall
+/// max(0, n - 4) over n = 0..24, South and East, r1 == r2), with the one-way split from the
+/// shared-memory timer-phase probe (`mf*`/`mr*`: the two tiles of a column read the same
+/// timer). The link routing realizes it as two end-of-cycle moves: MCD -> transit -> SCD.
+pub const CASCADE_TRANSIT_CYCLES: usize = 2;
 
 /// Words the core's stream input buffer holds before the Core master port is backpressured: 1.
 /// AM020 ch.2:143 gives the core's AXI4-Stream interface no FIFO, so this is only the hand-off
@@ -120,14 +126,15 @@ impl Tile {
 
     // === Cascade Stream Helpers ===
 
-    /// Words the producer-side (MCD) FIFO holds before `vmov MCD` stalls.
+    /// True when the outgoing link holds [`CASCADE_TOTAL_DEPTH`] words, so `vmov MCD` stalls.
+    /// Counts this tile's MCD stage plus the downstream occupancy the coordinator refreshed.
     pub fn cascade_output_full(&self) -> bool {
-        self.cascade_output.len() >= CASCADE_OUTPUT_DEPTH
+        self.cascade_output.len() + self.cascade_downstream_occupancy >= CASCADE_TOTAL_DEPTH
     }
 
-    /// Words the consumer-side (SCD) FIFO holds before the link refuses more.
-    pub fn cascade_input_full(&self) -> bool {
-        self.cascade_input.len() >= CASCADE_INPUT_DEPTH
+    /// Words of the incoming link held at this tile: in transit and readable.
+    pub fn cascade_inbound_occupancy(&self) -> usize {
+        self.cascade_wire.len() + self.cascade_input.len()
     }
 
     /// Push a 512-bit value into the cascade input FIFO (SCD).

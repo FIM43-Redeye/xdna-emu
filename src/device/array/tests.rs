@@ -315,85 +315,75 @@ fn module_gate_skips_ss_when_ss_module_gated() {
 
 // === Cascade Routing Tests ===
 
-#[test]
-fn test_cascade_route_south() {
-    // NPU1: 5 cols x 6 rows. Compute tiles at rows 2-5.
-    let mut array = TileArray::npu1();
+fn south_link(array: &mut TileArray) {
+    // (1,3) -> (1,2). cascade_input_dir: 0=North, 1=West; cascade_output_dir: 0=South, 1=East.
     array.clock_mut().ungate_all();
+    array.tile_mut(1, 3).cascade_input_dir = 0;
+    array.tile_mut(1, 3).cascade_output_dir = 0;
+    array.tile_mut(1, 2).cascade_input_dir = 0;
+    array.tile_mut(1, 2).cascade_output_dir = 0;
+}
 
-    // Configure tile (1,3): output direction = South (0)
-    // Configure tile (1,2): input direction = North (0)
-    // cascade_input_dir: bit 0 (0=North, 1=West)
-    // cascade_output_dir: bit 1 (0=South, 1=East)
-    array.tile_mut(1, 3).cascade_input_dir = 0; // North
-    array.tile_mut(1, 3).cascade_output_dir = 0; // South
-    array.tile_mut(1, 2).cascade_input_dir = 0; // North
-    array.tile_mut(1, 2).cascade_output_dir = 0; // South
-
-    // Push cascade data to tile (1,3) output
+/// A word written in cycle t is readable at the consumer from t + 2: the routing at the end of
+/// cycle t moves it into transit, the routing at the end of t + 1 into the SCD.
+#[test]
+fn test_cascade_route_south_takes_two_cycles() {
+    let mut array = TileArray::npu1();
+    south_link(&mut array);
     let data = [0xAAu64, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
     array.tile_mut(1, 3).push_cascade_output(data);
 
-    // Route cascade
-    array.route_cascade();
-
-    // Data should arrive at tile (1,2) input
-    assert!(array.tile(1, 2).has_cascade_input());
+    array.route_cascade(); // end of cycle t
     assert!(!array.tile(1, 3).has_cascade_output());
+    assert!(!array.tile(1, 2).has_cascade_input(), "not readable in t + 1");
+    assert_eq!(array.tile(1, 2).cascade_inbound_occupancy(), 1);
 
-    let received = array.tile_mut(1, 2).pop_cascade_input().unwrap();
-    assert_eq!(received, data);
+    array.route_cascade(); // end of cycle t + 1
+    assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap(), data);
 }
 
 #[test]
 fn test_cascade_route_east() {
     let mut array = TileArray::npu1();
     array.clock_mut().ungate_all();
-
-    // Configure tile (1,3): output direction = East (1)
     array.tile_mut(1, 3).cascade_input_dir = 0; // North
     array.tile_mut(1, 3).cascade_output_dir = 1; // East
-                                                 // Configure tile (2,3): input direction = West (1)
     array.tile_mut(2, 3).cascade_input_dir = 1; // West
     array.tile_mut(2, 3).cascade_output_dir = 0; // South
+    assert_eq!(array.cascade_consumer_of(1, 3), Some((2, 3)));
 
     let data = [1u64, 2, 3, 4, 5, 6, 7, 8];
     array.tile_mut(1, 3).push_cascade_output(data);
-
     array.route_cascade();
-
-    assert!(array.tile(2, 3).has_cascade_input());
+    array.route_cascade();
     assert!(!array.tile(1, 3).has_cascade_output());
-
-    let received = array.tile_mut(2, 3).pop_cascade_input().unwrap();
-    assert_eq!(received, data);
+    assert_eq!(array.tile_mut(2, 3).pop_cascade_input().unwrap(), data);
 }
 
+/// The producer's credit check counts every word in the link (transit and SCD) once the
+/// coordinator has refreshed the downstream occupancy; a pop frees the slot at once.
 #[test]
-fn test_cascade_backpressure() {
+fn test_cascade_credit_counts_words_in_transit_and_frees_on_pop() {
     let mut array = TileArray::npu1();
-
-    // Configure South cascade path: (1,3) -> (1,2)
-    array.tile_mut(1, 3).cascade_input_dir = 0;
-    array.tile_mut(1, 3).cascade_output_dir = 0;
-    array.tile_mut(1, 2).cascade_input_dir = 0;
-    array.tile_mut(1, 2).cascade_output_dir = 0;
-
-    // Fill destination's input FIFO
-    while !array.tile(1, 2).cascade_input_full() {
-        array.tile_mut(1, 2).push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
-    }
-
-    // Push data to source
-    let data = [42u64; xdna_archspec::aie2::CASCADE_WORDS];
-    array.tile_mut(1, 3).push_cascade_output(data);
-
-    // Route should NOT transfer (backpressure)
+    south_link(&mut array);
+    array
+        .tile_mut(1, 3)
+        .push_cascade_output([1; xdna_archspec::aie2::CASCADE_WORDS]);
     array.route_cascade();
+    array.refresh_cascade_occupancy(1, 3);
+    assert!(!array.tile(1, 3).cascade_output_full(), "one word in transit leaves room");
+    array
+        .tile_mut(1, 3)
+        .push_cascade_output([2; xdna_archspec::aie2::CASCADE_WORDS]);
+    assert!(array.tile(1, 3).cascade_output_full(), "transit + MCD = 2");
+    array.route_cascade();
+    array.refresh_cascade_occupancy(1, 3);
+    assert!(array.tile(1, 3).cascade_output_full());
 
-    // Source still has data, destination still has old data
-    assert!(array.tile(1, 3).has_cascade_output());
-    assert!(array.tile(1, 2).has_cascade_input());
+    // The consumer takes the first word; the same cycle's refresh frees the slot.
+    assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap()[0], 1);
+    array.refresh_cascade_occupancy(1, 3);
+    assert!(!array.tile(1, 3).cascade_output_full());
 }
 
 /// Total buffering between a producer's MCD write and the consumer's SCD read
@@ -403,14 +393,11 @@ fn test_cascade_backpressure() {
 #[test]
 fn test_cascade_total_buffering_is_two_words() {
     let mut array = TileArray::npu1();
-    array.clock_mut().ungate_all();
-    array.tile_mut(1, 3).cascade_input_dir = 0;
-    array.tile_mut(1, 3).cascade_output_dir = 0;
-    array.tile_mut(1, 2).cascade_input_dir = 0;
-    array.tile_mut(1, 2).cascade_output_dir = 0;
+    south_link(&mut array);
 
     let mut accepted = 0;
     for attempt in 0..16u64 {
+        array.refresh_cascade_occupancy(1, 3);
         if !array.tile(1, 3).cascade_output_full() {
             array
                 .tile_mut(1, 3)
@@ -423,7 +410,6 @@ fn test_cascade_total_buffering_is_two_words() {
 
     // Words come out in write order.
     assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap()[0], 0);
-    array.route_cascade();
     assert_eq!(array.tile_mut(1, 2).pop_cascade_input().unwrap()[0], 1);
 }
 
@@ -441,8 +427,10 @@ fn test_cascade_direction_mismatch_no_route() {
     array.tile_mut(1, 3).push_cascade_output(data);
 
     array.route_cascade();
+    array.route_cascade();
 
     // No transfer because directions don't match
+    assert_eq!(array.cascade_consumer_of(1, 3), None);
     assert!(array.tile(1, 3).has_cascade_output());
     assert!(!array.tile(1, 2).has_cascade_input());
 }

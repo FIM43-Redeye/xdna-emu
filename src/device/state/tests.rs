@@ -1135,3 +1135,58 @@ fn memtile_start_queue_honours_token_issue_and_controller_id() {
     assert_eq!(dma.channel_controller_id(0), Some(1));
     assert_eq!(dma.queued_token_issue(0), [true]);
 }
+
+/// The launch path releases enabled cores one at a time, column-major with rows ascending,
+/// `CORE_RELEASE_SPACING_CYCLES` apart (silicon: skew probe, see the constant).
+#[test]
+fn release_core_resets_staggers_cores_in_column_major_order() {
+    use crate::device::registers::TileAddress;
+    use crate::device::state::CORE_RELEASE_SPACING_CYCLES;
+    use crate::device::state::CoreTransition;
+
+    let mut state = DeviceState::new_npu1();
+    for (col, row) in [(2u8, 2u8), (1, 3), (1, 2)] {
+        let addr = TileAddress::encode(col, row, 0x32000);
+        state.write_register(addr, 0x3).unwrap(); // enabled, held in reset
+    }
+    state.pending_core_transitions.clear();
+    state.release_core_resets();
+    let enabled = |s: &mut DeviceState| -> Vec<(u8, u8)> {
+        s.pending_core_transitions
+            .drain(..)
+            .filter_map(|t| match t {
+                CoreTransition::Enable { col, row, enabled: true } => Some((col, row)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(enabled(&mut state), vec![(1, 2)], "first core released at once");
+    let mut released = Vec::new();
+    for cycle in 0..=2 * CORE_RELEASE_SPACING_CYCLES {
+        state.tick_core_releases();
+        for t in enabled(&mut state) {
+            released.push((cycle, t));
+        }
+    }
+    assert_eq!(
+        released,
+        vec![(CORE_RELEASE_SPACING_CYCLES, (1, 3)), (2 * CORE_RELEASE_SPACING_CYCLES, (2, 2))]
+    );
+}
+
+/// A staged core that is reset or disabled again before its turn is not released.
+#[test]
+fn staged_core_release_is_dropped_when_core_control_changes() {
+    use crate::device::registers::TileAddress;
+    use crate::device::state::CORE_RELEASE_SPACING_CYCLES;
+    let mut state = DeviceState::new_npu1();
+    for (col, row) in [(1u8, 2u8), (1, 3)] {
+        state.write_register(TileAddress::encode(col, row, 0x32000), 0x3).unwrap();
+    }
+    state.release_core_resets();
+    state.write_register(TileAddress::encode(1, 3, 0x32000), 0x0).unwrap();
+    for _ in 0..=CORE_RELEASE_SPACING_CYCLES {
+        state.tick_core_releases();
+    }
+    assert!(!state.array.tile(1, 3).core.enabled);
+}

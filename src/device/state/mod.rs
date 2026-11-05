@@ -23,6 +23,7 @@
 
 mod cdo;
 mod compute;
+pub use compute::CORE_RELEASE_SPACING_CYCLES;
 mod ctrl_access;
 mod dispatch;
 mod effects;
@@ -87,6 +88,9 @@ pub struct DeviceState {
     /// transition here. The coordinator drains these in order each cycle so a
     /// reset cannot be collapsed into a disable/re-enable pair.
     pub(crate) pending_core_transitions: Vec<CoreTransition>,
+    /// Cores the launch path has released but whose turn has not come yet
+    /// (`release_core_resets`, `tick_core_releases`): (col, row, cycles left).
+    pub(crate) staged_core_releases: Vec<(u8, u8, u64)>,
     /// Column offset applied to all CDO operations.
     ///
     /// CDO streams encode logical (partition-relative) tile columns
@@ -148,6 +152,7 @@ impl DeviceState {
             array,
             stats: CdoStats::default(),
             pending_core_transitions: Vec::new(),
+            staged_core_releases: Vec::new(),
             start_col,
             async_errors: AsyncErrorSink::new(num_cols),
             contexts,

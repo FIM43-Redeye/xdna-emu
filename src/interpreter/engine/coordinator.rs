@@ -590,6 +590,14 @@ impl InterpreterEngine {
                 }
                 CoreTransition::Enable { col, row, enabled } => {
                     if enabled {
+                        // The core's cycle counter reads its tile timer, which runs whether or
+                        // not the core does: align it with the engine's cycle count, so cores
+                        // released at different cycles read one timebase (silicon: two tiles
+                        // of a column read the same timer, cascade timer-phase probe).
+                        let now = self.total_cycles;
+                        if let Some(core) = self.get_core_mut(col as usize, row as usize) {
+                            core.context.cycle_counter_base = now.saturating_sub(core.context.cycles);
+                        }
                         self.enable_core(col as usize, row as usize);
                     } else {
                         self.disable_core(col as usize, row as usize);
@@ -676,6 +684,42 @@ impl InterpreterEngine {
         Ok(entry)
     }
 
+    /// Compute-core step order for one cycle: column-major with rows ascending, then each
+    /// cascade producer moved to just after its consumer (a South consumer already comes first;
+    /// an East consumer is in the next column). Cascade links form chains (South/East only), so
+    /// moving producers until no producer precedes its consumer terminates.
+    fn core_step_order(&self) -> Vec<(usize, usize)> {
+        let mut order: Vec<(usize, usize)> = (self.tile_col_start..self.cols)
+            .flat_map(|col| (self.compute_row_start..self.rows).map(move |row| (col, row)))
+            .collect();
+        let links: Vec<((usize, usize), (usize, usize))> = order
+            .iter()
+            .filter_map(|&(col, row)| {
+                let (dc, dr) = self.device.array.cascade_consumer_of(col as u8, row as u8)?;
+                Some(((col, row), (dc as usize, dr as usize)))
+            })
+            .collect();
+        for _ in 0..=links.len() {
+            let mut moved = false;
+            for &(producer, consumer) in &links {
+                let (Some(p), Some(c)) =
+                    (order.iter().position(|&t| t == producer), order.iter().position(|&t| t == consumer))
+                else {
+                    continue;
+                };
+                if p < c {
+                    let t = order.remove(p);
+                    order.insert(c, t);
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        order
+    }
+
     /// Execute one cycle on all enabled cores and DMA engines.
     ///
     /// The cycle is a REQUEST -> ARBITRATE -> COMMIT loop, because the tile's
@@ -718,6 +762,7 @@ impl InterpreterEngine {
         }
 
         self.status = EngineStatus::Running;
+        self.device.tick_core_releases();
         self.drain_core_transitions();
         let mut any_running = false;
         let mut all_halted = true;
@@ -767,13 +812,19 @@ impl InterpreterEngine {
         // read committed lock state, so DMA releases from cycle N-1 are
         // visible to cores at cycle N -- the same 1-cycle latency as the
         // hardware's lock pipeline.
-        for col in self.tile_col_start..self.cols {
-            for row in self.compute_row_start..self.rows {
+        //
+        // Step order: column-major, rows ascending, except that the consumer of a cascade link
+        // steps before its producer (`core_step_order`), and the producer's credit check is
+        // refreshed from the consumer just before it steps: a word the consumer takes in this
+        // cycle frees its slot for a write in this same cycle, as on silicon.
+        for (col, row) in self.core_step_order() {
+            {
                 let idx = (col - self.tile_col_start) * self.rows + row;
 
                 if !self.cores[idx].enabled {
                     continue;
                 }
+                self.device.array.refresh_cascade_occupancy(col as u8, row as u8);
 
                 if !self.device.array.clock().is_column_active(col as u8)
                     || !self
@@ -5084,6 +5135,29 @@ mod tests {
                 "commit tick 2: after 2 committed bundles (budget expiry), core must be halted by count-step"
             );
         }
+    }
+
+    /// Cores the launch path releases later read the same timer: a core started
+    /// `CORE_RELEASE_SPACING_CYCLES` after the first gets that many cycles as its counter base.
+    #[test]
+    fn staged_core_release_aligns_cycle_counter_base() {
+        use crate::device::state::CORE_RELEASE_SPACING_CYCLES;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        for row in [2usize, 3] {
+            engine.device_mut().tile_mut(1, row).unwrap().write_program(0, &[0; 64]);
+            engine.device_mut().write_tile_register(1, row as u8, 0x32000, 0x3);
+        }
+        engine.device_mut().release_core_resets();
+        engine.step();
+        assert!(engine.is_core_enabled(1, 2));
+        assert!(!engine.is_core_enabled(1, 3));
+        for _ in 1..=CORE_RELEASE_SPACING_CYCLES {
+            engine.step();
+        }
+        assert!(engine.is_core_enabled(1, 3));
+        assert_eq!(engine.core_context(1, 3).unwrap().cycle_counter_base, CORE_RELEASE_SPACING_CYCLES);
+        assert_eq!(engine.core_context(1, 2).unwrap().cycle_counter_base, 0);
     }
 
     #[test]

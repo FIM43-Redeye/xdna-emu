@@ -151,9 +151,9 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
         // Hardware state reads
         SemanticOp::ReadCycleCounter => {
-            // MOV_CNTR: read the per-core cycle counter into a scalar register.
-            // The counter is 32-bit on AIE2 (wraps at 2^32).
-            let counter = ctx.cycles as u32;
+            // MOV_CNTR: read the tile timer (engine cycles before the core started plus the
+            // core's own) into a scalar register; the low 32 bits.
+            let counter = (ctx.cycle_counter_base + ctx.cycles) as u32;
             write_dest(op, ctx, counter);
             true
         }

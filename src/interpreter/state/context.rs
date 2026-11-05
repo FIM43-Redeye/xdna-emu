@@ -386,6 +386,11 @@ pub struct ExecutionContext {
     /// Total cycles executed.
     pub cycles: u64,
 
+    /// Engine cycles that passed before this core ran (set when it is enabled), so the cycle
+    /// counter `MOV_CNTR` reads `cycle_counter_base + cycles`: the tile timer, one timebase
+    /// for all cores.
+    pub cycle_counter_base: u64,
+
     /// Total instructions executed.
     pub instructions: u64,
 
@@ -672,6 +677,7 @@ impl ExecutionContext {
             mask,
             sparse_load: super::sparse_load::SparseLoadUnit::new(),
             cycles: 0,
+            cycle_counter_base: 0,
             instructions: 0,
             stall_cycles: 0,
             halted: false,

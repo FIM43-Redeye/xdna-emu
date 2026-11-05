@@ -418,15 +418,30 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Fill the MCD FIFO
-        for _ in 0..crate::device::tile::CASCADE_OUTPUT_DEPTH {
-            tile.push_cascade_output([0; CASCADE_WORDS]);
-        }
+        // The link holds two words: one downstream, one just written here.
+        tile.cascade_downstream_occupancy = 1;
+        tile.push_cascade_output([0; CASCADE_WORDS]);
 
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
             .with_source(Operand::VectorReg(0));
 
+        assert_eq!(CascadeOps::would_stall(&op, &tile), Some(CascadeResult::StallWrite));
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::StallWrite);
+    }
+
+    /// A word popped downstream frees its slot for a write in the same cycle: only the
+    /// refreshed downstream occupancy decides, not this tile's own stage.
+    #[test]
+    fn test_cascade_write_proceeds_when_downstream_has_room() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        tile.cascade_downstream_occupancy = 2;
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
+            .with_source(Operand::VectorReg(0));
+        assert_eq!(CascadeOps::would_stall(&op, &tile), Some(CascadeResult::StallWrite));
+        tile.cascade_downstream_occupancy = 1;
+        assert_eq!(CascadeOps::would_stall(&op, &tile), None);
+        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
     }
 
     #[test]

@@ -40,6 +40,18 @@ pub(super) fn channel_field_layout(
     }
 }
 
+/// Cycles between the launch path releasing one core and the next: 1448.
+///
+/// Silicon (Phoenix, skew probe: 2 to 4 cores, each stamping its tile timer at its first
+/// instruction, 7 layouts x 6 runs, `build/experiments/harness/cascade/skew1`): the cores start
+/// one at a time in column-major order with rows ascending over the cores the design uses, the
+/// k-th about k gaps after the first. A gap does not depend on where the tiles are (rows 2 and 5
+/// with nothing between are one gap apart, like rows 2 and 3) and is not deterministic: 60
+/// same-column gaps range 1103-2018 cycles (median 1448.5, mean 1473, sd 201), varying run to
+/// run for one layout. It is the firmware's per-core release, off-array timing; the emulator uses
+/// the median as a deterministic representative.
+pub const CORE_RELEASE_SPACING_CYCLES: u64 = 1448;
+
 impl DeviceState {
     // =========================================================================
     // Lock helper functions (consolidate duplicate compute/memtile code)
@@ -626,29 +638,70 @@ impl DeviceState {
     /// before). Part 2 relocates it to the true launch timing; the long-term
     /// dream is running real NPU firmware on a simulated management processor,
     /// at which point this stub is replaced by the firmware's own reset write.
+    ///
+    /// Silicon releases the cores one at a time, in column-major order with rows ascending
+    /// over the cores the design enables, [`CORE_RELEASE_SPACING_CYCLES`] apart: the first
+    /// core here at once, the k-th after k spacings of [`Self::tick_core_releases`].
     pub fn release_core_resets(&mut self) {
+        self.staged_core_releases.clear();
+        let mut k = 0u64;
         for col in 0..self.array.cols() {
             for row in 0..self.array.rows() {
-                let Some(tile) = self.array.get_mut(col, row) else {
+                let Some(tile) = self.array.get(col, row) else {
                     continue;
                 };
-                if !tile.is_compute() {
-                    continue;
-                }
-                // Enable-intent (bit 0) but held in reset (bit 1): firmware
-                // clears reset -> ENABLE=1 && RESET=0 -> the core executes.
-                if tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET != 0 {
-                    let was_enabled = tile.core.enabled;
-                    tile.core.control &= !CORE_CONTROL_RESET;
-                    tile.core.enabled = true;
-                    if !was_enabled {
-                        self.pending_core_transitions.push(CoreTransition::Enable {
-                            col,
-                            row,
-                            enabled: true,
-                        });
+                if tile.is_compute()
+                    && tile.core.control & 1 != 0
+                    && tile.core.control & CORE_CONTROL_RESET != 0
+                {
+                    if k == 0 {
+                        self.release_core_reset(col, row);
+                    } else {
+                        self.staged_core_releases.push((col, row, k * CORE_RELEASE_SPACING_CYCLES));
                     }
+                    k += 1;
                 }
+            }
+        }
+    }
+
+    /// Advance the staged core releases by one cycle; call once per engine cycle, before the
+    /// core transitions are drained. A core whose `CORE_CONTROL` no longer reads
+    /// enabled-and-held when its turn comes is skipped.
+    pub fn tick_core_releases(&mut self) {
+        if self.staged_core_releases.is_empty() {
+            return;
+        }
+        let mut due = Vec::new();
+        // `left` counts the engine cycles still to run before the core's: the first core runs
+        // in engine cycle 0, the one staged k spacings later in cycle k * spacing.
+        self.staged_core_releases.retain_mut(|(col, row, left)| {
+            if *left == 0 {
+                due.push((*col, *row));
+                return false;
+            }
+            *left -= 1;
+            true
+        });
+        for (col, row) in due {
+            self.release_core_reset(col, row);
+        }
+    }
+
+    /// Clear RESET on one enabled-and-held core and publish its enable.
+    fn release_core_reset(&mut self, col: u8, row: u8) {
+        let Some(tile) = self.array.get_mut(col, row) else {
+            return;
+        };
+        // Enable-intent (bit 0) but held in reset (bit 1): firmware
+        // clears reset -> ENABLE=1 && RESET=0 -> the core executes.
+        if tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET != 0 {
+            let was_enabled = tile.core.enabled;
+            tile.core.control &= !CORE_CONTROL_RESET;
+            tile.core.enabled = true;
+            if !was_enabled {
+                self.pending_core_transitions
+                    .push(CoreTransition::Enable { col, row, enabled: true });
             }
         }
     }

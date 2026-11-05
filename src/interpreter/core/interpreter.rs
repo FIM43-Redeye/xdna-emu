@@ -959,9 +959,10 @@ where
                         Some(StepResult::WaitStream { port })
                     }
                 } else if port == 255 {
-                    // Cascade WRITE stall (sentinel port 255): MCD full.
-                    // Resume only when cascade output has been drained.
-                    if tile.cascade_output.is_empty() {
+                    // Cascade WRITE stall (sentinel port 255): the link holds its two
+                    // words. Resume once a slot is free (the downstream occupancy is
+                    // refreshed before this step, after the consumer's).
+                    if !tile.cascade_output_full() {
                         log::debug!("Cascade MCD drained, resuming execution");
                         self.status = CoreStatus::Ready;
                         // Falling edge of the cascade stall (held level).
@@ -1575,17 +1576,17 @@ mod tests {
         let mut ctx = ExecutionContext::new();
         ctx.timing_context_mut().enable_tracing();
         let mut tile = Tile::compute(0, 2);
-        tile.push_cascade_output([0; xdna_archspec::aie2::CASCADE_WORDS]); // MCD full
+        tile.cascade_downstream_occupancy = 2; // link full
         interp.status = CoreStatus::WaitingStream { port: 255 }; // cascade WRITE (MCD)
 
-        // MCD full: stalled.
+        // Link full: stalled.
         let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
-        assert!(matches!(r, Some(StepResult::WaitStream { port: 255 })), "stalled while MCD full");
+        assert!(matches!(r, Some(StepResult::WaitStream { port: 255 })), "stalled while the link is full");
 
-        // MCD drained: resume + CASCADE_STALL falling (NOT stream).
-        tile.pop_cascade_output();
+        // The consumer took a word: resume + CASCADE_STALL falling (NOT stream).
+        tile.cascade_downstream_occupancy = 1;
         let r = interp.try_resume_stall(&mut ctx, &mut tile, None);
-        assert!(r.is_none(), "resumes when MCD drained");
+        assert!(r.is_none(), "resumes when a slot frees");
         let ev = recorded_events(&ctx);
         assert_eq!(
             ev.iter()
