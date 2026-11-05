@@ -170,6 +170,63 @@ pub struct BuildInstrEncoding {
     /// Which rule produced each per-instruction fact (`element_type`, `mem_width`,
     /// `addressing_mode`, ...). Provenance only.
     pub fact_sources: Vec<(&'static str, &'static str)>,
+    /// TableGen record facts (emitted as `InstrEncoding::schema`); filled by
+    /// `extract::attach_encoding_schemas` after the encodings exist.
+    pub schema: BuildEncodingSchema,
+}
+
+// ---------------------------------------------------------------------------
+// Encoding schema (build-time version of aie2::isa::schema)
+// ---------------------------------------------------------------------------
+
+/// What an operand's TableGen class says about its values (build-time `OperandKind`).
+#[derive(Debug, Clone)]
+pub enum BuildOperandKind {
+    Register {
+        /// The register class (the `RegClass` of a `RegisterOperand`).
+        class: String,
+        /// `RegClassFamily` variant name.
+        family: &'static str,
+        bits: u16,
+        /// `EncoderMethod` of a `RegisterOperand` with a custom encoding.
+        encoder: Option<String>,
+        /// The register of a single-member class.
+        fixed: Option<String>,
+    },
+    Immediate {
+        bits: u8,
+        step: u16,
+        signed: bool,
+        negative: bool,
+    },
+}
+
+/// One MC operand (build-time `SchemaOperand`).
+#[derive(Debug, Clone)]
+pub struct BuildSchemaOperand {
+    pub mc_index: u8,
+    pub name: String,
+    pub class: String,
+    pub is_def: bool,
+    pub tied_to: Option<u8>,
+    pub encoded: bool,
+    pub kind: BuildOperandKind,
+}
+
+/// Build-time `EncodingSchema`. Enum-valued fields hold the variant name.
+#[derive(Debug, Clone, Default)]
+pub struct BuildEncodingSchema {
+    pub operands: Vec<BuildSchemaOperand>,
+    pub format_class: String,
+    pub classes: Vec<String>,
+    pub format_args: Vec<(String, u64)>,
+    /// `AgAddressing` variant name.
+    pub addressing: Option<&'static str>,
+    pub mem_vt_bits: Option<u16>,
+    /// (register, hardware encoding, is_use), `Defs` first, then `Uses`.
+    pub implicit_regs: Vec<(String, u16, bool)>,
+    /// (non-blocking, `StreamTlast` variant name).
+    pub stream: Option<(bool, Option<&'static str>)>,
 }
 
 // ---------------------------------------------------------------------------

@@ -51,11 +51,10 @@ For ISA decode, the delta between AIE2 and a hypothetical AIE1 port is:
 - Different register classes (AIE1 lacks AIE2's accumulator width
   hierarchy).
 
-Every one of these is a data change. The operand classifier
-(`resolver::operand_classification`), and the semantic inference logic
-(`resolver::semantic_inference`) all work off the data tables without
-hardcoding slot counts, specific bundle shapes, or particular opcode
-layouts.
+Every one of these is a data change. The build-time extraction
+(`crates/xdna-archspec/build_helpers/`, including the per-encoding
+`EncodingSchema`) works off the TableGen records without hardcoding slot
+counts, specific bundle shapes, or particular opcode layouts.
 
 A trait would be justified if an AIE1 instruction required a
 fundamentally different decode discipline -- e.g., non-TableGen-sourced

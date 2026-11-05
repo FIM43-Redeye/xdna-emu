@@ -1,21 +1,13 @@
-// Shared element type inference logic -- runtime copy (archspec isa/).
+// Element-type token parser: the one copy.
 //
-// This file has two authoritative copies that MUST stay in sync:
-//   - build_helpers/element_type_logic.rs                              (build-time, xdna-emu)
-//   - crates/xdna-archspec/src/aie2/isa/element_type_logic.rs         (this file, runtime)
+// The build script includes this file (`build_helpers/mod.rs`, `#[path]`) to label the
+// generated encodings with element types parsed from TableGen names and mnemonics; the crate
+// compiles it too, so the unit tests below run with `cargo test -p xdna-archspec`. It is a
+// parse of TableGen names (the ledger counts it as `name-parse`); the structural replacement
+// (lane width from operand classes, signedness from `cr*Sign` uses) is the VEC/SEM packages'.
 //
-// The runtime copy lives here in archspec's isa/ module, consumed by
-// the runtime resolver (resolver/semantic_inference.rs). The build-time
-// copy stays in build_helpers/ for xdna-emu's codegen phase.
-//
-// Task 6 will consolidate these; until then they are separate files that
-// must be kept in sync.
-//
-// It uses a self-contained TypeTag enum with no external dependencies so it
-// compiles in both contexts. Each consumer provides a thin conversion layer
-// from TypeTag to its own output type.
-//
-// IMPORTANT: when updating patterns, update BOTH copies identically.
+// It uses a self-contained TypeTag enum with no external dependencies so it compiles in both
+// contexts. Each consumer converts TypeTag to its own output type.
 
 /// Lightweight type discriminant shared between build-time and runtime.
 ///

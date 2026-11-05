@@ -612,7 +612,7 @@ impl BuildInstrRecord {
                 if self.defs.is_empty() && self.uses.is_empty() {
                     "none"
                 } else {
-                    "name_digits"
+                    "tablegen_hw_encoding"
                 },
             ),
             (
@@ -717,26 +717,15 @@ impl BuildInstrRecord {
         let input_order: Vec<String> = self.inputs.iter().map(|(_, n)| n.clone()).collect();
         let output_order: Vec<String> = self.outputs.iter().map(|(_, n)| n.clone()).collect();
 
+        // `reg_num` is set from the register model in `extract::attach_encoding_schemas`.
         let implicit_regs: Vec<BuildImplicitReg> = self
             .defs
             .iter()
-            .map(|r| {
-                let reg_num = r
-                    .chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0);
-                BuildImplicitReg { reg_class: r.clone(), reg_num, is_use: false }
-            })
-            .chain(self.uses.iter().map(|r| {
-                let reg_num = r
-                    .chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0);
-                BuildImplicitReg { reg_class: r.clone(), reg_num, is_use: true }
+            .map(|r| BuildImplicitReg { reg_class: r.clone(), reg_num: 0, is_use: false })
+            .chain(self.uses.iter().map(|r| BuildImplicitReg {
+                reg_class: r.clone(),
+                reg_num: 0,
+                is_use: true,
             }))
             .collect();
 
@@ -783,6 +772,7 @@ impl BuildInstrRecord {
             sched_class: self.itinerary_class.clone(),
             semantic_trail,
             fact_sources,
+            schema: Default::default(),
         })
     }
 }

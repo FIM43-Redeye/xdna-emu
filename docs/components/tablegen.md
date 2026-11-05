@@ -14,13 +14,13 @@ Use this component reference when working on ISA decoding or llvm-aie integratio
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Module root, re-exports public API |
-| `types.rs` | Core data types: `TableGenData`, `SlotDef`, `FormatClass`, `InstrDef`, `InstrEncoding`, `SemanticOp`, `SemanticPattern` |
-| `resolver/mod.rs` | `Resolver` -- computes concrete encodings (mask/bits) from format-class inheritance |
-| `resolver/operand_classification.rs` | Operand type classification used by the resolver |
-| `resolver/semantic_inference.rs` | Semantic op inference from instruction encoding patterns |
+| `mod.rs` | Module root, re-exports public API, `load_from_generated()` |
+| `types.rs` | Semantic vocabulary (`SemanticOp`, `ElementType`, `BranchCondition`, ...), scheduling, register model, composite formats, `TblgenOutput` |
+| `resolver/mod.rs` | `InstrEncoding`, `OperandField`, and `DecoderIndex` (lookup by the name the FFI decoder reports) |
+| `resolver/operand_types.rs` | Legacy per-field decode types (`OperandType`, `RegisterKind`, `CompositeEncoder`) and `AddressingMode` / `InstrMemWidth` |
+| `schema.rs` | `EncodingSchema`: the TableGen record facts of each encoding (see below) |
 | `decoder_ffi.rs` | C FFI to the llvm-aie disassembler: the only decode path (raw bits to instruction name) |
-| `element_type_logic.rs` | Element-type derivation for vector instructions |
+| `element_type_logic.rs` | Element-type token parser; the build script includes the same file |
 
 The build script (`crates/xdna-archspec/build.rs`) runs the resolver at
 build time and emits resolved encoding tables that the runtime loads with no
@@ -34,28 +34,50 @@ TableGen parsing on the hot path.
 | `loader.rs` | Loads decoder tables from generated artifacts at startup |
 | `composite.rs`, `crossref.rs`, `operand_extraction.rs`, `register_map.rs`, `slot_builder.rs` | Operand extraction, register mapping, and slot construction helpers |
 
-## Two Parsing Paths
+## Encoding schema (`InstrEncoding::schema`)
 
-The archspec module supports two complementary approaches:
+Each encoding carries an `EncodingSchema` read from its TableGen record, never from its
+name (`build_helpers/extract.rs::attach_encoding_schemas`, pure rules in
+`build_helpers/schema_rules.rs`):
 
-1. **Regex parsing**: Directly parses .td source files. Fast, no external
-   tool dependency, but cannot resolve all template inheritance.
-2. **LLVM-backed parsing**: `tblgen-rs` uses host LLVM 21 to resolve records
-   from the selected llvm-aie `.td` sources. The host LLVM ABI and the Peano
-   source tree are separate inputs.
+- `operands`: MC operands in `outs`-then-`ins` order (= `MCInst` index; no AIE2 operand has
+  sub-operands) with the DAG name, the TableGen class, def/use, `Constraints` ties, whether
+  encoding bits carry it, and its kind: a register class (family from the
+  `AIE2*RegisterClass` it derives from, `RegSize`, the custom MC encoder of a composite
+  `RegisterOperand`, the register a single-member class fixes) or an immediate with its LLVM
+  `DecoderMethod` (`ImmDecode::decode`).
+- `format_class` (the class directly below `AIE2_inst_<slot>_instr<N>`), `format_args` (its
+  bit template arguments, e.g. the MAC `mdm` / `md1` / `md2`, traced through the class's
+  `Inst` and read from the record's fixed bits), and `classes` (every class the record
+  instantiates, bases first, minus the ones all encodings share).
+- `addressing` (from the `*__ag_*` class), `mem_vt_bits` (Pat<> `MemoryVT`, propagated to
+  same-format siblings; sub-word scalar accesses only), `implicit_regs` with hardware
+  encodings, `stream` (blocking / TLAST from the derived format class).
 
-Both produce `InstrEncoding` values consumable by the decoder.
+The register model also carries `SubRegs` / `SubRegIndices` per register and the family of
+each class (`RegisterModel::leaves`, `hw_encodings`, `base_hw_encoding`).
+
+The schema sits beside the legacy name-derived fields (`operand_type`, `addressing_mode`,
+`mem_width`, ...) that the interpreter still consumes; consumer packages switch to it and
+delete the legacy field. `tools/datadriven_ledger.py` reports what the schema covers and
+where it disagrees with the legacy value (M9, `schema_disagreements.tsv`).
+
+## Parsing
+
+The build script parses the selected llvm-aie `.td` sources with `tblgen-rs` (host LLVM 21;
+the host LLVM ABI and the Peano source tree are separate inputs) and emits the resolved
+encodings. There is no runtime TableGen parser: the regex parser and the runtime `Resolver`
+were removed on 2026-11-04.
 
 ## Key Types
 
-- `TableGenData` -- all parsed data (slots, formats, instructions, patterns)
-- `SlotDef` -- VLIW slot definition (name, bit width, field name)
-- `FormatClass` -- instruction format with encoding pattern and template params
-- `InstrDef` -- concrete instruction (name, format, mnemonic, operands)
+- `TblgenOutput` -- encodings by slot, scheduling model, itineraries, register model, composite formats
+- `InstrEncoding` -- resolved encoding: fixed_mask, fixed_bits, operand fields, slot, semantic facts, `schema`
+- `EncodingSchema` -- TableGen record facts per encoding (operands, format class, classes, ...)
 - `SemanticOp` -- what an instruction does (Add, Sub, Load, Store, Br, ...)
-- `SemanticPattern` -- maps a `SemanticOp` to one or more instruction names
-- `InstrEncoding` -- resolved encoding: fixed_mask, fixed_bits, operand fields, slot assignment
-- `Resolver` -- resolves `InstrDef` + `FormatClass` into `InstrEncoding`
+- `RegisterModel` -- registers (hw_encoding, sub-registers) and register classes (members, size, family)
+- `CompositeFormatDef` -- VLIW bundle layouts
+- `DecoderIndex` -- lookup of an encoding by the instruction name the FFI decoder reports
 
 ## Parsing Results (from llvm-aie)
 

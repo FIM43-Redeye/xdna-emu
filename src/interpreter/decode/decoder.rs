@@ -1051,6 +1051,7 @@ mod tests {
                 is_ptr_arithmetic: false,
                 is_sp_relative: false,
                 sched_class: None,
+                schema: Default::default(),
             }
         };
 
@@ -1157,6 +1158,7 @@ mod tests {
             is_ptr_arithmetic: true,
             is_sp_relative: false,
             sched_class: None,
+            schema: Default::default(),
         };
 
         // Encode: ptr=3 at bits 12:10, imm=5 at bits 9:7
@@ -1420,6 +1422,7 @@ mod tests {
             is_ptr_arithmetic: false,
             is_sp_relative: false,
             sched_class: None,
+            schema: Default::default(),
         }
     }
 

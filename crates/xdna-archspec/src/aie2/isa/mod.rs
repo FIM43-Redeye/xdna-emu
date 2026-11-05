@@ -12,6 +12,7 @@
 
 pub mod types;
 pub mod resolver;
+pub mod schema;
 pub mod decoder_ffi;
 pub mod element_type_logic;
 pub mod reservation;
@@ -32,12 +33,32 @@ pub fn load_from_generated() -> types::TblgenOutput {
 // Re-exports matching xdna-emu's src/tablegen/mod.rs surface so consumers
 // can `use xdna_archspec::aie2::isa::*;` to get the full tablegen API.
 pub use types::*;
+pub use schema::*;
 pub use resolver::{
-    build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding, InstrMemWidth,
-    OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex, classify_operand_type,
-    detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_dual_element_types,
-    infer_element_type, infer_select_variant, refine_branch_semantic,
+    AddressingMode, CompositeEncoder, DecoderIndex, FieldFragment, InstrEncoding, InstrMemWidth,
+    OperandField, OperandType, RegisterKind, SlotIndex,
 };
+
+/// Element type parsed from a mnemonic suffix (`vadd.s16` -> `Int16`), the rule the build script
+/// labels encodings with. Kept for hand-built test encodings in the interpreter; decoding reads
+/// `InstrEncoding::element_type`.
+pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
+    use element_type_logic::TypeTag;
+    element_type_logic::infer_type_tag_from_mnemonic(mnemonic).map(|tag| match tag {
+        TypeTag::Int4 => ElementType::Int4,
+        TypeTag::UInt4 => ElementType::UInt4,
+        TypeTag::Int8 => ElementType::Int8,
+        TypeTag::UInt8 => ElementType::UInt8,
+        TypeTag::Int16 => ElementType::Int16,
+        TypeTag::UInt16 => ElementType::UInt16,
+        TypeTag::Int32 => ElementType::Int32,
+        TypeTag::UInt32 => ElementType::UInt32,
+        TypeTag::Int64 => ElementType::Int64,
+        TypeTag::UInt64 => ElementType::UInt64,
+        TypeTag::BFloat16 => ElementType::BFloat16,
+        TypeTag::Float32 => ElementType::Float32,
+    })
+}
 
 #[cfg(test)]
 mod tests {

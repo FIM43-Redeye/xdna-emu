@@ -54,6 +54,8 @@ pub struct BuildRegisterDef {
     pub asm_name: String,
     pub hw_encoding: u16,
     pub parents: Vec<String>,
+    pub sub_regs: Vec<String>,
+    pub sub_reg_indices: Vec<String>,
 }
 
 /// Register class definition (build-time version).
@@ -64,6 +66,8 @@ pub struct BuildRegisterClassDef {
     /// Width of one register of the class in bits (`RegInfo.RegSize`); 0 when TableGen gives none.
     pub reg_size_bits: u16,
     pub parents: Vec<String>,
+    /// `RegClassFamily` variant name, from the `AIE2*RegisterClass` the class derives from.
+    pub family: &'static str,
 }
 
 /// Register model (build-time version).
@@ -1029,8 +1033,22 @@ fn load_register_model(td_file: &Path, include_paths: &[&Path]) -> Result<BuildR
             .ok()
             .filter(|a| !a.is_empty())
             .unwrap_or_else(|| name.clone());
-        registers.insert(name.clone(), BuildRegisterDef { name, asm_name, hw_encoding, parents });
+        let sub_regs = extract_def_list(&record, "SubRegs");
+        let sub_reg_indices = extract_def_list(&record, "SubRegIndices");
+        if sub_regs.len() != sub_reg_indices.len() {
+            return Err(format!(
+                "{name}: {} SubRegs but {} SubRegIndices",
+                sub_regs.len(),
+                sub_reg_indices.len()
+            ));
+        }
+        registers.insert(
+            name.clone(),
+            BuildRegisterDef { name, asm_name, hw_encoding, parents, sub_regs, sub_reg_indices },
+        );
     }
+
+    let families = RegClassFamilies::new(&keeper)?;
 
     let mut classes: HashMap<String, BuildRegisterClassDef> = HashMap::new();
     let class_names = ["RegisterClass", "AIE2RegisterClass", "AIEBaseRegisterClass"];
@@ -1066,11 +1084,66 @@ fn load_register_model(td_file: &Path, include_paths: &[&Path]) -> Result<BuildR
                 parents.push(class.to_string());
             }
         }
-        classes
-            .insert(name.clone(), BuildRegisterClassDef { name, members, alignment, reg_size_bits, parents });
+        let family = families.family(&record)?;
+        classes.insert(
+            name.clone(),
+            BuildRegisterClassDef { name, members, alignment, reg_size_bits, parents, family },
+        );
     }
 
     Ok(BuildRegisterModel { registers, classes })
+}
+
+/// The register class families: the `AIE2*RegisterClass` classes the AIE2 register classes
+/// derive from, with the `RegClassFamily` variant each stands for. Every such TableGen class must
+/// be listed (the build fails on a new one) and a register class derives from at most one.
+struct RegClassFamilies {
+    table: Vec<(&'static str, &'static str)>,
+}
+
+impl RegClassFamilies {
+    const TABLE: &'static [(&'static str, &'static str)] = &[
+        ("AIE2ScalarRegisterClass", "Scalar"),
+        ("AIE220BitRegisterClass", "Bits20"),
+        ("AIE2Vector128RegisterClass", "Vector128"),
+        ("AIE2Vector256RegisterClass", "Vector256"),
+        ("AIE2Vector512RegisterClass", "Vector512"),
+        ("AIE2Vector640RegisterClass", "Vector640"),
+        ("AIE2Vector1024RegisterClass", "Vector1024"),
+        ("AIE2Acc256RegisterClass", "Acc256"),
+        ("AIE2Acc512RegisterClass", "Acc512"),
+        ("AIE2Acc1024RegisterClass", "Acc1024"),
+        ("AIE2Dim2DRegisterClass", "Dim2D"),
+        ("AIE2Dim3DRegisterClass", "Dim3D"),
+    ];
+
+    fn new(keeper: &tblgen::RecordKeeper<'_>) -> Result<Self, String> {
+        for (name, class) in keeper.classes() {
+            let Ok(name) = name else { continue };
+            let is_family = name.starts_with("AIE2")
+                && name.ends_with("RegisterClass")
+                && name != "AIE2RegisterClass"
+                && class.subclass_of("AIEBaseRegisterClass");
+            if is_family && !Self::TABLE.iter().any(|(c, _)| *c == name) {
+                return Err(format!("register class family {name} is not in RegClassFamilies::TABLE"));
+            }
+        }
+        Ok(Self { table: Self::TABLE.to_vec() })
+    }
+
+    fn family(&self, class: &tblgen::Record<'_>) -> Result<&'static str, String> {
+        let found: Vec<&'static str> = self
+            .table
+            .iter()
+            .filter(|(c, _)| class.subclass_of(c))
+            .map(|&(_, f)| f)
+            .collect();
+        match found.as_slice() {
+            [] => Ok("Other"),
+            [one] => Ok(one),
+            many => Err(format!("{}: several register class families {many:?}", record_name(class))),
+        }
+    }
 }
 
 /// `RegInfos` is a `RegInfoByHwMode` whose first object is a `RegInfo { RegSize, .. }`: the
@@ -1390,6 +1463,10 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         eprintln!("cargo:warning=TableGen: {} encoding-name semantics corrected", encoding_corrected);
     }
 
+    // TableGen record facts per encoding (the schema), beside the facts above.
+    let register_model = load_register_model(&td_file, &inc_refs)?;
+    attach_encoding_schemas(&td_file, &inc_refs, &register_model, &mut by_slot)?;
+
     // Post-propagation: derive is_ptr_arithmetic from resolved semantics
     for encodings in by_slot.values_mut() {
         for enc in encodings.iter_mut() {
@@ -1407,7 +1484,6 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         .map(|m| m.itinerary_name.clone())
         .ok_or("no processor model, so no itinerary record to take the functional units from")?;
     let functional_units = load_functional_units(&td_file, &inc_refs, &itinerary_name)?;
-    let register_model = load_register_model(&td_file, &inc_refs).unwrap_or_default();
     let composite_formats = load_composite_formats(&td_file, &inc_refs).unwrap_or_default();
     let unpack_forms = load_unpack_forms(&td_file, &inc_refs, &register_model)?;
     let sparse_load_forms = load_sparse_load_forms(&td_file, &inc_refs)?;
@@ -1824,4 +1900,380 @@ fn load_unpack_forms(
         return Err("no unpack instruction records found in the AIE2 TableGen".to_string());
     }
     Ok(forms)
+}
+
+// ============================================================================
+// Encoding schema: TableGen record facts per encoding
+// ============================================================================
+
+/// Fill `schema` on every encoding from its instruction record (see `aie2::isa::schema`):
+/// MC operands with their classes and ties, class lineage, format class and its template
+/// arguments, address-generator form, Pat<> memory width, implicit registers with hardware
+/// encodings, and stream form. Fails the build on anything it cannot classify instead of
+/// leaving a hole.
+pub fn attach_encoding_schemas(
+    td_file: &Path,
+    include_paths: &[&Path],
+    registers: &BuildRegisterModel,
+    by_slot: &mut HashMap<String, Vec<BuildInstrEncoding>>,
+) -> Result<(), String> {
+    use super::schema_rules::{
+        ag_addressing, constraint_ties, format_arg_values, order_by_derivation, stream_form,
+    };
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let class_names: Vec<String> = keeper.classes().filter_map(|(n, _)| n.ok().map(str::to_string)).collect();
+    let derives = |a: &str, b: &str| keeper.class(a).map(|c| c.subclass_of(b)).unwrap_or(false);
+    let slot_chain_classes: Vec<&String> = class_names
+        .iter()
+        .filter(|c| c.as_str() != "AIE2SlotInst" && derives(c, "AIE2SlotInst"))
+        .collect();
+
+    // Pass 1: every class each record instantiates.
+    let mut lineages: HashMap<String, Vec<String>> = HashMap::new();
+    for enc in by_slot.values().flatten() {
+        let record = keeper.def(&enc.name).map_err(|e| format!("{}: {e}", enc.name))?;
+        let lineage = class_names.iter().filter(|c| record.subclass_of(c)).cloned().collect();
+        lineages.insert(enc.name.clone(), lineage);
+    }
+    let mut shared: Vec<String> = lineages.values().next().cloned().unwrap_or_default();
+    for lineage in lineages.values() {
+        shared.retain(|c| lineage.contains(c));
+    }
+
+    let gprs = leaf_registers(registers, "eR");
+    if gprs.len() != 32 {
+        return Err(format!("GPR class eR has {} registers, expected 32", gprs.len()));
+    }
+
+    // Pass 2: the per-record facts.
+    let mut format_arg_cache: HashMap<String, Vec<(String, usize, usize)>> = HashMap::new();
+    for enc in by_slot.values_mut().flatten() {
+        let record = keeper.def(&enc.name).map_err(|e| format!("{}: {e}", enc.name))?;
+        let lineage = &lineages[&enc.name];
+        let mut classes: Vec<String> = lineage.iter().filter(|c| !shared.contains(c)).cloned().collect();
+        order_by_derivation(&mut classes, derives);
+
+        let mut chain: Vec<String> =
+            lineage.iter().filter(|c| slot_chain_classes.contains(c)).cloned().collect();
+        order_by_derivation(&mut chain, derives);
+        for pair in chain.windows(2) {
+            if !derives(&pair[1], &pair[0]) {
+                return Err(format!("{}: slot classes {chain:?} are not one inheritance chain", enc.name));
+            }
+        }
+        let format_class = chain
+            .get(1)
+            .cloned()
+            .ok_or_else(|| format!("{}: no format class below the slot base in {chain:?}", enc.name))?;
+
+        let arg_bits = match format_arg_cache.get(&format_class) {
+            Some(bits) => bits.clone(),
+            None => {
+                let bits = format_class_arg_bits(&keeper, &format_class)?;
+                format_arg_cache.insert(format_class.clone(), bits.clone());
+                bits
+            }
+        };
+        let inst = record
+            .value("Inst")
+            .map_err(|e| format!("{}: {e}", enc.name))?
+            .init
+            .as_bits()
+            .map_err(|_| format!("{}: Inst is not bits", enc.name))?;
+        let format_args = format_arg_values(&arg_bits, |i| inst.bit(i).and_then(|b| b.as_literal()));
+
+        let field_width = |name: &str| enc.operand_fields.iter().find(|f| f.name == name).map(|f| f.width);
+        let mut operands = Vec::new();
+        for (dag_field, is_def) in [("OutOperandList", true), ("InOperandList", false)] {
+            let dag = record
+                .value(dag_field)
+                .map_err(|e| format!("{}: {e}", enc.name))?
+                .init
+                .as_dag()
+                .map_err(|_| format!("{}: {dag_field} is not a dag", enc.name))?;
+            if dag.args().count() != dag.num_args() {
+                return Err(format!("{}: {dag_field} has an unnamed operand", enc.name));
+            }
+            for (arg_name, arg_init) in dag.args() {
+                let class: tblgen::Record = arg_init
+                    .as_def()
+                    .map_err(|_| format!("{}: operand ${arg_name} has no class", enc.name))?
+                    .into();
+                let class_name = record_name(&class);
+                let kind = operand_kind(&class, registers, field_width(arg_name))
+                    .map_err(|e| format!("{}: operand ${arg_name}: {e}", enc.name))?;
+                operands.push(super::records::BuildSchemaOperand {
+                    mc_index: operands.len() as u8,
+                    name: arg_name.to_string(),
+                    class: class_name,
+                    is_def,
+                    tied_to: None,
+                    encoded: field_width(arg_name).is_some(),
+                    kind,
+                });
+            }
+        }
+        let constraints = record.string_value("Constraints").unwrap_or_default();
+        for (a, b) in constraint_ties(&constraints) {
+            let index = |n: &str| {
+                operands
+                    .iter()
+                    .position(|o| o.name == n)
+                    .ok_or_else(|| format!("{}: constraint names unknown operand ${n}", enc.name))
+            };
+            let (ia, ib) = (index(&a)?, index(&b)?);
+            operands[ia].tied_to = Some(ib as u8);
+            operands[ib].tied_to = Some(ia as u8);
+        }
+
+        let addressing: Vec<&'static str> = {
+            let mut v: Vec<&'static str> = classes.iter().filter_map(|c| ag_addressing(c)).collect();
+            v.dedup();
+            v
+        };
+        if addressing.len() > 1 {
+            return Err(format!("{}: several address-generator forms {addressing:?}", enc.name));
+        }
+
+        let stream: Vec<(bool, Option<&'static str>)> = classes
+            .iter()
+            .filter(|c| **c != format_class && derives(c, &format_class))
+            .filter_map(|c| stream_form(c))
+            .collect();
+        if stream.len() > 1 {
+            return Err(format!("{}: several stream forms {stream:?}", enc.name));
+        }
+
+        // The legacy `reg_num` is a scalar GPR index: the hardware encoding of a register of
+        // the GPR class `eR`, 0 for any other register (audit bug 3: it was the name's digits).
+        for r in enc.implicit_regs.iter_mut() {
+            r.reg_num = match registers.registers.get(&r.reg_class) {
+                Some(def) if gprs.contains(&r.reg_class) => u32::from(def.hw_encoding),
+                _ => 0,
+            };
+        }
+        let implicit_regs = enc
+            .implicit_regs
+            .iter()
+            .map(|r| {
+                let def = registers.registers.get(&r.reg_class).ok_or_else(|| {
+                    format!("{}: implicit register {} is not in the register model", enc.name, r.reg_class)
+                })?;
+                Ok((r.reg_class.clone(), def.hw_encoding, r.is_use))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        enc.schema = super::records::BuildEncodingSchema {
+            operands,
+            format_class,
+            classes,
+            format_args,
+            addressing: addressing.first().copied(),
+            mem_vt_bits: None,
+            implicit_regs,
+            stream: stream.first().copied(),
+        };
+    }
+
+    // Pattern memory widths, then the same-format siblings (same format class and arguments:
+    // they differ only in the address generator).
+    let pattern_bits = pattern_memory_bits(&keeper)?;
+    let mut by_format: HashMap<(String, Vec<(String, u64)>), (u16, String)> = HashMap::new();
+    for enc in by_slot.values().flatten() {
+        let Some(&bits) = pattern_bits.get(&enc.name) else {
+            continue;
+        };
+        if !(enc.may_load || enc.may_store) {
+            return Err(format!(
+                "{}: a pattern gives it a memory type but it neither loads nor stores",
+                enc.name
+            ));
+        }
+        let key = (enc.schema.format_class.clone(), enc.schema.format_args.clone());
+        if let Some((other, from)) = by_format.insert(key, (bits, enc.name.clone())) {
+            if other != bits {
+                return Err(format!(
+                    "{}: memory type {bits} bits, but {from} of the same format says {other}",
+                    enc.name
+                ));
+            }
+        }
+    }
+    for enc in by_slot.values_mut().flatten() {
+        let key = (enc.schema.format_class.clone(), enc.schema.format_args.clone());
+        enc.schema.mem_vt_bits = by_format.get(&key).map(|&(bits, _)| bits);
+    }
+    Ok(())
+}
+
+/// The kind of one DAG operand class: a register class, a `RegisterOperand` (its `RegClass`,
+/// with a custom `EncoderMethod` for composite classes), or an immediate `Operand` with its
+/// decoder method. `field_width` is the width of the encoding field bound to the operand.
+fn operand_kind(
+    class: &tblgen::Record<'_>,
+    registers: &BuildRegisterModel,
+    field_width: Option<u8>,
+) -> Result<super::records::BuildOperandKind, String> {
+    let register =
+        |reg_class: &str, encoder: Option<String>| -> Result<super::records::BuildOperandKind, String> {
+            let def = registers
+                .classes
+                .get(reg_class)
+                .ok_or_else(|| format!("register class {reg_class} is not in the register model"))?;
+            let leaves = leaf_registers(registers, reg_class);
+            Ok(super::records::BuildOperandKind::Register {
+                class: reg_class.to_string(),
+                family: def.family,
+                bits: def.reg_size_bits,
+                encoder,
+                fixed: if leaves.len() == 1 {
+                    Some(leaves[0].clone())
+                } else {
+                    None
+                },
+            })
+        };
+    if class.subclass_of("RegisterClass") {
+        register(&record_name(class), None)
+    } else if class.subclass_of("RegisterOperand") {
+        let reg_class: tblgen::Record = class
+            .value("RegClass")
+            .map_err(|e| e.to_string())?
+            .init
+            .as_def()
+            .map_err(|_| format!("{}: RegClass is not a record", record_name(class)))?
+            .into();
+        let encoder = class.string_value("EncoderMethod").unwrap_or_default();
+        register(&record_name(&reg_class), Some(encoder).filter(|e| !e.is_empty()))
+    } else if class.subclass_of("Operand") {
+        let method = class.string_value("DecoderMethod").unwrap_or_default();
+        let (bits, step, signed, negative) = super::schema_rules::imm_decoder(&method, field_width)
+            .ok_or_else(|| format!("{}: unknown decoder method `{method}`", record_name(class)))?;
+        Ok(super::records::BuildOperandKind::Immediate { bits, step, signed, negative })
+    } else {
+        Err(format!("{}: neither a register class, a register operand nor an operand", record_name(class)))
+    }
+}
+
+/// The registers of a class with member classes expanded, in member order.
+fn leaf_registers(registers: &BuildRegisterModel, class: &str) -> Vec<String> {
+    fn walk(registers: &BuildRegisterModel, class: &str, out: &mut Vec<String>, depth: u8) {
+        let Some(def) = registers.classes.get(class) else {
+            return;
+        };
+        for member in &def.members {
+            if registers.classes.contains_key(member) {
+                if depth < 8 {
+                    walk(registers, member, out, depth + 1);
+                }
+            } else {
+                out.push(member.clone());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(registers, class, &mut out, 0);
+    out
+}
+
+/// Where each template argument bit of a format class lands in its `Inst`: (argument, argument
+/// bit, instruction bit), most significant instruction bit first. The class's `Inst` names its
+/// slot field, which names the format's own fields, which name the template arguments
+/// (`Inst{3}` -> `vec{3}` -> `vmac{2}` -> `AIE2_vmac_inst_vec:mdm{0}`); the chain is followed
+/// through the class record until it reaches an argument of this class.
+fn format_class_arg_bits(
+    keeper: &tblgen::RecordKeeper<'_>,
+    format_class: &str,
+) -> Result<Vec<(String, usize, usize)>, String> {
+    let class = keeper
+        .class(format_class)
+        .map_err(|e| format!("format class {format_class}: {e}"))?;
+    let inst = class
+        .value("Inst")
+        .map_err(|e| format!("{format_class}: {e}"))?
+        .init
+        .as_bits()
+        .map_err(|_| format!("{format_class}: Inst is not bits"))?;
+    let prefix = format!("{format_class}:");
+    let mut out = Vec::new();
+    for inst_bit in (0..inst.num_bits()).rev() {
+        let mut current = inst.bit(inst_bit).and_then(|b| b.as_var_bit()).map(|(n, i)| (n.to_string(), i));
+        for _ in 0..16 {
+            let Some((name, bit)) = current.take() else { break };
+            if let Some(arg) = name.strip_prefix(&prefix) {
+                out.push((arg.to_string(), bit, inst_bit));
+                break;
+            }
+            if name.contains(':') {
+                break; // an argument of another class: not a format argument
+            }
+            current = class
+                .value(&name)
+                .ok()
+                .and_then(|v| v.init.as_bits().ok())
+                .and_then(|bits| bits.bit(bit))
+                .and_then(|b| b.as_var_bit())
+                .map(|(n, i)| (n.to_string(), i));
+        }
+    }
+    Ok(out)
+}
+
+/// Memory access width per instruction from the Pat<> records that select it: the `MemoryVT`
+/// (`sextloadi16` -> `i16` -> 16 bits) of a pattern operator in `PatternToMatch`. Fails on an
+/// instruction two patterns give different widths.
+fn pattern_memory_bits(keeper: &tblgen::RecordKeeper<'_>) -> Result<HashMap<String, u16>, String> {
+    fn memory_vt_bits(dag: &tblgen::init::DagInit<'_>, out: &mut Vec<u16>) {
+        let op = dag.operator();
+        if let Some(size) = op
+            .value("MemoryVT")
+            .ok()
+            .and_then(|v| v.init.as_def().ok())
+            .and_then(|vt| tblgen::Record::from(vt).int_value("Size").ok())
+        {
+            out.push(size as u16);
+        }
+        // By index: `DagInit::args()` stops at the first unnamed argument, and pattern sub-DAGs
+        // are unnamed.
+        for i in 0..dag.num_args() {
+            if let Some(Ok(sub)) = dag.get(i).map(|a| a.as_dag()) {
+                memory_vt_bits(&sub, out);
+            }
+        }
+    }
+    let mut widths: HashMap<String, u16> = HashMap::new();
+    for record in keeper.all_derived_definitions("Pattern") {
+        let Some(result) = record
+            .value("ResultInstrs")
+            .ok()
+            .and_then(|v| v.init.as_list().ok())
+            .and_then(|l| l.iter().next())
+            .and_then(|d| d.as_dag().ok())
+        else {
+            continue;
+        };
+        let Ok(instr) = result.operator().name().map(str::to_string) else {
+            continue;
+        };
+        let Some(pattern) = record.value("PatternToMatch").ok().and_then(|v| v.init.as_dag().ok()) else {
+            continue;
+        };
+        let mut sizes = Vec::new();
+        memory_vt_bits(&pattern, &mut sizes);
+        sizes.dedup();
+        match sizes.as_slice() {
+            [] => {}
+            [bits] => {
+                if let Some(other) = widths.insert(instr.clone(), *bits) {
+                    if other != *bits {
+                        return Err(format!(
+                            "{instr}: patterns give memory types of {other} and {bits} bits"
+                        ));
+                    }
+                }
+            }
+            many => return Err(format!("{instr}: one pattern names memory types {many:?}")),
+        }
+    }
+    Ok(widths)
 }
