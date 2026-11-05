@@ -66,16 +66,9 @@ pub unsafe extern "C" fn xdna_emu_get_last_async_error(
     }
 
     let handle = &mut *handle;
-    match handle
-        .backend
-        .as_interpreter()
-        .expect("Plan A: interpreter backend")
-        .device()
-        .async_errors
-        .last_cache()
-    {
+    match handle.backend.last_async_error() {
         Some(rec) => {
-            *out = XdnaEmuAsyncError::from(rec);
+            *out = XdnaEmuAsyncError::from(&rec);
             1
         }
         None => 0,

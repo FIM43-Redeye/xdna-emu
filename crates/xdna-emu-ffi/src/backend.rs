@@ -136,6 +136,15 @@ pub trait NpuBackend {
     /// The host destroyed hardware context `ctx`. Default: nothing.
     fn destroy_hw_context(&mut self, _ctx: u32) {}
 
+    /// The last asynchronous error, as the driver's
+    /// `DRM_AMDXDNA_HW_LAST_ASYNC_ERR` reports it. Default: the interpreter
+    /// device's own error sink, for backends that model the error path
+    /// themselves.
+    fn last_async_error(&self) -> Option<AmdxdnaAsyncError> {
+        self.as_interpreter()
+            .and_then(|engine| engine.device().async_errors.last_cache().copied())
+    }
+
     // --- host memory (tier-2) ---
     fn host_memory_mut(&mut self) -> &mut HostMemory;
 
