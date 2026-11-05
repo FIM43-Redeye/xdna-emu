@@ -250,6 +250,11 @@ impl DeviceState {
 
         // Update DMA engine compression/OOO config when control register is written
         if !is_start_queue {
+            let (controller_id, fot_mode) = self
+                .array
+                .get(col, row)
+                .map(|t| (t.dma_channels[ch_idx].controller_id, t.dma_channels[ch_idx].fot_mode))
+                .unwrap_or((0, 0));
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 let (decompression_en, ooo_en) = if is_s2mm {
                     (compression_enable, out_of_order_enable)
@@ -259,6 +264,7 @@ impl DeviceState {
                 let compress_en = if is_s2mm { false } else { compression_enable };
 
                 dma.set_channel_compression_config(ch_idx as u8, compress_en, decompression_en, ooo_en);
+                dma.set_channel_controller(ch_idx as u8, controller_id, fot_mode);
                 // Ctrl's Reset field (AM025) resets the channel. (The shim's
                 // bit 1 is Pause_Mem instead; its path is separate.)
                 if lay.reset.extract_bool(value) {
@@ -454,6 +460,11 @@ impl DeviceState {
         }
 
         if !is_start_queue {
+            let (controller_id, fot_mode) = self
+                .array
+                .get(col, row)
+                .map(|t| (t.dma_channels[ch_idx].controller_id, t.dma_channels[ch_idx].fot_mode))
+                .unwrap_or((0, 0));
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 let (decompression_en, ooo_en) = if is_s2mm {
                     (compression_enable, out_of_order_enable)
@@ -462,6 +473,7 @@ impl DeviceState {
                 };
                 let compress_en = if is_s2mm { false } else { compression_enable };
                 dma.set_channel_compression_config(ch_idx as u8, compress_en, decompression_en, ooo_en);
+                dma.set_channel_controller(ch_idx as u8, controller_id, fot_mode);
             }
         }
 

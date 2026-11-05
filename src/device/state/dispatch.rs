@@ -590,6 +590,18 @@ mod tests {
         assert_eq!(d.read_tile_register(1, 1, 0x8_0000 - 4), 7, "memory tile");
     }
 
+    /// A runtime sequence may push a token-issuing task and set the
+    /// channel's Controller_ID afterwards (memtile_dmas/writebd does); the
+    /// token goes to the controller the channel names when it is issued.
+    #[test]
+    fn controller_id_written_after_a_queue_push_applies_to_its_token() {
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(1, 1);
+        d.write_tile_register(1, 0, 0x1D204, 0x8000_0000); // S2MM0 queue, token issue
+        d.write_tile_register(1, 0, 0x1D200, 0x100); // S2MM0 Ctrl, Controller_ID 1
+        assert_eq!(d.array.dma_engine(1, 0).unwrap().channel_controller_id(0), Some(1));
+    }
+
     #[test]
     fn assign_partition_columns_ungates_only_target_columns() {
         let mut d = DeviceState::new_npu1();

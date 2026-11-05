@@ -157,6 +157,22 @@ impl DmaEngine {
         }
     }
 
+    /// The channel's Ctrl register was written: its Controller_ID (and, for
+    /// S2MM, FoT mode) apply from now on, including to the token of a task
+    /// already queued or running (AM025: the token is sent to the
+    /// controller the channel names when the task completes).
+    pub fn set_channel_controller(&mut self, ch_idx: u8, controller_id: u8, fot_mode: u8) {
+        if let Some(ch) = self.channels.get_mut(ch_idx as usize) {
+            ch.task_config.controller_id = controller_id;
+            ch.task_config.fot_mode = fot_mode;
+        }
+    }
+
+    /// The Controller_ID a task-complete token from this channel carries now.
+    pub fn channel_controller_id(&self, ch_idx: u8) -> Option<u8> {
+        self.channels.get(ch_idx as usize).map(|ch| ch.task_config.controller_id)
+    }
+
     /// Set channel compression/decompression and out-of-order configuration.
     pub fn set_channel_compression_config(
         &mut self,
