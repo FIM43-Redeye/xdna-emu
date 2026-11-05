@@ -223,10 +223,9 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // lands.  Memtile and compute calibrate independently.
             memtile_first_bd_startup_cycles: 0,
             compute_first_bd_startup_cycles: 0,
-            // Lower bound pinned by HW co-captures (#140): memtile recv
-            // [16,16,16,16] (>= 16), compute recv [8,8,8,8,8,8,8,8].
-            // See the DmaTiming field doc.
-            s2mm_ingress_fifo_depth: 16,
+            // Pinned by the R4-D3 data race (NPU1, core and DMA sources,
+            // 0..3 hops): 18. See the DmaTiming field doc.
+            s2mm_ingress_fifo_depth: 18,
             // Pinned by silicon (R4-D3, Phoenix, 2026-10-28): 25 words held by
             // a compute-tile MM2S ahead of a stalled consumer, upstream of the
             // switch's local-slave port. See the DmaTiming field doc.
@@ -258,16 +257,14 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             local_master_fifo_depth: 2,
             external_master_fifo_depth: 4,
             switch_fifo_depth: 16,
+            slave_port_latency: 2,
             local_to_local_latency: 3,
             local_to_external_latency: 4,
             external_to_external_latency: 4,
             external_to_local_latency: 3,
-            // Single inter-tile hop = destination slave port input latency only.
-            // AM020 slave ports are 2-cycle latency; the source master-output
-            // latency is already accounted within the source tile, so a hop is
-            // NOT the full external_to_external (4) traversal. Bounds the crossing
-            // depth to slave_fifo(4) + 2 = 6, matching HW send headroom (#140).
-            inter_tile_hop_latency: 2,
+            // Measured 0 on NPU1: one more tile adds exactly one ext->ext crossing
+            // (4 cycles) to a core-to-core transit (gen_stream_rtt_probe.py).
+            inter_tile_hop_latency: 0,
             packet_arbitration_overhead: 1,
         },
         instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },

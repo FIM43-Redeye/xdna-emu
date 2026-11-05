@@ -108,6 +108,17 @@ pub struct StreamPort {
     tlast_flags: VecDeque<bool>,
     /// FIFO capacity
     pub fifo_capacity: usize,
+    /// Words crossing the switch that occupy a slot of this port without sitting in `fifo`.
+    ///
+    /// AM020 ch.2:78-92 gives each port a latency AND a depth, and a crossing's latency and
+    /// depth are the sums of its two ports': the traversal latency is time a word spends inside
+    /// the FIFOs, not storage on top of them. A word in a circuit route's switch pipeline is
+    /// therefore charged to its slave port for the slave's latency and to its master port for
+    /// the rest (`StreamSwitch::advance_switch_pipeline`), and both count against capacity.
+    pub reserved: usize,
+    /// A word charged to this slave port could not move on to its master this cycle (the master
+    /// was full): the slave holds data it cannot forward, the PORT_STALLED condition.
+    pub held_in_switch: bool,
     /// Raw configuration register value (from CDO)
     pub config: u32,
     /// Was this port active during the current routing cycle?
@@ -169,6 +180,8 @@ impl StreamPort {
             fifo: VecDeque::with_capacity(fifo_capacity),
             tlast_flags: VecDeque::with_capacity(fifo_capacity),
             fifo_capacity,
+            reserved: 0,
+            held_in_switch: false,
             config: 0,
             route_to: None,
             enabled: false,
@@ -189,13 +202,19 @@ impl StreamPort {
     /// Check if FIFO can accept more data.
     #[inline]
     pub fn can_accept(&self) -> bool {
-        self.fifo.len() < self.fifo_capacity
+        self.occupancy() < self.fifo_capacity
+    }
+
+    /// Slots in use: words in the FIFO plus words crossing the switch charged to this port.
+    #[inline]
+    pub fn occupancy(&self) -> usize {
+        self.fifo.len() + self.reserved
     }
 
     /// Check if FIFO is full (backpressure).
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.fifo.len() >= self.fifo_capacity
+        self.occupancy() >= self.fifo_capacity
     }
 
     /// Push data into FIFO (returns false if full). TLAST defaults to false.
@@ -309,6 +328,8 @@ impl StreamPort {
     pub fn clear(&mut self) {
         self.fifo.clear();
         self.tlast_flags.clear();
+        self.reserved = 0;
+        self.held_in_switch = false;
     }
 
     /// Set the route destination.

@@ -6,6 +6,15 @@ use super::*;
 /// byte length into the accepted-word count the recv accept cursor tracks.
 pub(super) const BYTES_PER_STREAM_WORD: u32 = 4;
 
+/// Words an MM2S channel holds between its egress staging FIFO and its stream-switch slave port:
+/// 1, the hand-off register (the core's stream output has the same single register,
+/// `interpreter::execute::stream`). Pinned by the R4-D3 data race on NPU1 (`r4d3_egress_race.py`):
+/// with the switch crossings at their AM020 depths (slave 4 + local master 2, ch.2:86) a DMA
+/// source holds staging + 25 words and a core source 1 + 1 + 24, and the four BD start phases
+/// match the staging's granule rule only with 25 downstream of the staging -- a 4-word buffer
+/// here made it 28 and shifted the phase pattern by one.
+pub const MM2S_OUTPUT_REGISTER_DEPTH: usize = 1;
+
 impl DmaEngine {
     /// Maximum per-channel `stream_in` depth before that S2MM channel
     /// backpressures its upstream stream-switch master port.
@@ -101,16 +110,14 @@ impl DmaEngine {
     }
 
     /// Maximum per-channel `stream_out` depth before that channel
-    /// backpressures.
+    /// backpressures: one word, the hand-off register between the MM2S and
+    /// its slave port ([`MM2S_OUTPUT_REGISTER_DEPTH`]).
     ///
-    /// Models the slave-port FIFO that the DMA's output bridges into on
-    /// real silicon; AM020 ch2 specifies "Local slave ports are 2-cycle
-    /// latency and a 4-deep FIFO" for AIE2 / Phoenix.  Each MM2S channel
-    /// pushes into its own slave port FIFO with independent credit-based
-    /// flow control, so the capacity is enforced per-channel -- one
-    /// channel filling its FIFO must not stall any other channel.
+    /// The slave port's 4-deep FIFO (AM020 ch.2:80) is the switch's
+    /// `StreamPort`, not this buffer; this one used to be sized as a second
+    /// copy of it, and silicon counts it once (R4-D3 data race, below).
     pub fn output_fifo_capacity(&self) -> usize {
-        xdna_archspec::aie2::timing::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize
+        MM2S_OUTPUT_REGISTER_DEPTH
     }
 
     /// Whether the MM2S channel's `stream_out` has room for at least one

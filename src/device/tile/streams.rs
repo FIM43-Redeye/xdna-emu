@@ -25,13 +25,17 @@ pub const CASCADE_TOTAL_DEPTH: usize = 2;
 /// timer). The link routing realizes it as two end-of-cycle moves: MCD -> transit -> SCD.
 pub const CASCADE_TRANSIT_CYCLES: usize = 2;
 
-/// Words the core's stream input buffer holds before the Core master port is backpressured: 1.
-/// AM020 ch.2:143 gives the core's AXI4-Stream interface no FIFO, so this is only the hand-off
-/// register between the switch and the `mov r, SS` read; the buffering of the path is the Core
-/// master port's own 2-deep FIFO (ch.2:82). Without a bound the buffer absorbed any number of
-/// words and a held consumer never backpressured its producer (silicon: 18 words between two
-/// cores one tile apart, `tools/gen_stream_absorb_probe.py`).
-pub const CORE_STREAM_INPUT_DEPTH: usize = 1;
+/// Words the core's stream input holds before the Core master port is backpressured: 3.
+///
+/// Pinned by silicon (NPU1, `tools/gen_stream_absorb_probe.py`, r1 == r2, 2026-11-04): a producer
+/// core one tile away writes 18 words into a consumer that is not reading before it stalls (39
+/// through the producer's switch FIFO). The producer's side of that path is pinned separately by
+/// the R4-D3 data race into a DMA sink (1-word output register; switch crossings at their AM020
+/// depths, 8 per external hop), which leaves 18 - 1 - 4 - 8 = 5 for the consumer's side: the Core
+/// master port's 2-deep FIFO (AM020 ch.2:82) and 3 here. AM020 ch.2:143 gives the core's stream
+/// interface no FIFO; where in the core's read path these 3 words sit is not separated. Without a
+/// bound the buffer absorbed any number of words and a held consumer never backpressured.
+pub const CORE_STREAM_INPUT_DEPTH: usize = 3;
 
 impl Tile {
     // === Stream Port Access (for core direct stream reads/writes) ===

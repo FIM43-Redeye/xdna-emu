@@ -102,6 +102,14 @@ pub struct StreamSwitch {
     /// traverse from slave input to master output within a single tile's
     /// stream switch. Without this, data moves slave->master in 1 cycle.
     pub(crate) switch_pipeline: Vec<InSwitchWord>,
+    /// Next multicast group id for `switch_pipeline` entries.
+    next_pipeline_group: u32,
+    /// The register between each switch FIFO and its paired slave port (k-th FIFO master to
+    /// k-th FIFO slave): it holds a word when the slave port is full, so a FIFO route stores
+    /// the FIFO's 16, this 1 and the FIFO slave port's 4 -- the 21 words silicon adds for a
+    /// flow through the FIFO (R4-D3 data race). A word passes it on the cycle it leaves the
+    /// FIFO when the slave has room, so it adds no latency of its own.
+    pub(crate) fifo_out_regs: Vec<Option<(u32, bool)>>,
 
     /// Fatal errors accumulated during routing.
     ///
@@ -150,6 +158,8 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
+            next_pipeline_group: 0,
+            fifo_out_regs: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -184,6 +194,8 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
+            next_pipeline_group: 0,
+            fifo_out_regs: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -216,6 +228,8 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
+            next_pipeline_group: 0,
+            fifo_out_regs: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -304,13 +318,14 @@ impl StreamSwitch {
     /// Check if any port or pipeline has pending data.
     pub fn has_pending_data(&self) -> bool {
         !self.switch_pipeline.is_empty()
+            || self.fifo_out_regs.iter().any(Option::is_some)
             || self.masters.iter().any(|p| p.has_data())
             || self.slaves.iter().any(|p| p.has_data())
     }
 
     /// Check if the switch pipeline has in-flight words.
     pub fn has_pipeline_data(&self) -> bool {
-        !self.switch_pipeline.is_empty()
+        !self.switch_pipeline.is_empty() || self.fifo_out_regs.iter().any(Option::is_some)
     }
 
     /// Begin a new routing cycle for port activity tracking.
@@ -333,6 +348,7 @@ impl StreamSwitch {
             port.cycle_beat = false;
             port.cycle_stalled = false;
             port.cycle_tlast = false;
+            port.held_in_switch = false;
         }
     }
 
@@ -358,7 +374,8 @@ impl StreamSwitch {
             port.cycle_stalled = port.cycle_stalled || (port.has_data() && !port.cycle_beat);
         }
         for port in &mut self.slaves {
-            port.cycle_stalled = port.cycle_stalled || (port.has_data() && !port.cycle_beat);
+            let holding = port.has_data() || port.held_in_switch;
+            port.cycle_stalled = port.cycle_stalled || (holding && !port.cycle_beat);
         }
     }
 
@@ -368,8 +385,10 @@ impl StreamSwitch {
             + self.slaves.iter().map(|p| p.fifo_level()).sum::<usize>()
     }
 
-    /// Clear all FIFOs.
+    /// Clear all FIFOs and the words crossing the switch (which hold their slots).
     pub fn clear_all(&mut self) {
+        self.switch_pipeline.clear();
+        self.fifo_out_regs.clear();
         for port in &mut self.masters {
             port.clear();
         }
@@ -444,18 +463,35 @@ impl StreamSwitch {
     }
 
     /// Carry words through the switch's FIFO: master port FIFO:n to slave port FIFO:n (the
-    /// k-th FIFO master pairs with the k-th FIFO slave), one word per cycle while the slave
-    /// has room. The FIFO itself is the master port's 16-deep buffer (`STREAM_SWITCH_FIFO_DEPTH`).
+    /// k-th FIFO master pairs with the k-th FIFO slave), one word per cycle, through the
+    /// output register `fifo_out_regs[k]`. The FIFO itself is the master port's 16-deep buffer
+    /// (`STREAM_SWITCH_FIFO_DEPTH`).
     fn advance_switch_fifos(&mut self) -> usize {
         let masters = self.masters.iter().enumerate().filter(|(_, p)| p.port_type == PortType::Fifo);
         let slaves = self.slaves.iter().enumerate().filter(|(_, p)| p.port_type == PortType::Fifo);
         let pairs: Vec<(usize, usize)> = masters.zip(slaves).map(|((m, _), (s, _))| (m, s)).collect();
+        if self.fifo_out_regs.len() < pairs.len() {
+            self.fifo_out_regs.resize(pairs.len(), None);
+        }
         let mut moved = 0;
-        for (m, s) in pairs {
-            if self.masters[m].has_data() && self.slaves[s].can_accept() {
-                if let Some((data, tlast)) = self.masters[m].pop_with_tlast() {
+        for (k, (m, s)) in pairs.into_iter().enumerate() {
+            let mut sent = false;
+            if let Some((data, tlast)) = self.fifo_out_regs[k] {
+                if self.slaves[s].can_accept() {
                     self.slaves[s].push_with_tlast(data, tlast);
+                    self.fifo_out_regs[k] = None;
+                    sent = true;
                     moved += 1;
+                }
+            }
+            if self.fifo_out_regs[k].is_none() {
+                if let Some((data, tlast)) = self.masters[m].pop_with_tlast() {
+                    if !sent && self.slaves[s].can_accept() {
+                        self.slaves[s].push_with_tlast(data, tlast);
+                        moved += 1;
+                    } else {
+                        self.fifo_out_regs[k] = Some((data, tlast));
+                    }
                 }
             }
         }
@@ -488,41 +524,16 @@ impl StreamSwitch {
         // We group routes by slave_idx so we pop once and push a pipeline
         // entry for every destination master.
         //
-        // Per-route backpressure: a route from slave to master models a
-        // `latency`-cycle pipe feeding the master's FIFO.  The total in-flight
-        // budget for a route is `latency + master.fifo_capacity` words --
-        // `latency` in the pipe (one per cycle of overlap) plus the master's
-        // own FIFO depth.  When in-flight reaches that budget, the slave can
-        // no longer be popped for that route; the slave's FIFO holds the
-        // word and back-pressures upstream (the DMA MM2S engine sees its
-        // stream-out slave full and stalls in Transferring with
-        // Stalled_Stream_Backpressure asserted).
-        //
-        // Without this gating, `step()` drained slaves unconditionally into an
-        // unbounded `switch_pipeline` Vec, so MM2S never saw downstream
-        // back-pressure and self-chained DMAs (the
-        // memtile_dmas/blockwrite_using_locks pattern) ran forever -- the
-        // engine never reached Halted/Stalled and natural completion never
-        // fired even though the sync target was satisfied.
-        //
-        // For multicast: every destination must have room.  If any one peer
-        // is at capacity, the slave is held until that peer drains.  This
-        // matches HW's all-or-nothing multicast semantics (a switch-fabric
-        // copy must land at every destination atomically).
-        //
-        // Collect which slaves have been consumed this cycle to avoid
-        // double-popping when multiple routes share the same slave.
+        // Buffering: a crossing holds its slave FIFO plus its master FIFO and
+        // nothing more (AM020 ch.2:84-92; silicon adds 8 words per external
+        // hop). A popped word keeps its slave slot (`StreamPort::reserved`)
+        // for the slave's latency, then needs a master slot to go on
+        // (`advance_switch_pipeline`); when the master is full the word waits
+        // there, the slave's slots stay taken, and the slave refuses its
+        // producer -- the backpressure a DMA MM2S sees as
+        // Stalled_Stream_Backpressure. The pop itself needs no budget check:
+        // the word's slot moves with it.
         let mut slave_consumed: u64 = 0; // bitset, up to 64 slave ports
-
-        // Pre-compute pipeline occupancy per destination master so we don't
-        // re-scan `switch_pipeline` for every (route, peer) check.
-        let mut pipeline_to_master: Vec<usize> = vec![0; self.masters.len()];
-        for w in &self.switch_pipeline {
-            let m = w.master_idx as usize;
-            if m < pipeline_to_master.len() {
-                pipeline_to_master[m] += 1;
-            }
-        }
 
         for i in 0..self.local_routes.len() {
             let route = &self.local_routes[i];
@@ -533,7 +544,6 @@ impl StreamSwitch {
             let slave_idx = route.slave_idx as usize;
             let master_idx = route.master_idx as usize;
 
-            // Check bounds
             if slave_idx >= self.slaves.len() || master_idx >= self.masters.len() {
                 continue;
             }
@@ -543,27 +553,22 @@ impl StreamSwitch {
                 continue;
             }
 
-            let slave_has_data = self.slaves[slave_idx].has_data();
-
-            log::trace!(
-                "TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
-                self.col,
-                self.row,
-                slave_idx,
-                master_idx,
-                slave_has_data,
-                self.slaves[slave_idx].fifo.len()
-            );
-
-            if !slave_has_data {
+            if !self.slaves[slave_idx].has_data() {
                 continue;
             }
 
-            // Per-peer backpressure check: every multicast destination must
-            // have room for one more in-flight word.  Budget per peer is
-            // `peer.latency + master.fifo_capacity`; in-flight is
-            // `pipeline_to_master[m] + masters[m].fifo.len()`.
-            let mut can_pop = true;
+            let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() else {
+                continue;
+            };
+            if slave_idx < 64 {
+                slave_consumed |= 1u64 << slave_idx;
+            }
+            self.slaves[slave_idx].reserved += 1;
+            let group = self.next_pipeline_group;
+            self.next_pipeline_group = self.next_pipeline_group.wrapping_add(1);
+
+            // Every enabled route from this slave gets a copy (multicast fanout).
+            let mut first = true;
             for j in 0..self.local_routes.len() {
                 let peer = &self.local_routes[j];
                 if peer.slave_idx as usize != slave_idx || !peer.enabled {
@@ -573,70 +578,30 @@ impl StreamSwitch {
                 if peer_master >= self.masters.len() {
                     continue;
                 }
-                let in_flight = pipeline_to_master[peer_master] + self.masters[peer_master].fifo.len();
-                let budget = peer.latency as usize + self.masters[peer_master].fifo_capacity;
-                if in_flight >= budget {
-                    log::trace!(
-                        "TileSwitch({},{}): slave[{}]->master[{}] backpressured \
-                         (in_flight={} budget={}=lat{}+cap{})",
-                        self.col,
-                        self.row,
-                        slave_idx,
-                        peer_master,
-                        in_flight,
-                        budget,
-                        peer.latency,
-                        self.masters[peer_master].fifo_capacity,
-                    );
-                    can_pop = false;
-                    break;
-                }
-            }
-
-            if !can_pop {
-                continue;
-            }
-
-            // Pop once from slave
-            if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
-                if slave_idx < 64 {
-                    slave_consumed |= 1u64 << slave_idx;
-                }
-
-                // Find ALL enabled routes from this slave (multicast fanout).
-                // Search the full route list -- routes for the same slave may
-                // appear at any position.
-                let mut dest_count: u32 = 0;
-                for j in 0..self.local_routes.len() {
-                    let peer = &self.local_routes[j];
-                    if peer.slave_idx as usize != slave_idx || !peer.enabled {
-                        continue;
-                    }
-                    let peer_master = peer.master_idx as usize;
-                    if peer_master >= self.masters.len() {
-                        continue;
-                    }
-                    self.switch_pipeline.push(InSwitchWord {
-                        master_idx: peer.master_idx,
-                        data,
-                        tlast,
-                        cycles_remaining: peer.latency,
-                    });
-                    pipeline_to_master[peer_master] += 1;
-                    dest_count += 1;
-                    log::debug!(
-                        "TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
-                        self.col,
-                        self.row,
-                        slave_idx,
-                        peer.latency,
-                        peer_master,
-                        data,
-                        if tlast { " TLAST" } else { "" },
-                        if dest_count > 1 { " (multicast)" } else { "" }
-                    );
-                }
-                let _ = dest_count; // used in log messages above
+                let master_latency = peer.latency.saturating_sub(arch_timing::STREAM_SLAVE_PORT_LATENCY);
+                self.switch_pipeline.push(InSwitchWord {
+                    master_idx: peer.master_idx,
+                    data,
+                    tlast,
+                    cycles_remaining: peer.latency,
+                    slave_idx: slave_idx as u8,
+                    master_latency,
+                    in_master: false,
+                    holds_slave: first,
+                    group,
+                });
+                log::debug!(
+                    "TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}{}",
+                    self.col,
+                    self.row,
+                    slave_idx,
+                    peer.latency,
+                    peer_master,
+                    data,
+                    if tlast { " TLAST" } else { "" },
+                    if first { "" } else { " (multicast)" }
+                );
+                first = false;
             }
         }
 
@@ -645,33 +610,68 @@ impl StreamSwitch {
 
     /// Advance the intra-tile switch pipeline by one cycle.
     ///
-    /// Decrements countdown timers and delivers words whose traversal is complete.
+    /// A word spends its first `STREAM_SLAVE_PORT_LATENCY` cycles in its slave
+    /// port's slot and the rest (`master_latency`) in a slot of its master,
+    /// then lands in the master FIFO. Moving from the slave's slot to the
+    /// master's needs a free master slot; without one the word (and every copy
+    /// of a multicast word: all-or-nothing) waits, keeping the slave's slot.
     /// Returns the number of words delivered to master ports.
     fn advance_switch_pipeline(&mut self) -> usize {
         let mut delivered = 0;
         let mut i = 0;
 
         while i < self.switch_pipeline.len() {
-            let word = &mut self.switch_pipeline[i];
-            if word.cycles_remaining > 0 {
-                word.cycles_remaining -= 1;
-            }
-
-            if word.cycles_remaining == 0 {
-                let master_idx = word.master_idx as usize;
-                if master_idx < self.masters.len() && self.masters[master_idx].can_accept() {
-                    let data = word.data;
-                    let tlast = word.tlast;
-                    self.masters[master_idx].push_with_tlast(data, tlast);
+            if self.switch_pipeline[i].in_master {
+                let word = &mut self.switch_pipeline[i];
+                word.cycles_remaining = word.cycles_remaining.saturating_sub(1);
+                if word.cycles_remaining == 0 {
+                    let master = &mut self.masters[word.master_idx as usize];
+                    master.reserved -= 1;
+                    let pushed = master.push_with_tlast(word.data, word.tlast);
+                    debug_assert!(pushed, "a reserved master slot refused its word");
                     self.switch_pipeline.remove(i);
                     delivered += 1;
                 } else {
-                    // Master full -- backpressure, retry next cycle
                     i += 1;
                 }
-            } else {
-                i += 1;
+                continue;
             }
+
+            // In the slave's slot: the copies of one word sit next to each other.
+            let group = self.switch_pipeline[i].group;
+            let end = i + self.switch_pipeline[i..].iter().take_while(|w| w.group == group).count();
+            let word = &self.switch_pipeline[i];
+            if word.cycles_remaining > word.master_latency + 1 {
+                for w in &mut self.switch_pipeline[i..end] {
+                    w.cycles_remaining -= 1;
+                }
+                i = end;
+                continue;
+            }
+            let room = self.switch_pipeline[i..end]
+                .iter()
+                .all(|w| self.masters[w.master_idx as usize].can_accept());
+            if !room {
+                let slave = self.switch_pipeline[i].slave_idx as usize;
+                self.slaves[slave].held_in_switch = true;
+                i = end;
+                continue;
+            }
+            for k in i..end {
+                let w = &mut self.switch_pipeline[k];
+                w.cycles_remaining -= 1;
+                w.in_master = true;
+                self.masters[w.master_idx as usize].reserved += 1;
+                if w.holds_slave {
+                    self.slaves[w.slave_idx as usize].reserved -= 1;
+                    w.holds_slave = false;
+                }
+            }
+            // A master latency of 0 delivers on the same cycle.
+            if self.switch_pipeline[i].cycles_remaining == 0 {
+                continue;
+            }
+            i = end;
         }
 
         delivered
@@ -679,7 +679,7 @@ impl StreamSwitch {
 
     /// Check if any local route has data pending (including in pipeline).
     pub fn has_pending_local(&self) -> bool {
-        if !self.switch_pipeline.is_empty() {
+        if !self.switch_pipeline.is_empty() || self.fifo_out_regs.iter().any(Option::is_some) {
             return true;
         }
         for route in &self.local_routes {

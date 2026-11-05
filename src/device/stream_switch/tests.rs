@@ -388,8 +388,12 @@ fn test_switch_step_backpressure() {
     // Make room in master
     ss.masters[0].pop();
 
-    // Next step should deliver
-    ss.step();
+    // The word takes the freed master slot, then spends the master's latency in it.
+    let master_latency = (latency - xdna_archspec::aie2::timing::STREAM_SLAVE_PORT_LATENCY) as usize;
+    for _ in 0..=master_latency {
+        assert!(!ss.switch_pipeline.is_empty(), "taking the master slot, then crossing it");
+        ss.step();
+    }
     assert!(ss.switch_pipeline.is_empty(), "Delivered after backpressure cleared");
 }
 
@@ -542,82 +546,38 @@ fn test_circuit_multicast_multiple_words() {
 // ========================================================================
 
 #[test]
-fn test_per_route_backpressure_caps_pipeline_at_latency_plus_master_fifo() {
-    // Regression test for the memtile_dmas/blockwrite_using_locks wedge.
+fn test_per_route_backpressure_holds_slave_and_master_slots() {
+    // Regression test for the memtile_dmas/blockwrite_using_locks wedge: a
+    // switch that drains its slaves into an unbounded pipeline never
+    // backpressures its producer, so a self-chained MM2S BD runs forever.
     //
-    // step() used to drain slave FIFOs unconditionally into an unbounded
-    // switch_pipeline Vec, so a producer (DMA MM2S) feeding a slave whose
-    // route led to a fully-backpressured master never saw its slave fill --
-    // every cycle, the slave was popped and the word buried in pipeline.  A
-    // self-chained MM2S BD would then run forever without ever asserting
-    // Stalled_Stream_Backpressure, and the run loop never reached natural
-    // completion.
-    //
-    // After the fix the slave-pop is gated by the per-route in-flight budget
-    // (`latency + master.fifo_capacity`).  Once that budget is reached the
-    // slave retains data and backpressures upstream.
+    // Words in the switch pipeline keep a slot of their slave (then their
+    // master), so with the master never drained the crossing fills to
+    // slave_cap + master_cap and the slave refuses further words.
     let mut ss = StreamSwitch::new_compute_tile(0, 2);
     ss.configure_local_route(0, 0);
-    let latency = ss.local_routes[0].latency as usize;
     let master_cap = ss.masters[0].fifo_capacity;
-    let budget = latency + master_cap;
-
-    // Fill master so deliveries can't drain in-flight words; pipeline is
-    // the only place words can pool.
-    while ss.masters[0].can_accept() {
-        ss.masters[0].push(0x0);
-    }
-
-    // Fill the slave to capacity.  With master full and slave full, the
-    // pipeline can absorb at most `latency` more words before the budget
-    // is reached and the slave starts to back up.
     let slave_cap = ss.slaves[0].fifo_capacity;
-    assert!(
-        slave_cap > latency,
-        "test setup needs slave capacity > latency ({} vs {}); the leak vs fixed comparison \
-         only makes sense if some slave words must be retained when the budget is reached",
-        slave_cap,
-        latency,
-    );
-    for i in 0..slave_cap {
-        assert!(ss.slaves[0].push(i as u32), "slave push must succeed up to capacity");
-    }
-    let pushed_to_slave = ss.slaves[0].fifo.len();
 
-    // Run more cycles than the budget so a leaky step() would have moved
-    // every slave word into the pipeline by now.
-    for _ in 0..(budget * 4) {
+    let mut accepted = 0usize;
+    for i in 0..64u32 {
+        if ss.slaves[0].push(i) {
+            accepted += 1;
+        }
         ss.step();
     }
+    assert_eq!(accepted, slave_cap + master_cap, "the crossing holds both FIFOs");
+    assert_eq!(ss.masters[0].fifo.len(), master_cap);
+    assert!(!ss.slaves[0].can_accept(), "the slave backpressures its producer");
+    assert_eq!(ss.slaves[0].occupancy(), slave_cap);
 
-    // Master stayed full (we never popped it), so no entries drained from
-    // the pipeline.  Pipeline + master FIFO must be exactly at budget; any
-    // further pops would exceed it.
-    let in_flight = ss.switch_pipeline.len() + ss.masters[0].fifo.len();
-    assert_eq!(in_flight, budget, "in-flight must equal budget at steady state");
-
-    // The slave retains words -- this is the backpressure signal that
-    // lets an upstream DMA MM2S stall in Transferring.  Master starts
-    // full (cap), so only `latency` slave words could enter the pipeline.
-    let expected_remaining = pushed_to_slave - latency;
-    assert_eq!(
-        ss.slaves[0].fifo.len(),
-        expected_remaining,
-        "slave must retain {} words once budget is reached; leaky pop would have emptied it",
-        expected_remaining,
-    );
-
-    // Drain one master slot.  The pipeline should advance one word to
-    // master, which opens budget for one more slave-pop.
+    // Draining one master word frees exactly one slot all the way back to the slave.
     ss.masters[0].pop();
-    ss.step();
-    let in_flight_after = ss.switch_pipeline.len() + ss.masters[0].fifo.len();
-    assert_eq!(in_flight_after, budget, "drain + step restores budget exactly");
-    assert_eq!(
-        ss.slaves[0].fifo.len(),
-        expected_remaining - 1,
-        "draining the master must let exactly one slave word into the pipeline",
-    );
+    for _ in 0..8 {
+        ss.step();
+    }
+    assert!(ss.slaves[0].push(99), "one slot came free");
+    assert!(!ss.slaves[0].can_accept(), "and only one");
 }
 
 // ========================================================================
@@ -1478,6 +1438,124 @@ fn the_switch_fifo_holds_its_depth_when_the_slave_side_is_blocked() {
     // everything accepted is somewhere in the path: nothing lost
     let in_path = ss.slaves.iter().map(|p| p.fifo.len()).sum::<usize>()
         + ss.masters.iter().map(|p| p.fifo.len()).sum::<usize>()
-        + ss.switch_pipeline.len();
+        + ss.switch_pipeline.len()
+        + ss.fifo_out_regs.iter().flatten().count();
     assert_eq!(in_path as u32, accepted);
+}
+
+// ========================================================================
+// Crossing buffering = slave FIFO + master FIFO (AM020 ch.2:84-92, NPU1 silicon)
+// ========================================================================
+
+/// Push one word per cycle into `slave` until it refuses, never draining `master`, and return
+/// how many words the crossing took.
+fn fill_blocked_crossing(ss: &mut StreamSwitch, slave: usize) -> usize {
+    let mut accepted = 0;
+    for _ in 0..64 {
+        if ss.slaves[slave].push(accepted as u32) {
+            accepted += 1;
+        }
+        ss.step();
+    }
+    accepted
+}
+
+/// An external -> external crossing holds exactly its two FIFOs: slave 4 + external master 4 = 8
+/// (AM020 ch.2:92 "4-cycle latency and 8-deep FIFO"). Silicon pins the same number: a stalled
+/// consumer one more tile away absorbs 8 more words (R4-D3 egress race, core and DMA sources,
+/// 48/56/64/72), so the 4-cycle traversal latency adds no storage of its own.
+#[test]
+fn external_crossing_holds_its_slave_and_master_fifos_and_no_more() {
+    use xdna_archspec::aie2::stream_switch::compute;
+    let mut ss = StreamSwitch::new_compute_tile(0, 3);
+    let slave = compute::SOUTH_SLAVE_START as usize;
+    let master = compute::NORTH_MASTER_START as usize;
+    ss.configure_local_route(slave, master);
+    let accepted = fill_blocked_crossing(&mut ss, slave);
+    assert_eq!(accepted, 8, "ext->ext crossing must hold slave 4 + master 4");
+    assert_eq!(ss.masters[master].fifo.len(), 4, "the master FIFO is full");
+}
+
+/// A local -> local crossing holds slave 4 + local master 2 = 6 (AM020 ch.2:86).
+#[test]
+fn local_crossing_holds_its_slave_and_master_fifos_and_no_more() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    assert_eq!(fill_blocked_crossing(&mut ss, 0), 6, "local->local crossing must hold 4 + 2");
+}
+
+/// Counting the traversal latency against the FIFOs must not throttle a draining crossing: with
+/// the master popped every cycle the slave takes a word every cycle and the master delivers one
+/// every cycle after the latency.
+#[test]
+fn a_draining_crossing_moves_one_word_per_cycle() {
+    use xdna_archspec::aie2::stream_switch::compute;
+    for (slave, master, drain_core) in [
+        (0usize, 0usize, true),
+        (compute::SOUTH_SLAVE_START as usize, compute::NORTH_MASTER_START as usize, false),
+    ] {
+        let mut ss = StreamSwitch::new_compute_tile(0, 3);
+        ss.configure_local_route(slave, master);
+        let latency = ss.local_routes[0].latency as usize;
+        let mut refused = 0;
+        let mut delivered = Vec::new();
+        for c in 0..100u32 {
+            if !ss.slaves[slave].push(c) {
+                refused += 1;
+            }
+            ss.step();
+            if let Some(w) = ss.masters[master].pop() {
+                delivered.push(w);
+            }
+        }
+        assert_eq!(refused, 0, "slave refused a word (core master: {drain_core})");
+        assert_eq!(delivered.len(), 100 - latency, "one word per cycle after the latency");
+        assert!(delivered.iter().enumerate().all(|(i, &w)| w == i as u32), "in order");
+    }
+}
+
+/// The traversal latency itself is unchanged: a word reaches the master `latency` steps after it
+/// entered the slave.
+#[test]
+fn a_word_crosses_in_the_route_latency() {
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    ss.configure_local_route(0, 0);
+    let latency = ss.local_routes[0].latency as usize;
+    ss.slaves[0].push(7);
+    let mut arrived_at = None;
+    for c in 0..10 {
+        ss.step();
+        if arrived_at.is_none() && ss.masters[0].has_data() {
+            arrived_at = Some(c);
+        }
+    }
+    assert_eq!(arrived_at, Some(latency), "first step pops, `latency` more steps deliver");
+}
+
+/// A flow through the switch FIFO holds 21 words more than the same flow around it, on silicon
+/// (core source 47 vs 26, DMA source 68 vs 48 with the staging's granule phase; R4-D3 data race):
+/// the FIFO's 16, the FIFO slave port's 4, and the one register that hands a word from the FIFO
+/// to its slave port (the cycle the FIFO route's latency adds; round trip +4 on silicon,
+/// `gen_stream_rtt_probe.py`).
+#[test]
+fn the_switch_fifo_route_holds_21_words_more_than_the_direct_route() {
+    let direct = {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+        ss.configure_local_route(0, 0);
+        fill_blocked_crossing(&mut ss, 0)
+    };
+    let mut ss = StreamSwitch::new_compute_tile(0, 2);
+    let fifo_master = ss.masters.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    let fifo_slave = ss.slaves.iter().position(|p| p.port_type == PortType::Fifo).unwrap();
+    ss.configure_local_route(0, fifo_master);
+    ss.configure_local_route(fifo_slave, 0);
+    let mut accepted = 0u32;
+    for _ in 0..400 {
+        if ss.slaves[0].push(accepted) {
+            accepted += 1;
+        }
+        ss.step();
+    }
+    assert_eq!(direct, 6);
+    assert_eq!(accepted as usize, direct + 21);
 }

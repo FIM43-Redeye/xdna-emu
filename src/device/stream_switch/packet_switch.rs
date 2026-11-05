@@ -236,6 +236,17 @@ pub(crate) struct InSwitchWord {
     pub(crate) data: u32,
     pub(crate) tlast: bool,
     pub(crate) cycles_remaining: u8,
+    /// The slave port the word left.
+    pub(crate) slave_idx: u8,
+    /// Cycles of the traversal spent in the master port (route latency minus the slave's).
+    pub(crate) master_latency: u8,
+    /// The word occupies a master slot (else a slave slot, see `StreamPort::reserved`).
+    pub(crate) in_master: bool,
+    /// The copy that holds the slave slot. A multicast word is one slave word fanned out to
+    /// several masters: only one copy is charged to the slave.
+    pub(crate) holds_slave: bool,
+    /// Copies of one multicast word share a group and move to their masters together.
+    pub(crate) group: u32,
 }
 
 /// Packet switch state for a tile.

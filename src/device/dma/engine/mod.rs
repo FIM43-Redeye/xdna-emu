@@ -151,6 +151,9 @@ pub struct DmaEngine {
     /// true so a transfer helper called outside the FSM (tests, static
     /// transfers) still records its access.
     pub(super) word_opens_granule: bool,
+    /// The word a staged MM2S drain sends: read from memory when its granule was
+    /// fetched (`Transfer::staged_data`), so `transfer_mm2s` must not re-read it.
+    pub(super) mm2s_staged_word: Option<u32>,
 
     /// Per-channel count of words drained from stream_in during Phase 3 this
     /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
@@ -236,6 +239,7 @@ impl DmaEngine {
             num_locks,
             cycle_dma_banks: 0,
             word_opens_granule: true,
+            mm2s_staged_word: None,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             s2mm_ingress_full_offered: vec![false; s2mm_channels],
             mm2s_egress_empty_wanted: vec![false; mm2s_channels],

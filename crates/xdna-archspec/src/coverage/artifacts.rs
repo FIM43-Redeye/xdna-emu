@@ -680,8 +680,10 @@ mod tests {
         let rows: Vec<&str> = out.lines().filter(|l| l.starts_with("| `")).collect();
         assert_eq!(rows.len(), timing_leaves(npu1_timing()).len());
         assert!(!out.contains("| ? |"), "every row is valued from the model");
-        let first = rows.first().unwrap();
-        assert!(first.contains("CONTRADICTED"), "contradicted constants lead the backlog: {first}");
+        // Contradicted constants (if any are left) lead the backlog.
+        let leading = rows.iter().take_while(|r| r.contains("CONTRADICTED")).count();
+        let total = rows.iter().filter(|r| r.contains("CONTRADICTED")).count();
+        assert_eq!(leading, total, "contradicted constants lead the backlog");
         let backlog = out.find("## Backlog").unwrap();
         let settled = out.find("## Settled").unwrap();
         let egress = out.find("`dma.mm2s_egress_fifo_depth`").unwrap();

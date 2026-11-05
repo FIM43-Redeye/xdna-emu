@@ -722,11 +722,12 @@ impl NpuExecutor {
                     // Post-sync settling. Two components:
                     // - Token stream-transit (EMERGENT): the TCT routes `row`
                     //   hops down the column to the firmware at the shim
-                    //   (row 0), each hop costing INTER_TILE_HOP_LATENCY cyc.
-                    //   So transit = sync.row * per-hop latency, derived from
-                    //   topology + the toolchain constant rather than a flat 4
-                    //   (the old constant was a row-2 tile's 2 hops * 2 cy
-                    //   frozen). Charged every sync.
+                    //   (row 0), each hop costing one external->external
+                    //   crossing (ROUTE_PER_HOP, 4 cy; the per-hop transit
+                    //   measured on NPU1 by gen_stream_rtt_probe.py, the wire
+                    //   itself adding 0). So transit = sync.row * per-hop
+                    //   latency, derived from topology rather than a flat
+                    //   constant. Charged every sync.
                     // - Mailbox cold-start (firmware residual): one-time
                     //   firmware mailbox latency for the FIRST dma_wait of the
                     //   runtime sequence (~8000 cyc on NPU1, Phase B). Later
@@ -735,12 +736,12 @@ impl NpuExecutor {
                     //   not pay 160x8000 on HW). This piece cannot emerge until
                     //   the firmware loop runs; overridable via
                     //   XDNA_EMU_MAILBOX_LATENCY until then.
-                    use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
+                    use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
                     const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
                     let transit_cycles = self
                         .pending_syncs
                         .get(sync_index)
-                        .map_or(0, |s| s.row as u32 * INTER_TILE_HOP_LATENCY as u32);
+                        .map_or(0, |s| s.row as u32 * ROUTE_PER_HOP as u32);
                     let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
                         .ok()
                         .and_then(|s| s.parse().ok())
@@ -1897,7 +1898,8 @@ mod tests {
     /// be deterministic regardless of caller env.
     #[test]
     fn test_sync_resolution_per_batch_mailbox() {
-        const STREAM_FLUSH_CYCLES: u32 = 4;
+        // Row-2 transit: 2 hops * ROUTE_PER_HOP (4).
+        const STREAM_FLUSH_CYCLES: u32 = 8;
         const TEST_MAILBOX: u32 = 200; // distinctive non-default value
 
         // SAFETY: set_var/remove_var are unsafe in the 2024 edition;
@@ -1979,20 +1981,19 @@ mod tests {
     }
 
     /// Phase 3 (TCT): the per-sync stream-transit charge EMERGES from the
-    /// producing tile's distance to the shim -- `transit = row *
-    /// INTER_TILE_HOP_LATENCY` -- rather than a flat constant. A TCT routes
-    /// `row` hops down the column to the firmware at the shim (row 0). A row-2
-    /// compute tile still charges 4 (2 hops * 2 cy, covered by
-    /// `test_sync_resolution_per_batch_mailbox`); a mem tile (row 1) charges 2
-    /// and a deeper compute row (row 3) charges 6.
+    /// producing tile's distance to the shim -- `transit = row * ROUTE_PER_HOP`
+    /// -- rather than a flat constant. A TCT routes `row` hops down the column
+    /// to the firmware at the shim (row 0), one external->external crossing
+    /// (4 cy) per hop. A row-2 compute tile charges 8 (covered by
+    /// `test_sync_resolution_per_batch_mailbox`); a mem tile (row 1) charges 4
+    /// and a deeper compute row (row 3) charges 12.
     #[test]
     fn test_sync_transit_charge_scales_with_row() {
         use crate::device::host_memory::HostMemory;
         use crate::device::DeviceState;
 
-        // Per-hop stream-switch latency
-        // (xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY).
-        const HOP_LATENCY: u32 = 2;
+        // Per-hop stream-switch latency (xdna_archspec::aie2::timing::ROUTE_PER_HOP).
+        const HOP_LATENCY: u32 = 4;
 
         for (row, expected) in [(1u8, HOP_LATENCY), (3u8, 3 * HOP_LATENCY)] {
             let mut executor = NpuExecutor::new();
@@ -2019,7 +2020,7 @@ mod tests {
             };
             assert_eq!(
                 remaining, expected,
-                "row {} sync should charge transit = row * {} = {} cy (emergent, not flat 4)",
+                "row {} sync should charge transit = row * {} = {} cy (emergent, not flat)",
                 row, HOP_LATENCY, expected,
             );
         }

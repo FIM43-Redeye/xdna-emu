@@ -6,12 +6,10 @@ Every `TimingModel` field with its provenance and verification verdict
 (`coverage/constants.rs`). The backlog lists what silicon contradicts or
 nothing has verified yet; settled values are toolchain-derived or measured.
 
-## Backlog (25)
+## Backlog (21)
 
 | Constant | Value | Provenance | Verification | Note |
 |----------|-------|------------|--------------|------|
-| `stream_switch.external_to_external_latency` | 4 | doc-specified | CONTRADICTED | AM020 ch.2 '4-cycle, 8-deep'. The switch backpressure budget counts this latency as buffer capacity. |
-| `stream_switch.inter_tile_hop_latency` | 2 | hardware-observed | CONTRADICTED | Pinned from a single memtile->compute crossing (send headroom 14 = 8 + 6; xdna-emu-priv: research/findings/2026-06-28-send-cadence-pipeline-latency-and-ingress-depth.md); two mechanisms fit that capture. Do not retune without a discriminating multi-hop capture. |
 | `lock.acquire_latency` | 1 | unspecified | unverified | Cited to AM020 ch.2 'a new request every clock cycle', but that sentence is the memory-bank arbitration bullet; AM020's lock text gives no cycle count. Live: core lock timing (interpreter/timing/latency.rs). |
 | `lock.release_latency` | 1 | unspecified | unverified | No source. Effectively unread: lock-release timing uses the acquire latency. |
 | `lock.retry_interval` | 1 | unspecified | unverified | No source. Read only by DMA lock timing, which production never enables (with_lock_timing is test-only). |
@@ -24,11 +22,9 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `dma.host_memory_latency_cycles` | 0 | unspecified | unverified | Placeholder 0: folded into the per-direction shim cold-start values. |
 | `dma.memtile_first_bd_startup_cycles` | 0 | unspecified | unverified | Placeholder 0 (inert). The cold-start gap it was meant for was later root-caused to the CORE_CONTROL reset, so it may never be needed. |
 | `dma.compute_first_bd_startup_cycles` | 0 | unspecified | unverified | Placeholder 0 (inert), as memtile_first_bd_startup_cycles. |
-| `dma.s2mm_ingress_fifo_depth` | 16 | hardware-observed | unverified | Silicon only lower-bounds it: memtile recv decodes [16,16,16,16] (>= 16). The exact value is not pinned (the 16-vs-28 capture was never taken), and backpressure onset is +16 in the emulator vs +15 on silicon. |
-| `stream_switch.local_slave_fifo_depth` | 4 | doc-specified | unverified | AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field) and the per-channel MM2S output FIFO; part of the contradicted per-hop sum. |
 | `stream_switch.local_master_fifo_depth` | 2 | doc-specified | unverified | AM020 ch.2 'local master ports ... 2-deep FIFO'. |
-| `stream_switch.external_master_fifo_depth` | 4 | doc-specified | unverified | AM020 ch.2 'external ports ... 4-deep FIFO' (does not say master or slave); part of the contradicted per-hop sum. |
-| `stream_switch.switch_fifo_depth` | 16 | doc-specified | unverified | AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through FIFO:0 absorbs +21 words (core source) / +20 (DMA source) on silicon (gen_stream_absorb_probe.py, r4d3 rig). |
+| `stream_switch.switch_fifo_depth` | 16 | doc-specified | unverified | AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through FIFO:0 absorbs +21 words on silicon (core and DMA sources, r4d3 rig and gen_stream_absorb_probe.py): this 16, the FIFO slave port's 4 and the 1-word FIFO output register; modelled, EMU == HW. |
+| `stream_switch.slave_port_latency` | 2 | doc-specified | unverified | AM020 ch.2:78/80 'slave ports are 2-cycle latency'. Splits a crossing's latency between its slave and master slots; only the sums are observed. |
 | `stream_switch.local_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2 '3-cycle latency and 6-deep FIFO'; the 6-deep half has no field. |
 | `stream_switch.local_to_external_latency` | 4 | doc-specified | unverified | AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for. |
 | `stream_switch.external_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2. UNREAD: the ext->local path uses the local->local latency (equal value, 3, hides it). |
@@ -36,7 +32,7 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `instruction.data_memory_latency` | 5 | doc-specified | unverified | AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie AIE2Schedule.td LoadLatency 5 (marked FIXME there). |
 | `instruction.branch_penalty` | 3 | unspecified | unverified | Original estimate (~3 fetch stages); llvm-aie MispredictPenalty is 4 (FIXME). The executor deliberately adds no branch penalty (the delay slots are the flush), so its live effect is unclear. |
 
-## Settled (15)
+## Settled (20)
 
 | Constant | Value | Provenance | Verification | Evidence and note |
 |----------|-------|------------|--------------|-------------------|
@@ -49,19 +45,14 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `dma.shim_per_task_overhead_s2mm_cycles` | 179 | hardware-observed | silicon-verified | NPU1 trace campaign N=50 on _diag_shim_chain_sweep K={1,2,4,8}, fitted against K=1 (cold) and K>=4 (steady) together (xdna-emu-priv: research/findings/2026-05-27-phase-2c-dispatch-overhead-recalibration.md, 2026-05-27-dispatch-overhead-multirun-structural-variance.md) -- Fitted. |
 | `dma.shim_warmup_decay_mm2s_permille` | 310 | hardware-observed | silicon-verified | NPU1 K=8 chain durations 1739/804/497/422 fit cold_start * 0.310^i (xdna-emu-priv: research/findings/2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.md) -- Fitted. |
 | `dma.shim_warmup_decay_s2mm_permille` | 0 | hardware-observed | silicon-verified | Same campaign: no measurable S2MM tail (excess at i=1 within noise) -- A measured zero, not a placeholder. |
+| `dma.s2mm_ingress_fifo_depth` | 18 | hardware-observed | silicon-verified | NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase points exactly (docs/fidelity-gaps/dma-stream-resources.md) -- The remainder after the switch crossings and the sources' 1-word registers (core: 1 + 1 + 6 + 18 = 26). Where inside the S2MM the 18 sit is not separated. |
 | `dma.mm2s_egress_fifo_depth` | 25 | hardware-observed | silicon-verified | NPU1 R4-D3 egress race, 20 route x phase points, zero spread (tools/experiments/r4d3_egress_race.py; DmaTiming field doc) -- Compute tiles only; mem tiles inherit it unverified. Assumes a stalled core holds one word (+/-1). |
+| `stream_switch.local_slave_fifo_depth` | 4 | doc-specified | silicon-verified | NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase points exactly (docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field). |
+| `stream_switch.external_master_fifo_depth` | 4 | doc-specified | silicon-verified | NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase points exactly (docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 'external ports ... 4-deep FIFO'; with the slave's 4, the 8 words silicon adds per hop. |
+| `stream_switch.external_to_external_latency` | 4 | doc-specified | silicon-verified | NPU1 core-to-core round trip 32/40/48 cycles at 1/2/3 hops, r1 == r2 (tools/gen_stream_rtt_probe.py): +4 cycles one way per hop = one ext->ext crossing, nothing for the wire; the emulator's slope matches (its intercept is 8 cycles high, docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 '4-cycle, 8-deep'. Latency is time inside the two FIFOs, not storage on top of them. |
+| `stream_switch.inter_tile_hop_latency` | 0 | hardware-observed | silicon-verified | NPU1 core-to-core round trip 32/40/48 cycles at 1/2/3 hops, r1 == r2 (tools/gen_stream_rtt_probe.py): +4 cycles one way per hop = one ext->ext crossing, nothing for the wire; the emulator's slope matches (its intercept is 8 cycles high, docs/fidelity-gaps/dma-stream-resources.md) -- 0: the wire adds no latency and no storage. The value 2 it replaces came from one memtile->compute capture that two mechanisms fit. |
 | `broadcast.per_hop_horizontal` | 4 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Horizontal isotropy assumed. |
 | `broadcast.per_hop_vertical` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Vertical isotropy assumed (blocked on the cold-start fill gap). |
 | `broadcast.intra_tile_core_offset` | 0 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Gauge-fixed at 0: only the core-memory contrast is observable. |
 | `broadcast.intra_tile_mem_offset` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- The add_one core-vs-memory-module signature contrast. |
 | `broadcast.calibrated` | true | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Flag: the constants above are a silicon calibration (SP-5c, reversible). |
-
-## Contradicting evidence
-
-### stream_switch.external_to_external_latency
-
-NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled DMA consumer 0/1/2/3 hops away absorbs 48/56/64/72 words on silicon (8 per hop, AM020 ch.2 8-deep external hops) vs 29/43/57/71 in the emulator (14 per hop). The emulator's per-hop budget is ext->ext latency 4 + external master FIFO 4 + crossing depth (slave FIFO 4 + hop latency 2); silicon contradicts the sum, the split between the terms is not yet separated (docs/fidelity-gaps/dma-stream-resources.md, egress staging row)
-
-### stream_switch.inter_tile_hop_latency
-
-NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled DMA consumer 0/1/2/3 hops away absorbs 48/56/64/72 words on silicon (8 per hop, AM020 ch.2 8-deep external hops) vs 29/43/57/71 in the emulator (14 per hop). The emulator's per-hop budget is ext->ext latency 4 + external master FIFO 4 + crossing depth (slave FIFO 4 + hop latency 2); silicon contradicts the sum, the split between the terms is not yet separated (docs/fidelity-gaps/dma-stream-resources.md, egress staging row)

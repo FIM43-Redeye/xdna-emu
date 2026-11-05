@@ -92,11 +92,13 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
     const SKEW: &str = "NPU1 R3b perf-counter skew sweep, N=20, drift range 0 \
         (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, \
         2026-07-02-sp5c-phase0-identifiability.md)";
-    const HOP_SLOPE: &str = "NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled DMA consumer 0/1/2/3 hops away \
-        absorbs 48/56/64/72 words on silicon (8 per hop, AM020 ch.2 8-deep external hops) vs 29/43/57/71 in the emulator \
-        (14 per hop). The emulator's per-hop budget is ext->ext latency 4 + external master FIFO 4 + crossing depth \
-        (slave FIFO 4 + hop latency 2); silicon contradicts the sum, the split between the terms is not yet separated \
-        (docs/fidelity-gaps/dma-stream-resources.md, egress staging row)";
+    const HOP_SLOPE: &str = "NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away \
+        absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = \
+        AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase \
+        points exactly (docs/fidelity-gaps/dma-stream-resources.md)";
+    const RTT_SLOPE: &str = "NPU1 core-to-core round trip 32/40/48 cycles at 1/2/3 hops, r1 == r2 \
+        (tools/gen_stream_rtt_probe.py): +4 cycles one way per hop = one ext->ext crossing, nothing for the wire; \
+        the emulator's slope matches (its intercept is 8 cycles high, docs/fidelity-gaps/dma-stream-resources.md)";
     vec![
         // -- lock --
         unsourced("lock.acquire_latency", "Cited to AM020 ch.2 'a new request every clock cycle', but that sentence is the \
@@ -129,31 +131,31 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         unsourced("dma.memtile_first_bd_startup_cycles", "Placeholder 0 (inert). The cold-start gap it was meant for was later \
             root-caused to the CORE_CONTROL reset, so it may never be needed."),
         unsourced("dma.compute_first_bd_startup_cycles", "Placeholder 0 (inert), as memtile_first_bd_startup_cycles."),
-        unit("dma.s2mm_ingress_fifo_depth", HardwareObserved, Verification::Unverified,
-            "Silicon only lower-bounds it: memtile recv decodes [16,16,16,16] (>= 16). The exact value is not pinned (the \
-            16-vs-28 capture was never taken), and backpressure onset is +16 in the emulator vs +15 on silicon."),
+        measured("dma.s2mm_ingress_fifo_depth", HOP_SLOPE, "The remainder after the switch crossings and the sources' \
+            1-word registers (core: 1 + 1 + 6 + 18 = 26). Where inside the S2MM the 18 sit is not separated."),
         measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
             (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles only; mem tiles inherit it unverified. \
             Assumes a stalled core holds one word (+/-1)."),
         // -- stream_switch --
-        manual("stream_switch.local_slave_fifo_depth", "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL \
-            slaves (no separate field) and the per-channel MM2S output FIFO; part of the contradicted per-hop sum."),
+        unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
+            "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),
         manual("stream_switch.local_master_fifo_depth", "AM020 ch.2 'local master ports ... 2-deep FIFO'."),
-        manual("stream_switch.external_master_fifo_depth", "AM020 ch.2 'external ports ... 4-deep FIFO' (does not say master or \
-            slave); part of the contradicted per-hop sum."),
+        unit("stream_switch.external_master_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
+            "AM020 ch.2 'external ports ... 4-deep FIFO'; with the slave's 4, the 8 words silicon adds per hop."),
         manual("stream_switch.switch_fifo_depth", "AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through \
-            FIFO:0 absorbs +21 words (core source) / +20 (DMA source) on silicon (gen_stream_absorb_probe.py, r4d3 rig)."),
+            FIFO:0 absorbs +21 words on silicon (core and DMA sources, r4d3 rig and gen_stream_absorb_probe.py): this 16, \
+            the FIFO slave port's 4 and the 1-word FIFO output register; modelled, EMU == HW."),
+        manual("stream_switch.slave_port_latency", "AM020 ch.2:78/80 'slave ports are 2-cycle latency'. Splits a \
+            crossing's latency between its slave and master slots; only the sums are observed."),
         manual("stream_switch.local_to_local_latency", "AM020 ch.2 '3-cycle latency and 6-deep FIFO'; the 6-deep half has no field."),
         manual("stream_switch.local_to_external_latency", "AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile \
             data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for."),
-        unit("stream_switch.external_to_external_latency", DocSpecified, Verification::Contradicted { evidence: HOP_SLOPE.into() },
-            "AM020 ch.2 '4-cycle, 8-deep'. The switch backpressure budget counts this latency as buffer capacity."),
+        unit("stream_switch.external_to_external_latency", DocSpecified, Verification::Verified { evidence: RTT_SLOPE.into() },
+            "AM020 ch.2 '4-cycle, 8-deep'. Latency is time inside the two FIFOs, not storage on top of them."),
         manual("stream_switch.external_to_local_latency", "AM020 ch.2. UNREAD: the ext->local path uses the local->local latency \
             (equal value, 3, hides it)."),
-        unit("stream_switch.inter_tile_hop_latency", HardwareObserved, Verification::Contradicted { evidence: HOP_SLOPE.into() },
-            "Pinned from a single memtile->compute crossing (send headroom 14 = 8 + 6; xdna-emu-priv: research/findings/\
-            2026-06-28-send-cadence-pipeline-latency-and-ingress-depth.md); two mechanisms fit that capture. Do not retune \
-            without a discriminating multi-hop capture."),
+        measured("stream_switch.inter_tile_hop_latency", RTT_SLOPE, "0: the wire adds no latency and no storage. \
+            The value 2 it replaces came from one memtile->compute capture that two mechanisms fit."),
         unsourced("stream_switch.packet_arbitration_overhead", "Original estimate; AM020 ch.2 excludes it from the latency table \
             and no capture exists."),
         // -- broadcast --

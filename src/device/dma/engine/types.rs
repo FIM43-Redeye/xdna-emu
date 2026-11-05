@@ -280,6 +280,8 @@ pub(super) struct GranuleFetch {
     /// fewer at the tail, or when a stride puts the next word in another
     /// granule).
     pub words: usize,
+    /// Addresses of those words, in drain order (`words` of them are valid).
+    pub addrs: [u64; 4],
 }
 
 #[cfg(test)]

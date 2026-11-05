@@ -870,17 +870,10 @@ fn step_data_movement_runs_ungated_columns() {
     let _ = array.step_data_movement(&mut host);
 }
 
-/// A stuck destination must backpressure the source, and the crossing must
-/// buffer up to its full depth before doing so. The crossing is a transport
-/// delay line (`INTER_TILE_HOP_LATENCY`, the single master->slave wire hop)
-/// feeding a FIFO (`fifo_capacity`); its depth is the sum. Admission bounds
-/// `fifo.len() + inflight_to` against that sum, so: (1) the source is
-/// backpressured (the master retains overflow), and (2) the crossing commits
-/// its full depth -- `fifo_capacity + INTER_TILE_HOP_LATENCY` -- not just the
-/// FIFO capacity. Bounding against the FIFO capacity alone (the earlier hard
-/// cap) would stop at `fifo_capacity`, which both under-buffers the stuck case
-/// and throttles a draining destination to the hop latency (HW-verified
-/// regression: recv [16,16,16,16] -> [4,4,..]).
+/// A stuck destination must backpressure the source, and a word on the wire
+/// holds a slot of the slave it is bound for: the destination takes exactly its
+/// FIFO's capacity, nothing more (one more tile adds exactly one ext->ext
+/// crossing's 8 words on silicon, R4-D3; the wire stores nothing).
 ///
 /// Topology: compute tile (1,2) sends south to mem tile (1,1). The destination
 /// slave has no onward route or DMA drain, so its FIFO fills and stays full.
@@ -889,8 +882,6 @@ fn step_data_movement_runs_ungated_columns() {
 fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     use crate::device::host_memory::HostMemory;
     use xdna_archspec::aie2::stream_switch::{compute, mem_tile};
-    use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
-
     let mut array = TileArray::npu1();
     // Ungate all columns so step_data_movement's tile-switch passes (which
     // respect column gates) do not interfere with the inter-tile path
@@ -909,7 +900,7 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
     let cap = array.tiles[dst_idx].stream_switch.slaves[dst_slave].fifo_capacity;
 
     let src_idx = array.tile_index(src_col, src_row);
-    let crossing_depth = cap + INTER_TILE_HOP_LATENCY as usize;
+    let crossing_depth = cap;
     let mut host = HostMemory::new();
 
     let mut max_committed = 0usize;
@@ -936,10 +927,7 @@ fn inter_tile_wire_backpressures_source_when_dest_cannot_drain() {
         );
     }
 
-    // The crossing must commit its FULL depth (FIFO skid + delay line), not just
-    // the FIFO capacity. Bounding admission against the FIFO alone would stop at
-    // `cap` and never reach the delay-line depth -- the throttle that fragments a
-    // draining destination's contiguous flow.
+    // The destination fills to its capacity and the source master keeps the rest.
     assert_eq!(
         max_committed, crossing_depth,
         "crossing did not commit its full depth: max_committed={} expected={} (cap={})",

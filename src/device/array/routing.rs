@@ -1324,10 +1324,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
         use crate::device::tile::isolation as iso;
-        use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY;
         // Phase 1: Advance the pipeline -- deliver words that have completed
         // their inter-tile traversal and decrement countdown timers.
-        let words_transferred = self.advance_inter_tile_pipeline();
+        let mut words_transferred = self.advance_inter_tile_pipeline();
 
         // Phase 2: Accept new words from source masters into the pipeline.
         // Each transfer: (src_col, src_row, src_master_idx, dst_col, dst_row, dst_slave_idx, data, tlast)
@@ -1384,25 +1383,15 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                                 if self.tiles[above_idx].isolation & iso::SOUTH != 0 {
                                     continue;
                                 }
-                                // Admit only if the crossing's total committed words (dest
-                                // FIFO occupancy + in-flight delay-line words) is below the
-                                // crossing depth. The crossing is a transport delay line
-                                // (INTER_TILE_HOP_LATENCY, the single master->slave wire hop =
-                                // the destination slave's 2-cycle input latency, NOT the full
-                                // within-switch ROUTE_PER_HOP traversal) feeding a FIFO
-                                // (fifo_capacity); its depth is their sum = 4 + 2 = 6,
-                                // HW-pinned by the add_one memtile send headroom (one-BD
-                                // ingress 8 + crossing 6 = 14). The crossing sustains a
-                                // contiguous run far longer than the FIFO alone when the
-                                // destination drains (recv PORT_RUNNING [16,16,16,16]), so the
-                                // delay-line occupancy must NOT be bounded by the FIFO capacity
-                                // alone -- that throttles a draining destination to the hop
-                                // latency (the [4,4,..] regression). It backpressures only when
-                                // the full crossing depth is committed.
+                                // Admit only if the destination slave has a free slot, counting
+                                // words still on the wire (none at the measured wire latency of 0)
+                                // and words its switch is moving on (`StreamPort::reserved`). The
+                                // wire adds no storage: one more tile adds exactly one ext->ext
+                                // crossing's 8 words (R4-D3) and 4 cycles (gen_stream_rtt_probe).
                                 if slave_idx < self.tiles[above_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[above_idx].stream_switch.slaves[slave_idx];
-                                    slave.fifo.len() + self.inflight_to(above_idx, slave_idx)
-                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
+                                    slave.occupancy() + self.inflight_to(above_idx, slave_idx)
+                                        < slave.fifo_capacity
                                 } {
                                     transfers.push((
                                         col,
@@ -1459,14 +1448,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                                 if self.tiles[below_idx].isolation & iso::NORTH != 0 {
                                     continue;
                                 }
-                                // Admit only if the crossing's total committed words (dest
-                                // FIFO occupancy + in-flight delay-line words) is below the
-                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
-                                // North-site comment for the full delay-line+FIFO rationale.
+                                // Admit only into a free slot of the destination slave; see the
+                                // North-site comment.
                                 if slave_idx < self.tiles[below_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[below_idx].stream_switch.slaves[slave_idx];
-                                    slave.fifo.len() + self.inflight_to(below_idx, slave_idx)
-                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
+                                    slave.occupancy() + self.inflight_to(below_idx, slave_idx)
+                                        < slave.fifo_capacity
                                 } {
                                     transfers.push((
                                         col,
@@ -1526,14 +1513,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                                 if self.tiles[right_idx].isolation & iso::WEST != 0 {
                                     continue;
                                 }
-                                // Admit only if the crossing's total committed words (dest
-                                // FIFO occupancy + in-flight delay-line words) is below the
-                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
-                                // North-site comment for the full delay-line+FIFO rationale.
+                                // Admit only into a free slot of the destination slave; see the
+                                // North-site comment.
                                 if slave_idx < self.tiles[right_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[right_idx].stream_switch.slaves[slave_idx];
-                                    slave.fifo.len() + self.inflight_to(right_idx, slave_idx)
-                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
+                                    slave.occupancy() + self.inflight_to(right_idx, slave_idx)
+                                        < slave.fifo_capacity
                                 } {
                                     transfers.push((
                                         col,
@@ -1583,14 +1568,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                                 if self.tiles[left_idx].isolation & iso::EAST != 0 {
                                     continue;
                                 }
-                                // Admit only if the crossing's total committed words (dest
-                                // FIFO occupancy + in-flight delay-line words) is below the
-                                // crossing depth (fifo_capacity + ROUTE_PER_HOP); see the
-                                // North-site comment for the full delay-line+FIFO rationale.
+                                // Admit only into a free slot of the destination slave; see the
+                                // North-site comment.
                                 if slave_idx < self.tiles[left_idx].stream_switch.slaves.len() && {
                                     let slave = &self.tiles[left_idx].stream_switch.slaves[slave_idx];
-                                    slave.fifo.len() + self.inflight_to(left_idx, slave_idx)
-                                        < slave.fifo_capacity + INTER_TILE_HOP_LATENCY as usize
+                                    slave.occupancy() + self.inflight_to(left_idx, slave_idx)
+                                        < slave.fifo_capacity
                                 } {
                                     transfers.push((
                                         col,
@@ -1652,6 +1635,15 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     ));
                 }
 
+                if ROUTE_LATENCY_PER_HOP == 0 {
+                    // No wire latency: the word lands in the neighbour's slave this cycle
+                    // (admission above checked its slot).
+                    let pushed =
+                        self.tiles[dst_idx].stream_switch.slaves[dst_slave].push_with_tlast(data, tlast);
+                    debug_assert!(pushed, "an admitted inter-tile word was refused");
+                    words_transferred += 1;
+                    continue;
+                }
                 self.inter_tile_pipeline.push(InFlightWord {
                     dst_tile_idx: dst_idx,
                     dst_slave_idx: dst_slave,
@@ -1715,11 +1707,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
     }
 
     /// Count words already in the inter-tile pipeline that target a given
-    /// destination slave. Inter-tile admission bounds `fifo.len() + inflight_to`
-    /// against the crossing depth (`fifo_capacity + ROUTE_PER_HOP`), so the
-    /// transport delay line is committed but the crossing still sustains
-    /// contiguous flow when the destination drains (it backpressures only when
-    /// the full crossing depth -- FIFO skid plus delay line -- is committed).
+    /// destination slave. Inter-tile admission counts them against the slave's
+    /// capacity: a word on the wire holds a slot of the slave it is bound for.
+    /// Empty at the measured wire latency of 0.
     pub(crate) fn inflight_to(&self, dst_idx: usize, dst_slave: usize) -> usize {
         self.inter_tile_pipeline
             .iter()

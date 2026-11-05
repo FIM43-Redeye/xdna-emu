@@ -1286,9 +1286,17 @@ pub struct DmaTiming {
     ///
     /// EMU counts the master-port beat at the DMA-accept point (pop to
     /// `stream_in`), so this single depth stands in for the combined ingress.
-    /// Whether the true depth exceeds 16 is not yet pinned -- both probe
-    /// kernels have BDs <= 16; a >16-word-BD discriminating capture is the
-    /// deferred follow-up. Shim s2mm recv is governed by the separately
+    ///
+    /// **Pinned at 18 by silicon (R4-D3 data race, NPU1, 2026-10-28 captures,
+    /// modelled 2026-11-04):** a core streaming into an S2MM whose lock is
+    /// withheld gets 26 words out before it stalls on the same tile, 34/42/50
+    /// one to three tiles away, and a DMA source 48/56/64/72 plus its staging
+    /// phase pattern. With the switch at its AM020 depths (local slave 4 +
+    /// local master 2 on the tile, 8 more per external hop, both confirmed by
+    /// the 8-per-hop slope) and the 1-word hand-off registers of the two
+    /// sources, every one of those 25 counts leaves exactly 18 for the
+    /// ingress (core: 1 held + 1 hand-off + 6 + 18 = 26). The co-captures
+    /// above only lower-bound it (16). Shim s2mm recv is governed by the separately
     /// calibrated DDR cold-start model, so shim keeps the shallow master-port
     /// depth. Far below the 256-word buffer that caused the 2026-06-13 warmup
     /// transient (~1 BD of warmup slack at depth 16).
@@ -1372,6 +1380,14 @@ pub struct StreamSwitchTiming {
     /// words. Silicon absorbs 21 more words (core source) through it than around it; the
     /// remaining 5 are the extra switch hop the route takes.
     pub switch_fifo_depth: u8,
+    /// Slave port latency in cycles (AM020 ch.2:78/80: external and local slave ports are
+    /// "2-cycle latency"). A crossing's latency is the slave's plus the master's (the table at
+    /// ch.2:84-92 is exactly those sums, as its depths are the sums of the two FIFO depths), so a
+    /// word in the crossing's first `slave_port_latency` cycles occupies a slave FIFO slot and in
+    /// the rest a master FIFO slot: the latency is time spent inside the FIFOs, not extra storage.
+    /// Silicon agrees: one more external hop adds 8 words of buffering (R4-D3 egress race) and 4
+    /// cycles of one-way latency (`tools/gen_stream_rtt_probe.py`, round trip +8 per hop).
+    pub slave_port_latency: u8,
     /// Local slave to local master latency in cycles.
     pub local_to_local_latency: u8,
     /// Local slave to external master latency in cycles.
@@ -1380,17 +1396,13 @@ pub struct StreamSwitchTiming {
     pub external_to_external_latency: u8,
     /// External slave to local master latency in cycles.
     pub external_to_local_latency: u8,
-    /// Inter-tile single-hop transport latency in cycles: the time for a word to
-    /// cross from one tile's (external) master output to the adjacent tile's
-    /// (external) slave FIFO. This is the destination SLAVE port's input latency
-    /// (AM020 Ch2: "external/local slave ports are 2-cycle latency"), NOT a full
-    /// within-switch slave->master traversal (`external_to_external_latency`,
-    /// which double-counts the source tile's master-output latency already paid
-    /// when the word entered that master port). It sets both the inter-tile
-    /// delay-line transit time and -- since in-flight words cannot be un-sent --
-    /// the crossing's backpressure-commit depth (`slave_fifo + this`). HW-pinned:
-    /// add_one memtile send headroom 14 = one-BD ingress (8) + crossing (6) =
-    /// 8 + (slave_fifo 4 + 2).
+    /// Inter-tile wire latency in cycles: the time a word spends between one tile's external
+    /// master and the neighbour's external slave, on top of the crossings. **0, measured**
+    /// (NPU1, 2026-11-04): a core-to-core round trip grows by exactly 8 cycles per extra tile
+    /// (32/40/48 for 1/2/3 hops, `tools/gen_stream_rtt_probe.py`, r1 == r2), i.e. 4 cycles one
+    /// way = one external -> external crossing (AM020 ch.2:92) and nothing for the wire. The
+    /// former value 2 came from one memtile -> compute capture that two mechanisms fit; it put
+    /// 6 cycles and 14 words on every hop.
     pub inter_tile_hop_latency: u8,
     /// Packet switch arbitration overhead per packet header.
     pub packet_arbitration_overhead: u8,

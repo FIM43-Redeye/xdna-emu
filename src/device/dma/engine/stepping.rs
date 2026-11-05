@@ -420,8 +420,9 @@ impl DmaEngine {
         // word -- which is what silicon does.
         let granule = layout.access_granule_bytes();
         let mut words = 1usize;
+        let mut addrs = [first; 4];
         let mut prev = first;
-        while words < unfetched {
+        while words < unfetched && words < addrs.len() {
             if probe.next().is_none() {
                 break;
             }
@@ -429,6 +430,7 @@ impl DmaEngine {
             if word_opens_granule(Some(prev), addr, granule) {
                 break;
             }
+            addrs[words] = addr;
             prev = addr;
             words += 1;
         }
@@ -439,7 +441,7 @@ impl DmaEngine {
 
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
         let offset = Self::wrap_local_offset(first, mem_size) as u32;
-        Some(GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words })
+        Some(GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words, addrs })
     }
 
     /// Step the DMA engine by one cycle.
@@ -1737,6 +1739,10 @@ impl DmaEngine {
             if let Some(fetch) = self.next_granule_fetch(transfer, layout) {
                 self.cycle_dma_banks |= fetch.bank_mask;
                 transfer.staged_words += fetch.words;
+                for &addr in &fetch.addrs[..fetch.words] {
+                    let word = self.read_staged_word(addr, tile, neighbors);
+                    transfer.staged_data.push_back(word);
+                }
             }
         }
 
@@ -1887,6 +1893,11 @@ impl DmaEngine {
                 // access and put it in the wrong cycle.
                 self.word_opens_granule =
                     !staging && word_opens_granule(transfer.last_access_addr, addr, granule);
+                self.mm2s_staged_word = if staging {
+                    transfer.staged_data.front().copied()
+                } else {
+                    None
+                };
 
                 let result = self.do_transfer(
                     source,
@@ -1900,6 +1911,7 @@ impl DmaEngine {
                     neighbors,
                     host_memory,
                 );
+                self.mm2s_staged_word = None; // consumed, or the word stalled and stays staged
 
                 if result.stall {
                     // Mid-chunk stall: if any word made it through this
@@ -1918,6 +1930,7 @@ impl DmaEngine {
                 transfer.advance(4);
                 if staging {
                     transfer.staged_words -= 1;
+                    transfer.staged_data.pop_front();
                 }
                 self.channels[ch_idx].stats.bytes_transferred += 4;
 
@@ -2332,6 +2345,22 @@ impl DmaEngine {
         }
     }
 
+    /// Read the word at BD address `addr` for the egress staging FIFO: the
+    /// memory side of a staged MM2S, on the cycle its granule is fetched. Same
+    /// address resolution as `transfer_mm2s`; an unresolvable or out-of-range
+    /// address stages 0 and the drain reports the error as before.
+    fn read_staged_word(&mut self, addr: u64, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) -> u32 {
+        let mem_size = tile.data_memory().len();
+        let Some((_, target_tile, offset)) = self.resolve_mm2s_target(addr, mem_size, tile, neighbors) else {
+            return 0;
+        };
+        let data = target_tile.data_memory();
+        if offset + 4 > data.len() {
+            return 0;
+        }
+        u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+    }
+
     /// MM2S: Read from tile memory and queue to stream output.
     ///
     /// For MemTile DMAs, the byte address is decoded into a West/Own/East
@@ -2394,10 +2423,12 @@ impl DmaEngine {
             );
         }
 
+        let staged_word = self.mm2s_staged_word.take();
         let data = target_tile.data_memory();
 
         // Uncompressed path: read data from tile memory in 32-bit words
         let word_count = (bytes + 3) / 4;
+        debug_assert!(staged_word.is_none() || word_count == 1, "a staged drain sends one word");
 
         log::debug!(
             "DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
@@ -2412,7 +2443,9 @@ impl DmaEngine {
 
         for i in 0..word_count {
             let word_offset = offset + i * 4;
-            let word = if word_offset + 4 <= data.len() {
+            let word = if let Some(w) = staged_word {
+                w
+            } else if word_offset + 4 <= data.len() {
                 u32::from_le_bytes([
                     data[word_offset],
                     data[word_offset + 1],
@@ -3569,10 +3602,12 @@ mod bank_demand_tests {
         let depth = DmaEngine::new_compute_tile(1, 2).egress_staging_capacity();
         assert_eq!(depth, 25);
 
-        // The local-slave FIFO in front of the (never-popping) stream router
-        // absorbs `output_fifo_capacity()` words; the rest stay staged. A
+        // The hand-off register in front of the (never-popping) stream router
+        // takes `output_fifo_capacity()` (1) word; the rest stay staged. A
         // granule is 4 words, so the staged count settles on the largest value
-        // <= depth that is congruent to -start_phase modulo 4.
+        // <= depth congruent to -(start_phase + 1) modulo 4. These are the
+        // silicon stale counts 48/47/50/49 less the 25 words downstream of the
+        // staging (hand-off 1 + local slave 4 + local master 2 + ingress 18).
         let mut staged_by_phase = Vec::new();
         for phase in 0..4u64 {
             let mut eng = DmaEngine::new_compute_tile(1, 2);
@@ -3592,9 +3627,46 @@ mod bank_demand_tests {
         }
         assert_eq!(
             staged_by_phase,
-            vec![24, 23, 22, 25],
+            vec![23, 22, 25, 24],
             "staged words at stall for BD starts 0/1/2/3 words into a granule"
         );
+    }
+
+    /// A staged word is read from memory when its granule is fetched, not when it
+    /// leaves the staging FIFO: overwriting the source while the MM2S is stalled
+    /// changes only the words not yet fetched. This is how silicon measures the
+    /// staging depth (R4-D3 data race: the stale-pattern count is the words the
+    /// pipeline held when the host overwrote the buffer).
+    #[test]
+    fn staged_words_carry_the_data_read_at_fetch_time() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        const N: u32 = 128;
+        for i in 0..N {
+            tile.write_data_u32(0x400 + 4 * i as usize, 0x0A00_0000 | i);
+        }
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 4 * N)).unwrap();
+        eng.start_channel(2, 0).unwrap();
+        for _ in 0..400 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        let held = eng.output_fifo_capacity() + eng.staged_words(2);
+        for i in 0..N {
+            tile.write_data_u32(0x400 + 4 * i as usize, 0x0B00_0000 | i);
+        }
+        let mut words = Vec::new();
+        for _ in 0..2000 {
+            while let Some(w) = eng.pop_stream_out_for_channel(2) {
+                words.push(w.data);
+            }
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        assert_eq!(words.len(), N as usize, "every word streamed");
+        assert!(words.iter().enumerate().all(|(i, w)| w & 0xFF_FFFF == i as u32), "in order");
+        let stale = words.iter().take_while(|w| *w >> 24 == 0x0A).count();
+        assert_eq!(stale, held, "stale words = output FIFO + staging at the overwrite");
+        assert!(words[stale..].iter().all(|w| w >> 24 == 0x0B), "the rest is the new data");
     }
 
     /// `urgent_channels` and `peek_bank_demand` read the identical per-transfer
