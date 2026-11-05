@@ -167,6 +167,21 @@ pub mod ctrl_regs {
     /// Source: `AIE2GenRegisterInfo.td`, `def crSat : AIE2ControlReg<0b1001, "crSat">`.
     pub const CR_SAT: u8 = 9;
 
+    /// Control register ID for crF2FMask (fp32 -> bf16 flag mask), binary 0b0001.
+    ///
+    /// Source: `AIE2GenRegisterInfo.td`, `def crF2FMask : AIE2ControlReg<0b0001, "crF2FMask">`.
+    pub const CR_F2F_MASK: u8 = 1;
+
+    /// Control register ID for crF2IMask (float -> int flag mask), binary 0b0010.
+    ///
+    /// Source: `AIE2GenRegisterInfo.td`, `def crF2IMask : AIE2ControlReg<0b0010, "crF2IMask">`.
+    pub const CR_F2I_MASK: u8 = 2;
+
+    /// Control register ID for crFPMask (float MAC / adder flag mask), binary 0b0011.
+    ///
+    /// Source: `AIE2GenRegisterInfo.td`, `def crFPMask : AIE2ControlReg<0b0011, "crFPMask">`.
+    pub const CR_FP_MASK: u8 = 3;
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -180,6 +195,9 @@ pub mod ctrl_regs {
             assert_eq!(u16::from(CR_RND), encoding("crRnd"));
             assert_eq!(u16::from(CR_SRS_SIGN), encoding("crSRSSign"));
             assert_eq!(u16::from(CR_SAT), encoding("crSat"));
+            assert_eq!(u16::from(CR_F2F_MASK), encoding("crF2FMask"));
+            assert_eq!(u16::from(CR_F2I_MASK), encoding("crF2IMask"));
+            assert_eq!(u16::from(CR_FP_MASK), encoding("crFPMask"));
         }
 
         /// Control and status register widths come from AM025 (`Core_CR` / `Core_SR` fields,

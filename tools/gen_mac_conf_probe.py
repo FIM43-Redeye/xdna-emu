@@ -397,7 +397,139 @@ def plan_random(rng):
     return out
 
 
-PLANS = {"accops": plan_accops, "sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
+# bf16 (.f) forms: builtin, takes acc1, takes acc2. The accumulators are 16 fp32 lanes (512 bits); the
+# tile layout is the integer one (A 64 | B 64 | acc1 | acc2 | conf), the output the 64-byte result.
+BF_KINDS = {
+    "mul": ("bf_mul16_conf", False, False),
+    "negmul": ("bf_negmul16_conf", False, False),
+    "mac": ("bf_mac16_conf", True, False),
+    "msc": ("bf_msc16_conf", True, False),
+    "addmac": ("bf_addmac16_conf", True, True),
+    "addmsc": ("bf_addmsc16_conf", True, True),
+}
+BF_TILE_OUT = 64
+
+
+def bf_kernel(kind: str, tiles: int) -> str:
+    builtin, acc1, acc2 = BF_KINDS[kind]
+    args = "a, b" + (", c1" if acc1 else "") + (", c2" if acc2 else "") + ", conf"
+    return f"""// Auto-generated (gen_mac_conf_probe.py): bf16 {kind} over {tiles} tiles with a per-tile conf word
+#define NOCPP
+#include <stdint.h>
+
+extern "C" {{
+void test_kernel(const int32_t *restrict in, int32_t *restrict out) {{
+    for (int t = 0; t < {tiles}; t++) {{
+        const int32_t *p = in + t * {TILE_IN // 4};
+        v32bfloat16 a = *(const v32bfloat16 *)(p);
+        v32bfloat16 b = *(const v32bfloat16 *)(p + 16);
+        v8acc64 c1 = *(const v8acc64 *)(p + 32);
+        v8acc64 c2 = *(const v8acc64 *)(p + 64);
+        int32_t conf = p[96];
+        v8acc64 r = __builtin_aiev2_{builtin}({args});
+        *(v8acc64 *)(out + t * {BF_TILE_OUT // 4}) = r;
+    }}
+}}
+}} // extern "C"
+"""
+
+
+def bf_small(rng, lo=-8, hi=8) -> int:
+    """bf16 bits of a small integer (exact products and sums)."""
+    v = float(rng.randint(lo, hi))
+    return struct.unpack("<I", struct.pack("<f", v))[0] >> 16
+
+
+def bf_moderate(rng) -> int:
+    """A random normal bf16 in [2^-8, 2^8) of either sign."""
+    return rng.getrandbits(1) << 15 | rng.randrange(119, 135) << 7 | rng.getrandbits(7)
+
+
+def f32_bits(v: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", v))[0]
+
+
+def bf_operands(rng, small: bool) -> dict:
+    if small:
+        a = [bf_small(rng) for _ in range(32)]
+        b = [bf_small(rng) for _ in range(32)]
+        c1 = [f32_bits(float(rng.randint(-64, 64))) for _ in range(16)]
+        c2 = [f32_bits(float(rng.randint(-64, 64))) for _ in range(16)]
+    else:
+        a = [bf_moderate(rng) for _ in range(32)]
+        b = [bf_moderate(rng) for _ in range(32)]
+        c1 = [bf_moderate(rng) << 16 | rng.getrandbits(16) for _ in range(16)]
+        c2 = [bf_moderate(rng) << 16 | rng.getrandbits(16) for _ in range(16)]
+    return dict(a=struct.pack("<32H", *a), b=struct.pack("<32H", *b),
+                c1=struct.pack("<16I", *c1).ljust(128, b"\0"), c2=struct.pack("<16I", *c2).ljust(128, b"\0"))
+
+
+def bf_cases(kind: str, plan: str, confs: list[int], rng, operands) -> list[CxxKernel]:
+    kernels = []
+    for k, start in enumerate(range(0, len(confs), TILES_PER_CASE)):
+        chunk = confs[start:start + TILES_PER_CASE]
+        data = b"".join(tile_bytes(rng, c, **operands(start + i)) for i, c in enumerate(chunk))
+        kernels.append(CxxKernel(
+            name=f"{plan}__{kind}__{k:02d}", source=bf_kernel(kind, len(chunk)),
+            in_size=len(data), out_size=BF_TILE_OUT * len(chunk), input_bytes=data,
+            meta={"plan": plan, "kind": kind, "confs": chunk, "tile_in": TILE_IN, "tile_out": BF_TILE_OUT}))
+    return kernels
+
+
+BF_CONF = 2 << 1 | 3 << 3      # aiev2_vmult.h: every bf16 intrinsic uses amode 2, bmode 3
+
+
+def plan_bftermneg(rng):
+    """Each term_neg bit alone on the bf16 forms, dense (cmode 0) and elementwise (cmode 1), with small
+    integer operands shared by all the tiles of a group (exact sums: out(base) - out(bit) is twice the
+    negated part)."""
+    out = []
+    for kind in ("mul", "mac", "addmac", "msc"):
+        confs, ops = [], []
+        for cmode in (0, 1):
+            for rep in range(2):
+                o = bf_operands(rng, small=True)
+                for bit in [None] + list(range(8)):
+                    confs.append(BF_CONF | cmode << 5 | (0 if bit is None else 1 << (16 + bit)))
+                    ops.append(o)
+        out += bf_cases(kind, "bftermneg", confs, rng, lambda i, ops=ops: ops[i])
+    return out
+
+
+def plan_bfcodes(rng):
+    """Every (amode, bmode, cmode) key on bf16 mul and mac, two sign settings, small integer operands."""
+    out = []
+    for kind in ("mul", "mac"):
+        confs, ops = [], []
+        for code in range(128):
+            o = bf_operands(rng, small=True)
+            for sx, sy in ((1, 1), (0, 0)):
+                confs.append(code << 1 | sy << 8 | sx << 9)
+                ops.append(o)
+        out += bf_cases(kind, "bfcodes", confs, rng, lambda i, ops=ops: ops[i])
+    return out
+
+
+def plan_bfupper(rng):
+    """The other conf bits alone (signs, shift16, reserved, term_neg) and the sub/zero flags with
+    shift16 on the bf16 forms, moderate random operands."""
+    out = []
+    bits = [8, 9, 10, 14, 15] + list(range(16, 32))
+    for kind in ("mac", "addmac", "mul"):
+        confs, ops = [], []
+        for cmode in (0, 1):
+            o = bf_operands(rng, small=False)
+            for bit in [None] + bits:
+                confs.append(BF_CONF | cmode << 5 | (0 if bit is None else 1 << bit))
+                ops.append(o)
+            for flags in range(16):     # zero_acc, sub_mul, sub_acc1, sub_acc2 with shift16
+                confs.append(BF_CONF | cmode << 5 | 1 << 10 | (flags & 1) | (flags >> 1) << 11)
+                ops.append(o)
+        out += bf_cases(kind, "bfupper", confs, rng, lambda i, ops=ops: ops[i])
+    return out
+
+
+PLANS = {"bftermneg": plan_bftermneg, "bfcodes": plan_bfcodes, "bfupper": plan_bfupper, "accops": plan_accops, "sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
 
 
 def main():

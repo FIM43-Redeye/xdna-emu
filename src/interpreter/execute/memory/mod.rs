@@ -1275,13 +1275,17 @@ impl MemoryUnit {
                 // configured rounding mode (HW: crRnd governs to_v16bfloat16).
                 let mode = super::VectorAlu::ctx_rounding(ctx);
                 let mut result = [0u32; 8];
+                let mut flags = 0;
                 for i in 0..8 {
                     let f_lo = f32::from_bits(acc[i] as u32);
                     let f_hi = f32::from_bits((acc[i] >> 32) as u32);
                     let bf_lo = super::vector_float::f32_to_bf16(f_lo, mode);
                     let bf_hi = super::vector_float::f32_to_bf16(f_hi, mode);
+                    flags |= super::status_flags::fp::f2f_lane(acc[i] as u32, bf_lo)
+                        | super::status_flags::fp::f2f_lane((acc[i] >> 32) as u32, bf_hi);
                     result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
                 }
+                super::VectorAlu::raise_f2f_flags(ctx, flags);
                 let addr = Self::get_store_address(op, ctx);
                 log::debug!("[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?}, from accum)", addr, from, to,);
                 Self::write_vector_to_memory(tile, addr, result, neighbors, view);

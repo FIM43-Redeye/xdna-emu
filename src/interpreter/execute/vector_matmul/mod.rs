@@ -442,7 +442,12 @@ fn complete_matmul(ctx: &mut ExecutionContext, p: &PendingMatmul) {
     if p.config.bfloat {
         // The float accumulators join the product sum (one aligned sum, one
         // rounding), so acc2 is an input here rather than a post-add.
-        matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config, p.b_present);
+        let flags = matmul_bf16(&mut acc, acc2.as_ref(), &a[..], &b[..], &p.config, p.b_present);
+        // srFPFlags (status_flags::fp), visible FP_VISIBLE_AT bundles after the issue.
+        use crate::interpreter::execute::status_flags::fp;
+        use xdna_archspec::aie2::registers::ctrl_regs::CR_FP_MASK;
+        let at = p.issue_bundle + fp::FP_VISIBLE_AT;
+        ctx.raise_fp_flags(crate::interpreter::state::FP_FLAGS_REG_INDEX, flags, CR_FP_MASK, at);
         queue_result(ctx, p, acc);
         return;
     }
@@ -768,6 +773,7 @@ pub fn matmul_config_driven(acc: &mut Acc1024, a: &[u32], b: &[u32], config: &Ma
 /// acc1 on entry when the config accumulates and is overwritten with the result; `acc2` is the second accumulator of the add*
 /// forms. `config.subtract` is the effective product negation (instruction
 /// family folded in by the caller); `sub_acc1`/`sub_acc2` negate the accumulators.
+/// Returns the srFPFlags bits of the 16 lanes (`status_flags::fp`).
 fn matmul_bf16(
     acc: &mut Acc1024,
     acc2: Option<&Acc1024>,
@@ -775,11 +781,12 @@ fn matmul_bf16(
     b: &[u32],
     config: &MatMulConfig,
     b_present: Option<u128>,
-) {
+) -> u32 {
     let bf16 = |v: &[u32], i: usize| (v[i / 2] >> (16 * (i % 2))) as u16;
     let lane32 = |v: &Acc1024, i: usize| (v[i / 2] >> (32 * (i % 2))) as u32;
     let shape = config.shape;
     let mut out: Acc1024 = [0u64; 16];
+    let mut flags = 0;
     for lane in 0..shape.lanes() {
         // A B element the sparse mask drops is absent from the multiplier: its product is not a
         // zero term (which would turn an Inf or NaN in A into a NaN) but not a term at all.
@@ -798,10 +805,12 @@ fn matmul_bf16(
         if let Some(a2) = acc2 {
             accs.push((lane32(a2, lane), config.sub_acc2));
         }
-        let bits = bf16::mac_lane(&products, &accs, config.subtract);
+        let (bits, lane_flags) = bf16::mac_lane_flags(&products, &accs, config.subtract);
         out[lane / 2] |= (bits as u64) << (32 * (lane % 2));
+        flags |= lane_flags;
     }
     *acc = out;
+    flags
 }
 
 // ---------------------------------------------------------------------------

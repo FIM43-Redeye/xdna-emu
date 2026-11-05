@@ -217,6 +217,16 @@ pub struct PendingCascadeRead {
 /// (silicon: timestamps 1..=4 bundles after the vmov exclude the wait, 5 includes it).
 pub const CASCADE_READ_HOLD_BUNDLES: u64 = 5;
 
+/// A status flag raise waiting for its visibility bundle (`raise_status_flag`, `raise_fp_flags`).
+#[derive(Debug, Clone, Copy)]
+struct PendingStatusFlag {
+    reg: u8,
+    bits: u32,
+    /// Control register whose value masks `bits` when they are ORed in.
+    mask: Option<u8>,
+    visible_at: u64,
+}
+
 /// A deferred accumulator add/sub awaiting its stage-3 source read.
 ///
 /// II_VACC / II_VACCf (AIE2Schedule.td) read their accumulator
@@ -518,7 +528,7 @@ pub struct ExecutionContext {
 
     /// Overflow status flags raised by a conversion and not yet visible: (status register
     /// index, issued-bundle count from which a reader sees it). See execute::status_flags.
-    pending_status_flags: Vec<(u8, u64)>,
+    pending_status_flags: Vec<PendingStatusFlag>,
 
     // === Vector Control Registers ===
     /// SRS/UPS control register state.
@@ -1826,6 +1836,7 @@ impl ExecutionContext {
             // The use cycle has elapsed since issue: read at the current bundle.
             let [ub1, ub2] = pa.use_bypass;
             let mut result = [0u64; 16];
+            let mut fp_flags = 0u32;
             if pa.is_wide {
                 let a1 = self.accumulator.read_wide_with(pa.acc1_reg, 0, ub1);
                 let mut a2 = self.accumulator.read_wide_with(pa.acc2_reg, 0, ub2);
@@ -1833,7 +1844,9 @@ impl ExecutionContext {
                     self.steal_acc_read(port, pa.issue_bundle, pa.acc2_reg, true, &mut a2);
                 }
                 for i in 0..16 {
-                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                    let (word, f) = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                    result[i] = word;
+                    fp_flags |= f;
                 }
             } else {
                 let a1 = self.accumulator.read_with(pa.acc1_reg, 0, ub1);
@@ -1844,8 +1857,16 @@ impl ExecutionContext {
                     self.steal_acc_read(port, pa.issue_bundle, pa.acc2_reg, false, &mut a2);
                 }
                 for i in 0..8 {
-                    result[i] = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                    let (word, f) = Self::acc_add_sub_lane_pair(a1[i], a2[i], &pa);
+                    result[i] = word;
+                    fp_flags |= f;
                 }
+            }
+            if pa.is_float {
+                use crate::interpreter::execute::status_flags::fp;
+                use xdna_archspec::aie2::registers::ctrl_regs::CR_FP_MASK;
+                let at = pa.issue_bundle + fp::FP_VISIBLE_AT;
+                self.raise_fp_flags(super::FP_FLAGS_REG_INDEX, fp_flags, CR_FP_MASK, at);
             }
             self.set_write_tag(pa.tag);
             self.queue_acc_write_timed(
@@ -1928,7 +1949,26 @@ impl ExecutionContext {
     /// Raise a sticky overflow status flag (`srSRS_of`, `srUPS_of`) for readers issued at or
     /// after bundle `visible_at` (an issued-bundle count, as `bundle_seq`).
     pub fn raise_status_flag(&mut self, reg: u8, visible_at: u64) {
-        self.pending_status_flags.push((reg, visible_at));
+        self.pending_status_flags
+            .push(PendingStatusFlag { reg, bits: 1, mask: None, visible_at });
+    }
+
+    /// Raise floating-point flag `bits` in status register `reg` for readers issued at or after
+    /// bundle `visible_at`, recorded where control register `mask` (crFPMask, crF2FMask,
+    /// crF2IMask) has them set when they are ORed in (`execute::status_flags::fp`).
+    pub fn raise_fp_flags(&mut self, reg: u8, bits: u32, mask: u8, visible_at: u64) {
+        if bits == 0 {
+            return;
+        }
+        if visible_at <= self.bundle_seq + 1 {
+            // Visible from the next bundle (the fp32 -> bf16 conversions): ORed in now, after
+            // this bundle's register snapshot, so its own readers still see the old value.
+            let v = self.scalar.read(reg);
+            self.scalar.write(reg, v | (bits & self.control_reg(mask)));
+            return;
+        }
+        self.pending_status_flags
+            .push(PendingStatusFlag { reg, bits, mask: Some(mask), visible_at });
     }
 
     /// OR the raised status flags into their registers one bundle before they are visible:
@@ -1943,10 +1983,11 @@ impl ExecutionContext {
         }
         let current = self.bundle_seq;
         let mut pending = std::mem::take(&mut self.pending_status_flags);
-        pending.retain(|&(reg, at)| {
-            if at <= current + 1 {
-                let v = self.scalar.read(reg);
-                self.scalar.write(reg, v | 1);
+        pending.retain(|f| {
+            if f.visible_at <= current + 1 {
+                let mask = f.mask.map_or(u32::MAX, |id| self.control_reg(id));
+                let v = self.scalar.read(f.reg);
+                self.scalar.write(f.reg, v | (f.bits & mask));
                 false
             } else {
                 true
@@ -2011,18 +2052,19 @@ impl ExecutionContext {
     }
 
     /// One 64-bit accumulator word of VADD/VSUB/VNEGADD/VNEGSUB (and the .f
-    /// variants): two independent 32-bit lanes.
-    fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> u64 {
+    /// variants): two independent 32-bit lanes, and the srFPFlags bits of a float form.
+    fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> (u64, u32) {
         if pa.is_float {
-            use crate::interpreter::execute::vector_matmul::bf16::acc_add_lane;
+            use crate::interpreter::execute::vector_matmul::bf16::acc_add_lane_flags;
             let lane = |x1: u32, x2: u32| {
-                acc_add_lane(
+                acc_add_lane_flags(
                     (!pa.zero_acc1).then_some((x1, pa.negate_acc1)),
                     (!pa.unary).then_some((x2, pa.negate_acc2)),
                 )
             };
-            return lane(a1 as u32, a2 as u32) as u64
-                | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32);
+            let (lo, f_lo) = lane(a1 as u32, a2 as u32);
+            let (hi, f_hi) = lane((a1 >> 32) as u32, (a2 >> 32) as u32);
+            return (lo as u64 | (hi as u64) << 32, f_lo | f_hi);
         }
         // The config word's shift16 bit shifts acc1 left by 16 before its negation and the add
         // (silicon: vadd -> (acc1 << 16) + acc2, vsub -> (acc1 << 16) - acc2, vneg -> -(acc1 << 16)).
@@ -2042,7 +2084,7 @@ impl ExecutionContext {
             } else {
                 a2 as i64
             };
-            return v1.wrapping_add(v2) as u64;
+            return (v1.wrapping_add(v2) as u64, 0);
         }
         // Acc32 mode: no carry chain between halves, per-lane 32-bit math.
         let lane = |x1: u32, x2: u32| -> u32 {
@@ -2061,7 +2103,7 @@ impl ExecutionContext {
             };
             v1.wrapping_add(v2) as u32
         };
-        lane(a1 as u32, a2 as u32) as u64 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32)
+        (lane(a1 as u32, a2 as u32) as u64 | ((lane((a1 >> 32) as u32, (a2 >> 32) as u32) as u64) << 32), 0)
     }
 
     /// Check if there are pending (deferred) register writes awaiting commit.

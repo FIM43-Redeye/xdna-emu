@@ -114,19 +114,28 @@ fn shr_rne(v: u64, n: u32) -> u64 {
 }
 
 /// Sum of the terms as (sign, biased exponent before clamping, 23-bit mantissa,
-/// flushed), or `None` for an exact zero.
-fn numeric_sum(terms: &[Term]) -> Option<(bool, i32, u32, bool)> {
-    let e_ref = terms.iter().map(|t| t.ieee).max()?;
+/// flushed), or `None` for a zero grid sum; and whether a term lost bits on the grid.
+fn numeric_sum(terms: &[Term]) -> (Option<(bool, i32, u32, bool)>, bool) {
+    let Some(e_ref) = terms.iter().map(|t| t.ieee).max() else {
+        return (None, false);
+    };
     let mut total: i128 = 0;
+    let mut lost = false;
     for t in terms {
         let shift = t.lsb - (e_ref - 23);
         let q = if shift >= 0 {
             (t.sig as u128) << shift
         } else {
-            shr_rne(t.sig, (-shift) as u32) as u128
+            let n = (-shift) as u32;
+            lost |= n > 63 || t.sig & ((1u64 << n) - 1) != 0;
+            shr_rne(t.sig, n) as u128
         } as i128;
         total += if t.neg { -q } else { q };
     }
+    (numeric_grid_sum(total, e_ref), lost)
+}
+
+fn numeric_grid_sum(total: i128, e_ref: i32) -> Option<(bool, i32, u32, bool)> {
     if total == 0 {
         return None;
     }
@@ -172,13 +181,26 @@ fn shr_rne_wide(v: u128, n: u32) -> u128 {
 /// zero of an exact cancellation and the NaN encoding, so `vneg.f` is not a bare
 /// sign flip (a denormal becomes -0, +0 stays +0, a NaN is re-encoded).
 pub fn acc_add_lane(acc1: Option<AccTerm>, acc2: Option<AccTerm>) -> u32 {
+    acc_add_lane_flags(acc1, acc2).0
+}
+
+/// [`acc_add_lane`] with the lane's `srFPFlags` bits.
+pub fn acc_add_lane_flags(acc1: Option<AccTerm>, acc2: Option<AccTerm>) -> (u32, u32) {
     let accs: Vec<AccTerm> = acc1.into_iter().chain(acc2).collect();
-    mac_lane(&[], &accs, false)
+    mac_lane_flags(&[], &accs, false)
 }
 
 /// One output lane: `products` are the (A, B) bf16 pairs, `accs` the accumulator
 /// operands, `neg_prod` negates every product. Returns the fp32 bits.
 pub fn mac_lane(products: &[(u16, u16)], accs: &[AccTerm], neg_prod: bool) -> u32 {
+    mac_lane_flags(products, accs, neg_prod).0
+}
+
+/// [`mac_lane`] with the lane's `srFPFlags` bits (`status_flags::fp`): NaN; Inf, plus overflow
+/// when no term was infinite; zero, plus underflow when the zero is not exact (a term lost bits
+/// on the grid, or the sum flushed).
+pub fn mac_lane_flags(products: &[(u16, u16)], accs: &[AccTerm], neg_prod: bool) -> (u32, u32) {
+    use crate::interpreter::execute::status_flags::fp;
     let mut terms = Vec::with_capacity(products.len() + accs.len());
     let mut flags = Vec::with_capacity(products.len() + accs.len());
     for &(a, b) in products {
@@ -194,30 +216,59 @@ pub fn mac_lane(products: &[(u16, u16)], accs: &[AccTerm], neg_prod: bool) -> u3
     let any_nan = flags.contains(&Flag::Nan);
     let inf_pos = flags.contains(&Flag::InfPos);
     let inf_neg = flags.contains(&Flag::InfNeg);
-    let sum = numeric_sum(&terms);
+    let (sum, lost) = numeric_sum(&terms);
     let sign_bit = |neg: bool| (neg as u32) << 31;
 
     if !any_nan && (inf_pos != inf_neg) {
-        return sign_bit(inf_neg) | 0x7f80_0000;
+        return (sign_bit(inf_neg) | 0x7f80_0000, fp::INF);
     }
     if any_nan || (inf_pos && inf_neg) {
         let (neg, mant) = match sum {
             None => (false, 0),
             Some((neg, biased, mant, flushed)) => (neg, if flushed || biased >= 255 { 0 } else { mant }),
         };
-        return sign_bit(neg) | 0x7f80_0000 | mant | 1;
+        return (sign_bit(neg) | 0x7f80_0000 | mant | 1, fp::NAN);
     }
+    let inexact_zero = fp::ZERO | fp::UNDERFLOW;
     match sum {
-        None => 0,
-        Some((neg, _, _, true)) => sign_bit(neg),
-        Some((neg, biased, _, _)) if biased >= 255 => sign_bit(neg) | 0x7f80_0000,
-        Some((neg, biased, mant, false)) => sign_bit(neg) | ((biased as u32) << 23) | mant,
+        None => (0, if lost { inexact_zero } else { fp::ZERO }),
+        Some((neg, _, _, true)) => (sign_bit(neg), inexact_zero),
+        Some((neg, biased, _, _)) if biased >= 255 => (sign_bit(neg) | 0x7f80_0000, fp::INF | fp::OVERFLOW),
+        Some((neg, biased, mant, false)) => (sign_bit(neg) | ((biased as u32) << 23) | mant, 0),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// srFPFlags of single lanes (fpflags2 / fpextra silicon probe suites).
+    #[test]
+    fn lane_flags_match_the_silicon_classes() {
+        use crate::interpreter::execute::status_flags::fp::*;
+        let one = 0x3f80;
+        let m_one = 0xbf80;
+        let p2 = |e: i32, s: u16| (s << 15) | (((e + 127) as u16) << 7);
+        let f = |p: &[(u16, u16)], a: &[AccTerm]| mac_lane_flags(p, a, false).1;
+        assert_eq!(f(&[(one, one), (one, m_one)], &[]), ZERO, "exact cancellation");
+        assert_eq!(
+            f(&[(one, one), (one, m_one), (p2(-30, 0), one), (p2(-30, 1), one)], &[]),
+            ZERO | UNDERFLOW,
+            "an exact zero whose small terms were dropped on the grid"
+        );
+        assert_eq!(f(&[(p2(-30, 0), one), (p2(-30, 1), one)], &[]), ZERO, "no term lost bits");
+        assert_eq!(f(&[(one, one)], &[(0xbf80_0000, false), (0x3080_0000, true)]), ZERO | UNDERFLOW);
+        assert_eq!(f(&[(p2(-70, 0), p2(-70, 0))], &[]), ZERO | UNDERFLOW, "flushed");
+        assert_eq!(f(&[(p2(127, 0), p2(1, 0))], &[]), INF | OVERFLOW);
+        assert_eq!(f(&[(0x7f80, one), (p2(127, 0), p2(1, 0))], &[]), INF, "an Inf term: no overflow");
+        assert_eq!(f(&[(0x7fc0, one)], &[]), NAN);
+        assert_eq!(f(&[(0x7f80, one), (0xff80, one)], &[]), NAN);
+        assert_eq!(f(&[(0, 0x7f80)], &[]), NAN);
+        assert_eq!(f(&[(one, one), (p2(-30, 0), one)], &[]), 0, "inexact is not a flag");
+        assert_eq!(f(&[], &[]), ZERO, "no terms at all");
+        assert_eq!(acc_add_lane_flags(Some((0x0040_0000, false)), Some((0x0040_0000, false))).1, 0);
+        assert_eq!(acc_add_lane_flags(Some((0x0040_0000, true)), None).1, ZERO | UNDERFLOW);
+    }
 
     fn bf(sign: u16, exp: u16, mant: u16) -> u16 {
         (sign << 15) | (exp << 7) | mant

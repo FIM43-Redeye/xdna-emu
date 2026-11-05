@@ -451,6 +451,9 @@ def record_body(form: Form, clear_at: int = 0, mask_at: int = 0) -> list[str]:
     for si, base in ((0, F_A), (1, F_B)):
         lines += pointer_setup(form, si)
         lines += nops(8)
+        if si == 0 and (clear_at or mask_at):
+            # The read slot the write replaces would keep a stale register: zero it.
+            lines.append(f"  mov {READ_REGS[(clear_at or mask_at) - 1]}, #0")
         lines += op_line(form, si)
         # `clear_at` k: the read at offset k after S1 is replaced by `mov flag, r14` (the record's
         # rnd word, 0 in the clear plan): how a write races the operation's flag.

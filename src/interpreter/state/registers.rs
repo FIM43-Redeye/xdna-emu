@@ -64,8 +64,8 @@ pub const NUM_SHIFT_REGS: u8 = 4;
 pub const SS_STATUS_REG_INDEX: u8 = 44;
 /// Stream-switch write status (`srMS0`): bit 0 = the last non-blocking write was accepted.
 pub const MS_STATUS_REG_INDEX: u8 = 45;
-// Status registers kept as plain slots masked to their silicon width. The carry and the SRS /
-// UPS overflow flags have producers (execute::status_flags); the floating-point flags do not yet.
+// Status registers kept as plain slots masked to their silicon width; their producers are in
+// execute::status_flags.
 /// `srCarry`.
 pub const CARRY_REG_INDEX: u8 = 46;
 /// `srSRS_of`.

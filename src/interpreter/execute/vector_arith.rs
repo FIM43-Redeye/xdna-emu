@@ -1201,12 +1201,21 @@ impl VectorAlu {
     ///
     /// The shift parameter comes from a scalar register operand.
     /// Hardware uses the low 6 bits as a signed value (range -32 to +31).
+    /// The shift `vfloor` applies: the register's low 6 bits, signed (-32 to +31).
+    pub(super) fn vfloor_shift(shift: i32) -> i32 {
+        let masked = (shift & 0x3F) as i8;
+        (if masked >= 32 { masked - 64 } else { masked }) as i32
+    }
+
+    /// srF2IFlags bits of `vector_floor_bf16_to_s32` on the 8 bf16 values of `src[..4]`.
+    pub(super) fn vfloor_flags(src: &[u32; 8], shift: i32) -> u32 {
+        let s = Self::vfloor_shift(shift);
+        (0..8).fold(0, |f, i| f | super::status_flags::fp::f2i_lane((src[i / 2] >> ((i % 2) * 16)) as u16, s))
+    }
+
     pub(super) fn vector_floor_bf16_to_s32(src: &[u32; 8], shift: i32) -> [u32; 8] {
         let mut result = [0u32; 8];
-        // Hardware interprets shift as signed 6-bit (-32 to +31).
-        let masked = (shift & 0x3F) as i8;
-        let effective_shift = if masked >= 32 { masked - 64 } else { masked } as i32;
-        let scale = (2.0f64).powi(effective_shift);
+        let scale = (2.0f64).powi(Self::vfloor_shift(shift));
         for i in 0..8 {
             let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
             // Silicon (NPU1 Phoenix, vec_vfloor_bf16_denorm, 2026-06-10) does NOT

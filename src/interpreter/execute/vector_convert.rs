@@ -168,9 +168,18 @@ impl VectorAlu {
             };
             let (res_lo, res_hi) = if is_vfloor {
                 let s = shift_val.unwrap();
+                Self::raise_f2i_flags(ctx, Self::vfloor_flags(&src_lo, s) | Self::vfloor_flags(&src_hi, s));
                 (Self::vector_floor_bf16_to_s32(&src_lo, s), Self::vector_floor_bf16_to_s32(&src_hi, s))
             } else {
-                (Self::vector_convert(&src_lo, from, et, mode), Self::vector_convert(&src_hi, from, et, mode))
+                let res = (
+                    Self::vector_convert(&src_lo, from, et, mode),
+                    Self::vector_convert(&src_hi, from, et, mode),
+                );
+                if from == ElementType::Float32 && et == ElementType::BFloat16 {
+                    let flags = Self::f2f_flags(&src_lo, &res.0) | Self::f2f_flags(&src_hi, &res.1);
+                    Self::raise_f2f_flags(ctx, flags);
+                }
+                res
             };
             // VCONV may produce narrow output (e.g., f32->bf16 packs 8 f32
             // into 4 words of bf16). Write to the appropriate dest width.
@@ -207,6 +216,7 @@ impl VectorAlu {
                 hi_in[..4].copy_from_slice(&src[4..]);
                 let (res_lo, res_hi) = if is_vfloor {
                     let s = shift_val.unwrap();
+                    Self::raise_f2i_flags(ctx, Self::vfloor_flags(&lo_in, s) | Self::vfloor_flags(&hi_in, s));
                     (Self::vector_floor_bf16_to_s32(&lo_in, s), Self::vector_floor_bf16_to_s32(&hi_in, s))
                 } else {
                     (
@@ -253,6 +263,30 @@ impl VectorAlu {
             }
         }
         true
+    }
+
+    /// srF2FFlags bits of an fp32 -> bf16 conversion: `src` 8 fp32 values, `res[..4]` their
+    /// 8 bf16 results.
+    pub(crate) fn f2f_flags(src: &[u32; 8], res: &[u32; 8]) -> u32 {
+        (0..8).fold(0, |f, i| {
+            f | super::status_flags::fp::f2f_lane(src[i], (res[i / 2] >> ((i % 2) * 16)) as u16)
+        })
+    }
+
+    /// Raise srF2FFlags for a conversion issued in the current bundle.
+    pub(crate) fn raise_f2f_flags(ctx: &mut ExecutionContext, flags: u32) {
+        use super::status_flags::fp;
+        use xdna_archspec::aie2::registers::ctrl_regs::CR_F2F_MASK;
+        let at = ctx.bundle_seq + fp::F2F_VISIBLE_AT;
+        ctx.raise_fp_flags(crate::interpreter::state::F2F_FLAGS_REG_INDEX, flags, CR_F2F_MASK, at);
+    }
+
+    /// Raise srF2IFlags for a `vfloor` issued in the current bundle.
+    fn raise_f2i_flags(ctx: &mut ExecutionContext, flags: u32) {
+        use super::status_flags::fp;
+        use xdna_archspec::aie2::registers::ctrl_regs::CR_F2I_MASK;
+        let at = ctx.bundle_seq + fp::F2I_VISIBLE_AT;
+        ctx.raise_fp_flags(crate::interpreter::state::F2I_FLAGS_REG_INDEX, flags, CR_F2I_MASK, at);
     }
 
     /// Vector type conversion.

@@ -1,4 +1,5 @@
-//! Producers of the status flags `srSRS_of`, `srUPS_of` and `srCarry`.
+//! Producers of the status flags `srSRS_of`, `srUPS_of`, `srCarry` and the floating-point flags
+//! `srFPFlags`, `srF2FFlags`, `srF2IFlags` (see [`fp`]).
 //!
 //! TableGen lists `Defs = [srSRS_of]` on every SRS form (`vsrs`, `vsrsm`, `vst[.2d|.3d].srs`)
 //! and `Defs = [srUPS_of]` on every UPS form (`vups`, `vlda[.2d|.3d].ups`). Silicon (satflags
@@ -30,6 +31,115 @@
 /// Issued bundles after an SRS before its `srSRS_of` is visible (silicon; AIE2Schedule.td's
 /// `/*def:srSRS_of*/3` for II_VSRS, II_VSRSM and II_VST*_SRS).
 pub(crate) const SRS_OF_VISIBLE_AT: u64 = 3;
+
+/// The floating-point status flags (fpflags probe suites, `tools/gen_fp_flags_probe.py`):
+///
+/// - TableGen `Defs`: `srFPFlags` on the bf16 MAC forms (`vmul.f` ... `vaddmsc.f`, dense and
+///   sparse) and the accumulator float forms (`vadd.f`, `vsub.f`, `vnegadd.f`, `vnegsub.f`,
+///   `vneg.f`; `vclr` on a bm register too, but silicon never changes the flag for it);
+///   `srF2FFlags` on `vconv.bf16.fp32` and every `vst.conv.bf16.fp32`; `srF2IFlags` on
+///   `vfloor.s32.bf16`.
+/// - All three hold the same five bits ([`ZERO`] ... [`OVERFLOW`]), each the OR over the 16 lanes
+///   of the instruction. There is no inexact bit.
+/// - A raised bit is recorded only where the instruction's mask register (`crFPMask`,
+///   `crF2FMask`, `crF2IMask`; 0 at reset) has it set, and is ORed in: the flags are sticky until
+///   a `mov` to the register.
+/// - The flags become visible to a reader issued [`FP_VISIBLE_AT`], [`F2F_VISIBLE_AT`],
+///   [`F2I_VISIBLE_AT`] bundles after the instruction (the itinerary's flag def cycles). They are
+///   ORed in one bundle earlier, after that bundle's register snapshot, with the mask as it stands
+///   then: a `mov` to the flag in that bundle wins, and a mask write issued in it comes too late.
+pub mod fp {
+    /// A lane's result is zero (either sign).
+    pub const ZERO: u32 = 1;
+    /// A lane's result is infinite.
+    pub const INF: u32 = 2;
+    /// A lane's result is NaN.
+    pub const NAN: u32 = 4;
+    /// A lane's result is zero but not exactly: the bf16 adder dropped bits of a term on its
+    /// alignment grid or flushed a nonzero sum below 2^-126; a conversion turned a nonzero input
+    /// into zero.
+    pub const UNDERFLOW: u32 = 8;
+    /// A lane overflowed: an infinite result from finite terms (MAC, adder, fp32 -> bf16), or a
+    /// float -> int32 result out of range (an infinite input included).
+    pub const OVERFLOW: u32 = 16;
+
+    /// Issued bundles after a `srFPFlags` producer before its flags are visible.
+    pub const FP_VISIBLE_AT: u64 = 7;
+    /// Issued bundles after a `srF2FFlags` producer before its flags are visible.
+    pub const F2F_VISIBLE_AT: u64 = 1;
+    /// Issued bundles after a `srF2IFlags` producer before its flags are visible.
+    pub const F2I_VISIBLE_AT: u64 = 2;
+
+    /// Flags of one fp32 -> bf16 lane from its input and its (already rounded) output.
+    pub fn f2f_lane(input: u32, output: u16) -> u32 {
+        let out_exp = (output >> 7) & 0xff;
+        let out_mant = output & 0x7f;
+        let in_finite = (input >> 23) & 0xff != 0xff;
+        if out_exp == 0xff && out_mant != 0 {
+            NAN
+        } else if out_exp == 0xff {
+            INF | if in_finite { OVERFLOW } else { 0 }
+        } else if output & 0x7fff == 0 {
+            ZERO | if input & 0x7fff_ffff != 0 { UNDERFLOW } else { 0 }
+        } else {
+            0
+        }
+    }
+
+    /// Flags of one `vfloor.s32.bf16` lane: `input` the bf16 bits, `shift` the effective
+    /// (sign-extended 6-bit) shift; the lane is floor(input * 2^shift) saturated to int32.
+    pub fn f2i_lane(input: u16, shift: i32) -> u32 {
+        let value = f32::from_bits((input as u32) << 16) as f64;
+        if value.is_nan() {
+            return NAN;
+        }
+        let scaled = value * 2f64.powi(shift);
+        let floored = scaled.floor();
+        if !(i32::MIN as f64..=i32::MAX as f64).contains(&floored) {
+            OVERFLOW
+        } else if floored == 0.0 {
+            ZERO | if scaled != 0.0 { UNDERFLOW } else { 0 }
+        } else {
+            0
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// fpflags2 `vconv_bf16_fp32`: NaN, Inf, finite -> Inf, nonzero -> 0, -0.
+        #[test]
+        fn f2f_lane_flags_follow_the_output_class() {
+            assert_eq!(f2f_lane(0x7fc0_0000, 0x7fc0), NAN);
+            assert_eq!(f2f_lane(0x7f80_0001, 0x7f81), NAN);
+            assert_eq!(f2f_lane(0xff80_0000, 0xff80), INF);
+            assert_eq!(f2f_lane(0x7f7f_ffff, 0x7f80), INF | OVERFLOW);
+            assert_eq!(f2f_lane(0x7f7f_ffff, 0x7f7f), 0);
+            assert_eq!(f2f_lane(0x0000_0001, 0x0000), ZERO | UNDERFLOW);
+            assert_eq!(f2f_lane(0x8000_0000, 0x8000), ZERO);
+            assert_eq!(f2f_lane(0x0001_0000, 0x0001), 0, "a bf16 denormal output is not flagged");
+        }
+
+        /// fpflags2 `vfloor_s32_bf16_*`: NaN alone, Inf and out of range as overflow, 0 <= x < 1
+        /// as an inexact zero.
+        #[test]
+        fn f2i_lane_flags() {
+            let bf = |x: f32| (x.to_bits() >> 16) as u16;
+            assert_eq!(f2i_lane(0x7fc0, 0), NAN);
+            assert_eq!(f2i_lane(0x7f80, 0), OVERFLOW);
+            assert_eq!(f2i_lane(0xff80, 0), OVERFLOW);
+            assert_eq!(f2i_lane(bf(2f32.powi(31)), 0), OVERFLOW);
+            assert_eq!(f2i_lane(bf(-(2f32.powi(31))), 0), 0, "-2^31 fits");
+            assert_eq!(f2i_lane(bf(1.5), 31), OVERFLOW);
+            assert_eq!(f2i_lane(bf(0.25), 0), ZERO | UNDERFLOW);
+            assert_eq!(f2i_lane(bf(-0.25), 0), 0, "floors to -1");
+            assert_eq!(f2i_lane(0x8000, 0), ZERO);
+            assert_eq!(f2i_lane(0x0001, 0), ZERO | UNDERFLOW);
+            assert_eq!(f2i_lane(bf(1.5), -1), ZERO | UNDERFLOW);
+        }
+    }
+}
 
 #[cfg(test)]
 mod execution {
