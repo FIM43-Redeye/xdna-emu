@@ -40,16 +40,17 @@ pub(super) fn channel_field_layout(
     }
 }
 
-/// Cycles between the launch path releasing one core and the next: 1448.
+/// Cycles between the start of one core of a design and the next: 1448.
 ///
 /// Silicon (Phoenix, skew probe: 2 to 4 cores, each stamping its tile timer at its first
 /// instruction, 7 layouts x 6 runs, `build/experiments/harness/cascade/skew1`): the cores start
-/// one at a time in column-major order with rows ascending over the cores the design uses, the
-/// k-th about k gaps after the first. A gap does not depend on where the tiles are (rows 2 and 5
-/// with nothing between are one gap apart, like rows 2 and 3) and is not deterministic: 60
-/// same-column gaps range 1103-2018 cycles (median 1448.5, mean 1473, sd 201), varying run to
-/// run for one layout. It is the firmware's per-core release, off-array timing; the emulator uses
-/// the median as a deterministic representative.
+/// one at a time in column-major order with rows ascending over the cores the design uses (the
+/// order of their enable writes in mlir-aie's CDO), the k-th about k gaps after the first. A gap
+/// does not depend on where the tiles are (rows 2 and 5 with nothing between are one gap apart,
+/// like rows 2 and 3) and is not deterministic: 60 same-column gaps range 1103-2018 cycles
+/// (median 1448.5, mean 1473, sd 201), varying run to run for one layout. It is off-array timing
+/// of the launch path applying the starts; the emulator uses the median as a deterministic
+/// representative.
 pub const CORE_RELEASE_SPACING_CYCLES: u64 = 1448;
 
 impl DeviceState {
@@ -624,27 +625,19 @@ impl DeviceState {
         }
     }
 
-    /// Firmware kernel-launch: deassert RESET on every enabled compute core.
+    /// Firmware kernel-launch: start every enabled compute core still held in reset.
     ///
-    /// On real hardware the CDO leaves each core `CORE_CONTROL = 0x03`
-    /// (ENABLE=1, RESET=1 = held); the XDNA firmware clears the reset bit when
-    /// the kernel is launched, and THAT is what actually starts the cores.
-    /// There is no reset-clearing register write anywhere in the CDO or the
-    /// runtime `insts.bin` -- it is a pure firmware side effect -- so we model
-    /// it explicitly here.
+    /// When the CDO leaves a core `CORE_CONTROL = 0x03` (ENABLE=1, RESET=1 = held), nothing in
+    /// the CDO or the runtime `insts.bin` clears the reset bit: the launch path does, and that is
+    /// what starts the core. (mlir-aie's CDO normally clears RESET in its init section and sets
+    /// ENABLE in its enable section, so the core starts at its enable write instead; see
+    /// [`Self::stagger_core_starts`].) Part 1 of #140 SP-4a calls this at config completion;
+    /// Part 2 relocates it to the true launch timing.
     ///
-    /// This is the firmware-launch anchor for #140 SP-4a. Part 1 calls it at
-    /// config-completion (behavior-preserving: cores start ~at CDO time, as
-    /// before). Part 2 relocates it to the true launch timing; the long-term
-    /// dream is running real NPU firmware on a simulated management processor,
-    /// at which point this stub is replaced by the firmware's own reset write.
-    ///
-    /// Silicon releases the cores one at a time, in column-major order with rows ascending
-    /// over the cores the design enables, [`CORE_RELEASE_SPACING_CYCLES`] apart: the first
-    /// core here at once, the k-th after k spacings of [`Self::tick_core_releases`].
+    /// The held cores start one at a time, column-major with rows ascending, after any cores
+    /// the CDO itself started, [`CORE_RELEASE_SPACING_CYCLES`] apart.
     pub fn release_core_resets(&mut self) {
-        self.staged_core_releases.clear();
-        let mut k = 0u64;
+        let mut held = Vec::new();
         for col in 0..self.array.cols() {
             for row in 0..self.array.rows() {
                 let Some(tile) = self.array.get(col, row) else {
@@ -653,28 +646,70 @@ impl DeviceState {
                 if tile.is_compute()
                     && tile.core.control & 1 != 0
                     && tile.core.control & CORE_CONTROL_RESET != 0
+                    && !self.staged_core_releases.iter().any(|&(c, r, _)| (c, r) == (col, row))
                 {
-                    if k == 0 {
-                        self.release_core_reset(col, row);
-                    } else {
-                        self.staged_core_releases.push((col, row, k * CORE_RELEASE_SPACING_CYCLES));
-                    }
-                    k += 1;
+                    held.push((col, row));
                 }
             }
         }
+        for (col, row) in held {
+            self.stage_core_start(col, row);
+        }
     }
 
-    /// Advance the staged core releases by one cycle; call once per engine cycle, before the
-    /// core transitions are drained. A core whose `CORE_CONTROL` no longer reads
-    /// enabled-and-held when its turn comes is skipped.
+    /// Spread the core starts a CDO application produced (`Enable` transitions published since
+    /// `first_transition`, in CDO order) over [`CORE_RELEASE_SPACING_CYCLES`] each: silicon
+    /// starts the cores of a design one at a time, about that far apart (the constant's
+    /// evidence). The first start stays immediate; the others are withdrawn and staged.
+    pub(super) fn stagger_core_starts(&mut self, first_transition: usize) {
+        let mut started: Vec<(u8, u8)> = Vec::new();
+        for t in &self.pending_core_transitions[first_transition..] {
+            if let CoreTransition::Enable { col, row, enabled: true } = *t {
+                if !started.contains(&(col, row)) {
+                    started.push((col, row));
+                }
+            }
+        }
+        started.retain(|&(col, row)| self.array.get(col, row).is_some_and(|t| t.core.enabled));
+        for (col, row) in started {
+            if self.next_core_start_slot == 0 {
+                // Slot 0: this core already started at its enable write.
+                self.next_core_start_slot = 1;
+                continue;
+            }
+            self.pending_core_transitions.retain(|t| {
+                !matches!(*t, CoreTransition::Enable { col: c, row: r, enabled: true } if (c, r) == (col, row))
+            });
+            if let Some(tile) = self.array.get_mut(col, row) {
+                tile.core.enabled = false;
+            }
+            self.stage_core_start(col, row);
+        }
+    }
+
+    /// Queue a core start in the next free slot: slot k starts k spacings after slot 0.
+    fn stage_core_start(&mut self, col: u8, row: u8) {
+        let k = self.next_core_start_slot;
+        self.next_core_start_slot += 1;
+        if k == 0 {
+            self.start_core(col, row);
+        } else {
+            self.staged_core_releases.push((col, row, k * CORE_RELEASE_SPACING_CYCLES));
+        }
+    }
+
+    /// Advance the staged core starts by one cycle; call once per engine cycle, before the
+    /// core transitions are drained. A core whose `CORE_CONTROL` ENABLE bit was cleared before
+    /// its turn is not started.
     pub fn tick_core_releases(&mut self) {
         if self.staged_core_releases.is_empty() {
+            // Every start of the last launch is out: the next launch numbers from slot 0.
+            self.next_core_start_slot = 0;
             return;
         }
         let mut due = Vec::new();
-        // `left` counts the engine cycles still to run before the core's: the first core runs
-        // in engine cycle 0, the one staged k spacings later in cycle k * spacing.
+        // `left` counts the engine cycles still to run before the core's: slot 0 runs in engine
+        // cycle 0, slot k in cycle k * spacing.
         self.staged_core_releases.retain_mut(|(col, row, left)| {
             if *left == 0 {
                 due.push((*col, *row));
@@ -684,18 +719,17 @@ impl DeviceState {
             true
         });
         for (col, row) in due {
-            self.release_core_reset(col, row);
+            self.start_core(col, row);
         }
     }
 
-    /// Clear RESET on one enabled-and-held core and publish its enable.
-    fn release_core_reset(&mut self, col: u8, row: u8) {
+    /// Start one core whose `CORE_CONTROL` has ENABLE set: clear RESET, mark it running and
+    /// publish its enable.
+    fn start_core(&mut self, col: u8, row: u8) {
         let Some(tile) = self.array.get_mut(col, row) else {
             return;
         };
-        // Enable-intent (bit 0) but held in reset (bit 1): firmware
-        // clears reset -> ENABLE=1 && RESET=0 -> the core executes.
-        if tile.core.control & 1 != 0 && tile.core.control & CORE_CONTROL_RESET != 0 {
+        if tile.core.control & 1 != 0 {
             let was_enabled = tile.core.enabled;
             tile.core.control &= !CORE_CONTROL_RESET;
             tile.core.enabled = true;

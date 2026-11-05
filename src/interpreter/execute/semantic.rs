@@ -151,10 +151,17 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
         // Hardware state reads
         SemanticOp::ReadCycleCounter => {
-            // MOV_CNTR: read the tile timer (engine cycles before the core started plus the
-            // core's own) into a scalar register; the low 32 bits.
-            let counter = (ctx.cycle_counter_base + ctx.cycles) as u32;
-            write_dest(op, ctx, counter);
+            // MOV_CNTR: read the 64-bit tile timer (engine cycles before the core started plus
+            // the core's own) into a register pair `rH:rL`, decoded as its low register.
+            // Silicon writes both halves (the high word reads 0 while the timer is below 2^32).
+            let counter = ctx.cycle_counter_base + ctx.cycles;
+            match op.dest {
+                Some(Operand::ScalarReg(lo)) => {
+                    write_operand(&Operand::ScalarReg(lo), ctx, counter as u32);
+                    write_operand(&Operand::ScalarReg(lo + 1), ctx, (counter >> 32) as u32);
+                }
+                _ => write_dest(op, ctx, counter as u32),
+            }
             true
         }
 

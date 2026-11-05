@@ -310,16 +310,25 @@ writers in the accumulator file" above; it stays as written for `x` destinations
 
 Open within this section: rule 2 is an observation about narrow odd-bank writers beside a cascade read;
 the probe cannot say whether the cause is the narrow writer's lane or the read's second chunk, and only
-the `am` quarter movers exercise it. The `SEMAPHORE` side is unprobed (above).
+the `am` quarter movers exercise it.
+
+**`SEMAPHORE` partners (silicon 2026-11-04: no effect).** The itinerary reserves the SEMAPHORE unit
+for the six cycles after the read (`AvoidSemaphore<6>`); `vmov MCD` and the stream moves hold it too.
+Probe `tools/gen_cascade_timing_probe.py` families `semc`/`semcr`/`sems`/`semsr`
+(`build/experiments/harness/cascade/sem1`, 32 cases, r1 == r2, no TDR): the middle core of a chain
+A -> B -> C issues `vmov x0, SCD` and, D = 1..8 bundles after (or before) it, `vmov MCD, x5` (cascade
+to C) or `mov ms, r5` (core stream to C). Every word arrives intact downstream and in B, and the pair
+costs no cycle beyond the read's own hold (stamps around the pair read D + 2 bundles whenever the
+read's hold bundle is not inside the window); two cascade reads 1, 2 or 3 bundles apart (`rt`
+families) likewise lose nothing. The reservation is a scheduling constraint of the compiler model,
+not a silicon hazard; EMU == HW on all 32 cases' data and pair timing. Lock `acq`/`rel` partners
+remain unprobed (a lock under a cascade read needs a lock the harness does not already use).
 
 **Open (not modelled), each with its reason.**
 
-- `VMOV_CASCADE_READ` collisions were **modelled** 2026-11-01 (section below). Still unprobed: the
-  `SEMAPHORE` reservation (the itinerary holds the semaphore unit for the six cycles after the vmov;
-  lock `acq`/`rel`, the stream moves and `vmov MCD` also hold it), because a probe needs a lock or a
-  stream source under the pair and the single-bank accumulator probes never touched them; a cascade
-  read colliding with a second cascade read (the two cannot issue in one bundle and are six apart on
-  the port); and the AIE2P cascade.
+- `VMOV_CASCADE_READ` collisions were **modelled** 2026-11-01 (section below); its `SEMAPHORE`
+  partners `vmov MCD`, the stream moves and a second cascade read were probed 2026-11-04 and have no
+  effect on silicon. Still unprobed: lock `acq`/`rel` as a partner, and the AIE2P cascade.
 - `UPS_UNIT` cannot be separated from `CM_WM_PORT`: every instruction that holds the UPS unit holds
   the write port exactly two cycles later (`vups` 0 and 2, `vlda.ups` 6 and 8), so two instructions
   colliding on the UPS unit collide on the write port at the same instant and no probe can tell which

@@ -1190,3 +1190,44 @@ fn staged_core_release_is_dropped_when_core_control_changes() {
     }
     assert!(!state.array.tile(1, 3).core.enabled);
 }
+
+/// mlir-aie's CDO starts each core at its enable write (RESET already cleared in the init
+/// section): the starts a CDO produced are spread over the release spacing in CDO order.
+#[test]
+fn cdo_enable_writes_start_cores_one_spacing_apart() {
+    use crate::device::registers::TileAddress;
+    use crate::device::state::CoreTransition;
+    use crate::device::state::CORE_RELEASE_SPACING_CYCLES;
+
+    let mut state = DeviceState::new_npu1();
+    let mark = state.pending_core_transitions.len();
+    for (col, row) in [(1u8, 2u8), (1, 3), (2, 2)] {
+        state.write_register(TileAddress::encode(col, row, 0x32000), 0x1).unwrap();
+    }
+    state.stagger_core_starts(mark);
+    assert!(state.array.tile(1, 2).core.enabled);
+    assert!(!state.array.tile(1, 3).core.enabled, "second start is staged");
+    let enables = |s: &mut DeviceState| -> Vec<(u8, u8)> {
+        s.pending_core_transitions
+            .drain(..)
+            .filter_map(|t| match t {
+                CoreTransition::Enable { col, row, enabled: true } => Some((col, row)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(enables(&mut state), vec![(1, 2)]);
+    let mut started = Vec::new();
+    for cycle in 0..=2 * CORE_RELEASE_SPACING_CYCLES {
+        state.tick_core_releases();
+        for t in enables(&mut state) {
+            started.push((cycle, t));
+        }
+    }
+    assert_eq!(
+        started,
+        vec![(CORE_RELEASE_SPACING_CYCLES, (1, 3)), (2 * CORE_RELEASE_SPACING_CYCLES, (2, 2))]
+    );
+    state.tick_core_releases();
+    assert_eq!(state.next_core_start_slot, 0, "the next launch numbers from slot 0 again");
+}

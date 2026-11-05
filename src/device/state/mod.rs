@@ -91,6 +91,9 @@ pub struct DeviceState {
     /// Cores the launch path has released but whose turn has not come yet
     /// (`release_core_resets`, `tick_core_releases`): (col, row, cycles left).
     pub(crate) staged_core_releases: Vec<(u8, u8, u64)>,
+    /// Start slot the next core of the current launch takes (slot k starts k spacings after
+    /// slot 0); back to 0 once every staged start is out.
+    pub(crate) next_core_start_slot: u64,
     /// Column offset applied to all CDO operations.
     ///
     /// CDO streams encode logical (partition-relative) tile columns
@@ -153,6 +156,7 @@ impl DeviceState {
             stats: CdoStats::default(),
             pending_core_transitions: Vec::new(),
             staged_core_releases: Vec::new(),
+            next_core_start_slot: 0,
             start_col,
             async_errors: AsyncErrorSink::new(num_cols),
             contexts,

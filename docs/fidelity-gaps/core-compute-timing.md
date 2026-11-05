@@ -2,7 +2,7 @@
 class: core-compute-timing
 subsystem: compute-core memory-port / execution cycle timing
 posture: mechanism AND per-iteration magnitude modelled + HW-confirmed (bank-arbitration arc); DMA bank-demand cadence HW-derived and fixed; DMA memory-pressure events closed by the staging-FIFO model; producer core-vs-DMA conflict count fixed (C-cycle arbiter, 2026-07-15), residual stall-count phase-average tail documented
-status: scalar write-port collisions modelled (fixed 2026-11-03); scalar-side register widths derived and fixed (2026-11-03; status-flag producers open); cascade depth pinned (2 words, split open, hop latency open); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
+status: scalar write-port collisions modelled (fixed 2026-11-03); scalar-side register widths derived and fixed (2026-11-03; status-flag producers open); cascade link modelled (2-word credit window, 2-cycle transit, same-cycle credit return, staggered core starts; 2026-11-04); 2 open (pipeline-fill depth; bank-arbiter resume-cycle hole, dormant/unreachable on corpus), 1 documented residual (producer stall-count phase-average tail below lockstep resolution, not chased), 4 root-caused-and-modelled
 ---
 
 # Core Compute Timing Gaps
@@ -21,25 +21,73 @@ HW-validated; these gaps are in the memory-port / stall accounting layered on to
 | Producer core over-collides with its own MM2S: net ~1.6x, from two compensating errors | **RE-CHARACTERISED 2026-07-14 on a clean steady-state probe (`producer_probe`); the "17 vs 1, ~10x" framing is RETRACTED.** On a self-looping MM2S draining logical bank 0 while a dense 1-store/cycle core marches the same logical bank, the producer stall rate is **EMU 30 vs HW 18-20 per run (~1.6x)**, the net of two errors that partly cancel: **(1)** EMU generates **~16x FEWER core-vs-DMA bank conflicts** (68 vs ~1100 CONFLICT_DM_BANK cy/run) -- a deterministic **phase anti-lock**: the DMA's per-granule bank pulse (1-in-4, period 8) and the core's per-store bank run (1/cy, period 8) run at the same rate, and the emulator's fixed step schedule pins them in a stable ~half-period anti-phase (92.5% anti-correlated, 6.7x below chance), so the DMA sails through the dense core's opposite-bank cycles. HW phase-locks the OTHER way (nearly every granule collides). **(2)** EMU's per-bank round-robin then loses **44%** of the few conflicts it has; HW loses only **1.6%** (core wins ~98%, DMA absorbs via egress-FIFO slack, `MM2S_STARVATION=0`). Few-but-lossy vs many-but-rarely-lost cancel to ~1.6x. The old "17" was this anti-lock stacked across of_q0_rich's 16 short-object BD boundaries; the reference-capture "1" was a Q=0 coverage undercount (same 16/9 trap as the width finding). | `src/device/dma/engine/stepping.rs:311` `next_granule_fetch` (DMA demand phase, decoupled from core); `:156` `channel_bank_mask`; `src/interpreter/engine/coordinator.rs` `arbitrate_memory_banks` (~2075-2108, the two phases meet uncoupled); `src/device/bank_arbiter.rs` (round-robin, error #2 site); probe `of_q0_rich_bank_arbitration_vs_hw` (`src/testing/xclbin_suite.rs`) | **CONFLICT COUNT LANDED (2026-07-15, C-cycle fix); residual STALL count DOCUMENTED, not chased.** The two-part fix landed as one change across three commits: core-class-priority arbiter (`c1e404a5`), DMA egress-FIFO urgency override + backoff-on-denial granule fetch (`c01ff205`), and threading that urgency into bank arbitration (`a9c2e134`) -- the backoff drift is what breaks the anti-lock (error #1), and core-CLASS priority with round-robin preserved WITHIN the class is error #2's fix, exactly as designed. FIFO depth unchanged (12); no phase constant, no RNG, no calibration knob. Gate (`xdna-emu-priv: research/sdd/task-4-emu-gate.md`): CONFLICT 68 -> 870 (collide) / 900 (collide_read_dense), within ~20% of HW's 1098-1103 / ~1162, read_dense >= collide (port-occupancy direction correct, per the aiesim sequel finding), apart stays 0 (no false conflicts). STARVATION 0, correct. STALL undershoots: EMU 0 vs HW 18-20 (collide) / 24 (collide_read_dense) -- this is NOT the anti-lock recurring and NOT a calibration miss. These are core-vs-local-SRAM bank conflicts (single-cycle on-chip memory on both HW and EMU; the core never touches DDR); the stall count is a small sub-cycle phase-sensitive TAIL -- on HW the analog jitter along the DMA's egress path (stream switch -> shim -> NoC -> DDR) samples the phase-AVERAGE (~18-20 forced grants), while the deterministic lockstep EMU locks to a single phase and lands in the zero-force regime (the same determinism ceiling the N=10 same-binary bimodality already proved -- see the phase-antilock finding). The CONFLICT count is a large aggregate that averages well under the backoff-drift the fix introduced; the STALL count is the small tail a lockstep model structurally has no way to populate. Registered as its own residual in `docs/known-fidelity-gaps.md` and left for the future variable-latency memory / RAM-simulation model -- the principled place to inject the sub-cycle jitter and de-phase-lock the DMA fetch -- as a SIGNPOST, not a promise it recovers exactly 18-20. Both findings updated to LANDED: `xdna-emu-priv: research/findings/2026-07-14-producer-overcollision-phase-antilock.md`, `xdna-emu-priv: research/findings/2026-07-14-producer-collision-aiesim-bank-model.md`. Plan/spec: `xdna-emu-priv: research/plans/2026-07-15-producer-collision-C-cycle.md`, `xdna-emu-priv: research/specs/2026-07-15-producer-collision-C-cycle-spec.md`. |
 | Bank-arbiter resume-cycle hole: one un-arbitrated bank touch on lock/DMA/stream resume | The per-physical-bank round-robin arbiter (bank-arbitration arc, `664f824e`) runs in the coordinator's Phase B demand peek (`CoreInterpreter::peek_bank_demand`), which declares nothing for a core in `WaitingLock`/`WaitingDma`/`WaitingStream` (`src/interpreter/core/interpreter.rs` ~198-205). But `try_resume_stall` (same file, ~858) resolves the stall INSIDE `step_internal`, on the commit path, one call after that cycle's peek already ran -- so the exact cycle a stalled core resumes, it decodes and executes its bundle having declared no bank demand for that cycle. The access reaches memory without ever reaching the arbiter: a **missed conflict, never a double grant** -- strictly an under-count of contention, never an over-count, and nothing is corrupted (EMU memory is not physically single-port). Measured unreachable on the validation corpus: disassembling 60 core ELFs (chess + peano, including the objectfifo kernels used for bridge validation) found **zero** bundles pairing a blocking op (`acq`, stream/cascade ops) with a load/store slot -- Peano always emits the acquire as its own out-of-line function (`acq r0, r1` / `ret lr`), a lone bundle with no memory slot, so nothing is ever both resuming AND touching a bank in the same bundle on the current corpus. | `src/interpreter/core/interpreter.rs`: `peek_bank_demand`'s `WaitingLock`/`WaitingDma`/`WaitingStream` exclusion (~198-205), `try_resume_stall` (~858) | **OPEN, dormant (task 6 review, bank-arbitration arc, 2026-07).** Zero bank touches leak on the current corpus (measured, above), so this is not an active fidelity regression today -- but a VLIW bundle CAN legally carry both a blocking op and a memory slot, so the hole is real, just unexercised. Fix is a non-mutating `can_resume_stall()` predicate consulted in the coordinator's Phase B demand peek instead of inside `step_internal`'s commit path; it needs the neighbour-lock snapshot for the `WaitingLock` arm (the only new plumbing) to evaluate the resume condition without mutating state. NOT implemented -- flagged for whoever next touches the stall-resume machinery, or if a kernel corpus ever produces a bundle that trips it. |
 
-## Cascade link (depth pinned by silicon 2026-11-01; hop latency open)
+## Cascade link (depth, timing, start skew: modelled from silicon 2026-11-04)
 
-Probes: `tools/gen_cascade_probe.py` (writes a suite) through the topology harness
-(`python3 -m harness suite build|hw|emu|compare`); data in `build/experiments/harness/cascade/final/`.
-Producer on the north (flow South) or west (flow East) of the consumer, one
-`aie.cascade_flow`.
+Probes: `tools/gen_cascade_probe.py` (smoke, depth) and `tools/gen_cascade_timing_probe.py`
+(timing, timer phase, SEMAPHORE partners) through the topology harness
+(`python3 -m harness suite build|hw|emu|compare`); data in `build/experiments/harness/cascade/`
+(`final/` depth, `t1` timing, `t2`/`t3` timer phase, `sem1` SEMAPHORE partners, `skew1` start skew).
+Producer on the north (flow South) or west (flow East) of the consumer, one `aie.cascade_flow`.
+
+The timing probes first pass a **sync word**: the consumer is already held in its first read, so
+the release of that read ties the two programs together and everything after it is straight-line
+code on both cores (the cores' start skew, below, would otherwise put a run-to-run jitter of
+hundreds of cycles on every cross-core placement). Each core stamps its timer at `@ts` markers.
 
 | What | Silicon | Model |
 |------|---------|-------|
-| Data path | `vmov MCD, x` / `vmov x, SCD` and the accumulator form (`bml`) carry all 512 bits, in order, South and East (8 distinct words, byte-exact, r1 == r2 == r3) | EMU == HW for both forms since the x-register fix (`cascade.rs`: x is a VectorReg pair; the high 256 bits used to be dropped) |
-| **Total buffering** between producer write and consumer read | **2 words.** Consumer idle for 1500-5000 cycles, producer issues K back-to-back writes and stamps `cntr` after each: writes 0 and 1 complete at the 6-cycle issue pitch, write 2 stalls until the consumer reads. 27/27 stalling runs (South and East, K = 3/8/24, three delays, three runs each) give exactly 2; data exact. Matches AM020's "2-deep". | `CASCADE_TOTAL_DEPTH = 2` (was 4 + 4 = 8, uncalibrated) |
-| Split of the 2 words (producer side / wire / consumer side) | **Not pinned**: the probe sees only the sum. | 1 + 1 (`CASCADE_OUTPUT_DEPTH`, `CASCADE_INPUT_DEPTH`), a modelling choice |
-| Stall length | Tracks the consumer delay plus the cores' start skew (the producer starts ~1100-1800 cycles after the consumer in a South pair, ~1100-1800 before it in an East pair, jittering by a few hundred cycles per run). Slope vs delay is about 1 but the skew jitter hides an exact fit. | not modelled (cores start together in EMU) |
-| Hop latency | Timers of different tiles keep a fixed phase offset (producer stamp minus consumer stamp at release: +5 South, -135 East, stable to a few cycles), so a one-way latency cannot be read off. The sum forward (write stamp to blocked read completing) + backward (consumer pop to the stalled write completing) is offset-free: **17 cycles South (3/3 runs), 16-21 East**, and includes fixed instruction-placement constants of the probe (a few to ~10 cycles, not separated). | the model moves a word per routing step; no latency calibrated |
+| Data path | `vmov MCD, x` / `vmov x, SCD` and the accumulator form (`bml`) carry all 512 bits, in order, South and East (8 distinct words, byte-exact, r1 == r2 == r3) | EMU == HW for both forms since the x-register fix (`cascade.rs`: x is a VectorReg pair) |
+| **Total buffering** | **2 words**, counted from the write until the consumer takes the word. Depth probe: writes 0 and 1 complete at the issue pitch, write 2 stalls until the consumer reads (27/27 stalling runs, South and East, K = 3/8/24) | `CASCADE_TOTAL_DEPTH = 2`, a credit window over MCD stage + transit + SCD (`Tile::cascade_output_full`) |
+| **Hop latency** (write to readable) | **2 cycles**: a word written in cycle t is taken by a consumer bundle issuing in t + 2 or later. Family `rel` (data word n bundles after the sync word, consumer read fixed): consumer stall = max(0, n - 4) for n = 0..24, South and East, r1 == r2; the sync release stamp reads the write's stamp + 3 (the stamp bundle after the write) in every South run | `CASCADE_TRANSIT_CYCLES = 2`: two end-of-cycle moves MCD -> transit -> SCD (`route_cascade`) |
+| **Release latency** (word arrival to held bundle) | **0**: the stall curve above is continuous (no step at the threshold), so a bundle held on an empty SCD issues in the first cycle the word is readable, the cycle an unheld bundle would | the held core resumes in the cycle the word reaches its SCD (`try_resume_stall`, port 254) |
+| **Credit return** (pop to stalled write) | **same cycle**: family `wrel` (link full, third write n bundles after the second): producer stall = 3 - n, i.e. the stalled write issues in the very cycle the consumer's hold bundle takes a word; family `rt` (consumer reads R words back to back after the link filled and a further write stalled; R = 3, 4, 6, spaced 0, 1, 2 bundles): no read ever waits, the producer's stalled writes issue one per pop. South and East, r1 == r2 | the consumer core steps before its producer in every cycle (`InterpreterEngine::core_step_order`) and the producer's downstream occupancy is refreshed between them (`TileArray::refresh_cascade_occupancy`) |
+| **Per-side split** of the 2 words | **not observable**: every probe sees exactly the credit window above plus the 2-cycle transit; the offset-free probes (`rel`, `wrel`, `rt`: single-core timer differences) cannot place the two slots, and no cross-core quantity depends on it once the one-way latency is pinned | modelled as the window, not as two FIFOs (the old 1 + 1 split is gone) |
+| One-way split of the round trip | The offset-free round trip is 2 cycles (pop -> stalled write -> readable); cross-tile stamps read forward 2 / backward 0 if the two tiles' timers agree. **Timer phase probe** (`mf1`/`mr2`, `mf2`/`mr1`): after the sync word one core stores to shared data memory (the producer's South window is the consumer's memory) and the other loads it at a swept distance; the same access kinds in both directions give visibility gaps (neighbour store -> local load 0, local store -> neighbour load 1 cycle) that agree between the two directions only with forward = 2, i.e. the two tiles of a column read the same timer. Two independent pairs agree; r1 == r2 | the emulator's timers are one timebase, so forward 2 / backward 0 reproduce the cross-tile stamps |
+| **Start skew** | Cores start one at a time, column-major with rows ascending over the cores the design uses, about 1448 cycles apart, jittering: see "Core start order" below. A South pair's producer (row r + 1) starts after its consumer, an East pair's producer (column c) before | staggered starts (`DeviceState::stagger_core_starts`, `CORE_RELEASE_SPACING_CYCLES`) |
+| Timers across columns | Column c + 1 reads about 140 cycles more than column c at the same instant (East sync release = write + 137..157, a few cycles of jitter per run; skew probe cross-column gaps median 1584 vs 1448 in a column) | **not modelled** (one timebase): East cross-tile stamp differences differ from silicon by this offset; every offset-free East quantity matches |
+| SEMAPHORE partners of `VMOV_CASCADE_READ` | No effect at any distance: see vector-compute.md, "Cascade-read collisions" | nothing to model |
 
-Still open: the per-side split of the 2 words (needs a probe that can see the
-producer-side queue on its own, e.g. a stall observable on the consumer without
-a read), and an offset-free one-way hop latency (a return path of known latency,
-or a shared timebase between tiles).
+EMU vs silicon after the model change (`t1`, 78 cases: `rel` n = 0..24, `wrel` n = 0..8, five `rt`
+patterns, South and East): every offset-free quantity and every South cross-tile stamp
+difference equal. Before it the offset-free quantities already matched, but the South stamps read
+forward 1 / backward 1: the old model moved a word one stage per cycle and freed the producer a
+cycle after the pop.
+
+### Core start order (silicon 2026-11-04)
+
+Skew probe (`build/experiments/harness/cascade/skew1`, generator `skewgen.py` there): 2 to 4 cores,
+each stamping its timer at its first instruction; layouts: a column (rows 2-5), rows 2+3, rows
+2+5, a row (columns 0-3), columns 0+1, a 2x2 square; 6 runs each. The cores start in
+column-major order with rows ascending over the cores present (the square: (0,2), (0,3), (1,2),
+(1,3)); consecutive starts are one gap apart whatever the distance (rows 2 and 5 alone: one gap).
+The gap is jitter, not a function of the layout: 60 same-column gaps span 1103-2018 cycles
+(median 1448.5, mean 1473, sd 201), and one layout varies run to run. The order is that of the
+cores' enable writes in mlir-aie's CDO (its init section clears RESET, its enable section sets
+ENABLE, one write per core, column-major): the launch path applies them one gap apart (off-array).
+The emulator starts the first core at its enable write and stages each later start one more
+`CORE_RELEASE_SPACING_CYCLES` (1448, the median, a deterministic representative) after it
+(`DeviceState::stagger_core_starts`); cores a CDO leaves held in reset take the following slots at
+the release seam (`release_core_resets`). A core's `MOV_CNTR` reads engine cycles, so cores started
+at different times read one timebase, and it writes both halves of its register pair (the EMU used
+to leave the high register untouched; silicon writes the timer's high word, 0 here). Where the
+start sits relative to the runtime sequence is the open `core-launch-timing` question
+(host-firmware-dispatch.md); the order and spacing hold wherever it lands.
+
+### Cross-tile memory visibility depends on core step order (EMU, open; found 2026-11-04)
+
+The timer-phase probe doubles as a cross-tile memory probe. Silicon, with the timers aligned: a
+store through a neighbour window is visible to a local load issued in the same cycle, and a local
+store to a neighbour-window load issued one cycle later, in both directions of a column (`t2`/`t3`,
+`mf*`/`mr*`, r1 == r2). The emulator gets two of the four right and is one cycle off in the other
+two, and which two depends on the order cores step within a cycle (column-major, rows ascending):
+a neighbour store by the later-stepping core reaches an earlier-stepping local reader one cycle
+late (`mf1`: EMU threshold k = 9, silicon 8), and a local store by the earlier-stepping core
+reaches a later-stepping neighbour-window reader one cycle early (`mr1`: EMU 2, silicon 3). Cause:
+buffered neighbour stores drain after the writing core's step and neighbour reads snapshot
+lazily during the reading core's step (`execute/memory/neighbor.rs`), so same-cycle visibility
+follows the step order instead of the pipeline stages. Not changed here (memory subsystem, outside
+the cascade scope); the fix is order-independent commit points for cross-tile stores and reads,
+checked against these four thresholds.
 
 Probe-design findings (silicon):
 
@@ -72,8 +120,8 @@ Probe-design findings (silicon):
   (`hw_r1_sweep1.txt`, 72 cases x absent/present; EMU `emu_e1_sweep1.txt` identical via
   `p2/cmp.py`). EMU: `PendingCascadeRead` (`state/context.rs`), `CascadeOps::{execute_read,
   due_read_would_stall, complete_due_read}`; tests in `execute/cascade.rs`. Before this the
-  EMU stalled at the vmov and wrote the destination immediately. Not probed: the per-side
-  split of the 2-word buffer, and the release latency from word arrival to the held bundle.
+  EMU stalled at the vmov and wrote the destination immediately. The split and the release
+  latency were probed 2026-11-04 (table above).
 - `vst` clears the low 5 address bits on silicon (a store at +48 landed at +32). Derived for
   the whole load/store family and fixed in the emulator: see "Unaligned accesses" in
   [`addressing.md`](addressing.md).

@@ -26,6 +26,7 @@ impl DeviceState {
     /// are unchanged from the pre-refactor implementation.
     pub fn apply_cdo(&mut self, cdo: &Cdo) -> Result<()> {
         self.stats = CdoStats::default();
+        let first_transition = self.pending_core_transitions.len();
 
         for cmd in cdo.commands() {
             self.stats.commands += 1;
@@ -49,6 +50,7 @@ impl DeviceState {
         // here (behavior-preserving: cores start ~at CDO time, as before Part 1
         // introduced the reset-honoring run-state). Part 2 moves this to the
         // true launch timing.
+        self.stagger_core_starts(first_transition);
         self.release_core_resets();
 
         Ok(())
