@@ -42,7 +42,7 @@ from pathlib import Path
 
 GENERATOR = "tools/gen_fw_op_cost_probe.py"
 
-POLL_WORDS_MAX = 128
+POLL_WORDS_MAX = 512
 BANK_BYTES = 0x2000
 POLL_ADDR = 0x8000
 TIMEOUT_FIRST = 1 << 26      # passes before the first word is given up on (~0.9 s)
@@ -74,6 +74,7 @@ class Case:
     poll_start: int = 0
     poll_stride: int = 1
     filler: Filler | None = None
+    prefill: Filler | None = None   # untimed-by-design ops before the first polled write
     preset: bool = False        # words hold their markers from configuration
     spin_iters: int = 0
 
@@ -88,6 +89,9 @@ def all_cases() -> list[Case]:
         cases.append(Case(f"bw_l{l}", "blockwrite", 128, block=l))
     cases.append(Case("bw_l16_last", "blockwrite", 128, block=16, poll_start=15, poll_stride=16))
     cases.append(Case("bw_l4_last", "blockwrite", 128, block=4, poll_start=3, poll_stride=4))
+    cases.append(Case("bw_l64_last", "blockwrite", 512, block=64, poll_start=63, poll_stride=64))
+    for k in (8, 64):
+        cases.append(Case(f"pre_f{k}_w32_n64", "write32", 64, prefill=Filler("memtile", k)))
     for target, tag in (("memtile", "mt"), ("column1", "c1")):
         for k in (1, 4):
             cases.append(Case(f"il_{tag}_k{k}", "write32", 16, filler=Filler(target, k)))
@@ -117,6 +121,8 @@ def sequence_ops(c: Case) -> list[tuple]:
     if c.kind == "spin":
         return [("write32", "poll", 0, marker(0))]
     ops: list[tuple] = []
+    if c.prefill:
+        ops += [("write32", c.prefill.target, 0, FILLER_VALUE)] * c.prefill.count
     if c.kind == "blockwrite":
         for first in range(0, c.words, c.block):
             ops.append(("blockwrite", "poll", first,
@@ -278,7 +284,8 @@ def generate(root: Path, only: list[str] | None = None) -> list[str]:
         meta = {"name": c.name, "kind": c.kind, "words": c.words, "block": c.block,
                 "polled": polled_indices(c), "results_words": results_words(c),
                 "spin_iters": c.spin_iters, "preset": c.preset,
-                "filler": None if c.filler is None else vars(c.filler)}
+                "filler": None if c.filler is None else vars(c.filler),
+                "prefill": None if c.prefill is None else vars(c.prefill)}
         (d / "case.json").write_text(json.dumps(meta, indent=1) + "\n")
         names.append(c.name)
     return names

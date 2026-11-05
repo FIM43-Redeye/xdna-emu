@@ -71,6 +71,14 @@ def test_interleave_puts_the_fillers_before_each_polled_write():
         assert group[-1][1] == "poll" and group[-1][3] == g.marker(k)
 
 
+def test_prefill_ops_precede_the_timed_writes_and_are_not_polled():
+    c = case("pre_f8_w32_n64")
+    ops = g.sequence_ops(c)
+    assert len(ops) == 8 + 64
+    assert [o[1] for o in ops[:8]] == ["memtile"] * 8 and ops[8] == ("write32", "poll", 0, g.marker(0))
+    assert g.polled_indices(c) == list(range(64))
+
+
 def test_control_has_no_runtime_writes_and_presets_the_words():
     c = case("control")
     assert g.sequence_ops(c) == [] and c.preset
