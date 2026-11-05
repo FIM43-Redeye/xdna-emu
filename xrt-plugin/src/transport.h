@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace xdna_emu {
 
@@ -60,11 +61,39 @@ public:
     virtual void assign_partition(uint8_t /*start_col*/,
                                   uint32_t /*num_tiles*/) {}
 
-    /// Pass the submission's ERT command register map (the kernel
-    /// arguments as the host packed them) to the emulator before
-    /// `execute_from_device`.  No-op if the library lacks the symbol.
-    virtual void set_command_regmap(const uint32_t* /*words*/,
-                                    uint32_t /*count*/) {}
+    /// One compute unit of a hardware context: its PDI and CU function.
+    struct cu_config {
+        const uint8_t* pdi;
+        size_t         size;
+        uint32_t       function;
+    };
+
+    /// Hand the emulator hardware context @ctx's compute units before a
+    /// submission on it, as the driver's CONFIG_CU does.  Returns true when
+    /// the emulator executes that context's commands itself (queue_command
+    /// + run_queued); false when the plugin must load each command's PDI
+    /// and instruction bytes (the default, and for libraries without the
+    /// symbol).
+    virtual bool configure_cus(uint32_t /*ctx*/,
+                               const std::vector<cu_config>& /*cus*/)
+    {
+        return false;
+    }
+
+    /// Queue one ERT command (opcode, CU index, payload after the CU masks)
+    /// of the next submission on @ctx.  Only after configure_cus returned
+    /// true.
+    virtual void queue_command(uint32_t /*ctx*/, uint32_t /*opcode*/,
+                               uint32_t /*cu_index*/,
+                               const uint32_t* /*words*/,
+                               uint32_t /*count*/) {}
+
+    /// Run the queued commands as one submission.
+    virtual void run_queued() {}
+
+    /// The host destroyed hardware context @ctx.  No-op if the library
+    /// lacks the symbol.
+    virtual void destroy_hw_context(uint32_t /*ctx*/) {}
 
     // -- Buffer management ---------------------------------------------------
 

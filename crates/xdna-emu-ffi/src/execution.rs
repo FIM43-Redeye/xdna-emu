@@ -48,18 +48,87 @@ pub unsafe extern "C" fn xdna_emu_execute_npu_instructions(
     }
 }
 
-/// Hand the backend the submission's ERT command register map: the kernel
-/// arguments exactly as the host packed them. Callers that decode an
-/// `ERT_START_CU` packet pass its regmap before
-/// `xdna_emu_execute_npu_instructions`; backends that patch addresses from
-/// the host-buffer list ignore it.
+fn config_result(error: crate::backend::ConfigError, what: &str) -> XdnaEmuResult {
+    match error {
+        crate::backend::ConfigError::Parse(e) => {
+            log::error!("{what}: {e}");
+            crate::set_last_error(e);
+            XdnaEmuResult::ParseError
+        }
+        crate::backend::ConfigError::Apply(e) => {
+            log::error!("{what}: {e}");
+            crate::set_last_error(e);
+            XdnaEmuResult::ExecutionError
+        }
+    }
+}
+
+/// Hand the backend the compute units of host hardware context `ctx` before
+/// a submission on it: `count` PDIs (`pdis[i]`, `pdi_sizes[i]` bytes) with
+/// their CU functions. `*executes_commands` reports whether the backend runs
+/// that context's commands itself; if so the caller queues each command with
+/// `xdna_emu_queue_command` and runs them with one `xdna_emu_run`, otherwise
+/// it loads each command's PDI and instruction bytes as before.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `pdis`, `pdi_sizes` and `functions` must each point to `count` entries,
+///   and each `pdis[i]` to `pdi_sizes[i]` bytes
+/// - `executes_commands` must be writable
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_configure_cus(
+    handle: *mut XdnaEmuHandle,
+    ctx: u32,
+    count: u32,
+    pdis: *const *const u8,
+    pdi_sizes: *const u64,
+    functions: *const u32,
+    executes_commands: *mut u8,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if executes_commands.is_null()
+        || (count > 0 && (pdis.is_null() || pdi_sizes.is_null() || functions.is_null()))
+    {
+        return XdnaEmuResult::NullPointer;
+    }
+    let count = count as usize;
+    let mut cus = Vec::with_capacity(count);
+    for index in 0..count {
+        let (pdi, size) = (*pdis.add(index), *pdi_sizes.add(index));
+        if pdi.is_null() && size > 0 {
+            return XdnaEmuResult::NullPointer;
+        }
+        let pdi = if size == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(pdi, size as usize)
+        };
+        cus.push(crate::backend::CuConfig { pdi, function: *functions.add(index) });
+    }
+    match (*handle).backend.configure_cus(ctx, &cus) {
+        Ok(owned) => {
+            *executes_commands = u8::from(owned);
+            XdnaEmuResult::Success
+        }
+        Err(e) => config_result(e, "configure_cus"),
+    }
+}
+
+/// Queue one ERT command of the next submission on `ctx` (backends that
+/// reported `executes_commands`): the packet opcode, the CU index its CU
+/// mask selects, and the `count` payload words after the CU masks.
 ///
 /// # Safety
 /// - `handle` must be valid
 /// - `words` must point to at least `count` u32 values
 #[no_mangle]
-pub unsafe extern "C" fn xdna_emu_set_command_regmap(
+pub unsafe extern "C" fn xdna_emu_queue_command(
     handle: *mut XdnaEmuHandle,
+    ctx: u32,
+    opcode: u32,
+    cu_index: u32,
     words: *const u32,
     count: u32,
 ) -> XdnaEmuResult {
@@ -69,12 +138,28 @@ pub unsafe extern "C" fn xdna_emu_set_command_regmap(
     if words.is_null() && count > 0 {
         return XdnaEmuResult::NullPointer;
     }
-    let regmap = if count == 0 {
+    let payload = if count == 0 {
         &[][..]
     } else {
         slice::from_raw_parts(words, count as usize)
     };
-    (*handle).backend.set_command_regmap(regmap);
+    let command = crate::backend::ErtCommand { opcode, cu_index, payload };
+    match (*handle).backend.queue_command(ctx, &command) {
+        Ok(()) => XdnaEmuResult::Success,
+        Err(e) => config_result(e, "queue_command"),
+    }
+}
+
+/// The host destroyed hardware context `ctx`.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_destroy_hw_context(handle: *mut XdnaEmuHandle, ctx: u32) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+    (*handle).backend.destroy_hw_context(ctx);
     XdnaEmuResult::Success
 }
 

@@ -176,6 +176,10 @@ private:
     // DMA-channel state from prior submits drift into the next
     // submit's run and stall on lock acquires.
     std::vector<std::vector<uint8_t>> pdi_blobs;
+    // CU function per CU (amdxdna_cu_config::cu_func), for emulator
+    // backends that take the context's CU configuration as a driver sends
+    // it to firmware.
+    std::vector<uint32_t> cu_funcs;
   };
   mutable std::mutex m_ctx_lock;
   mutable std::unordered_map<uint32_t, ctx_entry> m_ctx_map;

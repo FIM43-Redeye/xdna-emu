@@ -61,6 +61,25 @@ pub enum ConfigError {
     Apply(String),
 }
 
+/// One compute unit of a hardware context, as the host's CU configuration
+/// names it: the PDI that configures the array for it and its CU function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CuConfig<'a> {
+    pub pdi: &'a [u8],
+    pub function: u32,
+}
+
+/// One ERT command as a driver receives it: the packet opcode, the CU index
+/// its CU mask selects, and the payload words after the CU masks (for
+/// `ERT_START_CU` the register map, for `ERT_START_NPU` the instruction
+/// buffer descriptor and its arguments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErtCommand<'a> {
+    pub opcode: u32,
+    pub cu_index: u32,
+    pub payload: &'a [u32],
+}
+
 /// The operations the FFI performs that are common to every backend.
 ///
 /// Public so an out-of-tree platform crate can provide a backend through
@@ -96,10 +115,26 @@ pub trait NpuBackend {
         Ok(count)
     }
 
-    /// The submission's ERT command register map (the kernel arguments as
-    /// the host packed them), when the caller has one. Default: ignored; the
-    /// runtime-sequence executor patches addresses from the host-buffer list.
-    fn set_command_regmap(&mut self, _regmap: &[u32]) {}
+    // --- driver-level hardware contexts ---
+    /// The compute units of host hardware context `ctx`, before a
+    /// submission on it. Returns whether this backend executes that
+    /// context's commands itself: then the caller queues each command with
+    /// `queue_command` and runs them with one `run`. Default: `false`; the
+    /// caller applies each command's PDI through `apply_pdi` and runs its
+    /// instruction bytes.
+    fn configure_cus(&mut self, _ctx: u32, _cus: &[CuConfig<'_>]) -> Result<bool, ConfigError> {
+        Ok(false)
+    }
+
+    /// Queue one command of the next submission on `ctx`, for a backend whose
+    /// `configure_cus` returned `true`. The next `run` executes the queued
+    /// commands in order, as one submission.
+    fn queue_command(&mut self, _ctx: u32, _command: &ErtCommand<'_>) -> Result<(), ConfigError> {
+        Err(ConfigError::Apply("this backend does not execute driver-level commands".into()))
+    }
+
+    /// The host destroyed hardware context `ctx`. Default: nothing.
+    fn destroy_hw_context(&mut self, _ctx: u32) {}
 
     // --- host memory (tier-2) ---
     fn host_memory_mut(&mut self) -> &mut HostMemory;

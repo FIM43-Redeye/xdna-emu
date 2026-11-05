@@ -112,8 +112,12 @@ void
 platform_drv_emu::
 destroy_ctx(shim_xdna::destroy_ctx_arg& arg) const
 {
-  const std::lock_guard<std::mutex> lock(m_ctx_lock);
-  m_ctx_map.erase(arg.ctx_handle);
+  {
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    m_ctx_map.erase(arg.ctx_handle);
+  }
+  if (m_transport)
+    m_transport->destroy_hw_context(arg.ctx_handle);
 }
 
 void
@@ -149,6 +153,9 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
       it->second.num_cus = conf->num_cus;
       // Indexed by CU, as commands select their PDI by CU index.
       it->second.pdi_blobs.assign(conf->num_cus, {});
+      it->second.cu_funcs.assign(conf->num_cus, 0);
+      for (uint16_t i = 0; i < conf->num_cus; i++)
+        it->second.cu_funcs[i] = conf->cu_configs[i].cu_func;
     }
   }
 
@@ -474,6 +481,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   // from earlier submits drifts into the next submit's run and
   // stalls on lock acquires.
   std::vector<std::vector<uint8_t>> pdi_blobs;
+  std::vector<uint32_t> cu_funcs;
   uint16_t ctx_start_col = 0;
   // ctx_entry::num_tiles holds the XRT-native num_tiles = num_cols * core_rows
   // value (SHIM hwctx.cpp:279).  The emulator FFI inverts the formula.
@@ -483,6 +491,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     auto it = m_ctx_map.find(arg.ctx_handle);
     if (it != m_ctx_map.end()) {
       pdi_blobs = it->second.pdi_blobs;
+      cu_funcs = it->second.cu_funcs;
       ctx_start_col = static_cast<uint16_t>(it->second.start_col);
       ctx_num_tiles = it->second.num_tiles;
     }
@@ -759,13 +768,47 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   // ert_cmd_state translation below (spec §4.5: WedgeRecovered -> ABORT).
   bool any_wedged = false;
 
+  // Backends that execute driver-level commands take the context's CU
+  // configuration and each command as the driver sends them to firmware
+  // (CONFIG_CU, then the command's opcode, CU index and payload); the
+  // per-command PDI replay and instruction loading below are then theirs.
+  std::vector<emu_transport::cu_config> cus;
+  for (size_t i = 0; i < pdi_blobs.size(); i++)
+    cus.push_back({pdi_blobs[i].data(), pdi_blobs[i].size(),
+                   i < cu_funcs.size() ? cu_funcs[i] : 0});
+  const bool backend_runs_commands =
+      m_transport->configure_cus(arg.ctx_handle, cus);
+  if (backend_runs_commands) {
+    const ert_start_kernel_cmd* queued = nullptr;
+    for (const auto& sc : sub_cmds) {
+      if (sc.pkt == queued)
+        continue;  // one packet, several inline DPU entries
+      queued = sc.pkt;
+      const int cu = ert_cu_idx(sc.pkt);
+      if (cu < 0)
+        shim_err(EINVAL, "submit_cmd: command has an empty CU mask");
+      // amdxdna_cmd_get_payload: the words after the CU masks.
+      const uint32_t masks = 1 + sc.pkt->extra_cu_masks;
+      if (sc.pkt->count < masks)
+        shim_err(EINVAL, "submit_cmd: command count %u below its CU masks",
+                 static_cast<unsigned>(sc.pkt->count));
+      m_transport->queue_command(arg.ctx_handle, sc.pkt->opcode,
+                                 static_cast<uint32_t>(cu),
+                                 sc.pkt->data + sc.pkt->extra_cu_masks,
+                                 sc.pkt->count - masks);
+    }
+    m_transport->run_queued();
+    any_wedged = m_transport->last_run_wedged();
+  }
+
   // Contexts configured without any PDI (nothing captured at
   // config_ctx_cu_config) run on the reset array alone.
   const bool have_pdis = std::any_of(pdi_blobs.begin(), pdi_blobs.end(),
                                      [](const auto& b) { return !b.empty(); });
   int loaded_cu = -1;
 
-  for (size_t cmd_idx = 0; cmd_idx < sub_cmds.size(); cmd_idx++) {
+  for (size_t cmd_idx = 0; !backend_runs_commands && cmd_idx < sub_cmds.size();
+       cmd_idx++) {
     const auto& sc = sub_cmds[cmd_idx];
 
     // Load the PDI of the CU this command runs: the driver sends the
@@ -812,9 +855,6 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       // starting at offset 0x00.
       uint32_t bo_start = (sc.pkt->opcode == ERT_START_CU) ? 0x14 : 0x00;
       auto* regmap = reinterpret_cast<const uint8_t*>(regmap_begin);
-      if (sc.pkt->opcode == ERT_START_CU)
-        m_transport->set_command_regmap(regmap_begin,
-                                        static_cast<uint32_t>(regmap_end - regmap_begin));
 
       uint32_t arg_idx = 0;
       uint32_t valid_bo_count = 0;

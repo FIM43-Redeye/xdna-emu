@@ -111,7 +111,9 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_reset_context_      = resolve_required<fn_reset_context>("xdna_emu_reset_context");
     sym_set_start_col_      = resolve_optional<fn_set_start_col>("xdna_emu_set_start_col");
     sym_assign_partition_   = resolve_optional<fn_assign_partition>("xdna_emu_assign_partition");
-    sym_set_command_regmap_ = resolve_optional<fn_set_command_regmap>("xdna_emu_set_command_regmap");
+    sym_configure_cus_      = resolve_optional<fn_configure_cus>("xdna_emu_configure_cus");
+    sym_queue_command_      = resolve_optional<fn_queue_command>("xdna_emu_queue_command");
+    sym_destroy_hw_context_ = resolve_optional<fn_destroy_hw_context>("xdna_emu_destroy_hw_context");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
@@ -222,14 +224,45 @@ void emu_transport_inprocess::assign_partition(uint8_t start_col,
     check(rc, "assign_partition");
 }
 
-void emu_transport_inprocess::set_command_regmap(const uint32_t* words,
-                                                 uint32_t count)
+bool emu_transport_inprocess::configure_cus(uint32_t ctx,
+                                            const std::vector<cu_config>& cus)
 {
-    if (!sym_set_command_regmap_)
-        return;  // Older emulator builds: the host-buffer list carries the BOs.
+    if (!sym_configure_cus_ || !sym_queue_command_)
+        return false;  // Older emulator builds: the plugin loads PDIs.
+    std::vector<const uint8_t*> pdis;
+    std::vector<uint64_t> sizes;
+    std::vector<uint32_t> functions;
+    for (const auto& cu : cus) {
+        pdis.push_back(cu.pdi);
+        sizes.push_back(cu.size);
+        functions.push_back(cu.function);
+    }
+    uint8_t executes = 0;
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
-    Result rc = sym_set_command_regmap_(emu_, words, count);
-    check(rc, "set_command_regmap");
+    Result rc = sym_configure_cus_(emu_, ctx, static_cast<uint32_t>(cus.size()),
+                                   pdis.data(), sizes.data(), functions.data(),
+                                   &executes);
+    check(rc, "configure_cus");
+    return executes != 0;
+}
+
+void emu_transport_inprocess::queue_command(uint32_t ctx, uint32_t opcode,
+                                            uint32_t cu_index,
+                                            const uint32_t* words,
+                                            uint32_t count)
+{
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    Result rc = sym_queue_command_(emu_, ctx, opcode, cu_index, words, count);
+    check(rc, "queue_command");
+}
+
+void emu_transport_inprocess::destroy_hw_context(uint32_t ctx)
+{
+    if (!sym_destroy_hw_context_)
+        return;
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    Result rc = sym_destroy_hw_context_(emu_, ctx);
+    check(rc, "destroy_hw_context");
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +364,18 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
     rc = sym_sync_cores_(emu_);
     check(rc, "execute (sync cores)");
 
+    run_and_report("execute (run)");
+}
+
+void emu_transport_inprocess::run_queued()
+{
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    last_run_wedged_ = false;
+    run_and_report("run_queued");
+}
+
+void emu_transport_inprocess::run_and_report(const char* what)
+{
     // Run the emulator to completion.
     ExecStatus status = sym_run_(emu_);
     last_run_complete_ = (status.halted != 0);
@@ -351,7 +396,7 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
               << " cycles=" << status.cycles_executed
               << " max_cycles=" << max_cycles_budget_ << "\n";
 
-    check(status.result, "execute (run)");
+    check(status.result, what);
 }
 
 void emu_transport_inprocess::execute_from_device(uint64_t dev_addr,

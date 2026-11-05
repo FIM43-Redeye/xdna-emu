@@ -40,7 +40,12 @@ public:
     void load_pdi(const void* data, size_t size) override;
     void set_start_col(uint8_t start_col) override;
     void assign_partition(uint8_t start_col, uint32_t num_tiles) override;
-    void set_command_regmap(const uint32_t* words, uint32_t count) override;
+    bool configure_cus(uint32_t ctx,
+                       const std::vector<cu_config>& cus) override;
+    void queue_command(uint32_t ctx, uint32_t opcode, uint32_t cu_index,
+                       const uint32_t* words, uint32_t count) override;
+    void run_queued() override;
+    void destroy_hw_context(uint32_t ctx) override;
 
     uint64_t alloc_buffer(size_t size) override;
     void     free_buffer(uint64_t addr) override;
@@ -95,6 +100,10 @@ public:
     bool        last_run_wedged() const override;
 
 private:
+    /// Run to completion, record the outcome and print the bridge's
+    /// XDNA_EMU_STATUS line; throws on an error result.
+    void run_and_report(const char* what);
+
     // -----------------------------------------------------------------------
     // FFI function-pointer types.
     //
@@ -151,7 +160,12 @@ private:
     using fn_reset_context      = Result (*)(XdnaEmuHandle*, uint32_t);
     using fn_set_start_col      = Result (*)(XdnaEmuHandle*, uint8_t);
     using fn_assign_partition   = Result (*)(XdnaEmuHandle*, uint8_t, uint32_t);
-    using fn_set_command_regmap = Result (*)(XdnaEmuHandle*, const uint32_t*, uint32_t);
+    using fn_configure_cus      = Result (*)(XdnaEmuHandle*, uint32_t, uint32_t,
+                                             const uint8_t* const*, const uint64_t*,
+                                             const uint32_t*, uint8_t*);
+    using fn_queue_command      = Result (*)(XdnaEmuHandle*, uint32_t, uint32_t,
+                                             uint32_t, const uint32_t*, uint32_t);
+    using fn_destroy_hw_context = Result (*)(XdnaEmuHandle*, uint32_t);
     using fn_read_register      = uint32_t (*)(XdnaEmuHandle*, uint16_t,
                                                uint16_t, uint32_t);
     using fn_write_register     = Result (*)(XdnaEmuHandle*, uint16_t,
@@ -256,7 +270,9 @@ private:
     fn_reset_context      sym_reset_context_      = nullptr;
     fn_set_start_col      sym_set_start_col_      = nullptr;
     fn_assign_partition   sym_assign_partition_   = nullptr;
-    fn_set_command_regmap sym_set_command_regmap_ = nullptr;
+    fn_configure_cus      sym_configure_cus_      = nullptr;
+    fn_queue_command      sym_queue_command_      = nullptr;
+    fn_destroy_hw_context sym_destroy_hw_context_ = nullptr;
     fn_read_register      sym_read_register_      = nullptr;
     fn_write_register     sym_write_register_     = nullptr;
     fn_read_tile_mem      sym_read_tile_mem_      = nullptr;

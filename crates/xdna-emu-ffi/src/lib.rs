@@ -1176,24 +1176,195 @@ mod tests {
         assert!(select_backend("test-unregistered", never).is_err());
     }
 
+    /// A backend that executes driver-level commands and records what the
+    /// FFI handed it.
+    #[derive(Default)]
+    struct CommandRecorder {
+        cus: Vec<(u32, Vec<u8>, u32)>,
+        commands: Vec<(u32, u32, u32, Vec<u32>)>,
+        destroyed: Vec<u32>,
+    }
+
+    impl crate::backend::NpuBackend for CommandRecorder {
+        fn apply_cdo(&mut self, _cdo: &xdna_emu_core::parser::Cdo<'_>) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_start_col(&mut self, _start_col: u8) {}
+        fn load_elf_bytes(&mut self, _c: usize, _r: usize, _d: &[u8]) -> Result<u32, String> {
+            Ok(0)
+        }
+        fn configure_cus(
+            &mut self,
+            ctx: u32,
+            cus: &[crate::backend::CuConfig<'_>],
+        ) -> Result<bool, crate::backend::ConfigError> {
+            self.cus.extend(cus.iter().map(|cu| (ctx, cu.pdi.to_vec(), cu.function)));
+            Ok(true)
+        }
+        fn queue_command(
+            &mut self,
+            ctx: u32,
+            command: &crate::backend::ErtCommand<'_>,
+        ) -> Result<(), crate::backend::ConfigError> {
+            self.commands
+                .push((ctx, command.opcode, command.cu_index, command.payload.to_vec()));
+            Ok(())
+        }
+        fn destroy_hw_context(&mut self, ctx: u32) {
+            self.destroyed.push(ctx);
+        }
+        fn host_memory_mut(&mut self) -> &mut xdna_emu_core::device::host_memory::HostMemory {
+            unimplemented!()
+        }
+        fn sync_cores_from_device(&mut self) {}
+        fn reset_for_new_context(&mut self) {}
+        fn reset_context(&mut self, _cid: xdna_emu_core::device::context::ContextId) -> Result<(), ()> {
+            Ok(())
+        }
+        fn execute_npu_instructions(
+            &mut self,
+            _stream: &xdna_emu_core::npu::NpuInstructionStream,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn run(
+            &mut self,
+            _max_cycles: u64,
+            _observer: &mut dyn crate::backend::RunObserver,
+        ) -> crate::backend::RunOutcome {
+            crate::backend::RunOutcome { cycles: 0, halt: crate::backend::HaltKind::Completed }
+        }
+        fn add_host_buffer(&mut self, _address: u64, _size: usize) {}
+        fn clear_host_buffers(&mut self) {}
+        fn cols(&self) -> usize {
+            5
+        }
+        fn rows(&self) -> usize {
+            6
+        }
+        fn arch_name(&self) -> String {
+            "recorder".into()
+        }
+        fn partition_column_start(&self) -> u8 {
+            1
+        }
+    }
+
+    fn recorder_handle() -> XdnaEmuHandle {
+        XdnaEmuHandle {
+            backend: Box::new(CommandRecorder::default()),
+            extension: None,
+            xclbin_path: None,
+            max_cycles: 0,
+            next_alloc_addr: 0x8000_0000_0000,
+            free_list: Vec::new(),
+            async_callback: None,
+        }
+    }
+
+    fn recorded(handle: &mut XdnaEmuHandle) -> &CommandRecorder {
+        let backend: &dyn crate::backend::NpuBackend = &*handle.backend;
+        // SAFETY: recorder_handle() always installs a CommandRecorder.
+        unsafe { &*(backend as *const dyn crate::backend::NpuBackend as *const CommandRecorder) }
+    }
+
     #[test]
-    fn set_command_regmap_validates_its_pointers() {
+    fn configure_cus_reports_whether_the_backend_executes_commands() {
         unsafe {
+            let mut owned = 7u8;
             assert_eq!(
-                execution::xdna_emu_set_command_regmap(std::ptr::null_mut(), std::ptr::null(), 0),
+                execution::xdna_emu_configure_cus(
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut owned
+                ),
                 XdnaEmuResult::InvalidHandle
             );
             with_handle(|h| {
                 assert_eq!(
-                    execution::xdna_emu_set_command_regmap(h, std::ptr::null(), 1),
+                    execution::xdna_emu_configure_cus(
+                        h,
+                        0,
+                        1,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        &mut owned
+                    ),
                     XdnaEmuResult::NullPointer
                 );
-                let words = [3u32, 0, 0x1000];
                 assert_eq!(
-                    execution::xdna_emu_set_command_regmap(h, words.as_ptr(), 3),
+                    execution::xdna_emu_configure_cus(
+                        h,
+                        0,
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        &mut owned
+                    ),
                     XdnaEmuResult::Success
                 );
+                assert_eq!(owned, 0, "the interpreter leaves PDIs and instructions to the host");
             });
+
+            let mut handle = recorder_handle();
+            let (a, b) = ([1u8, 2, 3], [4u8; 5]);
+            let pdis = [a.as_ptr(), b.as_ptr()];
+            let sizes = [3u64, 5];
+            let functions = [0u32, 1];
+            assert_eq!(
+                execution::xdna_emu_configure_cus(
+                    &mut handle,
+                    9,
+                    2,
+                    pdis.as_ptr(),
+                    sizes.as_ptr(),
+                    functions.as_ptr(),
+                    &mut owned
+                ),
+                XdnaEmuResult::Success
+            );
+            assert_eq!(owned, 1);
+            assert_eq!(recorded(&mut handle).cus, vec![(9, a.to_vec(), 0), (9, b.to_vec(), 1)]);
+        }
+    }
+
+    #[test]
+    fn queue_command_and_destroy_reach_the_backend() {
+        unsafe {
+            assert_eq!(
+                execution::xdna_emu_queue_command(std::ptr::null_mut(), 0, 0, 0, std::ptr::null(), 0),
+                XdnaEmuResult::InvalidHandle
+            );
+            with_handle(|h| {
+                assert_eq!(
+                    execution::xdna_emu_queue_command(h, 0, 0, 0, std::ptr::null(), 1),
+                    XdnaEmuResult::NullPointer
+                );
+                let words = [3u32];
+                assert_eq!(
+                    execution::xdna_emu_queue_command(h, 0, 0, 0, words.as_ptr(), 1),
+                    XdnaEmuResult::ExecutionError,
+                    "the interpreter does not execute driver-level commands"
+                );
+                assert_eq!(execution::xdna_emu_destroy_hw_context(h, 0), XdnaEmuResult::Success);
+            });
+
+            let mut handle = recorder_handle();
+            let words = [3u32, 0, 0x1000, 0, 4];
+            assert_eq!(
+                execution::xdna_emu_queue_command(&mut handle, 9, 20, 1, words.as_ptr(), 5),
+                XdnaEmuResult::Success
+            );
+            assert_eq!(execution::xdna_emu_destroy_hw_context(&mut handle, 9), XdnaEmuResult::Success);
+            let recorder = recorded(&mut handle);
+            assert_eq!(recorder.commands, vec![(9, 20, 1, words.to_vec())]);
+            assert_eq!(recorder.destroyed, vec![9]);
         }
     }
 
