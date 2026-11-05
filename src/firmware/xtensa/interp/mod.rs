@@ -335,6 +335,8 @@ pub struct Cpu {
     /// Set by the `step` paths whose work is not derivable from the returned
     /// `Step` alone (halted yield, interrupt entry, collapsed loop).
     work_override: Option<Work>,
+    /// Bytes of the instruction the latest `step` fetched (empty if none was).
+    last_fetch: ([u8; 8], u8),
     /// Exception-vector layout of the modeled core configuration.
     vectors: ExceptionVectors,
 }
@@ -388,6 +390,7 @@ impl Cpu {
             halted: false,
             last_work: Work::None,
             work_override: None,
+            last_fetch: ([0; 8], 0),
         }
     }
 
@@ -792,6 +795,7 @@ impl Cpu {
     /// as a distinct case.
     pub fn step<B: XtensaBus + ?Sized>(&mut self, bus: &mut B) -> Step {
         self.work_override = None;
+        self.last_fetch.1 = 0;
         let step = self.step_unaccounted(bus);
         self.last_work = self.work_override.take().unwrap_or(match step {
             Step::Ran => Work::Instruction,
@@ -802,6 +806,14 @@ impl Cpu {
             Step::Unknown { .. } => Work::None,
         });
         step
+    }
+
+    /// The raw bytes of the instruction the latest [`Cpu::step`] fetched
+    /// (translated by the CPU's own MMU, so correct under any mapping); empty
+    /// when the step fetched nothing (halted, interrupt entry, fetch fault, loop
+    /// collapse). For instruments that classify what ran.
+    pub fn last_fetched(&self) -> &[u8] {
+        &self.last_fetch.0[..self.last_fetch.1 as usize]
     }
 
     /// The work done by the latest [`Cpu::step`].
@@ -877,6 +889,7 @@ impl Cpu {
             };
             buf[i] = bus.fetch8(pc.wrapping_add(i as u32), phys_i);
         }
+        self.last_fetch = (buf, need as u8);
         let decoded = decode::decode(&buf[..need], pc);
         match &decoded.op {
             Op::Unknown { word } => return Step::Unknown { pc, word: *word },
@@ -1472,6 +1485,17 @@ mod work_accounting_tests {
             assert_eq!(cpu.last_work(), Work::None);
             assert_eq!(cpu.last_work().instructions(), 0);
         }
+    }
+
+    #[test]
+    fn the_fetched_bytes_are_those_the_mmu_translated() {
+        let mut bus = FlatBus::new(vec![0x00, 0x70, 0x00]); // waiti 0
+        let mut cpu = mapped_cpu(0);
+        assert!(cpu.last_fetched().is_empty());
+        cpu.step(&mut bus);
+        assert_eq!(cpu.last_fetched(), &[0x00, 0x70, 0x00]);
+        cpu.step(&mut bus); // halted: nothing fetched
+        assert!(cpu.last_fetched().is_empty());
     }
 
     #[test]
