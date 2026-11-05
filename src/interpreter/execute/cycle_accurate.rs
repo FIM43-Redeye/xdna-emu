@@ -415,64 +415,39 @@ pub enum AccessOrigin {
     Neighbour(MemoryQuadrant),
 }
 
-/// Per-tile-kind layout of the WatchPoint registers.
+/// Per-tile-kind layout of the WatchPoint registers, from AM025 (generated into
+/// `xdna_archspec::aie2::registers::watchpoint`).
 ///
-/// Compute mem-module exposes 2 slots at 0x14100/4 with direction bits at
-/// 31 (Read) / 30 (Write) and a 12-bit address comparator [15:4]
-/// (16-byte aligned, covers the full 64KB local memory). Memtile exposes 4
-/// slots at 0x94100..0x9410C with direction bits at 29 / 28 and a 15-bit
-/// comparator [18:4] (16-byte aligned, covers the full 512KB memtile mem).
-/// Both layouts gate the slot on WriteStrobes [23:20] == 0xF, the AM025
-/// "active slot" sentinel.
+/// Compute mem-module exposes 2 slots with a 12-bit address comparator [15:4] (16-byte
+/// aligned, covers the full 64KB local memory); memtile exposes 4 slots with a 15-bit
+/// comparator [18:4] (covers the full 512KB memtile mem). Both gate the slot on WriteStrobes
+/// == 0xF, the AM025 "active slot" sentinel.
 ///
-/// Origin filter bit positions per AM025:
-///   compute: AXI [29], DMA [28], East [27], North [26], West [25], South [24]
-///   memtile: AXI [27], DMA [26], East [25], West [24]   (no N/S)
+/// The origin filter bits (AXI, DMA, and the E/N/W/S neighbour quadrants; memtile has no N/S)
+/// sit directly below the direction bits, per the layout.
 struct WatchpointLayout {
-    slot_offsets: &'static [u32],
-    addr_mask: u32,
-    read_bit: u8,
-    write_bit: u8,
-    axi_bit: u8,
-    dma_bit: u8,
-    east_bit: u8,
-    west_bit: u8,
-    /// Memtile lacks N/S quadrant filter bits.
-    north_bit: Option<u8>,
-    south_bit: Option<u8>,
+    fields: &'static xdna_archspec::aie2::registers::watchpoint::Layout,
     event_base: u8,
+}
+
+impl std::ops::Deref for WatchpointLayout {
+    type Target = xdna_archspec::aie2::registers::watchpoint::Layout;
+    fn deref(&self) -> &Self::Target {
+        self.fields
+    }
 }
 
 fn watchpoint_layout(kind: crate::device::tile::TileKind) -> Option<WatchpointLayout> {
     use crate::device::tile::TileKind;
+    use xdna_archspec::aie2::registers::watchpoint;
     use xdna_archspec::aie2::trace_events::{mem_events, memtile_events};
     match kind {
-        TileKind::Compute => Some(WatchpointLayout {
-            slot_offsets: &[0x14100, 0x14104],
-            addr_mask: 0xFFF0,
-            read_bit: 31,
-            write_bit: 30,
-            axi_bit: 29,
-            dma_bit: 28,
-            east_bit: 27,
-            north_bit: Some(26),
-            west_bit: 25,
-            south_bit: Some(24),
-            event_base: mem_events::WATCHPOINT_0,
-        }),
-        TileKind::Mem => Some(WatchpointLayout {
-            slot_offsets: &[0x94100, 0x94104, 0x94108, 0x9410C],
-            addr_mask: 0x7FFF0,
-            read_bit: 29,
-            write_bit: 28,
-            axi_bit: 27,
-            dma_bit: 26,
-            east_bit: 25,
-            west_bit: 24,
-            north_bit: None,
-            south_bit: None,
-            event_base: memtile_events::WATCHPOINT_0,
-        }),
+        TileKind::Compute => {
+            Some(WatchpointLayout { fields: &watchpoint::COMPUTE, event_base: mem_events::WATCHPOINT_0 })
+        }
+        TileKind::Mem => {
+            Some(WatchpointLayout { fields: &watchpoint::MEMTILE, event_base: memtile_events::WATCHPOINT_0 })
+        }
         TileKind::ShimNoc | TileKind::ShimPl => None,
     }
 }
@@ -545,7 +520,8 @@ fn matching_watchpoint_events_with_origin(
         // WriteStrobes [23:20] == 0xF gates the slot. AM025: "always set this
         // field to 0xF when using this watchpoint" -- we treat it as the
         // active/inactive sentinel.
-        if (value >> 20) & 0xF != 0xF {
+        let strobes = (value >> layout.strobes_lsb) & ((1u32 << layout.strobes_width) - 1);
+        if strobes != (1u32 << layout.strobes_width) - 1 {
             continue;
         }
         let dir_match = if is_write {

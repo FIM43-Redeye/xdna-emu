@@ -51,126 +51,89 @@ pub mod mem_tile {
 /// slot, and both behave the same way -- a write triggers a DMA
 /// transfer using the BD ID in the value.
 pub mod dma {
-    /// S2MM channel 0 control. AM025 offset 0x1DE00.
-    pub const COMPUTE_DMA_S2MM_0_CTRL: u32 = 0x1DE00;
-    /// S2MM channel 1 control. AM025 offset 0x1DE08 (stride 0x08).
-    pub const COMPUTE_DMA_S2MM_1_CTRL: u32 = 0x1DE08;
-    /// MM2S channel 0 control. AM025 offset 0x1DE10.
-    pub const COMPUTE_DMA_MM2S_0_CTRL: u32 = 0x1DE10;
-    /// MM2S channel 1 control. AM025 offset 0x1DE18.
-    pub const COMPUTE_DMA_MM2S_1_CTRL: u32 = 0x1DE18;
-
-    /// Per-channel stride (bytes) between adjacent channel control
-    /// registers. Each channel occupies an 8-byte slot: Ctrl at offset
-    /// 0, Start_Queue at offset 4.
-    pub const CHANNEL_STRIDE: u32 = 0x08;
-
-    /// Offset within a channel slot from Ctrl to Start_Queue.
-    /// Real hardware triggers a DMA transfer by pushing a BD ID to
-    /// Start_Queue; Ctrl is channel-level configuration only. Parser
-    /// promotion to `DeviceOp::DmaStart` targets Start_Queue writes.
-    pub const START_QUEUE_OFFSET_IN_SLOT: u32 = 0x04;
-
-    /// S2MM channel 0 Start_Queue. AM025 offset 0x1DE04.
-    pub const COMPUTE_DMA_S2MM_0_START_QUEUE: u32 = 0x1DE04;
-    /// S2MM channel 1 Start_Queue. AM025 offset 0x1DE0C.
-    pub const COMPUTE_DMA_S2MM_1_START_QUEUE: u32 = 0x1DE0C;
-    /// MM2S channel 0 Start_Queue. AM025 offset 0x1DE14.
-    pub const COMPUTE_DMA_MM2S_0_START_QUEUE: u32 = 0x1DE14;
-    /// MM2S channel 1 Start_Queue. AM025 offset 0x1DE1C.
-    pub const COMPUTE_DMA_MM2S_1_START_QUEUE: u32 = 0x1DE1C;
-
-    /// Number of S2MM (and MM2S) channels on memtiles -- 6 per direction.
-    pub const MEMTILE_CHANNELS_PER_DIR: u8 = 6;
-    /// Memtile DMA channel slot stride (Ctrl + Start_Queue = 8 bytes).
-    pub const MEMTILE_CHANNEL_STRIDE: u32 = 0x08;
-    /// Memtile S2MM channel 0 Start_Queue. AM025 offset 0xA0604.
-    /// Subsequent S2MM channels are at +0x08 each (S2MM_1 = 0xA060C, ..., S2MM_5 = 0xA062C).
-    pub const MEMTILE_DMA_S2MM_0_START_QUEUE: u32 = 0xA0604;
-    /// Memtile MM2S channel 0 Start_Queue. AM025 offset 0xA0634.
-    /// Subsequent MM2S channels are at +0x08 each (MM2S_1 = 0xA063C, ..., MM2S_5 = 0xA065C).
-    pub const MEMTILE_DMA_MM2S_0_START_QUEUE: u32 = 0xA0634;
-
-    /// Number of S2MM (and MM2S) channels on shim -- 2 per direction.
-    pub const SHIM_CHANNELS_PER_DIR: u8 = 2;
-    /// Shim DMA channel slot stride (Ctrl + Task_Queue = 8 bytes).
-    pub const SHIM_CHANNEL_STRIDE: u32 = 0x08;
-    /// Shim S2MM channel 0 Task_Queue. AM025 offset 0x1D204.
-    /// (Hardware names this `Task_Queue` on shim; semantically equivalent
-    /// to memtile/compute `Start_Queue`.) S2MM_1 follows at 0x1D20C.
-    pub const SHIM_DMA_S2MM_0_TASK_QUEUE: u32 = 0x1D204;
-    /// Shim MM2S channel 0 Task_Queue. AM025 offset 0x1D214. MM2S_1 at 0x1D21C.
-    pub const SHIM_DMA_MM2S_0_TASK_QUEUE: u32 = 0x1D214;
+    //! Generated from AM025 by `build.rs` (`gen_dma_queue_offsets`): the compute-tile channel
+    //! Ctrl and Start_Queue offsets, the memtile and shim channel-0 queue offsets, strides and
+    //! channel counts.
+    include!(concat!(env!("OUT_DIR"), "/gen_dma_queue.rs"));
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::regdb::RegisterDb;
+        use crate::toolchain_paths::ToolchainPaths;
 
-        /// Drift-detection: asserts the compute-tile DMA channel control
-        /// offsets match the AM025 register-database values. Source:
-        /// `mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json`,
-        /// module "memory".
-        #[test]
-        fn compute_dma_ctrl_offsets_match_am025() {
-            // S2MM lives in the first two slots, MM2S in the next two.
-            assert_eq!(COMPUTE_DMA_S2MM_0_CTRL, 0x1DE00);
-            assert_eq!(COMPUTE_DMA_S2MM_1_CTRL, 0x1DE08);
-            assert_eq!(COMPUTE_DMA_MM2S_0_CTRL, 0x1DE10);
-            assert_eq!(COMPUTE_DMA_MM2S_1_CTRL, 0x1DE18);
-            // Adjacent channels are 0x08 bytes apart (Ctrl + Start_Queue).
-            assert_eq!(COMPUTE_DMA_S2MM_1_CTRL - COMPUTE_DMA_S2MM_0_CTRL, CHANNEL_STRIDE,);
-            assert_eq!(COMPUTE_DMA_MM2S_1_CTRL - COMPUTE_DMA_MM2S_0_CTRL, CHANNEL_STRIDE,);
-            // MM2S_0 follows S2MM_1 with one more stride of gap.
-            assert_eq!(COMPUTE_DMA_MM2S_0_CTRL - COMPUTE_DMA_S2MM_1_CTRL, CHANNEL_STRIDE,);
+        fn am025() -> RegisterDb {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let mlir_aie = ToolchainPaths::require_mlir_aie(&root).expect("mlir-aie checkout");
+            RegisterDb::from_file(&mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json"))
+                .expect("AM025 register database")
         }
 
-        /// Drift-detection: asserts Start_Queue offsets match Ctrl + 4.
-        /// Source: `mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json`
-        /// (DMA_S2MM_0_Start_Queue at 0x1DE04, etc).
+        /// Drift detection: every generated offset, stride and count equals what the AM025
+        /// register database says, read here independently of the build script.
         #[test]
-        fn compute_dma_start_queue_offsets_match_am025() {
-            assert_eq!(COMPUTE_DMA_S2MM_0_START_QUEUE, 0x1DE04);
-            assert_eq!(COMPUTE_DMA_S2MM_1_START_QUEUE, 0x1DE0C);
-            assert_eq!(COMPUTE_DMA_MM2S_0_START_QUEUE, 0x1DE14);
-            assert_eq!(COMPUTE_DMA_MM2S_1_START_QUEUE, 0x1DE1C);
-            // Each Start_Queue is 4 bytes past its Ctrl.
-            assert_eq!(COMPUTE_DMA_S2MM_0_START_QUEUE - COMPUTE_DMA_S2MM_0_CTRL, START_QUEUE_OFFSET_IN_SLOT,);
-            assert_eq!(COMPUTE_DMA_MM2S_1_START_QUEUE - COMPUTE_DMA_MM2S_1_CTRL, START_QUEUE_OFFSET_IN_SLOT,);
-        }
-
-        /// Drift-detection: memtile S2MM/MM2S Start_Queue base offsets,
-        /// stride, and channel-count agree with AM025.
-        /// Source: `aie_registers_aie2.json` module "memory_tile":
-        /// DMA_S2MM_0_Start_Queue at 0xA0604, MM2S_0_Start_Queue at 0xA0634.
-        #[test]
-        fn memtile_dma_start_queue_offsets_match_am025() {
-            assert_eq!(MEMTILE_DMA_S2MM_0_START_QUEUE, 0xA0604);
-            assert_eq!(MEMTILE_DMA_MM2S_0_START_QUEUE, 0xA0634);
-            // 6 channels each direction, 8 bytes apart.
-            assert_eq!(MEMTILE_CHANNELS_PER_DIR, 6);
-            assert_eq!(MEMTILE_CHANNEL_STRIDE, 0x08);
-            // MM2S follows S2MM after 6 channels at stride 8 + 0 gap.
+        fn dma_queue_constants_match_am025() {
+            let db = am025();
+            let at = |module: &str, name: &str| {
+                db.module(module)
+                    .and_then(|m| m.register(name))
+                    .unwrap_or_else(|| panic!("{module}.{name}"))
+                    .offset
+            };
+            for (n, (ctrl, queue)) in [
+                (COMPUTE_DMA_S2MM_0_CTRL, COMPUTE_DMA_S2MM_0_START_QUEUE),
+                (COMPUTE_DMA_S2MM_1_CTRL, COMPUTE_DMA_S2MM_1_START_QUEUE),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(ctrl, at("memory", &format!("DMA_S2MM_{n}_Ctrl")));
+                assert_eq!(queue, at("memory", &format!("DMA_S2MM_{n}_Start_Queue")));
+            }
+            for (n, (ctrl, queue)) in [
+                (COMPUTE_DMA_MM2S_0_CTRL, COMPUTE_DMA_MM2S_0_START_QUEUE),
+                (COMPUTE_DMA_MM2S_1_CTRL, COMPUTE_DMA_MM2S_1_START_QUEUE),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert_eq!(ctrl, at("memory", &format!("DMA_MM2S_{n}_Ctrl")));
+                assert_eq!(queue, at("memory", &format!("DMA_MM2S_{n}_Start_Queue")));
+            }
+            assert_eq!(MEMTILE_DMA_S2MM_0_START_QUEUE, at("memory_tile", "DMA_S2MM_0_Start_Queue"));
+            assert_eq!(MEMTILE_DMA_MM2S_0_START_QUEUE, at("memory_tile", "DMA_MM2S_0_Start_Queue"));
+            assert_eq!(SHIM_DMA_S2MM_0_TASK_QUEUE, at("shim", "DMA_S2MM_0_Task_Queue"));
+            assert_eq!(SHIM_DMA_MM2S_0_TASK_QUEUE, at("shim", "DMA_MM2S_0_Task_Queue"));
+            // Last channel of each memtile direction sits on the generated stride and count.
+            let last = u32::from(MEMTILE_CHANNELS_PER_DIR) - 1;
             assert_eq!(
-                MEMTILE_DMA_MM2S_0_START_QUEUE - MEMTILE_DMA_S2MM_0_START_QUEUE,
-                MEMTILE_CHANNELS_PER_DIR as u32 * MEMTILE_CHANNEL_STRIDE,
+                MEMTILE_DMA_S2MM_0_START_QUEUE + last * MEMTILE_CHANNEL_STRIDE,
+                at("memory_tile", &format!("DMA_S2MM_{last}_Start_Queue"))
             );
-        }
-
-        /// Drift-detection: shim S2MM/MM2S Task_Queue base offsets,
-        /// stride, and channel-count agree with AM025.
-        /// Source: `aie_registers_aie2.json` module "shim":
-        /// DMA_S2MM_0_Task_Queue at 0x1D204, MM2S_0_Task_Queue at 0x1D214.
-        #[test]
-        fn shim_dma_task_queue_offsets_match_am025() {
-            assert_eq!(SHIM_DMA_S2MM_0_TASK_QUEUE, 0x1D204);
-            assert_eq!(SHIM_DMA_MM2S_0_TASK_QUEUE, 0x1D214);
-            assert_eq!(SHIM_CHANNELS_PER_DIR, 2);
-            assert_eq!(SHIM_CHANNEL_STRIDE, 0x08);
-            // MM2S follows S2MM after 2 channels at stride 8.
             assert_eq!(
-                SHIM_DMA_MM2S_0_TASK_QUEUE - SHIM_DMA_S2MM_0_TASK_QUEUE,
-                SHIM_CHANNELS_PER_DIR as u32 * SHIM_CHANNEL_STRIDE,
+                MEMTILE_DMA_MM2S_0_START_QUEUE + last * MEMTILE_CHANNEL_STRIDE,
+                at("memory_tile", &format!("DMA_MM2S_{last}_Start_Queue"))
             );
+            assert!(db
+                .module("memory_tile")
+                .unwrap()
+                .register(&format!("DMA_S2MM_{}_Ctrl", last + 1))
+                .is_none());
+            let last = u32::from(SHIM_CHANNELS_PER_DIR) - 1;
+            assert_eq!(
+                SHIM_DMA_S2MM_0_TASK_QUEUE + last * SHIM_CHANNEL_STRIDE,
+                at("shim", &format!("DMA_S2MM_{last}_Task_Queue"))
+            );
+            assert!(db
+                .module("shim")
+                .unwrap()
+                .register(&format!("DMA_S2MM_{}_Ctrl", last + 1))
+                .is_none());
+            // The compute, memtile and shim slots are all Ctrl + queue, 8 bytes.
+            assert_eq!(CHANNEL_STRIDE, 0x08);
+            assert_eq!(MEMTILE_CHANNEL_STRIDE, CHANNEL_STRIDE);
+            assert_eq!(SHIM_CHANNEL_STRIDE, CHANNEL_STRIDE);
+            assert_eq!(COMPUTE_DMA_S2MM_0_START_QUEUE - COMPUTE_DMA_S2MM_0_CTRL, START_QUEUE_OFFSET_IN_SLOT);
         }
     }
 }
@@ -208,18 +171,91 @@ pub mod ctrl_regs {
     mod tests {
         use super::*;
 
-        /// Drift-detection: asserts control-register IDs match the 4-bit
-        /// encoding in `AIE2GenRegisterInfo.td`. The bit patterns are
-        /// 0b0110, 0b1000, 0b1001 respectively; this test checks the
-        /// decimal equivalents remain stable.
+        /// Drift detection: the IDs equal the `HWEncoding` TableGen gives the registers.
         #[test]
         fn ctrl_reg_ids_match_tablegen_encoding() {
-            // crRnd = 0b0110 = 6
-            assert_eq!(CR_RND, 0b0110, "crRnd encoding changed in AIE2GenRegisterInfo.td");
-            // crSRSSign = 0b1000 = 8
-            assert_eq!(CR_SRS_SIGN, 0b1000, "crSRSSign encoding changed in AIE2GenRegisterInfo.td");
-            // crSat = 0b1001 = 9
-            assert_eq!(CR_SAT, 0b1001, "crSat encoding changed in AIE2GenRegisterInfo.td");
+            let model = crate::aie2::isa::load_from_generated().register_model;
+            let encoding =
+                |name: &str| model.registers.get(name).unwrap_or_else(|| panic!("no {name}")).hw_encoding;
+            assert_eq!(u16::from(CR_RND), encoding("crRnd"));
+            assert_eq!(u16::from(CR_SRS_SIGN), encoding("crSRSSign"));
+            assert_eq!(u16::from(CR_SAT), encoding("crSat"));
+        }
+
+        /// Control and status register widths come from AM025 (`Core_CR` / `Core_SR` fields,
+        /// `Core_S0..3`); the plain registers agree with the widths TableGen gives.
+        #[test]
+        fn core_register_bits_follow_am025() {
+            use super::super::core_register_bits as bits;
+            assert_eq!(bits("s0"), Some(6));
+            assert_eq!(bits("s3"), Some(6));
+            assert_eq!(bits("crSat"), Some(2));
+            assert_eq!(bits("crRnd"), Some(4));
+            for run in ["crFPMask", "crF2IMask", "crF2FMask", "srFPFlags", "srF2IFlags", "srF2FFlags"] {
+                assert_eq!(bits(run), Some(5), "{run}");
+            }
+            assert_eq!(bits("srSS0"), Some(2));
+            for flag in [
+                "crSRSSign",
+                "crUPSSign",
+                "crPackSign",
+                "crUnpackSign",
+                "crVaddSign",
+                "crSCDEn",
+                "crMCDEn",
+                "srCarry",
+                "srMS0",
+                "srSRS_of",
+                "srUPS_of",
+                "srCompr_uf",
+                "srSparse_of",
+            ] {
+                assert_eq!(bits(flag), Some(1), "{flag}");
+            }
+            assert_eq!(bits("r9"), Some(32));
+            assert_eq!(bits("p3"), Some(20));
+            assert_eq!(bits("lr"), Some(20));
+            assert_eq!(bits("nonesuch"), None);
+            // TableGen's class widths and AM025's register widths agree wherever both speak.
+            let model = crate::aie2::isa::load_from_generated().register_model;
+            for name in model.registers.keys() {
+                if let (Some(am025), Some(tablegen)) = (bits(name), model.register_width_bits(name)) {
+                    if name.starts_with("cr")
+                        || name.starts_with("sr")
+                        || name.len() == 2 && name.starts_with('s')
+                    {
+                        continue; // narrower than their 32-bit scalar class by design
+                    }
+                    assert_eq!(u16::from(am025), tablegen, "{name}");
+                }
+            }
+        }
+
+        /// The watchpoint layouts equal the AM025 field positions.
+        #[test]
+        fn watchpoint_layouts_follow_am025() {
+            use super::super::watchpoint::{COMPUTE, MEMTILE};
+            assert_eq!(COMPUTE.slot_offsets, &[0x14100, 0x14104]);
+            assert_eq!(COMPUTE.addr_mask, 0xFFF0);
+            assert_eq!(
+                (COMPUTE.read_bit, COMPUTE.write_bit, COMPUTE.axi_bit, COMPUTE.dma_bit),
+                (31, 30, 29, 28)
+            );
+            assert_eq!(
+                (COMPUTE.east_bit, COMPUTE.north_bit, COMPUTE.west_bit, COMPUTE.south_bit),
+                (27, Some(26), 25, Some(24))
+            );
+            assert_eq!((COMPUTE.strobes_lsb, COMPUTE.strobes_width), (20, 4));
+            assert_eq!(MEMTILE.slot_offsets, &[0x94100, 0x94104, 0x94108, 0x9410C]);
+            assert_eq!(MEMTILE.addr_mask, 0x7FFF0);
+            assert_eq!(
+                (MEMTILE.read_bit, MEMTILE.write_bit, MEMTILE.axi_bit, MEMTILE.dma_bit),
+                (29, 28, 27, 26)
+            );
+            assert_eq!(
+                (MEMTILE.east_bit, MEMTILE.north_bit, MEMTILE.west_bit, MEMTILE.south_bit),
+                (25, None, 24, None)
+            );
         }
     }
 }

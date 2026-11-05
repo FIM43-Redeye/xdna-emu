@@ -1381,7 +1381,273 @@ fn gen_core_module(regdb: &regdb::RegisterDb, out_dir: &Path) {
     writeln!(out, "/// Core module offset range end (before stream switch at 0x3F000)").unwrap();
     writeln!(out, "pub const OFFSET_END: u32 = {:#07X};", offset_end).unwrap();
 
+    gen_core_register_bits(regdb, &mut out);
+    gen_watchpoint_layouts(regdb, &mut out);
     fs::write(out_dir.join("gen_core_module.rs"), out).unwrap();
+
+    gen_dma_queue_offsets(regdb, out_dir);
+}
+
+/// TableGen register name -> the AM025 `Core_CR` / `Core_SR` field(s) it names. A group
+/// (`Float_MAC_*_Mask`) is a run of per-condition bits that TableGen exposes as one register;
+/// its width is the span from the lowest to the highest member (the reserved bit inside a run
+/// counts: the run is one contiguous slice of the register).
+const CORE_FLAG_REGISTERS: &[(&str, &str, &str)] = &[
+    ("crSat", "Core_CR", "Saturation_Mode"),
+    ("crRnd", "Core_CR", "Round_Mode"),
+    ("crFPMask", "Core_CR", "Float_MAC_*_Mask"),
+    ("crF2IMask", "Core_CR", "Bfloat_to_Int_*_Mask"),
+    ("crF2FMask", "Core_CR", "Float_to_Bfloat_*_Mask"),
+    ("crSRSSign", "Core_CR", "SRS_Sign"),
+    ("crUPSSign", "Core_CR", "UPS_Sign"),
+    ("crPackSign", "Core_CR", "Pack_Sign"),
+    ("crUnpackSign", "Core_CR", "Unpack_Sign"),
+    ("crVaddSign", "Core_CR", "Vadd_Sign"),
+    ("crSCDEn", "Core_CR", "SCD_Enable"),
+    ("crMCDEn", "Core_CR", "MCD_Enable"),
+    ("srCarry", "Core_SR", "Carry"),
+    ("srSS0", "Core_SR", "SS0_*"),
+    ("srMS0", "Core_SR", "MS0_Success"),
+    ("srSRS_of", "Core_SR", "SRS_Overflow"),
+    ("srUPS_of", "Core_SR", "UPS_Overflow"),
+    ("srCompr_uf", "Core_SR", "Compression_Underflow"),
+    ("srSparse_of", "Core_SR", "Sparse_Overflow"),
+    ("srFPFlags", "Core_SR", "Float_MAC_*_Flag"),
+    ("srF2IFlags", "Core_SR", "Bfloat_to_Int_*_Flag"),
+    ("srF2FFlags", "Core_SR", "Float_to_Bfloat_*_Flag"),
+];
+
+/// Whether `name` matches `pattern`, where one `*` stands for any text.
+fn matches_field_pattern(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, tail)) => {
+            name.len() >= head.len() + tail.len() && name.starts_with(head) && name.ends_with(tail)
+        }
+    }
+}
+
+/// Emit `core_register_bits(name)`: how many bits AM025 gives the core register that
+/// TableGen calls `name`. Plain registers are `Core_<NAME>` with one `Register_Value` field
+/// (r5 -> Core_R5, lr -> Core_LR); the control and status flags come from
+/// [`CORE_FLAG_REGISTERS`].
+fn gen_core_register_bits(regdb: &regdb::RegisterDb, out: &mut String) {
+    let core = regdb.module("core").expect("AM025 JSON missing 'core' module");
+    let mut entries: Vec<(String, u32)> = Vec::new();
+
+    for register in &core.registers {
+        let Some(upper) = register.name.strip_prefix("Core_") else {
+            continue;
+        };
+        let [field] = register.fields.as_slice() else {
+            continue;
+        };
+        if field.name != "Register_Value" || field.width > 32 {
+            continue;
+        }
+        entries.push((upper.to_ascii_lowercase(), u32::from(field.width)));
+    }
+
+    for &(tablegen_name, register_name, pattern) in CORE_FLAG_REGISTERS {
+        let register = core
+            .register(register_name)
+            .unwrap_or_else(|| panic!("AM025 core register '{register_name}' not found"));
+        let members: Vec<_> = register
+            .fields
+            .iter()
+            .filter(|f| matches_field_pattern(pattern, &f.name))
+            .collect();
+        assert!(!members.is_empty(), "AM025 {register_name} has no field matching '{pattern}'");
+        let low = members.iter().map(|f| f.lsb).min().unwrap();
+        let high = members.iter().map(|f| f.msb).max().unwrap();
+        entries.push((tablegen_name.to_string(), u32::from(high - low) + 1));
+    }
+
+    entries.sort();
+    entries.dedup();
+    writeln!(out).unwrap();
+    writeln!(out, "/// Bits AM025 gives the core register TableGen names `name` (`Core_<NAME>`, or the")
+        .unwrap();
+    writeln!(out, "/// `Core_CR` / `Core_SR` field run behind a control or status register).").unwrap();
+    writeln!(out, "pub fn core_register_bits(name: &str) -> Option<u8> {{").unwrap();
+    writeln!(out, "    match name {{").unwrap();
+    for (name, bits) in &entries {
+        writeln!(out, "        {name:?} => Some({bits}),").unwrap();
+    }
+    writeln!(out, "        _ => None,").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// Emit `watchpoint::{COMPUTE, MEMTILE}`: the WatchPoint<N> slot offsets and field positions
+/// of the compute memory module and the memory-tile module, read from AM025.
+fn gen_watchpoint_layouts(regdb: &regdb::RegisterDb, out: &mut String) {
+    writeln!(out).unwrap();
+    writeln!(out, "/// AM025 WatchPoint<N> register layouts.").unwrap();
+    writeln!(out, "pub mod watchpoint {{").unwrap();
+    writeln!(out, "    /// Slot offsets and field positions of one module's WatchPoint registers.").unwrap();
+    writeln!(out, "    #[derive(Debug, Clone, Copy)]").unwrap();
+    writeln!(out, "    pub struct Layout {{").unwrap();
+    writeln!(out, "        pub slot_offsets: &'static [u32],").unwrap();
+    writeln!(out, "        /// Mask of the `Address` comparator field, in place.").unwrap();
+    writeln!(out, "        pub addr_mask: u32,").unwrap();
+    writeln!(out, "        /// `WriteStrobes` field: lsb and width.").unwrap();
+    writeln!(out, "        pub strobes_lsb: u8,").unwrap();
+    writeln!(out, "        pub strobes_width: u8,").unwrap();
+    writeln!(out, "        pub read_bit: u8,").unwrap();
+    writeln!(out, "        pub write_bit: u8,").unwrap();
+    writeln!(out, "        pub axi_bit: u8,").unwrap();
+    writeln!(out, "        pub dma_bit: u8,").unwrap();
+    writeln!(out, "        pub east_bit: u8,").unwrap();
+    writeln!(out, "        pub west_bit: u8,").unwrap();
+    writeln!(out, "        /// Absent on the memory tile, which has no north / south neighbour filter.")
+        .unwrap();
+    writeln!(out, "        pub north_bit: Option<u8>,").unwrap();
+    writeln!(out, "        pub south_bit: Option<u8>,").unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    for (module_name, const_name) in [("memory", "COMPUTE"), ("memory_tile", "MEMTILE")] {
+        let module = regdb
+            .module(module_name)
+            .unwrap_or_else(|| panic!("AM025 JSON missing '{module_name}'"));
+        let mut slots: Vec<&regdb::RegisterDef> = module
+            .registers
+            .iter()
+            .filter(|r| r.name.strip_prefix("WatchPoint").is_some_and(|n| n.parse::<u32>().is_ok()))
+            .collect();
+        slots.sort_by_key(|r| r.offset);
+        assert!(!slots.is_empty(), "AM025 '{module_name}' has no WatchPoint registers");
+        let first = slots[0];
+        for slot in &slots {
+            let same = slot.fields.len() == first.fields.len()
+                && slot
+                    .fields
+                    .iter()
+                    .zip(&first.fields)
+                    .all(|(a, b)| a.name == b.name && a.lsb == b.lsb && a.msb == b.msb);
+            assert!(
+                same,
+                "AM025 {module_name}: {} and {} lay their fields out differently",
+                slot.name, first.name
+            );
+        }
+        let field = |name: &str| {
+            first
+                .field(name)
+                .unwrap_or_else(|| panic!("AM025 {module_name} WatchPoint has no field '{name}'"))
+        };
+        let offsets: Vec<String> = slots.iter().map(|s| format!("{:#X}", s.offset)).collect();
+        let optional = |name: &str| match first.field(name) {
+            Some(f) => format!("Some({})", f.lsb),
+            None => "None".to_string(),
+        };
+        writeln!(out).unwrap();
+        writeln!(out, "    /// `{module_name}` module.").unwrap();
+        writeln!(out, "    pub const {const_name}: Layout = Layout {{").unwrap();
+        writeln!(out, "        slot_offsets: &[{}],", offsets.join(", ")).unwrap();
+        writeln!(out, "        addr_mask: {:#X},", field("Address").mask << field("Address").shift).unwrap();
+        writeln!(out, "        strobes_lsb: {},", field("WriteStrobes").lsb).unwrap();
+        writeln!(out, "        strobes_width: {},", field("WriteStrobes").width).unwrap();
+        writeln!(out, "        read_bit: {},", field("Read_Access").lsb).unwrap();
+        writeln!(out, "        write_bit: {},", field("Write_Access").lsb).unwrap();
+        writeln!(out, "        axi_bit: {},", field("AXI_Access").lsb).unwrap();
+        writeln!(out, "        dma_bit: {},", field("DMA_Access").lsb).unwrap();
+        writeln!(out, "        east_bit: {},", field("East_Access").lsb).unwrap();
+        writeln!(out, "        west_bit: {},", field("West_Access").lsb).unwrap();
+        writeln!(out, "        north_bit: {},", optional("North_Access")).unwrap();
+        writeln!(out, "        south_bit: {},", optional("South_Access")).unwrap();
+        writeln!(out, "    }};").unwrap();
+    }
+    writeln!(out, "}}").unwrap();
+}
+
+/// Emit `gen_dma_queue.rs`, the body of `registers::dma`: per-channel Ctrl / queue-register
+/// offsets, strides and channel counts of the compute, memory-tile and shim DMAs.
+fn gen_dma_queue_offsets(regdb: &regdb::RegisterDb, out_dir: &Path) {
+    let mut out = gen_header("AM025 DMA channel Ctrl / queue registers");
+
+    // (module, const prefix, queue register suffix)
+    let modules = [
+        ("memory", "COMPUTE", "Start_Queue"),
+        ("memory_tile", "MEMTILE", "Start_Queue"),
+        ("shim", "SHIM", "Task_Queue"),
+    ];
+    let mut slot_strides = Vec::new();
+    let mut queue_offsets = Vec::new();
+
+    for (module_name, prefix, queue) in modules {
+        let module = regdb
+            .module(module_name)
+            .unwrap_or_else(|| panic!("AM025 JSON missing '{module_name}'"));
+        let offset = |name: String| -> u32 {
+            module
+                .register(&name)
+                .unwrap_or_else(|| panic!("AM025 {module_name} missing {name}"))
+                .offset
+        };
+        let channels = |dir: &str| -> u32 {
+            (0..)
+                .take_while(|n| module.register(&format!("DMA_{dir}_{n}_Ctrl")).is_some())
+                .count() as u32
+        };
+        let (s2mm, mm2s) = (channels("S2MM"), channels("MM2S"));
+        assert!(s2mm > 0 && s2mm == mm2s, "AM025 {module_name}: S2MM/MM2S channel counts {s2mm}/{mm2s}");
+        let stride = offset("DMA_S2MM_1_Ctrl".into()) - offset("DMA_S2MM_0_Ctrl".into());
+        for dir in ["S2MM", "MM2S"] {
+            for n in 0..s2mm {
+                let ctrl = offset(format!("DMA_{dir}_{n}_Ctrl"));
+                let q = offset(format!("DMA_{dir}_{n}_{queue}"));
+                assert_eq!(
+                    ctrl,
+                    offset(format!("DMA_{dir}_0_Ctrl")) + n * stride,
+                    "{module_name} {dir}_{n} not on the stride"
+                );
+                queue_offsets.push(q - ctrl);
+            }
+        }
+        slot_strides.push(stride);
+
+        let q_upper = queue.to_ascii_uppercase();
+        if module_name == "memory" {
+            // Compute tiles have two channels per direction; each is spelled out.
+            for dir in ["S2MM", "MM2S"] {
+                for n in 0..s2mm {
+                    let ctrl = offset(format!("DMA_{dir}_{n}_Ctrl"));
+                    writeln!(out, "/// {dir} channel {n} control. AM025 offset {ctrl:#X}.").unwrap();
+                    writeln!(out, "pub const {prefix}_DMA_{dir}_{n}_CTRL: u32 = {ctrl:#X};").unwrap();
+                }
+            }
+            for dir in ["S2MM", "MM2S"] {
+                for n in 0..s2mm {
+                    let q = offset(format!("DMA_{dir}_{n}_{queue}"));
+                    writeln!(out, "/// {dir} channel {n} {queue}. AM025 offset {q:#X}.").unwrap();
+                    writeln!(out, "pub const {prefix}_DMA_{dir}_{n}_{q_upper}: u32 = {q:#X};").unwrap();
+                }
+            }
+        } else {
+            writeln!(out, "/// Number of S2MM (and MM2S) channels on {module_name}.").unwrap();
+            writeln!(out, "pub const {prefix}_CHANNELS_PER_DIR: u8 = {s2mm};").unwrap();
+            writeln!(out, "/// {module_name} DMA channel slot stride (Ctrl + {queue}).").unwrap();
+            writeln!(out, "pub const {prefix}_CHANNEL_STRIDE: u32 = {stride:#X};").unwrap();
+            for dir in ["S2MM", "MM2S"] {
+                let q = offset(format!("DMA_{dir}_0_{queue}"));
+                writeln!(out, "/// {dir} channel 0 {queue}; later channels follow at the slot stride.")
+                    .unwrap();
+                writeln!(out, "pub const {prefix}_DMA_{dir}_0_{q_upper}: u32 = {q:#X};").unwrap();
+            }
+        }
+    }
+
+    let stride = slot_strides[0];
+    assert!(slot_strides.iter().all(|&s| s == stride), "DMA slot stride differs between modules");
+    let queue_in_slot = queue_offsets[0];
+    assert!(queue_offsets.iter().all(|&o| o == queue_in_slot), "queue-register offset in slot differs");
+    writeln!(out, "/// Per-channel stride (bytes) between adjacent channel control registers.").unwrap();
+    writeln!(out, "pub const CHANNEL_STRIDE: u32 = {stride:#X};").unwrap();
+    writeln!(out, "/// Offset within a channel slot from Ctrl to the queue register.").unwrap();
+    writeln!(out, "pub const START_QUEUE_OFFSET_IN_SLOT: u32 = {queue_in_slot:#X};").unwrap();
+
+    fs::write(out_dir.join("gen_dma_queue.rs"), out).unwrap();
 }
 
 // ============================================================================
