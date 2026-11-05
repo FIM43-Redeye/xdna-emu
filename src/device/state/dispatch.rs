@@ -53,10 +53,32 @@ impl DeviceState {
         if row == 0 && offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET {
             return self.array.clock().read_register(col, row, offset).unwrap_or(0);
         }
+        if let Some(status) = self.dma_channel_status(col, row, offset) {
+            return status;
+        }
         match self.array.get_mut(col, row) {
             Some(tile) => tile.read_register(offset),
             None => 0,
         }
+    }
+
+    /// A read of a DMA channel status register (DMA_S2MM_Status_n /
+    /// DMA_MM2S_Status_n): the live channel state, task-queue size included,
+    /// which a controller polls before pushing a task onto a full queue.
+    fn dma_channel_status(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
+        let layout = regdb::device_reg_layout();
+        let dma = self.array.dma_engine(col, row)?;
+        let (s2mm, mm2s) = (dma.s2mm_channel_count() as u32, dma.mm2s_channel_count() as u32);
+        let word = |base: u32, count: u32| {
+            (offset >= base && offset < base + count * 4 && offset % 4 == 0).then(|| (offset - base) / 4)
+        };
+        let channel = match tile_kind_from_row(row) {
+            TileKind::Compute => word(layout.memory_status_base, s2mm + mm2s),
+            TileKind::ShimNoc | TileKind::ShimPl => word(layout.shim_status_base, s2mm + mm2s),
+            TileKind::Mem => word(layout.memtile_status_s2mm_base, s2mm)
+                .or_else(|| word(layout.memtile_status_mm2s_base, mm2s).map(|index| s2mm + index)),
+        }?;
+        Some(dma.get_channel_status(channel as u8))
     }
 
     /// Internal register bus dispatch. Decodes an encoded tile address and
@@ -600,6 +622,29 @@ mod tests {
         d.write_tile_register(1, 0, 0x1D204, 0x8000_0000); // S2MM0 queue, token issue
         d.write_tile_register(1, 0, 0x1D200, 0x100); // S2MM0 Ctrl, Controller_ID 1
         assert_eq!(d.array.dma_engine(1, 0).unwrap().channel_controller_id(0), Some(1));
+    }
+
+    /// A controller polls a channel's status before pushing onto its task queue
+    /// (dma_queue_overflow); the register read must show the queue it has.
+    #[test]
+    fn dma_status_register_reads_report_the_task_queue() {
+        use crate::device::regdb::device_reg_layout;
+        let layout = device_reg_layout();
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(1, 1);
+        let status = |d: &mut DeviceState, row, offset| d.read_tile_register(1, row, offset);
+        // A shim MM2S0 task blocked on a lock, then three more queued.
+        let shim_mm2s0 = layout.shim_status_base + 2 * 4;
+        assert_eq!(status(&mut d, 0, shim_mm2s0), 0);
+        for _ in 0..4 {
+            d.write_tile_register(1, 0, layout.shim_channel_base + 2 * layout.shim_channel_stride + 4, 0);
+        }
+        let queued = d.array.dma_engine(1, 0).unwrap().get_channel_status(2);
+        assert_ne!(queued, 0);
+        assert_eq!(status(&mut d, 0, shim_mm2s0), queued);
+        // Memory-tile MM2S status words follow their own base.
+        let mt = d.array.dma_engine(1, 1).unwrap().get_channel_status(6);
+        assert_eq!(status(&mut d, 1, layout.memtile_status_mm2s_base), mt);
     }
 
     #[test]

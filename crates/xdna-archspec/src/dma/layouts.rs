@@ -103,6 +103,10 @@ pub struct DeviceRegLayout {
     pub memtile_channel_mm2s_base: u32,
     /// DMA channel stride in bytes (memory tile)
     pub memtile_channel_stride: u32,
+    /// S2MM channel status base address (memory tile)
+    pub memtile_status_s2mm_base: u32,
+    /// MM2S channel status base address (memory tile)
+    pub memtile_status_mm2s_base: u32,
 
     // -- Stream switch layouts --
     /// Compute tile stream switch address ranges
@@ -141,6 +145,8 @@ pub struct DeviceRegLayout {
     pub shim_channel_base: u32,
     /// DMA channel stride in bytes (shim)
     pub shim_channel_stride: u32,
+    /// DMA channel status base address (shim): S2MM then MM2S, one word each
+    pub shim_status_base: u32,
 
     // -- Per-module event/trace register layout (derived from register names) --
     // These are looked up by name from the register database, so they
@@ -252,6 +258,8 @@ impl DeviceRegLayout {
         let memtile_channel_mm2s_base = reg_offset("memory_tile", "DMA_MM2S_0_Ctrl")?;
         let memtile_channel_stride =
             reg_offset("memory_tile", "DMA_S2MM_1_Ctrl")? - memtile_channel_s2mm_base;
+        let memtile_status_s2mm_base = reg_offset("memory_tile", "DMA_S2MM_Status_0")?;
+        let memtile_status_mm2s_base = reg_offset("memory_tile", "DMA_MM2S_Status_0")?;
 
         // -- Stream switch --
         // Note: AM025 JSON places compute tile stream switch registers under
@@ -282,6 +290,7 @@ impl DeviceRegLayout {
         // -- Shim channels --
         let shim_channel_base = reg_offset("shim", "DMA_S2MM_0_Ctrl")?;
         let shim_channel_stride = reg_offset("shim", "DMA_S2MM_1_Ctrl")? - shim_channel_base;
+        let shim_status_base = reg_offset("shim", "DMA_S2MM_Status_0")?;
 
         // -- Per-module event/trace registers --
         // Helper: look up a register offset, returning 0 if not found
@@ -366,6 +375,8 @@ impl DeviceRegLayout {
             memtile_channel_s2mm_base,
             memtile_channel_mm2s_base,
             memtile_channel_stride,
+            memtile_status_s2mm_base,
+            memtile_status_mm2s_base,
             memory_stream_switch,
             memtile_stream_switch,
             shim_mux,
@@ -379,6 +390,7 @@ impl DeviceRegLayout {
             shim_bd_words,
             shim_channel_base,
             shim_channel_stride,
+            shim_status_base,
             core_events,
             memory_events,
             memtile_events,
