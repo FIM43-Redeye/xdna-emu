@@ -11,7 +11,7 @@
 //!   LEND: (loop back-edge)
 //! Anything else is not recognized (`None`) and the caller grinds normally.
 
-use super::{Access, Cpu, Step};
+use super::{Access, Cpu, Step, Work};
 use super::super::bus::XtensaBus;
 use crate::firmware::xtensa::mmu::AccessKind;
 use crate::firmware::xtensa::decode::{self, Op};
@@ -110,6 +110,9 @@ pub(super) fn try_fill_loop<B: XtensaBus + ?Sized>(cpu: &mut Cpu, bus: &mut B) -
     cpu.regs.write_ar(ptr_reg, start.wrapping_add(total as u32));
     cpu.regs.lcount = 0;
     cpu.pc = lend;
+    // The body is two instructions per iteration; the zero-overhead loop adds
+    // none.
+    cpu.work_override = Some(Work::Collapsed { instructions: 2 * n });
     Some(Step::Ran)
 }
 
@@ -234,6 +237,37 @@ mod tests {
         let d2 = decode::decode(&[0x1b, 0x55], 0);
         assert!(matches!(d2.op, Op::AddiN { t: 5, s: 5, imm: 1 }), "got {:?}", d2.op);
         assert_eq!(d2.len, 2);
+    }
+
+    #[test]
+    fn collapsed_fill_reports_the_work_the_ground_loop_does() {
+        const CODE: u32 = 0x0100_0000;
+        const DEST: u32 = 0x0100_4000;
+        const N: u32 = 5000;
+        let run = |fast: bool| -> u64 {
+            let mut cpu = Cpu::new(CODE, unmapped_mmu(), ExceptionVectors::default());
+            cpu.fastpath_enabled = fast;
+            cpu.mmu
+                .write_entry(Tlb::Instruction, (CODE & 0xfff0_0000) | 4, (CODE & 0xfff0_0000) | 0x1);
+            cpu.mmu
+                .write_entry(Tlb::Data, (CODE & 0xfff0_0000) | 4, (CODE & 0xfff0_0000) | 0x3);
+            let mut bus = FlatBus::new(vec![]);
+            let lend = place_byte_fill_body(&mut bus, CODE);
+            cpu.pc = CODE;
+            cpu.regs.lbeg = CODE;
+            cpu.regs.lend = lend;
+            cpu.regs.lcount = N - 1;
+            cpu.regs.write_ar(5, DEST);
+            cpu.regs.write_ar(3, 0xab);
+            let mut work = 0;
+            while cpu.pc != lend {
+                assert!(matches!(cpu.step(&mut bus), Step::Ran));
+                work += cpu.last_work().instructions();
+            }
+            work
+        };
+        assert_eq!(run(true), run(false));
+        assert_eq!(run(true), 2 * u64::from(N));
     }
 
     #[test]

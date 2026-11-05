@@ -236,6 +236,42 @@ pub enum Step {
     Unknown { pc: u32, word: u32 },
 }
 
+/// What the most recent `Cpu::step` did, for work accounting. `Step` says how
+/// control flow continues; `Work` says whether the core actually spent
+/// execution on it. A caller that prices time per instruction must count
+/// `Work::instructions`, never the number of `step` calls: a halted core
+/// yields on every call without doing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    /// One instruction (or one FLIX bundle) retired.
+    Instruction,
+    /// A recognised loop was collapsed into one step; `instructions` is how
+    /// many instructions the per-instruction interpreter would have retired.
+    Collapsed { instructions: u64 },
+    /// The `WAITI` that parks the core executed (work once, then halted).
+    WaitiEntry,
+    /// The core was already halted and had nothing to wake it: a yield, no work.
+    HaltedYield,
+    /// A pending interrupt was taken: entry into the handler, no instruction
+    /// of the interrupted stream retired.
+    InterruptEntry,
+    /// An instruction attempt (or its fetch) raised an exception.
+    Fault,
+    /// The instruction is not implemented (`Step::Unknown`): nothing executed.
+    None,
+}
+
+impl Work {
+    /// Instructions of work this step stands for.
+    pub fn instructions(self) -> u64 {
+        match self {
+            Work::Instruction | Work::WaitiEntry | Work::Fault => 1,
+            Work::Collapsed { instructions } => instructions,
+            Work::HaltedYield | Work::InterruptEntry | Work::None => 0,
+        }
+    }
+}
+
 /// The Xtensa interpreter core: program counter plus the windowed register file.
 pub struct Cpu {
     /// Program counter -- byte address in the CPU's address space.
@@ -294,6 +330,11 @@ pub struct Cpu {
     /// deliverable interrupt arrives (Xtensa "waiti" suspended state, ISA RM
     /// WAITI, p.556). Cleared when an interrupt is delivered.
     pub halted: bool,
+    /// Work classification of the latest `step`; read it with [`Cpu::last_work`].
+    last_work: Work,
+    /// Set by the `step` paths whose work is not derivable from the returned
+    /// `Step` alone (halted yield, interrupt entry, collapsed loop).
+    work_override: Option<Work>,
     /// Exception-vector layout of the modeled core configuration.
     vectors: ExceptionVectors,
 }
@@ -345,6 +386,8 @@ impl Cpu {
             excsave: [0; 7],
             fr: [0; 16],
             halted: false,
+            last_work: Work::None,
+            work_override: None,
         }
     }
 
@@ -748,6 +791,25 @@ impl Cpu {
     /// equal to its own fall-through address is dead code) and is not modeled
     /// as a distinct case.
     pub fn step<B: XtensaBus + ?Sized>(&mut self, bus: &mut B) -> Step {
+        self.work_override = None;
+        let step = self.step_unaccounted(bus);
+        self.last_work = self.work_override.take().unwrap_or(match step {
+            Step::Ran => Work::Instruction,
+            // Only `waiti` itself returns Wait from the core; the halted and
+            // interrupt paths record their own override.
+            Step::Wait(_) => Work::WaitiEntry,
+            Step::Exception { .. } => Work::Fault,
+            Step::Unknown { .. } => Work::None,
+        });
+        step
+    }
+
+    /// The work done by the latest [`Cpu::step`].
+    pub fn last_work(&self) -> Work {
+        self.last_work
+    }
+
+    fn step_unaccounted<B: XtensaBus + ?Sized>(&mut self, bus: &mut B) -> Step {
         self.interrupt |= bus.take_interrupt_assertions();
 
         // Interrupts are checked between instructions (faithful Xtensa). A
@@ -761,12 +823,14 @@ impl Cpu {
         // than let it re-park.
         if self.interrupt_deliverable() {
             self.halted = false;
+            self.work_override = Some(Work::InterruptEntry);
             return self.raise_general_exception(self.pc, EXCCAUSE_LEVEL1_INTERRUPT);
         }
 
         // A halted CPU (post-waiti) runs no instructions; it only yields Wait
         // until a deliverable interrupt arrives (checked above, ahead of this).
         if self.halted {
+            self.work_override = Some(Work::HaltedYield);
             return Step::Wait(WaitReason::Waiti);
         }
 
@@ -1346,5 +1410,79 @@ mod tests {
         // With the source acked, the body nop runs -- no spurious re-delivery.
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x103);
+    }
+}
+
+#[cfg(test)]
+mod work_accounting_tests {
+    use super::*;
+    use crate::firmware::xtensa::flat_bus::FlatBus;
+
+    #[test]
+    fn a_plain_instruction_is_one_instruction_of_work() {
+        let mut bus = FlatBus::new(vec![0xf0, 0x20, 0x00]); // nop
+        let mut cpu = mapped_cpu(0);
+        assert_eq!(cpu.step(&mut bus), Step::Ran);
+        assert_eq!(cpu.last_work(), Work::Instruction);
+        assert_eq!(cpu.last_work().instructions(), 1);
+    }
+
+    #[test]
+    fn waiti_is_work_once_and_the_halted_yields_after_it_are_not() {
+        let mut bus = FlatBus::new(vec![0x00, 0x70, 0x00]); // waiti 0
+        let mut cpu = mapped_cpu(0);
+        assert!(matches!(cpu.step(&mut bus), Step::Wait(WaitReason::Waiti)));
+        assert_eq!(cpu.last_work(), Work::WaitiEntry);
+        assert_eq!(cpu.last_work().instructions(), 1);
+        for _ in 0..3 {
+            assert!(matches!(cpu.step(&mut bus), Step::Wait(WaitReason::Waiti)));
+            assert_eq!(cpu.last_work(), Work::HaltedYield);
+            assert_eq!(cpu.last_work().instructions(), 0);
+        }
+    }
+
+    #[test]
+    fn interrupt_entry_is_labelled_and_is_not_an_instruction() {
+        let vector = ExceptionVectors::default().kernel as usize;
+        let mut rom = vec![0u8; vector + 3];
+        rom[vector..vector + 3].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        let mut bus = FlatBus::new(rom);
+        let mut cpu = mapped_cpu(0);
+        cpu.halted = true;
+        cpu.pc = 0x1000;
+        cpu.intenable = 1;
+        cpu.interrupt = 1;
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
+        assert_eq!(cpu.last_work(), Work::InterruptEntry);
+        assert_eq!(cpu.last_work().instructions(), 0);
+    }
+
+    #[test]
+    fn a_faulting_attempt_is_work_and_an_unknown_opcode_is_not() {
+        // No ITLB entry for the fetch page: the attempt faults.
+        let mut bus = FlatBus::new(vec![0xf0, 0x20, 0x00]);
+        let mut cpu = Cpu::new(0, unmapped_mmu(), ExceptionVectors::default());
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
+        assert_eq!(cpu.last_work(), Work::Fault);
+        assert_eq!(cpu.last_work().instructions(), 1);
+
+        let mut bus = FlatBus::new(vec![0xff, 0xff, 0xff]);
+        let mut cpu = mapped_cpu(0);
+        if let Step::Unknown { .. } = cpu.step(&mut bus) {
+            assert_eq!(cpu.last_work(), Work::None);
+            assert_eq!(cpu.last_work().instructions(), 0);
+        }
+    }
+
+    #[test]
+    fn work_does_not_leak_from_one_step_to_the_next() {
+        let mut bus = FlatBus::new(vec![0x00, 0x70, 0x00, 0xf0, 0x20, 0x00]);
+        let mut cpu = mapped_cpu(0);
+        cpu.step(&mut bus); // waiti
+        cpu.step(&mut bus); // halted yield
+        assert_eq!(cpu.last_work(), Work::HaltedYield);
+        cpu.halted = false;
+        assert_eq!(cpu.step(&mut bus), Step::Ran); // nop at 3
+        assert_eq!(cpu.last_work(), Work::Instruction);
     }
 }
