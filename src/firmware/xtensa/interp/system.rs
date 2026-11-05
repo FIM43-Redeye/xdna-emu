@@ -6,7 +6,7 @@
 //! `ipfl`/`ihu`/`iiu`/`iii` -- 19 cache-maintenance ops total, all logged
 //! no-ops since this interpreter models no cache).
 
-use super::{Cpu, Step, EXCCAUSE_SYSCALL};
+use super::{CacheOp, Cpu, Step, EXCCAUSE_SYSCALL};
 use crate::firmware::xtensa::mmu::Tlb;
 use crate::firmware::xtensa::decode::Op;
 
@@ -103,6 +103,8 @@ pub(super) fn exec(cpu: &mut Cpu, op: &Op, pc: u32, len: u8) -> Option<Step> {
         // dhwbi/dhi/dii/ihi: cache-maintenance ops, logged no-ops -- this
         // interpreter has no cache model to invalidate/writeback.
         Op::Dhwbi { s, imm } => {
+            cpu.last_cache_op =
+                Some(CacheOp::InvalidateHit { vaddr: cpu.regs.read_ar(*s).wrapping_add(*imm) });
             log::debug!(
                 "firmware interp: dhwbi a{},{} (addr 0x{:08x}) at 0x{:08x} (no modeled cache)",
                 s,
@@ -112,6 +114,8 @@ pub(super) fn exec(cpu: &mut Cpu, op: &Op, pc: u32, len: u8) -> Option<Step> {
             );
         }
         Op::Dhi { s, imm } => {
+            cpu.last_cache_op =
+                Some(CacheOp::InvalidateHit { vaddr: cpu.regs.read_ar(*s).wrapping_add(*imm) });
             log::debug!(
                 "firmware interp: dhi a{},{} (addr 0x{:08x}) at 0x{:08x} (no modeled cache)",
                 s,
@@ -121,6 +125,8 @@ pub(super) fn exec(cpu: &mut Cpu, op: &Op, pc: u32, len: u8) -> Option<Step> {
             );
         }
         Op::Dii { s, imm } => {
+            cpu.last_cache_op =
+                Some(CacheOp::InvalidateIndex { vaddr: cpu.regs.read_ar(*s).wrapping_add(*imm) });
             log::debug!(
                 "firmware interp: dii a{},{} (addr 0x{:08x}) at 0x{:08x} (no modeled cache)",
                 s,

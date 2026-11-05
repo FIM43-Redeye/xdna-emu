@@ -31,6 +31,7 @@ pub mod loading;
 pub mod npu;
 pub mod trace;
 pub mod debug;
+pub mod timebase;
 
 // GUI (requires eframe/egui)
 #[cfg(feature = "gui")]

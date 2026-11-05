@@ -202,8 +202,33 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     let max = handle.max_cycles;
     let mut observer = crate::async_errors::CallbackObserver { cb: handle.async_callback };
     let outcome = handle.backend.run(max, &mut observer);
+    log::info!(
+        "run: cycles={} simulated_wall_ns={}",
+        outcome.cycles,
+        simulated_wall_ps(outcome.cycles) / 1000
+    );
     let (result, halted, halt_reason) = map_halt(outcome.halt);
     XdnaEmuExecStatus { result, cycles_executed: outcome.cycles, halted, halt_reason }
+}
+
+/// Simulated wall time of `array_cycles` at the configured array clock
+/// (`XDNA_EMU_DPM`, default the silicon-reported DPM 1 point), in picoseconds.
+/// An invalid `XDNA_EMU_DPM` is reported and the default used, so a status
+/// line never fails over a typo.
+fn simulated_wall_ps(array_cycles: u64) -> u64 {
+    use xdna_emu_core::timebase::ClockPair;
+    let pair = ClockPair::configured().unwrap_or_else(|e| {
+        log::warn!("{e}; using the default clocks");
+        ClockPair::DEFAULT
+    });
+    pair.array_cycles_to_ps(array_cycles)
+}
+
+/// Simulated wall time, in picoseconds, of `array_cycles` array cycles (for
+/// example the `cycles_executed` of an `xdna_emu_run` status).
+#[no_mangle]
+pub extern "C" fn xdna_emu_array_cycles_to_wall_ps(array_cycles: u64) -> u64 {
+    simulated_wall_ps(array_cycles)
 }
 
 fn map_halt(halt: crate::backend::HaltKind) -> (XdnaEmuResult, bool, XdnaEmuHaltReason) {
@@ -256,5 +281,19 @@ mod tests {
             map_halt(HaltKind::Error),
             (XdnaEmuResult::ExecutionError, false, XdnaEmuHaltReason::Error)
         );
+    }
+}
+
+#[cfg(test)]
+mod wall_time_tests {
+    use super::simulated_wall_ps;
+
+    #[test]
+    fn default_clock_is_the_silicon_reported_array_clock() {
+        // Not run under XDNA_EMU_DPM: 1028 array cycles at 1028 MHz are 1 us.
+        if std::env::var_os("XDNA_EMU_DPM").is_none() {
+            assert_eq!(simulated_wall_ps(1028), 1_000_000);
+            assert_eq!(super::xdna_emu_array_cycles_to_wall_ps(0), 0);
+        }
     }
 }

@@ -261,6 +261,30 @@ pub enum Work {
     None,
 }
 
+/// One data-side memory access of the latest step, with the attribute the
+/// MMU translated it under (cache-relevant: see the attribute table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataAccess {
+    pub vaddr: u32,
+    pub paddr: u32,
+    pub attribute: u8,
+    pub store: bool,
+}
+
+/// Data-cache maintenance the latest step executed (`dhwbi`/`dhi` act on the
+/// line holding an address, `dii` on a cache index; none of them has any
+/// architectural effect here, since the interpreter holds no cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOp {
+    /// `dhwbi` / `dhi`: write back and/or invalidate the line holding `vaddr`.
+    InvalidateHit { vaddr: u32 },
+    /// `dii`: invalidate by index; `vaddr` carries the index bits.
+    InvalidateIndex { vaddr: u32 },
+}
+
+/// Most data translations one step can make (`store16`: two checks, two writes).
+const MAX_DATA_ACCESSES: usize = 4;
+
 impl Work {
     /// Instructions of work this step stands for.
     pub fn instructions(self) -> u64 {
@@ -337,6 +361,9 @@ pub struct Cpu {
     work_override: Option<Work>,
     /// Bytes of the instruction the latest `step` fetched (empty if none was).
     last_fetch: ([u8; 8], u8),
+    last_data: [Option<DataAccess>; MAX_DATA_ACCESSES],
+    last_cache_op: Option<CacheOp>,
+    last_fetch_attribute: Option<u8>,
     /// Exception-vector layout of the modeled core configuration.
     vectors: ExceptionVectors,
 }
@@ -391,6 +418,9 @@ impl Cpu {
             last_work: Work::None,
             work_override: None,
             last_fetch: ([0; 8], 0),
+            last_data: [None; MAX_DATA_ACCESSES],
+            last_cache_op: None,
+            last_fetch_attribute: None,
         }
     }
 
@@ -417,7 +447,19 @@ impl Cpu {
             Access::Store => AccessKind::Store,
         };
         match self.mmu.translate(bus, vaddr, kind, 0) {
-            Ok(t) => Ok(t.paddr),
+            Ok(t) => {
+                if access == Access::Fetch {
+                    self.last_fetch_attribute = Some(t.attribute);
+                } else if let Some(slot) = self.last_data.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(DataAccess {
+                        vaddr,
+                        paddr: t.paddr,
+                        attribute: t.attribute,
+                        store: access == Access::Store,
+                    });
+                }
+                Ok(t.paddr)
+            }
             Err(fault) => {
                 // EPC1 (or DEPC inside an active exception) = the faulting
                 // INSTRUCTION's pc (self.pc), EXCVADDR = the fault target
@@ -796,6 +838,9 @@ impl Cpu {
     pub fn step<B: XtensaBus + ?Sized>(&mut self, bus: &mut B) -> Step {
         self.work_override = None;
         self.last_fetch.1 = 0;
+        self.last_data = [None; MAX_DATA_ACCESSES];
+        self.last_cache_op = None;
+        self.last_fetch_attribute = None;
         let step = self.step_unaccounted(bus);
         self.last_work = self.work_override.take().unwrap_or(match step {
             Step::Ran => Work::Instruction,
@@ -814,6 +859,22 @@ impl Cpu {
     /// collapse). For instruments that classify what ran.
     pub fn last_fetched(&self) -> &[u8] {
         &self.last_fetch.0[..self.last_fetch.1 as usize]
+    }
+
+    /// Data accesses the latest [`Cpu::step`] made, in order (a store16 reports
+    /// its destination checks as well as its two writes).
+    pub fn last_data_accesses(&self) -> impl Iterator<Item = DataAccess> + '_ {
+        self.last_data.iter().flatten().copied()
+    }
+
+    /// The cache-maintenance operation the latest step executed, if any.
+    pub fn last_cache_op(&self) -> Option<CacheOp> {
+        self.last_cache_op
+    }
+
+    /// The attribute the latest step's instruction fetch translated under.
+    pub fn last_fetch_attribute(&self) -> Option<u8> {
+        self.last_fetch_attribute
     }
 
     /// The work done by the latest [`Cpu::step`].
@@ -1508,5 +1569,46 @@ mod work_accounting_tests {
         cpu.halted = false;
         assert_eq!(cpu.step(&mut bus), Step::Ran); // nop at 3
         assert_eq!(cpu.last_work(), Work::Instruction);
+    }
+}
+
+#[cfg(test)]
+mod data_trace_tests {
+    use super::*;
+    use crate::firmware::xtensa::flat_bus::FlatBus;
+
+    #[test]
+    fn a_load_reports_its_translated_address_and_attribute() {
+        // l32i.n a2,a1,0 with a1 = 0x2000; data page identity-mapped with attribute 11.
+        let mut bus = FlatBus::new(vec![0x28, 0x01]);
+        let mut cpu = mapped_cpu(0);
+        cpu.mmu.write_entry(Tlb::Data, 0x2000 | 1, 0x2000 | 11);
+        cpu.regs.write_ar(1, 0x2000);
+        assert_eq!(cpu.step(&mut bus), Step::Ran);
+        let acc: Vec<_> = cpu.last_data_accesses().collect();
+        assert_eq!(acc, vec![DataAccess { vaddr: 0x2000, paddr: 0x2000, attribute: 11, store: false }]);
+        assert_eq!(cpu.last_fetch_attribute(), Some(1));
+    }
+
+    #[test]
+    fn the_trace_is_per_step() {
+        let mut bus = FlatBus::new(vec![0x28, 0x01, 0xf0, 0x20, 0x00]);
+        let mut cpu = mapped_cpu(0);
+        cpu.mmu.write_entry(Tlb::Data, 0x2000 | 1, 0x2000 | 3);
+        cpu.regs.write_ar(1, 0x2000);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.last_data_accesses().count(), 1);
+        cpu.step(&mut bus); // nop
+        assert_eq!(cpu.last_data_accesses().count(), 0);
+    }
+
+    #[test]
+    fn cache_maintenance_reports_its_target() {
+        // `52 72 04` -> dhwbi a2,16 (imm8 = 4, scaled by 4)
+        let mut bus = FlatBus::new(vec![0x52, 0x72, 0x04]);
+        let mut cpu = mapped_cpu(0);
+        cpu.regs.write_ar(2, 0x1000);
+        assert_eq!(cpu.step(&mut bus), Step::Ran);
+        assert_eq!(cpu.last_cache_op(), Some(CacheOp::InvalidateHit { vaddr: 0x1010 }));
     }
 }
