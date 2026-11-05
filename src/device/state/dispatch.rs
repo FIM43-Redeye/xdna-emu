@@ -575,6 +575,21 @@ fn warnings_enabled() -> bool {
 mod tests {
     use crate::device::DeviceState;
 
+    /// A host or firmware read of a tile's data memory (a mask-write's read
+    /// half) sees what the core and DMAs stored there, not the last value
+    /// the register bus itself wrote.
+    #[test]
+    fn register_reads_of_data_memory_see_core_stores() {
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(1, 1);
+        d.write_tile_register(1, 2, 0x400, 0x1111_1111);
+        d.array.get_mut(1, 2).unwrap().data_memory_mut()[0x400..0x404]
+            .copy_from_slice(&0x3737_3737u32.to_le_bytes());
+        assert_eq!(d.read_tile_register(1, 2, 0x400), 0x3737_3737);
+        d.array.get_mut(1, 1).unwrap().data_memory_mut()[0x8_0000 - 4..].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(d.read_tile_register(1, 1, 0x8_0000 - 4), 7, "memory tile");
+    }
+
     #[test]
     fn assign_partition_columns_ungates_only_target_columns() {
         let mut d = DeviceState::new_npu1();

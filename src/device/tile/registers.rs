@@ -52,70 +52,6 @@ impl Tile {
             }
         }
 
-        // Check specific subsystem state first: DMA BD range.
-        // Base and stride are per-tile-type from the register database.
-        let (bd_base, bd_stride) = self.bd_layout(reg_layout);
-        let bd_end = bd_base + (self.dma_bds.len() as u32) * bd_stride;
-        if offset >= bd_base && offset < bd_end {
-            let bd_offset = offset - bd_base;
-            let bd_index = (bd_offset / bd_stride) as usize;
-            let reg_in_bd = (bd_offset % bd_stride) as usize / 4;
-
-            if bd_index < self.dma_bds.len() {
-                let bd = &self.dma_bds[bd_index];
-                // Legacy struct has 6 fields; words 6-7 (shim/memtile iteration
-                // and lock/valid) fall through to the register HashMap below.
-                match reg_in_bd {
-                    0 => return bd.addr_low,
-                    1 => return bd.addr_high,
-                    2 => return bd.length,
-                    3 => return bd.control,
-                    4 => return bd.d0,
-                    5 => return bd.d1,
-                    _ => {} // Fall through to register map for words 6-7
-                }
-            }
-        }
-
-        // Control_Packet_Handler_Status sticky bits (compute 0x3FF30,
-        // memtile 0xB0F30). Source-of-truth lives on the dedicated field;
-        // tile.registers is not used for this offset.
-        if (self.is_compute() && offset == 0x3FF30) || (self.is_mem() && offset == 0xB0F30) {
-            return self.pkt_handler_status & 0xF;
-        }
-
-        // Core debug register dispatch (compute tiles only).
-        //
-        // Mirrors the identical dispatch in read_register_pure (Phase B Unit 1,
-        // commit 2b88709). The two paths MUST return the same value for any
-        // given core_debug state -- divergence is a Phase B Unit 1b bug.
-        //
-        // Core_Status (0x32004) and Debug_Status (0x3201C) are live-computed
-        // from CoreDebugState fields; a raw HashMap lookup always returns 0
-        // even when the core is halted (DEBUG_HALT bit 16 comes from
-        // core_debug.read_status(), not from tile.registers). The same applies
-        // to Debug_Control0 (halted+single_step_count) and Debug_Control2
-        // (stall-to-halt enables stored in core_debug.debug_ctrl2).
-        //
-        // The injected MASKPOLL polls Core_Status (0x32004) via this mutable
-        // path. Without this dispatch the poll always read 0 and never
-        // satisfied, so the emulator could not observe the DEBUG_HALT set by
-        // the Unit-1 pre-execute seam (Phase B Unit 1b, spec §4.2/§5.3).
-        //
-        // Offsets from aie-rt xaiemlgbl_params.h, cross-checked against
-        // aie_registers_aie2.json (same offsets as read_register_pure):
-        //   Core_Status 0x32004, Debug_Control0..2 0x32010..0x32018,
-        //   Debug_Status 0x3201C, PC_Event0..3 0x32020..0x3202C.
-        if self.is_compute() {
-            if let Some(val) = self.core_debug.read_register(offset) {
-                return val;
-            }
-        }
-
-        if let Some(val) = self.read_event_register(offset) {
-            return val;
-        }
-
         // Interrupt controller read routing (shim tiles only). Mirrors the
         // write routing in effects.rs::apply_tile_local_effects. L1 and L2
         // occupy disjoint offset ranges (0x35xxx vs 0x15xxx) so order is
@@ -133,12 +69,10 @@ impl Tile {
             }
         }
 
-        // Fall back to register map
-        self.registers
-            .get(&offset)
-            .copied()
-            .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
-            .unwrap_or(0)
+        // Everything else reads the same with or without side effects: data
+        // memory, BDs, channel control, lock values, packet-handler status,
+        // core debug and event registers, then the raw register store.
+        self.read_register_pure(offset)
     }
 
     /// Read a register value without side effects.
@@ -642,9 +576,9 @@ mod unit1b_read_path_tests {
     #[test]
     fn memtile_core_status_offset_not_dispatched_to_core_debug() {
         let mut tile = Tile::mem_tile(0, 1);
-        // Mem tiles have no core_debug; write the offset to the HashMap to
-        // give it a non-zero value and verify it round-trips without dispatch.
-        tile.registers.insert(0x32004, 0xABCD_EF01);
+        // Mem tiles have no core_debug; on a memory tile the offset lies in
+        // data memory, so the read returns the stored word, not a status.
+        tile.data_memory_mut()[0x32004..0x32008].copy_from_slice(&0xABCD_EF01u32.to_le_bytes());
         assert_eq!(
             tile.read_register(0x32004),
             0xABCD_EF01,
