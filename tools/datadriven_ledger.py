@@ -21,6 +21,12 @@ Usage:
   tools/datadriven_ledger.py [--provenance FILE] [--out DIR]
   tools/datadriven_ledger.py --diff OLD_DIR NEW_DIR   # behaviour gate
 
+Facts M1-M8 count what the interpreter consumes. The `schema` object of each provenance row
+is the TableGen encoding schema (PIPE package); M9 reports its coverage and agreement with the
+consumed values. A package that switches a consumer to a schema field also switches that
+fact's rule in `fact_categories` to read the schema (and deletes the legacy field), so M5 moves
+with it.
+
 `--out` defaults to `build/experiments/harness/datadriven/ledger-<branch>/` in
 the main checkout. `--diff` compares the final per-instruction values (never the
 provenance tags, which a migration is meant to change) and the generated
