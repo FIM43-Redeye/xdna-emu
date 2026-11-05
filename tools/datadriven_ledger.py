@@ -90,6 +90,7 @@ FACT_CATEGORY = {
     "name_substring": NAME_PARSE,
     "mnemonic_prefix": NAME_PARSE,
     "name_digits": NAME_PARSE,
+    "tablegen_hw_encoding": TABLEGEN,
     "none": NA,
     "n/a": NA,
 }
@@ -336,6 +337,11 @@ Definitions (all over the N resolved encodings the decoder can produce):
   counts; only `hand` facts and non-generic executors disqualify.
 - M8 runtime name keys: string literals in `src/interpreter/` (tests and goldens
   excluded) that name an instruction or mnemonic, and the encodings they touch.
+- M9 schema availability: for the facts the TableGen encoding schema
+  (`InstrEncoding::schema`, PIPE package) provides, the share of applicable encodings it
+  covers, and how many agree with the legacy value the interpreter still consumes. M1-M8
+  count what is consumed, so they move only when a consumer switches to the schema; M9 is
+  what is ready to switch to. Every disagreement is listed in `schema_disagreements.tsv`.
 """
 
 
@@ -392,6 +398,102 @@ def compute(encodings, name_keys, hits):
     return rows, m
 
 
+# ---------------------------------------------------------------------------
+# Schema availability (M9): the TableGen schema beside the legacy values
+# ---------------------------------------------------------------------------
+
+# Legacy `RegisterKind` -> the schema register families it stands for.
+LEGACY_KIND_FAMILIES = {
+    "Scalar": {"Scalar"}, "Pointer": {"Bits20"}, "ModifierM": {"Bits20"}, "ModifierDN": {"Bits20"},
+    "ModifierDJ": {"Bits20"}, "ModifierDC": {"Bits20"}, "Vector256": {"Vector256"},
+    "Vector512": {"Vector512"}, "Vector1024": {"Vector1024"}, "SparseQx": {"Vector640"},
+    "Accumulator": {"Acc256", "Acc512", "Acc1024"}, "Control": {"Other"}, "ScalarPair": {"Other"},
+}
+LEGACY_ADDRESSING = {"Indexed": "IndexedRegister", "IndexedImm": "IndexedImmediate",
+                     "PostModify": "PostModifyRegister", "PostModifyImm": "PostModifyImmediate",
+                     "TwoDim": "TwoDim", "ThreeDim": "ThreeDim", None: "Unknown"}
+LEGACY_SUBWORD = {"Byte": 8, "HalfWord": 16}
+REG_TYPE = re.compile(r"OperandType::(?:Register\(RegisterKind::(\w+)\)|RegisterWithOffset\(RegisterKind::(\w+), \d+\))")
+IMM_TYPE = re.compile(r"OperandType::Immediate \{ signed: (\w+), scale: (-?\d+) \}")
+
+
+def operand_type_agrees(legacy, kind):
+    """Whether a legacy `OperandType` expression says what the schema operand kind says."""
+    reg, imm = kind.get("register"), kind.get("immediate")
+    m = REG_TYPE.fullmatch(legacy)
+    if m:
+        return reg is not None and reg["encoder"] is None and reg["family"] in LEGACY_KIND_FAMILIES[m.group(1) or m.group(2)]
+    if legacy.startswith("OperandType::CompositeRegister("):
+        return reg is not None and reg["encoder"] is not None
+    m = IMM_TYPE.fullmatch(legacy)
+    if m:
+        return (imm is not None and (m.group(1) == "true") == imm["signed"] and int(m.group(2)) == imm["step"]
+                and not imm["negative"])
+    if legacy == "OperandType::LockId":
+        return imm is not None and not imm["signed"]
+    return False
+
+
+def schema_report(encodings):
+    """M9 counts and the disagreement rows (name, fact, item, legacy, schema)."""
+    counts = collections.defaultdict(lambda: [0, 0, 0])  # fact -> [applicable, provided, agree]
+    dis = []
+    for e in encodings:
+        sc = e["schema"]
+        ops = {o["name"]: o for o in sc["operands"]}
+        for f in e["operand_fields"]:
+            c = counts["register_classes"]
+            c[0] += 1
+            o = ops.get(f["name"])
+            if o is None:
+                continue  # an encoding field with no DAG operand: the schema says nothing about it
+            c[1] += 1
+            if operand_type_agrees(f["operand_type"], o["kind"]):
+                c[2] += 1
+            else:
+                dis.append((e["name"], "register_classes", f["name"], f["operand_type"], json.dumps(o["kind"], sort_keys=True)))
+        c = counts["operand_roles"]
+        c[0] += 1
+        c[1] += 1
+        c[2] += 1  # the schema operand table is new: nothing legacy to agree with
+        mem = e["may_load"] or e["may_store"]
+        if mem or sc["addressing"]:
+            c = counts["addressing_mode"]
+            c[0] += 1
+            if sc["addressing"]:
+                c[1] += 1
+            want = LEGACY_ADDRESSING.get(sc["addressing"], "Unknown")
+            if e["addressing_mode"].split("::")[-1] == want:
+                c[2] += 1
+            else:
+                dis.append((e["name"], "addressing_mode", "", e["addressing_mode"], str(sc["addressing"])))
+        if mem:
+            c = counts["mem_width"]
+            c[0] += 1
+            legacy = LEGACY_SUBWORD.get(e["mem_width"].split("::")[-1])
+            if sc["mem_vt_bits"] is not None:
+                c[1] += 1
+            if legacy == sc["mem_vt_bits"]:
+                c[2] += 1 if sc["mem_vt_bits"] is not None else 0
+            else:
+                dis.append((e["name"], "mem_width", "", e["mem_width"], str(sc["mem_vt_bits"])))
+        if e["implicit_regs"]:
+            c = counts["implicit_regs"]
+            c[0] += 1
+            c[1] += 1
+            legacy = sorted((r["reg"], r["is_use"]) for r in e["implicit_regs"])
+            if legacy == sorted((r["reg"], r["is_use"]) for r in sc["implicit_regs"]):
+                c[2] += 1
+            else:
+                dis.append((e["name"], "implicit_regs", "", str(legacy), str(sc["implicit_regs"])))
+        c = counts["format_class"]
+        c[0] += 1
+        c[1] += bool(sc["format_class"])
+        c[2] += bool(sc["format_class"])
+    m9 = {f: {"applicable": a, "schema": f"{p}/{a}", "agree_with_legacy": f"{g}/{p}"} for f, (a, p, g) in counts.items()}
+    return m9, dis
+
+
 def write_outputs(out, rows, m, hits, provenance_dir):
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "ledger.csv", "w", newline="") as f:
@@ -421,6 +523,11 @@ def write_outputs(out, rows, m, hits, provenance_dir):
     lines.append(f"- M7b: {m['M7b']}")
     lines.append(f"- M8: {m['M8_literals']} literals touching {m['M8_encodings']} encodings")
     lines.append(f"- winning layers: {m['layers']}")
+    if "M9" in m:
+        lines.append("- M9 schema availability (applicable / provided by the schema / agreeing with legacy):")
+        for f, v in m["M9"].items():
+            lines.append(f"  - {f}: schema {v['schema']}, agrees with legacy {v['agree_with_legacy']}")
+        lines.append(f"  - disagreements: {m['M9_disagreements']} rows in schema_disagreements.tsv")
     (out / "metrics.md").write_text("\n".join(lines) + "\n")
 
 
@@ -478,10 +585,18 @@ def main():
     hits = scan_runtime(root)
     name_keys = match_hits(encodings, hits)
     rows, m = compute(encodings, name_keys, hits)
+    dis = []
+    if all("schema" in e for e in encodings):
+        m["M9"], dis = schema_report(encodings)
+        m["M9_disagreements"] = len(dis)
     if a.out is None:
         branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root, text=True).strip()
         a.out = main_checkout() / "build/experiments/harness/datadriven" / f"ledger-{branch.replace('/', '-')}"
     write_outputs(a.out, rows, m, hits, prov_dir)
+    with open(a.out / "schema_disagreements.tsv", "w") as f:
+        f.write("encoding\tfact\titem\tlegacy\tschema\n")
+        for d in dis:
+            f.write("\t".join(d) + "\n")
     print((a.out / "metrics.md").read_text())
     print(f"ledger: {a.out}")
 
