@@ -62,16 +62,26 @@ Complete instruction set definition for the Peano compiler backend.
 |-----------------|----------|
 | Instruction encodings and formats | ~600+ definitions, all VLIW slots |
 | Register file structure | Scalar, vector, accumulator, pointer classes |
-| Semantic operation mappings | ~48 SemanticOp types (Add, Mul, Br, etc.) |
+| Semantic operation mappings | Pat<> patterns, pseudo expansions, C++ selection |
 | Scheduling model / latencies | 278+ itinerary classes with cycle counts |
 | Intrinsic signatures | 317 AIE2-specific intrinsics with types |
 | Split field layouts | Non-contiguous operand bit positions |
 
 **Path**: `../llvm-aie/llvm/lib/Target/AIE/`
 
-Instruction decoding is already fully TableGen-driven. Instruction semantics
-are ~33% data-driven (via SemanticOp), with the rest in legacy fallback
-handlers. The goal is to close that gap.
+Instruction decoding is already fully TableGen-driven. Semantics are only
+partly data-driven, and closing that gap is the goal. Measure it with
+`tools/datadriven_ledger.py`, which reads the per-encoding provenance the
+archspec build writes (`semantic_provenance.json`) and reports, per resolved
+encoding, which layer assigned its SemanticOp, where each fact the executor
+uses comes from, and whether its executor is generic. Measured 2026-11-04 over
+the 607 resolved encodings: every encoding has a SemanticOp; 26% get it from
+TableGen structure, 26% from a Pat<> or C++ selection through a hand
+intrinsic-name table, and 48% from hand tables (`refine_encoding_semantic`,
+`ITINERARY_SEMANTICS`). Register classes, element types and memory widths are
+parsed out of TableGen names by hand rules; operand roles are positional for
+memory instructions; 74% of encodings run a generic executor. The script's
+docstring defines each metric; rerun it rather than trusting these numbers.
 
 ## 4. mlir-aie Device Model -- Array Topology
 

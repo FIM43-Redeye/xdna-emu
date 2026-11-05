@@ -62,8 +62,9 @@ Both produce `InstrEncoding` values consumable by the decoder.
 - 8 slots (lda, ldb, alu, mv, st, vec, lng, nop)
 - ~144 format classes
 - ~600+ instruction definitions
-- ~210+ fully resolved encodings
-- ~48 semantic operations
+- 607 resolved encodings (2026-11-04; `tools/datadriven_ledger.py` prints the
+  current count and where each encoding's semantics come from)
+- about 100 `SemanticOp` variants
 
 ## llvm-aie Dependency
 
