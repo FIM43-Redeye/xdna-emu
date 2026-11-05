@@ -389,16 +389,35 @@ fn matches_silicon_on_the_alternative_encodings() {
     run_kind("alt", 220_000);
 }
 
-/// A sparse config word whose key has no sparse geometry is reported unhandled.
+/// A dense key on a sparse instruction is the dense multiply of A's low 512 bits and the qx
+/// register's stored data, the mask ignored (silicon, `gen_mac_conf_probe.py sparsekeys`).
 #[test]
-fn a_dense_geometry_with_a_qx_operand_is_unhandled_and_writes_nothing() {
+fn a_dense_key_on_a_sparse_instruction_multiplies_the_stored_data() {
     let mut ctx = ExecutionContext::new();
-    ctx.accumulator.write_wide(DEST_REG, [0x1111_2222_3333_4444u64; 16]);
-    // (0, 1, 0) is the dense int8 tile, not a sparse mode.
-    ctx.scalar.write(5, (1 << 3) | (1 << 8) | (1 << 9));
-    let g = load("vec_macsparse_4x16_16x8_probe");
-    let op = sparse_op(&g, "mul", false);
-    assert!(!execute_matmul(&op, &mut ctx), "a qx operand needs a sparse geometry");
+    // A (x0) and the stored data (x2 = qx1's data) with distinct bytes; mask all zero.
+    let a: Vec512 = std::array::from_fn(|i| (i as u32).wrapping_mul(0x0305_0709) ^ 0x8040_2010);
+    let d: Vec512 = std::array::from_fn(|i| (i as u32).wrapping_mul(0x0b0d_1113) ^ 0x0102_0408);
+    ctx.vector.write_wide(A_NARROW_REG, a);
+    ctx.vector.write_wide(2 * QX_INDEX, d);
+    // (0, 1, 0) is the dense int8 4x8x8 tile; both operands signed.
+    let conf = (1 << 3) | (1 << 8) | (1 << 9);
+    ctx.scalar.write(5, conf);
+    let mut op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::MatMul);
+    op.is_vector = true;
+    op.is_wide_vector = true;
+    op.encoding_name = Some("VMUL_vmac_cm_core_sparse_narrow".to_string());
+    op.sources.push(Operand::VectorReg(A_NARROW_REG));
+    op.sources.push(Operand::SparseQxReg(QX_INDEX));
+    op.sources.push(Operand::ScalarReg(5));
+    op.dest = Some(Operand::AccumReg(DEST_REG));
+    assert!(execute_matmul(&op, &mut ctx));
     ctx.force_commit_all_pending();
-    assert_eq!(ctx.accumulator.read_wide(DEST_REG), [0x1111_2222_3333_4444u64; 16]);
+    let got = ctx.accumulator.read_wide(DEST_REG);
+    let byte = |v: &Vec512, i: usize| (v[i / 4] >> (8 * (i % 4))) as i8 as i64;
+    for lane in 0..32 {
+        let (r, c) = (lane / 8, lane % 8);
+        let want: i64 = (0..8).map(|k| byte(&a, r * 8 + k) * byte(&d, k * 8 + c)).sum();
+        let lane_bits = (got[lane / 2] >> (32 * (lane % 2))) as u32 as i32 as i64;
+        assert_eq!(lane_bits, want, "lane {lane}");
+    }
 }

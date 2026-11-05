@@ -148,22 +148,22 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     });
     // A sparse geometry on a dense instruction has no sparse operand to read: the multiplier
     // outputs zero products (silicon, `docs/fidelity-gaps/mac-conf.md`).
-    if qx.is_none() && config.sparse {
+    if qx.is_none() && config.sparse && config.bfloat {
+        let sparse = config;
+        config = MatMulConfig::bf16_idle();
+        config.accumulate = sparse.accumulate;
+        config.subtract = sparse.subtract;
+        config.sub_acc1 = sparse.sub_acc1;
+        config.sub_acc2 = sparse.sub_acc2;
+        config.shift16 = sparse.shift16;
+    } else if qx.is_none() && config.sparse {
         config = MatMulConfig { sparse: false, ..MatMulConfig::idle((conf_val >> 1) & 3) };
         config.accumulate = (conf_val & 1) == 0;
         config.x_signed = (conf_val >> 9) & 1 != 0;
         config.y_signed = (conf_val >> 8) & 1 != 0;
     }
-    if qx.is_some() != config.sparse {
-        log::warn!(
-            "[NOT MODELED] {:?}: sparse operand {} but config word 0x{:08x} selects a {} geometry",
-            op.encoding_name,
-            if qx.is_some() { "present" } else { "absent" },
-            conf_val,
-            if config.sparse { "sparse" } else { "dense" }
-        );
-        return false;
-    }
+    // A dense key on a sparse instruction is the dense multiply of the A register's low 512 bits
+    // and the `qx` register's stored data as B, the mask ignored (silicon, `sparsekeys` probe).
 
     // Fresh-multiply forms zero the accumulator regardless of the config word.
     //
@@ -299,11 +299,32 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             };
             ((widen(&a), widen(&b)), combine, None)
         }
-        Some((qx_pos, qx_index)) => {
+        Some((qx_pos, qx_index)) if config.sparse => {
             match sample_sparse(op, ctx, &config, conf_val, is_bf16, qx_pos, qx_index) {
                 Some(sampled) => sampled,
                 None => return false,
             }
+        }
+        Some((qx_pos, qx_index)) => {
+            let Some(a) = sparse_a_operand(op, ctx) else {
+                return false;
+            };
+            let read = |pos: usize, base: u8| match op.source_forward.get(pos) {
+                Some(&(uc, ub)) => ctx.vector.read_wide_with(base, uc, ub),
+                None => ctx.vector.read_wide(base),
+            };
+            let data = read(qx_pos, 2 * qx_index);
+            let combine = if config.bfloat {
+                None
+            } else {
+                match integer_combine(op, semantic, conf_val) {
+                    Some(c) => Some(c),
+                    None => return false,
+                }
+            };
+            let mut a_low = [0u32; 16];
+            a_low.copy_from_slice(&a[..16]);
+            ((widen(&a_low), widen(&data)), combine, None)
         }
     };
 
@@ -501,6 +522,34 @@ fn sample_sparse(
     qx_index: u8,
 ) -> Option<((Image, Image), Option<SparseCombine>, Option<u128>)> {
     let layout = sparse::layout_of(conf_val, is_bf16)?;
+    let a = sparse_a_operand(op, ctx)?;
+    let name = op.encoding_name.as_deref().unwrap_or("");
+    let read = |pos: usize, base: u8| match op.source_forward.get(pos) {
+        Some(&(uc, ub)) => ctx.vector.read_wide_with(base, uc, ub),
+        None => ctx.vector.read_wide(base),
+    };
+    // qx_n = {x_n, q_n}: the stored data is the x register, the mask the q register.
+    let data = read(qx_pos, 2 * qx_index);
+    let mask = ctx.mask.read_u128(qx_index);
+    let b = sparse::logical_b(&layout, config.bits_y, &data, mask);
+
+    let present = config.bfloat.then(|| sparse::present_elements(&layout, mask));
+    let combine = if config.bfloat {
+        None
+    } else {
+        let kind = sparse::op_kind_of(name)?;
+        Some(SparseCombine {
+            signs: kind.term_signs()?,
+            operand: Some((layout, mask)),
+            config_word: conf_val,
+        })
+    };
+    Some(((a, b), combine, present))
+}
+
+/// The A operand of a sparse instruction: a y register (`_sparse_wide`, 1024 bits) or an x
+/// register (`_sparse_narrow`, the low half).
+fn sparse_a_operand(op: &SlotOp, ctx: &ExecutionContext) -> Option<Image> {
     let name = op.encoding_name.as_deref().unwrap_or("");
     let wide = name.ends_with("sparse_wide") || (op.is_quad_vector && !name.ends_with("sparse_narrow"));
     let (a_pos, a_reg) = op.sources.iter().enumerate().find_map(|(pos, s)| match s {
@@ -519,23 +568,7 @@ fn sample_sparse(
     } else {
         a[..16].copy_from_slice(&read(a_pos, a_reg & !1));
     }
-    // qx_n = {x_n, q_n}: the stored data is the x register, the mask the q register.
-    let data = read(qx_pos, 2 * qx_index);
-    let mask = ctx.mask.read_u128(qx_index);
-    let b = sparse::logical_b(&layout, config.bits_y, &data, mask);
-
-    let present = config.bfloat.then(|| sparse::present_elements(&layout, mask));
-    let combine = if config.bfloat {
-        None
-    } else {
-        let kind = sparse::op_kind_of(name)?;
-        Some(SparseCombine {
-            signs: kind.term_signs()?,
-            operand: Some((layout, mask)),
-            config_word: conf_val,
-        })
-    };
-    Some(((a, b), combine, present))
+    Some(a)
 }
 
 /// The post-adder description of an integer MAC: the op kind from the record name (the
@@ -790,17 +823,26 @@ fn matmul_bf16(
     for lane in 0..shape.lanes() {
         // A B element the sparse mask drops is absent from the multiplier: its product is not a
         // zero term (which would turn an Inf or NaN in A into a NaN) but not a term at all.
-        let products: Vec<(u16, u16)> = (0..shape.terms())
-            .filter_map(|term| {
-                let (ia, ib) = shape.operand_indices(lane, term);
-                let kept = b_present.map_or(true, |p| p >> ib & 1 != 0);
-                kept.then(|| (bf16(a, ia as usize), bf16(b, ib as usize)))
-            })
-            .collect();
+        // The config word's term_neg bits negate the products of their slots (the A sign flip).
+        let products: Vec<(u16, u16)> = if config.multiplier == Multiplier::Idle {
+            Vec::new()
+        } else {
+            (0..shape.terms())
+                .filter_map(|term| {
+                    let (ia, ib) = shape.operand_indices(lane, term);
+                    let kept = b_present.map_or(true, |p| p >> ib & 1 != 0);
+                    let neg = config
+                        .term_neg_rule
+                        .is_some_and(|rule| config.term_neg >> rule.bit(lane, term, 0) & 1 != 0);
+                    kept.then(|| (bf16(a, ia as usize) ^ ((neg as u16) << 15), bf16(b, ib as usize)))
+                })
+                .collect()
+        };
         let lane = lane as usize;
         let mut accs = Vec::with_capacity(2);
         if config.accumulate {
-            accs.push((lane32(acc, lane), config.sub_acc1));
+            let acc1 = lane32(acc, lane);
+            accs.push((if config.shift16 { acc1 << 16 } else { acc1 }, config.sub_acc1));
         }
         if let Some(a2) = acc2 {
             accs.push((lane32(a2, lane), config.sub_acc2));
@@ -1591,8 +1633,11 @@ mod tests {
     }
 
     /// Build a config word for bf16 mode.
+    /// The bf16 dense 4x8x4 key every toolchain bf16 intrinsic uses (amode 2, bmode 3).
+    const BF16_KEY: u32 = 2 << 1 | 3 << 3;
+
     fn config_bf16_accumulate() -> u32 {
-        0x00
+        BF16_KEY
     }
 
     /// Build a config word for int8xi8 with zero_acc=1.
@@ -1853,7 +1898,8 @@ mod tests {
         } else {
             0
         };
-        let conf = flag("zero_acc1")
+        let conf = BF16_KEY
+            | flag("zero_acc1")
             | (variant << 5)
             | (flag("sub_mul") << 11)
             | (flag("sub_acc1") << 12)

@@ -14,7 +14,7 @@
 use super::helpers::{read_acc_wide, write_acc_wide};
 use crate::interpreter::execute::vector_config::AccWidth;
 use crate::interpreter::state::{Acc1024, Vec512};
-use xdna_archspec::aie2::matmul::{geometry_for, AccTerm, MacOpKind, MacTermSigns, SparseLayout};
+use xdna_archspec::aie2::matmul::{canonical_key, geometry_for, AccTerm, MacOpKind, MacTermSigns, SparseLayout};
 
 /// A vector operand image, 1024 bits (a dense operand fills the low half).
 pub(super) type Image = [u32; 32];
@@ -40,10 +40,13 @@ pub(super) struct SparseCombine {
 /// The sparse operand layout of the geometry a config word selects. A bfloat16 mode names only
 /// its variant (its amode and bmode are fixed by the header).
 pub(super) fn layout_of(config_word: u32, is_bf16: bool) -> Option<SparseLayout> {
-    let (amode, bmode, variant) = if is_bf16 {
+    let (amode, bmode, variant) = if is_bf16 || (config_word >> 1) & 3 >= 2 {
+        // The float multiplier (a .f instruction, or the float conf of an integer one) has the
+        // bf16 layouts whatever bmode.
         (2, 3, (config_word >> 5) & 7)
     } else {
-        ((config_word >> 1) & 3, (config_word >> 3) & 3, (config_word >> 5) & 7)
+        // amode 1 bmode 1 is bmode 3 (`canonical_key`; silicon, `sparsekeys` probe: key (1, 1, 5)).
+        canonical_key((config_word >> 1) & 3, (config_word >> 3) & 3, (config_word >> 5) & 7)
     };
     geometry_for(amode, bmode, variant)?.sparse_layout()
 }
@@ -134,19 +137,29 @@ pub(super) fn sparse_product(
     for lane in 0..rows * cols {
         let (r, c) = (lane / cols, lane % cols);
         let mut sum = 0i64;
+        let float_conf = config.multiplier == super::Multiplier::FloatConf;
         for k in 0..inner {
-            let a_val = extract_element_512(
-                a,
-                element_offset(r * inner + k, config.bits_x),
-                config.bits_x,
-                config.x_signed,
-            );
-            let b_val = extract_element_512(
-                b,
-                element_offset(k * cols + c, config.bits_y),
-                config.bits_y,
-                config.y_signed,
-            );
+            let (a_val, b_val) = if float_conf {
+                // The float-conf multiplier: the unsigned low bytes of the 16-bit elements.
+                let a16 = extract_element_512(a, element_offset(r * inner + k, 16), 16, false);
+                let b16 = extract_element_512(b, element_offset(k * cols + c, 16), 16, false);
+                (a16 & 0xFF, b16 & 0xFF)
+            } else {
+                (
+                    extract_element_512(
+                        a,
+                        element_offset(r * inner + k, config.bits_x),
+                        config.bits_x,
+                        config.x_signed,
+                    ),
+                    extract_element_512(
+                        b,
+                        element_offset(k * cols + c, config.bits_y),
+                        config.bits_y,
+                        config.y_signed,
+                    ),
+                )
+            };
             let product = a_val * b_val;
             let stored_row = layout
                 .stored_unit(mask, k, c / layout.elements_per_unit)
@@ -154,7 +167,17 @@ pub(super) fn sparse_product(
             let negated = config
                 .term_neg_rule
                 .is_some_and(|rule| config.term_neg >> rule.bit(lane, stored_row, 0) & 1 != 0);
-            sum += if negated { -product } else { product };
+            if float_conf {
+                // Negated before the product is kept to 14 signed bits (as the dense float conf).
+                let p = if negated ^ config.negate_products {
+                    -product
+                } else {
+                    product
+                };
+                sum += super::sign_extend(p, 14);
+            } else {
+                sum += if negated { -product } else { product };
+            }
         }
         write_acc_wide(&mut out, lane as usize, sum, config.acc_width);
     }

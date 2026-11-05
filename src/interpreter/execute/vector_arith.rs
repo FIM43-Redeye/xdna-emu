@@ -1554,8 +1554,9 @@ impl VectorAlu {
     ///
     /// The config register (scalar operand) controls:
     /// - Bit  0: zero_acc1 (zero acc1 before operation)
-    /// - Bit 10: shift16 (shift acc1 left by 16 before its negation and the add; integer only,
-    ///   silicon-observed in build/experiments/collisions/neg)
+    /// - Bit 10: shift16 (shift acc1 left by 16 before its negation and the add, integer and
+    ///   float alike: the float forms shift acc1's bit pattern; silicon, collisions/neg and the
+    ///   vecmac `accshift` probe)
     /// - Integer: bit 11 sub_acc1, bit 12 sub_acc2 (as decoded here historically;
     ///   TableGen's VecConf and the Chess-emitted constants put dynAcc0Neg and
     ///   dynAcc1Neg at bits 12 and 13, which the float decode uses -- the
@@ -1590,7 +1591,7 @@ impl VectorAlu {
         // Read config register.
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc1 = (conf & 1) != 0;
-        let shift16 = !is_float && ((conf >> 10) & 1) != 0;
+        let shift16 = ((conf >> 10) & 1) != 0;
         // One VecConf layout for integer and float (AIE2InstrPatterns.td):
         // bit 11 is dynMulNeg, 12 dynAcc0Neg, 13 dynAcc1Neg. Silicon confirms
         // 12/13 on the float forms (vec_acc_addsub_f32).
@@ -1715,7 +1716,8 @@ impl VectorAlu {
         if is_float {
             // vneg.f is the fp32 adder with one operand (see `acc_add_lane`); like
             // the adds it reads its source at operand cycle 3 and lands its
-            // result at 6. Config bit 12 (dynAcc0Neg) un-negates it.
+            // result at 6. Config bit 12 (dynAcc0Neg) un-negates it; bit 10 shifts
+            // acc1's bits left by 16 as on the adds.
             let sub_acc1 = (conf >> 12) & 1 != 0;
             let timing = op.acc_source_timing(0);
             ctx.queue_pending_acc_add(
@@ -1725,7 +1727,7 @@ impl VectorAlu {
                 !sub_acc1,
                 false,
                 zero_acc,
-                false,
+                (conf >> 10) & 1 != 0,
                 is_wide,
                 true,
                 false,

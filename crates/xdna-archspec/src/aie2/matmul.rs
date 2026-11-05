@@ -442,7 +442,7 @@ pub const fn float_conf_term_neg_rule(cmode: u32) -> Option<TermNegRule> {
 }
 
 /// The term-negation rule of a dense integer config key (after [`canonical_key`]), `None` for
-/// keys whose multiplier output is zero and for the unprobed 4-bit sparse mode.
+/// keys whose multiplier output is zero.
 pub fn term_neg_rule(amode: u32, bmode: u32, cmode: u32) -> Option<TermNegRule> {
     use SlotRule::*;
     let (lane_classes, slot) = match canonical_key(amode, bmode, cmode) {
@@ -458,7 +458,9 @@ pub fn term_neg_rule(amode: u32, bmode: u32, cmode: u32) -> Option<TermNegRule> 
         (1, 3, 0..=4) => (2, Term),
         // The sparse modes (a sparse instruction only; `tools/gen_mac_conf_probe.py sparse`): the
         // "term" is the stored row of B that feeds the product (`SparseLayout::stored_unit / unit_cols`),
-        // not the logical inner index. The 4-bit sparse mode (0, 0, 1) was not probed.
+        // not the logical inner index. The 4-bit mode (0, 0, 1) uses the int8x4 dense slots on the
+        // stored row (`gen_mac_conf_probe.py sparse4`, Chess mul32_conf on silicon).
+        (0, 0, 1) => (2, Terms16),
         (0, 1, 5) => (2, StoredRows8),
         (1, 2, 2) => (2, TermPair),
         (1, 3, 5) => (2, Term),
@@ -1298,18 +1300,15 @@ mod tests {
     }
 
     /// Every dense integer mode (header and silicon-only) has a term-negation rule whose bits stay
-    /// inside the 8-bit field for every lane and term, and every sparse mode but the unprobed
-    /// 4-bit one has one.
+    /// inside the 8-bit field for every lane and term, and every sparse mode has one.
     #[test]
     fn term_neg_rules_cover_the_modes_and_stay_in_the_field() {
         for (amode, bmode, cmode, entry) in CONFIG_GEOMETRY_TABLE.iter().chain(SILICON_GEOMETRY_TABLE) {
             if entry.bfloat {
                 continue;
             }
-            let Some(rule) = term_neg_rule(*amode, *bmode, *cmode) else {
-                assert_eq!((*amode, *bmode, *cmode), (0, 0, 1), "no rule for ({amode}, {bmode}, {cmode})");
-                continue;
-            };
+            let rule = term_neg_rule(*amode, *bmode, *cmode)
+                .unwrap_or_else(|| panic!("no rule for ({amode}, {bmode}, {cmode})"));
             // A sparse mode's term is the stored row, half the logical inner dimension.
             let terms = if entry.sparse {
                 entry.shape.terms() / 2

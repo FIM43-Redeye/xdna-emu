@@ -2056,7 +2056,10 @@ impl ExecutionContext {
     fn acc_add_sub_lane_pair(a1: u64, a2: u64, pa: &PendingAccAdd) -> (u64, u32) {
         if pa.is_float {
             use crate::interpreter::execute::vector_matmul::bf16::acc_add_lane_flags;
+            // shift16 moves acc1's 32 bits left by 16 before the float add (silicon, `accshift`
+            // probe: 1.0 = 0x3f800000 becomes +0), as on the integer adders.
             let lane = |x1: u32, x2: u32| {
+                let x1 = if pa.shift16 { x1 << 16 } else { x1 };
                 acc_add_lane_flags(
                     (!pa.zero_acc1).then_some((x1, pa.negate_acc1)),
                     (!pa.unary).then_some((x2, pa.negate_acc2)),

@@ -78,6 +78,9 @@ pub struct MatMulConfig {
     pub sub_acc1: bool,
     /// Config-word `sub2`: negate the second accumulator input (bf16 add* forms).
     pub sub_acc2: bool,
+    /// Config-word `shift16` (bf16 forms; the integer path reads the raw word): acc1's 32 bits
+    /// are shifted left by 16 before they join the float sum (silicon, `bfupper` probe).
+    pub shift16: bool,
     /// Whether this is a sparse mode (B operand has a sparsity mask).
     ///
     /// Sparse modes have doubled inner dimension compared to their dense
@@ -176,6 +179,7 @@ impl MatMulConfig {
             subtract,
             sub_acc1: false,
             sub_acc2: false,
+            shift16: false,
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -231,6 +235,7 @@ impl MatMulConfig {
             subtract,
             sub_acc1: false,
             sub_acc2: false,
+            shift16: false,
             sparse: false,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -319,17 +324,34 @@ impl MatMulConfig {
         let term_neg = (conf >> 16) as u8;
 
         let mut config = if is_bf16 {
-            let entry = lookup_bf16_geometry(variant)?;
-            Self::from_entry(entry, Multiplier::Array)
+            // Silicon (bfcodes probe): on a .f instruction amode 2 and 3 are the float multiplier
+            // and bmode is ignored; cmode 0 is the 4x8x4 tile, 1 the 16-lane pair form, 2 the
+            // sparse tile, every other cmode a zero product (the accumulators still pass through
+            // the float adder). term_neg follows the float-conf rule. amode 0 and 1 (an integer
+            // key) do something else on a .f instruction that is not modelled.
+            if amode < 2 {
+                return None;
+            }
+            match lookup_bf16_geometry(variant) {
+                Some(entry) => {
+                    let mut c = Self::from_entry(entry, Multiplier::Array);
+                    c.term_neg_rule = float_conf_term_neg_rule(variant);
+                    c
+                }
+                None => Self::bf16_idle(),
+            }
         } else if amode >= 2 {
             // The float multiplier mode on an integer instruction; bmode is ignored.
-            let (shape, rule) = match variant {
-                0 => (MacShape::Matmul { rows: 4, inner: 8, cols: 4 }, float_conf_term_neg_rule(0)),
-                1 => (MacShape::Elementwise { lanes: 16, k: 2 }, float_conf_term_neg_rule(1)),
+            // cmode 2 is the sparse bf16 tile's layout under the float-conf products (a sparse
+            // instruction only; silicon, `sparsekeys` probe); its term_neg is not probed.
+            let (shape, rule, sparse) = match variant {
+                0 => (MacShape::Matmul { rows: 4, inner: 8, cols: 4 }, float_conf_term_neg_rule(0), false),
+                1 => (MacShape::Elementwise { lanes: 16, k: 2 }, float_conf_term_neg_rule(1), false),
+                2 => (lookup_bf16_geometry(2)?.shape, None, true),
                 _ => return Some(Self::idle(amode)),
             };
             let mut c = Self::from_entry(
-                &GeometryEntry { bits_x: 16, bits_y: 16, shape, acc_cmb: 1, bfloat: false, sparse: false },
+                &GeometryEntry { bits_x: 16, bits_y: 16, shape, acc_cmb: 1, bfloat: false, sparse },
                 Multiplier::FloatConf,
             );
             c.term_neg_rule = rule;
@@ -356,6 +378,7 @@ impl MatMulConfig {
         config.subtract = sub0;
         config.sub_acc1 = sub1;
         config.sub_acc2 = sub2;
+        config.shift16 = (conf >> 10) & 1 != 0;
         config.term_neg = term_neg;
         Some(config)
     }
@@ -388,6 +411,7 @@ impl MatMulConfig {
             subtract: false,
             sub_acc1: false,
             sub_acc2: false,
+            shift16: false,
             sparse: entry.sparse,
             bits_x: entry.bits_x,
             bits_y: entry.bits_y,
@@ -396,6 +420,13 @@ impl MatMulConfig {
             term_neg_rule: None,
             multiplier,
         }
+    }
+
+    /// A bf16 key that selects no multiplier mode: no product, the 16 fp32 accumulator lanes go
+    /// through the float adder.
+    pub fn bf16_idle() -> Self {
+        let entry = lookup_bf16_geometry(0).expect("the bf16 4x8x4 geometry");
+        Self::from_entry(entry, Multiplier::Idle)
     }
 
     /// A key that selects no multiplier mode: every product is zero. The accumulator lanes are
@@ -486,10 +517,24 @@ mod tests {
 
     /// bf16 configs still reject a variant no float mode uses; every integer word parses.
     #[test]
-    fn bf16_variants_without_a_geometry_are_rejected() {
-        assert!(MatMulConfig::from_config_word(1 << 5, true).is_some());
-        assert!(MatMulConfig::from_config_word(0, true).is_some()); // bf16 variant 0 is the dense tile
-        assert!(MatMulConfig::from_config_word(3 << 5, true).is_none());
+    /// bfcodes probe: on a .f instruction amode 2 and 3 select the float multiplier whatever
+    /// bmode; cmode 3..7 are a zero product; an integer key (amode 0, 1) is not modelled.
+    fn bf16_keys_follow_silicon() {
+        for amode in [2, 3] {
+            for bmode in 0..4 {
+                let k = amode << 1 | bmode << 3;
+                assert_eq!(MatMulConfig::from_config_word(k, true).unwrap().shape.lanes(), 16);
+                let e = MatMulConfig::from_config_word(k | 1 << 5, true).unwrap();
+                assert_eq!(e.shape, MacShape::Elementwise { lanes: 16, k: 2 });
+                for cmode in 3..8 {
+                    let c = MatMulConfig::from_config_word(k | cmode << 5, true).unwrap();
+                    assert_eq!(c.multiplier, Multiplier::Idle);
+                    assert!(c.bfloat);
+                }
+            }
+        }
+        assert!(MatMulConfig::from_config_word(0, true).is_none());
+        assert!(MatMulConfig::from_config_word(1 << 1 | 1 << 5, true).is_none());
     }
 
     fn word(amode: u32, bmode: u32, cmode: u32) -> u32 {
@@ -540,8 +585,12 @@ mod tests {
                     (Multiplier::FloatConf, MacShape::Elementwise { lanes: 16, k: 2 })
                 );
                 assert_eq!(c1.accumulator_lanes(), 32);
+                // cmode 2: the sparse bf16 tile under the float-conf products (a sparse
+                // instruction; a dense one demotes it to a zero product).
+                let c2 = MatMulConfig::from_config_word(word(amode, bmode, 2), false).unwrap();
+                assert_eq!((c2.multiplier, c2.sparse, c2.bfloat), (Multiplier::FloatConf, true, false));
                 assert_eq!(
-                    MatMulConfig::from_config_word(word(amode, bmode, 2), false).unwrap().multiplier,
+                    MatMulConfig::from_config_word(word(amode, bmode, 3), false).unwrap().multiplier,
                     Multiplier::Idle
                 );
             }
@@ -615,7 +664,7 @@ mod tests {
     /// integer elementwise modes: it is read from the table, not special-cased.
     #[test]
     fn bf16_elementwise_is_the_shared_elementwise_kind() {
-        let c = MatMulConfig::from_config_word(1 << 5, true).unwrap();
+        let c = MatMulConfig::from_config_word(BF16_AMODE << 1 | BF16_BMODE << 3 | 1 << 5, true).unwrap();
         assert_eq!(c.shape, MacShape::Elementwise { lanes: 16, k: 2 });
         assert!(c.bfloat);
         assert_eq!((c.a_type, c.b_type), (ElementType::BFloat16, ElementType::BFloat16));
