@@ -571,19 +571,20 @@ where
         };
         let mut pc = stall_pc + stall_bundle.size() as u32;
 
-        // Walk forward up to 5 instructions looking for a branch (covers
-        // the common acquire-stub layout: ACQ, then immediately RET).
-        for _ in 0..5 {
+        // Walk forward a few instructions looking for a branch (covers the
+        // common acquire-stub layout: ACQ, then immediately RET). A search
+        // heuristic, not a hardware fact.
+        const BRANCH_SEARCH_WINDOW: usize = 5;
+        for _ in 0..BRANCH_SEARCH_WINDOW {
             let bundle = match decode_at(pc) {
                 Some(b) => b,
                 None => return stall_pc,
             };
             if is_branch(&bundle) {
-                // Found the branch -- walk forward 4 more bundles past it
-                // (delay slots 1..=4); the start of the 5th delay slot is
-                // where HW's fetch PC pins. AIE2 has 5 branch delay slots.
+                // Found the branch -- walk forward past delay slots 1..N-1; the
+                // start of the last delay slot is where HW's fetch PC pins.
                 let mut delay_pc = pc + bundle.size() as u32;
-                for _ in 0..4 {
+                for _ in 1..xdna_archspec::aie2::processor::BRANCH_DELAY_SLOTS {
                     let dbundle = match decode_at(delay_pc) {
                         Some(b) => b,
                         None => return stall_pc,
@@ -693,8 +694,8 @@ where
             }
 
             ExecuteResult::Branch { target } => {
-                // Set pending branch with 5 delay slots
-                // The next 5 instructions will still execute before the branch
+                // Set pending branch with BRANCH_DELAY_SLOTS delay slots:
+                // that many instructions still execute before the branch
                 ctx.set_pending_branch(target);
                 ctx.advance_pc(bundle_size as u32);
                 // Check if this was a back-to-back branch and delay slots exhausted
@@ -881,26 +882,27 @@ where
             CoreStatus::WaitingLock { raw_lock_id } => {
                 // Route the raw lock ID to the correct tile's lock array,
                 // matching the quadrant logic in ControlUnit::route_lock.
-                let lock_value = if raw_lock_id >= 48 {
+                use xdna_archspec::aie2::locks::quadrants;
+                let lock_value = if raw_lock_id >= quadrants::EAST_START {
                     // East/Internal = own tile
-                    let id = (raw_lock_id - 48) as usize % tile.locks.len();
+                    let id = (raw_lock_id - quadrants::EAST_START) as usize % tile.locks.len();
                     tile.locks[id].value
-                } else if raw_lock_id < 16 {
+                } else if raw_lock_id < quadrants::SOUTH_END {
                     // South = row-1 neighbor
                     neighbor_locks
                         .and_then(|nl| nl.south.as_ref())
                         .map(|locks| locks[raw_lock_id as usize % locks.len()].value)
                         .unwrap_or(tile.locks[raw_lock_id as usize % tile.locks.len()].value)
-                } else if raw_lock_id < 32 {
+                } else if raw_lock_id < quadrants::WEST_END {
                     // West = col-1 neighbor
-                    let id = (raw_lock_id - 16) as usize;
+                    let id = (raw_lock_id - quadrants::WEST_START) as usize;
                     neighbor_locks
                         .and_then(|nl| nl.west.as_ref())
                         .map(|locks| locks[id % locks.len()].value)
                         .unwrap_or(tile.locks[id % tile.locks.len()].value)
                 } else {
-                    // North = row+1 neighbor (IDs 32-47)
-                    let id = (raw_lock_id - 32) as usize;
+                    // North = row+1 neighbor
+                    let id = (raw_lock_id - quadrants::NORTH_START) as usize;
                     neighbor_locks
                         .and_then(|nl| nl.north.as_ref())
                         .map(|locks| locks[id % locks.len()].value)

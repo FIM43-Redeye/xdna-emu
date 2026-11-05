@@ -37,6 +37,41 @@ pub enum SlotType {
     Nop,
 }
 
+impl SlotType {
+    /// The TableGen slot name (`lda`, `alu`, ...) used by the format records
+    /// and the decoder index.
+    pub fn name(self) -> &'static str {
+        match self {
+            SlotType::Lda => "lda",
+            SlotType::Ldb => "ldb",
+            SlotType::Alu => "alu",
+            SlotType::Mv => "mv",
+            SlotType::St => "st",
+            SlotType::Vec => "vec",
+            SlotType::Lng => "lng",
+            SlotType::Nop => "nop",
+        }
+    }
+
+    /// Inverse of [`SlotType::name`]; also accepts the `nop16` marker slot.
+    pub fn from_name(name: &str) -> Option<SlotType> {
+        match name {
+            "lda" => Some(SlotType::Lda),
+            "ldb" => Some(SlotType::Ldb),
+            "alu" => Some(SlotType::Alu),
+            "mv" => Some(SlotType::Mv),
+            "st" => Some(SlotType::St),
+            "vec" => Some(SlotType::Vec),
+            "lng" => Some(SlotType::Lng),
+            "nop" | "nop16" => Some(SlotType::Nop),
+            _ => {
+                log::trace!("Unknown slot name '{}', skipping", name);
+                None
+            }
+        }
+    }
+}
+
 /// Extracted slot data from a bundle.
 #[derive(Debug, Clone)]
 pub struct ExtractedSlot {
@@ -131,7 +166,7 @@ impl FormatTable {
                 .slot_maps
                 .iter()
                 .filter_map(|sm| {
-                    let slot_type = slot_name_to_type(&sm.slot_name)?;
+                    let slot_type = SlotType::from_name(&sm.slot_name)?;
                     Some((slot_type, sm.start_bit, sm.width))
                 })
                 .collect();
@@ -205,24 +240,6 @@ impl FormatTable {
     #[cfg(test)]
     pub(crate) fn group_entries(&self, format: BundleFormat) -> &[FormatEntry] {
         &self.groups[format_to_group_index(format)]
-    }
-}
-
-/// Convert a slot name string to SlotType.
-fn slot_name_to_type(name: &str) -> Option<SlotType> {
-    match name {
-        "lda" => Some(SlotType::Lda),
-        "ldb" => Some(SlotType::Ldb),
-        "alu" => Some(SlotType::Alu),
-        "mv" => Some(SlotType::Mv),
-        "st" => Some(SlotType::St),
-        "vec" => Some(SlotType::Vec),
-        "lng" => Some(SlotType::Lng),
-        "nop" | "nop16" => Some(SlotType::Nop),
-        _ => {
-            log::trace!("Unknown slot name '{}', skipping", name);
-            None
-        }
     }
 }
 
@@ -360,7 +377,7 @@ mod tests {
             // Insert known test values for each slot
             let mut expected: Vec<(SlotType, u64, u8)> = Vec::new();
             for sm in &fmt.slot_maps {
-                let slot_type = match slot_name_to_type(&sm.slot_name) {
+                let slot_type = match SlotType::from_name(&sm.slot_name) {
                     Some(t) => t,
                     None => continue,
                 };

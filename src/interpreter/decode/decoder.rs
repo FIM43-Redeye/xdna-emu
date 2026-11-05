@@ -266,17 +266,10 @@ impl InstructionDecoder {
     ) -> Option<DecodedInstr> {
         use crate::interpreter::bundle::SlotType;
 
-        // Map SlotType to the slot names used in encodings
-        let slot_name = match slot_type {
-            SlotType::Lda => "lda",
-            SlotType::Ldb => "ldb",
-            SlotType::Alu => "alu",
-            SlotType::Mv => "mv",
-            SlotType::St => "st",
-            SlotType::Vec => "vec",
-            SlotType::Lng => "lng",
-            SlotType::Nop => return None, // NOPs don't have specific encodings
-        };
+        if slot_type == SlotType::Nop {
+            return None; // NOPs don't have specific encodings
+        }
+        let slot_name = slot_type.name();
 
         // O(1) lookup via DecoderIndex
         if let Some((encoding, operands)) = self.index.decode_slot(slot_name, bits) {
@@ -450,22 +443,11 @@ impl Decoder for InstructionDecoder {
                         pc,
                         slot.bits
                     );
-                    let slot_name = match slot.slot_type {
-                        SlotType::Lda => "lda",
-                        SlotType::Ldb => "ldb",
-                        SlotType::Alu => "alu",
-                        SlotType::Mv => "mv",
-                        SlotType::St => "st",
-                        SlotType::Vec => "vec",
-                        SlotType::Lng => "lng",
-                        SlotType::Nop => "nop",
-                    };
                     // Mark as unknown: semantic=None, raw_opcode for diagnostics
                     let mut unknown_op = SlotOp::nop(slot_index);
                     unknown_op.semantic = None;
                     unknown_op.raw_opcode = Some(slot.bits as u32);
                     bundle.set_slot(unknown_op);
-                    let _ = slot_name; // Suppress unused warning for now
                 }
             }
         }
