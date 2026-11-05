@@ -510,6 +510,22 @@ def plan_bfcodes(rng):
     return out
 
 
+def plan_bfcodesf(rng):
+    """bfcodes restricted to the float keys (amode 2, 3): the part the emulator models."""
+    out = []
+    for kind in ("mul", "mac"):
+        confs, ops = [], []
+        for code in range(128):
+            if code & 3 < 2:
+                continue
+            o = bf_operands(rng, small=True)
+            for sx, sy in ((1, 1), (0, 0)):
+                confs.append(code << 1 | sy << 8 | sx << 9)
+                ops.append(o)
+        out += bf_cases(kind, "bfcodesf", confs, rng, lambda i, ops=ops: ops[i])
+    return out
+
+
 def plan_bfupper(rng):
     """The other conf bits alone (signs, shift16, reserved, term_neg) and the sub/zero flags with
     shift16 on the bf16 forms, moderate random operands."""
@@ -529,7 +545,77 @@ def plan_bfupper(rng):
     return out
 
 
-PLANS = {"bftermneg": plan_bftermneg, "bfcodes": plan_bfcodes, "bfupper": plan_bfupper, "accops": plan_accops, "sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
+# Chess `mul32_conf(v128uint8, v256int4_sparse, int conf, uint1_t)`: the sparse wide multiply with a
+# run-time conf word, for the 4-bit sparse mode (0, 0, 1) and for keys that are not a sparse mode.
+S4_TILE = 320               # A (128) | B stored data (64) + mask (16), padded to 128 | conf at 256
+
+
+def sparse4_kernel(tiles: int) -> str:
+    return f"""// Auto-generated (gen_mac_conf_probe.py): mul32_conf on a 4-bit sparse B, conf per tile
+#define NOCPP
+#include <stdint.h>
+#include <string.h>
+
+extern "C" {{
+void test_kernel(const int32_t *restrict in, int32_t *restrict out) {{
+    for (int t = 0; t < {tiles}; t++) {{
+        const char *p = (const char *)in + t * {S4_TILE};
+        v128uint8 a;
+        memcpy(&a, p, sizeof(a));
+        v256int4_sparse b;
+        memcpy(&b, p + 128, sizeof(b));
+        int conf;
+        memcpy(&conf, p + 256, sizeof(int));
+        v32acc32 r = me_primitive::mul32_conf(a, b, conf, 0);
+        memcpy((char *)out + t * 128, &r, 128);
+    }}
+}}
+}} // extern "C"
+"""
+
+
+S4_MASKS = (bytes([0x33] * 16), bytes([0xCC] * 16))
+
+
+def sparse4_cases(plan: str, tiles: list[tuple[bytes, bytes, int]], meta_tiles: list) -> list[CxxKernel]:
+    out = []
+    for k, start in enumerate(range(0, len(tiles), TILES_PER_CASE)):
+        chunk = tiles[start:start + TILES_PER_CASE]
+        buf = b"".join((a + b.ljust(128, b"\0") + struct.pack("<I", c)).ljust(S4_TILE, b"\0") for a, b, c in chunk)
+        out.append(CxxKernel(name=f"{plan}__{k:02d}", source=sparse4_kernel(len(chunk)), in_size=len(buf),
+                             out_size=128 * len(chunk), input_bytes=buf,
+                             meta={"plan": plan, "tile_in": S4_TILE, "tiles": meta_tiles[start:start + len(chunk)]}))
+    return out
+
+
+def plan_sparse4(rng):
+    """term_neg of the 4-bit sparse mode (0, 0, 1): one A element of row 0 at 1 (unsigned), every stored
+    B nibble 1, two masks; per (mask, element) the base conf and each term_neg bit alone."""
+    data = bytes([0x11] * 64)
+    tiles, meta = [], []
+    for pat, mask in enumerate(S4_MASKS):
+        for i in range(32):
+            a = bytes(1 if x == i else 0 for x in range(128))
+            for bit in [None] + list(range(8)):
+                conf = 1 << 5 | (0 if bit is None else 1 << (16 + bit))
+                tiles.append((a, data + mask, conf))
+                meta.append([pat, i, bit])
+    return sparse4_cases("sparse4", tiles, meta)
+
+
+def plan_sparsekeys(rng):
+    """Every (amode, bmode, cmode) key on the 4-bit sparse multiply: random A and B, two masks."""
+    tiles, meta = [], []
+    for code in range(128):
+        for pat, mask in enumerate(S4_MASKS):
+            a = bytes(rng.getrandbits(8) for _ in range(128))
+            b = bytes(rng.getrandbits(8) for _ in range(64))
+            tiles.append((a, b + mask, code << 1 | 3 << 8))
+            meta.append([code, pat])
+    return sparse4_cases("sparsekeys", tiles, meta)
+
+
+PLANS = {"bfcodesf": plan_bfcodesf, "sparse4": plan_sparse4, "sparsekeys": plan_sparsekeys, "bftermneg": plan_bftermneg, "bfcodes": plan_bfcodes, "bfupper": plan_bfupper, "accops": plan_accops, "sparse": plan_sparse, "repro": plan_repro, "modes": plan_modes, "termneg": plan_termneg, "fsingle": plan_fsingle, "fprobe": plan_fprobe, "onehot": plan_onehot, "same": plan_same, "flags": plan_flags, "codes": plan_codes, "upper": plan_upper, "random": plan_random}
 
 
 def main():
@@ -541,7 +627,7 @@ def main():
     rng = random.Random(args.seed)
     kernels = PLANS[args.plan](rng)
     write_cxx_suite(args.suite_dir, f"macconf-{args.plan}", "tools/gen_mac_conf_probe.py",
-                    "chess" if args.plan == "sparse" else "peano",
+                    "chess" if args.plan in ("sparse", "sparse4", "sparsekeys") else "peano",
                     kernels, meta={"plan": args.plan, "seed": args.seed})
     print(f"{len(kernels)} cases -> {args.suite_dir}")
 
