@@ -530,3 +530,57 @@ pub unsafe extern "C" fn xdna_emu_dump_tile_state(
     *buf.add(needed) = 0;
     needed as i32
 }
+
+/// The device's own answers to the driver's firmware-version, AIE-version
+/// and AIE-metadata queries.
+///
+/// # Returns
+/// - `1` with `*out` filled when the backend's device supplies them
+/// - `0` when it does not (answer from the static model)
+/// - `-1` if `handle` or `out` is null
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `out` must point to a writable `DeviceInfo`
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_device_info(
+    handle: *mut XdnaEmuHandle,
+    out: *mut crate::backend::DeviceInfo,
+) -> i32 {
+    if handle.is_null() || out.is_null() {
+        return -1;
+    }
+    match (*handle).backend.device_info() {
+        Some(info) => {
+            *out = info;
+            1
+        }
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::*;
+
+    /// The plugin mirrors this layout (`emu_transport::device_info`).
+    #[test]
+    fn device_info_layout_matches_the_plugin_mirror() {
+        assert_eq!(std::mem::size_of::<crate::backend::DeviceInfo>(), 64);
+        assert_eq!(std::mem::offset_of!(crate::backend::DeviceInfo, cols), 28);
+        assert_eq!(std::mem::offset_of!(crate::backend::DeviceInfo, core), 32);
+        assert_eq!(std::mem::offset_of!(crate::backend::DeviceInfo, shim), 52);
+    }
+
+    #[test]
+    fn the_interpreter_supplies_no_device_info() {
+        unsafe {
+            let mut info = crate::backend::DeviceInfo::default();
+            assert_eq!(xdna_emu_get_device_info(std::ptr::null_mut(), &mut info), -1);
+            let handle = crate::xdna_emu_create();
+            assert_eq!(xdna_emu_get_device_info(handle, std::ptr::null_mut()), -1);
+            assert_eq!(xdna_emu_get_device_info(handle, &mut info), 0);
+            crate::xdna_emu_destroy(handle);
+        }
+    }
+}

@@ -1083,6 +1083,26 @@ get_info(amdxdna_drm_get_info& arg) const
     md->shim.lock_count = 16;
     md->shim.event_reg_count = 4;
 
+    // A device that answers QUERY_AIE_TILE_INFO itself overrides the model.
+    emu_transport::device_info dev{};
+    if (m_transport && m_transport->get_device_info(dev)) {
+      md->col_size = dev.col_size;
+      md->cols = dev.cols;
+      md->rows = dev.rows;
+      md->version.major = dev.aie_major;
+      md->version.minor = dev.aie_minor;
+      const auto fill = [](auto& out, const emu_transport::tile_class_info& in) {
+        out.row_count = in.row_count;
+        out.row_start = in.row_start;
+        out.dma_channel_count = in.dma_channel_count;
+        out.lock_count = in.lock_count;
+        out.event_reg_count = in.event_reg_count;
+      };
+      fill(md->core, dev.core);
+      fill(md->mem, dev.mem);
+      fill(md->shim, dev.shim);
+    }
+
     arg.buffer_size = sizeof(amdxdna_drm_query_aie_metadata);
     break;
   }
@@ -1094,6 +1114,11 @@ get_info(amdxdna_drm_get_info& arg) const
     auto* ver = reinterpret_cast<amdxdna_drm_query_aie_version*>(arg.buffer);
     ver->major = 2;
     ver->minor = 0;
+    emu_transport::device_info dev{};
+    if (m_transport && m_transport->get_device_info(dev)) {
+      ver->major = dev.aie_major;
+      ver->minor = dev.aie_minor;
+    }
     arg.buffer_size = sizeof(amdxdna_drm_query_aie_version);
     break;
   }
@@ -1140,6 +1165,13 @@ get_info(amdxdna_drm_get_info& arg) const
     fw->minor = 0;
     fw->patch = 0;
     fw->build = 0;
+    emu_transport::device_info dev{};
+    if (m_transport && m_transport->get_device_info(dev)) {
+      fw->major = dev.firmware_major;
+      fw->minor = dev.firmware_minor;
+      fw->patch = dev.firmware_patch;
+      fw->build = dev.firmware_build;
+    }
     arg.buffer_size = sizeof(amdxdna_drm_query_firmware_version);
     break;
   }

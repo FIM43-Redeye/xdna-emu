@@ -91,6 +91,29 @@ public:
     /// Run the queued commands as one submission.
     virtual void run_queued() {}
 
+    /// One tile class of the AIE metadata query.
+    struct tile_class_info {
+        uint16_t row_count;
+        uint16_t row_start;
+        uint16_t dma_channel_count;
+        uint16_t lock_count;
+        uint16_t event_reg_count;
+    };
+
+    /// The device's own answers to the version and metadata queries.
+    /// LAYOUT MUST MATCH `DeviceInfo` in crates/xdna-emu-ffi/src/backend.rs.
+    struct device_info {
+        uint32_t firmware_major, firmware_minor, firmware_patch, firmware_build;
+        uint32_t aie_major, aie_minor;
+        uint32_t col_size;
+        uint16_t cols, rows;
+        tile_class_info core, mem, shim;
+    };
+
+    /// Fill @info from the emulated device when it supplies the answers;
+    /// false means answer from the plugin's static model.
+    virtual bool get_device_info(device_info& /*info*/) { return false; }
+
     /// The host destroyed hardware context @ctx.  No-op if the library
     /// lacks the symbol.
     virtual void destroy_hw_context(uint32_t /*ctx*/) {}

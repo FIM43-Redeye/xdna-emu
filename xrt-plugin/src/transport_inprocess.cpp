@@ -114,6 +114,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_configure_cus_      = resolve_optional<fn_configure_cus>("xdna_emu_configure_cus");
     sym_queue_command_      = resolve_optional<fn_queue_command>("xdna_emu_queue_command");
     sym_destroy_hw_context_ = resolve_optional<fn_destroy_hw_context>("xdna_emu_destroy_hw_context");
+    sym_get_device_info_    = resolve_optional<fn_get_device_info>("xdna_emu_get_device_info");
     sym_read_register_      = resolve_optional<fn_read_register>("xdna_emu_read_register");
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
@@ -254,6 +255,14 @@ void emu_transport_inprocess::queue_command(uint32_t ctx, uint32_t opcode,
     std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
     Result rc = sym_queue_command_(emu_, ctx, opcode, cu_index, words, count);
     check(rc, "queue_command");
+}
+
+bool emu_transport_inprocess::get_device_info(device_info& info)
+{
+    if (!sym_get_device_info_)
+        return false;
+    std::lock_guard<std::recursive_mutex> lock(ffi_lock_);
+    return sym_get_device_info_(emu_, &info) == 1;
 }
 
 void emu_transport_inprocess::destroy_hw_context(uint32_t ctx)

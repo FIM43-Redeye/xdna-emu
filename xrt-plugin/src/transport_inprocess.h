@@ -46,6 +46,7 @@ public:
                        const uint32_t* words, uint32_t count) override;
     void run_queued() override;
     void destroy_hw_context(uint32_t ctx) override;
+    bool get_device_info(device_info& info) override;
 
     uint64_t alloc_buffer(size_t size) override;
     void     free_buffer(uint64_t addr) override;
@@ -166,6 +167,7 @@ private:
     using fn_queue_command      = Result (*)(XdnaEmuHandle*, uint32_t, uint32_t,
                                              uint32_t, const uint32_t*, uint32_t);
     using fn_destroy_hw_context = Result (*)(XdnaEmuHandle*, uint32_t);
+    using fn_get_device_info    = int32_t (*)(XdnaEmuHandle*, device_info*);
     using fn_read_register      = uint32_t (*)(XdnaEmuHandle*, uint16_t,
                                                uint16_t, uint32_t);
     using fn_write_register     = Result (*)(XdnaEmuHandle*, uint16_t,
@@ -273,6 +275,7 @@ private:
     fn_configure_cus      sym_configure_cus_      = nullptr;
     fn_queue_command      sym_queue_command_      = nullptr;
     fn_destroy_hw_context sym_destroy_hw_context_ = nullptr;
+    fn_get_device_info    sym_get_device_info_    = nullptr;
     fn_read_register      sym_read_register_      = nullptr;
     fn_write_register     sym_write_register_     = nullptr;
     fn_read_tile_mem      sym_read_tile_mem_      = nullptr;

@@ -80,6 +80,37 @@ pub struct ErtCommand<'a> {
     pub payload: &'a [u32],
 }
 
+/// One tile class of `DRM_AMDXDNA_QUERY_AIE_METADATA`
+/// (`struct amdxdna_drm_query_aie_tile_metadata`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TileClassInfo {
+    pub row_count: u16,
+    pub row_start: u16,
+    pub dma_channel_count: u16,
+    pub lock_count: u16,
+    pub event_reg_count: u16,
+}
+
+/// What the driver answers from its device for the firmware-version, AIE
+/// version and AIE metadata queries, when a backend's device supplies it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub firmware_major: u32,
+    pub firmware_minor: u32,
+    pub firmware_patch: u32,
+    pub firmware_build: u32,
+    pub aie_major: u32,
+    pub aie_minor: u32,
+    pub col_size: u32,
+    pub cols: u16,
+    pub rows: u16,
+    pub core: TileClassInfo,
+    pub mem: TileClassInfo,
+    pub shim: TileClassInfo,
+}
+
 /// The operations the FFI performs that are common to every backend.
 ///
 /// Public so an out-of-tree platform crate can provide a backend through
@@ -140,6 +171,12 @@ pub trait NpuBackend {
     /// `DRM_AMDXDNA_HW_LAST_ASYNC_ERR` reports it. Default: the interpreter
     /// device's own error sink, for backends that model the error path
     /// themselves.
+    /// The device's own answers to the driver's version and metadata
+    /// queries. Default: none; the caller answers from its static model.
+    fn device_info(&self) -> Option<DeviceInfo> {
+        None
+    }
+
     fn last_async_error(&self) -> Option<AmdxdnaAsyncError> {
         self.as_interpreter()
             .and_then(|engine| engine.device().async_errors.last_cache().copied())
