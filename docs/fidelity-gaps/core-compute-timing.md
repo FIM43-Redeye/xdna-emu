@@ -242,10 +242,11 @@ are now slots that keep what a move wrote, masked to their width. `srCarry`, `sr
   `--analyze` 1112/1112.
 - **`srSRS_of` / `srUPS_of`**: see "Status flags" in [vector-compute](vector-compute.md).
 
-Open: no producer for the floating-point flag registers `srFPFlags`/`srF2IFlags`/`srF2FFlags`
-(out of scope of the status-flag probes), so a kernel that reads one after the operation that
-should set it sees 0. The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`,
-`srSparse_of`) keep their producers.
+- **`srFPFlags` / `srF2IFlags` / `srF2FFlags`**: modelled 2026-11-05 (five sticky flag bits per register,
+  enable masks, per-definer visibility); see "Floating-point status flags" in
+  [vector-compute](vector-compute.md).
+
+The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`, `srSparse_of`) keep their producers.
 
 ## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
 

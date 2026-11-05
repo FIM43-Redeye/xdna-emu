@@ -524,6 +524,42 @@ honours crUPSSign: its flag follows the run-time sign in the satflags probe, and
 probe flipping crUPSSign before its read changes the converted lanes (top-bit-set source lanes
 zero- vs sign-extended).
 
+## Floating-point status flags (`srFPFlags`, `srF2FFlags`, `srF2IFlags`)
+
+TableGen `Defs`: `srFPFlags` on the bf16 MAC forms (`vmul.f`, `vnegmul.f`, `vmac.f`, `vmsc.f`,
+`vaddmac.f`, `vaddmsc.f`, dense and sparse) and the accumulator float forms (`vadd.f`, `vsub.f`,
+`vnegadd.f`, `vnegsub.f`, `vneg.f`, `vclr` on a bm register), `Uses = [crFPMask]`;
+`srF2FFlags` on `vconv.bf16.fp32` and `vst[.2d/.3d].conv.bf16.fp32` in every addressing mode
+(`Uses = [crF2FMask, crRnd]`); `srF2IFlags` on `vfloor.s32.bf16` (accumulator and vector source,
+`Uses = [crF2IMask]`). Silicon (`src/interpreter/execute/status_flags.rs`, module `fp`):
+
+| Bit | Meaning |
+|---|---|
+| 0 | a lane's result is zero (either sign) |
+| 1 | a lane's result is infinite (MAC, adder, fp32 -> bf16 only) |
+| 2 | a lane's result is NaN (a NaN input, Inf*0, Inf - Inf) |
+| 3 | a lane's result is zero but not exactly: the bf16 adder dropped bits of a term on its alignment grid or flushed a nonzero sum below 2^-126 (`1 - 1 + 2^-30 - 2^-30`, an exact zero, sets it; `2^-30 - 2^-30` alone does not); a conversion turned a nonzero input into zero |
+| 4 | overflow: an infinite result from finite terms (an Inf term in the same lane suppresses it), or a `vfloor` result outside int32 (an infinite input included, which sets no bit 1) |
+
+- Each bit is the OR over the instruction's 16 lanes. There is **no inexact bit**; a nonzero
+  inexact result sets nothing. `vclr` never changes `srFPFlags`, though TableGen lists it.
+- **Masks are enables**: a bit is recorded only where the mask register has it set (0 at reset,
+  so nothing is recorded by default; one bit per flag bit).
+- **Sticky**: ORed into the register; only a `mov` to it clears it. The other two flag registers
+  never change.
+- **Visible** to a reader issued 7 bundles after an `srFPFlags` producer (MAC and adder alike), 1
+  after an `srF2FFlags` producer and 2 after `vfloor`: the itinerary's flag def cycles. The bits are
+  ORed in one bundle earlier with the mask as it stands then: a `mov` to the flag issued in that
+  bundle wins (the flag is lost), an earlier one is overridden; a mask write issued in that bundle
+  comes too late, one issued a bundle earlier counts.
+
+Evidence: `tools/gen_fp_flags_probe.py` (assembly, two operations per record with 12 flag reads
+after each), `build/experiments/harness/vecmac/fpflags2` (57 cases, every definer and addressing
+mode, 14 MAC/adder operand kinds dense and elementwise, 19 conversion kinds with every crRnd, 16
+vfloor kinds with 9 shifts, sticky pairs and initial values) and `fpextra3` (`--plan extra`, 43
+cases: rounding-lost cancellations, specials next to an overflow, each mask bit, a clear and a mask
+write at every offset). HW r1 == r2 on both, 0 TDRs; EMU == HW 57/57 and 43/43.
+
 ## bf16 multiply-accumulate datapath (`vmul.f`, `vmac.f`, `vmsc.f`, `vaddmac.f`, ...)
 
 Modeled in `vector_matmul/bf16.rs` (`mac_lane`), derived from NPU1 silicon only
@@ -616,7 +652,7 @@ issue + 7); see "Accumulator read/write timing".
 
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
-| `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | no silicon capture (Chess/Peano emit no bf16 intrinsic for them) | `execute_matmul` bf16 gate | gated "[NOT MODELED]" |
+| `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | **do not exist on AIE2**: TableGen defines no such record, and the bf16 MAC encodings (`AIE2_vmac_bf_inst_vec`, `AIE2_vaddmac_bf_inst_vec`, `AIE2_vmul_bf_inst_vec` = {core, acc1, core, dst/acc2, mdm, family, 1}, acc1 = 0b11111 for vmul) carry only the product-sign bit `mdm`, with no slot for a negated acc1 or a subtracted acc2. Their arithmetic is the config word's `sub_acc1`/`sub_acc2` on `vmac.f`/`vaddmac.f`/`vaddmsc.f`, silicon-pinned in `vec_mac_bf16_forms` (`mac_sm_sa1` = -acc1 - P, `addmac_sa2` = acc1 - acc2 + P, `addmsc_sa2` = acc1 - acc2 - P) | `execute_matmul` | closed 2026-11-05: nothing to model |
 | sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed |
 | `vaddmac.f` / `vaddmsc.f` latency | dense and sparse both def 6, visible from issue + 7, pinned by the timing probe at controlled distances | `execute_matmul` latency | closed |
 | fp32-input MAC (emulated through bf16 splits in aie_api / the Chess `_accuracy_*` routines) | the split chain (`vconv.bf16.fp32` of an fp32 accumulator, `vmsc.f` residuals against 1.0, `vmul.f` cross products, `vadd.f` sums) is the bf16 datapath above applied in sequence; nothing split-specific is needed | `bf16::mac_lane`, `vector_float.rs` | **closed 2026-11-04**: the Chess intrinsic suite's fp32-via-bf16 cases (`*_accuracy_{safe,fast,low}`, real and complex, random bit patterns with Inf/NaN inputs) are EMU == silicon on 55 of 57; the 4 cfloat `mac`/`msc_elem_8` cases that differed were the `vlda am` timing (above), and the remaining 2 (`mul_2x8_8x2_accuracy_{safe,fast}`) read an uninitialized accumulator (next row) |

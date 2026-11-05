@@ -71,6 +71,38 @@ silicon with each bit alone on shared operands (`termneg`, 21 dense modes; `spar
 | 16x16 acc64, complex 16x16 | 2 | `t` |
 | float conf cmode 0 / cmode 1 | 2 | `t & 3` / `t` |
 | sparse 16-bit 2x8x8 / 8-bit 2x16x8 / 4x16x8 | 2 | stored B row `s` of the term: `s` / `s>>1` / `2*(s&1) + (s>>2&1)` |
+| sparse 4-bit 4x32x8 `(0, 0, 1)` | 2 | stored B row `s`: `2*(s>>1&1) + (s>>3&1)` (the int8x4 dense slots on `s`) |
+
+## Keys on a sparse instruction
+
+All 128 keys on the Chess `mul32_conf` sparse wide multiply (`sparsekeys`, random A and B, two masks;
+`build/experiments/harness/vecmac/sparsekeys`, HW r1 == r2, EMU == HW 6/6):
+
+- A sparse key is the sparse multiply (the amode-1 `bmode` 1 alias included: `(1, 1, 5)` is `(1, 3, 5)`).
+- A dense key is the **dense multiply of A's low 512 bits and the `qx` register's stored data as B**; the mask is
+  ignored.
+- The float conf (`amode` 2, 3) with `cmode` 2 is the sparse bf16 tile's layout under the float-conf products
+  (low bytes, 14-bit wrap); `cmode` 0/1 are the dense float conf on the stored data; `cmode` 3..7 a zero product.
+- The 4-bit sparse mode's `term_neg` (`sparse4`, Chess `mul32_conf`, one-hot A, two masks): see the table above.
+
+## bf16 (`.f`) instructions
+
+Probed with the Peano `bf_*16_conf` intrinsics (`tools/gen_mac_conf_probe.py bfcodes|bftermneg|bfupper`,
+`build/experiments/harness/vecmac/<plan>`):
+
+- **Keys** (`bfcodes`, all 128 keys on `vmul.f` and `vmac.f`, two sign settings): `amode` 2 and 3 are the float
+  multiplier and `bmode` is ignored; `cmode` 0 is the 4x8x4 tile, 1 the 16-lane pair form, 2 the sparse tile
+  (a zero product on a dense instruction), 3..7 a zero product with the accumulators still going through the
+  float adder (`MatMulConfig::bf16_idle`). An integer key (`amode` 0 or 1) on a `.f` instruction gives `vmul.f`
+  an all-zero result and makes `vmac.f` perturb the accumulator's low bits (e.g. `0x42280000` ->
+  `0x4227fff1`): not modelled, reported unhandled (no toolchain emits it; every bf16 intrinsic uses amode 2,
+  bmode 3).
+- **`term_neg`** (`bftermneg`, each bit alone, small-integer operands, `mul`/`mac`/`msc`/`addmac`): the float-conf
+  rule, `cmode` 0: two lane classes, slot `t & 3`; `cmode` 1: two classes, slot `t`. A negated slot flips the
+  sign of its products (an infinite product included). Sparse bf16 `term_neg` is not probed (none modelled).
+- **Other bits** (`bfupper`): `sgn_x`, `sgn_y` and the reserved bits have no effect; `shift16` shifts acc1's 32-bit
+  pattern left by 16 before it joins the float sum (`0x3f800000` becomes +0), with the sub/zero flags as usual. The
+  accumulator float forms (`vadd.f`, `vsub.f`, `vnegadd.f`, `vnegsub.f`, `vneg.f`) do the same (`accshift`, assembly).
 
 ## Evidence
 
@@ -87,10 +119,15 @@ regenerate with `tools/gen_mac_conf_probe.py <plan>`):
 | `modes`, `random`, `repro` | every kind x random flags on the complex, float-conf and idle keys; random conf words | 80, 40, 4 |
 | `accops` | `vadd`/`vsub`/`vnegadd`/`vnegsub`/`vneg` x every field | 24 / 1152 |
 | `sparse` | sparse term_neg, Chess `mul_*` sparse intrinsics | 48 / 2304 |
+| `bfcodesf`, `bftermneg`, `bfupper` | bf16 `.f` keys (Peano `bf_*_conf`), `term_neg` bits, upper bits (`build/experiments/harness/vecmac/`) | 6, 4, 6 |
+| `sparse4`, `sparsekeys` | 4-bit sparse `term_neg`; all 128 keys on the sparse wide multiply | 12, 6 |
+| `accshift` | `shift16` on the float accumulator forms (assembly) | 5 |
 
 ## Open
 
-- Sparse 4-bit mode `(0, 0, 1)`: `term_neg` not probed (no effect modelled).
-- Sparse instructions with a key that is not a sparse mode: no probe (needs hand assembly; reported unhandled).
-- `term_neg` on the bf16 `.f` instructions: not probed; `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` still unmodelled
-  (no intrinsic emits them).
+- `term_neg` of the float conf's sparse key (`cmode` 2 on an integer sparse instruction): not probed (none modelled).
+- `term_neg` on the bf16 sparse tile (`cmode` 2): not probed.
+- An integer key on a `.f` instruction (see "bf16 instructions"): reported unhandled; the only evidence is the HW-only
+  `bfcodes` capture (`vmul.f` all zero, `vmac.f` low-bit perturbation), not enough to pin a rule.
+- `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` do not exist on AIE2 (no TableGen record, no encoding slot); their
+  arithmetic is `sub_acc1`/`sub_acc2` on `vmac.f`/`vaddmac.f`/`vaddmsc.f`.
