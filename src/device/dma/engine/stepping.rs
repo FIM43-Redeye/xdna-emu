@@ -217,10 +217,11 @@ impl DmaEngine {
     /// Compression note: when decompression is enabled the number of stream
     /// words consumed per output word is data-dependent (a mask word plus a
     /// variable count of packed data words), which can't be sized without
-    /// actually popping the stream. This peek conservatively claims at most
-    /// the FIRST word's address in that case -- an under-approximation of a
-    /// rare multi-word-per-cycle case, not an over-claim (see task-4 report
-    /// and `docs/known-fidelity-gaps.md`).
+    /// actually popping the stream. This peek claims the FIRST word's
+    /// address in that case, and that is exact, not an under-claim: the
+    /// memory side stops at the first granule boundary
+    /// (`granule_capped_words`), so every word a granted cycle writes lies in
+    /// that word's granule and bank (`decompressing_s2mm_peek_matches_commit`).
     fn channel_bank_mask(&self, transfer: &Transfer, layout: crate::device::banking::BankLayout) -> u16 {
         // An MM2S channel's memory side is the granule FETCH into its egress
         // staging FIFO, not the word it hands the stream port this cycle (see
@@ -3367,6 +3368,65 @@ mod bank_demand_tests {
             eng.cycle_dma_banks, predicted_mask,
             "the banks a granted channel actually touches must match what peek predicted"
         );
+    }
+
+    /// A decompressing S2MM consumes a data-dependent number of stream words per
+    /// memory word, so its peek can only size the first word -- but the memory
+    /// side stops at the first granule boundary (`granule_capped_words`), so
+    /// every word a granted cycle writes lies in the granule peek named: the
+    /// committed banks equal the peeked ones, cycle by cycle, over a whole
+    /// compressed BD.
+    #[test]
+    fn decompressing_s2mm_peek_matches_commit() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        // A compressed image of 128 bytes with some non-zero bytes per block.
+        for i in 0..128usize {
+            if i % 5 == 0 {
+                tile.data_memory_mut()[0x1000 + i] = (i as u8) | 1;
+            }
+        }
+        eng.set_channel_compression_config(2, true, false, false);
+        assert!(eng.transfer_mm2s(0x1000, 128, 2, true, false, &mut tile, &mut NeighborTiles::empty()));
+        let mut compressed = Vec::new();
+        while let Some(sd) = eng.pop_stream_out() {
+            compressed.push(sd);
+        }
+        assert!(compressed.len() > 8, "fixture: a multi-word compressed stream");
+
+        eng.set_channel_compression_config(0, false, true, false);
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 128)).unwrap();
+        eng.start_channel(0, 0).unwrap();
+        let mut feed = compressed.into_iter();
+        let mut granted_cycles = 0;
+        for _ in 0..400 {
+            while eng.can_accept_stream_in_for_channel(0) {
+                match feed.next() {
+                    Some(sd) => {
+                        eng.push_stream_in(StreamData { data: sd.data, tlast: sd.tlast, channel: 0 });
+                    }
+                    None => break,
+                }
+            }
+            let peeked = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .find(|(r, _)| *r == Requester::S2mm(0))
+                .map_or(0, |(_, m)| *m);
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            assert_eq!(eng.cycle_dma_banks & !peeked, 0, "a bank touched that peek did not claim");
+            assert_eq!(eng.cycle_dma_banks, peeked & eng.cycle_dma_banks);
+            if eng.cycle_dma_banks != 0 {
+                granted_cycles += 1;
+            }
+        }
+        assert!(granted_cycles > 0, "the channel wrote memory");
+        // Bank demand only: the data a BD-driven decompressing channel writes is wrong (each
+        // 4-byte step consumes a whole compressed block), an open gap of its own
+        // (docs/fidelity-gaps/dma-stream-resources.md, "BD-driven (de)compression").
     }
 
     /// The tile DMA performs ONE 128-bit memory access per four 32-bit stream
