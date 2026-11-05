@@ -96,7 +96,7 @@ impl DeviceState {
         // keeps the shim's register value readable.  (Reset_Control_1 at
         // 0xFFF14, the shim-NoC reset, is intentionally a no-op: the NoC
         // is a stub with no state to tear down.)
-        const AIE_TILE_COLUMN_RESET_OFFSET: u32 = 0x000F_FF28;
+        use crate::device::clock_control::AIE_TILE_COLUMN_RESET_OFFSET;
         if matches!(tile_kind, TileKind::ShimNoc | TileKind::ShimPl)
             && tile_addr.offset == AIE_TILE_COLUMN_RESET_OFFSET
         {

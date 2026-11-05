@@ -75,6 +75,17 @@ pub struct ClockController {
 /// AM025 offset for Column_Clock_Control (shim tiles only).
 pub const COLUMN_CLOCK_CONTROL_OFFSET: u32 = 0x000FFF20;
 
+/// AM025 offset for AIE_Tile_Column_Reset (shim tiles only).
+pub const AIE_TILE_COLUMN_RESET_OFFSET: u32 = 0x000F_FF28;
+
+/// Shim registers the host drives while the column clock is gated, so an
+/// access to them is not the gated-access bug pattern. aie-rt's partition
+/// init and teardown (`_XAie_PrivilegeInitPart`,
+/// `_XAie_PrivilegeTeardownPart`) disable every column clock buffer, then
+/// assert AIE_Tile_Column_Reset ("Gate all tiles before resetting columns
+/// to quiet traffic"), and only then re-enable the clocks.
+const REACHABLE_WHILE_GATED_SHIM_OFFSETS: [u32; 1] = [AIE_TILE_COLUMN_RESET_OFFSET];
+
 /// AM025 offset for Module_Clock_Control on compute tiles.
 const MCC_COMPUTE_OFFSET: u32 = 0x00060000;
 /// AM025 offset for Module_Clock_Control on memtile and shim (MCC_0).
@@ -382,7 +393,8 @@ impl ClockController {
     /// pattern in the emulator.  The dispatch path should still serve
     /// the access regardless of this method's return value.
     pub fn warn_gated_access(&mut self, col: u8, row: u8, offset: u32) -> bool {
-        if self.is_tile_active(col, row) {
+        if self.is_tile_active(col, row) || (row == 0 && REACHABLE_WHILE_GATED_SHIM_OFFSETS.contains(&offset))
+        {
             return false;
         }
         self.warned_sites.insert((col, row, offset))
@@ -614,6 +626,15 @@ mod tests {
         for kind in [ModuleKind::Core, ModuleKind::Memory, ModuleKind::Dma, ModuleKind::StreamSwitch] {
             assert!(!clock.is_module_active(2, 2, kind), "module {:?} should be gated at boot", kind);
         }
+    }
+
+    #[test]
+    fn column_reset_on_a_gated_shim_is_not_a_gated_access() {
+        let mut clock = ClockController::new(5, 6);
+        assert!(!clock.warn_gated_access(1, 0, AIE_TILE_COLUMN_RESET_OFFSET));
+        assert!(clock.warn_gated_access(1, 0, 0x0003_6030), "other shim registers still warn");
+        assert!(clock.warn_gated_access(1, 2, AIE_TILE_COLUMN_RESET_OFFSET), "only the shim row is exempt");
+        assert_eq!(clock.warned_sites_len(), 2);
     }
 
     #[test]
