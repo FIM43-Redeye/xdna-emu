@@ -168,7 +168,7 @@ pub struct DmaEngine {
     /// Per-S2MM-channel: an upstream beat was offered this cycle and the
     /// channel could not take it because its ingress FIFO was FULL --
     /// `DMA_S2MM_n_MEMORY_BACKPRESSURE`. Set by the routing pass (Phase 4) via
-    /// `note_ingress_offer_refused`, read by the coordinator's event pass
+    /// `note_ingress_offer`, read by the coordinator's event pass
     /// (Phase E), cleared by `reset_cycle_drain_counters` at the top of each
     /// cycle. A refusal for any OTHER reason (the BD-switch TREADY gap, an
     /// unstarted channel) is not memory pressure and does not set this.

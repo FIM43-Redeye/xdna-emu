@@ -131,8 +131,13 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         unsourced("dma.memtile_first_bd_startup_cycles", "Placeholder 0 (inert). The cold-start gap it was meant for was later \
             root-caused to the CORE_CONTROL reset, so it may never be needed."),
         unsourced("dma.compute_first_bd_startup_cycles", "Placeholder 0 (inert), as memtile_first_bd_startup_cycles."),
-        measured("dma.s2mm_ingress_fifo_depth", HOP_SLOPE, "The remainder after the switch crossings and the sources' \
-            1-word registers (core: 1 + 1 + 6 + 18 = 26). Where inside the S2MM the 18 sit is not separated."),
+        measured("dma.s2mm_ingress_fifo_depth", "NPU1 S2MM_0_MEMORY_BACKPRESSURE opens 15 cycles into every steady \
+            lock-stall window (39 windows, zero variance, xdna-emu-priv: research/findings/2026-07-14-dma-memory-pressure-\
+            event-semantics.md; 15 again on the 2026-11-04 rebuild, EMU == HW)", "The FIFO the event watches; the ingress \
+            total (18) is this plus the skid stage."),
+        measured("dma.s2mm_ingress_skid_depth", HOP_SLOPE, "18 in all after the switch crossings and the sources' 1-word \
+            registers (core: 1 + 1 + 6 + 18 = 26), less the 15 the backpressure onset pins; which structure holds the 3 \
+            words is not separated."),
         measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
             (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles only; mem tiles inherit it unverified. \
             Assumes a stalled core holds one word (+/-1)."),

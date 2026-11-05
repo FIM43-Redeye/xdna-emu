@@ -1287,20 +1287,31 @@ pub struct DmaTiming {
     /// EMU counts the master-port beat at the DMA-accept point (pop to
     /// `stream_in`), so this single depth stands in for the combined ingress.
     ///
-    /// **Pinned at 18 by silicon (R4-D3 data race, NPU1, 2026-10-28 captures,
-    /// modelled 2026-11-04):** a core streaming into an S2MM whose lock is
-    /// withheld gets 26 words out before it stalls on the same tile, 34/42/50
-    /// one to three tiles away, and a DMA source 48/56/64/72 plus its staging
-    /// phase pattern. With the switch at its AM020 depths (local slave 4 +
-    /// local master 2 on the tile, 8 more per external hop, both confirmed by
-    /// the 8-per-hop slope) and the 1-word hand-off registers of the two
-    /// sources, every one of those 25 counts leaves exactly 18 for the
-    /// ingress (core: 1 held + 1 hand-off + 6 + 18 = 26). The co-captures
-    /// above only lower-bound it (16). Shim s2mm recv is governed by the separately
+    /// **Pinned by silicon at 15 here plus `s2mm_ingress_skid_depth` 3 in
+    /// front of it (NPU1, modelled 2026-11-04).** The whole ingress holds 18:
+    /// a core streaming into an S2MM whose lock is withheld gets 26 words out
+    /// before it stalls on the same tile, 34/42/50 one to three tiles away,
+    /// and a DMA source 48/56/64/72 plus its staging phase pattern (R4-D3 data
+    /// race); with the switch at its AM020 depths (local slave 4 + local
+    /// master 2 on the tile, 8 more per external hop, confirmed by the
+    /// 8-per-hop slope) and the 1-word hand-off registers of the two sources,
+    /// all 25 counts leave exactly 18 (core: 1 held + 1 hand-off + 6 + 18).
+    /// `DMA_S2MM_n_MEMORY_BACKPRESSURE`, which watches this FIFO, opens 15
+    /// cycles into a lock stall (39 windows, zero variance; 15 again on a
+    /// 2026-11-04 rebuild), so the FIFO is 15 and the other 3 are a skid
+    /// stage that takes beats once it is full. The co-captures above only
+    /// lower-bound the total (16). Shim s2mm recv is governed by the separately
     /// calibrated DDR cold-start model, so shim keeps the shallow master-port
     /// depth. Far below the 256-word buffer that caused the 2026-06-13 warmup
     /// transient (~1 BD of warmup slack at depth 16).
     pub s2mm_ingress_fifo_depth: u8,
+
+    /// S2MM skid stage (32-bit words) between the local master port and the
+    /// ingress FIFO (`s2mm_ingress_fifo_depth`), compute and mem tiles: 3.
+    /// It takes beats only once the FIFO is full, so it adds to what a held
+    /// S2MM absorbs (18 in all, R4-D3) but not to the backpressure event's
+    /// onset (15). Which physical structure holds these 3 words is not separated.
+    pub s2mm_ingress_skid_depth: u8,
 
     /// MM2S DMA egress staging depth (32-bit words) for compute and mem tiles
     /// -- how many words the channel holds between the memory read and the

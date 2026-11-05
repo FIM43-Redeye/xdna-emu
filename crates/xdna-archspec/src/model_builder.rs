@@ -223,9 +223,10 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // lands.  Memtile and compute calibrate independently.
             memtile_first_bd_startup_cycles: 0,
             compute_first_bd_startup_cycles: 0,
-            // Pinned by the R4-D3 data race (NPU1, core and DMA sources,
-            // 0..3 hops): 18. See the DmaTiming field doc.
-            s2mm_ingress_fifo_depth: 18,
+            // Pinned by silicon: 18 in all (R4-D3 data race), of which the
+            // backpressure event watches 15 (onset +15). See the field docs.
+            s2mm_ingress_fifo_depth: 15,
+            s2mm_ingress_skid_depth: 3,
             // Pinned by silicon (R4-D3, Phoenix, 2026-10-28): 25 words held by
             // a compute-tile MM2S ahead of a stalled consumer, upstream of the
             // switch's local-slave port. See the DmaTiming field doc.

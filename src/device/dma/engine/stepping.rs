@@ -3514,6 +3514,8 @@ mod bank_demand_tests {
         eng.start_channel(0, 0).unwrap();
 
         let cap = eng.input_fifo_capacity();
+        let watched = eng.ingress_watched_depth();
+        assert!(watched < cap, "the skid stage sits upstream of the watched FIFO");
         let mut accepted = 0usize;
         let mut first_backpressure_at = None;
 
@@ -3526,11 +3528,10 @@ mod bank_demand_tests {
             tile.resolve_lock_requests(0);
             eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
 
+            eng.note_ingress_offer(0, true);
             if eng.can_accept_stream_in_for_routing(0) {
                 eng.push_stream_in(StreamData { data: 0xC0DE_0000 | cycle as u32, tlast: false, channel: 0 });
                 accepted += 1;
-            } else {
-                eng.note_ingress_offer_refused(0);
             }
 
             if eng.s2mm_memory_backpressure(0) && first_backpressure_at.is_none() {
@@ -3539,10 +3540,13 @@ mod bank_demand_tests {
         }
 
         assert_eq!(accepted, cap, "the ingress must swallow exactly its own depth in beats");
+        // Silicon: backpressure opens 15 cycles into the lock stall (39 windows, zero variance,
+        // 2026-07-14 capture; 15 again on the 2026-11-04 rebuild), while the whole ingress
+        // swallows 18 beats (R4-D3): the event watches the 15-deep FIFO, the skid takes 3 more.
         assert_eq!(
             first_backpressure_at,
-            Some(cap),
-            "backpressure must assert on the first beat the FIFO cannot take, and not one cycle sooner"
+            Some(watched),
+            "backpressure must assert on the first beat the watched FIFO cannot take"
         );
 
         // Free the buffer. The channel drains the ingress, a slot opens, the
@@ -3565,23 +3569,22 @@ mod bank_demand_tests {
             eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
             tile.resolve_lock_requests(0);
             eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            eng.note_ingress_offer(0, true);
             if eng.can_accept_stream_in_for_routing(0) {
                 eng.push_stream_in(StreamData { data: 0xFEED_0000, tlast: false, channel: 0 });
                 if first_accept_at.is_none() {
                     first_accept_at = Some(cycle);
                 }
-            } else {
-                eng.note_ingress_offer_refused(0);
             }
             if !eng.s2mm_memory_backpressure(0) && cleared_at.is_none() {
                 cleared_at = Some(cycle);
             }
         }
         assert!(first_accept_at.is_some(), "the channel must resume once the buffer is free");
-        assert_eq!(
-            cleared_at, first_accept_at,
-            "backpressure must clear on exactly the cycle the FIFO can take a beat again"
-        );
+        // The event clears on the cycle the channel's drain takes the FIFO below full -- one
+        // cycle before the registered TREADY lets the next beat in.
+        assert!(cleared_at.is_some(), "backpressure clears once the FIFO drains");
+        assert_eq!(cleared_at.map(|c| c + 1), first_accept_at, "the cycle before the next accept");
     }
 
     /// The egress staging depth is pinned by silicon at 25 words (R4-D3,

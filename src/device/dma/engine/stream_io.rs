@@ -31,8 +31,9 @@ impl DmaEngine {
     /// `[16,16,16,16]` and compute recv to `[8,8,8,8,8,8,8,8]`, where the
     /// pre-fix 2-deep model split every reused BD (`[16,16,2,14,16]` /
     /// `[8,8,2,6,...]`). EMU counts the master-port beat at the DMA-accept
-    /// point, so this single capacity stands in for the combined ingress
-    /// (= `DMA_S2MM_INGRESS_FIFO_DEPTH`, 16, a lower bound pinned by HW). The
+    /// point, so this capacity stands in for the combined ingress: the skid
+    /// stage plus the ingress FIFO (`DMA_S2MM_INGRESS_SKID_DEPTH` 3 +
+    /// `DMA_S2MM_INGRESS_FIFO_DEPTH` 15 = 18, pinned by silicon). The
     /// **shim** s2mm recv is governed by the separately calibrated DDR
     /// cold-start model, so it keeps the shallow master-port depth.
     ///
@@ -41,7 +42,7 @@ impl DmaEngine {
     /// extra fast iterations during double-buffer warmup, defeating the
     /// otherwise HW-faithful master-port backpressure and producing a warmup
     /// transient much longer than silicon (root-caused 2026-06-13 via the
-    /// dma_passthrough buffer-size sweep). The depth-16 value is far shallower
+    /// dma_passthrough buffer-size sweep). The depth-18 ingress is far shallower
     /// (~1 BD of warmup slack). Phase 4's `can_accept_stream_in_for_routing`
     /// enforces the registered-FIFO ordering invariant: it checks
     /// `current + drained_this_cycle < capacity` rather than `current < capacity`,
@@ -50,7 +51,7 @@ impl DmaEngine {
     pub fn input_fifo_capacity(&self) -> usize {
         use xdna_archspec::aie2::timing;
         if self.tile_kind.is_mem() || self.tile_kind.is_compute() {
-            timing::DMA_S2MM_INGRESS_FIFO_DEPTH as usize
+            (timing::DMA_S2MM_INGRESS_FIFO_DEPTH + timing::DMA_S2MM_INGRESS_SKID_DEPTH) as usize
         } else {
             timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize
         }
@@ -388,23 +389,33 @@ impl DmaEngine {
         }
     }
 
-    /// The routing pass offered S2MM channel `ch` a beat and the channel refused
-    /// it. Raise `DMA_S2MM_n_MEMORY_BACKPRESSURE` if -- and only if -- the reason
-    /// was that the ingress FIFO is FULL: the stream has data, the channel cannot
-    /// drain to memory, and the staging has run out of room. That is the whole
-    /// semantics of the event on silicon
-    /// (xdna-emu-priv: research/findings/2026-07-14-dma-memory-pressure-event-semantics.md);
-    /// the *cause* of the channel not draining (a held lock, in practice) is not
-    /// tested for here and must not be.
+    /// Depth of the part of the S2MM ingress that `DMA_S2MM_n_MEMORY_BACKPRESSURE`
+    /// watches: the ingress FIFO proper, downstream of the skid stage
+    /// (`DMA_S2MM_INGRESS_SKID_DEPTH`) that takes the master port's beats.
+    pub fn ingress_watched_depth(&self) -> usize {
+        self.input_fifo_capacity()
+            .saturating_sub(xdna_archspec::aie2::timing::DMA_S2MM_INGRESS_SKID_DEPTH as usize)
+    }
+
+    /// The routing pass's view of S2MM channel `ch` this cycle: `offered` says whether its
+    /// master port holds a beat (TVALID). Raise `DMA_S2MM_n_MEMORY_BACKPRESSURE` if -- and only
+    /// if -- a beat is on offer and the ingress FIFO is FULL: its 15 slots are taken, whether or
+    /// not the skid stage still has room for the beat. That is the whole semantics of the event
+    /// on silicon (xdna-emu-priv: research/findings/2026-07-14-dma-memory-pressure-event-semantics.md):
+    /// it opens 15 cycles into a lock stall while the ingress goes on to swallow 18 beats. With
+    /// nothing on offer it deasserts however full the ingress is. The *cause* of the channel not
+    /// draining (a held lock, in practice) is not tested for here and must not be; control-path
+    /// refusals (the BD-switch TREADY gap, the one-BD-lookahead gate) are not occupancy and do
+    /// not raise it.
     ///
-    /// The other reasons `can_accept_stream_in_for_routing` refuses a beat -- the
-    /// one-cycle BD-switch TREADY gap, the one-BD-lookahead drain gate -- are
-    /// control-path, not memory pressure, and deliberately do not raise it.
-    pub fn note_ingress_offer_refused(&mut self, ch: u8) {
-        let cap = self.input_fifo_capacity();
-        let current = self.stream_in.get(ch as usize).map_or(0, |q| q.len());
-        let drained = self.stream_in_drained_this_cycle.get(ch as usize).copied().unwrap_or(0);
-        if current + drained >= cap {
+    /// Occupancy is the FIFO's level after this cycle's drain to memory, not the registered
+    /// start-of-cycle value that gates TREADY (`can_accept_stream_in_for_routing`): silicon
+    /// deasserts the event 1 cycle after the lock stall ends, the cycle the channel's first
+    /// drain takes the FIFO below full (the registered value held it one cycle longer).
+    pub fn note_ingress_offer(&mut self, ch: u8, offered: bool) {
+        let watched = self.ingress_watched_depth();
+        let occupancy = self.stream_in.get(ch as usize).map_or(0, |q| q.len());
+        if offered && occupancy >= watched {
             if let Some(f) = self.s2mm_ingress_full_offered.get_mut(ch as usize) {
                 *f = true;
             }
