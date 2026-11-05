@@ -304,10 +304,15 @@ impl DeviceState {
             }
         }
 
-        // Ctrl's Reset field (AM025) resets the channel.
-        if !is_start_queue && lay.reset.extract_bool(value) {
+        // Ctrl's Controller_ID names the controller that receives this
+        // channel's task-complete tokens; its Reset field (AM025) resets the
+        // channel.
+        if !is_start_queue {
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                dma.reset_channel(ch_idx as u8);
+                dma.set_channel_controller(ch_idx as u8, lay.controller_id.extract(value) as u8, 0);
+                if lay.reset.extract_bool(value) {
+                    dma.reset_channel(ch_idx as u8);
+                }
             }
         }
 
@@ -323,10 +328,11 @@ impl DeviceState {
                 repeat_count as u32 + 1,
                 ch_idx
             );
+            let enable_token_issue = lay.enable_token_issue.extract_bool(value);
             // Re-parse ALL dirty BDs so chained BDs are also configured
             self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
                     log::warn!(
                         "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
                         col,
@@ -393,10 +399,13 @@ impl DeviceState {
             None
         };
 
-        // Ctrl's Reset field (AM025) resets the channel.
-        if new_control.is_some_and(|ctrl| lay.reset.extract_bool(ctrl)) {
+        // Ctrl's Controller_ID and Reset field, as for a plain write.
+        if let Some(ctrl) = new_control {
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                dma.reset_channel(ch_idx as u8);
+                dma.set_channel_controller(ch_idx as u8, lay.controller_id.extract(ctrl) as u8, 0);
+                if lay.reset.extract_bool(ctrl) {
+                    dma.reset_channel(ch_idx as u8);
+                }
             }
         }
 
@@ -404,10 +413,11 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
+            let enable_token_issue = lay.enable_token_issue.extract_bool(queue_val);
             // Re-parse ALL dirty BDs so chained BDs are also configured
             self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
                     log::warn!(
                         "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
                         col,

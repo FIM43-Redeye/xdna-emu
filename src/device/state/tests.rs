@@ -1105,3 +1105,33 @@ fn memtile_dma_ctrl_reset_drops_the_channels_work() {
 
     assert!(!state.array.dma_engine(col, row).unwrap().channel_has_pending_work(0));
 }
+
+/// A memory-tile Start_Queue write with Enable_Token_Issue queues a
+/// token-issuing task, and Ctrl's Controller_ID names the token's controller
+/// (memtile_dmas/dma_configure_task_token awaits a memory-tile S2MM task).
+#[test]
+fn memtile_start_queue_honours_token_issue_and_controller_id() {
+    use crate::device::regdb::device_reg_layout;
+    let layout = device_reg_layout();
+    let mut state = DeviceState::new_npu1();
+    let (col, row) = (1u8, 1u8);
+    let blocked = layout.memtile_bd.valid_bd.insert(0, 1)
+        | layout.memtile_bd.lock_acq_enable.insert(0, 1)
+        | layout.memtile_bd.lock_acq_value.insert(0, 1);
+    state
+        .write_register(TileAddress::encode(col, row, layout.memtile_bd_base + 7 * 4), blocked)
+        .unwrap();
+    let ctrl = layout.memtile_channel_s2mm_base;
+    let channel = &layout.memtile_channel;
+    state
+        .write_register(TileAddress::encode(col, row, ctrl), channel.controller_id.insert(0, 1))
+        .unwrap();
+    let queue = channel.start_bd_id.insert(0, 0) | channel.enable_token_issue.insert(0, 1);
+    // The first task starts and blocks on its lock; the second waits queued.
+    state.write_register(TileAddress::encode(col, row, ctrl + 4), queue).unwrap();
+    state.write_register(TileAddress::encode(col, row, ctrl + 4), queue).unwrap();
+
+    let dma = state.array.dma_engine(col, row).unwrap();
+    assert_eq!(dma.channel_controller_id(0), Some(1));
+    assert_eq!(dma.queued_token_issue(0), [true]);
+}

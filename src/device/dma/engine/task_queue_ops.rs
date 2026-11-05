@@ -172,6 +172,14 @@ impl DmaEngine {
             .unwrap_or_default()
     }
 
+    /// Whether each pending task issues a task-complete token, in FIFO order.
+    pub fn queued_token_issue(&self, channel: ChannelId) -> Vec<bool> {
+        self.channels
+            .get(channel as usize)
+            .map(|ch| ch.task_queue.iter().map(|task| task.enable_token_issue).collect())
+            .unwrap_or_default()
+    }
+
     /// Check if the task queue overflow flag is set for a channel.
     pub fn task_queue_overflow(&self, channel: u8) -> bool {
         if !self.dma_model.supports_task_queue() {
