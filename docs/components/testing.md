@@ -154,6 +154,8 @@ AIE2 only) because aiecc links per package. The entry symbol is renamed at compi
 | Overflow-flag clear race (a `mov` to `srSRS_of`/`srUPS_of` N bundles after a saturating conversion) | `tools/gen_flag_clear_probe.py --suite-dir <dir>` | `tools/gen_flag_clear_probe.py --analyze <dir> <tag>` |
 | `vlda.ups` register read cycles (late writes of crUPSSign, crSat, the shift) | `tools/gen_ups_read_cycle_probe.py --suite-dir <dir>` | `tools/gen_ups_read_cycle_probe.py --analyze <dir> <tag>` |
 | Host runtime-sequence op cost (a core polls its own data memory and stamps the tile counter as `write32` / `blockwrite` / `maskwrite32` ops land; own host with optional context QoS; standalone, not a `harness` suite) | `tools/gen_fw_op_cost_probe.py generate\|build <dir>`; runner `tools/fw_op_cost_run.py <cases> <out> --tag T --dpm 1 0` (hardware only, records the clock pair before and after each launch) | `tools/fw_op_cost_report.py <cases> <runs>` |
+| Stream absorb (core -> core words before the producer stalls, direct and via the switch FIFO) | `tools/gen_stream_absorb_probe.py generate <dir>` | `tools/gen_stream_absorb_probe.py summarize <dir>/runs/<tag>/<case> <k>` |
+| Stream round trip (core <-> core, 1..3 hops, `--fifo` through the switch FIFO): per-hop latency | `tools/gen_stream_rtt_probe.py generate <dir> [--fifo]` | `tools/gen_stream_rtt_probe.py summarize <dir> <tag>` |
 | Shuffle network sweep (one Chess case) | `tests/shuffle-sweep/gen_suite.py <dir>` | `tests/shuffle-sweep/analyze.py <dir>/runs/<tag>/shuffle-sweep/core.out.bin` |
 | Characterizers (`tests/*.s`: sparse mask, sparse MAC, bf16 element-wise and sub-precision, vldb.4x*), five cases | `tools/charz_suites.py <dir>` | `python3 tests/<name>.py --suite <dir> r1 [e1]` |
 
