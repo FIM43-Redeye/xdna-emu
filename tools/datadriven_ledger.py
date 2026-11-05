@@ -464,7 +464,7 @@ def schema_report(encodings):
                 c[1] += 1
             want = LEGACY_ADDRESSING.get(sc["addressing"], "Unknown")
             if e["addressing_mode"].split("::")[-1] == want:
-                c[2] += 1
+                c[2] += bool(sc["addressing"])
             else:
                 dis.append((e["name"], "addressing_mode", "", e["addressing_mode"], str(sc["addressing"])))
         if mem:
