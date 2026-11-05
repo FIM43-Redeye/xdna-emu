@@ -210,7 +210,7 @@ impl BuildSlotEncoding {
             }
         }
 
-        field_bits
+        let mut fields: Vec<BuildOperandField> = field_bits
             .into_iter()
             .map(|(name, mut bit_pairs)| {
                 bit_pairs.sort_by_key(|&(_, target)| target);
@@ -251,7 +251,11 @@ impl BuildSlotEncoding {
                     }
                 }
             })
-            .collect()
+            .collect();
+        // MSB-first, as `InstrEncoding::operand_fields` documents. The fields come out of a
+        // HashMap, so without this the generated tables changed order from build to build.
+        fields.sort_by(|a, b| b.bit_position.cmp(&a.bit_position).then_with(|| a.name.cmp(&b.name)));
+        fields
     }
 }
 
