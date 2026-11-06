@@ -2,7 +2,7 @@
 class: addressing
 subsystem: AIE2 address generation -- the 2D / 3D descriptor post-modify (`[p], d`) of every load and store
 posture: resolved -- one rule, pinned on silicon for every TableGen family; the residuals are unobserved corners, not unvalidated model
-status: resolved (rule, descriptor layout, classification, unaligned accesses, address-bit decode); open: count-write latency, descriptors d4..d7 as 2D operands, west/south accesses, vldb.compr
+status: resolved (rule, descriptor layout, classification, unaligned accesses, address-bit decode, loads with no memory behind them); open: count-write latency, descriptors d4..d7 as 2D operands, west of column 1 (column-0 contents), vldb.compr
 ---
 
 # Addressing (2D / 3D descriptor post-modify)
@@ -144,9 +144,60 @@ input window, the top 512 bytes of its memory, a window it stores into the north
 
 Memory nobody in the kernel wrote (case `lut_unwritten`) is deterministic on one machine but is
 not the kernel's: the west quadrant of a column-1 tile is the DPU-reserved column 0 and returns
-its contents; the south quadrant of row 2 (the memory tile row, no core memory) returns stale
-port data (bytes of the last west read or the last north store, never the `vldb` issued just
-before). See Open.
+its contents (see Open); the south quadrant of row 2 (the memory-tile row, no core memory) is
+answered by the load-port rings of the next section. Replayed over that case, the rule names a
+source for all 32 south lanes: 16 are column-0 rows that the case's own west lanes also read
+(byte-equal, 0 mismatches), 10 are column-0 rows at offsets no west lane showed, and 6 are
+port-B ring slots left by the previous kernel (`ptr_alias`'s last north line). None is data the
+emulator has, so the case stays an exception for the column-0 node and for ring state across
+launches (replay: `build/experiments/harness/port-latch/wrap3-replay`).
+
+## Loads with no memory behind them (NPU1 silicon)
+
+A core in row 2 sits above the memory-tile row, so its south quadrant has no core data memory;
+a core in row 5 has nothing to its north. Probe: `tools/gen_port_latch_probe.py` (tests in
+`tools/tests/test_gen_port_latch_probe.py`), one hand-written core in physical column 2 (its
+west neighbour is real memory the kernel fills) or row 5, every input halfword naming its
+region and offset, so the analysis names the access each returned byte came from. Suite
+`build/experiments/harness/port-latch/suite`: 12 cases, HW r1 == r2 (`ring_f`: f1 == f2), no
+driver resets. A row-3 control (`ctrl`, real memory to the south) reads what the kernel stored
+there.
+
+**Each load port keeps a ring of the rows it fetched, and a load with no memory behind it is
+answered from that ring.**
+
+- Port A (`vlda`, `lda` in every width, `lda q`, `vlda.ups`, `vlda.conv`) and port B (`vldb`,
+  `vldb.128`, `vldb.unpack`, `vldb.sparse`) each have two rings of six 16-byte entries, one per
+  half of the 256-bit path (address bit 4), each with its own pointer.
+- A load with memory behind it (own or neighbour) writes the whole 16-byte row it fetched into
+  the slot at its half's pointer and advances that pointer: a 256-bit load both halves, a 128-bit
+  or scalar load only the half its address selects, with the full row even for one byte
+  (`ring_d`).
+- A load with no memory behind it writes nothing and returns the slot at the pointer (the bytes
+  at its in-row offset), then advances the pointer the same way. So a run of south `vldb`s
+  returns the last six `vldb` lines, oldest first, then repeats with period six whatever the
+  address (`sweep`, `ring_a` b0, `ring_b` b2).
+- Stores and the other port's loads never touch a ring (`ring_a`, `ring_d`, `ring_e`).
+- A `vldb.4x*` gather is one access on each port: lanes 0-1 (or 4-5) on A, 2-3 (or 6-7) on B,
+  even lanes through the low half, odd lanes through the high half (`ring_c`, `ring_e`). This
+  is why `lut_unwritten`'s south lanes 0-1 returned an earlier west gather's rows: six port-A
+  accesses back.
+- North of row 5 behaves the same (`ring_top`): the rule is "no core memory in that direction",
+  not something of the memory tile.
+- The rings survive kernel launches (the harness scrub uses only port-A loads, so port B keeps
+  what ran before): such a read depends on the previous kernel. Every probe kernel flushes both
+  rings first; the emulator starts a core with zero rings.
+
+Silicon does not write anything for a store into such a direction; the emulator drops it (the
+memory tile used to receive core stores and answer core loads south of row 2).
+
+**Emulator.** `interpreter::state::load_ring` holds the rings in `ExecutionContext`; every load
+in `MemoryUnit` fetches through `fetch_row` / `ring_row` (`port_line`, `port_quad`,
+`port_scalar`, the gather lanes, unpack, sparse fetches, the fused `vlda.ups` / `vlda.conv`,
+which now also reach neighbour memory). `NeighborMemory::data` tells core memory, no memory (a
+memory or shim tile, or outside the array) and an isolated direction apart; an isolated read
+still returns zeros (unprobed). Unit tests: `memory/load_ring_tests.rs` (one per silicon case
+family), `state/load_ring.rs`, `memory/neighbor.rs`. EMU == HW on all 12 probe cases.
 
 ## Emulator design
 
@@ -203,7 +254,10 @@ before). See Open.
 | count-write latency | at most two bundles (observed); not pinned lower |
 | `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise |
 | counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured |
-| west and south accesses with no memory behind them | silicon returns column-0 contents (west of column 1) and stale port data (south of row 2, no core memory there); the emulator returns zeros for a missing neighbour. Deterministic per machine but not the kernel's data; the port-latch rule is unprobed (`load4x/wrap3` `lut_unwritten`) |
+| west of column 1 | silicon returns the DPU-reserved column 0's contents, which the emulator does not have (`load4x/wrap3` `lut_unwritten`: its west lanes, and through the rings most of its south lanes) |
+| ring state across kernel launches | silicon keeps both rings from the previous kernel (the harness scrub loads only through port A, so port B is never reset); an emulator core starts with zeros. A no-memory read before six own loads on its port depends on what ran before (`lut_unwritten`, 6 lanes) |
+| loads into an isolated direction | `Tile_Control` isolation: the emulator returns zeros and writes zeros to the ring; unprobed |
+| a sparse peek / pop whose fetch is dropped | assumed not to touch the port-B ring (no fetch); unprobed |
 | `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed |
 | bytes a sparse peek reads past the first fetched line | they come from stale ring slots; silicon and the emulator differ there (sparse_4 / sparse_8, 16 of 64 records, the last 2 bytes of each) |
 | Chess emits `padds [sp], #imm` (stack adjust in the store slot) around spills in some register-pressure shapes | llvm-aie defines the `ag_pstm_sp_imm` stack adjust only for the A and B load units (`PADDA_sp_imm`, `PADDB_sp_imm`), so its disassembler, and the emulator with it, rejects the bundle (`St DECODE FAIL`). A one-def llvm-aie fix (`PADDS_sp_imm`) is being proposed upstream; built against it, the original `vec_agu_srs_d` d8 form decodes and passes on EMU. Until it lands, that form stays reshaped to avoid the spill. A decode sweep of every Chess listing on hand (`decode-sweep`) found no other undecodable encoding. Not an addressing-rule gap |
