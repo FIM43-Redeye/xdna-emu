@@ -622,7 +622,30 @@ impl ExecutionContext {
     /// Normal initialization then overwrites the fields it's responsible for.
     /// Any register NOT explicitly initialized retains the sentinel, making
     /// uninitialized reads immediately obvious in output.
+    ///
+    /// This is the core's power-on state (a fresh device): the sentinel, the launch reset
+    /// values, then `XDNA_EMU_CORE_INIT` if set. A launch's core reset keeps the data registers
+    /// instead: see [`after_reset`](Self::after_reset).
     pub fn new_for_tile(col: u8, row: u8) -> Self {
+        let mut ctx = Self::reset_values(col, row);
+        // A scrubbed run starts every core from the values the scrub kernel leaves on silicon.
+        if let Some(init) = super::scrub::CoreInit::from_env() {
+            init.apply(&mut ctx);
+        }
+        ctx
+    }
+
+    /// The context a core reset leaves (a launch on silicon): `carried` in the data registers
+    /// and load-port rings, the launch reset values in the control and status registers and
+    /// `le`, nothing in flight.
+    pub fn after_reset(col: u8, row: u8, carried: &super::carried::CarriedCoreState) -> Self {
+        let mut ctx = Self::reset_values(col, row);
+        carried.restore(&mut ctx);
+        ctx
+    }
+
+    /// The sentinel fill plus everything a core reset sets.
+    fn reset_values(col: u8, row: u8) -> Self {
         let pattern = reg_init_pattern();
         let mut timing = TimingContext::new();
         timing.enable_tracing();
@@ -680,7 +703,7 @@ impl ExecutionContext {
             }
         }
 
-        let mut ctx = Self {
+        Self {
             pc: 0,
             flags: Flags::default(),
             scalar,
@@ -730,12 +753,7 @@ impl ExecutionContext {
             srs_config: SrsConfig::default(),
             control_raw,
             pending_control_writes: Vec::new(),
-        };
-        // A scrubbed run starts every core from the values the scrub kernel leaves on silicon.
-        if let Some(init) = super::scrub::CoreInit::from_env() {
-            init.apply(&mut ctx);
         }
-        ctx
     }
 
     /// Create a new context with initial stack pointer.

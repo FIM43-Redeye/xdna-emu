@@ -217,8 +217,12 @@ fn core_control_masked_reset_restarts_engine_context_before_release() {
     engine.step();
     assert_eq!(engine.core_context(1, 2).unwrap().pc(), 4);
 
-    let reset_r7 = ExecutionContext::new_for_tile(1, 2).scalar.read(7);
     engine.core_context_mut(1, 2).unwrap().scalar.write(7, 0x1234_5678);
+    engine
+        .core_context_mut(1, 2)
+        .unwrap()
+        .scalar
+        .write(crate::interpreter::state::LE_REG_INDEX, 0x40);
     let core_control = TileAddress::encode(1, 2, 0x32000);
     engine.device_mut().mask_write_register(core_control, 0x2, 0x2).unwrap();
     engine.device_mut().release_core_resets();
@@ -226,7 +230,15 @@ fn core_control_masked_reset_restarts_engine_context_before_release() {
 
     let context = engine.core_context(1, 2).unwrap();
     assert_eq!(context.pc(), 4, "reset core must restart at address zero");
-    assert_eq!(context.scalar.read(7), reset_r7, "reset core must restore architectural reset state");
+    // silicon keeps data registers over a core reset and resets le (scrub/step1)
+    assert_eq!(context.scalar.read(7), 0x1234_5678, "reset core keeps its data registers");
+    assert_eq!(
+        context.scalar.read(crate::interpreter::state::LE_REG_INDEX),
+        ExecutionContext::new_for_tile(1, 2)
+            .scalar
+            .read(crate::interpreter::state::LE_REG_INDEX),
+        "reset core restores le"
+    );
 }
 
 #[test]

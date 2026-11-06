@@ -34,7 +34,7 @@ pub enum LoadPort {
     B,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct HalfRing {
     rows: [[u8; ROW_BYTES]; RING_DEPTH],
     ptr: usize,
@@ -55,7 +55,7 @@ impl HalfRing {
 }
 
 /// Both ports' rings, two halves each.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoadPortRings {
     rings: [[HalfRing; 2]; 2],
 }

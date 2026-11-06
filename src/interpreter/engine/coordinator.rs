@@ -23,6 +23,7 @@ use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborLocks, NeighborMemory};
 use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::carried::CarriedCoreState;
 use crate::parser::AieElf;
 use smallvec::SmallVec;
 use xdna_archspec::aie2::SHIM_ROW;
@@ -166,11 +167,14 @@ impl CoreState {
         }
     }
 
+    /// The core reset of a launch (a `Core_Control` reset, a new hardware context). Silicon
+    /// keeps the data registers and load-port rings and resets control, status and `le`
+    /// (`CarriedCoreState`); everything else (pipeline, timing, PC) starts over, and the wired
+    /// CORE_ID stays.
     fn reset(&mut self, col: u8, row: u8) {
         self.interpreter.reset();
-        // Rebuild architectural and timing state while preserving the wired
-        // per-tile CORE_ID value.
-        self.context = ExecutionContext::new_for_tile(col, row);
+        let carried = CarriedCoreState::capture(&mut self.context);
+        self.context = ExecutionContext::after_reset(col, row, &carried);
         self.enabled = false;
         self.trace_events_consumed = 0;
         self.active_this_cycle = false;
@@ -2490,6 +2494,38 @@ impl InterpreterEngine {
         }
     }
 
+    /// The state every compute core would keep over a core reset, keyed by (col, row): what
+    /// the device-state file saves. Writes still in flight land first.
+    pub fn carried_core_states(&mut self) -> Vec<((u8, u8), CarriedCoreState)> {
+        let tiles = &self.device.array.tiles;
+        self.cores
+            .iter_mut()
+            .zip(tiles.iter())
+            .filter(|(_, tile)| tile.is_compute())
+            .map(|(core, tile)| ((tile.col, tile.row), CarriedCoreState::capture(&mut core.context)))
+            .collect()
+    }
+
+    /// Put saved carried state into the named compute cores (a device opened again). Fails,
+    /// changing nothing, if a key names no compute core of this device.
+    pub fn restore_carried_core_states(
+        &mut self,
+        states: &[((u8, u8), CarriedCoreState)],
+    ) -> Result<(), String> {
+        let mut targets = Vec::with_capacity(states.len());
+        for ((col, row), state) in states {
+            let idx = self
+                .core_index(*col as usize, *row as usize)
+                .filter(|&i| self.device.array.tiles[i].is_compute())
+                .ok_or_else(|| format!("no compute core at ({col},{row})"))?;
+            targets.push((idx, state));
+        }
+        for (idx, state) in targets {
+            state.restore(&mut self.cores[idx].context);
+        }
+        Ok(())
+    }
+
     fn get_core(&self, col: usize, row: usize) -> Option<&CoreState> {
         self.core_index(col, row).map(|idx| &self.cores[idx])
     }
@@ -3331,6 +3367,83 @@ mod tests {
             .scalar
             .read(CORE_ID_REG_INDEX);
         assert_eq!(post, (1 << 16) | 2, "CORE_ID for (1,2) must survive reset; got 0x{post:08x}");
+    }
+
+    /// Silicon carries a core's data registers and load-port rings from one launch to the next
+    /// and resets control, status and `le` (scrub/step1, port-latch). A launch here is a new
+    /// hardware context (`reset_for_new_context`) or a `Core_Control` reset.
+    fn mark_core(engine: &mut InterpreterEngine, col: usize, row: usize, v: u32) {
+        use crate::interpreter::state::load_ring::LoadPort;
+        use crate::interpreter::state::LE_REG_INDEX;
+        let ctx = engine.core_context_mut(col, row).unwrap();
+        ctx.scalar.write(7, v);
+        ctx.pointer.write(3, v & 0xF_FFFF);
+        ctx.vector.write(4, [v; 8]);
+        ctx.accumulator.write(2, [v as u64; 8]);
+        ctx.mask.write(1, [v; 4]);
+        ctx.load_rings.pass(LoadPort::B, 0, Some([v as u8; 16]));
+        ctx.scalar.write(LE_REG_INDEX, 0x80);
+        ctx.set_control_reg_raw(cr_sat(), 1);
+    }
+
+    fn cr_sat() -> u8 {
+        match crate::interpreter::decode::register_map::classify_reg_name("crSat").map(|m| m.operand) {
+            Some(crate::interpreter::bundle::slot::Operand::ControlReg(id)) => id,
+            other => panic!("crSat: {other:?}"),
+        }
+    }
+
+    fn assert_carried(engine: &InterpreterEngine, col: usize, row: usize, v: u32, what: &str) {
+        use crate::interpreter::state::load_ring::LoadPort;
+        use crate::interpreter::state::LE_REG_INDEX;
+        let mut ctx = engine.core_context(col, row).unwrap().clone();
+        assert_eq!(ctx.scalar.read(7), v, "{what}: r7");
+        assert_eq!(ctx.pointer.read(3), v & 0xF_FFFF, "{what}: p3");
+        assert_eq!(ctx.vector.read(4), [v; 8], "{what}: wl2");
+        assert_eq!(ctx.accumulator.read(2), [v as u64; 8], "{what}: bml1");
+        assert_eq!(ctx.mask.read(1), [v; 4], "{what}: q1");
+        // the next no-memory read on port B half 0 returns the slot after the one written
+        // (period six): walk five more to reach it again
+        let slots: Vec<_> = (0..6).map(|_| ctx.load_rings.pass(LoadPort::B, 0, None)).collect();
+        assert!(slots.contains(&[v as u8; 16]), "{what}: port-B ring");
+        assert_eq!(ctx.scalar.read(LE_REG_INDEX), 0xF_FFFF, "{what}: le reset");
+        assert_eq!(ctx.control_reg_raw(cr_sat()), 0, "{what}: control register reset");
+    }
+
+    #[test]
+    fn a_new_hw_context_keeps_core_data_registers_and_rings() {
+        let mut engine = InterpreterEngine::new_npu1();
+        mark_core(&mut engine, 1, 2, 0x1357_9bdf);
+        engine.reset_for_new_context();
+        assert_carried(&engine, 1, 2, 0x1357_9bdf, "after one new context");
+        engine.reset_for_new_context();
+        assert_carried(&engine, 1, 2, 0x1357_9bdf, "after two");
+    }
+
+    #[test]
+    fn a_core_control_reset_keeps_core_data_registers_and_rings() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        mark_core(&mut engine, 1, 2, 0x2468_ace0);
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 2); // Core_Control.reset
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0);
+        engine.step();
+        assert_carried(&engine, 1, 2, 0x2468_ace0, "after a Core_Control reset");
+    }
+
+    #[test]
+    fn another_tiles_launch_changes_nothing_on_this_core() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        mark_core(&mut engine, 1, 2, 0x0bad_cafe);
+        mark_core(&mut engine, 2, 3, 0x0f00_0d00);
+        engine.device_mut().write_tile_register(2, 3, 0x32000, 2);
+        engine.device_mut().write_tile_register(2, 3, 0x32000, 0);
+        engine.step();
+        assert_carried(&engine, 2, 3, 0x0f00_0d00, "the reset core");
+        let ctx = engine.core_context(1, 2).unwrap();
+        assert_eq!(ctx.scalar.read(7), 0x0bad_cafe);
+        assert_eq!(ctx.control_reg_raw(cr_sat()), 1, "a core nobody reset keeps even its control registers");
     }
 
     #[test]

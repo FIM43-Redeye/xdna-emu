@@ -36,6 +36,7 @@ mod timing_context;
 mod context;
 mod sparse_load;
 pub mod load_ring;
+pub mod carried;
 #[cfg(test)]
 mod acc_timing_golden;
 
