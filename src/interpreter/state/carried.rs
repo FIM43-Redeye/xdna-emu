@@ -5,7 +5,8 @@
 //! separate xclbins, launches on other tiles in between, idle gaps up to 300 s; probe
 //! `build/experiments/harness/scrub/step1`, 17 launches) and resets only the control registers
 //! (0, `crSCDEn` = `crMCDEn` = 1), the status registers (0) and `le` (0xFFFFF). The load-port
-//! rings survive too (`build/experiments/harness/port-latch`). [`CarriedCoreState`] is exactly
+//! rings survive too (`build/experiments/harness/port-latch`), and so do the sparse-load unit and
+//! the stream read latch (`build/experiments/harness/core-persist/{sparse,latch}`). [`CarriedCoreState`] is exactly
 //! the kept part; everything else is rebuilt by the reset (`ExecutionContext::after_reset`).
 //!
 //! The struct is also the schema of the cross-process device-state file
@@ -51,6 +52,9 @@ pub struct CarriedCoreState {
     /// The sparse-load unit: its ring of fetched lines and positions (silicon keeps it:
     /// `core-persist/sparse`, a peek in the next launch returns the previous launch's line).
     pub sparse_load: SparseLoadUnit,
+    /// The last word the core took from its stream input and its TLAST: an empty non-blocking
+    /// read in the next launch returns it (silicon, `core-persist/latch`).
+    pub stream_read_latch: (u32, bool),
 }
 
 impl CarriedCoreState {
@@ -75,6 +79,7 @@ impl CarriedCoreState {
             q: std::array::from_fn(|i| c.mask.read(i as u8)),
             load_rings: c.load_rings.clone(),
             sparse_load: c.sparse_load.clone(),
+            stream_read_latch: c.stream_read_latch(),
         }
     }
 
@@ -108,6 +113,7 @@ impl CarriedCoreState {
         }
         ctx.load_rings = self.load_rings.clone();
         ctx.sparse_load = self.sparse_load.clone();
+        ctx.set_stream_read_latch(self.stream_read_latch.0, self.stream_read_latch.1);
     }
 }
 
@@ -160,6 +166,7 @@ mod tests {
             ctx.load_rings.pass(LoadPort::A, (k & 1) as usize, Some([0xA0 | k; 16]));
             ctx.load_rings.pass(LoadPort::B, (k & 1) as usize, Some([0xB0 | k; 16]));
         }
+        ctx.set_stream_read_latch(0x5A7C_0001, true);
         ctx.sparse_load.start(0x7_0400);
         for k in 0..3u8 {
             ctx.sparse_load.fetch(&[0x30 | k; 32]);
@@ -219,6 +226,7 @@ mod tests {
         }
         assert_eq!(after.load_rings, before.load_rings);
         assert_eq!(after.sparse_load, before.sparse_load);
+        assert_eq!(after.stream_read_latch(), (0x5A7C_0001, true));
         assert_ne!(after.sparse_load, crate::interpreter::state::SparseLoadUnit::new());
         assert_eq!(CarriedCoreState::capture(&mut after.clone()), carried);
     }
