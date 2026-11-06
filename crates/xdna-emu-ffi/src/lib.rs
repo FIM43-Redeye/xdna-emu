@@ -340,6 +340,11 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
         }
     };
 
+    let mut backend = backend;
+    if let Some(dir) = xdna_emu_core::interpreter::engine::device_state::state_dir_from_env() {
+        open_device_state(backend.as_mut(), &dir);
+    }
+
     let handle = Box::new(XdnaEmuHandle {
         backend,
         extension: None,
@@ -367,7 +372,47 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_destroy(handle: *mut XdnaEmuHandle) {
     if !handle.is_null() {
-        drop(Box::from_raw(handle));
+        let mut handle = Box::from_raw(handle);
+        if let Some(dir) = xdna_emu_core::interpreter::engine::device_state::state_dir_from_env() {
+            close_device_state(handle.backend.as_mut(), &dir);
+        }
+        drop(handle);
+    }
+}
+
+/// The device opens (`XDNA_EMU_STATE_DIR` set): load the core state the last process left.
+/// An absent file is a fresh device; a refused one is logged and the device starts fresh.
+/// Returns whether state was loaded.
+pub(crate) fn open_device_state(backend: &mut dyn crate::backend::NpuBackend, dir: &std::path::Path) -> bool {
+    use xdna_emu_core::interpreter::engine::device_state::{load, LoadError};
+    let Some(engine) = backend.as_interpreter_mut() else {
+        log::warn!("XDNA_EMU_STATE_DIR: this backend has no interpreter engine; no device state");
+        return false;
+    };
+    match load(dir, engine) {
+        Ok(path) => {
+            log::info!("device state loaded from {}", path.display());
+            true
+        }
+        Err(LoadError::Absent) => {
+            log::info!("no device state in {}: fresh device", dir.display());
+            false
+        }
+        Err(e) => {
+            log::warn!("device state in {} refused ({e}): fresh device", dir.display());
+            false
+        }
+    }
+}
+
+/// The device closes (`XDNA_EMU_STATE_DIR` set): save its core state for the next process.
+pub(crate) fn close_device_state(backend: &mut dyn crate::backend::NpuBackend, dir: &std::path::Path) {
+    let Some(engine) = backend.as_interpreter_mut() else {
+        return;
+    };
+    match xdna_emu_core::interpreter::engine::device_state::save(dir, engine) {
+        Ok(path) => log::info!("device state saved to {}", path.display()),
+        Err(e) => log::warn!("device state not saved to {}: {e}", dir.display()),
     }
 }
 
@@ -1122,6 +1167,44 @@ mod tests {
         assert_eq!(exports.len(), 2);
         assert_eq!(exports[0], "xdna_emu_create");
         assert_eq!(exports[1], "xdna_emu_version");
+    }
+
+    #[test]
+    fn the_device_state_file_carries_core_registers_from_one_device_open_to_the_next() {
+        use crate::backend::{InterpreterBackend, NpuBackend};
+        let dir = std::env::temp_dir().join(format!("xdna-emu-ffi-devstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let new_backend = || -> Box<dyn NpuBackend> {
+            Box::new(InterpreterBackend::new(
+                xdna_emu_core::interpreter::engine::InterpreterEngine::new_npu1(),
+            ))
+        };
+        let r9 = |b: &dyn NpuBackend| b.as_interpreter().unwrap().core_context(1, 3).unwrap().scalar.read(9);
+
+        let mut first = new_backend();
+        assert!(!open_device_state(first.as_mut(), &dir), "no file yet: a fresh device");
+        let fresh = r9(first.as_ref());
+        first
+            .as_interpreter_mut()
+            .unwrap()
+            .core_context_mut(1, 3)
+            .unwrap()
+            .scalar
+            .write(9, 0xC0FF_EE01);
+        close_device_state(first.as_mut(), &dir);
+
+        let mut second = new_backend();
+        assert!(open_device_state(second.as_mut(), &dir));
+        assert_eq!(r9(second.as_ref()), 0xC0FF_EE01, "the second process sees what the first left");
+
+        // without the directory (the variable unset) every device is fresh
+        assert_eq!(r9(new_backend().as_ref()), fresh);
+
+        // deleting the file resets the device
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut third = new_backend();
+        assert!(!open_device_state(third.as_mut(), &dir));
+        assert_eq!(r9(third.as_ref()), fresh);
     }
 
     #[test]

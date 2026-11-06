@@ -27,6 +27,7 @@
 
 pub mod bank_census;
 mod coordinator;
+pub mod device_state;
 
 pub use coordinator::{EngineStatus, InterpreterEngine};
 
