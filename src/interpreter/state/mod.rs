@@ -35,6 +35,7 @@ mod event_trace;
 mod timing_context;
 mod context;
 mod sparse_load;
+pub mod load_ring;
 #[cfg(test)]
 mod acc_timing_golden;
 
@@ -91,6 +92,7 @@ pub use registers::{
     validate_register_model,
 };
 pub use sparse_load::{SparseLoadUnit, SparseRead};
+pub use load_ring::{LoadPort, LoadPortRings};
 pub use context::{
     DeferredPcKind, EventLog, EventType, ExecutionContext, PendingBranch, PendingDeferredEvent, PendingWrite,
     SpRegister, SrsConfig, TimestampedEvent, TimingContext, UnpackSource, TRACE_PC_PIPELINE_DEPTH,

@@ -392,6 +392,10 @@ pub struct ExecutionContext {
     /// The ring behind `vldb.sparse.*`. `DP` and the two status flags live in the scalar file.
     pub sparse_load: super::sparse_load::SparseLoadUnit,
 
+    /// The rows each load port fetched, which a load with no memory behind it returns
+    /// (see [`super::load_ring`]).
+    pub load_rings: super::load_ring::LoadPortRings,
+
     // === Statistics ===
     /// Total cycles executed.
     pub cycles: u64,
@@ -686,6 +690,7 @@ impl ExecutionContext {
             accumulator,
             mask,
             sparse_load: super::sparse_load::SparseLoadUnit::new(),
+            load_rings: super::load_ring::LoadPortRings::new(),
             cycles: 0,
             cycle_counter_base: 0,
             instructions: 0,

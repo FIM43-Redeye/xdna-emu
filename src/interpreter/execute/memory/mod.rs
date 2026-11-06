@@ -31,12 +31,15 @@
 
 pub(crate) mod agu;
 mod neighbor;
-pub use neighbor::NeighborMemory;
+#[cfg(test)]
+mod load_ring_tests;
+pub use neighbor::{NeighborData, NeighborMemory};
 
 use crate::device::state::NeighborView;
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
+use crate::interpreter::state::load_ring::{LoadPort, ROW_BYTES};
 use crate::interpreter::state::{Bypass, ExecutionContext, UnpackSource};
 use xdna_archspec::aie2::pack::pack_form;
 use xdna_archspec::aie2::sparse_load::sparse_load_form;
@@ -251,14 +254,14 @@ impl MemoryUnit {
             Some(SemanticOp::Ups) if Self::has_memory_operand(op) => {
                 // vlda.ups: load from memory, upshift to accumulator
                 super::fuzz_recorder::record_op(SemanticOp::Ups, op, ctx);
-                Self::execute_fused_load_ups(op, ctx, tile, pm);
+                Self::execute_fused_load_ups(op, ctx, tile, pm, neighbors, view);
                 true
             }
 
             Some(SemanticOp::Convert) if Self::is_load_slot(op) && Self::has_memory_operand(op) => {
                 // vlda.conv: load from memory, convert (e.g., bf16 -> f32)
                 super::fuzz_recorder::record_op(SemanticOp::Convert, op, ctx);
-                Self::execute_fused_load_convert(op, ctx, tile, pm);
+                Self::execute_fused_load_convert(op, ctx, tile, pm, neighbors, view);
                 true
             }
 
@@ -335,7 +338,7 @@ impl MemoryUnit {
             }
         } else if width == MemWidth::QuadWord {
             // 128-bit load: read 16 bytes into a q register (mask) or vector.
-            let full_data = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            let full_data = Self::port_quad(ctx, Self::load_port(op), tile, addr, neighbors, view);
             let mut vec_data = [0u32; 8];
             vec_data[0] = full_data[0];
             vec_data[1] = full_data[1];
@@ -359,7 +362,7 @@ impl MemoryUnit {
             }
         } else {
             // Scalar/partial loads go through write_dest_with_latency (which queues)
-            let raw_value = Self::read_memory(tile, addr, width, neighbors, view);
+            let raw_value = Self::port_scalar(ctx, Self::load_port(op), tile, addr, width, neighbors, view);
 
             // Apply sign/zero extension based on element type.
             // lda.s8 sign-extends 8-bit to 32-bit, lda.u8 zero-extends, etc.
@@ -489,7 +492,7 @@ impl MemoryUnit {
         // Read from memory -- respect 128-bit vs 256-bit width.
         let vec_data = if op.mem_width == MemWidth::QuadWord {
             // 128-bit load: only lower 4 words, upper 4 zeroed.
-            let full = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            let full = Self::port_quad(ctx, LoadPort::A, tile, addr, neighbors, view);
             [full[0], full[1], full[2], full[3], 0, 0, 0, 0]
         } else {
             Self::read_load_line(op, ctx, tile, addr, neighbors, view)
@@ -553,10 +556,10 @@ impl MemoryUnit {
 
         // Read from memory -- respect 128-bit vs 256-bit width.
         let vec_data = if op.mem_width == MemWidth::QuadWord {
-            let full = Self::read_vector_from_memory(tile, addr, neighbors, view);
+            let full = Self::port_quad(ctx, LoadPort::B, tile, addr, neighbors, view);
             [full[0], full[1], full[2], full[3], 0, 0, 0, 0]
         } else {
-            Self::read_vector_from_memory(tile, addr, neighbors, view)
+            Self::port_line(ctx, LoadPort::B, tile, addr, neighbors, view)
         };
 
         if crate::debug::watch::is_watched(
@@ -675,30 +678,18 @@ impl MemoryUnit {
         // Read 64 bits from each effective address; bytes past the 16-byte row read as zero.
         let latency = LATENCY_MEMORY as u64;
         let mut result = [0u32; 8];
+        // Lanes 0-1 are an access on load port A, lanes 2-3 on port B; each lane's row goes
+        // through its port's ring for its half (an odd lane has bit 4 set). See `load_ring`.
         for i in 0..4 {
             let addr = eff_addrs[i];
-            let (quadrant, offset) = decode_data_address(addr);
-            let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
-                tile.data_memory()
-            } else {
-                // Lazy snapshot per accessed quadrant. The mut re-borrow
-                // ends at the if-let body so the shared `as_deref` below
-                // can re-borrow `neighbors` for `get_memory`.
-                if let (Some(n), Some(v)) = (neighbors.as_deref_mut(), view) {
-                    n.ensure_snapshot(quadrant, v);
-                }
-                match neighbors.as_deref().and_then(|n| n.get_memory(quadrant)) {
-                    Some(m) => m,
-                    None => continue, // non-existent neighbor -> zeros
-                }
-            };
-
+            let port = if i < 2 { LoadPort::A } else { LoadPort::B };
+            let row = Self::ring_row(ctx, port, i % 2, tile, addr, neighbors.as_deref_mut(), view);
             // The row cut keeps the read inside the 16-byte row, so the last bytes of memory
             // read like any other row end.
-            let row_left = 16 - (offset & 15);
+            let at = (addr & 15) as usize;
             let mut lane_bytes = [0u8; 8];
-            for (k, b) in lane_bytes.iter_mut().enumerate().take(row_left.min(8)) {
-                *b = mem.get(offset + k).copied().unwrap_or(0);
+            for (k, b) in lane_bytes.iter_mut().enumerate().take((16 - at).min(8)) {
+                *b = row[at + k];
             }
             result[i * 2] = u32::from_le_bytes(lane_bytes[0..4].try_into().unwrap());
             result[i * 2 + 1] = u32::from_le_bytes(lane_bytes[4..8].try_into().unwrap());
@@ -756,7 +747,7 @@ impl MemoryUnit {
         };
 
         let addr = Self::get_address(op, ctx);
-        let data = Self::read_vector_from_memory(tile, addr, neighbors, view);
+        let data = Self::port_line(ctx, LoadPort::B, tile, addr, neighbors, view);
         ctx.queue_pending_unpack(UnpackSource::Data(data), dest_reg, form);
 
         Self::apply_post_modify(op, ctx, post_modify);
@@ -807,9 +798,10 @@ impl MemoryUnit {
         // pointer rounded down to a word: bytes past the block end wrap to its start
         // (`sparse_*.plain` probes in build/experiments/ldst-align).
         let mut line = [0u8; LINE_BYTES];
-        let mut load_line = |ctx: &ExecutionContext, neighbors, view| {
-            let _ = ctx;
-            let words = Self::read_vector_from_memory(tile, addr & !(LINE_BYTES as u32 - 1), neighbors, view);
+        // The block goes through load port B's ring like any vldb line (`ring_f` b0).
+        let mut load_line = |ctx: &mut ExecutionContext, neighbors, view| {
+            let words =
+                Self::port_line(ctx, LoadPort::B, tile, addr & !(LINE_BYTES as u32 - 1), neighbors, view);
             let mut block = [0u8; LINE_BYTES];
             for (i, w) in words.iter().enumerate() {
                 block[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
@@ -909,9 +901,15 @@ impl MemoryUnit {
     }
 
     /// Load 256 bits from memory at the op's address. Shared by fused load handlers.
-    fn fused_load_vector(op: &SlotOp, ctx: &mut ExecutionContext, tile: &Tile) -> [u32; 8] {
+    fn fused_load_vector(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> [u32; 8] {
         let addr = Self::get_address(op, ctx);
-        Self::read_load_line(op, ctx, tile, addr, None, None)
+        Self::read_load_line(op, ctx, tile, addr, neighbors, view)
     }
 
     /// Get shift amount from operands (immediate or scalar register).
@@ -986,8 +984,10 @@ impl MemoryUnit {
         ctx: &mut ExecutionContext,
         tile: &Tile,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) {
-        let vec_data = Self::fused_load_vector(op, ctx, tile);
+        let vec_data = Self::fused_load_vector(op, ctx, tile, neighbors, view);
         let from = op.from_type.unwrap_or(ElementType::Int16);
         let to = op.element_type.unwrap_or(ElementType::Int32);
 
@@ -1057,8 +1057,10 @@ impl MemoryUnit {
         ctx: &mut ExecutionContext,
         tile: &Tile,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
     ) {
-        let vec_data = Self::fused_load_vector(op, ctx, tile);
+        let vec_data = Self::fused_load_vector(op, ctx, tile, neighbors, view);
         let from = op.from_type.unwrap_or(ElementType::BFloat16);
         let to = op.element_type.unwrap_or(ElementType::Float32);
 
@@ -1438,11 +1440,119 @@ impl MemoryUnit {
         Self::align_to_access(op, addr)
     }
 
+    /// The load port an op uses: B for the `LoadB` slot, A for everything else that loads.
+    fn load_port(op: &SlotOp) -> LoadPort {
+        if op.slot == SlotIndex::LoadB {
+            LoadPort::B
+        } else {
+            LoadPort::A
+        }
+    }
+
+    /// The 16-byte memory row holding `addr`, or `None` when no core memory is behind it (see
+    /// [`NeighborData::NoMemory`]). An isolated direction reads as zeros (unprobed); without a
+    /// neighbour view every address is the tile's own memory.
+    fn fetch_row(
+        tile: &Tile,
+        addr: u32,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> Option<[u8; ROW_BYTES]> {
+        let (quadrant, offset) = decode_data_address(addr);
+        let start = offset & !(ROW_BYTES - 1);
+        let from = |mem: &[u8]| -> [u8; ROW_BYTES] {
+            std::array::from_fn(|k| mem.get(start + k).copied().unwrap_or(0))
+        };
+        match neighbors {
+            Some(n) if quadrant != MemoryQuadrant::Local => {
+                if let Some(v) = view {
+                    n.ensure_snapshot(quadrant, v);
+                }
+                match n.data(quadrant) {
+                    NeighborData::Memory(m) => Some(from(m)),
+                    NeighborData::NoMemory => None,
+                    NeighborData::Isolated => Some([0; ROW_BYTES]),
+                }
+            }
+            _ => Some(from(tile.data_memory())),
+        }
+    }
+
+    /// One row through `port`'s ring for `half`: what the load sees at `addr`'s row.
+    fn ring_row(
+        ctx: &mut ExecutionContext,
+        port: LoadPort,
+        half: usize,
+        tile: &Tile,
+        addr: u32,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> [u8; ROW_BYTES] {
+        let fetched = Self::fetch_row(tile, addr, neighbors, view);
+        ctx.load_rings.pass(port, half, fetched)
+    }
+
+    fn rows_to_words(lo: &[u8; ROW_BYTES], hi: &[u8; ROW_BYTES]) -> [u32; 8] {
+        std::array::from_fn(|i| {
+            let r = if i < 4 { lo } else { hi };
+            u32::from_le_bytes(r[4 * (i % 4)..4 * (i % 4) + 4].try_into().unwrap())
+        })
+    }
+
+    /// A 256-bit load on `port` at `addr` (32-byte aligned): both rows through the ring.
+    fn port_line(
+        ctx: &mut ExecutionContext,
+        port: LoadPort,
+        tile: &Tile,
+        addr: u32,
+        mut neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> [u32; 8] {
+        let lo = Self::ring_row(ctx, port, 0, tile, addr & !31, neighbors.as_deref_mut(), view);
+        let hi = Self::ring_row(ctx, port, 1, tile, (addr & !31) | 16, neighbors, view);
+        Self::rows_to_words(&lo, &hi)
+    }
+
+    /// A 128-bit load on `port`: its row (the half `addr` selects) in words 0-3.
+    fn port_quad(
+        ctx: &mut ExecutionContext,
+        port: LoadPort,
+        tile: &Tile,
+        addr: u32,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> [u32; 8] {
+        let half = ((addr >> 4) & 1) as usize;
+        let row = Self::ring_row(ctx, port, half, tile, addr, neighbors, view);
+        Self::rows_to_words(&row, &[0; ROW_BYTES])
+    }
+
+    /// A scalar load (8 to 64 bits) on `port`: the whole row goes through the ring, the value is
+    /// the bytes at `addr`'s offset in it (`ring_d` b3..b7). The processor-bus window is a
+    /// register read, not a memory access, and bypasses the ring.
+    fn port_scalar(
+        ctx: &mut ExecutionContext,
+        port: LoadPort,
+        tile: &Tile,
+        addr: u32,
+        width: MemWidth,
+        neighbors: Option<&mut NeighborMemory>,
+        view: Option<&NeighborView>,
+    ) -> u64 {
+        if tile.processor_bus_enabled && addr >= memory_map::PROC_BUS_BASE && addr < memory_map::PROC_BUS_END
+        {
+            return Self::read_memory(tile, addr, width, neighbors, view);
+        }
+        let half = ((addr >> 4) & 1) as usize;
+        let row = Self::ring_row(ctx, port, half, tile, addr, neighbors, view);
+        Self::read_from_slice(&row, (addr & 15) as usize, width)
+    }
+
     /// The 256 bits a load reads at `addr` (from [`get_address`]): its two 16-byte rows, which a
     /// same-bundle gather may redirect (see [`arm_gather_hazards`]).
     fn read_load_line(
         op: &SlotOp,
-        ctx: &ExecutionContext,
+        ctx: &mut ExecutionContext,
         tile: &Tile,
         addr: u32,
         mut neighbors: Option<&mut NeighborMemory>,
@@ -1450,11 +1560,12 @@ impl MemoryUnit {
     ) -> [u32; 8] {
         match ctx.load_address_override(op.slot as u8) {
             Some(rows) if op.mem_width == MemWidth::Vector256 => {
-                let lo = Self::read_vector_from_memory(tile, rows[0] & !15, neighbors.as_deref_mut(), view);
-                let hi = Self::read_vector_from_memory(tile, rows[1] & !15, neighbors, view);
-                [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
+                let port = Self::load_port(op);
+                let lo = Self::ring_row(ctx, port, 0, tile, rows[0], neighbors.as_deref_mut(), view);
+                let hi = Self::ring_row(ctx, port, 1, tile, rows[1], neighbors, view);
+                Self::rows_to_words(&lo, &hi)
             }
-            _ => Self::read_vector_from_memory(tile, addr, neighbors, view),
+            _ => Self::port_line(ctx, Self::load_port(op), tile, addr, neighbors, view),
         }
     }
 

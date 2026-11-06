@@ -69,6 +69,19 @@ pub struct NeighborMemory {
     pub ensure_snapshot_calls: u32,
 }
 
+/// What sits behind a cross-tile direction, for a core access.
+#[derive(Debug)]
+pub enum NeighborData<'a> {
+    /// A core tile's data memory (the snapshot).
+    Memory(&'a [u8]),
+    /// No core data memory in that direction: outside the array, or a memory / shim tile (the
+    /// row below row 2). A core load there is answered by its port's ring
+    /// ([`crate::interpreter::state::load_ring`]); a store goes nowhere.
+    NoMemory,
+    /// Transit blocked by a `Tile_Control` isolation bit.
+    Isolated,
+}
+
 /// Map a cardinal direction to its snapshot array index.
 ///
 /// Returns None for `Local` (no snapshot needed -- use own tile memory).
@@ -184,7 +197,12 @@ impl NeighborMemory {
             None => return, // Local -- no snapshot needed
         };
 
-        let neighbor = self.neighbor_coords(dir).and_then(|(c, r)| source.tile(c, r));
+        // Only a core tile has core data memory: the memory tile below row 2 is not reachable
+        // through the core's address space (silicon, port-latch probe).
+        let neighbor = self
+            .neighbor_coords(dir)
+            .and_then(|(c, r)| source.tile(c, r))
+            .filter(|t| t.is_compute());
         let current_gen = neighbor.map(|t| t.data_memory_gen());
 
         // Cache hit: snapshot exists and the neighbor's gen hasn't changed
@@ -208,6 +226,22 @@ impl NeighborMemory {
         }
         let idx = dir_index(dir)?;
         self.snapshots[idx].as_ref().and_then(|opt| opt.as_deref())
+    }
+
+    /// What a core access in `dir` meets: the snapshot, no memory, or an isolation bit. Callers
+    /// refresh the snapshot first (`ensure_snapshot`); a direction never snapshotted reads as
+    /// no memory.
+    pub fn data(&self, dir: MemoryQuadrant) -> NeighborData<'_> {
+        if self.is_blocked(dir) {
+            return NeighborData::Isolated;
+        }
+        match dir_index(dir)
+            .and_then(|i| self.snapshots[i].as_ref())
+            .and_then(|o| o.as_deref())
+        {
+            Some(m) => NeighborData::Memory(m),
+            None => NeighborData::NoMemory,
+        }
     }
 
     /// Buffer a cross-tile write for deferred application.
@@ -252,7 +286,8 @@ impl NeighborMemory {
                 MemoryQuadrant::Local => None,
             };
             if let Some((c, r)) = coords {
-                if let Some(tile) = device.tile_mut(c, r) {
+                // A store into a direction with no core memory (a memory tile) is lost.
+                if let Some(tile) = device.tile_mut(c, r).filter(|t| t.is_compute()) {
                     let mem = tile.data_memory_mut();
                     if offset + data.len() <= mem.len() {
                         mem[offset..offset + data.len()].copy_from_slice(&data);
@@ -453,5 +488,53 @@ mod tests {
         nbr.buffer_write(MemoryQuadrant::West, 0x300, &[0x33]);
         nbr.buffer_write(MemoryQuadrant::North, 0x400, &[0x44]);
         assert_eq!(nbr.pending_writes.len(), 2, "permitted-dir writes must buffer");
+    }
+
+    // ------------------------------------------------------------------
+    // Directions with no core memory behind them
+    // ------------------------------------------------------------------
+
+    /// South of a row-2 core is the memory-tile row: no core data memory, whatever the
+    /// emulator keeps for the memtile. Silicon answers such a read from the load-port ring
+    /// (`build/experiments/harness/port-latch/suite`, cases unit/sweep/ring_*).
+    #[test]
+    fn south_of_row_two_has_no_core_memory() {
+        let mut device = crate::device::DeviceState::new_npu1();
+        device.tile_mut(2, 1).unwrap().data_memory_mut()[0x100] = 0xAB;
+        let mut nbr = NeighborMemory::new(2, 2);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert!(matches!(nbr.data(MemoryQuadrant::South), NeighborData::NoMemory));
+        nbr.ensure_snapshot(MemoryQuadrant::North, &device);
+        assert!(matches!(nbr.data(MemoryQuadrant::North), NeighborData::Memory(_)));
+    }
+
+    /// North of the top row: no tile at all (`ring_top`, a core in row 5).
+    #[test]
+    fn north_of_the_top_row_has_no_core_memory() {
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(2, 5);
+        nbr.ensure_snapshot(MemoryQuadrant::North, &device);
+        assert!(matches!(nbr.data(MemoryQuadrant::North), NeighborData::NoMemory));
+    }
+
+    /// An isolated direction stays distinct from a missing one (its read is unprobed).
+    #[test]
+    fn an_isolated_direction_is_not_a_missing_one() {
+        use crate::device::tile::isolation as iso;
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(2, 3);
+        nbr.set_isolation(iso::SOUTH);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        assert!(matches!(nbr.data(MemoryQuadrant::South), NeighborData::Isolated));
+    }
+
+    /// A store south of a row-2 core reaches no memory: the memtile is untouched.
+    #[test]
+    fn a_store_south_of_row_two_is_dropped() {
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(2, 2);
+        nbr.buffer_write(MemoryQuadrant::South, 0x100, &[0x55; 4]);
+        nbr.drain_writes(&mut device);
+        assert_eq!(&device.tile(2, 1).unwrap().data_memory()[0x100..0x104], &[0; 4]);
     }
 }
