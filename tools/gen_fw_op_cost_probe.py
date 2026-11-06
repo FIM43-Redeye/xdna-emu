@@ -92,6 +92,13 @@ def all_cases() -> list[Case]:
     cases.append(Case("bw_l64_last", "blockwrite", 512, block=64, poll_start=63, poll_stride=64))
     for k in (8, 64):
         cases.append(Case(f"pre_f{k}_w32_n64", "write32", 64, prefill=Filler("memtile", k)))
+    # Long streams: ones shorter than 16 KiB of instruction stream, and ones whose polled range
+    # contains a multiple of 16 KiB into the stream (the once-per-run stall probes).
+    cases.append(Case("w32_n512", "write32", 512))
+    cases.append(Case("mw32_n512", "maskwrite32", 512))   # ~14 KiB, ~110 us of ops
+    for k in (400, 500, 1200, 1900):
+        cases.append(Case(f"pre_f{k}_w32_n512", "write32", 512, prefill=Filler("memtile", k)))
+    cases.append(Case("pre_f400_mw32_n512", "maskwrite32", 512, prefill=Filler("memtile", 400)))
     for target, tag in (("memtile", "mt"), ("column1", "c1")):
         for k in (1, 4):
             cases.append(Case(f"il_{tag}_k{k}", "write32", 16, filler=Filler(target, k)))

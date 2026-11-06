@@ -79,6 +79,27 @@ def test_prefill_ops_precede_the_timed_writes_and_are_not_polled():
     assert g.polled_indices(c) == list(range(64))
 
 
+def test_long_stream_cases_put_a_16_kib_stream_offset_in_their_polled_range():
+    # Long streams under 16 KiB, and ones whose polled range contains a multiple of
+    # 16 KiB into the instruction stream (write32 = 24 bytes).
+    assert len(g.sequence_ops(case("w32_n512"))) == 512
+    assert len(g.sequence_ops(case("mw32_n512"))) == 512 and 512 * 28 < 16384
+    for name, prefill, boundaries in (("pre_f400_w32_n512", 400, (16384,)), ("pre_f500_w32_n512", 500, (16384,)),
+                                      ("pre_f1200_w32_n512", 1200, (32768,)),
+                                      ("pre_f1900_w32_n512", 1900, (49152,))):
+        c = case(name)
+        ops = g.sequence_ops(c)
+        assert len(ops) == prefill + 512 and ops[prefill] == ("write32", "poll", 0, g.marker(0))
+        for b in boundaries:
+            assert prefill * 24 < b < (prefill + 512) * 24, name
+
+
+def test_maskwrite_crossing_case_crosses_inside_its_polled_range():
+    c = case("pre_f400_mw32_n512")
+    ops = g.sequence_ops(c)
+    assert ops[400][0] == "maskwrite32" and 400 * 24 + 0 < 16384 < 400 * 24 + 512 * 28
+
+
 def test_control_has_no_runtime_writes_and_presets_the_words():
     c = case("control")
     assert g.sequence_ops(c) == [] and c.preset

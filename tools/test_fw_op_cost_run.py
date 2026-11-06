@@ -32,3 +32,10 @@ def test_hw_busy_detects_other_hardware_jobs():
     ps = "python3 -m harness suite hw x r1\nzsh -c grep emu-bridge-test\nvim a\n"
     assert r.hw_busy(ps)
     assert not r.hw_busy("vim a\nzsh -c emu-bridge-test\nbash -c isa-test\n")
+
+
+def test_host_command_carries_extra_host_args_after_the_qos_args():
+    import fw_op_cost_run as r
+    cmd = r.host_command("h", "case", {"results_words": 4}, "out", 0, ["--instr-bo-bytes", "65536"])
+    assert cmd[-6:] == ["--gops", "1", "--fps", "1000", "--instr-bo-bytes", "65536"]
+    assert "--out-size" in cmd and cmd[cmd.index("--out-size") + 1] == "16"

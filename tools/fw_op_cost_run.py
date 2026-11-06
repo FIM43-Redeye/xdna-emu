@@ -64,17 +64,22 @@ def sample_clocks(tool: Path):
     return parse_clocks(r.stdout)
 
 
+def host_command(host, case_dir, meta: dict, out_dir, dpm: int, extra: list[str]) -> list[str]:
+    case_dir, out_dir = Path(case_dir), Path(out_dir)
+    return [str(host), "-x", str(case_dir / "aie.xclbin"), "-i", str(case_dir / "insts.bin"),
+            "-k", "MLIR_AIE", "--out-size", str(4 * meta["results_words"]),
+            "--out-file", str(out_dir / "out.bin"), *host_qos_args(dpm), *extra]
+
+
 def run_case(case_dir: Path, out_dir: Path, dpm: int, host: Path, tool: Path,
-             timeout_s: float = 60) -> dict:
+             timeout_s: float = 60, extra: list[str] = ()) -> dict:
     meta = json.loads((case_dir / "case.json").read_text())
     if (out_dir / "run.json").exists():
         raise RuntimeError(f"{out_dir} already holds a run")
     out_dir.mkdir(parents=True, exist_ok=True)
     wait_for_npu()
     tdr0 = tdr_total()
-    cmd = [str(host), "-x", str(case_dir / "aie.xclbin"), "-i", str(case_dir / "insts.bin"),
-           "-k", "MLIR_AIE", "--out-size", str(4 * meta["results_words"]),
-           "--out-file", str(out_dir / "out.bin"), *host_qos_args(dpm)]
+    cmd = host_command(host, case_dir, meta, out_dir, dpm, list(extra))
     before = after = None
     wall_us = None
     log = []
@@ -99,7 +104,7 @@ def run_case(case_dir: Path, out_dir: Path, dpm: int, host: Path, tool: Path,
     rec = {"case": meta["name"], "dpm": dpm, "rc": rc, "wall_us": wall_us,
            "clocks_before": before, "clocks_after": after,
            "valid": rc == 0 and clocks_valid(dpm, before, after),
-           "tdr_before": tdr0, "tdr_after": tdr_total()}
+           "tdr_before": tdr0, "tdr_after": tdr_total(), "host_args": list(extra)}
     (out_dir / "run.json").write_text(json.dumps(rec, indent=1) + "\n")
     return rec
 
@@ -113,6 +118,8 @@ def main(argv=None) -> int:
     ap.add_argument("--only", nargs="+")
     ap.add_argument("--host", default=None)
     ap.add_argument("--clocks", default=None)
+    ap.add_argument("--host-arg", action="append", default=[],
+                    help="extra argument passed to the host (repeatable)")
     a = ap.parse_args(argv)
     root = Path(a.cases)
     here = root.resolve().parent
@@ -123,7 +130,8 @@ def main(argv=None) -> int:
         for d in sorted(p for p in root.iterdir() if (p / "insts.bin").is_file()):
             if a.only and d.name not in a.only:
                 continue
-            rec = run_case(d, Path(a.out) / a.tag / f"dpm{dpm}" / d.name, dpm, host, tool)
+            rec = run_case(d, Path(a.out) / a.tag / f"dpm{dpm}" / d.name, dpm, host, tool,
+                           extra=a.host_arg)
             flag = "ok" if rec["valid"] else "INVALID"
             bad += not rec["valid"]
             print(f"{a.tag} dpm{dpm} {d.name}: {flag} rc={rec['rc']} clocks={rec['clocks_before']}"

@@ -61,4 +61,13 @@ pub trait XtensaBus {
     fn take_interrupt_assertions(&mut self) -> u32 {
         0
     }
+
+    /// Level-sensitive interrupt inputs: `(mask, line)`. Each step the CPU
+    /// sets the INTERRUPT bits in `mask` to the matching bits of `line`
+    /// (Xtensa level-triggered external interrupts: the bit follows the pin
+    /// and INTCLEAR cannot drop it while the pin is high). Bits outside the
+    /// mask keep their edge and software semantics.
+    fn interrupt_levels(&mut self) -> (u32, u32) {
+        (0, 0)
+    }
 }

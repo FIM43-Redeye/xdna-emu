@@ -329,8 +329,9 @@ pub struct Cpu {
     /// `decode::Op::Wur`.
     pub threadptr: u32,
     /// INTERRUPT pending-interrupt bits (Xtensa INTERRUPT SR read / INTSET SR
-    /// write). A modeled interrupt source (an external interrupt line) sets a bit;
-    /// `INTCLEAR` clears it; the handler acks by clearing. Level-1 only.
+    /// write). An edge or software source sets a bit and `INTCLEAR` clears it;
+    /// a level-sensitive input (`XtensaBus::interrupt_levels`) is re-sampled
+    /// every step, so its bit follows the line. Level-1 only.
     pub interrupt: u32,
     /// INTENABLE per-bit interrupt-enable mask (Xtensa INTENABLE SR). An
     /// interrupt is deliverable only if its bit is set here.
@@ -884,6 +885,8 @@ impl Cpu {
 
     fn step_unaccounted<B: XtensaBus + ?Sized>(&mut self, bus: &mut B) -> Step {
         self.interrupt |= bus.take_interrupt_assertions();
+        let (level_mask, line) = bus.interrupt_levels();
+        self.interrupt = (self.interrupt & !level_mask) | (line & level_mask);
 
         // Interrupts are checked between instructions (faithful Xtensa). A
         // deliverable level-1 interrupt IS a general exception with
@@ -1484,6 +1487,110 @@ mod tests {
         // With the source acked, the body nop runs -- no spurious re-delivery.
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
         assert_eq!(cpu.pc, 0x103);
+    }
+}
+
+#[cfg(test)]
+mod level_interrupt_tests {
+    use super::*;
+    use crate::firmware::xtensa::flat_bus::FlatBus;
+
+    /// A flat bus whose interrupt input `mask` is level-sensitive and driven
+    /// by `line` (shared so the test can lower it mid-run).
+    struct LevelBus {
+        inner: FlatBus,
+        mask: u32,
+        line: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl XtensaBus for LevelBus {
+        fn fetch8(&mut self, vaddr: u32, paddr: u32) -> u8 {
+            self.inner.fetch8(vaddr, paddr)
+        }
+        fn inst_load8(&mut self, paddr: u32) -> u8 {
+            self.inner.inst_load8(paddr)
+        }
+        fn literal_load32(&mut self, vaddr: u32, paddr: u32) -> u32 {
+            self.inner.literal_load32(vaddr, paddr)
+        }
+        fn data_load32(&mut self, pc: u32, paddr: u32) -> u32 {
+            self.inner.data_load32(pc, paddr)
+        }
+        fn data_load8(&mut self, paddr: u32) -> u8 {
+            self.inner.data_load8(paddr)
+        }
+        fn data_store32(&mut self, paddr: u32, v: u32) {
+            self.inner.data_store32(paddr, v)
+        }
+        fn data_store8(&mut self, paddr: u32, v: u32) {
+            self.inner.data_store8(paddr, v)
+        }
+        fn pte_load32(&mut self, paddr: u32) -> u32 {
+            self.inner.pte_load32(paddr)
+        }
+        fn interrupt_levels(&mut self) -> (u32, u32) {
+            (self.mask, self.line.get())
+        }
+    }
+
+    /// Body at 0x100: nop, nop. Handler: wsr.intclear a2; rfe.
+    fn level_cpu(line: u32) -> (Cpu, LevelBus, std::rc::Rc<std::cell::Cell<u32>>) {
+        let h = ExceptionVectors::default().kernel as usize;
+        let mut rom = vec![0u8; h + 6];
+        rom[0x100..0x103].copy_from_slice(&[0xf0, 0x20, 0x00]);
+        rom[0x103..0x106].copy_from_slice(&[0xf0, 0x20, 0x00]);
+        rom[h..h + 3].copy_from_slice(&[0x20, 0xe3, 0x13]); // wsr.intclear a2
+        rom[h + 3..h + 6].copy_from_slice(&[0x00, 0x30, 0x00]); // rfe
+        let shared = std::rc::Rc::new(std::cell::Cell::new(line));
+        let bus = LevelBus { inner: FlatBus::new(rom), mask: 0b1, line: shared.clone() };
+        let mut cpu = mapped_cpu(0x100);
+        cpu.intenable = 0b1;
+        cpu.regs.write_ar(2, 0b1);
+        (cpu, bus, shared)
+    }
+
+    #[test]
+    fn a_level_input_follows_its_line() {
+        let (mut cpu, mut bus, line) = level_cpu(0);
+        assert_eq!(cpu.step(&mut bus), Step::Ran, "line low: the body runs");
+        assert_eq!(cpu.interrupt, 0);
+        line.set(1);
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }), "line high: delivered");
+        assert_eq!(cpu.last_work(), Work::InterruptEntry);
+    }
+
+    #[test]
+    fn intclear_does_not_drop_a_level_input_whose_line_is_still_high() {
+        // The source is still asserted after the handler's INTCLEAR and rfe:
+        // a level input is taken again at once (an edge latch would lose it).
+        let (mut cpu, mut bus, _line) = level_cpu(1);
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
+        assert_eq!(cpu.step(&mut bus), Step::Ran); // wsr.intclear
+        assert_eq!(cpu.step(&mut bus), Step::Ran); // rfe
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }), "re-delivered");
+    }
+
+    #[test]
+    fn a_level_input_whose_line_drops_needs_no_intclear() {
+        // The handler clears the source at the device and returns without
+        // INTCLEAR: the line is low, so nothing is re-delivered.
+        let (mut cpu, mut bus, line) = level_cpu(1);
+        assert!(matches!(cpu.step(&mut bus), Step::Exception { .. }));
+        line.set(0);
+        cpu.pc = ExceptionVectors::default().kernel + 3; // skip the intclear
+        assert_eq!(cpu.step(&mut bus), Step::Ran); // rfe
+        assert_eq!(cpu.step(&mut bus), Step::Ran, "no re-delivery");
+        assert_eq!(cpu.pc, 0x103);
+    }
+
+    #[test]
+    fn edge_bits_outside_the_level_mask_keep_intset_and_intclear() {
+        let (mut cpu, mut bus, _line) = level_cpu(0);
+        cpu.write_sr(SR_INTERRUPT, 0b10);
+        assert_eq!(cpu.step(&mut bus), Step::Ran);
+        assert_eq!(cpu.interrupt, 0b10, "software bit kept across the sample");
+        cpu.write_sr(SR_INTCLEAR, 0b10);
+        assert_eq!(cpu.interrupt, 0);
     }
 }
 

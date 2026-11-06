@@ -6,6 +6,7 @@
 //   EXIT             the post-launch hold is over
 // Usage: fw_op_cost_host -x aie.xclbin -i insts.bin --out-size BYTES --out-file F
 //          [--gops G --fps F] [--pre-ms 200] [--hold-ms 300] [-k MLIR_AIE]
+//          [--instr-bo-bytes N]   (allocate the instruction buffer at least N bytes, zero-padded)
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -32,7 +33,9 @@ int main(int argc, const char *argv[]) {
         ("gops", "Context QoS gops (0 = no QoS)", cxxopts::value<uint32_t>()->default_value("0"))
         ("fps", "Context QoS fps", cxxopts::value<uint32_t>()->default_value("0"))
         ("pre-ms", "Pause before the launch", cxxopts::value<int>()->default_value("200"))
-        ("hold-ms", "Pause after the launch", cxxopts::value<int>()->default_value("300"));
+        ("hold-ms", "Pause after the launch", cxxopts::value<int>()->default_value("300"))
+        ("instr-bo-bytes", "Minimum instruction buffer size (zero-padded)",
+         cxxopts::value<size_t>()->default_value("0"));
     cxxopts::ParseResult vm;
     test_utils::parse_options(argc, argv, options, vm);
 
@@ -56,14 +59,17 @@ int main(int argc, const char *argv[]) {
     }();
     auto kernel = xrt::kernel(context, xkernel.get_name());
 
-    auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int), XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+    size_t instr_bytes = instr_v.size() * sizeof(int);
+    size_t instr_bo_bytes = std::max(instr_bytes, vm["instr-bo-bytes"].as<size_t>());
+    auto bo_instr = xrt::bo(device, instr_bo_bytes, XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
     auto bo_in = xrt::bo(device, 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
     auto bo_buf = xrt::bo(device, 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
     auto bo_out = xrt::bo(device, out_elems * sizeof(int32_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
     memset(bo_in.map<uint8_t *>(), 0, 4);
     memset(bo_buf.map<uint8_t *>(), 0, 4);
     memset(bo_out.map<uint8_t *>(), 0, out_elems * sizeof(int32_t));
-    memcpy(bo_instr.map<void *>(), instr_v.data(), instr_v.size() * sizeof(int));
+    memset(bo_instr.map<uint8_t *>(), 0, instr_bo_bytes);
+    memcpy(bo_instr.map<void *>(), instr_v.data(), instr_bytes);
     bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bo_buf.sync(XCL_BO_SYNC_BO_TO_DEVICE);
