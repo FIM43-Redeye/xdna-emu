@@ -24,8 +24,12 @@ pub struct SparseRead {
     pub dp_advance: u32,
 }
 
-#[derive(Clone)]
+/// Silicon keeps the whole unit (ring, positions) across kernel launches, like the data
+/// registers (`core-persist/sparse` probe, 2026-11-06), so it is part of
+/// [`super::carried::CarriedCoreState`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SparseLoadUnit {
+    #[serde(with = "ring_hex")]
     ring: [u8; RING_BYTES],
     /// Where the next line is written.
     write: usize,
@@ -35,6 +39,32 @@ pub struct SparseLoadUnit {
     lines: i64,
     /// `DP` at the last `reset`: the address of the stream start.
     dp_base: u32,
+}
+
+/// The ring as one hex string (serde derives arrays only up to 32 elements).
+mod ring_hex {
+    use super::RING_BYTES;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(ring: &[u8; RING_BYTES], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&ring.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; RING_BYTES], D::Error> {
+        let text = String::deserialize(d)?;
+        let digit = |c: u8| (c as char).to_digit(16).ok_or_else(|| serde::de::Error::custom("not hex"));
+        if text.len() % 2 != 0 {
+            return Err(serde::de::Error::custom("odd hex length"));
+        }
+        let bytes = text
+            .as_bytes()
+            .chunks(2)
+            .map(|p| Ok((digit(p[0])? << 4 | digit(p[1])?) as u8))
+            .collect::<Result<Vec<u8>, D::Error>>()?;
+        bytes.try_into().map_err(|b: Vec<u8>| {
+            serde::de::Error::custom(format!("ring of {} bytes, want {RING_BYTES}", b.len()))
+        })
+    }
 }
 
 impl Default for SparseLoadUnit {

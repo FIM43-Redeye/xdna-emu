@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::context::ExecutionContext;
 use super::load_ring::LoadPortRings;
+use super::sparse_load::SparseLoadUnit;
 use super::registers::{
     DP_REG_INDEX, LC_REG_INDEX, LR_REG_INDEX, LS_REG_INDEX, NUM_ACCUMULATOR_REGS, NUM_MASK_REGS,
     NUM_MODIFIER_REGS, NUM_POINTER_REGS, NUM_SCALAR_GPRS, NUM_SHIFT_REGS, NUM_VECTOR_REGS, SHIFT_REG_BASE,
@@ -47,6 +48,9 @@ pub struct CarriedCoreState {
     pub q: [[u32; 4]; NUM_MASK_REGS],
     /// Both load ports' rings.
     pub load_rings: LoadPortRings,
+    /// The sparse-load unit: its ring of fetched lines and positions (silicon keeps it:
+    /// `core-persist/sparse`, a peek in the next launch returns the previous launch's line).
+    pub sparse_load: SparseLoadUnit,
 }
 
 impl CarriedCoreState {
@@ -70,6 +74,7 @@ impl CarriedCoreState {
             bm: std::array::from_fn(|i| c.accumulator.read_committed(i as u8)),
             q: std::array::from_fn(|i| c.mask.read(i as u8)),
             load_rings: c.load_rings.clone(),
+            sparse_load: c.sparse_load.clone(),
         }
     }
 
@@ -102,6 +107,7 @@ impl CarriedCoreState {
             ctx.mask.write(i as u8, *v);
         }
         ctx.load_rings = self.load_rings.clone();
+        ctx.sparse_load = self.sparse_load.clone();
     }
 }
 
@@ -153,6 +159,10 @@ mod tests {
         for k in 0..4u8 {
             ctx.load_rings.pass(LoadPort::A, (k & 1) as usize, Some([0xA0 | k; 16]));
             ctx.load_rings.pass(LoadPort::B, (k & 1) as usize, Some([0xB0 | k; 16]));
+        }
+        ctx.sparse_load.start(0x7_0400);
+        for k in 0..3u8 {
+            ctx.sparse_load.fetch(&[0x30 | k; 32]);
         }
         // launch-reset state, all away from reset
         ctx.scalar.write(LE_REG_INDEX, 0x40);
@@ -208,6 +218,8 @@ mod tests {
             assert_eq!(after.mask.read(i), [i as u32, 1, 2, 3]);
         }
         assert_eq!(after.load_rings, before.load_rings);
+        assert_eq!(after.sparse_load, before.sparse_load);
+        assert_ne!(after.sparse_load, crate::interpreter::state::SparseLoadUnit::new());
         assert_eq!(CarriedCoreState::capture(&mut after.clone()), carried);
     }
 
