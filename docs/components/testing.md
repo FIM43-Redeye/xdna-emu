@@ -125,6 +125,15 @@ turns both off. The pattern, its register list (from TableGen) and the kernel co
 stale). Run records and summaries name the pattern (`scrub`), and `compare` warns when two tags
 differ in it. Not scrubbed: `lr`, `sp`, `r16` (the core main restores it), data memory.
 
+Within one emulator instance the emulator carries core state from launch to launch as silicon
+does (data registers, load-port rings, sparse unit, stream read latch; `interpreter::state::carried`),
+but every harness phase is its own process, i.e. a fresh emulated device, so the scrub stays.
+Two tools reach what a phase cannot: `tools/harness/multi_launch.py` (+ `multi_launch_host.cpp`)
+runs a list of launches in ONE process on one `xrt::device` (each its own hw context, or a second
+run in the previous one), and `XDNA_EMU_STATE_DIR=<dir>` makes the emulated device keep its
+carried core state across processes (saved on device close, loaded on open; delete the file in
+`<dir>` to reset the device). Off by default, so ordinary runs stay independent.
+
 Results land in `<suite>/runs/<tag>/<case>/<core>.<buffer>.bin` plus `run.json`; tags are
 never overwritten. Comparing two hardware tags (`compare <suite> r1 r2`) is the determinism
 check; `--repeat N` does the same within one tag (repeats 2..N sit in `<case>/repeat_<k>/`).

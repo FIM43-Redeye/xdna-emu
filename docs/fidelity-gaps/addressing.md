@@ -186,7 +186,9 @@ answered from that ring.**
   not something of the memory tile.
 - The rings survive kernel launches (the harness scrub uses only port-A loads, so port B keeps
   what ran before): such a read depends on the previous kernel. Every probe kernel flushes both
-  rings first; the emulator starts a core with zero rings.
+  rings first. The emulator carries them like the data registers (a core reset keeps them,
+  `interpreter::state::carried`; host-firmware-dispatch.md, "Core register state across
+  launches"); a fresh emulated device starts with zero rings.
 
 Silicon does not write anything for a store into such a direction; the emulator drops it (the
 memory tile used to receive core stores and answer core loads south of row 2).
@@ -255,7 +257,7 @@ family), `state/load_ring.rs`, `memory/neighbor.rs`. EMU == HW on all 12 probe c
 | `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise |
 | counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured |
 | west of column 1 | silicon returns the DPU-reserved column 0's contents, which the emulator does not have (`load4x/wrap3` `lut_unwritten`: its west lanes, and through the rings most of its south lanes) |
-| ring state across kernel launches | silicon keeps both rings from the previous kernel (the harness scrub loads only through port A, so port B is never reset); an emulator core starts with zeros. A no-memory read before six own loads on its port depends on what ran before (`lut_unwritten`, 6 lanes) |
+| ring state across kernel launches | **modelled (2026-11-06)**: a core reset keeps both rings, within one emulator instance and, with `XDNA_EMU_STATE_DIR`, across processes. The harness still differs: every phase is a new process on a fresh emulated device (zero rings), while silicon holds the previous case's rings (the scrub loads only through port A), so `lut_unwritten` keeps its 6 port-B lanes |
 | loads into an isolated direction | `Tile_Control` isolation: the emulator returns zeros and writes zeros to the ring; unprobed |
 | a sparse peek / pop whose fetch is dropped | assumed not to touch the port-B ring (no fetch); unprobed |
 | `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed |
