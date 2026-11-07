@@ -3683,6 +3683,11 @@ main() {
       # parse-trace.py needs the post-lowering MLIR to resolve event slots.
       local t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/input_with_addresses.mlir"
       [[ -f "$t5_mlir" ]] || t5_mlir="$BUILD_BASE/$t5_name/${t5_compiler}/aie_arch.mlir.prj/input_with_addresses.mlir"
+      # Lit-native tests pick their own --output-dir (%t.prj -> test.prj); the
+      # same two-level search the per-side predecode uses finds it there.
+      if [[ ! -f "$t5_mlir" ]]; then
+        t5_mlir="$(find "$BUILD_BASE/$t5_name/${t5_compiler}" -mindepth 1 -maxdepth 2 -name 'input_with_addresses.mlir' -print -quit 2>/dev/null || true)"
+      fi
 
       if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]] && [[ -f "$t5_mlir" ]]; then
         local cmp_log="$RESULTS_DIR/${t5_safe}${t5_vsuffix}.${t5_compiler}.trace.log"
