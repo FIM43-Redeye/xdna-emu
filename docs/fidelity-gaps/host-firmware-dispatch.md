@@ -67,11 +67,23 @@ CRING != 0 (`src/firmware/xtensa/interp/ring_tests.rs`). A runtime-sequence read
 ring may not reach now faults in the emulator as it does on silicon ("Kernel did not complete");
 every other run is unchanged. MODELLED.
 
-**Management-firmware state across processes (open).** Silicon's management firmware runs from
-driver load; the emulator boots it once per emulator instance. Lazily built firmware state (for
-example software-filled TLB entries) that a long-running device already holds is therefore cold in
-the first command of each emulator process, and that command pays a one-time cost silicon pays once
-per driver load. Within one emulator instance, later commands match. Not modelled across processes.
+**Management-firmware state across processes (2026-11-07).** Silicon's management firmware boots
+once, at driver load, and keeps running while host processes come and go: a process exit or a TDR
+destroys and recreates hardware contexts, and only a driver reload or a runtime suspend boots the
+firmware again (the open driver's `aie2_hw_stop` / `aie2_hw_start`; with runtime PM allowed, the
+device suspends after an idle autosuspend delay, so firmware state outlives a process gap only
+when the gap is shorter than that delay or runtime PM is held off). Lazily built firmware state
+(software-filled TLB entries, cache contents) therefore stays built for later processes. With
+`XDNA_EMU_STATE_DIR` set, a backend that runs a management processor saves its whole platform when
+the device closes, after destroying the live hardware context as the driver does on process exit,
+and the next process restores it instead of booting: the generic Xtensa core state
+(`src/firmware/xtensa/state.rs`: registers, both TLBs, MMU special registers) plus the platform's
+own memories and devices, in a file beside the core-state file
+(`NpuBackend::save_platform_state`). A platform that is not back at its idle when the device
+closes (a hang whose recovery the emulator does not model) is not saved, and the older file is
+removed, so the next process boots fresh. Without the variable every process boots the firmware
+fresh, as before. MODELLED; the platform-specific parts and their evidence are in the private
+ledger.
 
 **Management-core instruction cache (2026-11-07).** The private per-step cost model gains an
 instruction cache (hit/miss per fetch line); its geometry and refill price live with the private

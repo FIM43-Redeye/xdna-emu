@@ -131,8 +131,9 @@ but every harness phase is its own process, i.e. a fresh emulated device, so the
 Two tools reach what a phase cannot: `tools/harness/multi_launch.py` (+ `multi_launch_host.cpp`)
 runs a list of launches in ONE process on one `xrt::device` (each its own hw context, or a second
 run in the previous one), and `XDNA_EMU_STATE_DIR=<dir>` makes the emulated device keep its
-carried core state across processes (saved on device close, loaded on open; delete the file in
-`<dir>` to reset the device). Off by default, so ordinary runs stay independent.
+carried core state, and a firmware backend its management-processor platform, across processes
+(saved on device close, loaded on open; delete the files in `<dir>` to reset the device). Off by
+default, so ordinary runs stay independent.
 
 Results land in `<suite>/runs/<tag>/<case>/<core>.<buffer>.bin` plus `run.json`; tags are
 never overwritten. Comparing two hardware tags (`compare <suite> r1 r2`) is the determinism
