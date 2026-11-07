@@ -25,7 +25,7 @@ use crate::interpreter::core::CoreStatus;
 pub enum WedgeReason {
     /// Every subsystem terminal, no possible forward progress.
     Quiescent,
-    /// Pending syncs, cores still running, but no DMA-bytes/lock-release progress.
+    /// Pending syncs, cores still running, but no MM2S-bytes/lock-release progress.
     Stalled,
     /// Executor parked in `BlockedOnPoll` past the cycle budget,
     /// and the cleaner `MaskPollUnsatisfied` test did not catch it
@@ -64,7 +64,7 @@ pub struct EngineSignals {
     pub engine_status: EngineStatusSnapshot,
     pub any_dma_active: bool,
     pub any_data_in_flight: bool,
-    pub total_dma_bytes_transferred: u64,
+    pub total_mm2s_bytes_transferred: u64,
     pub total_lock_releases: u64,
     /// Total instructions retired across all cores (monotonically increasing).
     pub total_instructions: u64,
@@ -271,7 +271,7 @@ impl TdrDetector {
             return false;
         }
         self.stall.note_progress(
-            signals.total_dma_bytes_transferred,
+            signals.total_mm2s_bytes_transferred,
             signals.total_lock_releases,
             signals.total_instructions,
         )
@@ -341,7 +341,7 @@ mod tests {
             engine_status: status,
             any_dma_active: false,
             any_data_in_flight: false,
-            total_dma_bytes_transferred: 0,
+            total_mm2s_bytes_transferred: 0,
             total_lock_releases: 0,
             total_instructions: 0,
             core_statuses: vec![],

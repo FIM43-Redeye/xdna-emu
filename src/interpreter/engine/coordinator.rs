@@ -222,8 +222,8 @@ pub struct InterpreterEngine {
     total_instructions: u64,
     /// Auto-run mode.
     auto_run: bool,
-    /// Stall detection: last observed total DMA bytes transferred.
-    last_dma_bytes: u64,
+    /// Stall detection: last observed total MM2S bytes transferred (DMA progress).
+    last_mm2s_bytes: u64,
     /// Stall detection: last observed total lock releases.
     last_lock_releases: u64,
     /// Stall detection: last observed total instructions executed.
@@ -275,7 +275,7 @@ impl InterpreterEngine {
             total_cycles: 0,
             total_instructions: 0,
             auto_run: false,
-            last_dma_bytes: 0,
+            last_mm2s_bytes: 0,
             last_lock_releases: 0,
             last_instructions: 0,
             stall_cycles: 0,
@@ -2118,7 +2118,8 @@ impl InterpreterEngine {
         // Three signals count as forward progress, any one of which resets
         // the stall counter:
         //
-        // 1. DMA bytes transferred: a DMA channel moved data.
+        // 1. MM2S bytes transferred: a DMA channel read data out of memory.
+        //    S2MM bytes do not count: see `total_mm2s_bytes_transferred`.
         // 2. Lock releases: an arbiter released a lock to a waiter.
         // 3. Core instructions executed: a core advanced its PC at least
         //    once outside of WaitLock/WaitDma/WaitStream.
@@ -2129,24 +2130,24 @@ impl InterpreterEngine {
         // True deadlocks are still caught: a deadlocked core is in WaitLock
         // (etc.) and does not advance total_instructions.
         if self.stall_threshold > 0 {
-            let dma_bytes = self.device.array.total_dma_bytes_transferred();
+            let mm2s_bytes = self.device.array.total_mm2s_bytes_transferred();
             let lock_releases = self.device.array.total_lock_releases();
             let instructions = self.total_instructions;
 
-            if dma_bytes > self.last_dma_bytes
+            if mm2s_bytes > self.last_mm2s_bytes
                 || lock_releases > self.last_lock_releases
                 || instructions > self.last_instructions
             {
                 self.stall_cycles = 0;
-                self.last_dma_bytes = dma_bytes;
+                self.last_mm2s_bytes = mm2s_bytes;
                 self.last_lock_releases = lock_releases;
                 self.last_instructions = instructions;
             } else {
                 self.stall_cycles += 1;
                 if self.stall_cycles >= self.stall_threshold {
                     log::warn!(
-                        "Stall detected: no progress for {} cycles (dma_bytes={}, lock_releases={}, instructions={})",
-                        self.stall_cycles, dma_bytes, lock_releases, instructions,
+                        "Stall detected: no progress for {} cycles (mm2s_bytes={}, lock_releases={}, instructions={})",
+                        self.stall_cycles, mm2s_bytes, lock_releases, instructions,
                     );
                     self.status = EngineStatus::Stalled;
                 }
@@ -2374,7 +2375,7 @@ impl InterpreterEngine {
         self.status = EngineStatus::Ready;
         self.total_cycles = 0;
         self.total_instructions = 0;
-        self.last_dma_bytes = 0;
+        self.last_mm2s_bytes = 0;
         self.last_lock_releases = 0;
         self.last_instructions = 0;
         self.stall_cycles = 0;
@@ -2833,6 +2834,38 @@ mod tests {
         assert!(dma.channel_has_pending_work(2));
         assert!(dma.channel_state_name(2).starts_with("MemoryLatency"));
         assert_eq!(engine.status(), EngineStatus::Running);
+    }
+
+    /// A traced design that deadlocks keeps streaming trace packets into its
+    /// shim S2MM. Those bytes are observation, not forward progress: the
+    /// detector must still declare the stall (dynamic_chain_passthrough/8
+    /// otherwise ran to the host timeout instead of recovering).
+    #[test]
+    fn s2mm_bytes_alone_do_not_hold_off_the_stall_detector() {
+        use crate::device::dma::{BdConfig, StreamData};
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.set_stall_threshold(50);
+        let dma = engine.device_mut().array.dma_engine_mut(2, 2).expect("compute DMA");
+        dma.configure_bd(0, BdConfig::simple_1d(0x400, 0x4000)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+
+        for cycle in 0..200u32 {
+            let dma = engine.device_mut().array.dma_engine_mut(2, 2).unwrap();
+            dma.push_stream_in(StreamData { data: cycle, tlast: false, channel: 0 });
+            engine.force_running();
+            engine.step();
+            if engine.status() == EngineStatus::Stalled {
+                break;
+            }
+        }
+
+        assert!(
+            engine.device().array.total_dma_bytes_transferred() > 0,
+            "fixture: the S2MM must have written"
+        );
+        assert_eq!(engine.status(), EngineStatus::Stalled);
     }
 
     #[test]

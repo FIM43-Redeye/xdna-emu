@@ -851,7 +851,7 @@ mod tier_c_integration {
             engine_status: EngineStatusSnapshot::Stalled,
             any_dma_active: false,
             any_data_in_flight: false,
-            total_dma_bytes_transferred: 0,
+            total_mm2s_bytes_transferred: 0,
             total_lock_releases: 0,
             total_instructions: 0,
             core_statuses: vec![],

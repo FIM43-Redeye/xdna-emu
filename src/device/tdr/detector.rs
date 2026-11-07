@@ -2,7 +2,7 @@
 //!
 //! `QuiescenceDetector` catches deadlocks (every subsystem terminal,
 //! no possible forward progress). `StallDetector` catches livelocks
-//! (cores running but no DMA-bytes/lock-release progress with pending
+//! (cores running but no MM2S-bytes/lock-release progress with pending
 //! syncs). Composed by [`super::TdrDetector`] which classifies engine
 //! run state into a single per-cycle verdict.
 //!
@@ -263,11 +263,11 @@ pub enum StallStatus {
 ///
 /// Complements [`QuiescenceDetector`] which catches true deadlocks (all
 /// subsystems terminal). This detector catches **livelocks** where cores
-/// are still running but neither DMA bytes are moving, any lock is being
+/// are still running but neither MM2S bytes are moving, any lock is being
 /// released, nor any instruction is retiring -- so the workload can never
 /// complete.
 ///
-/// The stall counter resets whenever DMA bytes, lock release count, or
+/// The stall counter resets whenever MM2S bytes, lock release count, or
 /// instruction retirement count changes. Instruction retirement is the third
 /// signal: a core running a pure-compute inner loop (e.g. a 4096-element
 /// accumulation loop spanning ~100K cycles) retires instructions every cycle
@@ -282,8 +282,8 @@ pub enum StallStatus {
 /// The counter only fires when there are unsatisfied pending syncs --
 /// otherwise the test may legitimately be doing pure computation.
 pub struct StallDetector {
-    /// Last observed total DMA bytes transferred.
-    last_dma_bytes: u64,
+    /// Last observed total MM2S bytes transferred (DMA progress; see `TileArray::total_mm2s_bytes_transferred`).
+    last_mm2s_bytes: u64,
     /// Last observed total lock releases across all tiles.
     last_lock_releases: u64,
     /// Last observed total instructions retired across all cores.
@@ -298,7 +298,7 @@ impl StallDetector {
     /// Create a new stall detector with the given cycle threshold.
     pub fn new(threshold: u64) -> Self {
         Self {
-            last_dma_bytes: 0,
+            last_mm2s_bytes: 0,
             last_lock_releases: 0,
             last_instructions: 0,
             cycles_since_progress: 0,
@@ -319,13 +319,13 @@ impl StallDetector {
     /// Returns true when threshold met (stalled).
     ///
     /// Any of the three signals advancing resets the no-progress counter:
-    /// DMA bytes transferred, lock releases, or instructions retired.
-    pub(crate) fn note_progress(&mut self, dma_bytes: u64, lock_releases: u64, instructions: u64) -> bool {
-        if dma_bytes != self.last_dma_bytes
+    /// MM2S bytes transferred, lock releases, or instructions retired.
+    pub(crate) fn note_progress(&mut self, mm2s_bytes: u64, lock_releases: u64, instructions: u64) -> bool {
+        if mm2s_bytes != self.last_mm2s_bytes
             || lock_releases != self.last_lock_releases
             || instructions != self.last_instructions
         {
-            self.last_dma_bytes = dma_bytes;
+            self.last_mm2s_bytes = mm2s_bytes;
             self.last_lock_releases = lock_releases;
             self.last_instructions = instructions;
             self.cycles_since_progress = 0;
@@ -339,7 +339,7 @@ impl StallDetector {
     /// Check whether the system has stalled this cycle.
     ///
     /// Must be called once per cycle. Returns:
-    /// - `Progressing` if DMA bytes, lock releases, or instructions are advancing
+    /// - `Progressing` if MM2S bytes, lock releases, or instructions are advancing
     /// - `Stalled(diagnosis)` if no progress for `threshold` cycles
     ///   with unsatisfied syncs
     pub fn check(&mut self, engine: &InterpreterEngine, npu_executor: Option<&NpuExecutor>) -> StallStatus {
@@ -357,15 +357,15 @@ impl StallDetector {
             return StallStatus::Progressing;
         }
 
-        let current_bytes = engine.device().array.total_dma_bytes_transferred();
+        let current_bytes = engine.device().array.total_mm2s_bytes_transferred();
         let current_lock_releases = engine.device().array.total_lock_releases();
         let current_instructions = engine.total_instructions();
 
-        if current_bytes != self.last_dma_bytes
+        if current_bytes != self.last_mm2s_bytes
             || current_lock_releases != self.last_lock_releases
             || current_instructions != self.last_instructions
         {
-            self.last_dma_bytes = current_bytes;
+            self.last_mm2s_bytes = current_bytes;
             self.last_lock_releases = current_lock_releases;
             self.last_instructions = current_instructions;
             self.cycles_since_progress = 0;

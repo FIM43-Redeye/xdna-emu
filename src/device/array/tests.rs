@@ -1080,3 +1080,38 @@ fn core_stream_input_is_bounded_and_backpressures_the_switch() {
     }
     assert_eq!(array.tiles[idx].stream_input_len(0), crate::device::tile::CORE_STREAM_INPUT_DEPTH);
 }
+
+/// The stall detectors' DMA progress signal counts MM2S bytes only. Every
+/// functional byte an S2MM channel writes was first read by an MM2S channel or
+/// put on the stream by a core (which retires instructions), so an S2MM fed by
+/// neither is draining a bounded FIFO or writing trace-unit packets. Trace keeps
+/// flowing while a design deadlocks (a stalled core still emits stall events),
+/// so counting S2MM bytes kept deadlocked traced designs "progressing" forever.
+#[test]
+fn mm2s_byte_total_ignores_bytes_an_s2mm_writes() {
+    use crate::device::dma::BdConfig;
+    use crate::device::host_memory::HostMemory;
+
+    let mut array = TileArray::npu1();
+    let mut host = HostMemory::new();
+    array.clock_mut().write_register(2, 0, 0x000F_FF20, 0x1); // ungate col 2
+    let idx = array.tile_index(2, 2);
+    {
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(0, BdConfig::simple_1d(0x400, 64)).unwrap();
+        dma.start_channel(0, 0).unwrap();
+    }
+    for i in 0..16u32 {
+        array.dma_engines[idx].push_stream_in(crate::device::dma::StreamData {
+            data: 0x7ACE_0000 | i,
+            tlast: false,
+            channel: 0,
+        });
+    }
+    for _ in 0..200 {
+        array.step_data_movement(&mut host);
+    }
+
+    assert!(array.total_dma_bytes_transferred() > 0, "fixture: the S2MM must have written");
+    assert_eq!(array.total_mm2s_bytes_transferred(), 0);
+}

@@ -605,7 +605,7 @@ fn build_engine_signals(engine: &InterpreterEngine) -> xdna_emu_core::device::td
         engine_status: status,
         any_dma_active: device.array.any_dma_active(),
         any_data_in_flight: device.array.any_data_in_flight(),
-        total_dma_bytes_transferred: device.array.total_dma_bytes_transferred(),
+        total_mm2s_bytes_transferred: device.array.total_mm2s_bytes_transferred(),
         total_lock_releases: device.array.total_lock_releases(),
         total_instructions: engine.total_instructions(),
         core_statuses,

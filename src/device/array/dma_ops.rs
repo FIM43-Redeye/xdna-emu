@@ -416,6 +416,27 @@ impl TileArray {
         total
     }
 
+    /// Total bytes moved by MM2S channels across all present tiles: the DMA
+    /// forward-progress signal of the stall detectors. S2MM bytes are left out
+    /// on purpose. Every functional byte an S2MM writes was first read by an
+    /// MM2S or put on the stream by a core (counted as retired instructions);
+    /// what remains is a bounded FIFO drain or trace-unit output, and trace
+    /// keeps streaming while a design deadlocks.
+    pub fn total_mm2s_bytes_transferred(&self) -> u64 {
+        let mut total = 0u64;
+        for (engine, &present) in self.dma_engines.iter().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
+            for ch in 0..engine.num_channels() as u8 {
+                if matches!(engine.channel_type(ch), ChannelType::MM2S) {
+                    total += engine.channel_stats(ch).map_or(0, |stats| stats.bytes_transferred);
+                }
+            }
+        }
+        total
+    }
+
     /// Total lock releases granted across all tiles.
     ///
     /// Monotonically increasing counter used by stall detection.
