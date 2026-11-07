@@ -58,3 +58,22 @@ builds, 2026-11) clears RESET itself in its init section (`CORE_CONTROL` mask wr
 sets ENABLE in its enable section, so those cores start at their enable write rather than at a
 release of a held reset; the "nothing in the CDO clears the reset bit" observation above predates
 that and should be rechecked when the launch point is pinned.
+
+**Management-core access ring (2026-11-07).** The firmware interpreter's MMU used to translate every
+access at ring 0. It now follows the Xtensa ISA: the access ring is CRING (`PS.EXCM ? 0 : PS.RING`),
+L32E/S32E use PS.RING, instruction fetch and the fill fast path included, and the privileged
+instructions (the RM's set; RSR/WSR of special registers 64 and up) raise PrivilegedCause at
+CRING != 0 (`src/firmware/xtensa/interp/ring_tests.rs`). A runtime-sequence read of a page the task's
+ring may not reach now faults in the emulator as it does on silicon ("Kernel did not complete");
+every other run is unchanged. MODELLED.
+
+**Management-firmware state across processes (open).** Silicon's management firmware runs from
+driver load; the emulator boots it once per emulator instance. Lazily built firmware state (for
+example software-filled TLB entries) that a long-running device already holds is therefore cold in
+the first command of each emulator process, and that command pays a one-time cost silicon pays once
+per driver load. Within one emulator instance, later commands match. Not modelled across processes.
+
+**Management-core instruction cache (2026-11-07).** The private per-step cost model gains an
+instruction cache (hit/miss per fetch line); its geometry and refill price live with the private
+cost model. Open: cold-code cost after the largest firmware paths still exceeds what the cache
+explains (private ledger).
