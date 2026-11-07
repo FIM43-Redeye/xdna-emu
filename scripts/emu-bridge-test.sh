@@ -3356,6 +3356,20 @@ main() {
     fi
   fi
 
+  # The trace gate's comparator is a release binary of this checkout. Same rule
+  # as the .so: rebuild from source, so a fresh worktree has one and an edited
+  # comparator never runs stale (a missing binary turned every trace verdict
+  # into ERROR on 2026-11-07).
+  if ! $NO_TRACE && $RUN_EMU; then
+    info "Phase 1b: rebuilding trace-compare (release) -- no-op if current"
+    ( cd "$EMU_ROOT" && cargo build --release --bin trace-compare ) 2>&1 | sed 's/^/  /'
+    local tc_build_rc=${PIPESTATUS[0]}
+    if [[ $tc_build_rc -ne 0 ]]; then
+      err "trace-compare build failed (exit $tc_build_rc) -- aborting before a run whose trace verdicts would all be ERROR"
+      exit 1
+    fi
+  fi
+
   # ---- Phase 2: Compile --------------------------------------------------
 
   info "Phase 2: Compiling ${#runnable[@]} test(s) (-j${JOBS})"
