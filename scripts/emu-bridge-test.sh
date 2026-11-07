@@ -2641,6 +2641,31 @@ _predecode_events_next_to_trace() {
 }
 export -f _predecode_events_next_to_trace
 
+# Why a test has no trace capture, as a short slug (the NONE verdict's reason).
+# Reads trace-prepare's status file; quarantine wins because it skips prepare.
+# Usage: _trace_none_reason <test_name>
+_trace_none_reason() {
+  local name="$1"
+  if is_trace_quarantined "$name"; then echo "quarantined"; return; fi
+  local status_file="$BUILD_BASE/$name/traced/prepare-status.txt"
+  local status=""
+  [[ -f "$status_file" ]] && status="$(head -n1 "$status_file")"
+  case "$status" in
+    "") echo "no-prepare" ;;
+    OK*) echo "prep-ok-no-buffer" ;;
+    "SKIP already-traced"*) echo "already-traced" ;;
+    SKIP*) echo "skipped" ;;
+    *"route infeasible"*) echo "route-infeasible" ;;
+    *"C++ patching"*) echo "cpp-patch" ;;
+    *"trace lowering"*) echo "lowering" ;;
+    *"trace injection"*) echo "injection" ;;
+    *"tile placement"*) echo "placement" ;;
+    *"source detection"*) echo "no-single-source" ;;
+    *) echo "prep-fail" ;;
+  esac
+}
+export -f _trace_none_reason
+
 # Run trace-compare on a bin pair. Requires the Rust binary and a matching
 # xclbin-mlir (for parse-trace.py). Caller supplies --hw <bin> --emu <bin>
 # --xclbin-mlir <mlir> [extra trace-compare args]; we convert to events
@@ -2983,7 +3008,7 @@ print_report() {
             CLEAN*)   trace_clean[$compiler]=$(( ${trace_clean[$compiler]} + 1 )) ;;
             DIVERGE*) trace_diverge[$compiler]=$(( ${trace_diverge[$compiler]} + 1 )) ;;
             ERROR*)   trace_error[$compiler]=$(( ${trace_error[$compiler]} + 1 )) ;;
-            SKIP*|EMU_ONLY*|HW_ONLY*|NONE*) trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 )) ;;
+            SKIP*|EMPTY*|EMU_ONLY*|HW_ONLY*|NONE*) trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 )) ;;
           esac
         else
           trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 ))
@@ -3706,19 +3731,28 @@ main() {
         # so this column was vacuously CLEAN for every kernel regardless of
         # divergence (mode-1 core LOCK_STALL noise AND real shim/memtile gaps
         # alike went unflagged).
-        if echo "$cmp_out" | grep -q "^TRACE_VERDICT: CLEAN"; then
+        # CLEAN over zero compared events is vacuous (both buffers empty):
+        # say so instead of reporting a pass nothing backs.
+        if echo "$cmp_out" | grep -q "^TRACE_VERDICT: CLEAN" \
+            && echo "$cmp_out" | grep -q "^Edge event types: *0 clean, 0 diverged, 0 count mismatch" \
+            && echo "$cmp_out" | grep -q "^Level event types: *0 clean, 0 diverged, 0 count mismatch"; then
+          echo "EMPTY" > "$summary_file"
+        elif echo "$cmp_out" | grep -q "^TRACE_VERDICT: CLEAN"; then
           echo "CLEAN" > "$summary_file"
         elif echo "$cmp_out" | grep -q "^TRACE_VERDICT: DIVERGE"; then
           echo "DIVERGE" > "$summary_file"
         else
           echo "ERROR" > "$summary_file"
         fi
+      elif [[ -f "$emu_trace" ]] && [[ -f "$hw_trace" ]]; then
+        # Both captures exist; only the post-lowering MLIR is missing.
+        echo "EMU_ONLY:no-mlir" > "$summary_file"
       elif [[ -f "$emu_trace" ]]; then
         echo "EMU_ONLY" > "$summary_file"
       elif [[ -f "$hw_trace" ]]; then
         echo "HW_ONLY" > "$summary_file"
       else
-        echo "NONE" > "$summary_file"
+        echo "NONE:$(_trace_none_reason "$t5_name")" > "$summary_file"
       fi
     done
   elif [[ "$NO_TRACE" != "true" ]]; then
