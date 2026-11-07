@@ -207,6 +207,32 @@ def inject_trace_declarative(
     return traced_text, cfg
 
 
+def place_logical_tiles(mlir_text: str) -> str:
+    """Resolve `aie.logical_tile` ops to physical `aie.tile` ops.
+
+    The route planner and the injector only see physical tiles, so designs
+    written with unplaced logical tiles (`aie.logical_tile<CoreTile>(?, ?)`)
+    reported "no traceable tiles". aiecc runs the same sequential placer on
+    the same input, so placing here does not change where the design lands.
+    MLIR without logical tiles is returned untouched.
+    """
+    if "aie.logical_tile" not in mlir_text:
+        return mlir_text
+    proc = subprocess.run(
+        ["aie-opt", "--aie-place-tiles", "-"],
+        input=mlir_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"aie-opt tile placement failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip().splitlines()[-1] if proc.stderr else ''}"
+        )
+    return proc.stdout
+
+
 def lower_trace_ops_with_lateral_routing(mlir_text: str) -> str:
     """Run aiecc's trace lowering pipeline externally with lateral-routing on.
 
@@ -306,6 +332,12 @@ def prepare_trace(
             mlir_text = trace_inject.get_mlir_text(
                 test_dir, source_type, device,
             )
+            mlir_text = place_logical_tiles(mlir_text)
+        except RuntimeError as e:
+            msg = f"FAIL tile placement: {e}"
+            write_status(output_dir, msg)
+            print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+            return 1
         except SystemExit:
             msg = "FAIL source detection or MLIR loading"
             write_status(output_dir, msg)

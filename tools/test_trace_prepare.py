@@ -364,3 +364,45 @@ class TestIntegration:
         # aie_traced.mlir should have trace packet flows.
         mlir_content = (output_dir / "aie_traced.mlir").read_text()
         assert "Trace" in mlir_content
+
+
+# ---------------------------------------------------------------------------
+# Logical-tile placement before injection
+# ---------------------------------------------------------------------------
+
+def _load_prepare_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("trace_prepare_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+LOGICAL_MLIR = """
+module {
+  aie.device(npu1_1col) {
+    %c = aie.logical_tile<CoreTile>(?, ?)
+    %s = aie.logical_tile<ShimNOCTile>(?, ?)
+    aie.objectfifo @in(%s, {%c}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    %core = aie.core(%c) {
+      aie.end
+    }
+  }
+}
+"""
+
+
+class TestPlaceLogicalTiles:
+    def test_logical_tiles_become_physical(self):
+        """The trace planner only sees aie.tile ops; unplaced logical tiles
+        made every logical-tile test fail with 'no traceable tiles'."""
+        mod = _load_prepare_module()
+        placed = mod.place_logical_tiles(LOGICAL_MLIR)
+        assert "aie.logical_tile" not in placed
+        assert "aie.tile(0, 2)" in placed
+
+    def test_physical_mlir_passes_through_unchanged(self):
+        mod = _load_prepare_module()
+        text = "module {\n  aie.device(npu1_1col) {\n    %t = aie.tile(0, 2)\n  }\n}\n"
+        assert mod.place_logical_tiles(text) == text
