@@ -629,6 +629,35 @@ pub fn shift_tile_columns(tiles: &TileEvents, placement: PlacementRecord) -> Til
         .collect()
 }
 
+/// `shift_tile_columns` applied to a per-tile mode map.
+fn shift_mode_columns(modes: &TileModes, placement: PlacementRecord) -> TileModes {
+    modes
+        .iter()
+        .map(|(key, mode)| {
+            let new_key = TileKey {
+                col: key.col.saturating_sub(placement.origin_col),
+                row: key.row.saturating_sub(placement.origin_row),
+                pkt_type: key.pkt_type,
+            };
+            (new_key, *mode)
+        })
+        .collect()
+}
+
+/// `remap_tile_columns` applied to a per-tile mode map. The dense column map
+/// is derived from `tiles` (not from the modes) so both transforms agree.
+fn remap_mode_columns(modes: &TileModes, tiles: &TileEvents) -> TileModes {
+    let cols: BTreeSet<u8> = tiles.keys().map(|k| k.col).collect();
+    let col_map: HashMap<u8, u8> = cols.into_iter().enumerate().map(|(i, c)| (c, i as u8)).collect();
+    modes
+        .iter()
+        .filter_map(|(key, mode)| {
+            let col = *col_map.get(&key.col)?;
+            Some((TileKey { col, row: key.row, pkt_type: key.pkt_type }, *mode))
+        })
+        .collect()
+}
+
 // ============================================================================
 // Comparison
 // ============================================================================
@@ -1871,15 +1900,24 @@ pub fn compare_batch_with_opts(
     // When neither is available, leave columns as-is (and HW vs EMU will
     // appear on disjoint tile keys -- correct behavior for traces that
     // genuinely live on different physical tiles).
-    let hw_tiles = match (hw_placement, opts.remap_columns) {
-        (Some(p), _) => shift_tile_columns(&hw_tiles, p),
-        (None, true) => remap_tile_columns(&hw_tiles),
-        (None, false) => hw_tiles,
+    // The per-tile mode maps are keyed like the tiles, so they take the same
+    // key transform; otherwise the mode lookup below misses and falls back to
+    // the legacy default (cores = EVENT_PC), skipping every EVENT_TIME core.
+    let (hw_tiles, hw_modes) = match (hw_placement, opts.remap_columns) {
+        (Some(p), _) => (shift_tile_columns(&hw_tiles, p), shift_mode_columns(&hw_modes, p)),
+        (None, true) => {
+            let modes = remap_mode_columns(&hw_modes, &hw_tiles);
+            (remap_tile_columns(&hw_tiles), modes)
+        }
+        (None, false) => (hw_tiles, hw_modes),
     };
-    let emu_tiles = match (emu_placement, opts.remap_columns) {
-        (Some(p), _) => shift_tile_columns(&emu_tiles, p),
-        (None, true) => remap_tile_columns(&emu_tiles),
-        (None, false) => emu_tiles,
+    let (emu_tiles, emu_modes) = match (emu_placement, opts.remap_columns) {
+        (Some(p), _) => (shift_tile_columns(&emu_tiles, p), shift_mode_columns(&emu_modes, p)),
+        (None, true) => {
+            let modes = remap_mode_columns(&emu_modes, &emu_tiles);
+            (remap_tile_columns(&emu_tiles), modes)
+        }
+        (None, false) => (emu_tiles, emu_modes),
     };
 
     let all_keys: BTreeSet<TileKey> = hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
@@ -3369,6 +3407,41 @@ mod tests {
         let as_pc = compare_tile_events(key, &hw, &emu, &names, &opts, TRACE_MODE_EVENT_PC);
         assert!(as_pc.level_results.is_empty(), "mode-1 tile must not feed cycle summary");
         assert!(as_pc.edge_results.is_empty(), "mode-1 tile must not feed edge summary");
+    }
+
+    /// The per-tile mode map is keyed by the raw physical column, while the
+    /// tiles are shifted by the placement origin before comparison. A mode
+    /// lookup with the shifted key missed and fell back to the legacy default
+    /// (cores = EVENT_PC), so every EVENT_TIME core tile was silently skipped.
+    #[test]
+    fn event_time_core_tile_survives_placement_shift() {
+        let dir = std::env::temp_dir().join(format!("xdna-emu-mode-shift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = |cycles: &[u64]| {
+            let evs: Vec<String> = cycles
+                .iter()
+                .map(|c| {
+                    format!(
+                        r#"{{"col":1,"row":2,"pkt_type":0,"slot":0,"name":"PERF_CNT_2","ts":{c},"soc":{c},"mode":0}}"#
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"schema_version":1,"events":[{}],"slot_names":{{"core":["PERF_CNT_2","","","","","","",""]}},"placement":{{"origin_col":1,"origin_row":0}}}}"#,
+                evs.join(",")
+            )
+        };
+        let hw = dir.join("hw.json");
+        let emu = dir.join("emu.json");
+        std::fs::write(&hw, events(&[100, 200])).unwrap();
+        std::fs::write(&emu, events(&[500, 600])).unwrap();
+
+        let batch =
+            compare_batch_with_opts(&hw, &emu, &EventsConfig::default(), 0, &AnalysisOptions::default())
+                .unwrap();
+        let (_, core) = batch.tiles.iter().find(|(k, _)| k.pkt_type == 0).expect("core tile present");
+        assert!(!core.edge_results.is_empty(), "EVENT_TIME core tile must be compared, not skipped");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1637,10 +1637,23 @@ compile_one_compiler() {
     # substitute `cp <traced_mlir> ./foo.mlir` so the traced MLIR our
     # injector produced ends up where aiecc expects it. Without this swap
     # the .py would regenerate the MLIR clean, clobbering our injection.
-    if [[ -n "$HW_CYCLES_TRACED_MLIR" ]] \
-       && [[ "$cmd" =~ ^python3[[:space:]]+[^[:space:]]+/aie[^[:space:]]*\.py[[:space:]]+\>[[:space:]]+([^[:space:]]+\.mlir)$ ]]; then
-      local _py_out="${BASH_REMATCH[1]}"
-      cmd="cp $HW_CYCLES_TRACED_MLIR $_py_out"
+    #
+    # The generator line may carry arguments (`aie2.py npu 0 > ./aie2.mlir`,
+    # the mlir-aie python-test idiom). The old pattern admitted none, so for
+    # those tests the generator ran clean, aiecc compiled the untraced design,
+    # and the host's trace BO came back all zeros on both HW and EMU. Swap in
+    # the traced MLIR whenever one exists: the hw-cycles one, else
+    # trace-prepare's.
+    local _traced_swap=""
+    if [[ -n "$HW_CYCLES_TRACED_MLIR" ]]; then
+      _traced_swap="$HW_CYCLES_TRACED_MLIR"
+    elif [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
+      _traced_swap="$TRACED_DIR/aie_traced.mlir"
+    fi
+    if [[ -n "$_traced_swap" ]] \
+       && [[ "$cmd" =~ ^[^[:space:]]*python[0-9.]*[[:space:]]+[^[:space:]]+\.py([[:space:]]+[^\>]*)?[[:space:]]+\>[[:space:]]+([^[:space:]]+\.mlir)$ ]]; then
+      local _py_out="${BASH_REMATCH[2]}"
+      cmd="cp $_traced_swap $_py_out"
     fi
 
     # Fix MLIR path references for aiecc commands.
@@ -1811,7 +1824,10 @@ compile_one() {
     # core-only hw-cycles injection -- see below) must carry cycles too. A
     # PC-anchored sweep needs event_pc, so it wins; an explicit override always
     # wins.
-    if [[ -z "$_trace_mode" && "$WITH_HW_CYCLES" == "true" && "$PC_ANCHORED" != "true" ]]; then
+    # The regression gate also needs event_time: trace-compare skips every
+    # EVENT_PC tile in the cycle comparison (abs_cycle is a PC there), so under
+    # the injector's event_pc default no Core section was ever compared.
+    if [[ -z "$_trace_mode" && "$PC_ANCHORED" != "true" ]]; then
       _trace_mode="event_time"
     fi
     if [[ -n "$_trace_mode" ]]; then
