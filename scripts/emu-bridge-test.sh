@@ -1668,7 +1668,10 @@ compile_one_compiler() {
       cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
       cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
       # Secondary aiecc steps (post-xclbin) use original MLIR when available.
-      if $first_aiecc_done && $orig_mlir_available; then
+      # Exception: a step that merges into an earlier xclbin (--xclbin-input=)
+      # builds the xclbin and insts the host actually runs (add_one_two), so
+      # it must carry the trace too.
+      if $first_aiecc_done && $orig_mlir_available && [[ "$cmd" != *--xclbin-input=* ]]; then
         cmd="${cmd//aie_arch.mlir/aie_arch_orig.mlir}"
       fi
       first_aiecc_done=true
@@ -2651,7 +2654,7 @@ _trace_none_reason() {
   local status=""
   [[ -f "$status_file" ]] && status="$(head -n1 "$status_file")"
   case "$status" in
-    "") echo "no-prepare" ;;
+    "") if [[ -f "$TEST_SRC/$name/test.cpp" ]]; then echo "no-prepare"; else echo "python-host"; fi ;;
     OK*) echo "prep-ok-no-buffer" ;;
     "SKIP already-traced"*) echo "already-traced" ;;
     SKIP*) echo "skipped" ;;
