@@ -306,3 +306,19 @@ int main(int argc, const char *argv[]) {
         result = _patch(self.EXT_CPP, trace_arg_index=6)
         assert "kernel.group_id(6)" in result
         assert "bo_out, bo_trace)" in result
+
+
+class TestWaitInsideCondition:
+    """Tests commonly check `if (run.wait() != ERT_CMD_STATE_COMPLETED)`: the
+    wait call sits in an if condition, not in its own statement."""
+
+    SRC = MINIMAL_CPP.replace(
+        "ert_cmd_state r = run.wait();",
+        'if (run.wait() != ERT_CMD_STATE_COMPLETED) { std::cout << "bad\\n"; return 1; }',
+    )
+
+    def test_wait_in_if_condition_is_patched(self):
+        assert "run.wait() != ERT_CMD_STATE_COMPLETED" in self.SRC
+        out = _patch(self.SRC)
+        write_pos = out.index("trace_raw.bin")
+        assert write_pos > out.index("run.wait() != ERT_CMD_STATE_COMPLETED")

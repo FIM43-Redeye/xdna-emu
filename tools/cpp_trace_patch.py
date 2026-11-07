@@ -244,8 +244,11 @@ def _find_last_wait(root: Node, source_bytes: bytes) -> Optional[Node]:
 def _find_enclosing_statement(node: Node, root: Node, source_bytes: bytes) -> Optional[Node]:
     """Find the nearest enclosing statement (declaration or expression_statement)."""
     best = None
+    # An if_statement counts too: tests commonly guard the wait itself,
+    # `if (run.wait() != ERT_CMD_STATE_COMPLETED) {...}`, so the call lives in
+    # the condition and no declaration or expression statement contains it.
     for candidate in _walk_all(root):
-        if candidate.type in ("declaration", "expression_statement"):
+        if candidate.type in ("declaration", "expression_statement", "if_statement"):
             if (candidate.start_byte <= node.start_byte and
                     candidate.end_byte >= node.end_byte):
                 # Prefer the tightest enclosing statement
