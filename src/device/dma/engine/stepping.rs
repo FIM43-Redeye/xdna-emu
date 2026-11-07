@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::device::bank_arbiter::{Requester, NUM_DMA_CHANNELS};
-use crate::device::dma::channel::PendingRelease;
+use crate::device::dma::channel::{PendingReadCompletion, PendingRelease};
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
 use smallvec::SmallVec;
@@ -344,6 +344,21 @@ impl DmaEngine {
         (words, mask)
     }
 
+    /// Does this transfer read through the shim MM2S read-ahead window?
+    ///
+    /// A shim MM2S reading host memory issues its reads into a per-channel
+    /// window (`shim_mm2s_read_window_bytes`); each returns
+    /// `shim_mm2s_read_latency_cycles` later and enters the stream in issue
+    /// order, and the BD completes when its last read returns, not when its
+    /// last word has entered the stream (`retire_issued_bd`). NPU1 silicon: a
+    /// back-pressured shim MM2S finishes with ~3.4 KiB still undelivered
+    /// (shim-inflight probe, 2026-11-07).
+    fn uses_read_ahead(&self, transfer: &Transfer) -> bool {
+        self.tile_kind.is_shim()
+            && transfer.direction == TransferDirection::MM2S
+            && transfer.involves_host_memory()
+    }
+
     /// Does this transfer run through the MM2S egress staging FIFO?
     ///
     /// The staging model describes a DMA whose memory side reads banked TILE
@@ -352,8 +367,8 @@ impl DmaEngine {
     ///
     /// - S2MM, whose staging is the ingress FIFO (`stream_in`) on the other side
     ///   of the same asymmetry, already modelled;
-    /// - the shim MM2S, which reads host DDR through the NoC rather than a bank
-    ///   and whose transient is the separately calibrated DDR cold-start model;
+    /// - the shim MM2S, which reads host DDR through the NoC rather than a bank:
+    ///   its buffering is the read-ahead window (`uses_read_ahead`);
     /// - a zero-padding or compressing MM2S, whose stream output is not a 1:1
     ///   image of the words it reads from memory, so "words fetched but not yet
     ///   sent" is not a well-defined quantity.
@@ -539,9 +554,17 @@ impl DmaEngine {
     ) -> DmaResult {
         let mut any_active = false;
         let mut any_waiting = false;
+        self.read_clock += 1;
 
         for ch_idx in 0..self.channels.len() {
             let phase_before = self.channels[ch_idx].fsm.phase_name();
+
+            // Shim MM2S read-ahead: returned reads enter the stream before this
+            // cycle's issue decision, whatever the FSM is doing.
+            if !self.channels[ch_idx].read_ahead.is_empty() || self.channels[ch_idx].read_backpressure {
+                self.drain_read_ahead(ch_idx);
+                any_active = true;
+            }
 
             // Snapshot the egress backlog BEFORE the step pushes this cycle's
             // word, so `complete_or_drain` can tell a lagging sink from a
@@ -624,6 +647,14 @@ impl DmaEngine {
                         }
                     }
                 }
+            }
+
+            // BDs whose last read returns this cycle complete now: after the FSM
+            // step, so a BD whose last read issued this very cycle with zero
+            // latency completes in the same cycle.
+            if !self.channels[ch_idx].read_completions.is_empty() {
+                self.fire_read_completions(ch_idx, tile, neighbors);
+                any_active = true;
             }
 
             // Log transitions
@@ -812,8 +843,9 @@ impl DmaEngine {
     /// - `channel_start_cycles`: generic "start trigger to first data" cost.
     ///   Fires on every task (every Idle->BdSetup), tile-agnostic.
     /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
-    ///   shim DMA touching host memory.  Fires on every task -- covers BD
-    ///   programming + per-task AXI burst arbitration.
+    ///   shim DMA touching host memory.  Fires on every task.  0 for MM2S:
+    ///   its calibrated 325 is the read latency, charged per read between
+    ///   issue and stream (`uses_read_ahead`).
     /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles` decayed by
     ///   `shim_warmup_decay_{mm2s,s2mm}_permille`: the warm-up transient.
     ///   The cold-start cost (DDR read pipeline fill on MM2S / AXI setup on
@@ -1218,6 +1250,10 @@ impl DmaEngine {
         host_memory: &mut HostMemory,
     ) -> ChannelFsm {
         let result = self.do_transfer_cycle(ch_idx, mem_denied, &mut transfer, tile, neighbors, host_memory);
+        // A shim MM2S's stream-side level is driven by its read-ahead drain
+        // (`drain_read_ahead`); its read side stalling on a full window is not
+        // a stream event.
+        let read_ahead = self.uses_read_ahead(&transfer);
 
         match result {
             TransferCycleResult::Continue => {
@@ -1228,11 +1264,16 @@ impl DmaEngine {
                     self.channels[ch_idx].prev_starving = false;
                 }
                 if transfer.remaining_bytes() == 0 {
-                    self.complete_or_hold(ch_idx, transfer, tile, neighbors)
+                    if read_ahead {
+                        self.retire_issued_bd(ch_idx, transfer, tile, neighbors)
+                    } else {
+                        self.complete_or_hold(ch_idx, transfer, tile, neighbors)
+                    }
                 } else {
                     ChannelFsm::Transferring { transfer }
                 }
             }
+            TransferCycleResult::Stalled if read_ahead => ChannelFsm::Transferring { transfer },
             TransferCycleResult::Stalled => {
                 // STREAM_STARVATION held level: assert on the rising edge; the
                 // deassert fires on the next Continue (data resumed).
@@ -1586,6 +1627,83 @@ impl DmaEngine {
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
+        self.note_bd_finished(ch_idx, &completion);
+        self.advance_after_bd(ch_idx, completion, tile, neighbors, true).0
+    }
+
+    /// A shim MM2S BD whose last read was issued this cycle (`uses_read_ahead`):
+    /// queue its completion for the cycle that read returns -- lock release,
+    /// FINISHED_BD, and on a task's last BD FINISHED_TASK and the TCT token
+    /// (`fire_read_completions`) -- and move the channel on now. The next BD
+    /// or task issues behind it into the same window: silicon must, since a
+    /// chained BD pays no per-BD read latency (cold start is per task) and
+    /// dynamic_chain_passthrough's LIFO BD reuse is safe on HW only because
+    /// its shim tasks finish this early.
+    fn retire_issued_bd(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        if self.channels[ch_idx].prev_lock_stalled {
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+            self.channels[ch_idx].prev_lock_stalled = false;
+        }
+        let completion = CompletionInfo {
+            bd_index: transfer.bd_index,
+            next_bd: transfer.next_bd,
+            cycles_elapsed: transfer.cycles_elapsed,
+            channel: ch_idx as u8,
+        };
+        let release = transfer.release_lock.map(|lock| (lock, transfer.release_value));
+        let ready_at = self.read_clock + self.timing_config.shim_mm2s_read_latency_cycles as u64;
+        // The token belongs to the task being retired: take it before a next
+        // queued task reprograms the channel's task config, and put it back if
+        // this BD did not end the task.
+        let token = {
+            let config = &mut self.channels[ch_idx].task_config;
+            let token = config.enable_token_issue.then_some(config.controller_id);
+            config.enable_token_issue = false;
+            token
+        };
+        let (next, task_end) = self.advance_after_bd(ch_idx, completion.clone(), tile, neighbors, false);
+        if !task_end && token.is_some() {
+            self.channels[ch_idx].task_config.enable_token_issue = true;
+        }
+        self.channels[ch_idx].read_completions.push_back(PendingReadCompletion {
+            ready_at,
+            completion,
+            release,
+            task_end,
+            token: if task_end { token } else { None },
+        });
+        next
+    }
+
+    /// Complete every read-ahead BD whose last read has returned (oldest first).
+    fn fire_read_completions(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
+        while self.channels[ch_idx]
+            .read_completions
+            .front()
+            .is_some_and(|c| c.ready_at <= self.read_clock)
+        {
+            let done = self.channels[ch_idx].read_completions.pop_front().expect("front checked");
+            if let Some((lock_id, value)) = done.release {
+                self.apply_lock_release_direct(lock_id, value, tile, neighbors, ch_idx);
+            }
+            self.note_bd_finished(ch_idx, &done.completion);
+            if done.task_end {
+                self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
+                if let Some(controller_id) = done.token {
+                    self.task_tokens.issue(ch_idx as u8, controller_id);
+                }
+            }
+        }
+    }
+
+    /// A BD has completed: stats, FINISHED_BD.
+    fn note_bd_finished(&mut self, ch_idx: usize, completion: &CompletionInfo) {
         self.channels[ch_idx].stats.transfers_completed += 1;
         self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;
 
@@ -1600,7 +1718,21 @@ impl DmaEngine {
             completion.bd_index,
             self.current_cycle
         );
+    }
 
+    /// Move a channel on after a BD: chained next BD, out-of-order packet,
+    /// repeat, next queued task, or Idle. Returns the next FSM state and
+    /// whether the BD ended its task. `emit_task_end` emits FINISHED_TASK and
+    /// the TCT token here; a read-ahead BD defers both to its last read's
+    /// return.
+    fn advance_after_bd(
+        &mut self,
+        ch_idx: usize,
+        completion: CompletionInfo,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        emit_task_end: bool,
+    ) -> (ChannelFsm, bool) {
         // Check for BD chaining.
         //
         // Hardware follows next_bd unconditionally when Use_Next_BD is set
@@ -1620,12 +1752,12 @@ impl DmaEngine {
                 next_bd,
                 completion.bd_index
             );
-            return self.enter_chained_bd(ch_idx, next_bd, tile, neighbors);
+            return (self.enter_chained_bd(ch_idx, next_bd, tile, neighbors), false);
         }
 
         // An out-of-order task runs until its packet count is spent.
         if let Some(next) = self.ooo_next_packet(ch_idx) {
-            return next;
+            return (next, false);
         }
 
         // Chain ended (Use_Next_BD=0). Check repeat_count for re-execution.
@@ -1640,16 +1772,21 @@ impl DmaEngine {
                     start_bd,
                     self.channels[ch_idx].repeat_count
                 );
-                return ChannelFsm::BdChaining {
-                    cycles_remaining: self.timing_config.bd_chain_cycles as u16,
-                    next_bd: start_bd,
-                };
+                return (
+                    ChannelFsm::BdChaining {
+                        cycles_remaining: self.timing_config.bd_chain_cycles as u16,
+                        next_bd: start_bd,
+                    },
+                    false,
+                );
             }
         }
 
         // Task complete (no chaining, no repeats)
-        self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
-        self.maybe_emit_task_token(ch_idx);
+        if emit_task_end {
+            self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
+            self.maybe_emit_task_token(ch_idx);
+        }
 
         // Check for more tasks in the queue (AIE2+ only).
         if self.dma_model.supports_task_queue() && !self.channels[ch_idx].task_queue.is_empty() {
@@ -1670,12 +1807,12 @@ impl DmaEngine {
             // warms.  See finding 2026-05-25-shim-bd-chain-amortization and
             // the Phase 2d warm-up-transient model.
             self.channels[ch_idx].is_first_bd = true;
-            return std::mem::take(&mut self.channels[ch_idx].fsm);
+            return (std::mem::take(&mut self.channels[ch_idx].fsm), true);
         }
 
         // Channel goes cold; re-arm the first-BD bonus for any future task.
         self.channels[ch_idx].is_first_bd = true;
-        ChannelFsm::Idle
+        (ChannelFsm::Idle, true)
     }
 
     /// Per-cycle word throughput for `transfer`, depending on the NARROWEST
@@ -1777,7 +1914,14 @@ impl DmaEngine {
             match action {
                 PadAction::Zero => {
                     let should_assert_tlast = is_last_word && !tlast_suppress;
-                    self.push_stream_out(StreamData { data: 0, tlast: should_assert_tlast, channel });
+                    let zero = StreamData { data: 0, tlast: should_assert_tlast, channel };
+                    if self.uses_read_ahead(transfer) {
+                        // Generated padding: no read, but ordered behind the
+                        // returning data.
+                        self.issue_host_read(zero, 0);
+                    } else {
+                        self.push_stream_out(zero);
+                    }
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                     TransferCycleResult::Continue
@@ -2101,7 +2245,14 @@ impl DmaEngine {
         }
 
         if let Some(header_word) = transfer.generate_packet_header() {
-            self.push_stream_out(StreamData { data: header_word, tlast: false, channel: transfer.channel });
+            let header = StreamData { data: header_word, tlast: false, channel: transfer.channel };
+            if self.uses_read_ahead(transfer) {
+                // The DMA builds the header itself (no DDR read, no latency),
+                // but it enters the stream behind the data still returning.
+                self.issue_host_read(header, 0);
+            } else {
+                self.push_stream_out(header);
+            }
             transfer.mark_packet_header_sent();
             let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
             log::info!(
@@ -2201,13 +2352,12 @@ impl DmaEngine {
                 }
             }
             (TransferEndpoint::HostMemory, TransferEndpoint::Stream { .. }) => {
-                // Shim MM2S: Read from host DDR, queue to stream output.
-                // Same backpressure as tile MM2S above -- shim's outgoing
-                // stream port stalls when the next slave FIFO is full,
-                // which is what propagates the consumer drain rate (memtile
-                // S2MM lock waits, compute kernel rate) back to the shim
-                // and gates DMA_FINISHED_TASK timing.  Per-channel gate.
-                if !self.can_push_stream_out_for_channel(channel) {
+                // Shim MM2S: issue a host-DDR read into the channel's
+                // read-ahead window (`uses_read_ahead`). The read side stalls
+                // only when the window is full; the stream side drains returned
+                // reads into the port (`drain_read_ahead`), which is where the
+                // consumer's backpressure lands. Per-channel gate.
+                if !self.read_window_has_room(channel) {
                     return TransferResult::stalled();
                 }
                 let addr = resolve_shim_host_address(host_memory, addr, bytes);
@@ -2917,6 +3067,7 @@ impl DmaEngine {
         }
 
         // Uncompressed path: read data from host memory in 32-bit words
+        let latency = self.timing_config.shim_mm2s_read_latency_cycles as u64;
         let word_count = (bytes + 3) / 4;
 
         log::debug!("MM2S transfer: addr=0x{:X} bytes={} words={}", addr, bytes, word_count);
@@ -2943,7 +3094,7 @@ impl DmaEngine {
             // AM025: TLAST_Suppress (Word 5, bit 31) prevents TLAST assertion
             let is_last_word = is_last && i == word_count - 1;
             let should_assert_tlast = is_last_word && !tlast_suppress;
-            self.push_stream_out(StreamData { data: word, channel, tlast: should_assert_tlast });
+            self.issue_host_read(StreamData { data: word, channel, tlast: should_assert_tlast }, latency);
         }
 
         true
@@ -2960,6 +3111,7 @@ impl DmaEngine {
         host_memory: &HostMemory,
     ) -> bool {
         const BLOCK_SIZE: usize = 32;
+        let latency = self.timing_config.shim_mm2s_read_latency_cycles as u64;
 
         log::debug!("Shim MM2S COMPRESSED: addr=0x{:X} bytes={}", addr, bytes);
 
@@ -3003,7 +3155,7 @@ impl DmaEngine {
 
                 let is_last_word = is_last_block && w == compressed_words - 1;
                 let should_assert_tlast = is_last_word && !tlast_suppress;
-                self.push_stream_out(StreamData { data: word, channel, tlast: should_assert_tlast });
+                self.issue_host_read(StreamData { data: word, channel, tlast: should_assert_tlast }, latency);
             }
         }
 
@@ -4198,6 +4350,9 @@ mod bank_demand_tests {
         // swap at all -- not the transfer (covered by the retry-contract
         // test above), and not this engine-wide bookkeeping either.
         eng.step_with_denied(&[Requester::S2mm(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        // The engine's step counter (the shim read-ahead's clock) ticks on
+        // every step, denied channels or not; it is not channel state.
+        eng.read_clock -= 1;
 
         assert_eq!(
             format!("{:?}", eng),

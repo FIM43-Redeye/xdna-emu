@@ -546,7 +546,10 @@ fn test_shim_ddr_timing_decomposition() {
     // state simultaneously.
     assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 1330);
     assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 341);
-    assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 325);
+    // The MM2S 325 is now the shim read latency, charged between each read
+    // and the stream (readahead_tests), so it is not also a per-task cost.
+    assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 0);
+    assert_eq!(cfg.shim_mm2s_read_latency_cycles, 325);
     assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 179);
     assert_eq!(cfg.shim_words_per_cycle, 1);
     // Phase 2d warm-up transient decay ratios (per-mille).  MM2S decays the
@@ -586,10 +589,11 @@ fn test_shim_mm2s_warmup_transient_decays_geometrically() {
         seq.push(engine.consume_first_bd_bonus(0, &transfer));
     }
 
-    // channel_start(2) + per_task_mm2s(325) + cold_start(1330) * 0.310^i,
-    // integer fixed-point (term = term * 310 / 1000 each task):
+    // channel_start(2) + per_task_mm2s(0; its 325 is now the read latency
+    // between issue and stream) + cold_start(1330) * 0.310^i, integer
+    // fixed-point (term = term * 310 / 1000 each task):
     //   cold terms: 1330, 412, 127, 39, 12, 3
-    assert_eq!(seq, vec![1657, 739, 454, 366, 339, 330]);
+    assert_eq!(seq, vec![1332, 414, 129, 41, 14, 5]);
 }
 
 /// S2MM warm-up decay is 0 on Phoenix: the cold-start fires once on task 0

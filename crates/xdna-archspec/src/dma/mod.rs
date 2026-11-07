@@ -106,6 +106,12 @@ pub struct DmaTimingConfig {
     /// Per-task overhead on shim S2MM DMA, paid on every task.
     pub shim_per_task_overhead_s2mm_cycles: u16,
 
+    /// Shim MM2S host-memory read latency (issue to stream).  See `DmaTiming`.
+    pub shim_mm2s_read_latency_cycles: u16,
+
+    /// Shim MM2S read-ahead window in bytes.  See `DmaTiming`.
+    pub shim_mm2s_read_window_bytes: u16,
+
     /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
     /// transient: `cold_start_mm2s * (permille/1000)^i` is charged at
     /// task index `i` within a channel session, so the cold-start cost

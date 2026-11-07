@@ -9,9 +9,10 @@
 //! stats) that was previously spread across 11 parallel Vec<T> arrays in
 //! DmaEngine.
 
+use std::collections::VecDeque;
 use std::fmt;
 
-use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue};
+use super::engine::{ChannelStats, ChannelTaskConfig, StreamData, TaskQueue};
 #[cfg(test)]
 use super::engine::TaskQueueEntry;
 use super::transfer::Transfer;
@@ -55,6 +56,32 @@ pub struct PendingRelease {
     /// that is never reused, at the `ready_cycle` floor when the channel idles.
     /// `None` until then.
     pub trace_at: Option<u64>,
+}
+
+/// A word a shim MM2S channel has read from host memory, waiting to enter the
+/// stream (`ChannelContext::read_ahead`).
+#[derive(Debug, Clone)]
+pub struct ReturningRead {
+    /// Engine step (`DmaEngine::read_clock`) at which the read's data returns.
+    pub ready_at: u64,
+    pub data: StreamData,
+}
+
+/// A shim MM2S BD whose reads have all been issued, waiting for its last read
+/// to return: then its lock release, FINISHED_BD and (on a task's last BD)
+/// FINISHED_TASK and TCT token happen (`ChannelContext::read_completions`).
+#[derive(Debug, Clone)]
+pub struct PendingReadCompletion {
+    /// Engine step at which the BD's last read returns.
+    pub ready_at: u64,
+    pub completion: CompletionInfo,
+    /// The BD's release lock and value, applied when the last read returns.
+    pub release: Option<(u8, i8)>,
+    /// This BD ended its task: FINISHED_TASK fires with its FINISHED_BD.
+    pub task_end: bool,
+    /// The task's TCT token (controller id), captured when its last BD was
+    /// issued, since the next task may have reprogrammed the channel since.
+    pub token: Option<u8>,
 }
 
 /// Information carried from a completed transfer into the lock release phase.
@@ -527,6 +554,18 @@ pub struct ChannelContext {
     /// Count of words drained so far under the cold-start throttle (drives the
     /// geometric decay of `cold_drain_cooldown`).
     pub cold_drain_word_index: u32,
+
+    /// Shim MM2S read-ahead: words read from host memory, in issue order, not
+    /// yet handed to the stream output register. Drained one per cycle as their
+    /// reads return, whatever the FSM is doing, so data keeps flowing after
+    /// FINISHED. Empty on every other channel.
+    pub read_ahead: VecDeque<ReturningRead>,
+    /// Shim MM2S BDs fully issued and waiting for their last read to return,
+    /// oldest first.
+    pub read_completions: VecDeque<PendingReadCompletion>,
+    /// Held level of the stream-side STREAM_BACKPRESSURE for a read-ahead
+    /// channel: a returned word is waiting on a full output register.
+    pub read_backpressure: bool,
 }
 
 impl ChannelContext {
@@ -564,6 +603,9 @@ impl ChannelContext {
             cold_drain_armed: false,
             cold_drain_cooldown: 0,
             cold_drain_word_index: 0,
+            read_ahead: VecDeque::new(),
+            read_completions: VecDeque::new(),
+            read_backpressure: false,
         }
     }
 
@@ -643,7 +685,16 @@ impl ChannelContext {
 
     /// Whether this channel has any pending work (active or queued).
     pub fn has_pending_work(&self) -> bool {
-        self.fsm.is_active() || self.queued_bd.is_some() || !self.task_queue.is_empty()
+        self.fsm.is_active()
+            || self.queued_bd.is_some()
+            || !self.task_queue.is_empty()
+            || self.has_outstanding_reads()
+    }
+
+    /// Shim MM2S read-ahead state still in flight: words not yet in the
+    /// stream, or BDs whose last read has not returned.
+    pub fn has_outstanding_reads(&self) -> bool {
+        !self.read_ahead.is_empty() || !self.read_completions.is_empty()
     }
 
     /// Access the in-flight Transfer, if any.
@@ -692,6 +743,9 @@ impl ChannelContext {
         self.accept_awaiting_drain = false;
         self.accept_ooo_header = false;
         self.ooo_packets_remaining = 0;
+        self.read_ahead.clear();
+        self.read_completions.clear();
+        self.read_backpressure = false;
     }
 }
 

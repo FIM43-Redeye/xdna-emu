@@ -1231,6 +1231,39 @@ pub struct DmaTiming {
     /// 168 cyc.
     pub shim_per_task_overhead_s2mm_cycles: u16,
 
+    /// Read latency of a shim MM2S host-memory read, in cycles: from the cycle
+    /// a read issues to the cycle its data can enter the stream. A BD's
+    /// FINISHED_BD (and its task's FINISHED_TASK) fires when its last read
+    /// returns, not when its last word has entered the stream.
+    ///
+    /// HW calibration (NPU1, 2026-11-07 shim-inflight probe): a back-pressured
+    /// shim MM2S reports FINISHED 308-722 cycles (typical; 4.5k/8.9k outliers
+    /// are DDR/IOMMU noise) after the release that lets its final read issue.
+    /// 325 is the 2026-05-27 per-task MM2S overhead re-read as this latency:
+    /// that overhead sat before the first read and each word entered the
+    /// stream the cycle it was read, so moving it between issue and stream
+    /// keeps every free-stream timing (first data, FINISHED) unchanged, and
+    /// `shim_per_task_overhead_mm2s_cycles` drops to 0. Inside the probe's HW
+    /// spread, at its low end; DDR latency under load is not modelled.
+    pub shim_mm2s_read_latency_cycles: u16,
+
+    /// Read-ahead window of a shim MM2S channel, in bytes: data it has read
+    /// from host memory but its stream-switch slave port has not yet accepted
+    /// (the returning reads plus the 1-word output register). The channel
+    /// issues reads while the window has room, so a back-pressured shim MM2S
+    /// runs this far ahead of its stream and finishes its tasks early.
+    ///
+    /// HW calibration (NPU1, 2026-11-07 shim-inflight tile-size sweep, 128 B to
+    /// 4 KiB tiles into a slow core): the bytes between the shim's reads and
+    /// the core's memory when the final read issues lie in [3072, 3584) (1 KiB
+    /// tiles: the release at 4 KiB undelivered issues it; 512 B tiles: that
+    /// release does not, the next one at 3.5 KiB does) and, with the read
+    /// latency above, in [3358, 3614] from the continuously drained 128 B-tile
+    /// point. Less the ~164 B the shim -> core stream path holds, the shim-side
+    /// window lies in about [3194, 3420). Per channel: whether two channels of
+    /// one shim tile share it is unprobed.
+    pub shim_mm2s_read_window_bytes: u16,
+
     /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
     /// transient across a task chain.  The cold-start cost is not a
     /// one-shot: HW per-task MM2S transfer durations decay geometrically

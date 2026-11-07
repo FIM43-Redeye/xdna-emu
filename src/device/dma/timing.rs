@@ -78,6 +78,15 @@ pub struct DmaTimingConfig {
     /// Per-task overhead on shim S2MM DMA touching host memory.
     pub shim_per_task_overhead_s2mm_cycles: u16,
 
+    /// Shim MM2S host-memory read latency: a word read at cycle `t` can enter
+    /// the stream at `t + latency`, and a BD finishes when its last read
+    /// returns. See the archspec `DmaTiming` field for the calibration.
+    pub shim_mm2s_read_latency_cycles: u16,
+
+    /// Shim MM2S read-ahead window (bytes read from host memory but not yet
+    /// accepted by the stream port). See the archspec `DmaTiming` field.
+    pub shim_mm2s_read_window_bytes: u16,
+
     /// Geometric decay ratio (per-mille) of the shim MM2S warm-up
     /// transient.  The cold-start cost is charged as
     /// `shim_ddr_cold_start_mm2s_cycles * (permille/1000)^i` at task
@@ -191,6 +200,8 @@ impl DmaTimingConfig {
             shim_ddr_cold_start_s2mm_cycles: m.shim_ddr_cold_start_s2mm_cycles,
             shim_per_task_overhead_mm2s_cycles: m.shim_per_task_overhead_mm2s_cycles,
             shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
+            shim_mm2s_read_latency_cycles: m.shim_mm2s_read_latency_cycles,
+            shim_mm2s_read_window_bytes: m.shim_mm2s_read_window_bytes,
             shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,
             shim_warmup_decay_s2mm_permille: m.shim_warmup_decay_s2mm_permille,
             // Non-shim first-BD pipeline-fill startup (#140).  Env-overridable

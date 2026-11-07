@@ -207,8 +207,16 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // and Phase 2c.3 recalibration.
             shim_ddr_cold_start_mm2s_cycles: 1330,
             shim_ddr_cold_start_s2mm_cycles: 341,
-            shim_per_task_overhead_mm2s_cycles: 325,
+            // MM2S per-task 325 is the shim read latency (issue -> stream,
+            // `shim_mm2s_read_latency_cycles`) since the 2026-11-07 read-ahead
+            // model: charged between each read and the stream, not before the
+            // first read, so it is 0 here (never counted twice).
+            shim_per_task_overhead_mm2s_cycles: 0,
             shim_per_task_overhead_s2mm_cycles: 179,
+            // Shim MM2S read-ahead (NPU1 shim-inflight probe, 2026-11-07). See
+            // the DmaTiming field docs for the bounds.
+            shim_mm2s_read_latency_cycles: 325,
+            shim_mm2s_read_window_bytes: 3328,
             // Warm-up transient: the MM2S cold-start cost decays
             // geometrically across a task chain rather than firing once.
             // Fit against 2026-05-27 N=50 K=8 HW (durations 1739/804/497/

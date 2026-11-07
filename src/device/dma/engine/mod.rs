@@ -45,6 +45,8 @@ mod iteration_tests;
 #[cfg(test)]
 mod ooo_tests;
 #[cfg(test)]
+mod readahead_tests;
+#[cfg(test)]
 mod tests;
 
 pub use types::*;
@@ -115,6 +117,11 @@ pub struct DmaEngine {
     /// Lock timing state for contention tracking (optional).
     /// When enabled, tracks detailed lock acquire/release timing per lock.
     pub(super) lock_timing: Option<LockTimingState>,
+
+    /// Engine step counter: advanced once per `step`. The shim MM2S read-ahead
+    /// times its returning reads in steps, so it never depends on a caller
+    /// having set `current_cycle`.
+    pub(super) read_clock: u64,
 
     /// Current cycle, set by coordinator before each step.
     /// Used for timestamping trace events.
@@ -228,6 +235,7 @@ impl DmaEngine {
             channels,
             timing_config: DmaTimingConfig::from_model(dma_model),
             dma_model,
+            read_clock: 0,
             stream_out: (0..mm2s_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             task_tokens: TokenState::new(),
@@ -657,11 +665,14 @@ impl DmaEngine {
         if self.channels[ch_idx].prev_lock_stalled {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
         }
-        if self.channels[ch_idx].prev_starving {
+        if self.channels[ch_idx].prev_starving || self.channels[ch_idx].read_backpressure {
             self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
         }
 
         let ch = &mut self.channels[ch_idx];
+        ch.read_ahead.clear();
+        ch.read_completions.clear();
+        ch.read_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;
         ch.queued_bd = None;
@@ -765,7 +776,7 @@ impl DmaEngine {
         if ch_idx >= self.num_channels() {
             return false;
         }
-        self.channels[ch_idx].is_active()
+        self.channels[ch_idx].is_active() || self.channels[ch_idx].has_outstanding_reads()
     }
 
     /// Whether an S2MM channel is started/live: an active FSM, a dispatched BD,
@@ -808,7 +819,7 @@ impl DmaEngine {
 
     /// Check if any channel is active.
     pub fn any_channel_active(&self) -> bool {
-        self.channels.iter().any(|ch| ch.is_active())
+        self.channels.iter().any(|ch| ch.is_active() || ch.has_outstanding_reads())
     }
 
     /// Check if any channel has anything to do this cycle -- FSM mid-flight

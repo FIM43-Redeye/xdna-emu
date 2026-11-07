@@ -463,6 +463,18 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
+            "    pub const DMA_SHIM_MM2S_READ_LATENCY_CYCLES: u16 = {};",
+            t.dma.shim_mm2s_read_latency_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_MM2S_READ_WINDOW_BYTES: u16 = {};",
+            t.dma.shim_mm2s_read_window_bytes
+        )
+        .unwrap();
+        writeln!(
+            out,
             "    pub const DMA_SHIM_WARMUP_DECAY_MM2S_PERMILLE: u16 = {};",
             t.dma.shim_warmup_decay_mm2s_permille
         )

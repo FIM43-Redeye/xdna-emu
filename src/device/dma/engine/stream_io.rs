@@ -1,6 +1,7 @@
 //! Stream interface methods for TileArray integration.
 
 use super::*;
+use crate::device::dma::channel::ReturningRead;
 
 /// Bytes per AIE2 stream beat (32-bit AXI4-Stream word). Used to convert a BD's
 /// byte length into the accepted-word count the recv accept cursor tracks.
@@ -73,6 +74,62 @@ impl DmaEngine {
     pub(super) fn push_stream_out(&mut self, data: StreamData) {
         let idx = self.stream_out_idx(data.channel);
         self.stream_out[idx].push_back(data);
+    }
+
+    /// Words a shim MM2S channel's read-ahead window holds: read from host
+    /// memory but not yet accepted by its stream-switch slave port (the
+    /// returning reads plus the output register). 0 on a non-shim tile, whose
+    /// MM2S reads banked tile memory through its egress staging instead.
+    pub fn read_ahead_words(&self, channel: u8) -> usize {
+        if !self.tile_kind.is_shim() {
+            return 0;
+        }
+        let returning = self.channels.get(channel as usize).map_or(0, |c| c.read_ahead.len());
+        returning + self.stream_out_len_for_channel(channel)
+    }
+
+    /// The read-ahead window in 32-bit words.
+    pub(super) fn read_window_words(&self) -> usize {
+        self.timing_config.shim_mm2s_read_window_bytes as usize / BYTES_PER_STREAM_WORD as usize
+    }
+
+    /// Whether a shim MM2S channel may issue another host-memory read: its
+    /// window still has room.
+    pub(super) fn read_window_has_room(&self, channel: u8) -> bool {
+        self.read_ahead_words(channel) < self.read_window_words()
+    }
+
+    /// Issue a host-memory read: `data` returns, and may enter the stream,
+    /// `latency` engine steps from now, behind every word issued before it.
+    pub(super) fn issue_host_read(&mut self, data: StreamData, latency: u64) {
+        let ready_at = self.read_clock + latency;
+        let ch = data.channel as usize;
+        self.channels[ch].read_ahead.push_back(ReturningRead { ready_at, data });
+    }
+
+    /// Move returned reads into the stream output register, one per cycle (the
+    /// register holds one word), and drive the stream-side STREAM_BACKPRESSURE
+    /// level: a returned word is waiting and the register is still occupied.
+    /// Runs every step regardless of the FSM, so a window keeps draining after
+    /// its BDs have finished.
+    pub(super) fn drain_read_ahead(&mut self, ch_idx: usize) {
+        let now = self.read_clock;
+        let channel = ch_idx as u8;
+        let returned = self.channels[ch_idx].read_ahead.front().is_some_and(|r| r.ready_at <= now);
+        // The register still holds a word exactly when the routing pass refused
+        // it last cycle: that, with a returned word waiting behind it, is
+        // backpressure. A word moved this step is handed downstream later in
+        // the same cycle, and an empty-handed port is not backpressured.
+        let blocked = !self.can_push_stream_out_for_channel(channel);
+        if returned && !blocked {
+            let read = self.channels[ch_idx].read_ahead.pop_front().expect("front checked");
+            self.push_stream_out(read.data);
+        }
+        let held = returned && blocked;
+        if held != self.channels[ch_idx].read_backpressure {
+            self.channels[ch_idx].read_backpressure = held;
+            self.trace(EventType::DmaStreamStarvation { channel, active: held });
+        }
     }
 
     /// Pop a word from any non-empty MM2S channel's stream output buffer.
