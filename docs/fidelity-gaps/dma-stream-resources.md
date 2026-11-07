@@ -28,7 +28,48 @@ root-caused elsewhere (the `CORE_CONTROL` reset mechanism -- see
 | Gap | Model vs hardware | Where | Status / rationale |
 |-----|-------------------|-------|--------------------|
 | TCT token buffer | we model **unbounded**; HW has finite token backpressure that stalls the channel (`Stalled_TCT`) | `src/device/dma/token.rs` (`TokenState`; the deliberate simplification is called out in the doc comment) | **OPEN, deferred 2026-11-04.** aie-rt exposes only a 1-bit `STALLED_TCT` flag, no numeric depth. Pinning it means issuing tokens the firmware does not consume until a channel raises `Stalled_TCT` -- a probe that leaves the firmware's TCT queue in an unknown state on the shared NPU (wedge risk, so not run in the 2026-11-04 wave). The probe: one tile DMA, a run of `Enable_Token_Issue` tasks with no `dma_wait`, `Stalled_TCT` (DMA status) read back per task count; depth = tasks issued before it sets. |
+| Shim MM2S read-ahead window | was **none**: the shim MM2S finished a BD when its last word entered the stream, so it back-pressured at the consumer's buffers and its tasks were consumer-paced; HW keeps ~3.4 KiB of reads outstanding past the stream and fires FINISHED when the last read returns | `src/device/dma/engine/stepping.rs` (`uses_read_ahead`, `retire_issued_bd`, `fire_read_completions`), `stream_io.rs` (`drain_read_ahead`), archspec `shim_mm2s_read_window_bytes` / `shim_mm2s_read_latency_cycles` | **MODELLED 2026-11-07** (see "Shim MM2S read-ahead" below). Open: per channel vs shared per shim tile (needs two MM2S channels at once); S2MM write posting unprobed; DDR latency under load (HW 308-722, model 325); first-data latency of a fresh task (HW 2.0-3.8k, model 1680, the 2026-05-27 cold start). |
 | BD reuse-while-live / BD-pool over-allocation | we re-parse a BD on reuse and complete; HW wedges when a kernel needs > 16 distinct shim BDs (in-flight BD reuse) | finding: 2026-06-06 shim BD-pool over-allocation (`xdna-emu-priv: research/findings/2026-06-06-shim-bd-pool-overallocation-nonmonotonic-wedge.md`) | **OPEN (won't-fix).** The HW wedge is *non-monotonic* in K (k8 pass, k9 wedge, k12 pass, k16 wedge) -- no clean model. Generator (`gen-shim-chain-sweep.py`) capped at K=8 instead. |
+
+## Shim MM2S read-ahead (modelled 2026-11-07, NPU1 silicon)
+
+A shim MM2S channel reading host memory issues reads into a per-channel window of 3328 B
+(`shim_mm2s_read_window_bytes`: data read but not yet accepted by its stream-switch slave port),
+one 32-bit word per cycle while the window has room. Each read returns 325 cycles later
+(`shim_mm2s_read_latency_cycles`) and enters the stream in issue order, every cycle whatever the
+channel FSM is doing. A BD completes (lock release, FINISHED_BD; on a task's last BD FINISHED_TASK
+and the TCT token) when its last read returns; the channel moves on to the next BD or queued task
+as soon as that read has issued, so the next task reads behind the previous one's draining data.
+STREAM_BACKPRESSURE follows the stream side and keeps tracing after FINISHED, as on HW.
+
+The 325 is the 2026-05-27 per-task MM2S overhead re-read: it used to sit before the first read with
+each word entering the stream the cycle it was read, so moving it between issue and stream leaves
+every free-stream timing (first data, FINISHED) unchanged and per-task MM2S is now 0.
+
+Evidence: the shim-inflight probe (IRON shim -> core passthrough, of_in depth 2, slow core, shim
+traced; tile sizes 128 B to 4 KiB, 12 + 2 HW runs, all PASS, no TDR). `inflight.py`: bytes the core
+receives after shim FINISHED_TASK, and the last backpressure release -> FINISHED.
+
+| variant | HW after-FIN | HW rel->FIN | EMU before | EMU now |
+|---|---|---|---|---|
+| 1 KiB x 8 / 12 / 16 | 3008 B every run | 619, 722, 1094, 531, 575 (+4577) | 92-108 B, 214 | 3000 B, 476 |
+| 4 KiB x 8 | 1656 B | 579 | 92 B, 982 | 2116 B, 476 |
+| 512 B x 16 | 3008 B | 308 | 124 B, 86 | 3000 B, 348 |
+| 128 B x 64 (fast core) | 21-22 tiles after FIN | n/a | 2 tiles | 22 tiles |
+
+The window is pinned by the tile sizes: with 1 KiB tiles the release at 4 KiB undelivered lets the
+final read issue, with 512 B tiles that release does not and the next one (3.5 KiB) does, and the
+continuously drained 128 B point fixes it against the latency; less the ~164 B the shim -> core stream
+path holds, the shim-side window lies in about [3194, 3420). The 4 KiB point's after-FIN is high
+because the model's 325-cycle latency sits at the low end of the HW spread; HW DDR latency varies
+run to run (outliers to 8.9k) and is not modelled. `dynamic_chain_passthrough/8` (Peano) now passes
+in the EMU as on HW: its LIFO BD reuse is safe only because the shim tasks finish this early.
+Bridge suite at the change (2026-11-07): Chess 90/0, Peano 106/0 (was 105/1, the one fail was that
+case); trace verdicts unchanged (163 DIVERGE, 2 EMPTY, 33 NONE). Shim MM2S FINISHED edges moved
+earlier wherever the shim was back-pressured (47 rows, median 322 cycles); against single HW runs
+that scatter by ~2k cycles between runs, 24 moved closer and 23 farther, and the signed median
+HW - EMU went from -709 to -338.
+Evidence and scripts: `build/experiments/shim-inflight/` (gitignored).
 
 ## Inter-tile port cadence (consumer-pacing)
 
