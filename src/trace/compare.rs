@@ -680,11 +680,19 @@ fn find_edge_anchor(hw_events: &[TileEvent], emu_events: &[TileEvent], slot_name
     // Find first shared slot that is an edge event (not level, not TRUE).
     let shared: BTreeSet<u8> = hw_first.keys().copied().filter(|s| emu_first.contains_key(s)).collect();
 
-    for slot in shared {
-        let name = slot_name(slot, slot_names);
-        if !is_level_event(&name) && name != "TRUE" {
-            return (hw_first[&slot], emu_first[&slot]);
-        }
+    // Perfcnt overflow ticks are free-running (one per period from counter
+    // start), so their first occurrence marks the counter phase, not any
+    // kernel activity; anchoring on it shifted every other core event by the
+    // phase difference between the sides. Prefer any other shared edge event
+    // and fall back to a perfcnt tick only when nothing else is shared.
+    let anchor_slot = |allow_perfcnt: bool| {
+        shared.iter().copied().find(|&slot| {
+            let name = slot_name(slot, slot_names);
+            !is_level_event(&name) && name != "TRUE" && (allow_perfcnt || !is_perfcnt_event(&name))
+        })
+    };
+    if let Some(slot) = anchor_slot(false).or_else(|| anchor_slot(true)) {
+        return (hw_first[&slot], emu_first[&slot]);
     }
 
     // Fallback: first non-slot-0 event with cycle > 0.
@@ -3442,6 +3450,23 @@ mod tests {
         let (_, core) = batch.tiles.iter().find(|(k, _)| k.pkt_type == 0).expect("core tile present");
         assert!(!core.edge_results.is_empty(), "EVENT_TIME core tile must be compared, not skipped");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edge_anchor_skips_perfcnt_ticks() {
+        // slot 0 = PERF_CNT_2 (free-running, phase differs per side),
+        // slot 7 = INSTR_LOCK_ACQUIRE_REQ (kernel activity).
+        let names: Vec<String> = ["PERF_CNT_2", "", "", "", "", "", "LOCK_STALL", "INSTR_LOCK_ACQUIRE_REQ"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hw = vec![TileEvent { slot: 0, abs_cycle: 100 }, TileEvent { slot: 7, abs_cycle: 900 }];
+        let emu = vec![TileEvent { slot: 0, abs_cycle: 40 }, TileEvent { slot: 7, abs_cycle: 300 }];
+        assert_eq!(find_edge_anchor(&hw, &emu, &names), (900, 300));
+        // Only a perfcnt tick shared: fall back to it.
+        let hw1 = vec![TileEvent { slot: 0, abs_cycle: 100 }];
+        let emu1 = vec![TileEvent { slot: 0, abs_cycle: 40 }];
+        assert_eq!(find_edge_anchor(&hw1, &emu1, &names), (100, 40));
     }
 
     #[test]
