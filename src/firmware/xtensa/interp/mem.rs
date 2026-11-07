@@ -126,10 +126,15 @@ pub(super) fn exec<B: XtensaBus + ?Sized>(
         // and privilege -- the address/data registers are read through the
         // CURRENT (exception-rotated) window, so a plain windowed access is
         // correct. Used only inside the window overflow/underflow handlers.
+        // The access ring is PS.RING, not CRING: the handler runs with EXCM
+        // set and reaches the interrupted code's stack at that code's ring
+        // (ISA RM L32E p.377, S32E p.509). The CRING != 0 privilege check
+        // precedes exec in `Cpu::step`.
         Op::L32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
-            let v = match cpu.data_read32(bus, vaddr) {
-                Ok(v) => v,
+            let ring = cpu.regs.ps_ring();
+            let v = match cpu.translate_at_ring(bus, vaddr, Access::Load, ring) {
+                Ok(paddr) => bus.data_load32(cpu.pc, paddr),
                 Err(step) => return Some(step),
             };
             cpu.regs.write_ar(*t, v);
@@ -137,8 +142,10 @@ pub(super) fn exec<B: XtensaBus + ?Sized>(
         Op::S32e { t, s, imm } => {
             let vaddr = cpu.regs.read_ar(*s).wrapping_add(*imm);
             let val = cpu.regs.read_ar(*t); // read before the &mut cpu borrow
-            if let Err(step) = cpu.data_write32(bus, vaddr, val) {
-                return Some(step);
+            let ring = cpu.regs.ps_ring();
+            match cpu.translate_at_ring(bus, vaddr, Access::Store, ring) {
+                Ok(paddr) => bus.data_store32(paddr, val),
+                Err(step) => return Some(step),
             }
         }
         _ => return None,

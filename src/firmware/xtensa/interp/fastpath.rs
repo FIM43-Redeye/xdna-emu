@@ -79,7 +79,7 @@ pub(super) fn try_fill_loop<B: XtensaBus + ?Sized>(cpu: &mut Cpu, bus: &mut B) -
     let mut off = 0u64;
     while off < total {
         let vaddr = start.wrapping_add(off as u32);
-        match cpu.mmu.translate(bus, vaddr, AccessKind::Store, 0) {
+        match cpu.mmu.translate(bus, vaddr, AccessKind::Store, cpu.regs.cring()) {
             Ok(t) => {
                 let psize = t.page_size as u64;
                 let page_left = psize - (vaddr as u64 & (psize - 1));
@@ -158,7 +158,7 @@ fn decode_fill_body<B: XtensaBus + ?Sized>(
 /// pc/epc1/exccause); returns `None` on any unmapped byte or an Unknown op, and
 /// the caller then leaves the loop to the normal (raising) fetch path.
 fn decode_at<B: XtensaBus + ?Sized>(cpu: &mut Cpu, bus: &mut B, pc: u32) -> Option<(Op, u8)> {
-    let phys0 = cpu.mmu.translate(bus, pc, AccessKind::Fetch, 0).ok()?.paddr;
+    let phys0 = cpu.mmu.translate(bus, pc, AccessKind::Fetch, cpu.regs.cring()).ok()?.paddr;
     let b0 = bus.inst_load8(phys0);
     let op0 = b0 & 0xF;
     // Match step()'s length rule: 0xE/0xF are 8-byte FLIX bundles, narrow .n
@@ -173,9 +173,10 @@ fn decode_at<B: XtensaBus + ?Sized>(cpu: &mut Cpu, bus: &mut B, pc: u32) -> Opti
     };
     let mut buf = [b0, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     for i in 1..need {
+        let ring = cpu.regs.cring();
         let p = cpu
             .mmu
-            .translate(bus, pc.wrapping_add(i as u32), AccessKind::Fetch, 0)
+            .translate(bus, pc.wrapping_add(i as u32), AccessKind::Fetch, ring)
             .ok()?
             .paddr;
         buf[i] = bus.inst_load8(p);

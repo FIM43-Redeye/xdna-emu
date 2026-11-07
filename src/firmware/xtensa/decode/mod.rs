@@ -1264,6 +1264,36 @@ pub enum Op {
 }
 
 impl Op {
+    /// True for the instructions that raise PrivilegedCause at CRING != 0
+    /// [RM 4.4.1.4, p.88]: those whose RM page lists
+    /// `GenExcep(PrivilegedCause)`, of the ones this decoder knows. RSR/WSR
+    /// are privileged for special registers numbered 64 and up [RM RSR
+    /// p.500, WSR p.561]. Not privileged: DHWB/DHWBI, IHI, the plain
+    /// prefetches DPFR/DPFW/DPFRO/DPFWO/IPF, and user-register access.
+    /// A FLIX bundle is privileged if any slot is.
+    pub fn is_privileged(&self) -> bool {
+        use Op::*;
+        match self {
+            Rsr { sr, .. } | Wsr { sr, .. } => *sr >= 64,
+            L32e { .. }
+            | S32e { .. }
+            | Rfwo
+            | Rfwu
+            | Rfe
+            | Rfde
+            | Rotw { .. }
+            | Rsil { .. }
+            | Waiti { .. } => true,
+            Witlb { .. } | Wdtlb { .. } | Iitlb { .. } | Idtlb { .. } => true,
+            Dhi { .. } | Dii { .. } | Dpfl { .. } | Dhu { .. } | Diu { .. } | Diwb { .. } | Diwbi { .. } => {
+                true
+            }
+            Ipfl { .. } | Ihu { .. } | Iiu { .. } | Iii { .. } => true,
+            Flix1 { ops } => ops.iter().any(Op::is_privileged),
+            _ => false,
+        }
+    }
+
     /// The highest AR (`a0`..`a15`) register index this instruction reads or
     /// writes, or `None` if it touches no AR register (or manages its own
     /// windowing). Drives the windowed-register-ABI overflow check in
@@ -1600,6 +1630,24 @@ mod tests {
         let d = decode(&[0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 0);
         assert_eq!(d.len, 8);
         assert!(matches!(d.op, Op::Nop), "got {:?}", d.op);
+    }
+
+    #[test]
+    fn privileged_instructions_are_the_rm_set() {
+        // Encodings: rsil a2,2 / wsr.ps a2 / wsr.sar a2 / rsr.ps a2 / l32e / s32e
+        // / l32i.n / rfe / iii a2,0 / ihi a2,0.
+        let p = |b: &[u8]| decode(b, 0).op.is_privileged();
+        assert!(p(&[0x20, 0x62, 0x00]), "rsil");
+        assert!(p(&[0x20, 0xe6, 0x13]), "wsr.ps");
+        assert!(!p(&[0x20, 0x03, 0x13]), "wsr.sar");
+        assert!(p(&[0x20, 0xe6, 0x03]), "rsr.ps");
+        assert!(!p(&[0x20, 0x03, 0x03]), "rsr.sar");
+        assert!(p(&[0x40, 0xd9, 0x09]), "l32e");
+        assert!(p(&[0x40, 0xd9, 0x49]), "s32e");
+        assert!(!p(&[0x78, 0x02]), "l32i.n");
+        assert!(p(&[0x00, 0x30, 0x00]), "rfe");
+        assert!(p(&[0xf2, 0x72, 0x00]), "iii");
+        assert!(!p(&[0xe2, 0x72, 0x00]), "ihi");
     }
 
     #[test]

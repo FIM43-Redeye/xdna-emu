@@ -38,6 +38,8 @@ mod control;
 mod fastpath;
 pub use fastpath::MIN_ITERS;
 mod mem;
+#[cfg(test)]
+mod ring_tests;
 mod system;
 
 use super::decode::{self, Op};
@@ -124,6 +126,9 @@ pub const EXCCAUSE_LEVEL1_INTERRUPT: u32 = 4;
 /// Syscall(1), InstructionFetchError(2), LoadStoreError(3),
 /// Level1Interrupt(4), Alloca(5).
 pub const EXCCAUSE_INTEGER_DIVIDE_BY_ZERO: u32 = 6;
+/// EXCCAUSE for a privileged instruction at CRING != 0 (`PrivilegedCause`
+/// = 8, ISA RM Table 4-64, p.89).
+pub const EXCCAUSE_PRIVILEGED: u32 = 8;
 
 /// Exception-vector layout of an Xtensa core configuration: the offsets, from
 /// VECBASE, of the kernel, user and double exception vectors. These are
@@ -433,21 +438,32 @@ impl Cpu {
     /// Translate a virtual address to physical for `access`, or return a
     /// ready-to-propagate `Step::Exception` on a TLB/permission fault. The one
     /// chokepoint for all address translation; the bus downstream sees only
-    /// physical addresses. `mmu_idx` (the ring `Mmu::translate` checks
-    /// privilege against) is hardwired to 0 -- the interpreter models
-    /// kernel-only execution and PS.RING is never set.
+    /// physical addresses. The access ring is CRING (ISA RM 4.6.2.3, p.148);
+    /// L32E/S32E use [`Cpu::translate_at_ring`] with PS.RING instead.
     pub fn translate<B: XtensaBus + ?Sized>(
         &mut self,
         bus: &mut B,
         vaddr: u32,
         access: Access,
     ) -> Result<u32, Step> {
+        let ring = self.regs.cring();
+        self.translate_at_ring(bus, vaddr, access, ring)
+    }
+
+    /// [`Cpu::translate`] at an explicit access ring.
+    pub fn translate_at_ring<B: XtensaBus + ?Sized>(
+        &mut self,
+        bus: &mut B,
+        vaddr: u32,
+        access: Access,
+        ring: u8,
+    ) -> Result<u32, Step> {
         let kind = match access {
             Access::Fetch => AccessKind::Fetch,
             Access::Load => AccessKind::Load,
             Access::Store => AccessKind::Store,
         };
-        match self.mmu.translate(bus, vaddr, kind, 0) {
+        match self.mmu.translate(bus, vaddr, kind, ring) {
             Ok(t) => {
                 if access == Access::Fetch {
                     self.last_fetch_attribute = Some(t.attribute);
@@ -957,6 +973,11 @@ impl Cpu {
         let decoded = decode::decode(&buf[..need], pc);
         match &decoded.op {
             Op::Unknown { word } => return Step::Unknown { pc, word: *word },
+            // Privileged instructions at CRING != 0 raise PrivilegedCause
+            // before any effect (ISA RM 4.4.1.4, p.88; Table 4-64, p.89).
+            op if op.is_privileged() && self.regs.cring() != 0 => {
+                return self.raise_general_exception(pc, EXCCAUSE_PRIVILEGED);
+            }
             // FLIX xt_format1 bundle carrying >=2 real ops: parallel executor,
             // NOT the per-category dispatch (which never sees this variant).
             Op::Flix1 { ops } => return self.exec_flix1_bundle(bus, ops, pc),

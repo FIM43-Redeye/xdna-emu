@@ -21,6 +21,9 @@ const PS_OWB_SHIFT: u32 = 8;
 /// which interrupts are masked. `waiti imm4` writes `imm4` here and idles
 /// until an interrupt at a higher level arrives.
 const PS_INTLEVEL_MASK: u32 = 0xF;
+/// PS.RING field shift (bits 7:6): the privilege level [MMU Option]
+/// (ISA RM Table 4-63 and Fig. 4-8, p.87).
+const PS_RING_SHIFT: u32 = 6;
 
 /// Number of window frames (quads) the WINDOWBASE/WINDOWSTART bookkeeping wraps
 /// through: 64 physical AR registers / 4 registers per quad.
@@ -143,6 +146,21 @@ impl RegFile {
     /// True when PS.EXCM is set (the CPU is in exception mode).
     pub fn excm(&self) -> bool {
         self.ps & PS_EXCM != 0
+    }
+
+    /// PS.RING, the privilege level outside exception mode.
+    pub fn ps_ring(&self) -> u8 {
+        ((self.ps >> PS_RING_SHIFT) & 0x3) as u8
+    }
+
+    /// CRING, the ring of an ordinary access and of the privileged-instruction
+    /// check: `PS.EXCM ? 0 : PS.RING` (ISA RM 4.4.1.4, p.88).
+    pub fn cring(&self) -> u8 {
+        if self.excm() {
+            0
+        } else {
+            self.ps_ring()
+        }
     }
 
     /// True when PS.UM selects user mode.

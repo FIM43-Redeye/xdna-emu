@@ -296,18 +296,19 @@ mod tests {
     #[test]
     fn rsil_captures_full_old_ps_and_sets_intlevel() {
         // rsil a2,0x2 (`20 62 00`). PS is seeded with bits
-        // OUTSIDE INTLEVEL set (0xDEAD_BEE5, intlevel nibble = 5) to prove
+        // OUTSIDE INTLEVEL set (0xDEAD_BE25, intlevel nibble = 5) to prove
         // AR[2] captures the FULL old PS -- not just the 4-bit level (a bug
         // that returned `old_intlevel` instead of `old_ps` would produce 5
-        // instead of 0xDEAD_BEE5, easily distinguished).
+        // instead of 0xDEAD_BE25, easily distinguished). PS.RING (bits 7:6)
+        // stays 0: rsil is privileged at CRING != 0.
         let rom = vec![0x20, 0x62, 0x00];
         let mut bus = FlatBus::new(rom);
         let mut cpu = mapped_cpu(0);
-        cpu.regs.ps = 0xDEAD_BEE5;
+        cpu.regs.ps = 0xDEAD_BE25;
         assert!(matches!(cpu.step(&mut bus), Step::Ran));
-        assert_eq!(cpu.regs.read_ar(2), 0xDEAD_BEE5, "AR[2] = the FULL old PS");
+        assert_eq!(cpu.regs.read_ar(2), 0xDEAD_BE25, "AR[2] = the FULL old PS");
         assert_eq!(cpu.regs.intlevel(), 2, "PS.INTLEVEL set from imm4");
-        assert_eq!(cpu.regs.ps, 0xDEAD_BEE2, "rest of PS preserved, only INTLEVEL changed");
+        assert_eq!(cpu.regs.ps, 0xDEAD_BE22, "rest of PS preserved, only INTLEVEL changed");
         assert_eq!(cpu.pc, 3);
     }
 
