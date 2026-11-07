@@ -78,7 +78,7 @@ pub mod cause {
 /// NIREFILLENTRIES / NDREFILLENTRIES [RM Table 4-105, p.159]. They are split
 /// evenly over ways 0-3, so each refill way holds four or eight entries and is
 /// indexed by `vaddr[13:12]` or `vaddr[14:12]` [RM Fig. 4-33, p.166].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RefillEntries {
     /// 16 entries: four per refill way.
     Sixteen,
@@ -100,7 +100,7 @@ impl RefillEntries {
 ///
 /// The other configuration the manual allows (fixed ways 5/6) is
 /// unsupported; see the module documentation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MmuConfig {
     /// Attribute written into every way-6 entry at reset, in both TLBs.
     ///
@@ -164,7 +164,7 @@ pub struct TranslationFault {
 /// xTLBCFG size, so an entry left over from before a size change is matched
 /// as-is (unspecified by the manual, which only says the way "should be
 /// invalidated" when its size changes [RM 4.6.5.2, p.162]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TlbEntry {
     pub vaddr: u32,
     pub paddr: u32,
@@ -202,19 +202,19 @@ struct Hit {
 /// The MMU: both TLBs, the MMU special registers, and the refill state.
 #[derive(Clone, Debug)]
 pub struct Mmu {
-    config: MmuConfig,
-    itlb: [[TlbEntry; MAX_WAY_ENTRIES]; ITLB_WAYS],
-    dtlb: [[TlbEntry; MAX_WAY_ENTRIES]; DTLB_WAYS],
+    pub(super) config: MmuConfig,
+    pub(super) itlb: [[TlbEntry; MAX_WAY_ENTRIES]; ITLB_WAYS],
+    pub(super) dtlb: [[TlbEntry; MAX_WAY_ENTRIES]; DTLB_WAYS],
     /// Upper 10 bits of PTEVADDR [RM 4.6.5.2, Fig. 4-29, p.161].
-    ptebase: u32,
-    rasid: u32,
-    itlbcfg: u32,
-    dtlbcfg: u32,
+    pub(super) ptebase: u32,
+    pub(super) rasid: u32,
+    pub(super) itlbcfg: u32,
+    pub(super) dtlbcfg: u32,
     /// Next refill way to evict per TLB when all of 0..=3 are valid at the
     /// target slot. The manual does not say which way refill replaces
     /// [RM 4.6.5.9, p.174]; this policy (lowest invalid way first, then
     /// round-robin) is deterministic.
-    refill_victim: [u8; 2],
+    pub(super) refill_victim: [u8; 2],
 }
 
 impl Mmu {

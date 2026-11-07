@@ -361,17 +361,17 @@ pub struct Cpu {
     /// WAITI, p.556). Cleared when an interrupt is delivered.
     pub halted: bool,
     /// Work classification of the latest `step`; read it with [`Cpu::last_work`].
-    last_work: Work,
+    pub(in crate::firmware::xtensa) last_work: Work,
     /// Set by the `step` paths whose work is not derivable from the returned
     /// `Step` alone (halted yield, interrupt entry, collapsed loop).
-    work_override: Option<Work>,
+    pub(in crate::firmware::xtensa) work_override: Option<Work>,
     /// Bytes of the instruction the latest `step` fetched (empty if none was).
-    last_fetch: ([u8; 8], u8),
-    last_data: [Option<DataAccess>; MAX_DATA_ACCESSES],
-    last_cache_op: Option<CacheOp>,
-    last_fetch_attribute: Option<u8>,
+    pub(in crate::firmware::xtensa) last_fetch: ([u8; 8], u8),
+    pub(in crate::firmware::xtensa) last_data: [Option<DataAccess>; MAX_DATA_ACCESSES],
+    pub(in crate::firmware::xtensa) last_cache_op: Option<CacheOp>,
+    pub(in crate::firmware::xtensa) last_fetch_attribute: Option<u8>,
     /// Exception-vector layout of the modeled core configuration.
-    vectors: ExceptionVectors,
+    pub(in crate::firmware::xtensa) vectors: ExceptionVectors,
 }
 
 /// Harness MMU: generic config, but with both TLBs emptied -- NOT the

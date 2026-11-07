@@ -37,7 +37,7 @@ pub const NUM_FRAMES: u32 = 16;
 #[derive(Clone)]
 pub struct RegFile {
     // Physical AR registers; accessed via logical indices through the window mechanism.
-    ar: [u32; 64],
+    pub(super) ar: [u32; 64],
     /// Window base register: selects which 16-register block is the logical AR0-AR15.
     pub windowbase: u32,
     /// Window start register: bitmask indicating which window frames contain live state.

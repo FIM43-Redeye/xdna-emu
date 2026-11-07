@@ -11,6 +11,12 @@
 //! the device starts fresh, with a warning) when its format version or device key differs
 //! from this build's; an absent file is a fresh device. To reset the device, delete the file
 //! or point the variable at an empty directory.
+//!
+//! A backend whose platform has state of its own that outlives a host process on silicon (a
+//! management processor booted once at driver load, say) keeps it in the same directory, in a
+//! file of its own beside this one: it loads it when it is created and saves it through
+//! `NpuBackend::save_platform_state` (FFI crate) when the device closes, before the core state
+//! is captured. Deleting the directory's files resets the whole device.
 
 use std::path::{Path, PathBuf};
 

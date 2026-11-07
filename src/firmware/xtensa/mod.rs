@@ -6,3 +6,4 @@ pub mod flat_bus;
 pub mod interp;
 pub mod mmu;
 pub mod regfile;
+pub mod state;

@@ -405,8 +405,14 @@ pub(crate) fn open_device_state(backend: &mut dyn crate::backend::NpuBackend, di
     }
 }
 
-/// The device closes (`XDNA_EMU_STATE_DIR` set): save its core state for the next process.
+/// The device closes (`XDNA_EMU_STATE_DIR` set): save the backend's platform state, then its
+/// core state, for the next process.
 pub(crate) fn close_device_state(backend: &mut dyn crate::backend::NpuBackend, dir: &std::path::Path) {
+    match backend.save_platform_state(dir) {
+        Ok(Some(path)) => log::info!("platform state saved to {}", path.display()),
+        Ok(None) => {}
+        Err(e) => log::warn!("platform state not saved to {}: {e}", dir.display()),
+    }
     let Some(engine) = backend.as_interpreter_mut() else {
         return;
     };
@@ -1266,6 +1272,7 @@ mod tests {
         cus: Vec<(u32, Vec<u8>, u32)>,
         commands: Vec<(u32, u32, u32, Vec<u32>)>,
         destroyed: Vec<u32>,
+        platform_saves: Vec<std::path::PathBuf>,
     }
 
     impl crate::backend::NpuBackend for CommandRecorder {
@@ -1295,6 +1302,13 @@ mod tests {
         }
         fn destroy_hw_context(&mut self, ctx: u32) {
             self.destroyed.push(ctx);
+        }
+        fn save_platform_state(
+            &mut self,
+            dir: &std::path::Path,
+        ) -> Result<Option<std::path::PathBuf>, String> {
+            self.platform_saves.push(dir.to_path_buf());
+            Ok(Some(dir.join("recorder.json")))
         }
         fn host_memory_mut(&mut self) -> &mut xdna_emu_core::device::host_memory::HostMemory {
             unimplemented!()
@@ -1349,6 +1363,14 @@ mod tests {
         let backend: &dyn crate::backend::NpuBackend = &*handle.backend;
         // SAFETY: recorder_handle() always installs a CommandRecorder.
         unsafe { &*(backend as *const dyn crate::backend::NpuBackend as *const CommandRecorder) }
+    }
+
+    #[test]
+    fn closing_the_device_saves_the_backends_platform_state_into_the_state_directory() {
+        let mut handle = recorder_handle();
+        let dir = std::path::Path::new("state-dir");
+        close_device_state(handle.backend.as_mut(), dir);
+        assert_eq!(recorded(&mut handle).platform_saves, vec![dir.to_path_buf()]);
     }
 
     #[test]

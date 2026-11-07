@@ -167,6 +167,17 @@ pub trait NpuBackend {
     /// The host destroyed hardware context `ctx`. Default: nothing.
     fn destroy_hw_context(&mut self, _ctx: u32) {}
 
+    /// The device closes with a state directory (`XDNA_EMU_STATE_DIR`): save
+    /// whatever state of this backend's own platform outlives a host process
+    /// on silicon (a management processor, say), beside the core state file.
+    /// The backend brings the platform to a state silicon can be in between
+    /// processes first (no hardware context). It loads that state itself when
+    /// it is created. Called before the core state is captured. Returns the
+    /// file written, if any. Default: no platform state.
+    fn save_platform_state(&mut self, _dir: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(None)
+    }
+
     /// The last asynchronous error, as the driver's
     /// `DRM_AMDXDNA_HW_LAST_ASYNC_ERR` reports it. Default: the interpreter
     /// device's own error sink, for backends that model the error path
