@@ -78,6 +78,9 @@ TRACE_OP_NAME = "aie.trace"
 # defaults in python/utils/trace/setup.py (configure_trace + _get_default_events_for_tile).
 # Keeping them as named constants documents the derivation and makes upstream
 # drift easy to track.
+# Packet ids are a 5-bit field; AIEInsertTraceFlows rejects a device that needs
+# more than this many trace sources (aie.trace ops).
+_MAX_TRACE_SOURCES = 31
 _TRACE_PACKET_ID_START = 1          # AIEInsertTraceFlows reassigns during lowering
 _TRACE_BROADCAST_START = 15         # hardware broadcast channel that starts trace
 _TRACE_BROADCAST_STOP = 14          # hardware broadcast channel that stops trace
@@ -960,6 +963,19 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 elif row == 0 and inject_shim:
                     shim_tiles.append((col, row, inner.operation.result))
 
+        n_core_kept, n_memmod_kept = _trace_source_budget(
+            len(compute_tiles), len(memtile_tiles), len(shim_tiles), inject_memmod,
+        )
+        if n_core_kept < len(compute_tiles) or (inject_memmod and n_memmod_kept < len(compute_tiles)):
+            print(
+                f"warning: {len(compute_tiles)} compute tiles exceed the 5-bit "
+                f"trace packet-id budget; tracing {n_core_kept} core and "
+                f"{n_memmod_kept} memory-module sources",
+                file=sys.stderr,
+            )
+        memmod_tiles = compute_tiles[:n_memmod_kept]
+        compute_tiles = compute_tiles[:n_core_kept]
+
         # Skip only if nothing on this device is going to be traced.
         # Originally this skipped any device without compute tiles on the
         # assumption that DMA-only traces would be empty -- but tests like
@@ -983,7 +999,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         for col, row, _ in compute_tiles:
             all_traced_tiles.append((col, row, core_events, "core"))
         if inject_memmod:
-            for col, row, _ in compute_tiles:
+            for col, row, _ in memmod_tiles:
                 all_traced_tiles.append((col, row, memmod_events, "mem"))
         for col, row, _ in memtile_tiles:
             all_traced_tiles.append((col, row, memtile_events, None))
@@ -1182,7 +1198,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             #     memmod has its own Performance_Counter0 in the regdb,
             #     but the perfcnt config emit path is core-only today.
             if inject_memmod:
-                for col, row, tile_val in compute_tiles:
+                for col, row, tile_val in memmod_tiles:
                     pkt_id = packet_id_counter
                     packet_id_counter += 1
 
@@ -1212,7 +1228,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             for col, row, _ in compute_tiles:
                 aied.trace_start_config(_trace_sym(col, row, "core"))
             if inject_memmod:
-                for col, row, _ in compute_tiles:
+                for col, row, _ in memmod_tiles:
                     aied.trace_start_config(_trace_sym(col, row, "mem"))
             for col, row, _ in memtile_tiles:
                 aied.trace_start_config(_trace_sym(col, row, "memtile"))
@@ -1284,6 +1300,22 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     trace_config_dump(cfg, args.trace_config_out)
 
     return 0
+
+
+def _trace_source_budget(n_compute: int, n_memtile: int, n_shim: int,
+                         inject_memmod: bool,
+                         max_sources: int = _MAX_TRACE_SOURCES) -> tuple[int, int]:
+    """Return (core traces kept, memmod traces kept) for one device.
+
+    Every trace source needs its own packet id, and the field is 5 bits. When a
+    design has more sources than ids, memory-module traces are dropped first
+    (the gate's timing events live on core, memtile and shim), then trailing
+    core traces. Memtile and shim traces are always kept.
+    """
+    free = max(0, max_sources - n_memtile - n_shim)
+    cores = min(n_compute, free)
+    memmod = min(n_compute, free - cores) if inject_memmod else 0
+    return cores, memmod
 
 
 def main():

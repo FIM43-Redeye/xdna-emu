@@ -977,3 +977,27 @@ class TestLowerAndRoute:
         with Context(), Location.unknown():
             with pytest.raises(RuntimeError, match="aiecc not found"):
                 _mod.lower_and_route(Module.parse("module {}"))
+
+
+# ---------------------------------------------------------------------------
+# Trace-source budget (5-bit packet id)
+# ---------------------------------------------------------------------------
+
+class TestTraceSourceBudget:
+    """The packet-id field is 5 bits: at most 31 trace sources per device.
+    Over budget, memory-module traces go first (core, memtile and shim traces
+    carry the gate's timing events), then trailing core traces."""
+
+    def test_within_budget_keeps_everything(self):
+        assert _mti_mod._trace_source_budget(4, 1, 1, True) == (4, 4)
+
+    def test_memmod_dropped_before_cores(self):
+        # 16 cores + 16 memmod + 4 memtile + 4 shim = 40 > 31
+        assert _mti_mod._trace_source_budget(16, 4, 4, True) == (16, 7)
+
+    def test_cores_trimmed_when_even_cores_overflow(self):
+        # 32 cores + 4 memtile + 4 shim: 24 ids left for cores, no memmod
+        assert _mti_mod._trace_source_budget(32, 4, 4, True) == (23, 0)
+
+    def test_memmod_off_is_not_charged(self):
+        assert _mti_mod._trace_source_budget(16, 4, 4, False) == (16, 0)
