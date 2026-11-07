@@ -240,6 +240,65 @@ while preserving the difference. This gives us minimal test cases for debugging.
 
 ---
 
+## The bridge-suite trace gate: what it compares
+
+`scripts/emu-bridge-test.sh` Phase 5 compares the HW and EMU trace buffers of
+every traced test with `trace-compare`, and writes one verdict per test and
+compiler (`<test>.<compiler>.trace.summary`, report in `.trace.log`).
+
+What it compares:
+
+- **Injected by `tools/trace-prepare.py`** (MLIR plus host `test.cpp` patched
+  with a trace BO): core events on every compute tile, memory-module events,
+  memtile port events and shim DMA events, all in `event_time` mode. The core
+  default mode is `event_time` because `trace-compare` compares cycles, and in
+  `event_pc` mode (the injector's own default, still used by
+  `--trace=pc-anchored`) an event carries a PC, so those tiles are skipped by
+  the cycle comparison and compared on the PC-anchored axis instead.
+- **Edge events** are paired by occurrence index after anchoring each tile on
+  its first shared edge event; a pair diverges at `|dt| > 10`. **Level
+  events** are compared by interval structure (count and durations).
+- **Anchor**: the first shared edge event of the tile, *excluding* the
+  free-running `PERF_CNT_*` ticks (their first occurrence marks the counter
+  phase, not kernel activity). Core tiles therefore anchor on the first
+  `INSTR_LOCK_ACQUIRE_REQ`; the `PERF_CNT_2` row then reads as the offset of
+  the perfcnt phase against the first lock acquire.
+- The packet `mode` of each tile follows the same column shift as the tile
+  events (placement origin / remap); a lookup keyed by the unshifted column
+  once made every `event_time` core tile fall back to the legacy `event_pc`
+  default and silently vanish from the report.
+
+Verdicts: `CLEAN`, `DIVERGE`, `EMPTY` (both sides decoded zero events: nothing
+was compared), `EMU_ONLY:no-mlir` (both captures exist but the post-lowering
+MLIR does not), `HW_ONLY` / `EMU_ONLY` (one side produced no capture), and
+`NONE:<reason>` when no trace was captured: `quarantined`, `already-traced`,
+`route-infeasible`, `cpp-patch`, `lowering`, `injection`, `placement`,
+`no-single-source`, `python-host`, `no-prepare`, `prep-ok-no-buffer`.
+
+Known limits (genuine, not harness bugs):
+
+- **Hardware trace budget**: packet ids are 5 bits, so at most 31 trace sources
+  per device. Designs with more sources lose their memory-module traces first
+  (then trailing cores); `mlir-trace-inject.py` warns.
+- **Shim S2MM channels**: a 1-column device whose two shim S2MM channels are
+  both in use has no free channel for the trace stream (`dma_s2mm_ooo_shim_recv`).
+- **Already traced** designs (`dynamic_pingpong_trace`, `bd_chain_repeat_on_memtile`)
+  are not injected a second time.
+- **Host patching** covers one kernel invocation with `xrt::bo` declarations;
+  multi-kernel `xrt::runlist` hosts, `unique_ptr<xrt::bo>` hosts and
+  Python hosts (`test.py`) are not patched.
+- **Several MLIR variants per test** (`aie_<variant>.mlir`, e.g. the cascade
+  matmul) are not selectable by `trace-prepare.py`.
+- **Quarantined** tests (`scripts/trace-quarantine.txt`) are never traced.
+- Python-generated tests (`aie2.py`) are traced by swapping the generator RUN
+  line for a copy of the traced MLIR; a secondary `aiecc` step that merges into
+  an earlier xclbin (`--xclbin-input=`) also keeps the trace, while other
+  secondary steps use the untraced MLIR on purpose (control packets, txn
+  binaries).
+- Run-to-run HW scatter on shim FINISHED events (hundreds of cycles) is larger
+  than the divergence threshold: a shim FINISHED divergence is not by itself
+  evidence of an emulator gap.
+
 ## Architecture Decisions
 
 ### Why Perfetto JSON (not a custom format)?
