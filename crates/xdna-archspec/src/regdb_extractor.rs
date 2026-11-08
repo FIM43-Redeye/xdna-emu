@@ -1825,10 +1825,11 @@ mod tests {
 
     /// Load the real register database, or skip if unavailable.
     fn load_test_db() -> Option<regdb::RegisterDb> {
-        // CARGO_MANIFEST_DIR is crates/xdna-archspec/, go up to npu-work/
-        let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..") // up to npu-work/
-            .join("mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json");
+        // Resolve mlir-aie the way every toolchain consumer does (env vars, then
+        // ancestor discovery) so the tests also find it from a git worktree.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mlir_aie = crate::toolchain_paths::ToolchainPaths::require_mlir_aie(&root).ok()?;
+        let json_path = mlir_aie.join("lib/Dialect/AIE/Util/aie_registers_aie2.json");
         regdb::RegisterDb::from_file(&json_path).ok()
     }
 

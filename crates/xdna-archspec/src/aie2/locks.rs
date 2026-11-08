@@ -156,9 +156,10 @@ mod tests {
     /// AM025 + aie-rt values; this test asserts the JSON still agrees.
     #[test]
     fn aie2_lock_layout_matches_regdb() {
-        let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..") // up to npu-work/
-            .join("mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let json_path = crate::toolchain_paths::ToolchainPaths::require_mlir_aie(&root)
+            .map(|m| m.join("lib/Dialect/AIE/Util/aie_registers_aie2.json"))
+            .unwrap_or_default();
 
         if !json_path.exists() {
             eprintln!("Skipping drift test: register DB JSON not found at {}", json_path.display());
