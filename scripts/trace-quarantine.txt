@@ -67,9 +67,11 @@ ctrl_packet_reconfig_4x1_cores
 ctrl_packet_reconfig_elf
 #
 # 2026-11-08: objectfifo_time_link quarantined. mlir-aie main's router now
-# proves deadlock-prone flow sets and refuses them; our injected trace packet
-# flows (6 packet_flow ops) make this design's flow set deadlock-prone, so the
-# traced build fails to compile ("Flows can deadlock however they are routed").
-# Upstream's untraced recipe compiles. Remove once the trace planner avoids
-# deadlock-prone routes (or routes trace on circuit flows here).
+# proves deadlock-prone flow sets and refuses them. The design's time-mode
+# objectfifo.link shares memtile MM2S 1 between two packet flows (ids 0 and 7);
+# untraced, the router keeps them on separate arbiters. The six trace packet
+# flows that upstream's aie-insert-trace-flows adds for our aie.trace ops (we
+# only inject the declarative ops) leave no such assignment, so the traced build
+# fails ("Flows can deadlock however they are routed"). Remove once upstream's
+# trace flow insertion accounts for the router's deadlock analysis.
 objectfifo_time_link
