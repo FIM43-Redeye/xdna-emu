@@ -53,6 +53,10 @@ PRODUCER_TILE = TileRef(0, 3)
 RAW_OWN = 48 + LOCK_ID             # the consumer's own memory module ("east" quadrant)
 RAW_SOUTH = LOCK_ID                # the producer's south quadrant: the consumer's module
 LDA_OLD, LDA_NEW = 111, 222
+# Silicon (lk_D): a refused acquire stalls the core only after the three bundles that
+# follow it have issued, so a counter read must sit at least four bundles after a lock
+# request to see the request's stall.
+LOCK_SETTLE_BUNDLES = 4
 LOG_BYTES, TS_BYTES = 64, 32
 TS_PAIRS = [(17, 16), (19, 18), (21, 20), (23, 22), (25, 24), (27, 26), (29, 28), (31, 30)]
 N = "  nop"
@@ -146,6 +150,36 @@ def same_case(mode: str, late_iters: int):
     stall = mode == "stall"
     cons = _sampler_asm(same_program(), list(range(1, 9)), 0 if stall else late_iters, True)
     return _topology(f"same_{mode}", cons, _releaser(late_iters if stall else 0), 0)
+
+
+# -- pos / relpos: where in the pipeline a lock request stalls the core ---------------
+
+def pos_case(kind: str, mode: str, late_iters: int):
+    """`pos_MODE`: a counter read, `acq` (change -1), then a counter read in each of the
+    next seven bundles: the first difference above 1 is where the core stops issuing (the
+    refused acquire's wait in `stall`, its one arbitration cycle, if any, in `free`).
+    `relpos`: the same around a `rel` +1 (one mode: a release never waits)."""
+    if mode not in MODES:
+        raise ValueError(f"mode is one of {MODES}")
+    stall = mode == "stall"
+    req = f"  acq #{RAW_OWN}, r4" if kind == "pos" else f"  rel #{RAW_OWN}, r1"
+    body = ["  mov r4, #-1", "  mov r1, #1", *[N] * 2]
+    if not stall and kind == "pos":
+        body += base.delay_loop(late_iters, ".Lcons")
+    body += [_ts(0), req, *[_ts(i) for i in range(1, 8)], *[N] * 8, *_store_ts(8, 0)]
+    if kind == "pos":
+        prod = _releaser(late_iters if stall else 0)
+        name = f"pos_{mode}"
+    else:
+        prod = _frame([*[N] * 2])
+        name = "relpos"
+    return _topology(name, _frame(body), prod, 0)
+
+
+def parse_pos(consumer_log: bytes) -> list[int]:
+    """Cycle differences between consecutive counter reads (read 0 before the request)."""
+    ts = struct.unpack_from("<8I", consumer_log)
+    return [(ts[i + 1] - ts[i]) & 0xFFFFFFFF for i in range(7)]
 
 
 # -- eq: acquires with a change >= 0 -----------------------------------------------
@@ -264,7 +298,7 @@ def eq_consumer_asm(case: EqCase) -> str:
     regs = _change_regs(case.consumer)
     body = [f"  mov {r}, #{ch}" for ch, r in regs.items()] + [*[N] * 2, _ts(0)]
     for i, (kind, ch) in enumerate(case.consumer):
-        body += [f"  {kind} #{RAW_OWN}, {regs[ch]}", _ts(i + 1)]
+        body += [f"  {kind} #{RAW_OWN}, {regs[ch]}", *[N] * LOCK_SETTLE_BUNDLES, _ts(i + 1)]
     body += [*[N] * 8, *_store_ts(len(case.consumer) + 1, 0)]
     return _frame(body)
 
@@ -320,6 +354,12 @@ def cmd_generate(args) -> int:
         elif fam == "same":
             made = [same_case(m, args.late_iters) for m in args.modes]
             metas = [{"family": "same", "mode": m, "late_iters": args.late_iters} for m in args.modes]
+        elif fam == "pos":
+            made = [pos_case("pos", m, args.late_iters) for m in args.modes]
+            metas = [{"family": "pos", "mode": m, "late_iters": args.late_iters} for m in args.modes]
+        elif fam == "relpos":
+            made = [pos_case("relpos", "stall", 0)]
+            metas = [{"family": "relpos"}]
         elif fam.startswith("eq_"):
             name = fam[3:]
             made = [eq_case(name, args.step_iters)]
@@ -346,6 +386,9 @@ def cmd_analyze(args) -> int:
             print(f"{name:14s} (no output)")
             continue
         log = (cdir / "consumer.log.bin").read_bytes()
+        if meta["family"] in ("pos", "relpos"):
+            print(f"{name:14s} deltas after the request: {parse_pos(log)}")
+            continue
         if meta["family"] in ("lk", "same"):
             r = parse_sampler(log)
             caps = " ".join("A" if meta.get("d") == i + 1 else f"{v}" for i, v in enumerate(r["caps"]))
@@ -365,7 +408,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, same, eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, same, pos, relpos, eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)

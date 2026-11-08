@@ -37,7 +37,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import gen_cascade_probe as base                                    # noqa: E402
-from gen_lock_stall_probe import TS_PAIRS, _frame, _ts  # noqa: E402
+from gen_lock_stall_probe import LOCK_SETTLE_BUNDLES, TS_PAIRS, _frame, _ts  # noqa: E402
 
 LOCK_A, LOCK_F, LOCK_C, LOCK_D, LOCK_E = 14, 13, 12, 11, 10
 OWN = 48                           # raw ID base of the core's own memory module
@@ -98,7 +98,9 @@ def core_asm(case: DmaCase, step_iters: int) -> str:
         body += [f"  mov r6, #{k}", *[N] * 2, "  st r6, [p0, #0]", *[N] * 8, _ts(k),
                  f"  rel #{OWN + LOCK_A}, r1"]
     n = case.steps + 1
-    body += [f"  acq #{OWN + LOCK_F}, r2", _ts(n), f"  acq #{OWN + LOCK_A}, r3", _ts(n + 1), *[N] * 8]
+    settle = [N] * LOCK_SETTLE_BUNDLES
+    body += [f"  acq #{OWN + LOCK_F}, r2", *settle, _ts(n), f"  acq #{OWN + LOCK_A}, r3", *settle, _ts(n + 1),
+             *[N] * 8]
     body += [f"  st r{TS_PAIRS[i][1]}, [p2, #{4 * i}]" for i in range(n + 2)]
     body += ["  lda r7, [p1, #0]", *[N] * 8, f"  st r7, [p2, #{4 * (WORDS - 1)}]"]
     body += [*[N] * 8, f"  rel #{OWN + LOCK_C}, r1"]

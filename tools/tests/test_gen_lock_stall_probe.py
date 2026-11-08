@@ -90,7 +90,8 @@ def test_parse_eq_quantizes_waits_to_producer_steps():
 @pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
 @pytest.mark.parametrize("made", [
     lambda: g.lk_case(1, "stall", 100), lambda: g.lk_case(8, "free", 100),
-    lambda: g.same_case("stall", 100), *[(lambda n=n: g.eq_case(n, 50)) for n in g.EQ_CASES]])
+    lambda: g.same_case("stall", 100), lambda: g.pos_case("pos", "free", 100),
+    lambda: g.pos_case("relpos", "stall", 0), *[(lambda n=n: g.eq_case(n, 50)) for n in g.EQ_CASES]])
 def test_asm_assembles(made, tmp_path):
     _, files = made()
     for fname, text in files.items():
@@ -107,3 +108,15 @@ def test_cli_generate_writes_a_loadable_suite(tmp_path):
     s = suite.load_suite(tmp_path)
     assert s.cases == ("lk_2_stall", "same_stall", "eq_c1v1")
     assert s.case_meta("eq_c1v1")["predictions"]["eq"] == [0, 0]
+
+
+def test_pos_reads_the_counter_in_every_bundle_after_the_request():
+    _, files = g.pos_case("pos", "stall", 100)
+    lines = files["consumer.s"].splitlines()
+    i = next(k for k, l in enumerate(lines) if "acq #" in l)
+    assert all("cntr" in l for l in lines[i - 1:i + 8] if l != lines[i])
+
+
+def test_parse_pos():
+    log = struct.pack("<8I", 10, 11, 12, 13, 900, 901, 902, 903) + bytes(32)
+    assert g.parse_pos(log) == [1, 1, 1, 887, 1, 1, 1]
