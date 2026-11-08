@@ -81,6 +81,33 @@ class BridgePathTests(unittest.TestCase):
             )
             self.assertNotIn("FAIL (test.exe)", result.stdout)
 
+    def test_failed_multistep_compile_is_not_served_from_cache_next_run(self) -> None:
+        # A multi-step build (ctrl_packet_reconfig_elf: xclbin step, then a
+        # ctrlpkt/elf step) leaves the first step's xclbin behind when a later
+        # step fails. The next run must not mistake that for a finished build.
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp)
+            test_dir = work_root / "mlir-aie/test/npu-xrt/twostep"
+            test_dir.mkdir(parents=True)
+            (test_dir / "test.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+            (test_dir / "aie.mlir").write_text("// fixture\n", encoding="utf-8")
+            (test_dir / "run.lit").write_text(
+                "// RUN: touch aie.xclbin\n// RUN: false\n", encoding="utf-8"
+            )
+            build_dir = work_root / "mlir-aie/build/test/npu-xrt/twostep/peano"
+            args = ("--no-trace", "--no-hw", "--no-emu", "^twostep$")
+
+            first = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE twostep (peano): FAIL", first.stdout, first.stdout)
+            self.assertFalse(
+                list(build_dir.glob("*.xclbin")),
+                "a failed build must not leave an xclbin that reads as cached",
+            )
+
+            second = self.run_bridge(work_root, *args)
+            self.assertNotIn("twostep (peano): cached", second.stdout, second.stdout)
+            self.assertIn("COMPILE twostep (peano): FAIL", second.stdout, second.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1709,6 +1709,12 @@ compile_one_compiler() {
       fail_tag="FAIL_TRACED"
       label="FAIL(traced)"
     fi
+    # A multi-step build (xclbin first, then ctrlpkt/elf artifacts) leaves the
+    # first step's xclbin behind when a later step fails. Left in place it
+    # reads as a finished build to the cache check on the next run, which then
+    # pairs it with stale outputs of the later steps (ctrl_packet_reconfig_elf:
+    # a traced xclbin with a pre-upgrade aie.elf, which timed out on HW).
+    rm -f "$build_dir"/*.xclbin
     echo "$fail_tag" > "$result_file"
     echo "  COMPILE $name ($compiler): $label"
     return 0
