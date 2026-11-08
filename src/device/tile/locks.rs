@@ -385,6 +385,33 @@ impl Lock {
         LockResult::Success
     }
 
+    /// Acquire by a change value, the one rule every requestor follows on silicon (host
+    /// Lock_Request, core `acq`, DMA BD): a change < 0 is granted iff the count is at
+    /// least -change and subtracts it; a change >= 0 is granted iff the count equals the
+    /// change and leaves the count unchanged.
+    #[inline]
+    pub fn acquire_change(&mut self, change: i8) -> LockResult {
+        if change < 0 {
+            self.acquire_with_value(change.unsigned_abs(), change)
+        } else {
+            self.acquire_equal(change as u8, 0)
+        }
+    }
+
+    /// What `acquire_change(change)` would return now, without changing the lock.
+    #[inline]
+    pub fn check_change(&self, change: i8) -> LockResult {
+        if change < 0 {
+            self.check_acquire(change.unsigned_abs(), change)
+        } else if self.is_frozen() {
+            LockResult::Frozen
+        } else if self.value == change as u8 {
+            LockResult::Success
+        } else {
+            LockResult::PreconditionNotMet
+        }
+    }
+
     /// Equal acquire: granted iff the count is exactly `expected`, then
     /// `delta` is applied (0 on the Lock_Request path, where silicon leaves
     /// the count unchanged).
@@ -439,6 +466,35 @@ impl Lock {
 
 #[cfg(test)]
 mod tests {
+
+    // Silicon, one rule for every requestor: the host Lock_Request path
+    // (build/experiments/objectfifo-wedges lockrange-probe), the core `acq` and a tile-DMA
+    // BD (build/experiments/lock-stall eq_* and dma2, gen_lock_stall_probe.py /
+    // gen_dma_lock_probe.py, all EMU rules but this one excluded): a change < 0 needs a
+    // count >= -change and subtracts it; a change >= 0 needs count == change and leaves
+    // the count alone.
+    #[test]
+    fn acquire_change_follows_the_silicon_rule() {
+        for (count, change, granted, after) in [
+            (2, 2, true, 2),
+            (1, 1, true, 1),
+            (0, 0, true, 0),
+            (10, 2, false, 10),
+            (5, 0, false, 5),
+            (1, 2, false, 1),
+            (3, -2, true, 1),
+            (1, -2, false, 1),
+            (63, -64, false, 63),
+        ] {
+            let mut lock = Lock::new(count);
+            assert_eq!(lock.check_change(change) == LockResult::Success, granted, "check {count} {change:+}");
+            assert_eq!(lock.acquire_change(change) == LockResult::Success, granted, "{count} {change:+}");
+            assert_eq!(lock.value, after, "{count} {change:+}");
+        }
+        let mut frozen = Lock::new(0);
+        frozen.overflow = true;
+        assert_eq!(frozen.acquire_change(0), LockResult::Frozen);
+    }
     use super::*;
 
     #[test]

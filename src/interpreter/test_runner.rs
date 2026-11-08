@@ -1873,14 +1873,14 @@ mod tests {
         // Producer's MM2S BD: acquire lock 0, read from memory, release lock 0
         // This simulates: DMA waits for buffer to be ready, reads it, signals done
         let producer_bd = BdConfig::simple_1d(producer_src_offset as u64, transfer_size)
-            .with_acquire(producer_lock_id, 1) // Acquire: wait for lock >= 1, decrement
+            .with_acquire(producer_lock_id, -1) // Acquire: wait for lock >= 1, decrement
             .with_release(producer_lock_id, 1); // Release: increment lock after transfer
         runner.configure_dma_bd(producer_col, producer_row, 0, producer_bd).unwrap();
 
         // Consumer's S2MM BD: acquire lock 0, write to memory, release lock 0
         // This simulates: DMA waits for buffer to be available, writes to it, signals done
         let consumer_bd = BdConfig::simple_1d(consumer_dst_offset as u64, transfer_size)
-            .with_acquire(consumer_lock_id, 1) // Acquire: wait for lock >= 1, decrement
+            .with_acquire(consumer_lock_id, -1) // Acquire: wait for lock >= 1, decrement
             .with_release(consumer_lock_id, 1); // Release: increment lock after transfer
         runner.configure_dma_bd(consumer_col, consumer_row, 0, consumer_bd).unwrap();
 

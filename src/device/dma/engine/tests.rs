@@ -369,8 +369,46 @@ fn test_transfer_with_lock() {
         }
     }
 
-    // Verify lock was released: started at 1, acquired (->0), released +1 (->1)
-    assert_eq!(tile.locks[5].value, 1);
+    // Started at 1, an equal acquire of 1 leaves it at 1 (silicon), released +1 (->2)
+    assert_eq!(tile.locks[5].value, 2);
+}
+
+/// Run MM2S 2 of a compute-tile DMA on a BD acquiring lock 5 with `change` on a count of
+/// `count` for up to 200 cycles; whether the BD completed, and the count after.
+fn run_bd_acquire(change: i8, count: u8) -> (bool, u8) {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    tile.locks[5].set(count);
+    let mut bd = BdConfig::simple_1d(0x100, 32);
+    bd.acquire_lock = Some(5);
+    bd.acquire_value = change;
+    engine.configure_bd(0, bd).unwrap();
+    engine.start_channel(2, 0).unwrap();
+    for _ in 0..200 {
+        if !engine.channel_active(2) {
+            return (true, tile.locks[5].value);
+        }
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(0);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+    }
+    (false, tile.locks[5].value)
+}
+
+// Silicon (build/experiments/lock-stall dma2, gen_dma_lock_probe.py): a BD acquire with a
+// change >= 0 is granted on a count equal to the change (c0v0 at once, c2v1 only once the
+// count reaches 2) and leaves the count unchanged.
+#[test]
+fn a_bd_acquire_with_a_change_of_zero_or_more_is_an_equal_acquire() {
+    assert_eq!(run_bd_acquire(1, 1), (true, 1));
+    assert_eq!(run_bd_acquire(2, 2), (true, 2));
+    assert_eq!(run_bd_acquire(0, 0), (true, 0));
+    assert_eq!(run_bd_acquire(2, 1), (false, 1));
+    assert_eq!(run_bd_acquire(0, 1), (false, 1));
+    assert_eq!(run_bd_acquire(1, 2), (false, 2));
+    assert_eq!(run_bd_acquire(-1, 2), (true, 1));
 }
 
 #[test]
@@ -2798,7 +2836,7 @@ fn chained_bd_16w_lock_interval_diagnostic() {
         .configure_bd(
             0,
             BdConfig::simple_1d(0x100, 64)
-                .with_acquire(0, 1)
+                .with_acquire(0, -1)
                 .with_release(1, 1)
                 .with_next(1),
         )
@@ -2807,7 +2845,7 @@ fn chained_bd_16w_lock_interval_diagnostic() {
         .configure_bd(
             1,
             BdConfig::simple_1d(0x200, 64)
-                .with_acquire(1, 1)
+                .with_acquire(1, -1)
                 .with_release(0, 1)
                 .with_next(2),
         )
@@ -2816,16 +2854,17 @@ fn chained_bd_16w_lock_interval_diagnostic() {
         .configure_bd(
             2,
             BdConfig::simple_1d(0x300, 64)
-                .with_acquire(0, 1)
+                .with_acquire(0, -1)
                 .with_release(1, 1)
                 .with_next(3),
         )
         .unwrap();
     engine
-        .configure_bd(3, BdConfig::simple_1d(0x400, 64).with_acquire(1, 1).with_release(0, 1))
+        .configure_bd(3, BdConfig::simple_1d(0x400, 64).with_acquire(1, -1).with_release(0, 1))
         .unwrap();
 
-    // with_acquire(N, 1) is acq_eq: lock must == 1, then decrement.
+    // with_acquire(N, -1): wait for lock >= 1, then decrement (the toolchain's
+    // AcquireGreaterEqual; a change of +1 is an equal acquire that leaves the count).
     // Ping-pong: BD#0/#2 acquire lock 0 (which BD#1/#3 just released back).
     tile.locks[0].set(1);
     tile.locks[1].set(0);

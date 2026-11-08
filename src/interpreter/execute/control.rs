@@ -93,8 +93,13 @@ pub struct LockRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockRequestKind {
-    Acquire { expected: u8, delta: i8 },
-    Release { delta: i8 },
+    /// Change value: < 0 greater-or-equal (subtracts), >= 0 equal (count unchanged).
+    Acquire {
+        change: i8,
+    },
+    Release {
+        delta: i8,
+    },
 }
 
 /// The memory module a core's raw lock ID (0..63) names.
@@ -343,7 +348,7 @@ impl ControlUnit {
     /// - ACQ_mLockId_imm: lock ID is a 6-bit immediate (Operand::Immediate or Lock)
     /// - ACQ_mLockId_reg: lock ID is in a scalar register (Operand::ScalarReg)
     /// Both variants also take a register (mRy) for the lock value parameter.
-    fn get_lock_acquire_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, u8, i8) {
+    fn get_lock_acquire_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, i8) {
         // Lock ID from first operand -- immediate or register
         let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
@@ -355,18 +360,10 @@ impl ControlUnit {
             }
         });
 
-        // Change value from second operand.
-        //
-        // AIE2 lock acquire instructions (ACQ_mLockId_imm, ACQ_mLockId_reg)
-        // encode the change value in the second operand. The semantics match
-        // the BD lock field and handle_lock_request:
-        //
-        //   change < 0: acq_ge -- expected = |change|, delta = change
-        //   change > 0: acq_eq -- expected = change, delta = -change
-        //   change == 0: simple acquire -- expected = 1, delta = -1
-        //
-        // The operand is either an Immediate (for constant values) or a
-        // ScalarReg (when the compiler loads the value into a register).
+        // Change value from the second operand: an Immediate, or a ScalarReg when
+        // the compiler loads it into a register (mlir-aie negates an
+        // AcquireGreaterEqual value; `Acquire` passes it as is). No second
+        // operand: a plain acquire of 1 (change -1).
         let change_value = op.sources.get(1).map_or(-1_i8, |src| match src {
             Operand::Immediate(v) => *v as i8,
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as i8,
@@ -376,15 +373,7 @@ impl ControlUnit {
             }
         });
 
-        let (expected, delta) = if change_value < 0 {
-            (change_value.unsigned_abs(), change_value)
-        } else if change_value > 0 {
-            (change_value as u8, -change_value)
-        } else {
-            (1_u8, -1_i8)
-        };
-
-        (lock_id, expected, delta)
+        (lock_id, change_value)
     }
 
     /// Get lock release parameters from operands.
@@ -497,10 +486,10 @@ impl ControlUnit {
     pub fn lock_request(op: &SlotOp, ctx: &ExecutionContext) -> Option<LockRequest> {
         let kind = match op.semantic {
             Some(SemanticOp::LockAcquire) => {
-                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
+                let (raw_lock_id, change) = Self::get_lock_acquire_params(op, ctx);
                 return Some(LockRequest {
                     raw_lock_id,
-                    kind: LockRequestKind::Acquire { expected, delta },
+                    kind: LockRequestKind::Acquire { change },
                     pc: ctx.pc(),
                 });
             }
@@ -517,8 +506,8 @@ impl ControlUnit {
     /// interpreter polls this to decide when.
     pub fn request_blocked(req: &LockRequest, tile: &Tile, neighbor_locks: Option<&NeighborLocks>) -> bool {
         match req.kind {
-            LockRequestKind::Acquire { expected, delta } => {
-                Self::lock_ref(req.raw_lock_id, tile, neighbor_locks).check_acquire(expected, delta)
+            LockRequestKind::Acquire { change } => {
+                Self::lock_ref(req.raw_lock_id, tile, neighbor_locks).check_change(change)
                     != LockResult::Success
             }
             LockRequestKind::Release { .. } => false,
@@ -545,15 +534,20 @@ impl ControlUnit {
         let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
         let current_value = locks[lock_id as usize].value;
         match req.kind {
-            LockRequestKind::Acquire { expected, delta } => {
-                // Greater-or-equal acquire for every change value: see
-                // get_lock_acquire_params for how a change >= 0 is read here.
+            LockRequestKind::Acquire { change } => {
+                // Silicon (gen_lock_stall_probe.py eq_*): the Lock_Request rule, a change
+                // >= 0 is an equal acquire that leaves the count alone.
                 let lock = &mut locks[lock_id as usize];
-                match lock.acquire_with_value(expected, delta) {
+                match lock.acquire_change(change) {
                     LockResult::Success => {
                         log::info!(
-                            "LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
-                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile
+                            "LockAcquire raw={} mapped={} change={} current={} -> {} SUCCESS (own_tile={})",
+                            raw_lock_id,
+                            lock_id,
+                            change,
+                            current_value,
+                            lock.value,
+                            is_own_tile
                         );
                         // Trace event: INSTR_LOCK_ACQUIRE_REQ (hw_id 44), once per
                         // acquire, when it completes (so a refused acquire's wait does
@@ -584,10 +578,10 @@ impl ControlUnit {
                     // like an unmet condition: the core keeps waiting.
                     LockResult::PreconditionNotMet | LockResult::Frozen => {
                         log::info!(
-                            "LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
+                            "LockAcquire raw={} mapped={} change={} current={} -> WAIT (own_tile={})",
                             raw_lock_id,
                             lock_id,
-                            expected,
+                            change,
                             current_value,
                             is_own_tile
                         );
@@ -893,6 +887,30 @@ mod tests {
         // Resolve the arbiter to apply the deferred release
         tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[3].value, 1, "Committed after arbiter resolve");
+    }
+
+    // Silicon (build/experiments/lock-stall eq_*, gen_lock_stall_probe.py): a core `acq`
+    // with a change >= 0 is granted only on a count equal to the change, and leaves the
+    // count unchanged (c1v1, c2v1, c0v0, c0v1, c1v2 all match that rule only).
+    #[test]
+    fn a_core_acquire_with_a_change_of_zero_or_more_is_an_equal_acquire() {
+        for (count, change, granted) in
+            [(2, 2, true), (1, 2, false), (3, 2, false), (0, 0, true), (1, 0, false)]
+        {
+            let mut ctx = make_ctx();
+            let mut tile = make_tile();
+            tile.locks[2].value = count;
+            let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::LockAcquire)
+                .with_source(Operand::Lock(48 + 2))
+                .with_source(Operand::Immediate(change));
+            let r = ControlUnit::execute(&op, &mut ctx, &mut tile);
+            if granted {
+                assert!(matches!(r, Some(ExecuteResult::Continue)), "{count} {change:+}");
+            } else {
+                assert!(matches!(r, Some(ExecuteResult::WaitLock { .. })), "{count} {change:+}");
+            }
+            assert_eq!(tile.locks[2].value, count, "{count} {change:+}: the count is left alone");
+        }
     }
 
     #[test]

@@ -65,13 +65,13 @@ impl DmaEngine {
             },
         };
 
+        // Lock::acquire_change's rule (silicon, gen_dma_lock_probe.py): a change >= 0
+        // is an equal acquire that leaves the count alone.
         let acquire_value = transfer.acquire_value;
         let (expected, delta, equal_mode) = if acquire_value < 0 {
             (acquire_value.unsigned_abs(), acquire_value, false)
-        } else if acquire_value > 0 {
-            (acquire_value as u8, -acquire_value, true)
         } else {
-            (1u8, -1i8, false)
+            (acquire_value as u8, 0, true)
         };
 
         target_tile.submit_lock_request(LockRequest {

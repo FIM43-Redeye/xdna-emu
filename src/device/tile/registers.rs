@@ -442,10 +442,8 @@ impl Tile {
         let lock = &mut self.locks[lock_id];
         let result = if !is_acquire {
             lock.release_with_value(change_value)
-        } else if change_value < 0 {
-            lock.acquire_with_value(change_value.unsigned_abs(), change_value)
         } else {
-            lock.acquire_equal(change_value as u8, 0)
+            lock.acquire_change(change_value)
         };
 
         // Return success bit
