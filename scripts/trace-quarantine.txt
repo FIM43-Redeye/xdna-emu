@@ -54,3 +54,14 @@ ctrl_packet_reconfig_4x1_cores
 # a relocation for the trace BO and XRT (both ELF and non-ELF paths)
 # patches the trace BD's source address to the correct bo_trace.
 # Quarantine removed.  See findings/2026-05-10-ctrl-packet-elf-trace-bd-collision.md.
+#
+# 2026-11-07: ctrl_packet_reconfig_elf quarantined again, upstream compile
+# failure. The trace BO's memref arg (above) lowers to a buffer-form
+# address_patch, and aiecc's control-packet DMA pipeline
+# (getControlPacketDmaPipeline in tools/aiecc/IRTransforms.h, mlir-aie
+# e5a3fa14879) lacks -aie-resolve-address-patch-buffers, which the other two
+# DMA lowering pipelines run. The --get-ctrlpkt step then fails on
+# {0}_ctrlpkt_dma_seq.bin. Pre-resolving the patch with aie-opt makes the
+# traced build compile and pass on HW, so tracing itself is fine. Remove this
+# entry once upstream adds the pass.
+ctrl_packet_reconfig_elf

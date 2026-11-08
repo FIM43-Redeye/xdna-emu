@@ -108,6 +108,31 @@ class BridgePathTests(unittest.TestCase):
             self.assertNotIn("twostep (peano): cached", second.stdout, second.stdout)
             self.assertIn("COMPILE twostep (peano): FAIL", second.stdout, second.stdout)
 
+    def test_a_toolchain_change_invalidates_cached_builds(self) -> None:
+        # A rebuilt aiecc must not reuse binaries the previous toolchain built:
+        # an unchanged aie_arch.mlir says nothing about which compiler built them.
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp)
+            test_dir = work_root / "mlir-aie/test/npu-xrt/stamped"
+            test_dir.mkdir(parents=True)
+            (test_dir / "test.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+            (test_dir / "aie.mlir").write_text("// fixture\n", encoding="utf-8")
+            (test_dir / "run.lit").write_text("// RUN: touch aie.xclbin test.exe\n", encoding="utf-8")
+            aiecc = work_root / "mlir-aie/build/bin/aiecc"
+            aiecc.parent.mkdir(parents=True)
+            aiecc.write_text("old\n", encoding="utf-8")
+            args = ("--no-trace", "--no-hw", "--no-emu", "^stamped$")
+
+            first = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE stamped (peano): OK", first.stdout, first.stdout)
+            second = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE stamped (peano): cached", second.stdout, second.stdout)
+
+            aiecc.write_text("rebuilt\n", encoding="utf-8")
+            third = self.run_bridge(work_root, *args)
+            self.assertNotIn("stamped (peano): cached", third.stdout, third.stdout)
+            self.assertIn("COMPILE stamped (peano): OK", third.stdout, third.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

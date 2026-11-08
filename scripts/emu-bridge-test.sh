@@ -278,9 +278,26 @@ for _c in "${COMPILERS[@]}"; do
   fi
 done
 
+# Which toolchain builds come from. The cache otherwise keys only on the test's
+# MLIR, so after a toolchain rebuild every unchanged test would keep running
+# binaries the old compilers made. Size and mtime of each compiler binary catch
+# a rebuild without hashing hundreds of MB per run.
+toolchain_stamp() {
+  git -C "$MLIR_AIE" rev-parse HEAD 2>/dev/null || echo "mlir-aie: not a git checkout"
+  local tool
+  for tool in "$AIECC_BIN" "$PEANO_CLANG" "${AIETOOLS_DIR}/bin/xchesscc"; do
+    if [[ -e "$tool" ]]; then
+      stat -L -c '%n %s %Y' "$tool"
+    else
+      echo "missing: $tool"
+    fi
+  done
+}
+TOOLCHAIN_STAMP="$(toolchain_stamp)"
+
 # Export variables that parallel jobs need.
 export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP PC_ANCHORED RUN_AIESIM RUN_AIESIM_EMU AIESIM_TIMING NO_TIMEOUT WITH_HW_CYCLES WITH_CYCLE_DIFF
-export MLIR_AIE AIECC_BIN TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
+export TOOLCHAIN_STAMP MLIR_AIE AIECC_BIN TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
 export AIETOOLS_DIR
@@ -1592,6 +1609,11 @@ compile_one_compiler() {
     fi
   fi
 
+  # A build from another toolchain is stale however unchanged its MLIR is.
+  if $have_xclbin && [[ "$(cat "$build_dir/.toolchain-stamp" 2>/dev/null)" != "$TOOLCHAIN_STAMP" ]]; then
+    have_xclbin=false
+  fi
+
   # A lit-native build is not done until its host is built, too.
   if $have_xclbin && [[ ! -f "$build_dir/test.exe" ]] && uses_lit_tmp "$src_dir"; then
     have_xclbin=false
@@ -1741,6 +1763,7 @@ compile_one_compiler() {
     return 0
   fi
 
+  printf '%s\n' "$TOOLCHAIN_STAMP" > "$build_dir/.toolchain-stamp"
   echo "OK" > "$result_file"
   echo "  COMPILE $name ($compiler): OK"
 }
