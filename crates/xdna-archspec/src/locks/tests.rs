@@ -5,39 +5,31 @@
 
 use super::LockValueLayout;
 
-/// Fixture matching AIE2's Lock_value field (width=6, mask=0x3F,
-/// sign_bit=5, min=-64, max=63). Duplicated here so the trait-side
-/// tests are independent of the AIE2 impl.
+/// Fixture matching AIE2's Lock_value field (width=6, mask=0x3F).
+/// Duplicated here so the trait-side tests are independent of the AIE2
+/// impl.
 fn aie2_layout() -> LockValueLayout {
-    LockValueLayout { width: 6, mask: 0x3F, sign_bit: 5, min: -64, max: 63 }
+    LockValueLayout { width: 6, mask: 0x3F }
 }
 
 #[test]
-fn sign_extend_zero_is_zero() {
-    assert_eq!(aie2_layout().sign_extend(0), 0);
+fn decode_keeps_the_unsigned_field() {
+    let layout = aie2_layout();
+    assert_eq!(layout.decode(0), 0);
+    assert_eq!(layout.decode(31), 31);
+    // Bit 5 is a count bit, not a sign bit (silicon: 40 is a count of 40).
+    assert_eq!(layout.decode(0x20), 32);
+    assert_eq!(layout.decode(40), 40);
+    assert_eq!(layout.decode(0x3F), 63);
 }
 
 #[test]
-fn sign_extend_max_positive() {
-    // 0x1F = 31 -- max positive for 6-bit signed is 31.
-    assert_eq!(aie2_layout().sign_extend(31), 31);
+fn decode_masks_bits_above_the_field() {
+    // Silicon: writing 0xFF reads back 0x3F.
+    assert_eq!(aie2_layout().decode(0xFF), 63);
 }
 
 #[test]
-fn sign_extend_min_negative_for_field() {
-    // 0x20 = 0b100000 -- sign bit set, all-zeros payload -> -32.
-    assert_eq!(aie2_layout().sign_extend(0x20), -32);
-}
-
-#[test]
-fn sign_extend_all_bits_set_is_minus_one() {
-    // 0x3F = all 6 bits set -> -1.
-    assert_eq!(aie2_layout().sign_extend(0x3F), -1);
-}
-
-#[test]
-fn sign_extend_masks_extra_bits() {
-    // 0xFF = all 8 bits set; upper bits outside mask must be ignored
-    // before sign-extend.
-    assert_eq!(aie2_layout().sign_extend(0xFF), -1);
+fn max_is_the_field_mask() {
+    assert_eq!(aie2_layout().max(), 63);
 }

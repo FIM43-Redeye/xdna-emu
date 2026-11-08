@@ -459,7 +459,7 @@ pub struct ChannelContext {
     /// freeing a buffer) emits the oldest still-pending release, so a trailing
     /// fill whose slot is never re-acquired still lands its trace. `None` when not
     /// stream-stalled (re-baselined on each stall). See `service_pending_releases`.
-    pub swap_free_watch: Option<(u8, i8)>,
+    pub swap_free_watch: Option<(u8, u8)>,
 
     /// Pending post-transfer startup hold (#140), in cycles.  Latched once per
     /// channel session by `consume_first_bd_bonus` on the first BD of a

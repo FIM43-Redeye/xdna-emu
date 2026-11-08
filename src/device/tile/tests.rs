@@ -71,30 +71,35 @@ fn test_lock_operations() {
 }
 
 #[test]
-fn test_lock_max_value() {
-    // Test clamping at creation (positive overflow)
-    let lock = Lock::new(100);
-    assert_eq!(lock.value, Lock::MAX_VALUE); // Clamped to 63
+fn test_lock_value_is_six_bit_unsigned() {
+    // A Lock_value write keeps the low 6 bits (silicon: 0xFF reads 0x3F).
+    assert_eq!(Lock::new(100).value, 100 & 0x3F);
+    assert_eq!(Lock::new(0xFF).value, Lock::MAX_VALUE);
+    // 32..=63 are ordinary counts.
+    let mut lock = Lock::new(40);
+    assert!(lock.acquire());
+    assert_eq!(lock.value, 39);
 
-    // Test clamping at creation (negative overflow)
-    let lock = Lock::new(-100);
-    assert_eq!(lock.value, Lock::MIN_VALUE); // Clamped to -64
-
-    // Test saturation on release
-    let mut lock = Lock::new(63);
-    lock.release();
-    assert_eq!(lock.value, 63); // Saturated at max
-
-    // Test set
     let mut lock = Lock::new(0);
     lock.set(50);
     assert_eq!(lock.value, 50);
-    lock.set(Lock::MAX_VALUE + 1); // would be 64, but i8 can't hold it; test boundary
-                                   // i8 max is 127, so test with explicit value
-    lock.set(100); // > 63
-    assert_eq!(lock.value, 63); // Clamped
-    lock.set(-100); // < -64
-    assert_eq!(lock.value, -64); // Clamped
+    lock.set(100);
+    assert_eq!(lock.value, 100 & 0x3F);
+}
+
+#[test]
+fn test_lock_release_wraps_and_sets_overflow() {
+    // Silicon: 63 + 1 reads 0 with the overflow bit set; the release is granted.
+    let mut lock = Lock::new(63);
+    assert_eq!(lock.release_with_value(1), LockResult::Success);
+    assert_eq!(lock.value, 0);
+    assert!(lock.overflow && !lock.underflow);
+
+    // 60 + 10 = 70 reads 6.
+    let mut lock = Lock::new(60);
+    assert_eq!(lock.release_with_value(10), LockResult::Success);
+    assert_eq!(lock.value, 6);
+    assert!(lock.overflow);
 }
 
 #[test]
@@ -174,38 +179,50 @@ fn test_lock_acquire_with_value() {
 #[test]
 fn test_lock_release_with_value() {
     let mut lock = Lock::new(0);
-
-    // Release by 3
     assert_eq!(lock.release_with_value(3), LockResult::Success);
     assert_eq!(lock.value, 3);
-
-    // Release by 10
     assert_eq!(lock.release_with_value(10), LockResult::Success);
     assert_eq!(lock.value, 13);
-
-    // Release to max (60 + 13 = 73, saturates to 63)
-    assert_eq!(lock.release_with_value(60), LockResult::WouldOverflow);
+    assert_eq!(lock.release_with_value(50), LockResult::Success);
     assert_eq!(lock.value, 63);
-    assert!(lock.overflow);
+    assert!(!lock.has_error());
 }
 
 #[test]
-fn test_lock_release_negative_delta() {
-    // Release with negative delta (unusual but supported)
+fn test_lock_release_negative_delta_wraps_and_sets_underflow() {
     let mut lock = Lock::new(10);
-
-    // "Release" with -3 is like an acquire
     assert_eq!(lock.release_with_value(-3), LockResult::Success);
     assert_eq!(lock.value, 7);
+    assert!(!lock.has_error());
 
-    // Large negative delta: goes into negative range (7 - 10 = -3, valid)
-    assert_eq!(lock.release_with_value(-10), LockResult::Success);
-    assert_eq!(lock.value, -3);
-
-    // Push to underflow past MIN_VALUE (-3 - 62 = -65, beyond -64)
-    assert_eq!(lock.release_with_value(-62), LockResult::PreconditionNotMet);
-    assert_eq!(lock.value, Lock::MIN_VALUE); // Clamped to -64
+    // Silicon: 3 - 5 reads 62 with the underflow bit set; 0 - 1 reads 63.
+    let mut lock = Lock::new(3);
+    assert_eq!(lock.release_with_value(-5), LockResult::Success);
+    assert_eq!(lock.value, 62);
+    assert!(lock.underflow && !lock.overflow);
+    let mut lock = Lock::new(0);
+    assert_eq!(lock.release_with_value(-1), LockResult::Success);
+    assert_eq!(lock.value, 63);
     assert!(lock.underflow);
+}
+
+#[test]
+fn test_flagged_lock_is_frozen_until_cleared() {
+    let mut lock = Lock::new(63);
+    lock.release_with_value(1);
+    assert!(lock.is_frozen());
+    // Silicon: a flagged lock refuses releases and acquires alike.
+    assert_eq!(lock.release_with_value(5), LockResult::Frozen);
+    assert_eq!(lock.acquire_equal(0, 0), LockResult::Frozen);
+    assert_eq!(lock.value, 0);
+    // A Lock_value write lands but does not unfreeze it.
+    lock.set(7);
+    assert_eq!(lock.value, 7);
+    assert_eq!(lock.acquire_with_value(1, -1), LockResult::Frozen);
+    // Clearing the bit frees it.
+    lock.clear_flags();
+    assert_eq!(lock.acquire_with_value(1, -1), LockResult::Success);
+    assert_eq!(lock.value, 6);
 }
 
 #[test]

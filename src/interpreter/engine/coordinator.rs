@@ -1549,7 +1549,7 @@ impl InterpreterEngine {
                     }
                 }
             }
-            let locks: Vec<i8> = mt.locks.iter().take(8).map(|l| l.value).collect();
+            let locks: Vec<u8> = mt.locks.iter().take(8).map(|l| l.value).collect();
             // Logical compute (0,2) consumer side: input-objfifo locks (prod=lock0,
             // cons=lock1), input S2MM fill, output MM2S drain, and whether the
             // core executed this cycle. The HW-faithful invariant is that the
@@ -1557,7 +1557,7 @@ impl InterpreterEngine {
             // yet ++), so with both buffers full (prod_lock==0) the compute S2MM
             // must stall -- that stall is what backpressures memtile MM2S (slot4).
             let c2 = self.device.array.tile(probe_col, 2);
-            let c2_locks: Vec<i8> = c2.locks.iter().take(4).map(|l| l.value).collect();
+            let c2_locks: Vec<u8> = c2.locks.iter().take(4).map(|l| l.value).collect();
             let mut c2_chans = String::new();
             if let Some(eng) = self.device.array.dma_engine(probe_col, 2) {
                 for ch in 0u8..4 {
@@ -1618,7 +1618,7 @@ impl InterpreterEngine {
                 .dma_engine(col, 2)
                 .map_or(0, |e| e.stream_in_count_for_channel(0));
             let c2_phase = self.device.array.dma_engine(col, 2).map_or("?", |e| e.channel_phase(0));
-            let c2_locks: Vec<i8> =
+            let c2_locks: Vec<u8> =
                 self.device.array.tile(col, 2).locks.iter().take(4).map(|l| l.value).collect();
             // Producer send-port (slot 4) beat/stall via the memtile's trace
             // event-port selection (same mapping the XFORM probe uses).

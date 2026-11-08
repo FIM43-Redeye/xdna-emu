@@ -110,22 +110,20 @@ fn test_lock_write() {
     // AIE-ML lock registers are 16 bytes apart (0x10 spacing per lock)
     let addr = TileAddress::encode(1, 2, 0x1F050); // Lock 5 = 0x1F000 + 5*0x10
 
-    // Lock_value field is 6-bit signed (bits [5:0], per AM025 regdb).
-    // Value 5 fits in unsigned 6-bit range -> positive.
+    // Lock_value is a 6-bit unsigned count (bits [5:0], AM025 regdb; silicon
+    // lock request probe 2026-11-08).
     state.write_register(addr, 5).unwrap();
     assert_eq!(state.array.tile(1, 2).locks[5].value, 5);
 
-    // Value 0x3F = 63 = all 6 bits set -> sign-extends to -1.
+    // Bit 5 is a count bit: 0x3F is 63, 0x20 is 32.
     state.write_register(addr, 0x3F).unwrap();
-    assert_eq!(state.array.tile(1, 2).locks[5].value, -1);
-
-    // Value 0x20 = bit 5 set -> sign-extends to -32.
+    assert_eq!(state.array.tile(1, 2).locks[5].value, 63);
     state.write_register(addr, 0x20).unwrap();
-    assert_eq!(state.array.tile(1, 2).locks[5].value, -32);
+    assert_eq!(state.array.tile(1, 2).locks[5].value, 32);
 
-    // Value 31 = max positive in 6-bit signed.
-    state.write_register(addr, 31).unwrap();
-    assert_eq!(state.array.tile(1, 2).locks[5].value, 31);
+    // Bits above the field are dropped (silicon: 0xFF reads 0x3F).
+    state.write_register(addr, 0xFF).unwrap();
+    assert_eq!(state.array.tile(1, 2).locks[5].value, 63);
 }
 
 #[test]
@@ -142,9 +140,9 @@ fn test_shim_lock_write() {
     state.write_register(addr, 7).unwrap();
     assert_eq!(state.array.tile(col, row).locks[3].value, 7);
 
-    // Negative value: 0x3F = -1 in 6-bit signed.
+    // 0x3F is a count of 63.
     state.write_register(addr, 0x3F).unwrap();
-    assert_eq!(state.array.tile(col, row).locks[3].value, -1);
+    assert_eq!(state.array.tile(col, row).locks[3].value, 63);
 
     // Write to lock 0 (base address)
     let addr0 = TileAddress::encode(col, row, 0x14000);
@@ -157,7 +155,7 @@ fn test_shim_lock_write() {
     assert_eq!(state.array.tile(col, row).locks[15].value, 1);
 
     // Verify lock 3 was not disturbed by other writes.
-    assert_eq!(state.array.tile(col, row).locks[3].value, -1);
+    assert_eq!(state.array.tile(col, row).locks[3].value, 63);
 }
 
 #[test]
@@ -1242,4 +1240,35 @@ fn cdo_enable_writes_start_cores_one_spacing_apart() {
     );
     state.tick_core_releases();
     assert_eq!(state.next_core_start_slot, 0, "the next launch numbers from slot 0 again");
+}
+
+/// A memtile object FIFO deeper than 31 initialises its producer lock above
+/// 31 (mlir-aie allows up to 63). Silicon takes the Lock_value field as an
+/// unsigned count, so a DMA acquire_ge 1 on a lock written 40 is granted.
+/// Sign-extending the 6-bit field turned 40 into -24 and wedged the
+/// `objectfifo_deep_memtile_hold` and `objectfifo_turns_walkers` bridge
+/// tests with every memtile S2MM stuck acquiring.
+#[test]
+fn memtile_lock_written_above_31_is_acquirable_by_dma() {
+    use crate::device::tile::{LockRequest, LockRequestor};
+
+    let mut state = DeviceState::new_npu1();
+    state.write_register(TileAddress::encode(1, 1, 0xC0000), 40).unwrap();
+    let tile = state.array.tile_mut(1, 1);
+    assert_eq!(tile.locks[0].value, 40);
+
+    tile.submit_lock_request(LockRequest {
+        requestor: LockRequestor::DmaS2mm(0),
+        lock_id: 0,
+        is_acquire: true,
+        expected: 1,
+        delta: -1,
+        equal_mode: false,
+    });
+    let results = tile.resolve_lock_requests(0);
+    assert!(
+        results.iter().any(|&(_, id, granted, _)| id == 0 && granted),
+        "acquire_ge 1 on 40 must be granted"
+    );
+    assert_eq!(tile.locks[0].value, 39);
 }

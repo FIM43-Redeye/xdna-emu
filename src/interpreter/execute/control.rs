@@ -213,22 +213,10 @@ impl ControlUnit {
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
 
-                // Choose acquire mode based on delta sign:
-                //   delta < 0: acq_ge (wait until value >= expected)
-                //   delta > 0: this would be acq_eq derived from positive change_value
-                // The get_lock_acquire_params derivation ensures delta < 0 for acq_ge
-                // and delta < 0 (= -expected) for acq_eq, so both use the same path.
-                // The difference is the threshold: acq_ge checks >=, acq_eq checks ==.
-                // We distinguish by checking if delta == -expected (acq_eq pattern).
-                let result = if delta < 0 && expected > 0 && delta == -expected {
-                    // Could be either acq_ge or acq_eq -- both derived the same way.
-                    // Use acq_ge which is the more common mode. acq_eq would only
-                    // matter when the lock value overshoots the expected value, which
-                    // is rare in ObjectFIFO-generated code.
-                    lock.acquire_with_value(expected, delta)
-                } else {
-                    lock.acquire_with_value(expected, delta)
-                };
+                // Greater-or-equal acquire for every change value: see
+                // get_lock_acquire_params for how a change >= 0 is read here
+                // (the core's equal-acquire semantics are unprobed).
+                let result = lock.acquire_with_value(expected, delta);
 
                 match result {
                     LockResult::Success => {
@@ -276,7 +264,9 @@ impl ControlUnit {
                         }
                         Some(ExecuteResult::Continue)
                     }
-                    LockResult::PreconditionNotMet => {
+                    // A frozen lock (overflow/underflow bit set) refuses the
+                    // acquire like an unmet condition: the core keeps waiting.
+                    LockResult::PreconditionNotMet | LockResult::Frozen => {
                         log::info!(
                             "LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
                             raw_lock_id,
@@ -286,10 +276,6 @@ impl ControlUnit {
                             is_own_tile
                         );
                         Some(ExecuteResult::WaitLock { raw_lock_id })
-                    }
-                    LockResult::WouldOverflow => {
-                        // This shouldn't happen for acquire, but handle it
-                        Some(ExecuteResult::Continue)
                     }
                 }
             }
@@ -466,7 +452,7 @@ impl ControlUnit {
     /// - ACQ_mLockId_imm: lock ID is a 6-bit immediate (Operand::Immediate or Lock)
     /// - ACQ_mLockId_reg: lock ID is in a scalar register (Operand::ScalarReg)
     /// Both variants also take a register (mRy) for the lock value parameter.
-    fn get_lock_acquire_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, i8, i8) {
+    fn get_lock_acquire_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, u8, i8) {
         // Lock ID from first operand -- immediate or register
         let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
@@ -500,11 +486,11 @@ impl ControlUnit {
         });
 
         let (expected, delta) = if change_value < 0 {
-            ((-change_value) as i8, change_value)
+            (change_value.unsigned_abs(), change_value)
         } else if change_value > 0 {
-            (change_value, -change_value)
+            (change_value as u8, -change_value)
         } else {
-            (1_i8, -1_i8)
+            (1_u8, -1_i8)
         };
 
         (lock_id, expected, delta)
@@ -956,13 +942,13 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_release_saturates() {
+    fn test_lock_release_wraps() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
         tile.locks[6].value = 60;
 
-        // Release with delta=10 (should saturate at 63)
+        // Release with delta=10: silicon wraps 70 to 6 and sets the overflow bit
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::Lock(6))
             .with_source(Operand::Immediate(10)); // delta
@@ -971,7 +957,7 @@ mod tests {
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[6].value, 60, "Not yet committed (pending in arbiter)");
         tile.resolve_lock_requests(0);
-        assert_eq!(tile.locks[6].value, 63, "Committed saturated at MAX");
+        assert_eq!(tile.locks[6].value, 6, "Committed modulo 64");
         assert!(tile.locks[6].overflow, "Overflow flag set");
     }
 

@@ -3,12 +3,13 @@
 /// Result of a lock operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockResult {
-    /// Operation succeeded
+    /// Operation granted.
     Success,
-    /// Operation failed - would underflow (value would go below -64)
+    /// Acquire refused: the count does not meet the acquire's condition.
     PreconditionNotMet,
-    /// Operation failed - would overflow (value would exceed +63)
-    WouldOverflow,
+    /// Refused because the lock's overflow or underflow bit is set: a
+    /// flagged lock grants nothing until the bit is cleared.
+    Frozen,
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ pub struct LockRequest {
     /// True = acquire (blocking), false = release (non-blocking)
     pub is_acquire: bool,
     /// For acquire: value threshold (acq_ge: lock >= expected; acq_eq: lock == expected)
-    pub expected: i8,
+    pub expected: u8,
     /// Change to apply to the lock value
     pub delta: i8,
     /// For acquire: true = exact match (acq_eq), false = greater-or-equal (acq_ge)
@@ -192,17 +193,18 @@ impl LockArbiter {
                     .collect();
                 group_with_dist.sort_by_key(|&(_, dist)| dist);
 
-                // Process releases first: they are non-blocking and always
-                // succeed on real hardware. A release must not prevent a
+                // Process releases first: they are non-blocking and succeed
+                // unless the lock is frozen. A release must not prevent a
                 // same-cycle acquire from seeing the updated value.
                 for &(idx, _) in &group_with_dist {
                     let req = &self.pending[idx];
                     if !req.is_acquire {
-                        Self::try_apply(req, locks);
+                        // A release is refused only by a frozen lock.
+                        let granted = Self::try_apply(req, locks);
                         if lock_id < self.stats.len() {
-                            self.stats[lock_id].grants += 1;
+                            self.stats[lock_id].grants += granted as u64;
                         }
-                        self.results.push((req.requestor, lock_id, true, false));
+                        self.results.push((req.requestor, lock_id, granted, false));
                     }
                 }
 
@@ -241,41 +243,17 @@ impl LockArbiter {
 
     /// Try to apply a single lock request. Returns true if granted.
     fn try_apply(req: &LockRequest, locks: &mut [Lock]) -> bool {
-        if req.lock_id >= locks.len() {
+        let Some(lock) = locks.get_mut(req.lock_id) else {
             return false;
-        }
-        let lock = &mut locks[req.lock_id];
-
-        if req.is_acquire {
-            // Check precondition based on mode
-            let precondition_met = if req.equal_mode {
-                lock.value == req.expected
-            } else {
-                lock.value >= req.expected
-            };
-
-            if !precondition_met {
-                return false;
-            }
-
-            // Apply delta
-            let new_value = (lock.value as i16) + (req.delta as i16);
-            if new_value < Lock::MIN_VALUE as i16 {
-                lock.underflow = true;
-                return false;
-            }
-            if new_value > Lock::MAX_VALUE as i16 {
-                lock.overflow = true;
-                lock.value = Lock::MAX_VALUE;
-            } else {
-                lock.value = new_value as i8;
-            }
-            true
+        };
+        let result = if !req.is_acquire {
+            lock.release_with_value(req.delta)
+        } else if req.equal_mode {
+            lock.acquire_equal(req.expected, req.delta)
         } else {
-            // Release: always succeeds (non-blocking), apply delta
-            lock.release_with_value(req.delta);
-            true
-        }
+            lock.acquire_with_value(req.expected, req.delta)
+        };
+        result == LockResult::Success
     }
 
     /// Check if a specific requestor was granted in the last resolve.
@@ -308,17 +286,23 @@ impl LockArbiter {
 
 /// Lock state.
 ///
-/// AIE2 uses semaphore locks with acquire/release semantics.
-/// Lock value range is -64 to +63 (per aie-rt LockValLowerBound/UpperBound).
-/// The Lock_Value register field is bits [5:0] (6-bit, mask 0x3F per
-/// xaiemlgbl_params.h). Values outside the 6-bit range (-64 to -33) are
-/// valid in the logical model but alias when read back from the register.
+/// An AIE2 lock is a 6-bit unsigned count, 0..=63, plus sticky overflow and
+/// underflow bits. Acquires and releases carry a 7-bit signed change value
+/// (-64..=63). Silicon (lock request probe, 2026-11-08, compute and memtile
+/// locks alike):
 ///
-/// # Semaphore Model (AM025)
+/// - An acquire with a negative change c is granted iff count >= -c, and
+///   then subtracts -c. An acquire with c >= 0 is granted iff count == c
+///   and leaves the count unchanged. A refused acquire changes nothing and
+///   sets no bit.
+/// - A release adds its change modulo 64 and is granted even when it wraps;
+///   wrapping above 63 sets the overflow bit, below 0 the underflow bit.
+/// - While either bit is set the lock refuses every acquire and release. A
+///   Lock_value write still lands and leaves the bits alone; only a
+///   write-1-to-clear of the bit frees the lock.
 ///
-/// Lock operations use a change_value parameter:
-/// - Acquire: Waits until condition met, then applies change
-/// - Release: Applies change_value, clamping to [MIN_VALUE, MAX_VALUE]
+/// The acquire-with-c>=0 rule was measured on the host Lock_Request path;
+/// the DMA and core paths still pass their own (expected, delta) pairs.
 ///
 /// The Lock_Request register format (AM025):
 /// - Lock_Id [13:10]: Which lock (0-15 for compute, 0-63 for mem tile)
@@ -328,193 +312,105 @@ impl LockArbiter {
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Lock {
-    /// Current lock value (semaphore count, -64 to +63).
-    /// Register field is 6-bit [5:0] (mask 0x3F), but aie-rt defines the
-    /// logical range as LockValLowerBound=-64 to LockValUpperBound=63.
-    pub value: i8,
-    /// Overflow flag - set when release would exceed MAX_VALUE
+    /// Current count, 0..=MAX_VALUE.
+    pub value: u8,
+    /// Overflow bit: a release wrapped the count past MAX_VALUE.
     pub overflow: bool,
-    /// Underflow flag - set when acquire would go below MIN_VALUE
+    /// Underflow bit: a release wrapped the count below 0.
     pub underflow: bool,
 }
 
 impl Lock {
-    /// Maximum lock value (+63, per aie-rt LockValUpperBound).
+    /// Largest count (the 6-bit Lock_value field, mlir-aie
+    /// `getMaxLockValue()`).
     ///
-    /// This compile-time constant is validated against the mlir-aie device
-    /// model in tests (see `device::model::validate_against_spec()`). It is kept
-    /// as a const for hot-path efficiency in lock acquire/release.
-    pub const MAX_VALUE: i8 = 63;
+    /// Kept as a const for the hot path; a test checks it against the
+    /// archspec value layout.
+    pub const MAX_VALUE: u8 = 63;
 
-    /// Minimum lock value (-64, per aie-rt LockValLowerBound).
-    pub const MIN_VALUE: i8 = -64;
+    /// Counts are taken modulo this (the field is `MAX_VALUE + 1` wide).
+    const MODULUS: i16 = Self::MAX_VALUE as i16 + 1;
 
-    /// Create a new lock with initial value (clamped to -64..+63)
+    /// Create a lock holding `value`'s low 6 bits (what a Lock_value write
+    /// stores).
     #[inline]
-    pub fn new(value: i8) -> Self {
-        Self {
-            value: value.clamp(Self::MIN_VALUE, Self::MAX_VALUE),
-            overflow: false,
-            underflow: false,
-        }
+    pub fn new(value: u8) -> Self {
+        Self { value: value & Self::MAX_VALUE, overflow: false, underflow: false }
     }
 
-    /// Acquire the lock (decrement if > 0).
-    ///
-    /// This is the simple form equivalent to `acquire_with_value(1, -1)`.
+    /// Whether the lock refuses requests: either sticky bit is set.
+    #[inline]
+    pub fn is_frozen(&self) -> bool {
+        self.overflow || self.underflow
+    }
+
+    /// Acquire one (equivalent to `acquire_with_value(1, -1)`).
     #[inline]
     pub fn acquire(&mut self) -> bool {
-        if self.value > 0 {
-            self.value -= 1;
-            true
-        } else {
-            false
-        }
+        self.acquire_with_value(1, -1) == LockResult::Success
     }
 
-    /// Release the lock (increment, clamping at MAX_VALUE).
-    ///
-    /// This is the simple form equivalent to `release_with_value(1)`.
+    /// Release one (equivalent to `release_with_value(1)`).
     #[inline]
     pub fn release(&mut self) {
-        if self.value < Self::MAX_VALUE {
-            self.value += 1;
-        }
+        self.release_with_value(1);
     }
 
-    /// Acquire with greater-or-equal check (acquire_ge mode).
+    /// Greater-or-equal acquire: granted iff the count is at least
+    /// `expected`, then `delta` (normally `-expected`) is applied.
     ///
-    /// Checks if `value >= expected_value`, and if so, applies `delta` to the
-    /// lock value. Returns `LockResult::Success` if the operation succeeded,
-    /// or the appropriate error if it would underflow.
-    ///
-    /// This implements the AIE-ML acquire_ge semantics where a negative
-    /// Lock_Acq_Value in the BD indicates waiting for lock >= |value|.
-    ///
-    /// # Arguments
-    /// * `expected_value` - Minimum value required for acquire to succeed
-    /// * `delta` - Change to apply (typically negative for acquire)
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Wait for lock value >= 1, then decrement by 1
-    /// lock.acquire_with_value(1, -1);
-    ///
-    /// // Wait for lock value >= 2, then decrement by 2
-    /// lock.acquire_with_value(2, -2);
-    /// ```
+    /// A delta that would take the count below 0 is refused like an unmet
+    /// condition; the hardware encodings (one change value) never ask for
+    /// one.
     #[inline]
-    pub fn acquire_with_value(&mut self, expected_value: i8, delta: i8) -> LockResult {
-        if self.value < expected_value {
-            // Not enough value - operation would stall
+    pub fn acquire_with_value(&mut self, expected: u8, delta: i8) -> LockResult {
+        if self.is_frozen() {
+            return LockResult::Frozen;
+        }
+        let new_value = self.value as i16 + delta as i16;
+        if self.value < expected || !(0..Self::MODULUS).contains(&new_value) {
             return LockResult::PreconditionNotMet;
         }
-
-        // Apply delta (convert to i16 for safe arithmetic)
-        let new_value = (self.value as i16) + (delta as i16);
-
-        if new_value < Self::MIN_VALUE as i16 {
-            self.underflow = true;
-            return LockResult::PreconditionNotMet;
-        }
-
-        if new_value > Self::MAX_VALUE as i16 {
-            // This shouldn't happen for acquire (negative delta), but handle it
-            self.overflow = true;
-            self.value = Self::MAX_VALUE;
-            return LockResult::WouldOverflow;
-        }
-
-        self.value = new_value as i8;
+        self.value = new_value as u8;
         LockResult::Success
     }
 
-    /// Acquire with exact-match check (acquire_eq mode).
-    ///
-    /// Checks if `value == expected_value`, and if so, applies `delta` to the
-    /// lock value. Returns `LockResult::Success` if the operation succeeded.
-    /// Returns `LockResult::PreconditionNotMet` if the value doesn't match exactly.
-    ///
-    /// This implements the AIE-ML acquire_eq semantics where a non-negative
-    /// Lock_Acq_Value in the BD indicates waiting for lock == value exactly.
-    ///
-    /// # Arguments
-    /// * `expected_value` - Exact value required for acquire to succeed
-    /// * `delta` - Change to apply (typically sets to 0 for acquire_eq)
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Wait for lock value == 1, then set to 0
-    /// lock.acquire_equal(1, -1);
-    ///
-    /// // Wait for lock value == 2, then set to 0
-    /// lock.acquire_equal(2, -2);
-    /// ```
+    /// Equal acquire: granted iff the count is exactly `expected`, then
+    /// `delta` is applied (0 on the Lock_Request path, where silicon leaves
+    /// the count unchanged).
     #[inline]
-    pub fn acquire_equal(&mut self, expected_value: i8, delta: i8) -> LockResult {
-        if self.value != expected_value {
-            // Value doesn't match exactly - operation would stall
+    pub fn acquire_equal(&mut self, expected: u8, delta: i8) -> LockResult {
+        if self.is_frozen() {
+            return LockResult::Frozen;
+        }
+        let new_value = self.value as i16 + delta as i16;
+        if self.value != expected || !(0..Self::MODULUS).contains(&new_value) {
             return LockResult::PreconditionNotMet;
         }
-
-        // Apply delta (convert to i16 for safe arithmetic)
-        let new_value = (self.value as i16) + (delta as i16);
-
-        if new_value < Self::MIN_VALUE as i16 {
-            self.underflow = true;
-            return LockResult::PreconditionNotMet;
-        }
-
-        if new_value > Self::MAX_VALUE as i16 {
-            self.overflow = true;
-            self.value = Self::MAX_VALUE;
-            return LockResult::WouldOverflow;
-        }
-
-        self.value = new_value as i8;
+        self.value = new_value as u8;
         LockResult::Success
     }
 
-    /// Release with specific delta.
-    ///
-    /// Adds `delta` to the lock value, saturating at MAX_VALUE.
-    /// Sets overflow flag if saturation occurs.
-    ///
-    /// # Arguments
-    /// * `delta` - Amount to add (typically positive for release)
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Release: increment by 1
-    /// lock.release_with_value(1);
-    ///
-    /// // Release: increment by 2
-    /// lock.release_with_value(2);
-    /// ```
+    /// Release: add `delta` modulo 64, setting the overflow bit when the sum
+    /// passes MAX_VALUE and the underflow bit when it drops below 0. Granted
+    /// unless the lock is frozen.
     #[inline]
     pub fn release_with_value(&mut self, delta: i8) -> LockResult {
-        let new_value = (self.value as i16) + (delta as i16);
-
-        if new_value < Self::MIN_VALUE as i16 {
-            self.underflow = true;
-            self.value = Self::MIN_VALUE;
-            return LockResult::PreconditionNotMet;
+        if self.is_frozen() {
+            return LockResult::Frozen;
         }
-
-        if new_value > Self::MAX_VALUE as i16 {
-            self.overflow = true;
-            self.value = Self::MAX_VALUE;
-            return LockResult::WouldOverflow;
-        }
-
-        self.value = new_value as i8;
+        let sum = self.value as i16 + delta as i16;
+        self.overflow = sum >= Self::MODULUS;
+        self.underflow = sum < 0;
+        self.value = sum.rem_euclid(Self::MODULUS) as u8;
         LockResult::Success
     }
 
-    /// Set the lock value directly (clamped to -64..+63)
+    /// Write the count (a Lock_value register write): keeps the low 6 bits
+    /// and leaves the sticky bits alone, as silicon does.
     #[inline]
-    pub fn set(&mut self, value: i8) {
-        self.value = value.clamp(Self::MIN_VALUE, Self::MAX_VALUE);
+    pub fn set(&mut self, value: u8) {
+        self.value = value & Self::MAX_VALUE;
     }
 
     /// Clear the overflow and underflow flags.
@@ -527,7 +423,7 @@ impl Lock {
     /// Check if the lock has any error flags set.
     #[inline]
     pub fn has_error(&self) -> bool {
-        self.overflow || self.underflow
+        self.is_frozen()
     }
 }
 
@@ -539,15 +435,9 @@ mod tests {
     fn lock_bounds_match_archspec() {
         use xdna_archspec::aie2::locks::AIE2_LOCK_VALUE_LAYOUT;
         assert_eq!(
-            Lock::MIN_VALUE,
-            AIE2_LOCK_VALUE_LAYOUT.min,
-            "Lock::MIN_VALUE must match AIE2_LOCK_VALUE_LAYOUT.min; \
-                    update the constant (or split per-arch) when AIE1 lands"
-        );
-        assert_eq!(
             Lock::MAX_VALUE,
-            AIE2_LOCK_VALUE_LAYOUT.max,
-            "Lock::MAX_VALUE must match AIE2_LOCK_VALUE_LAYOUT.max"
+            AIE2_LOCK_VALUE_LAYOUT.max(),
+            "Lock::MAX_VALUE must match the AIE2 Lock_value field"
         );
     }
 }

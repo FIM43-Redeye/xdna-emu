@@ -105,13 +105,12 @@ fn block_rects(rect: Rect, kind: TileKindDisplay) -> FloorplanBlocks {
     }
 }
 
-/// Lock-bank colour by semaphore value. The number in each cell keeps the
-/// state readable without relying on colour alone.
-pub(crate) fn lock_color(value: i8, palette: &Palette) -> egui::Color32 {
+/// Lock-bank colour by count: held (nonzero) or empty. Counts are unsigned.
+/// The number in each cell keeps the state readable without relying on
+/// colour alone.
+pub(crate) fn lock_color(value: u8, palette: &Palette) -> egui::Color32 {
     if value > 0 {
         palette.band_green
-    } else if value < 0 {
-        palette.band_amber
     } else {
         palette.band_pale
     }
@@ -120,7 +119,7 @@ pub(crate) fn lock_color(value: i8, palette: &Palette) -> egui::Color32 {
 /// Paint the tile's own lock bank as a compact, responsive colour+number grid.
 /// Directional West/Own/East framing does not apply: these are the tile's own
 /// locks, while a mem tile's cross-tile address space is a separate view.
-pub(crate) fn lock_map(ui: &mut egui::Ui, locks: &[i8], palette: &Palette) {
+pub(crate) fn lock_map(ui: &mut egui::Ui, locks: &[u8], palette: &Palette) {
     const PER_ROW: usize = 8;
     const PREFERRED_CELL: egui::Vec2 = vec2(30.0, 20.0);
 
@@ -657,10 +656,10 @@ mod tests {
     }
 
     #[test]
-    fn lock_color_encodes_value_sign() {
+    fn lock_color_encodes_held_or_empty() {
         let palette = Palette::dark();
         assert_eq!(lock_color(3, &palette), palette.band_green);
+        assert_eq!(lock_color(40, &palette), palette.band_green);
         assert_eq!(lock_color(0, &palette), palette.band_pale);
-        assert_eq!(lock_color(-2, &palette), palette.band_amber);
     }
 }

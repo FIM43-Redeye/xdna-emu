@@ -60,8 +60,10 @@ impl DeviceState {
 
     /// Write a lock value (direct write, no mask).
     ///
-    /// Lock registers are 16 bytes (LOCK_STRIDE) apart per AM025.
-    /// Lock_Value field width is derived from the archspec LockValueLayout.
+    /// Lock registers are 16 bytes (LOCK_STRIDE) apart per AM025. The
+    /// Lock_value field is an unsigned count (archspec `LockValueLayout`):
+    /// a write stores its low bits, and an mlir-aie object FIFO deeper than
+    /// 31 initialises its producer lock to a count above 31.
     pub(super) fn write_lock_value(
         tile: &mut Tile,
         tile_addr: TileAddress,
@@ -72,8 +74,8 @@ impl DeviceState {
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            let signed = crate::device::arch_handle::lock_value_layout().sign_extend(value);
-            tile.locks[lock_idx].set(signed);
+            let count = crate::device::arch_handle::lock_value_layout().decode(value);
+            tile.locks[lock_idx].set(count);
             if value != 0 {
                 log::info!(
                     "CDO init {} lock {} on tile ({},{}) = {}",
@@ -81,7 +83,7 @@ impl DeviceState {
                     lock_idx,
                     tile_addr.col,
                     tile_addr.row,
-                    signed
+                    count
                 );
             }
         }
@@ -98,13 +100,9 @@ impl DeviceState {
     ) {
         let lock_idx = ((offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            // Read current value in unsigned representation for mask ops.
-            // Mask is derived from the archspec LockValueLayout (6-bit field for AIE2).
             let layout = crate::device::arch_handle::lock_value_layout();
-            let current_raw = (tile.locks[lock_idx].value as u8 & layout.mask as u8) as u32;
-            let new_raw = (current_raw & !mask) | (value & mask);
-            let signed = layout.sign_extend(new_raw);
-            tile.locks[lock_idx].set(signed);
+            let current = tile.locks[lock_idx].value as u32;
+            tile.locks[lock_idx].set(layout.decode((current & !mask) | (value & mask)));
         }
     }
 

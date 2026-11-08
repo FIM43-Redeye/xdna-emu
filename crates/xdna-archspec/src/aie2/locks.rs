@@ -4,17 +4,17 @@
 //! Krackan). All AIE2-family devices share the same lock feature
 //! set:
 //!
-//! - 6-bit register field (mask 0x3F), logical 7-bit signed range
-//!   (-64..63); values outside the 6-bit field alias when read back.
+//! - 6-bit unsigned count (mask 0x3F, 0..=63); acquire and release
+//!   change values are 7-bit signed (-64..=63).
 //! - Both acquire-GE and acquire-EQ modes supported.
 //! - Host-side GetValue / SetValue both supported.
 //!
 //! Width and mask sourced from
 //! `mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json`
-//! (`memory.Lock0_value.Lock_value` field). Bounds from aie-rt
-//! `xaiemlgbl_reginit.c:2452-2453` (LockValUpperBound=63,
-//! LockValLowerBound=-64). A regdb drift-detection test in this
-//! module asserts the JSON still agrees with these static constants.
+//! (`memory.Lock0_value.Lock_value` field); aie-rt's LockValUpperBound=63
+//! / LockValLowerBound=-64 (`xaiemlgbl_reginit.c:2452-2453`) bound the
+//! change value. A regdb drift-detection test in this module asserts the
+//! JSON still agrees with these static constants.
 //!
 //! ## Lock ID Quadrant Mapping
 //!
@@ -99,8 +99,7 @@ pub mod quadrants {
 ///
 /// Static so hot-path consumers can cache `&'static LockValueLayout`
 /// at construction time.
-pub static AIE2_LOCK_VALUE_LAYOUT: LockValueLayout =
-    LockValueLayout { width: 6, mask: 0x3F, sign_bit: 5, min: -64, max: 63 };
+pub static AIE2_LOCK_VALUE_LAYOUT: LockValueLayout = LockValueLayout { width: 6, mask: 0x3F };
 
 /// AIE2 lock model.
 ///
@@ -143,9 +142,7 @@ mod tests {
     fn aie2_lock_value_layout_constants() {
         assert_eq!(AIE2_LOCK_VALUE_LAYOUT.width, 6);
         assert_eq!(AIE2_LOCK_VALUE_LAYOUT.mask, 0x3F);
-        assert_eq!(AIE2_LOCK_VALUE_LAYOUT.sign_bit, 5);
-        assert_eq!(AIE2_LOCK_VALUE_LAYOUT.min, -64);
-        assert_eq!(AIE2_LOCK_VALUE_LAYOUT.max, 63);
+        assert_eq!(AIE2_LOCK_VALUE_LAYOUT.max(), 63);
     }
 
     #[test]

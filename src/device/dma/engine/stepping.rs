@@ -819,7 +819,7 @@ impl DmaEngine {
     }
 
     /// Read a (possibly-neighbor) lock's committed value, read-only.
-    fn read_lock_value(&self, lock_id: u8, tile: &Tile, neighbors: &NeighborTiles<'_>) -> Option<i8> {
+    fn read_lock_value(&self, lock_id: u8, tile: &Tile, neighbors: &NeighborTiles<'_>) -> Option<u8> {
         match self.resolve_lock_id(lock_id)? {
             LockTarget::Own(id) => tile.locks.get(id as usize).map(|l| l.value),
             LockTarget::West(id) => neighbors
@@ -2176,11 +2176,11 @@ impl DmaEngine {
 
         let requestor = self.channel_requestor(ch_idx as u8);
         let granted = target_tile.lock_was_granted(requestor, local_id as usize);
-        let lock_value = target_tile.locks.get(local_id as usize).map(|l| l.value).unwrap_or(i8::MIN);
+        let lock_value = target_tile.locks.get(local_id as usize).map(|l| l.value);
 
         log::info!(
             "DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} \
-             lock_value={} granted={}",
+             lock_value={:?} granted={}",
             self.col,
             self.row,
             ch_idx,

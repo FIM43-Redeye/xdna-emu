@@ -21,48 +21,40 @@
 #[cfg(test)]
 mod tests;
 
-/// Lock-value field layout -- register field shape plus logical value bounds.
+/// Lock-value field layout: the register field that holds a lock's count.
 ///
-/// Field shape and bounds diverge per-arch:
-/// - AIE2: 6-bit register field (bits [5:0], mask 0x3F), min=-64, max=63.
-///   Logical range is 7-bit signed; values outside the 6-bit field
-///   alias when read back. aie-rt `xaiemlgbl_reginit.c:2452-2453` for
-///   the bounds; `aie_registers_aie2.json` `memory.Lock0_value.Lock_value`
-///   for the field shape.
+/// - AIE2: a 6-bit unsigned count (bits [5:0], mask 0x3F), 0..=63, the
+///   field shape `aie_registers_aie2.json` gives for
+///   `memory.Lock0_value.Lock_value` and the maximum mlir-aie's AIE2
+///   target model allows (`getMaxLockValue() == 0x3F`). Silicon confirms
+///   it (lock request probe, 2026-11-08): 32..=63 are ordinary positive
+///   counts, a write keeps bits [5:0], and a release wraps modulo 64.
+///   aie-rt's LockValLowerBound/UpperBound (-64/63) bound the 7-bit
+///   signed *change* value of an acquire or release, not the count.
 /// - AIE1: no read-back value field. AIE1's lock hardware is
 ///   address-encoded (`Lock.LockVal * LockMod->LockValOff`); value reads
 ///   come via the per-lock `LockN` status bit in the all-locks-status
-///   register (1 bit per lock, not a per-lock value field). The
-///   `width` / `mask` / `sign_bit` fields are not meaningful for AIE1;
-///   bounds (min=-1, max=1) are enforced software-side per aie-rt
-///   `xaiegbl_reginit.c:1251-1252`.
+///   register (1 bit per lock, not a per-lock value field), so `width`
+///   and `mask` are not meaningful there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockValueLayout {
     /// Width of the Lock_value register field, in bits.
     pub width: u8,
-    /// Mask that isolates the field within a raw 32-bit register read.
+    /// Mask that isolates the field within a raw 32-bit register value.
     pub mask: u32,
-    /// Position of the sign bit within the field (always `width - 1`
-    /// for two's-complement representations).
-    pub sign_bit: u8,
-    /// Minimum logical lock value (aie-rt LockValLowerBound).
-    pub min: i8,
-    /// Maximum logical lock value (aie-rt LockValUpperBound).
-    pub max: i8,
 }
 
 impl LockValueLayout {
-    /// Sign-extend a raw register read to a signed 8-bit lock value.
-    ///
-    /// Identical formula on every arch; only the field width differs.
+    /// The count a raw register value stores: its low `width` bits.
     #[inline]
-    pub fn sign_extend(&self, raw: u32) -> i8 {
-        let masked = (raw & self.mask) as u8;
-        if masked & (1 << self.sign_bit) != 0 {
-            masked as i8 | !(self.mask as i8)
-        } else {
-            masked as i8
-        }
+    pub fn decode(&self, raw: u32) -> u8 {
+        (raw & self.mask) as u8
+    }
+
+    /// The largest count the field holds.
+    #[inline]
+    pub fn max(&self) -> u8 {
+        self.mask as u8
     }
 }
 

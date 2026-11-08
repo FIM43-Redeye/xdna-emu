@@ -302,7 +302,8 @@ pub unsafe extern "C" fn xdna_emu_set_log_level(level: *const c_char) -> i32 {
 /// - `handle` must be valid
 ///
 /// # Returns
-/// Lock value (-64..63), or -128 on error.
+/// Lock count (0..=63), or -128 on error. The C return type stays signed for
+/// the error sentinel; every count fits.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_get_lock_value(
     handle: *mut XdnaEmuHandle,
@@ -327,7 +328,7 @@ pub unsafe extern "C" fn xdna_emu_get_lock_value(
 
     let id = lock_id as usize;
     if id < tile.locks.len() {
-        tile.locks[id].value
+        tile.locks[id].value as i8
     } else {
         set_last_error(format!(
             "get_lock_value: lock_id {} out of range (tile has {})",

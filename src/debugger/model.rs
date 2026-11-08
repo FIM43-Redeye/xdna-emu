@@ -270,7 +270,7 @@ pub struct TileSnapshot {
     pub core_status: Option<String>,
     pub pc: Option<u32>,
     pub dma: Vec<ChannelSnapshot>,
-    pub locks: Vec<i8>,
+    pub locks: Vec<u8>,
     pub mem_size: usize,
     pub mem_peek: Vec<u32>,
     pub ports: Vec<PortSnapshot>,
@@ -307,7 +307,7 @@ pub fn tile_snapshot(engine: &InterpreterEngine, col: u8, row: u8) -> Option<Til
 
     // The tile's real lock bank (16 on compute/shim, 64 on mem). Effective value
     // accounts for pending updates this cycle.
-    let locks: Vec<i8> = (0..tile.locks.len()).map(|i| tile.effective_lock_value(i)).collect();
+    let locks: Vec<u8> = (0..tile.locks.len()).map(|i| tile.effective_lock_value(i)).collect();
 
     // Memory: size + a small word peek (first 8 words).
     let mem_size = tile.data_memory().len();

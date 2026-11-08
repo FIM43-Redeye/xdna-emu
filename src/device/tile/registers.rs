@@ -52,6 +52,13 @@ impl Tile {
             }
         }
 
+        // Lock_value registers read the live count, as on the pure path
+        // (the raw register map holds whatever was last written, high bits
+        // included).
+        if let Some(count) = self.lock_value_register(offset) {
+            return count;
+        }
+
         // Data memory: what the cores and DMAs stored there (a mask-write's
         // read half from a host or the firmware must see it), the same as
         // the side-effect-free path.
@@ -209,24 +216,8 @@ impl Tile {
             }
         }
 
-        // Lock value registers (read-only, no acquire side effect)
-        let lock_base = if self.is_mem() {
-            reg_layout.memtile_lock_base
-        } else {
-            reg_layout.memory_lock_base
-        };
-        let lock_stride = if self.is_mem() {
-            reg_layout.memtile_lock_stride
-        } else {
-            reg_layout.memory_lock_stride
-        };
-        let lock_end = lock_base + (self.locks.len() as u32) * lock_stride;
-        if (lock_base..lock_end).contains(&offset) {
-            let lock_id = ((offset - lock_base) / lock_stride) as usize;
-            if lock_id < self.locks.len() {
-                return self.locks[lock_id].value as u32
-                    & crate::device::arch_handle::lock_value_layout().mask;
-            }
+        if let Some(count) = self.lock_value_register(offset) {
+            return count;
         }
 
         // Control_Packet_Handler_Status sticky bits (compute 0x3FF30,
@@ -354,6 +345,24 @@ impl Tile {
         self.mem_perf_counters.write_register(offset_in_block, value, event_width);
     }
 
+    /// A read of a Lock_value register: the lock's live count. `None` when
+    /// `offset` is not one.
+    fn lock_value_register(&self, offset: u32) -> Option<u32> {
+        let reg_layout = super::super::regdb::device_reg_layout();
+        let (lock_base, lock_stride) = if self.is_mem() {
+            (reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride)
+        } else if self.is_compute() {
+            (reg_layout.memory_lock_base, reg_layout.memory_lock_stride)
+        } else {
+            (reg_layout.shim_lock_base, reg_layout.shim_lock_stride)
+        };
+        let lock_end = lock_base + (self.locks.len() as u32) * lock_stride;
+        if !(lock_base..lock_end).contains(&offset) || (offset - lock_base) % lock_stride != 0 {
+            return None;
+        }
+        Some(self.locks[((offset - lock_base) / lock_stride) as usize].value as u32)
+    }
+
     // === Lock_Request Register Handling ===
 
     /// Handle a Lock_Request register read.
@@ -404,29 +413,17 @@ impl Tile {
             return 0; // Invalid lock ID
         }
 
-        // Perform the operation.
-        //
-        // AIE-ML lock semantics (matching DMA engine in dma/engine.rs):
-        // - change_value < 0: acq_ge -- wait until lock >= |value|, then decrement
-        // - change_value > 0: acq_eq -- wait until lock == value, then set to 0
-        // - change_value == 0: simple acquire (decrement if > 0)
-        let result = if is_acquire {
-            if change_value < 0 {
-                // acq_ge: wait until lock >= |value|, then decrement by |value|
-                let expected = (-change_value) as i8;
-                self.locks[lock_id].acquire_with_value(expected, change_value)
-            } else if change_value > 0 {
-                // acq_eq: wait until lock == value, then decrement to 0
-                let expected = change_value as i8;
-                let delta = -expected;
-                self.locks[lock_id].acquire_equal(expected, delta)
-            } else {
-                // Simple acquire: decrement by 1 if > 0
-                self.locks[lock_id].acquire_with_value(1, -1)
-            }
+        // Perform the operation (silicon, lock request probe 2026-11-08):
+        // - acquire, change < 0: granted iff count >= -change, then subtract;
+        // - acquire, change >= 0: granted iff count == change, count unchanged;
+        // - release: add change modulo 64 (wrapping sets a sticky bit).
+        let lock = &mut self.locks[lock_id];
+        let result = if !is_acquire {
+            lock.release_with_value(change_value)
+        } else if change_value < 0 {
+            lock.acquire_with_value(change_value.unsigned_abs(), change_value)
         } else {
-            // Release: apply delta (typically positive)
-            self.locks[lock_id].release_with_value(change_value)
+            lock.acquire_equal(change_value as u8, 0)
         };
 
         // Return success bit

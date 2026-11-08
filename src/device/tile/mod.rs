@@ -30,6 +30,8 @@ mod streams;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod lock_silicon_tests;
 
 // Re-export all public types so external code sees them at `tile::`.
 pub use params::{PROGRAM_MEMORY_SIZE, TileParams};
@@ -1201,7 +1203,7 @@ impl Tile {
     /// Returns the live lock value. Pending arbiter requests that have
     /// not yet been resolved are NOT reflected.
     #[inline]
-    pub fn effective_lock_value(&self, lock_id: usize) -> i8 {
+    pub fn effective_lock_value(&self, lock_id: usize) -> u8 {
         if lock_id < self.locks.len() {
             self.locks[lock_id].value
         } else {

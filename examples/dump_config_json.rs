@@ -195,8 +195,8 @@ pub struct DmaChannelDump {
 pub struct LockDump {
     /// Lock slot index.
     pub id: u8,
-    /// Current semaphore value (range -64..=63 per aie-rt).
-    pub value: i8,
+    /// Current count (6-bit unsigned, 0..=63).
+    pub value: u8,
 }
 
 /// Aggregate core lock-order fact: first acquire precedes first release.

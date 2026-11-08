@@ -1908,13 +1908,13 @@ mod tests {
             .device()
             .tile(producer_col as usize, producer_row as usize)
             .map(|t| t.locks[producer_lock_id as usize].value)
-            .unwrap_or(-1);
+            .expect("tile exists");
         let consumer_lock_initial = runner
             .engine
             .device()
             .tile(consumer_col as usize, consumer_row as usize)
             .map(|t| t.locks[consumer_lock_id as usize].value)
-            .unwrap_or(-1);
+            .expect("tile exists");
         assert_eq!(producer_lock_initial, 1, "Producer lock should be 1 initially");
         assert_eq!(consumer_lock_initial, 1, "Consumer lock should be 1 initially");
         eprintln!(
@@ -1999,13 +1999,13 @@ mod tests {
             .device()
             .tile(producer_col as usize, producer_row as usize)
             .map(|t| t.locks[producer_lock_id as usize].value)
-            .unwrap_or(-1);
+            .expect("tile exists");
         let consumer_lock_final = runner
             .engine
             .device()
             .tile(consumer_col as usize, consumer_row as usize)
             .map(|t| t.locks[consumer_lock_id as usize].value)
-            .unwrap_or(-1);
+            .expect("tile exists");
         eprintln!("Final lock states: producer={}, consumer={}", producer_lock_final, consumer_lock_final);
 
         // Verify producer lock was properly acquired and released
