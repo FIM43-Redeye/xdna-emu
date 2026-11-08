@@ -2432,8 +2432,11 @@ impl InterpreterEngine {
                         if let Some(core) = self.cores.get_mut(idx) {
                             // Sync enabled state from tile
                             core.enabled = tile.core.enabled;
-                            // Sync PC from tile (if set by CDO)
-                            if tile.core.pc != 0 || tile.core.enabled {
+                            // Sync PC from tile (if set by CDO). Not for a core held on a
+                            // lock, stream or DMA: it is mid-bundle (only a core reset
+                            // restarts it), and while it waits on a lock `tile.core.pc`
+                            // holds the trace-visible fetch PC, not its execution PC.
+                            if (tile.core.pc != 0 || tile.core.enabled) && !core.interpreter.is_stalled() {
                                 core.context.set_pc(tile.core.pc);
                             }
                         }
@@ -2606,6 +2609,40 @@ mod tests {
         assert_eq!(engine.status(), EngineStatus::Ready);
         assert_eq!(engine.total_cycles(), 0);
         assert_eq!(engine.enabled_cores(), 0);
+    }
+
+    /// A launch must not move the PC of a core held on a lock acquire. While the core is
+    /// held, `tile.core.pc` carries the trace-visible fetch PC (`lock_stall_pipeline_pc`),
+    /// not the execution PC; `sync_cores_from_device` (called by every launch) copied it
+    /// back into the context, so the core resumed at the wrong bundle (bridge
+    /// `add_one_two_txn`: it resumed in the release stub after the acquire stub).
+    #[test]
+    fn a_launch_keeps_the_pc_of_a_core_held_on_a_lock() {
+        // mov r4, #-1 ; nop ; acq #63, r4 ; ret lr ; nop x 5 (llvm-mc --triple=aie2)
+        const PROGRAM: [u8; 24] = [
+            0x99, 0xff, 0x0f, 0x19, 0x01, 0x00, 0x19, 0x42, 0xe2, 0x17, 0x19, 0x18, 0x00, 0x10, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+        ];
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        let (col, row) = (1usize, 2usize);
+        {
+            let tile = engine.device_mut().array.get_mut(col as u8, row as u8).unwrap();
+            assert!(tile.write_program(0, &PROGRAM));
+            tile.locks[15].value = 0;
+        }
+        engine.enable_core(col, row);
+        for _ in 0..40 {
+            engine.force_running();
+            engine.step();
+            if matches!(engine.core_status(col, row), Some(CoreStatus::WaitingLock { .. })) {
+                break;
+            }
+        }
+        assert!(matches!(engine.core_status(col, row), Some(CoreStatus::WaitingLock { raw_lock_id: 63 })));
+        let held_pc = engine.core_context(col, row).unwrap().pc();
+        engine.sync_cores_from_device();
+        assert_eq!(engine.core_context(col, row).unwrap().pc(), held_pc, "the launch left the held PC alone");
     }
 
     #[test]
