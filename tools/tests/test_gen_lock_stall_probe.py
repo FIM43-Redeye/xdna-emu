@@ -181,3 +181,53 @@ def test_parse_b2b_counts():
     log = bytes(32) + struct.pack("<4I", 500, 1010, 3010, 4010) + bytes(16)
     prod = struct.pack("<5I", 100, 1000, 2000, 3000, 4000) + bytes(12)
     assert g.parse_b2b_counts(log, prod) == {g.B2B_FIRST: 1, g.LOCK_ID: 0}
+
+
+def test_cond_program_puts_the_request_between_two_counter_reads_and_never_reads_into_r26():
+    prog = g.cond_program("acq")
+    i = next(k for k, l in enumerate(prog) if ".cond" in l)
+    assert "acq.cond #63, r3, r26" in prog[i] and "cntr" in prog[i]
+    assert "cntr" in prog[i - 1] and all("cntr" in l for l in prog[i:i + 6])
+    assert not any("r27:r26" in l for l in prog)
+    assert "rel.cond #63, r2, r26" in "".join(g.cond_program("rel"))
+
+
+@pytest.mark.parametrize("kind,state", [("acq", "free"), ("acq", "stall"), ("rel", "rel")])
+def test_cond_cases_validate_and_load_r26(kind, state):
+    topo, files = g.cond_case(kind, state, "m", 100)
+    assert validate(topo, load_device_model("npu1")) == []
+    assert "movxm r26, #2147483648" in files["consumer.s"]
+    assert topo.links[0].init == (1 if state == "free" else 0)
+    assert ("rel #15, r1" in files["producer.s"].split("Lfb0")[0]) == (state == "stall")
+
+
+def test_cond_rejects_an_impossible_state():
+    with pytest.raises(ValueError):
+        g.cond_case("rel", "free", "z", 100)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("ks", [("acq", "free"), ("acq", "stall"), ("rel", "rel")])
+def test_cond_asm_assembles(ks, tmp_path):
+    _, files = g.cond_case(*ks, "f", 100)
+    for fname, text in files.items():
+        s = tmp_path / fname
+        s.write_text(text)
+        res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
+                              str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+
+def test_cli_generate_selects_cond_cases(tmp_path):
+    from harness import suite
+    assert g.main(["generate", str(tmp_path), "--cases", "cond_acq_free"]) == 0
+    assert suite.load_suite(tmp_path).cases == tuple(f"cond_acq_free_{v}" for v in g.COND_VALUES)
+
+
+def test_parse_cond():
+    # reads at -1..+5: one cycle lost in front of +4; tests at 500 (before the first
+    # fallback release at 1000) and 1010
+    reads = [10, 11, 12, 13, 14, 16, 17]
+    log = struct.pack("<8I", *reads, 0) + struct.pack("<2I", 500, 1010)
+    prod = struct.pack("<3I", 100, 1000, 2000)
+    assert g.parse_cond(log, prod) == {"lost": [0, 0, 0, 0, 0, 1, 1], "count": 1}

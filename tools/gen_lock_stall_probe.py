@@ -25,6 +25,14 @@ eq_NAME     acquires with a change >= 0. The consumer runs a list of lock reques
             tells the acquire rule apart: `simulate` predicts it for each candidate rule,
             and every case completes under every rule (nothing can hang the NPU).
 
+cond_KIND_STATE_V  `acq.cond` / `rel.cond` on LOCK_ID with the condition register r26 = V
+            (COND_VALUES), KIND acq or rel. STATE `free` (acquire, lock holds 1: granted on
+            issue if performed), `stall` (acquire, lock 0, the producer releases it late:
+            a performed request waits), `rel` (release into lock 0). The counter is read
+            in front of the request and in the next six bundles (cycles lost beyond one
+            per bundle: the arbitration cycle at +4 or a refusal), then the lock's count
+            is read back (0/1/2+): was the request performed, did it cost its timing.
+
 Consumer output (`consumer.log`, 64 bytes, little-endian u32):
   lk/same: words 0..7 = r6 at +1..+8 (0 where bundle +D is the acquire), word 8/9 = the
            counter before the load / after the last sample, word 10 = p2 - p0 (same only),
@@ -306,6 +314,61 @@ def parse_b2b(window: str, consumer_log: bytes, producer_ts: bytes | None) -> di
     return out
 
 
+# -- cond: acq.cond / rel.cond, the request performed or skipped by r26 ----------------
+
+# Condition values: 0, 1, nonzero with bit 0 clear, a middle bit, the top bit, all ones,
+# all ones but bit 0 -- whether the test is the whole register or one bit of it.
+COND_VALUES = {"z": 0, "o": 1, "t": 2, "h": 0x100, "m": 0x80000000, "f": 0xFFFFFFFF,
+               "e": 0xFFFFFFFE}
+COND_STATES = {"acq": ("free", "stall"), "rel": ("rel",)}
+# r26 holds the condition, so the counter pair (r27:r26) is not used by cond cases.
+COND_PAIRS = [p for i, p in enumerate(TS_PAIRS) if i != 5]
+COND_LAYOUT = [-1, 0, 1, 2, 3, 4, 5]     # bundle offset from the request of each read
+COND_LAST = 8
+
+
+def cond_program(kind: str) -> list[str]:
+    """Consumer window of cond: `kind`.cond at offset 0, counter reads at COND_LAYOUT."""
+    if kind not in COND_STATES:
+        raise ValueError(f"cond kind is one of {tuple(COND_STATES)}")
+    slots: dict[int, list[str]] = {0: [f"{kind}.cond #{48 + LOCK_ID}, {'r3' if kind == 'acq' else 'r2'}, r26"]}
+    for (hi, lo), off in zip(COND_PAIRS, COND_LAYOUT):
+        slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
+    return [("  " + " ; ".join(slots[o])) if o in slots else N for o in range(-1, COND_LAST + 1)]
+
+
+def cond_case(kind: str, state: str, vkey: str, late_iters: int):
+    if state not in COND_STATES.get(kind, ()):
+        raise ValueError(f"no cond case {kind}_{state}")
+    value = COND_VALUES[vkey]
+    init = 1 if state == "free" else 0
+    body = ["  mov r2, #1", "  mov r3, #-1", f"  movxm r26, #{value}", *[N] * 3,
+            *cond_program(kind), *[N] * 8]
+    body += [f"  st r{lo}, [p0, #{4 * i}]" for i, (_, lo) in enumerate(COND_PAIRS)]
+    body += base.delay_loop(late_iters + B2B_SPACING_ITERS // 2, ".Lcons")
+    for i in range(2):
+        body += [f"  acq #{RAW_OWN}, r3", *[N] * LOCK_SETTLE_BUNDLES, _ts(i)]
+    body += [*[N] * 8, *[f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (8 + i)}]" for i in range(2)]]
+    prod = ["  mov r1, #1", *[N] * 2, *base.delay_loop(late_iters, ".Lprod"), _ts(0)]
+    prod += [f"  rel #{RAW_SOUTH}, r1"] if state == "stall" else [N]
+    for k in range(2):
+        gap = late_iters + 3 * B2B_SPACING_ITERS // 2 if k == 0 else B2B_SPACING_ITERS
+        prod += [*base.delay_loop(gap, f".Lfb{k}"), _ts(k + 1), f"  rel #{RAW_SOUTH}, r1"]
+    prod += [*[N] * 8, *_store_ts(3, 0)]
+    return _topology(f"cond_{kind}_{state}_{vkey}", _frame(body), _frame(prod), init)
+
+
+def parse_cond(consumer_log: bytes, producer_ts: bytes) -> dict:
+    """Cycles lost beyond one per bundle at each read since the one in front of the request,
+    and the count the lock held after the window (0, 1, or 2 = 2 or more)."""
+    ts = struct.unpack_from("<7I", consumer_log)
+    lost = [((ts[i] - ts[0]) & 0xFFFFFFFF) - (COND_LAYOUT[i] - COND_LAYOUT[0]) for i in range(7)]
+    tests = struct.unpack_from("<2I", consumer_log, 32)
+    first_release = struct.unpack_from("<3I", producer_ts)[1]
+    count = sum(((first_release - t) & 0xFFFFFFFF) < 1 << 31 for t in tests)
+    return {"lost": lost, "count": count}
+
+
 # -- eq: acquires with a change >= 0 -----------------------------------------------
 
 Op = tuple[str, int]               # ("acq" | "rel", change)
@@ -498,6 +561,20 @@ def cmd_generate(args) -> int:
                         made.append(b2b_case(pair, v, d, w, args.late_iters))
                         metas.append({"family": "b2b", "pair": pair, "variant": v, "d": d,
                                       "window": w, "late_iters": args.late_iters})
+        elif fam == "cond" or fam.startswith("cond_"):
+            # cond (every case), cond_KIND, cond_KIND_STATE, cond_KIND_STATE_V
+            parts = fam.split("_")[1:]
+            made, metas = [], []
+            for kind, states in COND_STATES.items():
+                for st in states:
+                    for vk in COND_VALUES:
+                        if [kind, st, vk][:len(parts)] != parts:
+                            continue
+                        made.append(cond_case(kind, st, vk, args.late_iters))
+                        metas.append({"family": "cond", "kind": kind, "state": st, "v": vk,
+                                      "value": COND_VALUES[vk], "late_iters": args.late_iters})
+            if not made:
+                raise SystemExit(f"no cond case matches {fam!r}")
         elif fam.startswith("eq_"):
             name = fam[3:]
             made = [eq_case(name, args.step_iters)]
@@ -535,6 +612,11 @@ def cmd_analyze(args) -> int:
             cnt = " ".join(f"L{k}={v}" for k, v in counts.items())
             print(f"{name:24s} lost {cells}  {cnt}{res}")
             continue
+        if meta["family"] == "cond":
+            r = parse_cond(log, (cdir / "producer.ts.bin").read_bytes())
+            cells = " ".join(f"{o:+d}:{x}" for o, x in zip(COND_LAYOUT[1:], r["lost"][1:]))
+            print(f"{name:20s} r26={meta['value']:#010x} lost {cells}  count={r['count']}")
+            continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
             continue
@@ -557,7 +639,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, same, pos, relpos, eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, same, pos, relpos, b2b_<pair>, cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)
