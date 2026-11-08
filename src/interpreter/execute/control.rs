@@ -246,7 +246,9 @@ impl ControlUnit {
                 // Performed at once here; the cycle-accurate executor instead holds the
                 // request for CORE_REQUEST_BUNDLES_IN_FLIGHT bundles (`lock_request` /
                 // `perform_lock_request`).
-                let req = Self::lock_request(op, ctx)?;
+                let Some(req) = Self::lock_request(op, ctx) else {
+                    return Some(ExecuteResult::Continue); // a skipped acq.cond / rel.cond
+                };
                 let pc = ctx.pc();
                 Some(Self::perform_lock_request(&req, ctx, tile, neighbor_locks, pc))
             }
@@ -484,6 +486,9 @@ impl ControlUnit {
 
     /// The lock request of an `acq` / `rel` op, its operands read now (at issue).
     pub fn lock_request(op: &SlotOp, ctx: &ExecutionContext) -> Option<LockRequest> {
+        if !Self::lock_condition_holds(op, ctx) {
+            return None;
+        }
         let kind = match op.semantic {
             Some(SemanticOp::LockAcquire) => {
                 let (raw_lock_id, change) = Self::get_lock_acquire_params(op, ctx);
@@ -498,6 +503,18 @@ impl ControlUnit {
         };
         let (raw_lock_id, delta) = kind;
         Some(LockRequest { raw_lock_id, kind: LockRequestKind::Release { delta }, pc: ctx.pc() })
+    }
+
+    /// Whether an `acq` / `rel` is performed. `acq.cond` / `rel.cond` carry the condition
+    /// register (r26) as a third source and perform their request iff its bit 0 is set;
+    /// a skipped request is nothing at all (silicon, build/experiments/lock-cond): no
+    /// arbitration cycle, no wait, no window for other requests to join. The plain forms
+    /// have two sources and always perform.
+    pub fn lock_condition_holds(op: &SlotOp, ctx: &ExecutionContext) -> bool {
+        match op.sources.get(2) {
+            Some(Operand::ScalarReg(r)) => ctx.scalar_read(*r) & 1 == 1,
+            _ => true,
+        }
     }
 
     /// Whether `req` is an acquire that cannot be granted now (lock unchanged).

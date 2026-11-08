@@ -1541,6 +1541,87 @@ mod tests {
         }
     }
 
+    /// `acq.cond` (change -1) / `rel.cond` (+1) of own local lock `lock`; the condition
+    /// register is r26.
+    fn own_cond_request(acquire: bool, lock: u8) -> SlotOp {
+        own_lock_request(acquire, lock).with_source(Operand::ScalarReg(26))
+    }
+
+    // Silicon (build/experiments/lock-cond, `tools/gen_lock_stall_probe.py` cond, r1 == r2):
+    // `acq.cond` / `rel.cond` perform their request iff bit 0 of r26 is set (r26 = 1 and
+    // 0xFFFFFFFF do; 0, 2, 0x100, 0x80000000 and 0xFFFFFFFE do not). A skipped request is
+    // nothing at all: no arbitration cycle, no wait on a lock that would refuse it, the
+    // count untouched. A performed one is the plain request.
+    #[test]
+    fn a_conditional_lock_request_is_performed_iff_bit_0_of_r26_is_set() {
+        // (deltas between counter reads, held flags, final count) of `req` in front of 7 nops
+        let run = |req: SlotOp, cond: u32, count: u8| {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            let mut tile = Tile::compute(0, 2);
+            ctx.scalar.write(26, cond);
+            tile.locks[5].value = count;
+            let mut bundles = vec![make_bundle(vec![req])];
+            bundles.extend(nops(7));
+            // a refused acquire is released at once (wait 0)
+            let issued = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
+            tile.resolve_lock_requests(ctx.cycles);
+            let deltas: Vec<u64> = issued.windows(2).map(|w| w[1].0 - w[0].0).collect();
+            (deltas, issued.iter().map(|x| x.1).collect::<Vec<_>>(), tile.locks[5].value)
+        };
+        for cond in [0u32, 1, 2, 0x100, 0x8000_0000, 0xFFFF_FFFF, 0xFFFF_FFFE] {
+            for (acquire, count) in [(true, 1u8), (true, 0), (false, 0)] {
+                let case = format!("r26 {cond:#x}, {} on count {count}", if acquire { "acq" } else { "rel" });
+                let got = run(own_cond_request(acquire, 5), cond, count);
+                if cond & 1 == 1 {
+                    assert_eq!(got, run(own_lock_request(acquire, 5), cond, count), "performed: {case}");
+                } else {
+                    assert_eq!(got, (vec![1; 7], vec![false; 8], count), "skipped: {case}");
+                }
+            }
+        }
+    }
+
+    // Silicon (lock-cond condwin, r1 == r2): a skipped request does not open the window
+    // that a request issued 1..3 bundles after it would join: the plain `rel` then
+    // resolves in front of its own fourth bundle (+d+4), not the skipped one's (+4). A
+    // skipped request after a plain one changes nothing. A performed `rel.cond` opens the
+    // window as a plain `rel` does.
+    #[test]
+    fn a_skipped_conditional_request_opens_no_window() {
+        for (cond_first, cond, acquire) in
+            [(true, 0u32, true), (true, 0, false), (false, 0, true), (true, 1, false)]
+        {
+            for d in 1..=3usize {
+                let mut executor = CycleAccurateExecutor::new();
+                let mut ctx = ExecutionContext::new();
+                let mut tile = Tile::compute(0, 2);
+                ctx.scalar.write(26, cond);
+                tile.locks[5].value = u8::from(acquire);
+                let (first, second) = if cond_first {
+                    (own_cond_request(acquire, 5), own_lock_request(false, 6))
+                } else {
+                    (own_lock_request(false, 6), own_cond_request(acquire, 5))
+                };
+                let bundles: Vec<VliwBundle> = (0..=12)
+                    .map(|i| match i {
+                        0 => make_bundle(vec![first.clone()]),
+                        i if i == d => make_bundle(vec![second.clone()]),
+                        _ => make_bundle(vec![]),
+                    })
+                    .collect();
+                let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
+                tile.resolve_lock_requests(ctx.cycles);
+                let lost: Vec<u64> =
+                    reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
+                let resolves_at = if cond_first && cond & 1 == 0 { d + 4 } else { 4 };
+                let expect: Vec<u64> = (0..=12).map(|i| u64::from(i >= resolves_at)).collect();
+                assert_eq!(lost, expect, "cond first {cond_first}, r26 {cond}, acq {acquire}, d {d}");
+                assert_eq!(tile.locks[6].value, 1, "the plain rel is performed");
+            }
+        }
+    }
+
     // Silicon (lock-b2b, 116 samples of b2b gr/rg out of the window and pos_stall): with S
     // the cycle the held bundle first tried to issue and P the releasing core's counter
     // read in front of its `rel`, the held bundle issues at P+7, or at P+8 when

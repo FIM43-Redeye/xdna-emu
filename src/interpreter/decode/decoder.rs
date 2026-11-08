@@ -767,6 +767,27 @@ mod tests {
     }
 
     #[test]
+    fn test_conditional_lock_requests_carry_r26_as_a_third_source() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder =
+            InstructionDecoder::try_load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+        // llvm-mc: `acq.cond #63, r4, r26`, `rel.cond #62, r4, r26`, `acq.cond r5, r4, r26`
+        for (bytes, semantic) in [
+            ([0x19u8, 0x42, 0xe6, 0x17], SemanticOp::LockAcquire),
+            ([0x19, 0x42, 0xc4, 0x17], SemanticOp::LockRelease),
+            ([0x19, 0x42, 0x56, 0x11], SemanticOp::LockAcquire),
+        ] {
+            let bundle = decoder.decode(&bytes, 0).expect("Should decode a conditional lock request");
+            let op = bundle.active_slots().find(|s| s.semantic == Some(semantic)).expect("lock op");
+            assert_eq!(op.sources.get(2), Some(&Operand::ScalarReg(26)), "{bytes:02x?}");
+        }
+    }
+
+    #[test]
     fn test_decoder_via_tblgen() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {
