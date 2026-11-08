@@ -56,6 +56,7 @@ class DeviceModel:
     default_core_stack_size: int
     address_gen_granularity_bits: int   # mlir-aie getAddressGenGranularity(): BITS
     cascade: CascadeRule
+    max_lock_value: int                 # mlir-aie getMaxLockValue(): largest lock count
     _tile_types: dict[TileCoord, str]
     _type_configs: dict[str, dict]
 
@@ -176,6 +177,7 @@ def load_device_model(name: str, path: Path = DEFAULT_MODELS_PATH) -> DeviceMode
             default_core_stack_size=d["default_core_stack_size"],
             address_gen_granularity_bits=d["address_gen_granularity"],
             cascade=rule,
+            max_lock_value=d["max_lock_value"],
             _tile_types={(t["col"], t["row"]): t["type"] for t in d["tile_map"]},
             _type_configs=d["tile_types"],
         )

@@ -23,7 +23,7 @@ from pathlib import Path
 from .device_model import (
     DEFAULT_MODELS_PATH, DeviceModel, DeviceModelError, load_device_model,
 )
-from .topology import Cascade, Core, CoreStream, Topology
+from .topology import Cascade, Core, CoreStream, SharedLock, Topology
 
 
 # aiecc picks the linker per package (`--xchesscc --xbridge` or not), hence one compiler
@@ -178,6 +178,7 @@ def _check_links(topology: Topology, device: DeviceModel, err) -> None:
     cascade_out: dict[str, int] = {}
     cascade_in: dict[str, int] = {}
     core_ports = device.stream_ports("core", "Core")
+    locks_seen: set[tuple[int, int, int]] = set()
 
     for link in topology.links:
         missing = [n for n in (link.src, link.dst) if n not in cores]
@@ -200,6 +201,13 @@ def _check_links(topology: Topology, device: DeviceModel, err) -> None:
                     f"({src.tile.col},{src.tile.row}) -> "
                     f"({dst.tile.col},{dst.tile.row}) is not a legal hop; "
                     f"legal: {legal}", link.src, link.dst)
+        elif isinstance(link, SharedLock):
+            _check_lock(link, src, dst, device, err)
+            key = (src.tile.col, src.tile.row, link.lock_id)
+            if key in locks_seen:
+                err("lock_duplicate",
+                    f"lock {link.lock_id} of core {link.src!r} is declared twice", link.src)
+            locks_seen.add(key)
         elif isinstance(link, CoreStream):
             if link.src == link.dst:
                 err("stream_endpoints_same",
@@ -219,3 +227,25 @@ def _check_links(topology: Topology, device: DeviceModel, err) -> None:
     for name, n in cascade_in.items():
         if n > 1:
             err("cascade_multiple_in", f"core {name!r} has {n} cascade inputs", name)
+
+
+# Memory modules an AIE2 core reaches, as (owner - user) tile offsets: its own (the
+# "east" quadrant, raw lock IDs 48..63), south (row - 1, IDs 0..15), west (col - 1,
+# 16..31) and north (row + 1, 32..47). mlir-aie AIE2TargetModel::isLegalMemAffinity
+# and getLockLocalBaseIndex.
+_LOCK_REACH = ((0, 0), (0, -1), (-1, 0), (0, 1))
+
+
+def _check_lock(link: SharedLock, owner: Core, user: Core, device: DeviceModel, err) -> None:
+    n = device.num_locks("core")
+    if not 0 <= link.lock_id < n:
+        err("lock_id_range", f"lock {link.lock_id} of core {link.src!r}: outside 0..{n - 1}",
+            link.src)
+    if not 0 <= link.init <= device.max_lock_value:
+        err("lock_init_range", f"lock {link.lock_id} of core {link.src!r}: init {link.init} "
+            f"outside 0..{device.max_lock_value}", link.src)
+    offset = (owner.tile.col - user.tile.col, owner.tile.row - user.tile.row)
+    if offset not in _LOCK_REACH:
+        err("lock_out_of_reach",
+            f"core {link.dst!r} at ({user.tile.col},{user.tile.row}) cannot reach the locks of "
+            f"({owner.tile.col},{owner.tile.row})", link.src, link.dst)

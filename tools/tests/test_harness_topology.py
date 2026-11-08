@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from harness.topology import (
-    Buffer, Cascade, Core, CoreStream, TileRef, Topology, TopologyFormatError,
+    Buffer, Cascade, Core, CoreStream, SharedLock, TileRef, Topology, TopologyFormatError,
     load_topology, topology_from_dict, to_dict,
 )
 
@@ -156,3 +156,17 @@ def test_via_fifo_round_trips_and_is_absent_from_plain_streams():
     assert d["links"][0]["via_fifo"] is True
     assert "via_fifo" not in d["links"][1], "plain streams serialize as before (case hashes stay)"
     assert topology_from_dict(d) == t
+
+
+def test_shared_lock_round_trips_and_defaults_init_to_zero():
+    t = Topology("t", cores=(), links=(SharedLock("a", "b", 15, init=3), SharedLock("a", "a", 4)))
+    assert SharedLock("a", "b", 1).init == 0
+    d = to_dict(t)
+    assert d["links"][0] == {"kind": "lock", "src": "a", "dst": "b", "lock_id": 15, "init": 3}
+    assert topology_from_dict(d) == t
+
+
+def test_shared_lock_needs_an_id():
+    d = {"name": "t", "cores": [], "links": [{"kind": "lock", "src": "a", "dst": "b"}]}
+    with pytest.raises(TopologyFormatError, match="lock_id"):
+        topology_from_dict(d)

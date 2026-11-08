@@ -12,7 +12,7 @@ import pytest
 
 from harness.device_model import load_device_model
 from harness.plan import ChannelPlan, PlanError, plan_channels, resolve_device
-from harness.topology import Buffer, Cascade, Core, CoreStream, TileRef, Topology
+from harness.topology import Buffer, Cascade, Core, CoreStream, SharedLock, TileRef, Topology
 
 
 @pytest.fixture(scope="module")
@@ -498,3 +498,12 @@ def test_sixteen_cores_balance_two_per_column_per_phase(dev):
             per_col[col] = per_col.get(col, 0) + 1
         assert per_col == {0: 2, 1: 2, 2: 2, 3: 2}
         assert not any(r.borrowed for r in p.routes)
+
+
+def test_shared_lock_keeps_its_cores_in_one_phase(dev):
+    small = tiny_memtile(dev)
+    cs = sixteen()
+    t = topo(*cs, links=[SharedLock(cs[7].name, cs[8].name, 15)])
+    plan = plan_channels(t, small)
+    where = {c: p.index for p in plan.phases for c in p.cores}
+    assert where[cs[7].name] == where[cs[8].name]

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 
 from .device_model import DeviceModel, load_device_model
 from .plan import BufferRoute, ChannelPlan, Phase, StagingGroup
-from .topology import Cascade, Core, CoreStream, Topology
+from .topology import Cascade, Core, CoreStream, SharedLock, Topology
 
 
 class EmitError(ValueError):
@@ -239,7 +239,11 @@ def _emit_links(out: list[str], topology: Topology, ph: Phase,
         if link.src not in in_phase or link.dst not in in_phase:
             continue
         s, d = by_name[link.src].tile, by_name[link.dst].tile
-        if isinstance(link, Cascade):
+        if isinstance(link, SharedLock):
+            name = f"lock_{s.col}_{s.row}_{link.lock_id}"
+            lines.append(f"    %{name} = aie.lock(%tile_{s.col}_{s.row}, {link.lock_id}) "
+                         f'{{init = {link.init} : i32, sym_name = "{name}"}}')
+        elif isinstance(link, Cascade):
             lines.append(f"    aie.cascade_flow(%tile_{s.col}_{s.row}, %tile_{d.col}_{d.row})")
         elif isinstance(link, CoreStream) and link.via_fifo:
             lines.append(f"    aie.flow(%tile_{s.col}_{s.row}, Core : {link.src_port}, "

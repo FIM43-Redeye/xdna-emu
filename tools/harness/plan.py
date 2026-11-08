@@ -106,7 +106,7 @@ from .device_model import (
     DEFAULT_MODELS_PATH, DeviceModel, DeviceModelError, available_devices,
     load_device_model,
 )
-from .topology import Buffer, Cascade, Core, CoreStream, Topology
+from .topology import Buffer, Cascade, Core, CoreStream, SharedLock, Topology
 
 OBJECTFIFO_DEPTH = 1
 DEFAULT_DEVICE_FAMILY = "npu1"
@@ -275,7 +275,7 @@ def _linked_units(topology: Topology) -> list[list[int]]:
         return i
 
     for link in topology.links:
-        if isinstance(link, (Cascade, CoreStream)) and link.src in index and link.dst in index:
+        if isinstance(link, (Cascade, CoreStream, SharedLock)) and link.src in index and link.dst in index:
             a, b = find(index[link.src]), find(index[link.dst])
             if a != b:
                 parent[max(a, b)] = min(a, b)

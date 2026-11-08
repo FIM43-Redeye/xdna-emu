@@ -7,7 +7,7 @@ import pytest
 from harness.device_model import load_device_model
 from harness.emit import EmitError, emit_mlir, kernel_object, kernel_symbol
 from harness.plan import plan_channels
-from harness.topology import Buffer, Cascade, Core, CoreStream, TileRef, Topology
+from harness.topology import Buffer, Cascade, Core, CoreStream, SharedLock, TileRef, Topology
 
 
 @pytest.fixture(scope="module")
@@ -142,3 +142,13 @@ def test_shim_bd_budget_is_checked(dev):
     plan = plan_channels(t, dev)
     with pytest.raises(EmitError, match="BDs"):
         emit_mlir(t, plan, 0, small)
+
+
+def test_shared_lock_is_declared_on_the_owner_tile_with_its_init(dev):
+    """The lock gets a fixed ID (objectfifo locks are assigned around it) and an init, so
+    every load of the design starts it from the same count."""
+    a, b = core("a", 0, 2, outs=(64,)), core("b", 0, 3)
+    text = emit(topo(a, b, links=[SharedLock("a", "b", 15, init=2)]), dev)
+    assert ('%lock_0_2_15 = aie.lock(%tile_0_2, 15) {init = 2 : i32, sym_name = "lock_0_2_15"}'
+            in text)
+    assert text.index("aie.lock(") > text.index("%tile_0_3 = aie.tile(0, 3)")

@@ -5,7 +5,7 @@ import pytest
 
 from harness.device_model import load_device_model
 from harness.topology import (
-    Buffer, Cascade, Core, CoreStream, TileRef, Topology,
+    Buffer, Cascade, Core, CoreStream, SharedLock, TileRef, Topology,
 )
 from harness.validate import ValidationError, validate, validate_topology
 
@@ -249,3 +249,50 @@ def test_validate_topology_auto_still_checks_the_rest():
 
 def test_validate_itself_still_compares_names(dev):
     assert "device_mismatch" in codes(validate(topo(core(), device="auto"), dev))
+
+
+# -- shared locks --------------------------------------------------------------
+
+@pytest.mark.parametrize("user", [(0, 2), (0, 3), (1, 2)])
+def test_shared_lock_legal_where_the_user_reaches_the_owner_memory(dev, user):
+    """Owner (0,2): its own core, the core above it (whose south quadrant it is) and
+    the core east of it (west quadrant). Below (0,2) is the memtile row."""
+    owner = core("a", 0, 2)
+    cores = [owner] if user == (0, 2) else [owner, core("b", *user)]
+    dst = "a" if user == (0, 2) else "b"
+    t = topo(*cores, links=[SharedLock("a", dst, 15)])
+    assert validate(t, dev) == []
+
+
+@pytest.mark.parametrize("user", [(1, 3), (0, 4), (2, 2)])
+def test_shared_lock_out_of_reach(dev, user):
+    t = topo(core("a", 0, 2), core("b", *user), links=[SharedLock("a", "b", 15)])
+    assert codes(validate(t, dev)) == ["lock_out_of_reach"]
+
+
+def test_shared_lock_west_of_owner_is_out_of_reach(dev):
+    """The west quadrant is the memory of the core to the WEST: (1,2) owns, (0,2) cannot."""
+    t = topo(core("a", 1, 2), core("b", 0, 2), links=[SharedLock("a", "b", 15)])
+    assert codes(validate(t, dev)) == ["lock_out_of_reach"]
+
+
+def test_shared_lock_id_and_init_ranges(dev):
+    n = dev.num_locks("core")
+    bad_id = topo(core("a", 0, 2), links=[SharedLock("a", "a", n)])
+    assert codes(validate(bad_id, dev)) == ["lock_id_range"]
+    bad_init = topo(core("a", 0, 2), links=[SharedLock("a", "a", 0, init=dev.max_lock_value + 1)])
+    assert codes(validate(bad_init, dev)) == ["lock_init_range"]
+    neg = topo(core("a", 0, 2), links=[SharedLock("a", "a", 0, init=-1)])
+    assert codes(validate(neg, dev)) == ["lock_init_range"]
+
+
+def test_shared_lock_declared_twice(dev):
+    t = topo(core("a", 0, 2), core("b", 0, 3),
+             links=[SharedLock("a", "b", 3), SharedLock("a", "a", 3)])
+    assert codes(validate(t, dev)) == ["lock_duplicate"]
+
+
+def test_shared_lock_from_the_core_below_is_legal(dev):
+    """Owner (0,3), user (0,2): the owner is the user's north quadrant."""
+    t = topo(core("a", 0, 3), core("b", 0, 2), links=[SharedLock("a", "b", 15)])
+    assert validate(t, dev) == []

@@ -64,7 +64,21 @@ class CoreStream:
     via_fifo: bool = False
 
 
-Link = Cascade | CoreStream
+@dataclass(frozen=True)
+class SharedLock:
+    """`aie.lock(<src tile>, lock_id) {init}`: a lock in the memory module of core `src`'s
+    tile that core `dst` also uses (`dst == src` for a lock only its own core touches).
+
+    The lock has a fixed ID, so objectfifo locks are assigned around it, and an init, so
+    every load of the design starts it from the same count. Kernels address it by the raw
+    ID of the quadrant it sits in, as seen from each core."""
+    src: str
+    dst: str
+    lock_id: int
+    init: int = 0
+
+
+Link = Cascade | CoreStream | SharedLock
 
 
 @dataclass(frozen=True)
@@ -82,7 +96,7 @@ class Topology:
 
 # -- serialization -----------------------------------------------------------
 
-_LINK_KINDS: dict[str, type] = {"cascade": Cascade, "stream": CoreStream}
+_LINK_KINDS: dict[str, type] = {"cascade": Cascade, "stream": CoreStream, "lock": SharedLock}
 
 
 def to_dict(t: Topology) -> dict[str, Any]:
@@ -100,8 +114,10 @@ def to_dict(t: Topology) -> dict[str, Any]:
                 "args": [buffer(b) for b in c.args]}
 
     def link(l: Link) -> dict[str, Any]:
-        kind = "cascade" if isinstance(l, Cascade) else "stream"
+        kind = next(k for k, t in _LINK_KINDS.items() if isinstance(l, t))
         d: dict[str, Any] = {"kind": kind, "src": l.src, "dst": l.dst}
+        if isinstance(l, SharedLock):
+            d.update(lock_id=l.lock_id, init=l.init)
         if isinstance(l, CoreStream):
             d.update(src_port=l.src_port, dst_port=l.dst_port)
             if l.via_fifo:
@@ -160,6 +176,9 @@ def topology_from_dict(d: dict[str, Any]) -> Topology:
         if isinstance(l, dict) and l["kind"] == "cascade":
             l = _fields(l, {"kind", "src", "dst"}, set(), where)
             return Cascade(l["src"], l["dst"])
+        if isinstance(l, dict) and l["kind"] == "lock":
+            l = _fields(l, {"kind", "src", "dst", "lock_id"}, {"init"}, where)
+            return SharedLock(l["src"], l["dst"], l["lock_id"], l.get("init", 0))
         l = _fields(l, {"kind", "src", "dst"}, {"src_port", "dst_port", "via_fifo"}, where)
         return CoreStream(l["src"], l["dst"], l.get("src_port", 0), l.get("dst_port", 0),
                           bool(l.get("via_fifo", False)))
