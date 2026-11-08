@@ -721,7 +721,13 @@ impl CycleAccurateExecutor {
             let stall_cycle = ctx.cycles;
             ctx.timing_context_mut()
                 .record_event(stall_cycle, EventType::CascadeStallLevel { active: true });
-            ctx.record_instruction(1);
+            // The held bundle does not issue, so this cycle freezes the pipeline like
+            // every later cycle of the stall: `record_stall`, not `record_instruction`,
+            // which would let in-flight write-backs advance one issued bundle early.
+            // Silicon (cascade read hold, cascade write and stream read stalls):
+            // a load in flight across the stall lands 7 issued bundles after it
+            // (build/experiments/cascade-numerics/{lda1,wlda1,slda1}).
+            ctx.record_stall(1);
             let timing = ctx.timing_context_mut();
             timing.hazard_stalls = self.total_hazard_stalls;
             return ExecuteResult::WaitStream { port: 254 };
@@ -743,7 +749,7 @@ impl CycleAccurateExecutor {
                     // edge is recorded in try_resume_stall when the cascade unblocks.
                     ctx.timing_context_mut()
                         .record_event(stall_cycle, EventType::CascadeStallLevel { active: true });
-                    ctx.record_instruction(1);
+                    ctx.record_stall(1); // frozen, as for the hold above
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
                     return ExecuteResult::WaitStream { port };
@@ -756,7 +762,7 @@ impl CycleAccurateExecutor {
                     // try_resume_stall when stream data resumes.
                     ctx.timing_context_mut()
                         .record_event(stall_cycle, EventType::StreamStallLevel { active: true });
-                    ctx.record_instruction(1);
+                    ctx.record_stall(1); // frozen, as for the hold above
                     let timing = ctx.timing_context_mut();
                     timing.hazard_stalls = self.total_hazard_stalls;
                     return ExecuteResult::WaitStream { port };
@@ -1436,6 +1442,133 @@ mod tests {
                 .any(|e| matches!(e, EventType::StreamStall { .. } | EventType::StreamStallLevel { .. })),
             "cascade stall must not be mislabeled as STREAM_STALL; got {events:?}"
         );
+    }
+
+    /// Issued bundles after a scalar `lda r6` at which its result first becomes visible,
+    /// with the load issued 4 bundles after a `vmov x0, SCD` (the in-flight position of
+    /// Peano's matmul_scalar_cascade get loop). With `hold_cycles > 0` the SCD is empty when
+    /// the read's hold bundle (+5 after the vmov, the bundle right after the load) arrives,
+    /// and stays empty that many cycles; the stall loop mimics `CoreInterpreter` (one
+    /// `record_stall` per waiting cycle, then the held bundle re-executes).
+    fn scalar_load_visibility_across_cascade_hold(hold_cycles: u32) -> usize {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.write_data_u32(0x100, 222);
+        ctx.pointer.write(0, 0x100);
+        ctx.scalar.write(6, 111);
+        if hold_cycles == 0 {
+            tile.push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
+        }
+        let read =
+            make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
+                .with_dest(Operand::VectorReg(0))]);
+        let lda = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(6))
+            .with_source(Operand::PointerReg(0))]);
+        assert!(matches!(executor.execute(&read, &mut ctx, &mut tile), ExecuteResult::Continue));
+        for _ in 0..3 {
+            assert!(matches!(
+                executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile),
+                ExecuteResult::Continue
+            ));
+        }
+        assert!(matches!(executor.execute(&lda, &mut ctx, &mut tile), ExecuteResult::Continue));
+        for after_lda in 1..=12 {
+            if ctx.scalar_read(6) == 222 {
+                return after_lda;
+            }
+            let mut r = executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            if after_lda == 1 && hold_cycles > 0 {
+                assert!(matches!(r, ExecuteResult::WaitStream { port: 254 }), "+5 after the vmov is held");
+                ctx.record_stall(1);
+                for _ in 1..hold_cycles {
+                    ctx.record_stall(1);
+                }
+                tile.push_cascade_input([0; xdna_archspec::aie2::CASCADE_WORDS]);
+                r = executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            }
+            assert!(matches!(r, ExecuteResult::Continue), "bundle +{after_lda} after the lda issues");
+        }
+        panic!("the load never landed");
+    }
+
+    // Silicon (Phoenix, build/experiments/cascade-numerics/lda1, r1 == r2): a scalar load
+    // issued 1..7 bundles after `vmov x0, SCD` lands 7 issued bundles after the load whether
+    // or not the read's hold stalls the core in between (~15k cycles in the `absent` runs).
+    // The hold freezes the pipeline: in-flight write-backs do not advance while it lasts.
+    #[test]
+    fn scalar_load_in_flight_lands_seven_issued_bundles_later_across_a_cascade_hold() {
+        assert_eq!(scalar_load_visibility_across_cascade_hold(0), 7, "no hold");
+        for hold in [1, 2, 5, 40] {
+            assert_eq!(scalar_load_visibility_across_cascade_hold(hold), 7, "hold of {hold} cycles");
+        }
+    }
+
+    /// Issued bundles after a scalar `lda r6` at which its result first becomes visible, with
+    /// a blocking `mov r2, SS` `read_at` bundles after the load on a stream that stays empty
+    /// for `stall_cycles` (0: a word is already there).
+    fn scalar_load_visibility_across_stream_stall(read_at: usize, stall_cycles: u32) -> usize {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.write_data_u32(0x100, 222);
+        ctx.pointer.write(0, 0x100);
+        ctx.scalar.write(6, 111);
+        if stall_cycles == 0 {
+            tile.push_stream_input(0, 5);
+        }
+        let lda = make_bundle(vec![SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Word)
+            .with_dest(Operand::ScalarReg(6))
+            .with_source(Operand::PointerReg(0))]);
+        let ss_read = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(true)
+            .with_dest(Operand::ScalarReg(2))]);
+        assert!(matches!(executor.execute(&lda, &mut ctx, &mut tile), ExecuteResult::Continue));
+        for after_lda in 1..=12 {
+            if after_lda != read_at && ctx.scalar_read(6) == 222 {
+                return after_lda;
+            }
+            let bundle = if after_lda == read_at {
+                ss_read.clone()
+            } else {
+                make_bundle(vec![])
+            };
+            let mut r = executor.execute(&bundle, &mut ctx, &mut tile);
+            if after_lda == read_at && stall_cycles > 0 {
+                assert!(matches!(r, ExecuteResult::WaitStream { .. }), "the read stalls");
+                for _ in 0..stall_cycles {
+                    ctx.record_stall(1);
+                }
+                tile.push_stream_input(0, 5);
+                r = executor.execute(&bundle, &mut ctx, &mut tile);
+            }
+            assert!(matches!(r, ExecuteResult::Continue), "bundle +{after_lda} after the lda issues");
+        }
+        panic!("the load never landed");
+    }
+
+    // Silicon (build/experiments/cascade-numerics/slda1, r1 == r2): with the blocking stream
+    // read at +1..+6 after the load and the producer ~15k cycles late, the load still lands 7
+    // issued bundles after it (the read bundle counts as one).
+    #[test]
+    fn scalar_load_in_flight_lands_seven_issued_bundles_later_across_a_stream_stall() {
+        for read_at in 1..=6 {
+            assert_eq!(
+                scalar_load_visibility_across_stream_stall(read_at, 0),
+                7,
+                "no stall, read at +{read_at}"
+            );
+            for stall in [1, 3, 40] {
+                assert_eq!(
+                    scalar_load_visibility_across_stream_stall(read_at, stall),
+                    7,
+                    "read at +{read_at}, stall of {stall} cycles"
+                );
+            }
+        }
     }
 
     #[test]
