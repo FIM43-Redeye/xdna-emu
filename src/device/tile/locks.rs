@@ -364,6 +364,17 @@ impl Lock {
     /// one.
     #[inline]
     pub fn acquire_with_value(&mut self, expected: u8, delta: i8) -> LockResult {
+        let result = self.check_acquire(expected, delta);
+        if result == LockResult::Success {
+            self.value = (self.value as i16 + delta as i16) as u8;
+        }
+        result
+    }
+
+    /// What `acquire_with_value(expected, delta)` would return now, without
+    /// changing the lock. A core held on an acquire polls this.
+    #[inline]
+    pub fn check_acquire(&self, expected: u8, delta: i8) -> LockResult {
         if self.is_frozen() {
             return LockResult::Frozen;
         }
@@ -371,7 +382,6 @@ impl Lock {
         if self.value < expected || !(0..Self::MODULUS).contains(&new_value) {
             return LockResult::PreconditionNotMet;
         }
-        self.value = new_value as u8;
         LockResult::Success
     }
 

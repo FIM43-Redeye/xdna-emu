@@ -81,6 +81,47 @@ impl<'a> NeighborLocks<'a> {
         Self { south: locks, west: None, north: None }
     }
 }
+/// A core lock request, its operands read when the `acq` / `rel` issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockRequest {
+    /// Raw lock ID (0-63): quadrant + index.
+    pub raw_lock_id: u8,
+    pub kind: LockRequestKind,
+    /// PC of the `acq` / `rel`.
+    pub pc: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRequestKind {
+    Acquire { expected: u8, delta: i8 },
+    Release { delta: i8 },
+}
+
+/// The memory module a core's raw lock ID (0..63) names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockQuadrant {
+    South,
+    West,
+    North,
+    /// "East" = the core's own memory module on AIE2.
+    Own,
+}
+
+impl LockQuadrant {
+    /// Quadrant and lock index within it.
+    fn of(raw_lock_id: u8) -> (Self, u8) {
+        if raw_lock_id >= quadrants::EAST_START {
+            (Self::Own, raw_lock_id - quadrants::EAST_START)
+        } else if raw_lock_id >= quadrants::NORTH_START {
+            (Self::North, raw_lock_id - quadrants::NORTH_START)
+        } else if raw_lock_id >= quadrants::WEST_START {
+            (Self::West, raw_lock_id - quadrants::WEST_START)
+        } else {
+            (Self::South, raw_lock_id - quadrants::SOUTH_START)
+        }
+    }
+}
+
 use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
 
 /// Control unit for branches, calls, and synchronization.
@@ -196,163 +237,13 @@ impl ControlUnit {
                 Some(ExecuteResult::Branch { target })
             }
 
-            Some(SemanticOp::LockAcquire) => {
-                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
-                // AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex
-                // and AIE2TargetModel::isMemEast = isInternal):
-                //
-                // - IDs 0-15  (South): row-1 neighbor (MemTile for compute row 2)
-                // - IDs 16-31 (West):  col-1 neighbor
-                // - IDs 32-47 (North): row+1 neighbor
-                // - IDs 48-63 (East=Internal): OWN tile's memory module
-                //
-                // The DMA BD lock field (4-bit) directly addresses tile-local
-                // locks 0-15, matching the East/Internal quadrant (IDs 48-63).
-                let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
-
-                let current_value = locks[lock_id as usize].value;
-                let lock = &mut locks[lock_id as usize];
-
-                // Greater-or-equal acquire for every change value: see
-                // get_lock_acquire_params for how a change >= 0 is read here
-                // (the core's equal-acquire semantics are unprobed).
-                let result = lock.acquire_with_value(expected, delta);
-
-                match result {
-                    LockResult::Success => {
-                        log::trace!(
-                            "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
-                            ctx.pc(),
-                            ctx.cycles,
-                            raw_lock_id,
-                            current_value,
-                            lock.value
-                        );
-                        log::info!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
-                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile);
-                        // Trace event: INSTR_LOCK_ACQUIRE_REQ (hw_id 44). HW fires
-                        // this once per acquire instruction issued. We record only
-                        // on Success so retries during WaitLock stalls don't inflate
-                        // the count -- for tests that complete, every acquire
-                        // eventually succeeds exactly once, matching HW 1:1.
-                        //
-                        // PC is sampled with a pipeline-depth delay rather than
-                        // taken from the issuing acq instruction, because HW's
-                        // trace controller observes the acq-success signal at a
-                        // late pipeline stage and stamps the frame with the
-                        // then-current issue PC. Empirically that lands ~4 cyc
-                        // (one ret + three delay-slot nops) past the acq.
-                        let cycle = ctx.cycles;
-                        ctx.timing_context_mut().record_event_with_pc_delay(
-                            cycle,
-                            crate::interpreter::state::TRACE_PC_PIPELINE_DEPTH,
-                            crate::interpreter::state::DeferredPcKind::InstrLockAcquireReq,
-                        );
-                        // Core-relay recorder (P6): record own-tile acquires only.
-                        // cross-tile acquires go to a different tile's lock and are
-                        // not part of the through-core relay pattern.
-                        if is_own_tile {
-                            if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
-                                lock_evs.push(crate::device::tile::CoreLockEvent {
-                                    cycle,
-                                    lock_local_id: lock_id,
-                                    op: crate::device::tile::CoreLockOp::Acquire,
-                                    col: tile.col,
-                                    row: tile.row,
-                                });
-                            }
-                        }
-                        Some(ExecuteResult::Continue)
-                    }
-                    // A frozen lock (overflow/underflow bit set) refuses the
-                    // acquire like an unmet condition: the core keeps waiting.
-                    LockResult::PreconditionNotMet | LockResult::Frozen => {
-                        log::info!(
-                            "LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
-                            raw_lock_id,
-                            lock_id,
-                            expected,
-                            current_value,
-                            is_own_tile
-                        );
-                        Some(ExecuteResult::WaitLock { raw_lock_id })
-                    }
-                }
-            }
-
-            Some(SemanticOp::LockRelease) => {
-                let (raw_lock_id, delta) = Self::get_lock_release_params(op, ctx);
-                let tile_col = tile.col;
-                let tile_row = tile.row;
-
-                // Same quadrant routing as LockAcquire.
-                let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
-
-                if is_own_tile {
-                    // Own-tile release: defer by 1 cycle to model hardware lock
-                    // arbiter pipeline. The request is submitted to the arbiter
-                    // and resolved in Phase 3, making it visible to DMA next cycle.
-                    let old_value = locks[lock_id as usize].value;
-                    tile.defer_core_lock_release(lock_id as usize, delta);
-                    log::info!(
-                        "LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
-                        tile_col,
-                        tile_row,
-                        raw_lock_id,
-                        lock_id,
-                        delta,
-                        old_value
-                    );
-                    // Core-relay recorder (P6): record own-tile releases only.
-                    let cycle = ctx.cycles;
-                    if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
-                        lock_evs.push(crate::device::tile::CoreLockEvent {
-                            cycle,
-                            lock_local_id: lock_id,
-                            op: crate::device::tile::CoreLockOp::Release,
-                            col: tile_col,
-                            row: tile_row,
-                        });
-                    }
-                } else {
-                    // Cross-tile release (memtile path): the clone-modify-writeback
-                    // mechanism in the coordinator handles deferral separately.
-                    let old_value = locks[lock_id as usize].value;
-                    let lock = &mut locks[lock_id as usize];
-                    lock.release_with_value(delta);
-                    log::info!(
-                        "LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
-                        tile_col,
-                        tile_row,
-                        raw_lock_id,
-                        lock_id,
-                        delta,
-                        old_value,
-                        lock.value
-                    );
-                }
-                // Trace event: INSTR_LOCK_RELEASE_REQ (hw_id 45). HW fires this
-                // once per release instruction issued; releases always complete
-                // in the same cycle, so a single record matches HW 1:1.
-                //
-                // Plus a 1-cycle LOCK_STALL: HW emits LOCK_STALL for the cycle
-                // each release operation is in flight (the lock arbiter commit
-                // window). Observed on add_one_using_dma chess trace: 16
-                // releases in the kernel produce exactly 16 LOCK_STALL events
-                // at the release helper's last-bundle PC, in addition to the
-                // thousands at the head-of-line-stalled acquire's PC. Without
-                // this emission, EMU shows one LOCK_STALL PC cluster where HW
-                // shows two -- the "missing stall window" symptom that started
-                // the 2026-05-11 trace-fidelity investigation.
+            Some(SemanticOp::LockAcquire) | Some(SemanticOp::LockRelease) => {
+                // Performed at once here; the cycle-accurate executor instead holds the
+                // request for CORE_REQUEST_BUNDLES_IN_FLIGHT bundles (`lock_request` /
+                // `perform_lock_request`).
+                let req = Self::lock_request(op, ctx)?;
                 let pc = ctx.pc();
-                let cycle = ctx.cycles;
-                ctx.timing_context_mut()
-                    .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
-                ctx.timing_context_mut().record_event(
-                    cycle,
-                    crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) },
-                );
-                Some(ExecuteResult::Continue)
+                Some(Self::perform_lock_request(&req, ctx, tile, neighbor_locks, pc))
             }
 
             Some(SemanticOp::DmaStart) => {
@@ -561,39 +452,202 @@ impl ControlUnit {
         tile: &'a mut Tile,
         neighbor_locks: &'a mut NeighborLocks,
     ) -> (&'a mut [Lock], u8, bool) {
-        if raw_lock_id >= quadrants::EAST_START {
-            // East = Internal = own tile's memory module locks.
-            let id = (raw_lock_id - quadrants::EAST_START) % tile.locks.len() as u8;
-            (&mut tile.locks, id, true)
-        } else if raw_lock_id < quadrants::SOUTH_END {
-            // South = row-1 neighbor.
-            if let Some(ref mut locks) = neighbor_locks.south {
-                let id = raw_lock_id % locks.len() as u8;
-                (&mut **locks, id, false)
-            } else {
-                log::warn!("Lock ID {} targets South neighbor but no South locks available", raw_lock_id);
-                let id = raw_lock_id % tile.locks.len() as u8;
+        let (quadrant, local) = LockQuadrant::of(raw_lock_id);
+        let neighbor = match quadrant {
+            LockQuadrant::Own => None,
+            LockQuadrant::South => neighbor_locks.south.as_deref_mut(),
+            LockQuadrant::West => neighbor_locks.west.as_deref_mut(),
+            LockQuadrant::North => neighbor_locks.north.as_deref_mut(),
+        };
+        match neighbor {
+            Some(locks) => {
+                let id = local % locks.len() as u8;
+                (locks, id, false)
+            }
+            None => {
+                if quadrant != LockQuadrant::Own {
+                    log::warn!(
+                        "Lock ID {} targets {:?} neighbor but no {:?} locks available",
+                        raw_lock_id,
+                        quadrant,
+                        quadrant
+                    );
+                }
+                let id = local % tile.locks.len() as u8;
                 (&mut tile.locks, id, true)
             }
-        } else if raw_lock_id < quadrants::WEST_END {
-            // West = col-1 neighbor.
-            if let Some(ref mut locks) = neighbor_locks.west {
-                let id = (raw_lock_id - quadrants::WEST_START) % locks.len() as u8;
-                (&mut **locks, id, false)
-            } else {
-                log::warn!("Lock ID {} targets West neighbor but no West locks available", raw_lock_id);
-                let id = (raw_lock_id - quadrants::WEST_START) % tile.locks.len() as u8;
-                (&mut tile.locks, id, true)
+        }
+    }
+
+    /// Read-only `route_lock`: the lock a raw ID names (same quadrant routing and
+    /// own-tile fallback).
+    fn lock_ref<'a>(raw_lock_id: u8, tile: &'a Tile, neighbor_locks: Option<&'a NeighborLocks>) -> &'a Lock {
+        let (quadrant, local) = LockQuadrant::of(raw_lock_id);
+        let neighbor = neighbor_locks.and_then(|nl| match quadrant {
+            LockQuadrant::Own => None,
+            LockQuadrant::South => nl.south.as_deref(),
+            LockQuadrant::West => nl.west.as_deref(),
+            LockQuadrant::North => nl.north.as_deref(),
+        });
+        let locks = neighbor.unwrap_or(&tile.locks);
+        &locks[local as usize % locks.len()]
+    }
+
+    /// The lock request of an `acq` / `rel` op, its operands read now (at issue).
+    pub fn lock_request(op: &SlotOp, ctx: &ExecutionContext) -> Option<LockRequest> {
+        let kind = match op.semantic {
+            Some(SemanticOp::LockAcquire) => {
+                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
+                return Some(LockRequest {
+                    raw_lock_id,
+                    kind: LockRequestKind::Acquire { expected, delta },
+                    pc: ctx.pc(),
+                });
             }
-        } else {
-            // North = row+1 neighbor (IDs 32-47).
-            if let Some(ref mut locks) = neighbor_locks.north {
-                let id = (raw_lock_id - quadrants::NORTH_START) % locks.len() as u8;
-                (&mut **locks, id, false)
-            } else {
-                log::warn!("Lock ID {} targets North neighbor but no North locks available", raw_lock_id);
-                let id = (raw_lock_id - quadrants::NORTH_START) % tile.locks.len() as u8;
-                (&mut tile.locks, id, true)
+            Some(SemanticOp::LockRelease) => Self::get_lock_release_params(op, ctx),
+            _ => return None,
+        };
+        let (raw_lock_id, delta) = kind;
+        Some(LockRequest { raw_lock_id, kind: LockRequestKind::Release { delta }, pc: ctx.pc() })
+    }
+
+    /// Whether `req` is an acquire that cannot be granted now (lock unchanged).
+    ///
+    /// A core holding such a request stops issuing until it can be granted; the core
+    /// interpreter polls this to decide when.
+    pub fn request_blocked(req: &LockRequest, tile: &Tile, neighbor_locks: Option<&NeighborLocks>) -> bool {
+        match req.kind {
+            LockRequestKind::Acquire { expected, delta } => {
+                Self::lock_ref(req.raw_lock_id, tile, neighbor_locks).check_acquire(expected, delta)
+                    != LockResult::Success
+            }
+            LockRequestKind::Release { .. } => false,
+        }
+    }
+
+    /// Perform a lock request: `WaitLock` for a refused acquire (nothing changes),
+    /// else `Continue`. `stamp_pc` is the issue PC the trace controller sees when the
+    /// request completes (it stamps INSTR_LOCK_ACQUIRE_REQ with it).
+    pub fn perform_lock_request(
+        req: &LockRequest,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        neighbor_locks: &mut NeighborLocks,
+        stamp_pc: u32,
+    ) -> ExecuteResult {
+        let raw_lock_id = req.raw_lock_id;
+        let tile_col = tile.col;
+        let tile_row = tile.row;
+        // AIE2 lock quadrant mapping (mlir-aie getLockLocalBaseIndex and
+        // AIE2TargetModel::isMemEast = isInternal): 0-15 south (row-1), 16-31 west
+        // (col-1), 32-47 north (row+1), 48-63 the own tile, which the DMA BD lock
+        // field (0-15) addresses directly.
+        let (locks, lock_id, is_own_tile) = Self::route_lock(raw_lock_id, tile, neighbor_locks);
+        let current_value = locks[lock_id as usize].value;
+        match req.kind {
+            LockRequestKind::Acquire { expected, delta } => {
+                // Greater-or-equal acquire for every change value: see
+                // get_lock_acquire_params for how a change >= 0 is read here.
+                let lock = &mut locks[lock_id as usize];
+                match lock.acquire_with_value(expected, delta) {
+                    LockResult::Success => {
+                        log::info!(
+                            "LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
+                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile
+                        );
+                        // Trace event: INSTR_LOCK_ACQUIRE_REQ (hw_id 44), once per
+                        // acquire, when it completes (so a refused acquire's wait does
+                        // not inflate the count). HW stamps the frame with the issue PC
+                        // of that moment, the bundle the request held the core in front
+                        // of (add_one_using_dma: acq at 0x330, frame PC 0x33C).
+                        let cycle = ctx.cycles;
+                        ctx.timing_context_mut().record_event(
+                            cycle,
+                            crate::interpreter::state::EventType::InstrLockAcquireReq { pc: stamp_pc },
+                        );
+                        // Core-relay recorder (P6): own-tile acquires only; cross-tile
+                        // acquires are not part of the through-core relay pattern.
+                        if is_own_tile {
+                            if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
+                                lock_evs.push(crate::device::tile::CoreLockEvent {
+                                    cycle,
+                                    lock_local_id: lock_id,
+                                    op: crate::device::tile::CoreLockOp::Acquire,
+                                    col: tile_col,
+                                    row: tile_row,
+                                });
+                            }
+                        }
+                        ExecuteResult::Continue
+                    }
+                    // A frozen lock (overflow/underflow bit set) refuses the acquire
+                    // like an unmet condition: the core keeps waiting.
+                    LockResult::PreconditionNotMet | LockResult::Frozen => {
+                        log::info!(
+                            "LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
+                            raw_lock_id,
+                            lock_id,
+                            expected,
+                            current_value,
+                            is_own_tile
+                        );
+                        ExecuteResult::WaitLock { raw_lock_id }
+                    }
+                }
+            }
+            LockRequestKind::Release { delta } => {
+                if is_own_tile {
+                    // Own-tile release: submitted to the tile's lock arbiter and
+                    // resolved in its phase 3, so a DMA sees it the next cycle.
+                    tile.defer_core_lock_release(lock_id as usize, delta);
+                    log::info!(
+                        "LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
+                        tile_col,
+                        tile_row,
+                        raw_lock_id,
+                        lock_id,
+                        delta,
+                        current_value
+                    );
+                    let cycle = ctx.cycles;
+                    if let Some((lock_evs, _)) = &mut tile.core_relay_recorder {
+                        lock_evs.push(crate::device::tile::CoreLockEvent {
+                            cycle,
+                            lock_local_id: lock_id,
+                            op: crate::device::tile::CoreLockOp::Release,
+                            col: tile_col,
+                            row: tile_row,
+                        });
+                    }
+                } else {
+                    // Cross-tile release (memtile path): the coordinator's
+                    // clone-modify-writeback handles deferral separately.
+                    let lock = &mut locks[lock_id as usize];
+                    lock.release_with_value(delta);
+                    log::info!(
+                        "LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
+                        tile_col,
+                        tile_row,
+                        raw_lock_id,
+                        lock_id,
+                        delta,
+                        current_value,
+                        lock.value
+                    );
+                }
+                // Trace: INSTR_LOCK_RELEASE_REQ (hw_id 45), once per release, plus
+                // the 1-cycle LOCK_STALL of the request's arbitration (add_one_using_dma
+                // chess trace: one per release, beside the held acquire's thousands),
+                // both at the release's own PC.
+                let cycle = ctx.cycles;
+                let pc = req.pc;
+                ctx.timing_context_mut()
+                    .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
+                ctx.timing_context_mut().record_event(
+                    cycle,
+                    crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) },
+                );
+                ExecuteResult::Continue
             }
         }
     }

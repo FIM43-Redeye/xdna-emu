@@ -248,6 +248,21 @@ pub trait Executor: Send {
     /// Returns `true` if the executor models pipeline stages, hazards,
     /// and accurate timing. Returns `false` for fast/instant execution.
     fn is_cycle_accurate(&self) -> bool;
+
+    /// The raw lock ID of the lock acquire the core is held on, if it still cannot be
+    /// granted (an executor that performs lock requests at once never holds one).
+    fn held_lock_acquire(
+        &self,
+        _tile: &Tile,
+        _neighbor_locks: Option<&crate::interpreter::execute::NeighborLocks>,
+    ) -> Option<u8> {
+        None
+    }
+
+    /// PC of the lock request in flight, if any.
+    fn pending_lock_pc(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Trait for accessing processor state.

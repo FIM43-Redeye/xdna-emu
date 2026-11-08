@@ -521,6 +521,11 @@ where
         )
     }
 
+    /// PC of the lock request (`acq` / `rel`) in flight, if any.
+    pub fn pending_lock_pc(&self) -> Option<u32> {
+        self.executor.pending_lock_pc()
+    }
+
     /// Get the last decoded bundle (for debugging).
     pub fn last_bundle(&self) -> Option<&VliwBundle> {
         self.last_bundle.as_ref()
@@ -743,6 +748,8 @@ where
                 StepResult::Continue
             }
 
+            // The executor has charged the stall's first cycle (as in step_internal); the
+            // wait arms used to charge a second one here.
             ExecuteResult::WaitLock { raw_lock_id } => {
                 log::info!(
                     "Core({},{}) stall: WaitingLock raw_lock={} pc=0x{:X}",
@@ -752,7 +759,6 @@ where
                     ctx.pc()
                 );
                 self.status = CoreStatus::WaitingLock { raw_lock_id };
-                ctx.record_stall(1);
                 StepResult::WaitLock { raw_lock_id }
             }
 
@@ -765,7 +771,6 @@ where
                     ctx.pc()
                 );
                 self.status = CoreStatus::WaitingDma { channel };
-                ctx.record_stall(1);
                 StepResult::WaitDma { channel }
             }
 
@@ -778,7 +783,6 @@ where
                     ctx.pc()
                 );
                 self.status = CoreStatus::WaitingStream { port };
-                ctx.record_stall(1);
                 StepResult::WaitStream { port }
             }
 
@@ -880,53 +884,23 @@ where
     ) -> Option<StepResult> {
         match self.status {
             CoreStatus::WaitingLock { raw_lock_id } => {
-                // Route the raw lock ID to the correct tile's lock array,
-                // matching the quadrant logic in ControlUnit::route_lock.
-                use xdna_archspec::aie2::locks::quadrants;
-                let lock_value = if raw_lock_id >= quadrants::EAST_START {
-                    // East/Internal = own tile
-                    let id = (raw_lock_id - quadrants::EAST_START) as usize % tile.locks.len();
-                    tile.locks[id].value
-                } else if raw_lock_id < quadrants::SOUTH_END {
-                    // South = row-1 neighbor
-                    neighbor_locks
-                        .and_then(|nl| nl.south.as_ref())
-                        .map(|locks| locks[raw_lock_id as usize % locks.len()].value)
-                        .unwrap_or(tile.locks[raw_lock_id as usize % tile.locks.len()].value)
-                } else if raw_lock_id < quadrants::WEST_END {
-                    // West = col-1 neighbor
-                    let id = (raw_lock_id - quadrants::WEST_START) as usize;
-                    neighbor_locks
-                        .and_then(|nl| nl.west.as_ref())
-                        .map(|locks| locks[id % locks.len()].value)
-                        .unwrap_or(tile.locks[id % tile.locks.len()].value)
+                // Poll the executor's in-flight acquire, so the core resumes only when
+                // the held bundle will issue (an acquire of -2 is not satisfied by a
+                // count of 1) and the LOCK_STALL level spans the whole wait.
+                let blocked = self.executor.held_lock_acquire(tile, neighbor_locks).is_some();
+                if blocked {
+                    ctx.record_stall(1);
+                    Some(StepResult::WaitLock { raw_lock_id })
                 } else {
-                    // North = row+1 neighbor
-                    let id = (raw_lock_id - quadrants::NORTH_START) as usize;
-                    neighbor_locks
-                        .and_then(|nl| nl.north.as_ref())
-                        .map(|locks| locks[id % locks.len()].value)
-                        .unwrap_or(tile.locks[id % tile.locks.len()].value)
-                };
-
-                log::trace!("try_resume_stall: raw_lock {} value = {}", raw_lock_id, lock_value);
-                if lock_value > 0 {
-                    log::info!("Lock {} available (value={}), resuming execution", raw_lock_id, lock_value);
+                    log::info!("Lock {} available, resuming execution", raw_lock_id);
                     self.status = CoreStatus::Ready;
-                    // Falling edge of the lock stall (held level): the lock is
-                    // available, so the stall deasserts now. Pairs with the
-                    // rising edge recorded at WaitLock entry. This replaces the
-                    // old per-cycle LOCK_STALL re-emission (period=1), which
-                    // over-emitted ~375x vs HW; the held-level model produces
-                    // one B..E span of the real stall duration.
+                    // Falling edge of the lock stall (held level), pairing with the
+                    // rising edge recorded when the executor held the bundle; one B..E
+                    // span of the real stall duration.
                     let cycle = ctx.cycles;
                     ctx.timing_context_mut()
                         .record_event(cycle, EventType::LockStallLevel { active: false });
-                    // Re-execute the instruction - it will acquire the lock
                     None
-                } else {
-                    ctx.record_stall(1);
-                    Some(StepResult::WaitLock { raw_lock_id })
                 }
             }
 
@@ -1483,6 +1457,50 @@ mod tests {
 
     fn recorded_events(ctx: &ExecutionContext) -> Vec<EventType> {
         ctx.timing_context().events.events().iter().map(|e| e.event).collect()
+    }
+
+    /// `mov r4, #-2 ; nop ; acq #63, r4 ; nop x 7` (llvm-mc --triple=aie2): an acquire of
+    /// own lock 15 that needs a count of at least 2.
+    const ACQ_GE2_PROGRAM: [u8; 24] = [
+        0x99, 0xfe, 0x0f, 0x19, 0x01, 0x00, 0x19, 0x42, 0xe2, 0x17, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+    ];
+
+    #[test]
+    fn a_lock_stall_resumes_only_when_the_acquire_can_be_granted() {
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = make_tile_with_program(&ACQ_GE2_PROGRAM);
+        tile.locks[15].value = 1;
+        // mov, nop, acq, and the three bundles that issue while the request is in flight
+        for _ in 0..6 {
+            assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::Continue));
+        }
+        assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::WaitLock { raw_lock_id: 63 }));
+        assert_eq!(ctx.pc(), 0x10, "held in front of the fourth bundle after the acq");
+        assert_eq!(interp.pending_lock_pc(), Some(0x6));
+        let (cycles_at_entry, instrs_at_entry) = (ctx.cycles, ctx.instructions);
+        // A count of 1 does not meet `acq` -2: the core keeps waiting, one stall cycle each.
+        for _ in 0..5 {
+            assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::WaitLock { raw_lock_id: 63 }));
+        }
+        assert_eq!(ctx.cycles, cycles_at_entry + 5);
+        assert_eq!(tile.locks[15].value, 1, "nothing acquired");
+        tile.locks[15].value = 2;
+        assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::Continue));
+        assert_eq!(tile.locks[15].value, 0, "acquired once");
+        assert_eq!(ctx.instructions, instrs_at_entry + 1, "the held bundle retires once");
+        assert_eq!(ctx.pc(), 0x12);
+        assert_eq!(interp.pending_lock_pc(), None);
+        let levels: Vec<bool> = recorded_events(&ctx)
+            .into_iter()
+            .filter_map(|e| match e {
+                EventType::LockStallLevel { active } => Some(active),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels, vec![true, false], "one LOCK_STALL span over the whole wait");
     }
 
     #[test]

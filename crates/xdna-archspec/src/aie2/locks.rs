@@ -35,6 +35,17 @@
 
 use crate::locks::{LockModel, LockValueLayout};
 
+/// Bundles a core issues after a lock request (`acq` / `rel`) before the request
+/// resolves: the core stops in front of the fourth bundle after the request, for one
+/// arbitration cycle when it is granted and for as long as an acquire is refused.
+///
+/// Source: silicon (Phoenix, `tools/gen_lock_stall_probe.py` `pos` / `relpos` / `lk_D`):
+/// counter reads in the three bundles after the request run back to back, the read in
+/// the fourth is one cycle late (granted acquire, release) or the whole wait late
+/// (refused acquire). llvm-aie models the same window conservatively
+/// (`II_ACQ`/`II_REL`: the SEMAPHORE resource for 4 cycles; `getCoreResumeCycleAfterLock`).
+pub const CORE_REQUEST_BUNDLES_IN_FLIGHT: u64 = 3;
+
 /// Lock ID quadrant boundaries for AIE2.
 ///
 /// The 6-bit lock ID field in AIE2 core instructions (range 0–63) is
