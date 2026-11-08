@@ -251,15 +251,15 @@ family), `state/load_ring.rs`, `memory/neighbor.rs`. EMU == HW on all 12 probe c
 
 ## Open
 
-| Gap | Status |
-|---|---|
-| count-write latency | at most two bundles (observed); not pinned lower |
-| `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise |
-| counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured |
-| west of column 1 | silicon returns the DPU-reserved column 0's contents, which the emulator does not have (`load4x/wrap3` `lut_unwritten`: its west lanes, and through the rings most of its south lanes) |
-| ring state across kernel launches | **modelled (2026-11-06)**: a core reset keeps both rings, within one emulator instance and, with `XDNA_EMU_STATE_DIR`, across processes. The harness still differs: every phase is a new process on a fresh emulated device (zero rings), while silicon holds the previous case's rings (the scrub loads only through port A), so `lut_unwritten` keeps its 6 port-B lanes |
-| loads into an isolated direction | `Tile_Control` isolation: the emulator returns zeros and writes zeros to the ring; unprobed |
-| a sparse peek / pop whose fetch is dropped | assumed not to touch the port-B ring (no fetch); unprobed |
-| `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed |
-| bytes a sparse peek reads past the first fetched line | they come from stale ring slots; silicon and the emulator differ there (sparse_4 / sparse_8, 16 of 64 records, the last 2 bytes of each) |
-| Chess emits `padds [sp], #imm` (stack adjust in the store slot) around spills in some register-pressure shapes | llvm-aie defines the `ag_pstm_sp_imm` stack adjust only for the A and B load units (`PADDA_sp_imm`, `PADDB_sp_imm`), so its disassembler, and the emulator with it, rejects the bundle (`St DECODE FAIL`). A one-def llvm-aie fix (`PADDS_sp_imm`) is being proposed upstream; built against it, the original `vec_agu_srs_d` d8 form decodes and passes on EMU. Until it lands, that form stays reshaped to avoid the spill. A decode sweep of every Chess listing on hand (`decode-sweep`) found no other undecodable encoding. Not an addressing-rule gap |
+| Gap | Status | Obs. |
+|---|---|------|
+| count-write latency | at most two bundles (observed); not pinned lower | confirmable: sweep count-write to use distance |
+| `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise | confirmable: hand-written asm, d4..d7 |
+| counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured | confirmable: raw write of oversize/negative counts |
+| west of column 1 | silicon returns the DPU-reserved column 0's contents, which the emulator does not have (`load4x/wrap3` `lut_unwritten`: its west lanes, and through the rings most of its south lanes) | confirmed |
+| ring state across kernel launches | **modelled (2026-11-06)**: a core reset keeps both rings, within one emulator instance and, with `XDNA_EMU_STATE_DIR`, across processes. The harness still differs: every phase is a new process on a fresh emulated device (zero rings), while silicon holds the previous case's rings (the scrub loads only through port A), so `lut_unwritten` keeps its 6 port-B lanes | confirmed |
+| loads into an isolated direction | `Tile_Control` isolation: the emulator returns zeros and writes zeros to the ring; unprobed | confirmable: load into isolated direction |
+| a sparse peek / pop whose fetch is dropped | assumed not to touch the port-B ring (no fetch); unprobed | confirmable: sparse peek with dropped fetch |
+| `vldb.compr.*` alignment | the instructions are unmodelled in the emulator and were not probed | confirmable: vldb.compr probe |
+| bytes a sparse peek reads past the first fetched line | they come from stale ring slots; silicon and the emulator differ there (sparse_4 / sparse_8, 16 of 64 records, the last 2 bytes of each) | confirmed |
+| Chess emits `padds [sp], #imm` (stack adjust in the store slot) around spills in some register-pressure shapes | llvm-aie defines the `ag_pstm_sp_imm` stack adjust only for the A and B load units (`PADDA_sp_imm`, `PADDB_sp_imm`), so its disassembler, and the emulator with it, rejects the bundle (`St DECODE FAIL`). A one-def llvm-aie fix (`PADDS_sp_imm`) is being proposed upstream; built against it, the original `vec_agu_srs_d` d8 form decodes and passes on EMU. Until it lands, that form stays reshaped to avoid the spill. A decode sweep of every Chess listing on hand (`decode-sweep`) found no other undecodable encoding. Not an addressing-rule gap | confirmable: assemble padds [sp] after llvm-aie fix |

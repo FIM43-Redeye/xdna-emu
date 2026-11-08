@@ -18,10 +18,10 @@ unvalidated model.
 
 ## Result forwarding / bypass network
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| Accumulator/CM-domain (`VEC_Bypass`) result visibility | folded into the accumulator timing model below: every accumulator write is queued with its itinerary def cycle and bypass class, every read carries its use cycle and class | `src/interpreter/state/registers.rs` (`AccumulatorRegisterFile::resolve`), `src/interpreter/state/context.rs` (`queue_acc_write*`) | **RESOLVED** 2026-10-31: 468 producer/consumer pairs measured on silicon, all reproduced exactly (see "Accumulator read/write timing"). |
-| `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| Accumulator/CM-domain (`VEC_Bypass`) result visibility | folded into the accumulator timing model below: every accumulator write is queued with its itinerary def cycle and bypass class, every read carries its use cycle and class | `src/interpreter/state/registers.rs` (`AccumulatorRegisterFile::resolve`), `src/interpreter/state/context.rs` (`queue_acc_write*`) | **RESOLVED** 2026-10-31: 468 producer/consumer pairs measured on silicon, all reproduced exactly (see "Accumulator read/write timing"). | confirmed |
+| `source_forward` positional alignment for merged memory operands | `SlotOp::source_forward` aligns exactly for compute ops; may drift for fused memory operands that merge address/data into a single TableGen operand list position | `src/interpreter/bundle/slot.rs` (`FIXME(source-forward-memory-alignment)`); `src/interpreter/decode/operand_extraction.rs` | **DOCUMENTED / benign.** The bypass model only reads vector-register compute sources; memory operands use `NoBypass` or are not vector-reg reads, so this positional drift does not affect result visibility decisions. | n/a |
 
 ## Accumulator read/write timing
 
@@ -372,9 +372,9 @@ sum `r` through instead of zeroing it. Validated **8160/8160** against fresh
 dominant-regime NPU1 captures (bf16+fp32, add+sub); `cargo test --lib`
 3408/3408; seed 6159 via EMU now reproduces `0xFF8C`.
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| special-value NaN payload: datapath vs canonical regime | HW has two residual-state regimes for `vadd.f`/`vsub.f` NaN-input payloads; we now model the dominant **datapath** regime (payload = exp-255 mantissa sum `r`). HW in the rare **canonical** regime forces payload 1 and would mismatch the payload bits (a HW-state artifact, not a model bug). | `src/interpreter/execute/vector_float.rs` (`aie2_acc_fp32_add`, `use_r` gate). | **RESOLVED (datapath regime) 2026-06-11.** Validated 8160/8160 vs dominant-regime HW. Residual open: *what* flips the regime is uncharacterized (not driver reload); low priority since the payload is functionally dead. See the design note. |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| special-value NaN payload: datapath vs canonical regime | HW has two residual-state regimes for `vadd.f`/`vsub.f` NaN-input payloads; we now model the dominant **datapath** regime (payload = exp-255 mantissa sum `r`). HW in the rare **canonical** regime forces payload 1 and would mismatch the payload bits (a HW-state artifact, not a model bug). | `src/interpreter/execute/vector_float.rs` (`aie2_acc_fp32_add`, `use_r` gate). | **RESOLVED (datapath regime) 2026-06-11.** Validated 8160/8160 vs dominant-regime HW. Residual open: *what* flips the regime is uncharacterized (not driver reload); low priority since the payload is functionally dead. See the design note. | confirmed |
 
 
 ## SRS rounding/saturation and f32->bf16 conversion
@@ -439,10 +439,10 @@ SRS shift of 16 on the signed f32 bit pattern (sign-magnitude, rounded by value)
   the result stays a NaN (`0x7F81` / `0xFF81`). The captures contain 27 distinct
   NaN inputs, all consistent with this.
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| SRS paths other than int32 -> int16, signed | unsigned and signed 8/16/32-bit outputs of 32- and 64-bit accumulators, register `vsrs` and fused `vst.srs`, every `crSat`, shifts 0/1/4/8/15: exact against silicon (dynsign probe suite, see "Run-time sign") | `srs_lane` callers in `vector_srs.rs` | **RESOLVED** 2026-11-04 for those shifts and `crRnd` 0 (the `crRnd` sweep above is int16 only) |
-| `crSat` value 2 | saturates exactly like 3 (symmetric for a signed output, `[0, umax]` for an unsigned one) | `SrsConfig::saturate` / `symmetric_saturate` | **RESOLVED** 2026-11-04 (dynsign probe suite, every `d` SRS form) |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| SRS paths other than int32 -> int16, signed | unsigned and signed 8/16/32-bit outputs of 32- and 64-bit accumulators, register `vsrs` and fused `vst.srs`, every `crSat`, shifts 0/1/4/8/15: exact against silicon (dynsign probe suite, see "Run-time sign") | `srs_lane` callers in `vector_srs.rs` | **RESOLVED** 2026-11-04 for those shifts and `crRnd` 0 (the `crRnd` sweep above is int16 only) | confirmed |
+| `crSat` value 2 | saturates exactly like 3 (symmetric for a signed output, `[0, umax]` for an unsigned one) | `SrsConfig::saturate` / `symmetric_saturate` | **RESOLVED** 2026-11-04 (dynsign probe suite, every `d` SRS form) | confirmed |
 
 ## Run-time sign (`d` forms) and UPS saturation
 
@@ -481,13 +481,13 @@ suite (6 cases, register `vups` w2b/w2c in a software-pipelined loop), sweeping 
 5808 records, HW r1 == r2 and EMU == HW on all of them, plus the 26 chess-full cases that showed
 the gap (`lups`, `sups`, `ups_to_*`, `abs`, `gtz`, `abs_gtz` with a run-time sign).
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| `d` forms of UPS, SRS and the crVaddSign ops | all zero-extended / unsigned regardless of the register (only `vextract.d8/.d16` followed crVaddSign) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 |
-| UPS saturation | not modelled (always wrapped) | `ups_lane_signed` | **RESOLVED** 2026-11-04 |
-| `vlda.2d/.3d.ups.*.d*`, `vst.2d/.3d.srs.d*`, `vsrsm.d*`, `vlda.ups` idx / pstm / pstm_imm | same code path and `Uses` entry as the probed forms: exact against silicon, data and flag (satflags probe, hand-written assembly) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 |
-| `srUPS_of` / `srSRS_of` | not produced | `status_flags.rs` | **RESOLVED** 2026-11-04, see "Status flags" |
-| Exact read cycle of crUPSSign, crSat and the shift for `vlda.ups` | crSat was read a bundle after the sign and shift (itinerary 8 vs 7) | `PendingUpsLoad` | **RESOLVED** 2026-11-04: all three at issue+6 (satflags `upsread` late-write probe, 7 forms x 3 registers x offsets 0..10, HW r1 == r2, EMU == HW) |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| `d` forms of UPS, SRS and the crVaddSign ops | all zero-extended / unsigned regardless of the register (only `vextract.d8/.d16` followed crVaddSign) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 | confirmed |
+| UPS saturation | not modelled (always wrapped) | `ups_lane_signed` | **RESOLVED** 2026-11-04 | confirmed |
+| `vlda.2d/.3d.ups.*.d*`, `vst.2d/.3d.srs.d*`, `vsrsm.d*`, `vlda.ups` idx / pstm / pstm_imm | same code path and `Uses` entry as the probed forms: exact against silicon, data and flag (satflags probe, hand-written assembly) | `dynamic_sign.rs` | **RESOLVED** 2026-11-04 | confirmed |
+| `srUPS_of` / `srSRS_of` | not produced | `status_flags.rs` | **RESOLVED** 2026-11-04, see "Status flags" | confirmed |
+| Exact read cycle of crUPSSign, crSat and the shift for `vlda.ups` | crSat was read a bundle after the sign and shift (itinerary 8 vs 7) | `PendingUpsLoad` | **RESOLVED** 2026-11-04: all three at issue+6 (satflags `upsread` late-write probe, 7 forms x 3 registers x offsets 0..10, HW r1 == r2, EMU == HW) | confirmed |
 
 ## Status flags (`srSRS_of`, `srUPS_of`)
 
@@ -650,14 +650,14 @@ product are dropped.
 **Timing note.** The float add* forms land with the other float MACs (itinerary def 6, visible from
 issue + 7); see "Accumulator read/write timing".
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | **do not exist on AIE2**: TableGen defines no such record, and the bf16 MAC encodings (`AIE2_vmac_bf_inst_vec`, `AIE2_vaddmac_bf_inst_vec`, `AIE2_vmul_bf_inst_vec` = {core, acc1, core, dst/acc2, mdm, family, 1}, acc1 = 0b11111 for vmul) carry only the product-sign bit `mdm`, with no slot for a negated acc1 or a subtracted acc2. Their arithmetic is the config word's `sub_acc1`/`sub_acc2` on `vmac.f`/`vaddmac.f`/`vaddmsc.f`, silicon-pinned in `vec_mac_bf16_forms` (`mac_sm_sa1` = -acc1 - P, `addmac_sa2` = acc1 - acc2 + P, `addmsc_sa2` = acc1 - acc2 - P) | `execute_matmul` | closed 2026-11-05: nothing to model |
-| sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed |
-| `vaddmac.f` / `vaddmsc.f` latency | dense and sparse both def 6, visible from issue + 7, pinned by the timing probe at controlled distances | `execute_matmul` latency | closed |
-| fp32-input MAC (emulated through bf16 splits in aie_api / the Chess `_accuracy_*` routines) | the split chain (`vconv.bf16.fp32` of an fp32 accumulator, `vmsc.f` residuals against 1.0, `vmul.f` cross products, `vadd.f` sums) is the bf16 datapath above applied in sequence; nothing split-specific is needed | `bf16::mac_lane`, `vector_float.rs` | **closed 2026-11-04**: the Chess intrinsic suite's fp32-via-bf16 cases (`*_accuracy_{safe,fast,low}`, real and complex, random bit patterns with Inf/NaN inputs) are EMU == silicon on 55 of 57; the 4 cfloat `mac`/`msc_elem_8` cases that differed were the `vlda am` timing (above), and the remaining 2 (`mul_2x8_8x2_accuracy_{safe,fast}`) read an uninitialized accumulator (next row) |
-| Chess `mul_2x8_8x2(v16float, v16cfloat)` (plain and `_accuracy_*`) | the compiled kernel reads `bmh0` before writing it (`vmov x1, bmh0` near entry) and the garbage reaches every output lane through the bf16 split, so the result depends on the previous kernel's leftover accumulator state: silicon gives a different output for the same input after a different predecessor (`cfloat/seven` vs the full suite run); EMU fills registers with `XDNA_EMU_REG_INIT` (default `0xDEADBEEF`) | n/a (undefined input) | **not an emulator gap**; the cases are not a function of their inputs. Under the harness scrub (2026-11-04) the accumulator starts from the same known value on both and all three are EMU == silicon (`cfloat/seven` tags sc2 / sce1) |
-| other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| `vnegmac.f`, `vsubmac.f`, `vsubmsc.f` | **do not exist on AIE2**: TableGen defines no such record, and the bf16 MAC encodings (`AIE2_vmac_bf_inst_vec`, `AIE2_vaddmac_bf_inst_vec`, `AIE2_vmul_bf_inst_vec` = {core, acc1, core, dst/acc2, mdm, family, 1}, acc1 = 0b11111 for vmul) carry only the product-sign bit `mdm`, with no slot for a negated acc1 or a subtracted acc2. Their arithmetic is the config word's `sub_acc1`/`sub_acc2` on `vmac.f`/`vaddmac.f`/`vaddmsc.f`, silicon-pinned in `vec_mac_bf16_forms` (`mac_sm_sa1` = -acc1 - P, `addmac_sa2` = acc1 - acc2 + P, `addmsc_sa2` = acc1 - acc2 - P) | `execute_matmul` | closed 2026-11-05: nothing to model | n/a |
+| sparse bf16 4x16x4 | resolved with the other sparse modes (see "Sparse MAC and sparse loads"); only the `vmul` narrow form is reachable from the toolchain | `vector_matmul/sparse.rs` | closed | confirmed |
+| `vaddmac.f` / `vaddmsc.f` latency | dense and sparse both def 6, visible from issue + 7, pinned by the timing probe at controlled distances | `execute_matmul` latency | closed | confirmed |
+| fp32-input MAC (emulated through bf16 splits in aie_api / the Chess `_accuracy_*` routines) | the split chain (`vconv.bf16.fp32` of an fp32 accumulator, `vmsc.f` residuals against 1.0, `vmul.f` cross products, `vadd.f` sums) is the bf16 datapath above applied in sequence; nothing split-specific is needed | `bf16::mac_lane`, `vector_float.rs` | **closed 2026-11-04**: the Chess intrinsic suite's fp32-via-bf16 cases (`*_accuracy_{safe,fast,low}`, real and complex, random bit patterns with Inf/NaN inputs) are EMU == silicon on 55 of 57; the 4 cfloat `mac`/`msc_elem_8` cases that differed were the `vlda am` timing (above), and the remaining 2 (`mul_2x8_8x2_accuracy_{safe,fast}`) read an uninitialized accumulator (next row) | confirmed |
+| Chess `mul_2x8_8x2(v16float, v16cfloat)` (plain and `_accuracy_*`) | the compiled kernel reads `bmh0` before writing it (`vmov x1, bmh0` near entry) and the garbage reaches every output lane through the bf16 split, so the result depends on the previous kernel's leftover accumulator state: silicon gives a different output for the same input after a different predecessor (`cfloat/seven` vs the full suite run); EMU fills registers with `XDNA_EMU_REG_INIT` (default `0xDEADBEEF`) | n/a (undefined input) | **not an emulator gap**; the cases are not a function of their inputs. Under the harness scrub (2026-11-04) the accumulator starts from the same known value on both and all three are EMU == silicon (`cfloat/seven` tags sc2 / sce1) | n/a |
+| other NaN payload sources | payload from a cancelling special pair derived for products and accumulators; NaN produced by an fp32 accumulator whose mantissa has bits beyond bf16 precision is covered only by the sampled capture | `bf16::mac_lane` | closed for the sampled space | confirmable: fp32 accumulator capture beyond bf16 mantissa |
 
 ## fp32 accumulator add/sub/neg (`vadd.f`, `vsub.f`, `vnegadd.f`, `vnegsub.f`, `vneg.f`)
 
@@ -720,11 +720,11 @@ The integer-style path `execute_acc_negate` used before did flush the denormal
 but turned `+0` into `-0`, kept a NaN positive and ignored `sub_acc1`; it is
 replaced by the shared lane (`float_vneg_is_not_a_bare_sign_flip`).
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| fp32 add/neg result latency | `vadd.f` reads its accumulators at use cycle 3 and its result is visible from issue + 7 (`II_VACCf` def 6); both pinned by the timing probe | `PendingAccAdd` | closed |
-| integer accumulator add/sub config bits | `execute_acc_add_sub` decoded integer `sub_acc1`/`sub_acc2` from bits 11/12 (bit 11 is `dynMulNeg`); TableGen's `VecConf` and the constants Chess emits for `add_conf` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | fixed from TableGen; integer variants silicon-confirmed 2026-11-03 (`accops`, [mac-conf](mac-conf.md)); integer `vneg` also honours bit 12 |
-| float vector-register add/sub gate | `float_addsub_not_modeled` (x/w float `Add`/`Sub`/`SubLt`/`SubGe`) is unreachable: no TableGen encoding pairs those semantics with a float element type | `vector_arith.rs` | guard only; `float_add_sub_is_reachable_only_through_the_accumulator_family` asserts it |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| fp32 add/neg result latency | `vadd.f` reads its accumulators at use cycle 3 and its result is visible from issue + 7 (`II_VACCf` def 6); both pinned by the timing probe | `PendingAccAdd` | closed | confirmed |
+| integer accumulator add/sub config bits | `execute_acc_add_sub` decoded integer `sub_acc1`/`sub_acc2` from bits 11/12 (bit 11 is `dynMulNeg`); TableGen's `VecConf` and the constants Chess emits for `add_conf` (`0x1`, `0x400`, `0x1000`, `0x2000`) put them at 12/13 | `execute_acc_add_sub` | fixed from TableGen; integer variants silicon-confirmed 2026-11-03 (`accops`, [mac-conf](mac-conf.md)); integer `vneg` also honours bit 12 | confirmed |
+| float vector-register add/sub gate | `float_addsub_not_modeled` (x/w float `Add`/`Sub`/`SubLt`/`SubGe`) is unreachable: no TableGen encoding pairs those semantics with a float element type | `vector_arith.rs` | guard only; `float_add_sub_is_reachable_only_through_the_accumulator_family` asserts it | n/a |
 
 ## Wide VSHIFT / VSHIFT_ALIGN (512-bit x registers)
 
@@ -849,11 +849,11 @@ sgn_x, so `uu` is the base word and `ss` adds `0x300`):
 | 4x4_4x4_2ch | two stacked matmuls, channel outermost | 0 / 1,760 |
 | all eight | adopted maps | 100% |
 
-| Gap | Model vs hardware | Where | Status / rationale |
-|-----|-------------------|-------|--------------------|
-| config word with no geometry | silicon multiplies nothing for a key no mode uses (every product zero, accumulator inputs still added); the emulator now does the same | `vector_matmul/mod.rs`, `Multiplier::Idle` | closed 2026-11-03, see [mac-conf](mac-conf.md) |
-| mode forms beyond mul/mac/msc | every kind (`vnegmul` ... `vsubmsc`) runs the shared post-adder on every mode; the `flags`/`modes` probes pin all kinds on the int8, int16, complex, float-conf and idle modes | `execute_matmul` | closed 2026-11-03, see [mac-conf](mac-conf.md) |
-| mode result latency | the modes use the itinerary def cycle of their instruction (the integer MAC family 5, visible from issue + 6), the same rule the timing probe pins for the dense and sparse MACs | `execute_matmul` | closed |
+| Gap | Model vs hardware | Where | Status / rationale | Obs. |
+|-----|-------------------|-------|--------------------|------|
+| config word with no geometry | silicon multiplies nothing for a key no mode uses (every product zero, accumulator inputs still added); the emulator now does the same | `vector_matmul/mod.rs`, `Multiplier::Idle` | closed 2026-11-03, see [mac-conf](mac-conf.md) | confirmed |
+| mode forms beyond mul/mac/msc | every kind (`vnegmul` ... `vsubmsc`) runs the shared post-adder on every mode; the `flags`/`modes` probes pin all kinds on the int8, int16, complex, float-conf and idle modes | `execute_matmul` | closed 2026-11-03, see [mac-conf](mac-conf.md) | confirmed |
+| mode result latency | the modes use the itinerary def cycle of their instruction (the integer MAC family 5, visible from issue + 6), the same rule the timing probe pins for the dense and sparse MACs | `execute_matmul` | closed | confirmed |
 
 ## Unpack: fused `vldb.unpack.*` and standalone `vunpack.*`
 
@@ -953,15 +953,15 @@ spills) exposed:
 
 **Open questions.**
 
-| Gap | Model vs hardware | Status |
-|---|---|---|
-| unaligned fused loads | silicon rounds the address down to 32 bytes (`vlda.ups`, `vlda.conv`, `vldb.unpack`, 328-case probe); the emulator does the same | resolved: [`addressing.md`](addressing.md), "Unaligned accesses" |
-| `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write |
-| how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed |
-| descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) |
-| negative or very large counts and sizes | compared unsigned | open; only 0..7 observed |
-| cross-tile fused unpack loads | go through the shared vector read, not captured | open |
-| AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred |
+| Gap | Model vs hardware | Status | Obs. |
+|---|---|---|------|
+| unaligned fused loads | silicon rounds the address down to 32 bytes (`vlda.ups`, `vlda.conv`, `vldb.unpack`, 328-case probe); the emulator does the same | resolved: [`addressing.md`](addressing.md), "Unaligned accesses" | confirmed |
+| `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write | confirmable: raw control-register write asm |
+| how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
+| descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) | confirmed |
+| negative or very large counts and sizes | compared unsigned | open; only 0..7 observed | confirmable: counts above 7 / negative via asm |
+| cross-tile fused unpack loads | go through the shared vector read, not captured | open | confirmable: cross-tile fused unpack capture |
+| AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred | confirmable: Strix capture (halo) |
 
 ## Pack: fused `vst.pack.*` and standalone `vpack.*`
 
@@ -1067,14 +1067,14 @@ are deleted; a non-wide pack now logs an error and does nothing.
 
 **Open questions.**
 
-| Gap | Model vs hardware | Status |
-|---|---|---|
-| `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `pack(v, int)` as used, needs a raw register write |
-| `crSat` values above 3 | only the low two bits are used | open; not captured |
-| how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | open; only Chess's own schedules observed |
-| unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation |
-| 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only |
-| AIE2P | `vpack` there has `packSign0` / `packSign1` and a `crPackSize` register, a different layout; the AIE2 table does not describe it | deferred |
+| Gap | Model vs hardware | Status | Obs. |
+|---|---|---|------|
+| `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `pack(v, int)` as used, needs a raw register write | confirmable: raw control-register write asm |
+| `crSat` values above 3 | only the low two bits are used | open; not captured | confirmable: raw control-register write asm |
+| how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
+| unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation | confirmed |
+| 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only | confirmable: 2D/3D vst.pack capture |
+| AIE2P | `vpack` there has `packSign0` / `packSign1` and a `crPackSize` register, a different layout; the AIE2 table does not describe it | deferred | confirmable: Strix capture (halo) |
 
 ## Sparse MAC and sparse loads (`*_sparse_{narrow,wide}`, `vldb.sparse.*`)
 

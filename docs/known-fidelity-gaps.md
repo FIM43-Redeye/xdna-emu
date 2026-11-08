@@ -43,6 +43,22 @@ frontmatter, so the cross-cutting "what kind of wrong" axis stays queryable.
 
 ---
 
+## Observability
+
+The `Obs.` column in the class files says how far silicon can check the row:
+
+- **confirmed**: a silicon run exists and the model matches it.
+- **confirmable**: no run yet, but a probe we can build would settle it (named in the cell).
+- **edge-observable**: silicon shows only consequences (timing of other events, completion or failure), not the behaviour itself.
+- **equivalent**: no observable separates the model's choice from the alternatives, so any choice that reproduces every observable meets the "indistinguishable from silicon" goal by definition.
+- **unobservable**: real behaviour that no current capability can see; the cell names what would expose it.
+
+Rows that are not silicon behaviour at all (emulator bookkeeping, undefined inputs) read n/a.
+
+Unobservable items are re-examined whenever a new capability lands (a new probe kind, trace route or firmware path). An unobservable item may also be inferred statistically from many silicon runs, for example by regressing a total against per-run counts the emulator can report.
+
+---
+
 ## Maintenance
 
 When a new confirmed HW-disagreement surfaces:
