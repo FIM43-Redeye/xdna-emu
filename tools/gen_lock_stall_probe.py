@@ -567,6 +567,240 @@ def eq_case(name: str, step_iters: int):
     return _topology(f"eq_{name}", eq_consumer_asm(case), eq_producer_asm(case, step_iters), case.init)
 
 
+# -- frozen: requests that overflow / underflow a lock, read back over control packets ---
+
+# One core (0,2) issues lock requests on lock FZ_P, gated by FZ_G so the host reads a clean
+# baseline first. A timer core (0,3), gated by FZ_GT, later releases FZ_C1 and FZ_C2, which
+# let the tile DMA ship the core's `stamps` buffer to the host twice: pass 1 shows how far
+# the core got (its progress marker and, once it finished, its counter reads) before the host
+# reads the flags; pass 2, much later, after the host cleared them. Nothing here waits for the
+# core, so a core held forever by a frozen lock cannot hang the run.
+FZ_P, FZ_Q, FZ_G, FZ_C1, FZ_C2, FZ_D, FZ_GT = 15, 14, 13, 12, 11, 10, 9
+FZ_D2, FZ_D3 = 8, 7                      # DMA cases: release targets of the second and third BD
+FZ_SENTINEL = 0x5E5E5E5E
+FZ_PROGRESS = (FZ_SENTINEL, 0xA1A1A1A1, 0xA2A2A2A2, 0xA3A3A3A3, 0x600D600D)
+FZ_STAMP_WORDS = 16
+FZ_PASS1_ITERS = 20000                   # timer: ~0.2 ms after the go write
+FZ_PASS2_ITERS = 6 * 65536               # then ~4 ms (several maximal delay loops)
+FZ_READ_OFFSETS = (-1, 3, 4, 5)          # counter reads around each request (bundles from it)
+
+
+@dataclass(frozen=True)
+class FrozenCase:
+    init: int                            # FZ_P's count at load
+    reqs: tuple[Op, ...]                 # one or two ("rel" | "acq", change) requests on FZ_P
+    keep: bool = False                   # never clear the flags: do they outlive the run?
+    dma: str = ""                        # "rel" | "acq": a BD chain on FZ_P instead of core requests
+
+
+FROZEN_CASES: dict[str, FrozenCase] = {
+    "base":   FrozenCase(5, ()),                              # no request: the plumbing alone
+    "fit_hi": FrozenCase(62, (("rel", 1),)),                  # lands on 63: no flag
+    "fit_lo": FrozenCase(5, (("rel", -5),)),                  # lands on 0: no flag
+    "fit63":  FrozenCase(0, (("rel", 63),)),
+    "ovf1":   FrozenCase(63, (("rel", 1),)),
+    "ovf5":   FrozenCase(62, (("rel", 5),)),
+    "unf1":   FrozenCase(0, (("rel", -1),)),
+    "unf3":   FrozenCase(1, (("rel", -3),)),
+    "ovf_rel": FrozenCase(63, (("rel", 1), ("rel", 1))),      # a release on the frozen lock
+    "ovf_acq": FrozenCase(63, (("rel", 2), ("acq", -1))),     # count 1 and frozen: an acquire
+    "unf_rel": FrozenCase(0, (("rel", -1), ("rel", 1))),
+    "unf_acq": FrozenCase(0, (("rel", -1), ("acq", -1))),     # count 63 and frozen: an acquire
+    # DMA BD path (three-BD chain, see frozen_design): BD1 overflows FZ_P with its release,
+    # BD2's release meets the frozen lock, BD3 shows whether BD2 completed
+    "dma_rel": FrozenCase(63, (), dma="rel"),
+    # the core overflows FZ_P to count 1, BD2 acquires it (>= 1) while it is frozen
+    "dma_acq": FrozenCase(63, (("rel", 2),), dma="acq"),
+    "ovf1_keep": FrozenCase(63, (("rel", 1),), keep=True),    # leaves the flag set after the run
+    "unf1_keep": FrozenCase(0, (("rel", -1),), keep=True),
+}
+
+
+def _own(lock: int) -> int:
+    return 48 + lock
+
+
+def frozen_core_asm(case: FrozenCase) -> str:
+    """p0 = stamps. Words 0..7: counter reads at FZ_READ_OFFSETS around each request, word 8:
+    the progress marker (FZ_PROGRESS). The marker moves before each request, so a core held by
+    one is seen at the marker of that request."""
+    if len(case.reqs) > 2:
+        raise ValueError("at most two requests (eight counter reads)")
+    body = ["  mov r4, #-1", *[f"  mov r{2 + k}, #{ch}" for k, (_, ch) in enumerate(case.reqs)],
+            f"  movxm r5, #{FZ_SENTINEL}", *[N] * 3,
+            *[f"  st r5, [p0, #{4 * i}]" for i in range(FZ_STAMP_WORDS)], *[N] * 8,
+            f"  movxm r6, #{FZ_PROGRESS[1]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8,
+            f"  acq #{_own(FZ_G)}, r4", *[N] * LOCK_SETTLE_BUNDLES,
+            f"  movxm r6, #{FZ_PROGRESS[2]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
+    for k, (kind, _) in enumerate(case.reqs):
+        if k:
+            body += [f"  movxm r6, #{FZ_PROGRESS[3]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
+        slots: dict[int, list[str]] = {0: [f"{kind} #{_own(FZ_P)}, r{2 + k}"]}
+        for j, off in enumerate(FZ_READ_OFFSETS):
+            hi, lo = TS_PAIRS[4 * k + j]
+            slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
+        body += [("  " + " ; ".join(slots[o])) if o in slots else N
+                 for o in range(FZ_READ_OFFSETS[0], FZ_READ_OFFSETS[-1] + 1)]
+        body += [*[N] * 6]
+    body += [*[N] * 8, *[f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * i}]" for i in range(4 * len(case.reqs))],
+             f"  movxm r6, #{FZ_PROGRESS[4]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
+    return _frame(body)
+
+
+def _long_delay(iters: int, tag: str) -> list[str]:
+    """`iters` loop iterations (~10 cycles each) in as many maximal delay loops as needed."""
+    out, k = [], 0
+    while iters > 0:
+        n = min(iters, base.MAX_LOOP_ITERS)
+        out += base.delay_loop(n, f".L{tag}{k}")
+        iters -= n
+        k += 1
+    return out
+
+
+def frozen_timer_asm(second: bool = True) -> str:
+    """Core (0,3): gated by FZ_GT, releases FZ_C1 and, if `second`, much later FZ_C2 (south
+    quadrant raw IDs)."""
+    body = ["  mov r4, #-1", "  mov r1, #1", *[N] * 2,
+            f"  acq #{FZ_GT}, r4", *[N] * LOCK_SETTLE_BUNDLES,
+            *_long_delay(FZ_PASS1_ITERS, "pass1"), f"  rel #{FZ_C1}, r1", *[N] * 8]
+    if second:
+        body += [*_long_delay(FZ_PASS2_ITERS, "pass2"), f"  rel #{FZ_C2}, r1", *[N] * 8]
+    return _frame(body)
+
+
+def frozen_passes(case: FrozenCase) -> int:
+    """Stamps transfers the design makes: two timed passes, or one per BD of a DMA chain."""
+    return 3 if case.dma else 2
+
+
+def frozen_steps(case: FrozenCase) -> list:
+    """Host steps: baseline, go, pass 1, flags, clear, re-read, pass 2, flags, clear, re-read
+    (DMA cases: see the comments in the branches)."""
+    import ctrlpkt_readback as cp
+    lv = cp.lock_value_addr
+    extra = (FZ_D2, FZ_D3) if case.dma else ()
+
+    def snap(tag: str) -> list:
+        return [cp.Read(cp.LOCKS_OVERFLOW, f"{tag} ovf"), cp.Read(cp.LOCKS_UNDERFLOW, f"{tag} unf"),
+                cp.Read(lv(FZ_P), f"{tag} L{FZ_P}"), cp.Read(lv(FZ_Q), f"{tag} L{FZ_Q}"),
+                cp.Read(lv(FZ_G), f"{tag} L{FZ_G}"),
+                *[cp.Read(lv(x), f"{tag} L{x}") for x in extra]]
+
+    def clear() -> list:
+        return [cp.Write(cp.LOCKS_OVERFLOW, 0xFFFF), cp.Write(cp.LOCKS_UNDERFLOW, 0xFFFF)]
+
+    go = [*snap("s0"), cp.Write(lv(FZ_G), 1), cp.Write(lv(FZ_GT), 1), cp.Wait("stamp0")]
+    if case.dma == "rel":
+        # pass 1: BD1 sent and released FZ_P (+1 on 63: overflow). Open BD2 (host-written gate):
+        # its data arrives, then its release meets the frozen lock; BD3 runs only if that
+        # release completed (FZ_D3 counts it). Clear, then BD3 must run.
+        return [*go, *snap("s1"), cp.Write(lv(FZ_C2), 1), cp.Wait("stamp0"), *snap("s2"),
+                *clear(), *snap("s3"), cp.Wait("stamp0"), *snap("s4"), *clear(), *snap("s5")]
+    if case.dma == "acq":
+        # the core froze FZ_P at count 1; BD2 acquires it right after BD1 (timer-gated)
+        return [*go, *snap("s1"), *clear(), *snap("s2"), cp.Wait("stamp0"), cp.Wait("stamp0"),
+                *snap("s3"), *clear(), *snap("s4")]
+    if case.keep:
+        return [*go, *snap("s1"), *snap("s2"), cp.Wait("stamp0"), *snap("s3"), *snap("s4")]
+    return [*go, *snap("s1"), *clear(), *snap("s2"), cp.Wait("stamp0"), *snap("s3"), *clear(), *snap("s4")]
+
+
+FZ_X = 6                                 # DMA cases: a release target nobody reads
+
+
+def frozen_chain(case: FrozenCase) -> list[tuple[str, str]]:
+    """The tile DMA's BD chain as (acquire lock, release lock) symbols; each acquires >= 1 and
+    releases +1. Core cases ship the stamps twice (timer-gated). DMA cases: see FrozenCase."""
+    if case.dma == "rel":
+        return [("lC1", "lP"), ("lC2", "lP"), ("lD", "lD3")]
+    if case.dma == "acq":
+        return [("lC1", "lX"), ("lP", "lD2"), ("lD", "lD3")]
+    return [("lC1", "lD"), ("lC2", "lD")]
+
+
+def frozen_design(case: FrozenCase) -> tuple[str, list, "object"]:
+    """(aie.mlir text, host steps, packet layout)."""
+    import ctrlpkt_readback as cp
+    steps = frozen_steps(case)
+    layout = cp.encode(steps)
+    passes = frozen_passes(case)
+    chain = frozen_chain(case)
+    assert len(chain) == passes
+    w = FZ_STAMP_WORDS
+    m = f"memref<{w}xi32>"
+    seq = [f"      aiex.npu.dma_memcpy_nd(%data[0, 0, 0, {w * i}][1, 1, 1, {w}][0, 0, 0, 1]) "
+           f"{{id = {14 - i} : i64, issue_token = true, metadata = @stamp0}} : memref<{passes * w}xi32>"
+           for i in range(passes)]
+    seq += cp.sequence_lines(steps, layout, "ctrlout", "ctrlin")
+
+    def bd(i: int, acq: str, rel: str, nxt: str) -> str:
+        return f"""      %a{i} = arith.constant 1 : i32
+      aie.use_lock(%{acq}, AcquireGreaterEqual, %a{i})
+      aie.dma_bd(%stamps : {m})
+      %r{i} = arith.constant 1 : i32
+      aie.use_lock(%{rel}, Release, %r{i})
+      aie.next_bd {nxt}"""
+    blocks = []
+    for i, (acq, rel) in enumerate(chain):
+        blocks += [f"    ^b{i + 1}:", bd(i, acq, rel, f"^b{i + 2}" if i + 1 < len(chain) else "^end")]
+    dma = bool(case.dma)
+    lock_defs = [(FZ_P, "lP", case.init), (FZ_Q, "lQ", 0), (FZ_G, "lG", 0), (FZ_GT, "lGT", 0),
+                 (FZ_C1, "lC1", 0), (FZ_C2, "lC2", 0), (FZ_D, "lD", 1 if dma else 0)]
+    if dma:
+        lock_defs += [(FZ_D2, "lD2", 0), (FZ_D3, "lD3", 0), (FZ_X, "lX", 0)]
+    text = "\n".join([
+        "module {",
+        "  aie.device(npu1_1col) {",
+        "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
+        f"    %t02 = aie.tile(0, 2) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {cp.CTRL_PKT_ID}>}}",
+        "    %t03 = aie.tile(0, 3)",
+        f'    %stamps = aie.buffer(%t02) {{sym_name = "stamps"}} : {m}',
+        *[f'    %{sym} = aie.lock(%t02, {lid}) {{init = {init} : i32, sym_name = "{sym}"}}'
+          for lid, sym, init in lock_defs],
+        "    aie.flow(%t02, DMA : 0, %t00, DMA : 1)",
+        *cp.flow_lines("%t02", "%t00"),
+        "    aie.shim_dma_allocation @stamp0 (%t00, S2MM, 1)",
+        f"    func.func private @k_core({m}) attributes {{link_with = \"core.o\"}}",
+        "    func.func private @k_timer() attributes {link_with = \"timer.o\"}",
+        "    aie.core(%t02) {",
+        f"      func.call @k_core(%stamps) : ({m}) -> ()",
+        "      aie.end", "    }",
+        "    aie.core(%t03) {", "      func.call @k_timer() : () -> ()", "      aie.end", "    }",
+        "    %mem = aie.mem(%t02) {",
+        "      %s0 = aie.dma_start(MM2S, 0, ^b1, ^end)",
+        *blocks,
+        "    ^end:", "      aie.end", "    }",
+        f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+        f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{passes * w}xi32>) {{",
+        *seq, "    }", "  }", "}", ""])
+    return text, steps, layout
+
+
+def parse_frozen(out: bytes, labels: list[str], passes: int = 2) -> dict:
+    """Split a host output file: the labelled ctrl responses, then the stamps passes."""
+    n, w = len(labels), FZ_STAMP_WORDS
+    words = struct.unpack(f"<{n + passes * w}I", out[:4 * (n + passes * w)])
+    r = {"ctrl": dict(zip(labels, words[:n]))}
+    for i in range(passes):
+        r[f"pass{i + 1}"] = list(words[n + i * w:n + (i + 1) * w])
+    return r
+
+
+def frozen_lost(stamps: list[int], n_reqs: int) -> list[list[int | None]]:
+    """Per request: cycles beyond one per bundle at each of FZ_READ_OFFSETS[1:] since the read
+    in front of it (None: that read was never made, the sentinel is still there)."""
+    out = []
+    for k in range(n_reqs):
+        ts = stamps[4 * k:4 * k + 4]
+        if FZ_SENTINEL in ts:
+            out.append([None] * 3)
+            continue
+        out.append([((ts[j] - ts[0]) & 0xFFFFFFFF) - (FZ_READ_OFFSETS[j] - FZ_READ_OFFSETS[0])
+                    for j in range(1, 4)])
+    return out
+
+
 # -- results ---------------------------------------------------------------------
 
 def parse_sampler(consumer_log: bytes) -> dict:
@@ -586,6 +820,107 @@ def parse_eq(name: str, consumer_log: bytes, producer_ts: bytes, step_cycles: fl
     return {"waits": waits, "steps": [round(w / step_cycles) for w in waits],
             "producer_ts": list(pts),
             "match": [r for r in RULES if simulate(case, r) == [round(w / step_cycles) for w in waits]]}
+
+
+
+# -- frozen CLI: generate / build / run / analyze one directory per case --------------------
+
+def frozen_generate(args) -> int:
+    import json
+    import ctrlpkt_readback as cp
+    out = Path(args.out_dir)
+    for name in args.cases:
+        case = FROZEN_CASES[name]
+        d = out / name
+        d.mkdir(parents=True, exist_ok=True)
+        text, steps, layout = frozen_design(case)
+        (d / "aie.mlir").write_text(text)
+        (d / "core.s").write_text(frozen_core_asm(case))
+        (d / "timer.s").write_text(frozen_timer_asm(second=not case.dma))
+        (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
+        (d / "case.json").write_text(json.dumps(
+            {"case": name, "init": case.init, "reqs": case.reqs, "labels": list(layout.labels),
+             "n_words": len(layout.words), "passes": frozen_passes(case), "dma": case.dma,
+             "keep": case.keep}, indent=1) + "\n")
+    return 0
+
+
+def frozen_build(args) -> int:
+    import subprocess
+    from harness.build import _peano_tool, aiecc_command, aiecc_path
+    for d in sorted(p for p in Path(args.out_dir).iterdir() if (p / "aie.mlir").exists()):
+        for k in ("core", "timer"):
+            subprocess.run([_peano_tool("llvm-mc"), "--triple=aie2", "--filetype=obj",
+                            "-o", str(d / f"{k}.o"), str(d / f"{k}.s")], check=True)
+            subprocess.run([_peano_tool("llvm-objcopy"), "--redefine-sym", f"test_kernel=k_{k}",
+                            str(d / f"{k}.o")], check=True)
+        r = subprocess.run(aiecc_command("peano", aiecc_path()), cwd=d, capture_output=True, text=True)
+        (d / "aiecc.log").write_text(r.stdout + r.stderr)
+        print(f"{d.name}: aiecc exit {r.returncode}")
+        if r.returncode:
+            return 1
+    return 0
+
+
+def frozen_run(args) -> int:
+    import json
+    import subprocess
+    import ctrlpkt_readback as cp
+    from harness.run import KERNEL_NAME, _env, build_ffi
+    root = Path(args.out_dir)
+    host = cp.build_host(root)
+    if args.backend == "emu":
+        build_ffi(args.runtime)
+    env = _env(args.backend, args.runtime)
+    for d in sorted(p for p in root.iterdir() if (p / "aie.xclbin").exists()):
+        if args.only and d.name not in args.only:
+            continue
+        rd = d / "runs" / args.tag
+        if rd.exists():
+            raise SystemExit(f"{rd} exists; pick another tag")
+        rd.mkdir(parents=True)
+        meta = json.loads((d / "case.json").read_text())
+        cmd = [str(host), str(d / "aie.xclbin"), str(d / "insts.bin"), str(d / "pkts.bin"),
+               str(len(meta["labels"])), str(meta["passes"] * FZ_STAMP_WORDS), str(rd / "out.bin")]
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                               timeout=60 if args.backend == "hw" else 1800)
+            rc, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            rc, text = -1, "TIMEOUT"
+        (rd / "log.txt").write_text(text)
+        print(f"{d.name}: rc {rc}", flush=True)
+        if rc != 0:
+            return 1
+    return 0
+
+
+def frozen_analyze(args) -> int:
+    import json
+    root = Path(args.out_dir)
+    for d in sorted(p for p in root.iterdir() if (p / "case.json").exists()):
+        meta = json.loads((d / "case.json").read_text())
+        if args.only and d.name not in args.only:
+            continue
+        out = d / "runs" / args.tag / "out.bin"
+        if not out.exists():
+            print(f"{d.name:8s} (no output)")
+            continue
+        r = parse_frozen(out.read_bytes(), meta["labels"], meta.get("passes", 2))
+        c = r["ctrl"]
+        tags = sorted({k.split()[0] for k in c})
+        locks = sorted({int(k.split()[1][1:]) for k in c if k.split()[1].startswith("L")})
+        snaps = [f"{t}: ovf={c[t + ' ovf']:#x} unf={c[t + ' unf']:#x} "
+                 + " ".join(f"L{x}={c[f'{t} L{x}']}" for x in locks if x != FZ_Q) for t in tags]
+        n = len(meta["reqs"])
+        print(f"{d.name:8s} init={meta['init']} reqs={meta['reqs']} dma={meta.get('dma', '')}")
+        for sn in snaps:
+            print("   " + sn)
+        for i in range(meta.get("passes", 2)):
+            st = r[f"pass{i + 1}"]
+            print(f"   pass{i + 1}: marker={st[8]:#010x} lost={frozen_lost(st, n)} "
+                  f"raw={[hex(x) for x in st[:4 * n]]}")
+    return 0
 
 
 # -- CLI -----------------------------------------------------------------------------
@@ -742,7 +1077,27 @@ def main(argv=None) -> int:
     an.add_argument("tag")
     an.add_argument("--step-cycles", type=float, default=None,
                     help="cycles per producer step (default: 10 per loop iteration)")
+    fg = sub.add_parser("frozen-generate", help="overflow/underflow probes read back over control packets")
+    fg.add_argument("out_dir")
+    fg.add_argument("--cases", nargs="+", default=list(FROZEN_CASES))
+    fb = sub.add_parser("frozen-build")
+    fb.add_argument("out_dir")
+    fr = sub.add_parser("frozen-run")
+    fr.add_argument("out_dir")
+    fr.add_argument("tag")
+    fr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    fr.add_argument("--only", nargs="*", default=[])
+    fr.add_argument("--runtime", choices=("debug", "release"), default="debug",
+                    help="emulator .so profile (release is far faster; the 4 ms timer pass is slow in debug)")
+    fa = sub.add_parser("frozen-analyze")
+    fa.add_argument("out_dir")
+    fa.add_argument("tag")
+    fa.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
+    special = {"frozen-generate": frozen_generate, "frozen-build": frozen_build,
+               "frozen-run": frozen_run, "frozen-analyze": frozen_analyze}
+    if args.cmd in special:
+        return special[args.cmd](args)
     return cmd_generate(args) if args.cmd == "generate" else cmd_analyze(args)
 
 

@@ -517,7 +517,8 @@ impl ControlUnit {
         }
     }
 
-    /// Whether `req` is an acquire that cannot be granted now (lock unchanged).
+    /// Whether `req` cannot be granted now (an acquire refused, or any request on a frozen
+    /// lock; lock unchanged).
     ///
     /// A core holding such a request stops issuing until it can be granted; the core
     /// interpreter polls this to decide when.
@@ -527,7 +528,11 @@ impl ControlUnit {
                 Self::lock_ref(req.raw_lock_id, tile, neighbor_locks).check_change(change)
                     != LockResult::Success
             }
-            LockRequestKind::Release { .. } => false,
+            // A release is refused only by a frozen lock, and the core is then held on it
+            // like on a refused acquire (silicon, lock-frozen).
+            LockRequestKind::Release { .. } => {
+                Self::lock_ref(req.raw_lock_id, tile, neighbor_locks).is_frozen()
+            }
         }
     }
 
@@ -607,6 +612,19 @@ impl ControlUnit {
                 }
             }
             LockRequestKind::Release { delta } => {
+                // A lock holding an overflow / underflow flag refuses a release as it does an
+                // acquire, and the core waits for the flag to be cleared (silicon, lock-frozen
+                // ovf_rel / unf_rel: held, then performed after the clear; nothing dropped).
+                if locks[lock_id as usize].is_frozen() {
+                    log::info!(
+                        "LockRelease raw={} mapped={} delta={} -> WAIT (frozen, own_tile={})",
+                        raw_lock_id,
+                        lock_id,
+                        delta,
+                        is_own_tile
+                    );
+                    return ExecuteResult::WaitLock { raw_lock_id };
+                }
                 if is_own_tile {
                     // Own-tile release: submitted to the tile's lock arbiter and
                     // resolved in its phase 3, so a DMA sees it the next cycle.

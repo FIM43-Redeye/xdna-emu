@@ -2014,6 +2014,48 @@ mod tests {
         assert_eq!(executor.held_lock_acquire(&tile, None), None);
     }
 
+    // Silicon (build/experiments/lock-frozen, `frozen` family, ovf_rel / ovf_acq / unf_rel /
+    // unf_acq, r1): an overflowing or underflowing release is performed (the count wraps and
+    // the lock's flag is set); the next request on that lock, a release as much as an acquire,
+    // holds the core in front of the fourth bundle after it until the flag is cleared (write 1
+    // to Locks_Overflow / Locks_Underflow), then goes through. Nothing is dropped.
+    #[test]
+    fn a_release_on_a_frozen_lock_holds_the_core_until_the_flag_clears() {
+        for flag_is_overflow in [true, false] {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = 0;
+            tile.locks[5].overflow = flag_is_overflow;
+            tile.locks[5].underflow = !flag_is_overflow;
+            for b in std::iter::once(make_bundle(vec![release_own_lock_5()])).chain(nops(3)) {
+                assert!(matches!(executor.execute(&b, &mut ctx, &mut tile), ExecuteResult::Continue));
+            }
+            let (cycles, instrs, seq) = (ctx.cycles, ctx.instructions, ctx.bundle_seq);
+            let probe = make_bundle(vec![lda_r6_from_p0()]);
+            for _ in 0..3 {
+                let r = executor.execute(&probe, &mut ctx, &mut tile);
+                assert!(matches!(r, ExecuteResult::WaitLock { raw_lock_id: OWN_LOCK_5 }), "{r:?}");
+            }
+            assert_eq!((ctx.instructions, ctx.bundle_seq), (instrs, seq), "the held bundle never issues");
+            assert!(ctx.cycles >= cycles + 3, "every held cycle is a stall");
+            assert_eq!(executor.held_lock_acquire(&tile, None), Some(OWN_LOCK_5));
+            tile.resolve_lock_requests(ctx.cycles);
+            assert_eq!(tile.locks[5].value, 0, "the refused release changed nothing");
+            tile.locks[5].clear_flags();
+            assert_eq!(executor.held_lock_acquire(&tile, None), None, "the clear frees the core");
+            loop {
+                match executor.execute(&probe, &mut ctx, &mut tile) {
+                    ExecuteResult::Continue => break,
+                    ExecuteResult::LockArbitration => {}
+                    other => panic!("{other:?}"),
+                }
+            }
+            tile.resolve_lock_requests(ctx.cycles);
+            assert_eq!(tile.locks[5].value, 1, "the held release is performed once cleared");
+        }
+    }
+
     #[test]
     fn test_reset() {
         let mut executor = CycleAccurateExecutor::new();
