@@ -107,6 +107,11 @@ pub enum ExecuteResult {
         raw_lock_id: u8,
     },
 
+    /// The bundle did not issue this cycle: the pipeline is frozen for a lock request's
+    /// arbitration cycle (the request has been performed). The same bundle issues next
+    /// cycle.
+    LockArbitration,
+
     /// Stall waiting on DMA completion.
     WaitDma {
         /// DMA channel being waited on.

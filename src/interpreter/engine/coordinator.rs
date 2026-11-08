@@ -1080,6 +1080,13 @@ impl InterpreterEngine {
                             tile.core_debug.update_pc(pipeline_pc);
                         }
                     }
+                    // Frozen for a lock request's arbitration cycle (silicon trails every
+                    // request with a 1-cycle LOCK_STALL): a lock-stall cycle, nothing retired.
+                    StepResult::LockArbitration => {
+                        tile.core_debug.update_stalls(false, true, false, false);
+                        all_halted = false;
+                        any_running = true;
+                    }
                     StepResult::WaitDma { .. } => {
                         tile.core_debug.update_stalls(true, false, false, false);
                         all_halted = false;

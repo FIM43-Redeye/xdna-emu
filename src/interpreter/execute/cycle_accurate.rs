@@ -73,16 +73,24 @@ pub struct CycleAccurateExecutor {
     /// Detailed stall breakdown by reason.
     detailed_stats: HazardStats,
 
-    /// A lock request (`acq` / `rel`) that has issued but not resolved yet.
-    pending_lock: Option<PendingLockRequest>,
+    /// Lock requests (`acq` / `rel`) that have issued but not resolved yet.
+    pending_lock: Option<PendingLockRequests>,
+
+    /// Cycles the next bundle stays frozen after a lock request's arbitration cycle (the
+    /// resume phase of a held acquire), each one an engine step of its own.
+    frozen_cycles: u8,
 }
 
-/// A core lock request in flight: it resolves in front of the bundle whose `bundle_seq`
-/// is `resolve_at`, CORE_REQUEST_BUNDLES_IN_FLIGHT bundles after the request's own.
-#[derive(Debug, Clone, Copy)]
-struct PendingLockRequest {
-    req: super::control::LockRequest,
+/// Core lock requests in flight: they resolve together, in order, in front of the bundle
+/// whose `bundle_seq` is `resolve_at`, CORE_REQUEST_BUNDLES_IN_FLIGHT bundles after the
+/// first one's. A request issued while they are in flight joins them (silicon, lock-b2b
+/// gg: one arbitration cycle for both).
+#[derive(Debug, Clone)]
+struct PendingLockRequests {
+    reqs: smallvec::SmallVec<[super::control::LockRequest; 4]>,
     resolve_at: u64,
+    /// The cycle the held bundle first tried to issue, once an acquire refused it.
+    held_since: Option<u64>,
 }
 
 impl CycleAccurateExecutor {
@@ -100,6 +108,7 @@ impl CycleAccurateExecutor {
             total_branch_stalls: 0,
             detailed_stats: HazardStats::default(),
             pending_lock: None,
+            frozen_cycles: 0,
         }
     }
 
@@ -111,14 +120,16 @@ impl CycleAccurateExecutor {
         neighbor_locks: Option<&super::control::NeighborLocks>,
     ) -> Option<u8> {
         self.pending_lock
-            .filter(|p| ControlUnit::request_blocked(&p.req, tile, neighbor_locks))
-            .map(|p| p.req.raw_lock_id)
+            .as_ref()
+            .and_then(|p| p.reqs.first())
+            .filter(|req| ControlUnit::request_blocked(req, tile, neighbor_locks))
+            .map(|req| req.raw_lock_id)
     }
 
-    /// PC of the lock request in flight, if any (while the core is held on an acquire,
-    /// the `acq`'s PC).
+    /// PC of the oldest lock request in flight, if any (while the core is held on an
+    /// acquire, the `acq`'s PC).
     pub fn pending_lock_pc(&self) -> Option<u32> {
-        self.pending_lock.map(|p| p.req.pc)
+        self.pending_lock.as_ref().and_then(|p| p.reqs.first()).map(|req| req.pc)
     }
 
     /// Calculate the execution cycles for a slot operation.
@@ -368,6 +379,7 @@ impl CycleAccurateExecutor {
         self.total_branch_stalls = 0;
         self.detailed_stats = HazardStats::default();
         self.pending_lock = None;
+        self.frozen_cycles = 0;
     }
 
     /// Get statistics.
@@ -753,14 +765,24 @@ impl CycleAccurateExecutor {
         // has not touched any state yet: the pipeline freezes, so a load in flight still
         // lands 7 issued bundles after it. Rising edge of the lock stall (held level)
         // here; the falling edge in try_resume_stall once the acquire can be granted.
-        // A bundle carrying another lock request resolves the pending one first (the
-        // compilers never issue two within the window: SEMAPHORE is held 4 cycles).
-        let carries_lock_request = bundle.active_slots().any(is_lock_request);
-        if let Some(p) = self.pending_lock {
-            if ctx.bundle_seq >= p.resolve_at || carries_lock_request {
-                match ControlUnit::perform_lock_request(&p.req, ctx, tile, neighbor_locks, pc) {
-                    ExecuteResult::WaitLock { raw_lock_id } => {
+        // Requests issued inside the window resolve with the first (lock-b2b gg).
+        //
+        // Every frozen cycle is a step of its own (`LockArbitration`), so the core's cycle
+        // counter stays on its tile's timer like every other core's.
+        if self.frozen_cycles > 0 {
+            self.frozen_cycles -= 1;
+            ctx.record_stall(1);
+            ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
+            return ExecuteResult::LockArbitration;
+        }
+        if let Some(p) = self.pending_lock.as_mut() {
+            if ctx.bundle_seq >= p.resolve_at {
+                while let Some(req) = p.reqs.first() {
+                    if let ExecuteResult::WaitLock { raw_lock_id } =
+                        ControlUnit::perform_lock_request(req, ctx, tile, neighbor_locks, pc)
+                    {
                         let stall_cycle = ctx.cycles;
+                        p.held_since.get_or_insert(stall_cycle);
                         ctx.timing_context_mut()
                             .record_event(stall_cycle, EventType::LockStallLevel { active: true });
                         ctx.record_stall(1);
@@ -768,14 +790,21 @@ impl CycleAccurateExecutor {
                         timing.hazard_stalls = self.total_hazard_stalls;
                         return ExecuteResult::WaitLock { raw_lock_id };
                     }
-                    _ => {
-                        self.pending_lock = None;
-                        // The request's arbitration cycle (HW trails every
-                        // LOCK_ACQUIRE_REQ / LOCK_RELEASE_REQ with a 1-cycle LOCK_STALL),
-                        // a frozen cycle like any other stall.
-                        ctx.record_stall(1);
-                    }
+                    p.reqs.remove(0);
                 }
+                // The requests' arbitration cycle (HW trails every LOCK_ACQUIRE_REQ /
+                // LOCK_RELEASE_REQ with a 1-cycle LOCK_STALL), a frozen cycle like any
+                // other stall. After a refusal the held bundle issues off a 3-cycle phase
+                // of the cycle it was first held (silicon, lock-b2b resume samples: never
+                // at a cycle I with (I - held_since) % 3 == 0).
+                let issue_at = ctx.cycles + 1;
+                self.frozen_cycles = p.held_since.map_or(0, |held| {
+                    u8::from((issue_at - held) % xdna_archspec::aie2::locks::CORE_RESUME_PHASE_CYCLES == 0)
+                });
+                self.pending_lock = None;
+                ctx.record_stall(1);
+                ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
+                return ExecuteResult::LockArbitration;
             }
         }
 
@@ -934,15 +963,22 @@ impl CycleAccurateExecutor {
                 ctx.record_read_claim(op);
 
                 // A lock request is issued here and performed
-                // CORE_REQUEST_BUNDLES_IN_FLIGHT bundles later (see the resolution above).
+                // CORE_REQUEST_BUNDLES_IN_FLIGHT bundles later (see the resolution above),
+                // with any request already in flight.
                 if is_lock_request(op) {
                     if let Some(req) = ControlUnit::lock_request(op, ctx) {
-                        self.pending_lock = Some(PendingLockRequest {
-                            req,
-                            resolve_at: ctx.bundle_seq
-                                + 1
-                                + xdna_archspec::aie2::locks::CORE_REQUEST_BUNDLES_IN_FLIGHT,
-                        });
+                        match self.pending_lock.as_mut() {
+                            Some(p) => p.reqs.push(req),
+                            None => {
+                                self.pending_lock = Some(PendingLockRequests {
+                                    reqs: smallvec::smallvec![req],
+                                    resolve_at: ctx.bundle_seq
+                                        + 1
+                                        + xdna_archspec::aie2::locks::CORE_REQUEST_BUNDLES_IN_FLIGHT,
+                                    held_since: None,
+                                })
+                            }
+                        }
                     }
                     continue;
                 }
@@ -961,7 +997,7 @@ impl CycleAccurateExecutor {
                         | ExecuteResult::WaitStream { .. } => {
                             final_result = result;
                         }
-                        ExecuteResult::Continue => {}
+                        ExecuteResult::Continue | ExecuteResult::LockArbitration => {}
                         ExecuteResult::Error { .. } => {
                             return result;
                         }
@@ -1043,9 +1079,9 @@ impl CycleAccurateExecutor {
                 // A lock request still in flight completes as the pipeline drains (a
                 // release just before `done`); an acquire that cannot be granted is
                 // dropped with the core.
-                if let Some(p) = self.pending_lock.take() {
+                for req in self.pending_lock.take().into_iter().flat_map(|p| p.reqs) {
                     if let ExecuteResult::WaitLock { raw_lock_id } =
-                        ControlUnit::perform_lock_request(&p.req, ctx, tile, neighbor_locks, pc)
+                        ControlUnit::perform_lock_request(&req, ctx, tile, neighbor_locks, pc)
                     {
                         log::warn!(
                             "core halted with an acquire of raw lock {raw_lock_id} in flight; dropped"
@@ -1464,6 +1500,71 @@ mod tests {
         );
     }
 
+    /// Cycles each counter read lost beyond one per bundle since bundle 0, for request 1 at
+    /// bundle 0 on own lock 5 and request 2 at bundle `d` on own lock 6 (`acq` -1 or `rel`
+    /// +1, every acquire granted), and the two locks' counts afterwards.
+    fn back_to_back_requests(first_acq: bool, second_acq: bool, d: usize) -> (Vec<u64>, [u8; 2]) {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[5].value = u8::from(first_acq);
+        tile.locks[6].value = u8::from(second_acq);
+        let bundles: Vec<VliwBundle> = (0..=12)
+            .map(|i| match i {
+                0 => make_bundle(vec![own_lock_request(first_acq, 5)]),
+                i if i == d => make_bundle(vec![own_lock_request(second_acq, 6)]),
+                _ => make_bundle(vec![]),
+            })
+            .collect();
+        let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
+        tile.resolve_lock_requests(ctx.cycles); // own-tile releases go through the lock arbiter
+        let lost = reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
+        (lost, [tile.locks[5].value, tile.locks[6].value])
+    }
+
+    // Silicon (build/experiments/lock-b2b, `tools/gen_lock_stall_probe.py` b2b gg, rel->acq,
+    // acq->acq, acq->rel, rel->rel, r1 == r2): a second request issued 1..3 bundles after a
+    // first one is performed with it, in front of the fourth bundle after the first, with a
+    // single arbitration cycle; from 4 bundles apart each resolves in front of its own fourth
+    // bundle. Both requests take effect every time.
+    #[test]
+    fn a_lock_request_inside_the_window_of_another_resolves_with_it() {
+        for (first_acq, second_acq) in [(false, true), (true, true), (true, false), (false, false)] {
+            for d in 1..=5 {
+                let (lost, counts) = back_to_back_requests(first_acq, second_acq, d);
+                let expect: Vec<u64> = (0..=12u64)
+                    .map(|i| u64::from(i >= 4) + u64::from(d >= 4 && i >= d as u64 + 4))
+                    .collect();
+                assert_eq!(lost, expect, "acq {first_acq} -> acq {second_acq}, d {d}");
+                assert_eq!(counts, [u8::from(!first_acq), u8::from(!second_acq)], "d {d}: both performed");
+            }
+        }
+    }
+
+    // Silicon (lock-b2b, 116 samples of b2b gr/rg out of the window and pos_stall): with S
+    // the cycle the held bundle first tried to issue and P the releasing core's counter
+    // read in front of its `rel`, the held bundle issues at P+7, or at P+8 when
+    // (P - S) mod 3 == 2: it never issues at a cycle I with (I - S) mod 3 == 0. Here the
+    // release lands after `wait` stall cycles; without the phase the bundle would issue at
+    // S + 2 + wait (the refused cycle, the wait, the grant's arbitration cycle).
+    #[test]
+    fn a_held_bundle_issues_off_a_three_cycle_phase_of_its_stall_start() {
+        for wait in 0..=9u32 {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            let mut tile = Tile::compute(0, 2);
+            let mut bundles = vec![make_bundle(vec![acquire_own_lock_5()])];
+            bundles.extend(nops(5));
+            let issued = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, wait, true);
+            let held_after = 2 + u64::from(wait);
+            let phase = u64::from(held_after % 3 == 0);
+            // the read in bundle 3 is at S - 1
+            assert_eq!(issued[4].0 - issued[3].0, 1 + held_after + phase, "wait {wait}");
+            assert_eq!((issued[4].0 - issued[3].0 - 1) % 3 != 0, true, "wait {wait}");
+            assert_eq!(issued[5].0 - issued[4].0, 1);
+        }
+    }
+
     /// Issued bundles after a scalar `lda r6` at which its result first becomes visible,
     /// with the load issued 4 bundles after a `vmov x0, SCD` (the in-flight position of
     /// Peano's matmul_scalar_cascade get loop). With `hold_cycles > 0` the SCD is empty when
@@ -1606,6 +1707,18 @@ mod tests {
             .with_source(Operand::Immediate(1))
     }
 
+    /// `acq` (change -1) or `rel` (change +1) of own local lock `lock`.
+    fn own_lock_request(acquire: bool, lock: u8) -> SlotOp {
+        let (semantic, change) = if acquire {
+            (SemanticOp::LockAcquire, -1)
+        } else {
+            (SemanticOp::LockRelease, 1)
+        };
+        SlotOp::from_semantic(SlotIndex::Scalar0, semantic)
+            .with_source(Operand::Lock(48 + lock))
+            .with_source(Operand::Immediate(change))
+    }
+
     fn lda_r6_from_p0() -> SlotOp {
         SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
             .with_mem_width(MemWidth::Word)
@@ -1615,9 +1728,10 @@ mod tests {
 
     /// Issue `bundles` in order, as `CoreInterpreter` does: a bundle held on a lock waits
     /// `wait_cycles` (one `record_stall` per cycle), the lock is then released and the
-    /// held bundle runs again. Returns, per bundle, whether it was held first and, with
-    /// `count`, the cycle counter it read (a `mov rN, cntr` added to its free mv slot;
-    /// at most 8 bundles, r16..r23).
+    /// held bundle runs again; a bundle frozen for a lock arbitration cycle runs again
+    /// next cycle. Returns, per bundle, whether it was held first and, with `count`, the
+    /// cycle counter it read (a `mov rN, cntr` added to its free mv slot; at most 16
+    /// bundles, r16..r31).
     fn issue_all(
         executor: &mut CycleAccurateExecutor,
         ctx: &mut ExecutionContext,
@@ -1631,7 +1745,7 @@ mod tests {
             let mut held = false;
             let mut probe = b.clone();
             if count {
-                assert!(probe.slots()[SlotIndex::Scalar1 as usize].is_none() && i < 8);
+                assert!(probe.slots()[SlotIndex::Scalar1 as usize].is_none() && i < 16);
                 probe.set_slot(
                     SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::ReadCycleCounter)
                         .with_dest(Operand::ScalarReg(16 + i as u8)),
@@ -1648,6 +1762,7 @@ mod tests {
                         }
                         tile.locks[5].value = 1;
                     }
+                    ExecuteResult::LockArbitration => {}
                     ExecuteResult::Continue => break,
                     other => panic!("bundle {i}: {other:?}"),
                 }
@@ -1699,8 +1814,9 @@ mod tests {
             let issued = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, wait, true);
             let deltas: Vec<u64> = issued.windows(2).map(|w| w[1].0 - w[0].0).collect();
             let held: Vec<bool> = issued.iter().map(|x| x.1).collect();
-            // Held: the refused cycle, the wait, then the arbitration cycle of the grant.
-            let fourth = if free { 2 } else { 3 + u64::from(wait) };
+            // Held: the refused cycle, the wait, then the arbitration cycle of the grant
+            // (and, for wait 40, one more: see the resume-phase test).
+            let fourth = if free { 2 } else { 3 + u64::from(wait) + 1 };
             assert_eq!(deltas, vec![1, 1, 1, fourth, 1, 1, 1], "{req:?}");
             assert_eq!(held, (0..8).map(|i| i == 4 && !free).collect::<Vec<_>>());
         }

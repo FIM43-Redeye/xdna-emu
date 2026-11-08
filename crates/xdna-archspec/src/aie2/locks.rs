@@ -46,6 +46,17 @@ use crate::locks::{LockModel, LockValueLayout};
 /// (`II_ACQ`/`II_REL`: the SEMAPHORE resource for 4 cycles; `getCoreResumeCycleAfterLock`).
 pub const CORE_REQUEST_BUNDLES_IN_FLIGHT: u64 = 3;
 
+/// Period of the cycle a core held on a refused acquire resumes on: with S the cycle the
+/// held bundle first tried to issue, the bundle never issues at a cycle I with
+/// (I - S) % CORE_RESUME_PHASE_CYCLES == 0, so the grant that lands there costs one cycle
+/// more (the held core resumes 7 or 8 cycles after the releasing core's counter read in
+/// front of its `rel`).
+///
+/// Source: silicon (Phoenix, `tools/gen_lock_stall_probe.py` `b2b` gr/rg and `pos`,
+/// 116 samples over five runs: P+8 exactly when (P - S) % 3 == 2, P+7 otherwise; the
+/// same binary gives either, so it is not code layout).
+pub const CORE_RESUME_PHASE_CYCLES: u64 = 3;
+
 /// Lock ID quadrant boundaries for AIE2.
 ///
 /// The 6-bit lock ID field in AIE2 core instructions (range 0–63) is
