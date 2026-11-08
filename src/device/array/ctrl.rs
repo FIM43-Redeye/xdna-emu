@@ -118,10 +118,13 @@ impl TileArray {
             return false;
         }
 
-        // Read the register values (pure reads, no side effects).
+        // Read the register values. A read in the Lock_Request space
+        // performs the lock request and returns its result (silicon, lock
+        // request probe 2026-11-08); every other register reads without
+        // side effects.
         let mut values = Vec::with_capacity(count as usize);
         for i in 0..count as u32 {
-            values.push(tile.read_register_pure(offset + i * 4));
+            values.push(tile.read_register_for_ctrl_packet(offset + i * 4));
         }
 
         // Build stream packet header: pkt_id = response_id, type = Data,

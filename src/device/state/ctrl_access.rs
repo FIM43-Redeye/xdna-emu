@@ -69,6 +69,15 @@ mod tests {
     }
 
     #[test]
+    fn lock_request_space_decodes() {
+        let d = DeviceState::new_npu1();
+        // The request is encoded in the address, so every word of the
+        // request space is a register (compute 16 KB, memtile 64 KB).
+        assert!(d.ctrl_pkt_offset_decodes(2, 0x423FC));
+        assert!(d.ctrl_pkt_offset_decodes(1, 0xDB0A0));
+    }
+
+    #[test]
     fn read_range_zero_count_is_vacuously_decodable() {
         let d = DeviceState::new_npu1();
         // Header-only read (count=0) accesses no register, so even an

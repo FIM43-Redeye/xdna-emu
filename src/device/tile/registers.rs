@@ -26,30 +26,11 @@ impl Tile {
             if (mt::LOCK_REQUEST_BASE..mt::LOCK_REQUEST_END).contains(&offset) {
                 return self.handle_lock_request(offset, true);
             }
-            // Lock status registers
-            if offset == reg_layout.memtile_locks_overflow_0 {
-                return self.get_lock_overflow_bits(0, 32);
-            }
-            if offset == reg_layout.memtile_locks_overflow_1 {
-                return self.get_lock_overflow_bits(32, 64);
-            }
-            if offset == reg_layout.memtile_locks_underflow_0 {
-                return self.get_lock_underflow_bits(0, 32);
-            }
-            if offset == reg_layout.memtile_locks_underflow_1 {
-                return self.get_lock_underflow_bits(32, 64);
-            }
-        } else if self.is_compute() {
-            if (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
-                return self.handle_lock_request(offset, false);
-            }
-            // Lock status registers
-            if offset == reg_layout.memory_locks_overflow {
-                return self.get_lock_overflow_bits(0, 16);
-            }
-            if offset == reg_layout.memory_locks_underflow {
-                return self.get_lock_underflow_bits(0, 16);
-            }
+        } else if self.is_compute() && (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
+            return self.handle_lock_request(offset, false);
+        }
+        if let Some(bits) = self.lock_status_register(offset) {
+            return bits;
         }
 
         // Lock_value registers read the live count, as on the pure path
@@ -156,6 +137,21 @@ impl Tile {
             .unwrap_or(0)
     }
 
+    /// A control-packet register read: a read in the Lock_Request space
+    /// performs the request (as a host read does) and returns its result;
+    /// every other offset reads without side effects.
+    pub fn read_register_for_ctrl_packet(&mut self, offset: u32) -> u32 {
+        use xdna_archspec::aie2::registers::mem_tile as mt;
+        use xdna_archspec::aie2::registers::memory as mm;
+        if self.is_mem() && (mt::LOCK_REQUEST_BASE..mt::LOCK_REQUEST_END).contains(&offset) {
+            return self.handle_lock_request(offset, true);
+        }
+        if self.is_compute() && (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
+            return self.handle_lock_request(offset, false);
+        }
+        self.read_register_pure(offset)
+    }
+
     /// Read a register value without side effects.
     ///
     /// Unlike `read_register()`, this does NOT execute lock operations.
@@ -218,6 +214,9 @@ impl Tile {
 
         if let Some(count) = self.lock_value_register(offset) {
             return count;
+        }
+        if let Some(bits) = self.lock_status_register(offset) {
+            return bits;
         }
 
         // Control_Packet_Handler_Status sticky bits (compute 0x3FF30,
@@ -361,6 +360,29 @@ impl Tile {
             return None;
         }
         Some(self.locks[((offset - lock_base) / lock_stride) as usize].value as u32)
+    }
+
+    /// A read of a Locks_Overflow / Locks_Underflow register: one sticky
+    /// bit per lock. `None` when `offset` is not one.
+    fn lock_status_register(&self, offset: u32) -> Option<u32> {
+        let reg_layout = super::super::regdb::device_reg_layout();
+        if self.is_mem() {
+            match offset {
+                o if o == reg_layout.memtile_locks_overflow_0 => Some(self.get_lock_overflow_bits(0, 32)),
+                o if o == reg_layout.memtile_locks_overflow_1 => Some(self.get_lock_overflow_bits(32, 64)),
+                o if o == reg_layout.memtile_locks_underflow_0 => Some(self.get_lock_underflow_bits(0, 32)),
+                o if o == reg_layout.memtile_locks_underflow_1 => Some(self.get_lock_underflow_bits(32, 64)),
+                _ => None,
+            }
+        } else if self.is_compute() {
+            match offset {
+                o if o == reg_layout.memory_locks_overflow => Some(self.get_lock_overflow_bits(0, 16)),
+                o if o == reg_layout.memory_locks_underflow => Some(self.get_lock_underflow_bits(0, 16)),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 
     // === Lock_Request Register Handling ===

@@ -462,11 +462,14 @@ pub fn subsystem_from_offset(offset: u32, tile_kind: TileKind) -> SubsystemKind 
             ) {
                 SubsystemKind::StreamSwitch
             }
-            // Lock request (non-overlapping)
+            // Lock request: the whole 16 KB request space the AM025
+            // Lock_Request description gives (the address encodes the
+            // request), not just the single register entry the subsystem
+            // range is generated from.
             else if in_range(
                 offset,
-                subsystem::compute::lock_request::OFFSET_START,
-                subsystem::compute::lock_request::OFFSET_END,
+                arch::registers::memory::LOCK_REQUEST_BASE,
+                arch::registers::memory::LOCK_REQUEST_END,
             ) {
                 SubsystemKind::LockRequest
             }
@@ -578,10 +581,12 @@ pub fn subsystem_from_offset(offset: u32, tile_kind: TileKind) -> SubsystemKind 
                 subsystem::memtile::stream_switch::OFFSET_END,
             ) {
                 SubsystemKind::StreamSwitch
-            } else if in_range(
+            }
+            // Lock request: the whole 64 KB request space (see compute).
+            else if in_range(
                 offset,
-                subsystem::memtile::lock_request::OFFSET_START,
-                subsystem::memtile::lock_request::OFFSET_END,
+                arch::registers::mem_tile::LOCK_REQUEST_BASE,
+                arch::registers::mem_tile::LOCK_REQUEST_END,
             ) {
                 SubsystemKind::LockRequest
             }
@@ -859,6 +864,8 @@ mod tests {
 
         // Lock request (address-encoded command interface)
         assert_eq!(subsystem_from_offset(0x40000, TileKind::Compute), SubsystemKind::LockRequest);
+        assert_eq!(subsystem_from_offset(0x43FFC, TileKind::Compute), SubsystemKind::LockRequest);
+        assert_ne!(subsystem_from_offset(0x44000, TileKind::Compute), SubsystemKind::LockRequest);
     }
 
     #[test]
@@ -908,6 +915,9 @@ mod tests {
 
         // Lock request
         assert_eq!(subsystem_from_offset(0xD0000, TileKind::Mem), SubsystemKind::LockRequest);
+        // The address encodes the request, so the whole space decodes.
+        assert_eq!(subsystem_from_offset(0xDFFFC, TileKind::Mem), SubsystemKind::LockRequest);
+        assert_ne!(subsystem_from_offset(0xE0000, TileKind::Mem), SubsystemKind::LockRequest);
 
         // Performance
         assert_eq!(subsystem_from_offset(0x91000, TileKind::Mem), SubsystemKind::Performance);

@@ -1115,3 +1115,22 @@ fn mm2s_byte_total_ignores_bytes_an_s2mm_writes() {
     assert!(array.total_dma_bytes_transferred() > 0, "fixture: the S2MM must have written");
     assert_eq!(array.total_mm2s_bytes_transferred(), 0);
 }
+
+/// A control-packet read in the Lock_Request space performs the request and
+/// returns its result (silicon, lock request probe 2026-11-08): an acquire_ge
+/// 1 on a memtile lock holding 40 answers 1 and leaves 39.
+#[test]
+fn test_ctrl_packet_read_performs_lock_request() {
+    let mut array = TileArray::npu1();
+    let (col, row) = (1u8, 1u8);
+    array.tile_mut(col, row).locks[5].set(40);
+
+    // Lock_Request: base + id * 0x400 + acquire (0x200) + (change & 0x7F) << 2.
+    let acquire_minus_one = 0xD0000 + 5 * 0x400 + 0x200 + ((-1i8 as u8 as u32 & 0x7F) << 2);
+    assert!(array.handle_read_registers(col, row, acquire_minus_one, 1, 3));
+
+    let response: Vec<u32> = array.tile(col, row).pending_ctrl_response.iter().map(|&(w, _)| w).collect();
+    assert_eq!(response.len(), 2, "header + one result word");
+    assert_eq!(response[1], 1, "request granted");
+    assert_eq!(array.tile(col, row).locks[5].value, 39);
+}
