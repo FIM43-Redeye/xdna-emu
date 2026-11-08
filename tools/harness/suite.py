@@ -40,7 +40,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .emit import kernel_object
 from .build import BuildError, _peano_tool, build_package
@@ -80,7 +80,7 @@ def output_path(suite_dir: Path, tag: str, case: str,
 # -- writing (generators) ----------------------------------------------------
 
 def write_case(suite_dir: str | Path, name: str, topology: Topology, *,
-               files: dict[str, str | bytes], meta: dict[str, Any] | None = None) -> None:
+               files: Mapping[str, str | bytes], meta: dict[str, Any] | None = None) -> None:
     """Write one case: the topology, the files its sources name, and `case.json`.
 
     Every core source must be a relative path naming a key of `files`, so the case

@@ -182,6 +182,105 @@ def parse_pos(consumer_log: bytes) -> list[int]:
     return [(ts[i + 1] - ts[i]) & 0xFFFFFFFF for i in range(7)]
 
 
+# -- b2b: a second lock request inside the first's window ------------------------------
+
+# Request 1 is on lock B2B_FIRST, request 2 on LOCK_ID; both locks live in the consumer's
+# memory module and the producer reaches both (to release whichever acquire is refused).
+B2B_FIRST = 14
+B2B_PAIRS = ("relacq", "acqacq", "acqrel", "relrel")
+# Variants: "gg" every acquire granted on issue; "gr" the second acquire refused until the
+# producer releases it; "rg" the first acquire refused; "same" (relacq only) both requests
+# on LOCK_ID, count 0: the release is what lets the acquire through, unless silicon takes
+# the acquire first, in which case the producer's release lets it through late.
+B2B_VARIANTS = {"relacq": ("gg", "gr", "same"), "acqacq": ("gg", "gr", "rg"),
+                "acqrel": ("gg", "rg"), "relrel": ("gg",)}
+B2B_MAX_D = 5
+# Counter reads co-issue with every bundle, the requests included, but only the eight
+# eL pairs r16..r31 take `mov rH:rL, cntr`: each case reads the counter in front of
+# request 1 and in seven consecutive bundles of one window (offsets from request 1).
+# Window "a" covers +0..+6, "b" +6..+12; both read +6, a determinism check across cases.
+B2B_WINDOWS = {"a": 0, "b": 6}
+B2B_LAST = 12                      # the program runs to request 1 + B2B_LAST, then nops
+
+
+def _b2b_requests(pair: str) -> tuple[str, str]:
+    return pair[:3], pair[3:]
+
+
+def b2b_layout(window: str) -> list[int]:
+    """Bundle offset from request 1 of each counter read of a b2b case."""
+    first = B2B_WINDOWS[window]
+    return [-1, *range(first, first + 7)]
+
+
+def b2b_program(pair: str, variant: str, d: int, window: str) -> list[str]:
+    """Consumer window of b2b: request 1 at offset 0, request 2 at +d, nops to +B2B_LAST,
+    the counter read at the offsets of `b2b_layout(window)`."""
+    if pair not in B2B_PAIRS or variant not in B2B_VARIANTS[pair]:
+        raise ValueError(f"no b2b case {pair}_{variant}")
+    if not 1 <= d <= B2B_MAX_D:
+        raise ValueError(f"b2b needs 1 <= d <= {B2B_MAX_D}")
+    k1, k2 = _b2b_requests(pair)
+    lock1 = LOCK_ID if variant == "same" else B2B_FIRST
+    regs = {"acq": "r3", "rel": "r2"}
+    slots: dict[int, list[str]] = {0: [f"{k1} #{48 + lock1}, {regs[k1]}"],
+                                   d: [f"{k2} #{48 + LOCK_ID}, {regs[k2]}"]}
+    for i, off in enumerate(b2b_layout(window)):
+        hi, lo = TS_PAIRS[i]
+        slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
+    return [("  " + " ; ".join(slots[o])) if o in slots else N for o in range(-1, B2B_LAST + 1)]
+
+
+def b2b_inits(pair: str, variant: str) -> tuple[int, int]:
+    """Initial counts of (B2B_FIRST, LOCK_ID)."""
+    k1, k2 = _b2b_requests(pair)
+    if variant == "same":
+        return 0, 0
+    first = 1 if k1 == "acq" and variant != "rg" else 0
+    second = 1 if k2 == "acq" and variant != "gr" else 0
+    return first, second
+
+
+def b2b_refused_lock(variant: str) -> int | None:
+    """The lock the producer releases (the refused acquire's), if any."""
+    return {"gr": LOCK_ID, "rg": B2B_FIRST, "same": LOCK_ID}.get(variant)
+
+
+def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
+    prog = b2b_program(pair, variant, d, window)
+    body = ["  mov r2, #1", "  mov r3, #-1", *[N] * 2, *prog, *[N] * 8, *_store_ts(8, 0)]
+    lock = b2b_refused_lock(variant)
+    if lock is None:
+        prod = _frame([*[N] * 2])
+    else:
+        prod = _frame([*base.delay_loop(late_iters, ".Lprod"), "  mov r1, #1", *[N] * 2, _ts(0),
+                       f"  rel #{lock}, r1", *[N] * 8, *_store_ts(1, 0)])
+    first, second = b2b_inits(pair, variant)
+    topo = Topology(
+        name=f"b2b_{pair}_{variant}_d{d}{window}",
+        cores=(Core("producer", PRODUCER_TILE, Path("producer.s"), args=(Buffer("ts", "out", TS_BYTES),)),
+               Core("consumer", CONSUMER_TILE, Path("consumer.s"), args=(Buffer("log", "out", LOG_BYTES),))),
+        links=(SharedLock("consumer", "producer", B2B_FIRST, init=first),
+               SharedLock("consumer", "producer", LOCK_ID, init=second)))
+    return topo, {"producer.s": prod, "consumer.s": _frame(body)}
+
+
+def parse_b2b(window: str, consumer_log: bytes, producer_ts: bytes | None) -> dict:
+    """Per counter read: its bundle offset and the cycles lost beyond one per bundle since
+    the read in front of request 1 (0 0 0 0 1 ... : one cycle lost in front of +4).
+    `resume`: the first read after the producer's release minus the producer's read in
+    front of its `rel` (as the lk/pos resume numbers)."""
+    layout = b2b_layout(window)
+    ts = struct.unpack_from("<8I", consumer_log)
+    lost = [((ts[i] - ts[0]) & 0xFFFFFFFF) - (layout[i] - layout[0]) for i in range(8)]
+    out = {"layout": layout, "lost": lost, "resume": None}
+    if producer_ts is not None:
+        (p,) = struct.unpack_from("<I", producer_ts)
+        after = [(t - p) & 0xFFFFFFFF for t in ts if 0 < ((t - p) & 0xFFFFFFFF) < 1 << 31]
+        out["resume"] = min(after) if after else None
+    return out
+
+
 # -- eq: acquires with a change >= 0 -----------------------------------------------
 
 Op = tuple[str, int]               # ("acq" | "rel", change)
@@ -360,6 +459,20 @@ def cmd_generate(args) -> int:
         elif fam == "relpos":
             made = [pos_case("relpos", "stall", 0)]
             metas = [{"family": "relpos"}]
+        elif fam.startswith("b2b_"):
+            # b2b_PAIR (every variant) or b2b_PAIR_VARIANT, at every distance 1..B2B_MAX_D
+            parts = fam.split("_")
+            pair = parts[1]
+            if pair not in B2B_PAIRS:
+                raise SystemExit(f"unknown b2b pair {pair!r}")
+            variants = parts[2:] or list(B2B_VARIANTS[pair])
+            made, metas = [], []
+            for v in variants:
+                for d in range(1, B2B_MAX_D + 1):
+                    for w in B2B_WINDOWS:
+                        made.append(b2b_case(pair, v, d, w, args.late_iters))
+                        metas.append({"family": "b2b", "pair": pair, "variant": v, "d": d,
+                                      "window": w, "late_iters": args.late_iters})
         elif fam.startswith("eq_"):
             name = fam[3:]
             made = [eq_case(name, args.step_iters)]
@@ -386,6 +499,14 @@ def cmd_analyze(args) -> int:
             print(f"{name:14s} (no output)")
             continue
         log = (cdir / "consumer.log.bin").read_bytes()
+        if meta["family"] == "b2b":
+            pts = cdir / "producer.ts.bin"
+            refused = b2b_refused_lock(meta["variant"]) is not None
+            r = parse_b2b(meta["window"], log, pts.read_bytes() if refused and pts.exists() else None)
+            cells = " ".join(f"{o:+d}:{x}" for o, x in zip(r["layout"][1:], r["lost"][1:]))
+            res = f"  resume=P+{r['resume']}" if r["resume"] is not None else ""
+            print(f"{name:24s} lost {cells}{res}")
+            continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
             continue

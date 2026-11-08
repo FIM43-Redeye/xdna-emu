@@ -120,3 +120,56 @@ def test_pos_reads_the_counter_in_every_bundle_after_the_request():
 def test_parse_pos():
     log = struct.pack("<8I", 10, 11, 12, 13, 900, 901, 902, 903) + bytes(32)
     assert g.parse_pos(log) == [1, 1, 1, 887, 1, 1, 1]
+
+
+@pytest.mark.parametrize("d", range(1, g.B2B_MAX_D + 1))
+@pytest.mark.parametrize("window", list(g.B2B_WINDOWS))
+def test_b2b_program_puts_request_2_d_bundles_after_request_1(d, window):
+    prog = g.b2b_program("relacq", "gg", d, window)
+    reqs = [i for i, l in enumerate(prog) if "acq #" in l or "rel #" in l]
+    assert len(reqs) == 2 and reqs[1] - reqs[0] == d
+    assert [i - reqs[0] for i, l in enumerate(prog) if "cntr" in l] == g.b2b_layout(window)
+    assert len(prog) == g.B2B_LAST + 2
+
+
+def test_b2b_windows_overlap_in_one_read():
+    a, b = (set(g.b2b_layout(w)[1:]) for w in ("a", "b"))
+    assert a & b == {6} and a | b == set(range(0, 13))
+
+
+def test_b2b_cases_validate_and_release_only_the_refused_lock():
+    dev = load_device_model("npu1")
+    for pair, variants in g.B2B_VARIANTS.items():
+        for v in variants:
+            topo, files = g.b2b_case(pair, v, 3, "a", 100)
+            assert validate(topo, dev) == []
+            inits = {l.lock_id: l.init for l in topo.links}
+            assert (inits[g.B2B_FIRST], inits[g.LOCK_ID]) == g.b2b_inits(pair, v)
+            lock = g.b2b_refused_lock(v)
+            if lock is None:
+                assert "rel #" not in files["producer.s"]
+            else:
+                assert f"rel #{lock}," in files["producer.s"]
+                assert inits[lock] == 0
+
+
+def test_parse_b2b_reports_lost_cycles_and_the_resume():
+    # window a: reads at -1, 0..6; one cycle lost in front of +4 and a stall of 100 there
+    ts = [0, 1, 2, 3, 105, 106, 107, 108]
+    r = g.parse_b2b("a", struct.pack("<8I", *ts) + bytes(32), struct.pack("<I", 98) + bytes(28))
+    assert r["layout"] == [-1, 0, 1, 2, 3, 4, 5, 6]
+    assert r["lost"] == [0, 0, 0, 0, 101, 101, 101, 101]
+    assert r["resume"] == 7
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("pv", [(p, v) for p, vs in g.B2B_VARIANTS.items() for v in vs])
+def test_b2b_asm_assembles(pv, tmp_path):
+    for d, w in ((1, "a"), (g.B2B_MAX_D, "b")):
+        _, files = g.b2b_case(*pv, d, w, 100)
+        for fname, text in files.items():
+            s = tmp_path / fname
+            s.write_text(text)
+            res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
+                                  str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
+            assert res.returncode == 0, res.stderr
