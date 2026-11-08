@@ -78,6 +78,7 @@ def expand_program(lines: list[str]) -> tuple[list[str], int, int]:
 # -- cases ---------------------------------------------------------------------
 
 N = "  nop"
+LDA_OLD, LDA_NEW = 111, 222        # `lda` family: r6 before / after its load lands
 
 
 def case_program(name: str) -> list[str]:
@@ -97,6 +98,12 @@ def case_program(name: str) -> list[str]:
     if fam == "two":           # two back-to-back reads, d nops between them
         return ["@ts", "  vmov x0, SCD", *[N] * d, "  vmov x4, SCD", "@ts", "@store", "@ts",
                 "  vmov x0, x4", "@ts", "@store"]
+    if fam == "lda":           # a scalar load d bundles after the read, its result sampled at +1..+8
+        if not 1 <= d <= 8:
+            raise ValueError("lda_D needs 1 <= D <= 8")
+        return ["@ts", "  vmov x0, SCD", *[N] * (d - 1), "  lda r6, [p1, #60]",
+                *[f"  mov r{8 + j}, r6" for j in range(8)], "@ts", *[N] * 8,
+                *[f"  st r{8 + j}, [p1, #{4 * j}]" for j in range(8)], "@ts"]
     raise ValueError(f"unknown case {name!r}")
 
 
@@ -124,6 +131,10 @@ def consumer_asm(case: str, late_iters: int) -> str:
     body += ["  mov r1, #7", "  mov p1, p0", f"  padda [p1], #{TS_BYTES}", *base._nops(2),
              "  vbcst.32 x0, r1", "  vbcst.32 x4, r1", *base._nops(2),
              "  vmov bml1, x0", *base._nops(6)]
+    if case.startswith("lda"):
+        # The load reads LDA_NEW from the record's last word; r6 holds LDA_OLD until it lands.
+        body += [f"  mov r5, #{LDA_NEW}", f"  mov r6, #{LDA_OLD}", *base._nops(2),
+                 "  st r5, [p1, #60]", *base._nops(8)]
     if late_iters:
         body += base.delay_loop(late_iters, ".Lcons")
     body += prog
@@ -160,10 +171,72 @@ def read_case(case: str, mode: str, late_iters: int, direction: str = "south") -
                       (Buffer("ts", "out", 16),), (Buffer("log", "out", consumer_out_bytes(case)),))
 
 
+def write_lda_case(d: int, late_iters: int, direction: str = "south") -> base.Case:
+    """`wlda_D`: the producer fills the link (two words), issues `lda r6` and, D bundles after
+    it, a third `vmov MCD` that stalls until the late consumer pops a word. r6 is sampled into
+    r8.. at every other bundle +1..+8 after the load (bundle +D is the write). The consumer
+    waits `late_iters` loop iterations, then reads the three words."""
+    if not 1 <= d <= 8:
+        raise ValueError("wlda_D needs 1 <= D <= 8")
+    body = base._enable("crMCDEn")
+    body += [f"  mov r5, #{LDA_NEW}", f"  mov r6, #{LDA_OLD}", "  mov r1, #9", *base._nops(2),
+             "  st r5, [p0, #60]", "  vbcst.32 x0, r1", *base._nops(8),
+             "  vmov MCD, x0", "  vmov MCD, x0", *base._nops(4), "  lda r6, [p0, #60]"]
+    caps = []
+    for j in range(1, 9):
+        if j == d:
+            body.append("  vmov MCD, x0")
+        else:
+            body.append(f"  mov r{7 + j}, r6")
+            caps.append(j)
+    body += base._nops(8) + [f"  st r{7 + j}, [p0, #{4 * (j - 1)}]" for j in caps]
+    cons = base._enable("crSCDEn") + base.delay_loop(late_iters, ".Lcons")
+    cons += ["  vmov x0, SCD", *base._nops(8)] * 3 + ["  vst wl0, [p0, #0]", *base._nops(2)]
+    return base._pair(f"wlda_{d}_{direction}", direction, base._frame(body), base._frame(cons),
+                      (Buffer("log", "out", 64),), (Buffer("ts", "out", 32),))
+
+
+def stream_lda_case(d: int, late_iters: int) -> tuple:
+    """`slda_D`: the consumer issues `lda r6` and, D bundles after it, a blocking `mov r2, SS`
+    on an empty stream; r6 is sampled into r8.. at every other bundle +1..+8 after the load.
+    The producer (one core north, `Core:0 -> Core:0`) waits `late_iters` iterations, then
+    sends one word. Same output record as `wlda`."""
+    from harness.topology import Core, CoreStream, TileRef, Topology
+    if not 1 <= d <= 8:
+        raise ValueError("slda_D needs 1 <= D <= 8")
+    body = [f"  mov r5, #{LDA_NEW}", f"  mov r6, #{LDA_OLD}", *base._nops(2),
+            "  st r5, [p0, #60]", *base._nops(8), "  lda r6, [p0, #60]"]
+    caps = []
+    for j in range(1, 9):
+        if j == d:
+            body.append("  mov r2, SS")
+        else:
+            body.append(f"  mov r{7 + j}, r6")
+            caps.append(j)
+    body += base._nops(8) + [f"  st r{7 + j}, [p0, #{4 * (j - 1)}]" for j in caps]
+    prod = base.delay_loop(late_iters, ".Lprod") + ["  mov r1, #5", *base._nops(2), "  mov ms, r1",
+                                                    *base._nops(8)]
+    (pc, pr), (cc, cr) = base._placement("south")
+    topo = Topology(
+        name=f"slda_{d}",
+        cores=(Core("producer", TileRef(pc, pr), Path("producer.s"), args=(Buffer("ts", "out", 32),)),
+               Core("consumer", TileRef(cc, cr), Path("consumer.s"), args=(Buffer("log", "out", 64),))),
+        links=(CoreStream("producer", "consumer"),))
+    return topo, {"producer.s": base._frame(prod), "consumer.s": base._frame(body)}
+
+
 def cmd_generate(args) -> int:
     out = Path(args.out_dir)
     names = []
     for case in args.cases:
+        if case.startswith(("wlda_", "slda_")):
+            d = int(case.split("_")[1])
+            topo, files = (write_lda_case(d, args.late_iters, args.direction) if case[0] == "w"
+                           else stream_lda_case(d, args.late_iters))
+            suite.write_case(out, topo.name, topo, files=files,
+                             meta={"case": case, "late_iters": args.late_iters, "direction": args.direction})
+            names.append(topo.name)
+            continue
         for mode in args.modes:
             topo, files = read_case(case, mode, args.late_iters, args.direction)
             suite.write_case(out, topo.name, topo, files=files,
