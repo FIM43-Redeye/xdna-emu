@@ -13,7 +13,6 @@ use std::fmt;
 /// allocating a formatted `String` on every routed word when logging is off.
 enum Mm2sRouteDesc {
     ShimMux { channel: u8 },
-    ShimFallbackSouthNorth,
     DmaPort { channel: u8, port_type: PortType },
 }
 
@@ -21,7 +20,6 @@ impl fmt::Display for Mm2sRouteDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShimMux { channel } => write!(f, "Shim Mux MM2S ch{}", channel),
-            Self::ShimFallbackSouthNorth => f.write_str("fallback South->North"),
             Self::DmaPort { channel, port_type } => {
                 write!(f, "ch {}, type={:?}", channel, port_type)
             }
@@ -1028,42 +1026,23 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                         if let Some(slave_idx) = from_mux {
                             Some((slave_idx, Mm2sRouteDesc::ShimMux { channel: mm2s_ch }))
                         } else {
-                            // Fallback: find South slave with circuit route to North
-                            let ss = &tile.stream_switch;
-                            let slaves = ss.slaves.as_slice();
-                            let masters = ss.masters.as_slice();
-                            let mut fallback_slave = None;
-                            for route in &ss.local_routes {
-                                let s = route.slave_idx as usize;
-                                let m = route.master_idx as usize;
-                                if s < slaves.len()
-                                    && m < masters.len()
-                                    && matches!(slaves[s].port_type, PortType::South)
-                                    && matches!(masters[m].port_type, PortType::North)
-                                {
-                                    fallback_slave = Some(s);
-                                    break;
-                                }
+                            // Silicon has no other path from a shim MM2S channel
+                            // into the switchbox: only a Mux South port that
+                            // selects DMA carries it. Log + drop once per channel
+                            // that has data pending; without data the channel
+                            // never reaches this branch.
+                            if dma.has_stream_out_for_channel(combined_ch) {
+                                let msg = format!(
+                                    "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
+                                 no Mux South port selects DMA for it",
+                                    col, row, mm2s_ch,
+                                );
+                                log::error!("{}", msg);
+                                fatal_errors.push(msg);
+                                // Drain the unroutable queue
+                                while dma.pop_stream_out_for_channel(combined_ch).is_some() {}
                             }
-                            if let Some(slave_idx) = fallback_slave {
-                                Some((slave_idx, Mm2sRouteDesc::ShimFallbackSouthNorth))
-                            } else {
-                                // Only log + drop once per channel that has data
-                                // pending and no route.  Without data the channel
-                                // never reaches this branch.
-                                if dma.has_stream_out_for_channel(combined_ch) {
-                                    let msg = format!(
-                                        "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
-                                     no slave port or fallback available",
-                                        col, row, mm2s_ch,
-                                    );
-                                    log::error!("{}", msg);
-                                    fatal_errors.push(msg);
-                                    // Drain the unroutable queue
-                                    while dma.pop_stream_out_for_channel(combined_ch).is_some() {}
-                                }
-                                continue;
-                            }
+                            continue;
                         }
                     } else {
                         let slave_port = match tile_kind {
@@ -1930,6 +1909,44 @@ mod isolation_tests {
             array.tiles[src_idx].stream_switch.masters[master_idx].fifo.len(),
             1,
             "west-bound must be blocked by dst.EAST"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shim_mm2s_route_tests {
+    use super::*;
+    use crate::device::dma::engine::StreamData;
+    use xdna_archspec::aie2::stream_switch::shim;
+
+    /// Silicon wires shim MM2S output into the switchbox only through a Mux
+    /// South port that selects DMA. With no DMA select, the data has no path
+    /// into the switch, even if some South slave has a circuit to North (that
+    /// slave is fed by PL or NoC, not the DMA). The channel must report no
+    /// route rather than borrow another port's circuit.
+    #[test]
+    fn shim_mm2s_without_mux_dma_select_does_not_borrow_a_south_circuit() {
+        let mut array = TileArray::npu1();
+        let idx = array.tile_index(1, 0);
+        let south3 = shim::SOUTH_SLAVE_START as usize + 3;
+        let north0 = shim::NORTH_MASTER_START as usize;
+        array.tiles[idx].stream_switch.configure_local_route(south3, north0);
+        assert!(array.tiles[idx].shim_mux_mm2s_slaves.iter().all(Option::is_none));
+
+        let combined_ch = array.dma_engines[idx].s2mm_channel_count() as u8;
+        let word = StreamData { data: 0x1234_5678, tlast: true, channel: combined_ch };
+        array.dma_engines[idx].prepend_stream_out_for_channel(combined_ch, [word].into_iter().collect());
+
+        array.route_dma_to_tile_switches();
+
+        assert!(
+            array.tiles[idx].stream_switch.slaves[south3].fifo.is_empty(),
+            "MM2S data must not enter South3 without a Mux DMA select"
+        );
+        assert!(
+            array.fatal_errors.iter().any(|e| e.contains("no route for MM2S ch0")),
+            "expected a no-route error, got {:?}",
+            array.fatal_errors
         );
     }
 }
