@@ -95,8 +95,8 @@ pub use registers::{
 pub use sparse_load::{SparseLoadUnit, SparseRead};
 pub use load_ring::{LoadPort, LoadPortRings};
 pub use context::{
-    DeferredPcKind, EventLog, EventType, ExecutionContext, PendingBranch, PendingDeferredEvent, PendingWrite,
-    SpRegister, SrsConfig, TimestampedEvent, TimingContext, UnpackSource, TRACE_PC_PIPELINE_DEPTH,
+    EventLog, EventType, ExecutionContext, PendingBranch, PendingWrite, SpRegister, SrsConfig,
+    TimestampedEvent, TimingContext, UnpackSource,
 };
 
 #[cfg(test)]
