@@ -968,3 +968,61 @@ fn test_lock_release_counter() {
 
     assert_eq!(tile.lock_release_count(), 2);
 }
+
+// Shim mux/demux DMA channel mapping. aie-rt's default channel-port table
+// (routing/xaie_routing.c) fixes it per channel: MM2S ch0 feeds South3, ch1
+// South7; S2MM ch0 drains South2, ch1 South3. A channel's port does not depend
+// on which other ports the register selects.
+
+const SHIM_MUX_SOUTH3_DMA: u32 = 1 << 10;
+const SHIM_MUX_SOUTH7_DMA: u32 = 1 << 14;
+const SHIM_DEMUX_SOUTH2_DMA: u32 = 1 << 4;
+const SHIM_DEMUX_SOUTH3_DMA: u32 = 1 << 6;
+
+#[test]
+fn shim_mux_south7_alone_feeds_mm2s_ch1() {
+    // The control-packet overlay since mlir-aie #3935 selects DMA on South7
+    // only, to leave MM2S ch0 to the design.
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_mux_config(SHIM_MUX_SOUTH7_DMA);
+    assert_eq!(tile.shim_mux_mm2s_slaves, vec![None, Some(9)]);
+}
+
+#[test]
+fn shim_mux_south3_alone_feeds_mm2s_ch0() {
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_mux_config(SHIM_MUX_SOUTH3_DMA);
+    assert_eq!(tile.shim_mux_mm2s_slaves, vec![Some(5), None]);
+}
+
+#[test]
+fn shim_mux_both_dma_ports_feed_both_channels() {
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_mux_config(SHIM_MUX_SOUTH3_DMA | SHIM_MUX_SOUTH7_DMA);
+    assert_eq!(tile.shim_mux_mm2s_slaves, vec![Some(5), Some(9)]);
+}
+
+#[test]
+fn shim_mux_dma_select_on_a_port_without_dma_feeds_nothing() {
+    // AM025 offers only PL or NoC on South2 and South6.
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_mux_config((1 << 8) | (1 << 12));
+    assert_eq!(tile.shim_mux_mm2s_slaves, vec![None, None]);
+}
+
+#[test]
+fn shim_demux_south3_alone_drains_to_s2mm_ch1() {
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_demux_config(SHIM_DEMUX_SOUTH3_DMA);
+    assert_eq!(tile.shim_mux_s2mm_masters, vec![None, Some(5)]);
+    tile.parse_shim_demux_config(SHIM_DEMUX_SOUTH2_DMA | SHIM_DEMUX_SOUTH3_DMA);
+    assert_eq!(tile.shim_mux_s2mm_masters, vec![Some(4), Some(5)]);
+}
+
+#[test]
+fn shim_demux_dma_select_on_a_port_without_dma_drains_nothing() {
+    // AM025 offers only PL or NoC on South4 and South5.
+    let mut tile = Tile::shim(1, 0);
+    tile.parse_shim_demux_config((1 << 8) | (1 << 10));
+    assert_eq!(tile.shim_mux_s2mm_masters, vec![None, None]);
+}

@@ -1475,7 +1475,15 @@ mod tests {
             description: None,
             fields: field_names
                 .iter()
-                .map(|n| BitField { name: n.to_string(), lsb: 0, msb: 0, width: 1, mask: 1, shift: 0 })
+                .map(|n| BitField {
+                    name: n.to_string(),
+                    lsb: 0,
+                    msb: 0,
+                    width: 1,
+                    mask: 1,
+                    shift: 0,
+                    description: None,
+                })
                 .collect(),
         }
     }
@@ -1559,7 +1567,15 @@ mod tests {
             description: None,
             fields: field_names
                 .iter()
-                .map(|n| BitField { name: n.to_string(), lsb: 0, msb: 0, width: 1, mask: 1, shift: 0 })
+                .map(|n| BitField {
+                    name: n.to_string(),
+                    lsb: 0,
+                    msb: 0,
+                    width: 1,
+                    mask: 1,
+                    shift: 0,
+                    description: None,
+                })
                 .collect(),
         }
     }

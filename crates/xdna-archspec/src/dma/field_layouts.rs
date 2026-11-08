@@ -505,6 +505,14 @@ pub struct ShimMuxField {
     /// For mux (input): slave port index.
     /// For demux (output): master port index.
     pub port_index: usize,
+    /// Shim DMA channel this port connects to when the field selects DMA,
+    /// or `None` when AM025 offers no DMA source/sink on this port.
+    ///
+    /// Each DMA-capable port is wired to one fixed channel: the n-th
+    /// DMA-capable port (in port order) is channel n. That reproduces aie-rt's
+    /// default channel-port table (routing/xaie_routing.c): MM2S ch0 = South3,
+    /// ch1 = South7; S2MM ch0 = South2, ch1 = South3.
+    pub dma_channel: Option<usize>,
 }
 
 /// Pre-resolved layout for shim mux and demux configuration registers.
@@ -540,12 +548,23 @@ impl ShimMuxLayout {
                     if let Ok(n) = n_str.parse::<usize>() {
                         // SouthN maps to switchbox port N+2
                         // (South0=slave[2] / master[2] in shim layout)
-                        fields.push(ShimMuxField { field: bf.clone(), port_index: n + 2 });
+                        fields.push(ShimMuxField { field: bf.clone(), port_index: n + 2, dma_channel: None });
                     }
                 }
             }
             // Sort by port_index for deterministic ordering
             fields.sort_by_key(|f| f.port_index);
+            // AM025 names the encodings of each select field in its
+            // description, e.g. "Connect PL (00), DMA(01) or NoC(10) ..."; a
+            // port without a DMA connection lists only PL and NoC.
+            let mut next_channel = 0usize;
+            for f in &mut fields {
+                let offers_dma = f.field.description.as_deref().is_some_and(|d| d.contains("DMA"));
+                if offers_dma {
+                    f.dma_channel = Some(next_channel);
+                    next_channel += 1;
+                }
+            }
             Ok((reg.offset, fields))
         };
 

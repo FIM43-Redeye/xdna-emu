@@ -48,6 +48,10 @@ use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
 use crate::interpreter::state::EventType;
 
+/// Shim Mux_Config / Demux_Config select encoding for a DMA connection
+/// (AM025: "Connect PL (00), DMA(01) or NoC(10)").
+const SHIM_MUX_SELECT_DMA: u32 = 0b01;
+
 /// How a queued broadcast entered the network.
 ///
 /// A flood "source" is a tile that ORIGINATES a channel -- the Event_Generate
@@ -1227,29 +1231,39 @@ impl Tile {
     /// The Shim Mux selects which source (PL/DMA/NoC) feeds each switchbox South
     /// slave port. DMA MM2S output enters the switchbox through a South slave.
     ///
-    /// Field layout and port mappings are derived from the AM025 register database.
-    /// Select values: 0=South/PL, 1=DMA, 2=NoC
+    /// Field layout, port mappings and which port carries which MM2S channel
+    /// come from the AM025 register database (see `ShimMuxField::dma_channel`).
+    /// A channel's port is fixed: MM2S ch1 feeds South7 even when South3 is not
+    /// DMA-selected. Select values: 0=PL, 1=DMA, 2=NoC.
     pub(crate) fn parse_shim_mux_config(&mut self, value: u32) {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping (register may be rewritten with different config)
         self.shim_mux_mm2s_slaves.fill(None);
 
-        let mut dma_ch = 0usize;
         for mf in &mux.mux_fields {
-            let select = mf.field.extract(value);
-            if select == 1 && dma_ch < self.shim_mux_mm2s_slaves.len() {
-                // DMA source -> this South slave gets MM2S output
-                self.shim_mux_mm2s_slaves[dma_ch] = Some(mf.port_index);
-                log::info!(
-                    "Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
+            if mf.field.extract(value) != SHIM_MUX_SELECT_DMA {
+                continue;
+            }
+            match mf.dma_channel {
+                Some(ch) if ch < self.shim_mux_mm2s_slaves.len() => {
+                    self.shim_mux_mm2s_slaves[ch] = Some(mf.port_index);
+                    log::info!(
+                        "Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
+                        self.col,
+                        self.row,
+                        ch,
+                        mf.port_index,
+                        mf.field.name
+                    );
+                }
+                _ => log::warn!(
+                    "[NOT MODELED] Shim Mux ({},{}): DMA select on {}, which AM025 \
+                     gives no DMA source; port fed by nothing",
                     self.col,
                     self.row,
-                    dma_ch,
-                    mf.port_index,
                     mf.field.name
-                );
-                dma_ch += 1;
+                ),
             }
         }
     }
@@ -1259,33 +1273,39 @@ impl Tile {
     /// The Shim Demux selects which destination (PL/DMA/NoC) receives switchbox
     /// South master output. DMA S2MM input comes from a South master.
     ///
-    /// Field layout and port mappings are derived from the AM025 register database.
-    /// Select values: 0=South/PL, 1=DMA, 2=NoC
+    /// Field layout, port mappings and which port drains to which S2MM channel
+    /// come from the AM025 register database (see `ShimMuxField::dma_channel`):
+    /// South2 -> S2MM ch0, South3 -> S2MM ch1, as in aie-rt.
+    /// Select values: 0=PL, 1=DMA, 2=NoC.
     pub(crate) fn parse_shim_demux_config(&mut self, value: u32) {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping
         self.shim_mux_s2mm_masters.fill(None);
 
-        // Per aie-rt (xaie_plif.c), the AIE2 shim demux has a FIXED mapping
-        // from south ports to S2MM DMA channels:
-        //   South2 (master[4]) -> S2MM ch0
-        //   South3 (master[5]) -> S2MM ch1
-        // The demux_fields are ordered South2, South3, South4, South5 and
-        // the DMA channel index matches the field's position in the valid
-        // S2MM port list (first two fields = ch0 and ch1).
-        for (dma_ch, df) in mux.demux_fields.iter().enumerate() {
-            let select = df.field.extract(value);
-            if select == 1 && dma_ch < self.shim_mux_s2mm_masters.len() {
-                self.shim_mux_s2mm_masters[dma_ch] = Some(df.port_index);
-                log::info!(
-                    "Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
+        for df in &mux.demux_fields {
+            if df.field.extract(value) != SHIM_MUX_SELECT_DMA {
+                continue;
+            }
+            match df.dma_channel {
+                Some(ch) if ch < self.shim_mux_s2mm_masters.len() => {
+                    self.shim_mux_s2mm_masters[ch] = Some(df.port_index);
+                    log::info!(
+                        "Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
+                        self.col,
+                        self.row,
+                        ch,
+                        df.port_index,
+                        df.field.name
+                    );
+                }
+                _ => log::warn!(
+                    "[NOT MODELED] Shim Demux ({},{}): DMA select on {}, which AM025 \
+                     gives no DMA sink; port output goes nowhere",
                     self.col,
                     self.row,
-                    dma_ch,
-                    df.port_index,
                     df.field.name
-                );
+                ),
             }
         }
     }

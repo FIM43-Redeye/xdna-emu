@@ -66,6 +66,9 @@ struct RawBitField {
     name: String,
     /// Array [lsb, msb], e.g. [14, 27] for bits 27:14
     bit_range: Vec<u32>,
+    /// Prose description (lists the encodings of select fields).
+    #[serde(default)]
+    description: Option<String>,
 }
 
 // ============================================================================
@@ -86,6 +89,9 @@ pub struct BitField {
     pub mask: u32,
     /// Shift amount (same as lsb)
     pub shift: u8,
+    /// AM025 prose description. Select fields list their encodings here
+    /// (the shim mux names which ports offer a DMA source).
+    pub description: Option<String>,
 }
 
 impl BitField {
@@ -127,7 +133,7 @@ impl BitField {
         } else {
             (1u32 << width) - 1
         };
-        Self { name, lsb, msb, width, mask, shift: lsb }
+        Self { name, lsb, msb, width, mask, shift: lsb, description: None }
     }
 }
 
@@ -267,7 +273,9 @@ impl RegisterDb {
                         }
                         let lsb = f.bit_range[0] as u8;
                         let msb = f.bit_range[1] as u8;
-                        Ok(BitField::from_range(f.name.clone(), lsb, msb))
+                        let mut field = BitField::from_range(f.name.clone(), lsb, msb);
+                        field.description = f.description.clone();
+                        Ok(field)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 

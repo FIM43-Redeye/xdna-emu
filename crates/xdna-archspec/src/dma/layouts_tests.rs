@@ -354,6 +354,17 @@ mod tests {
         assert_eq!(mux.demux_fields[2].field.lsb, 8);
         assert_eq!(mux.demux_fields[3].port_index, 7);
         assert_eq!(mux.demux_fields[3].field.lsb, 10);
+
+        // DMA channel per port, derived from the AM025 field descriptions.
+        // Must equal aie-rt's default channel-port table
+        // (routing/xaie_routing.c): MM2S ch0 = South3 (slave[5]),
+        // ch1 = South7 (slave[9]); South2/South6 offer no DMA.
+        let mux_channels: Vec<_> = mux.mux_fields.iter().map(|f| f.dma_channel).collect();
+        assert_eq!(mux_channels, vec![None, Some(0), None, Some(1)]);
+        // S2MM ch0 = South2 (master[4]), ch1 = South3 (master[5]);
+        // South4/South5 offer no DMA.
+        let demux_channels: Vec<_> = mux.demux_fields.iter().map(|f| f.dma_channel).collect();
+        assert_eq!(demux_channels, vec![Some(0), Some(1), None, None]);
     }
 
     // ====================================================================
