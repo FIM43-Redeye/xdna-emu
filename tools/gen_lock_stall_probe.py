@@ -263,28 +263,36 @@ B2B_COUNT_LOCKS = (B2B_FIRST, LOCK_ID)
 B2B_SPACING_ITERS = 1000
 
 
-def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
-    prog = b2b_program(pair, variant, d, window)
-    body = ["  mov r2, #1", "  mov r3, #-1", *[N] * 2, *prog, *[N] * 8, *_store_ts(8, 0)]
+def _two_lock_case(name: str, setup: list[str], prog: list[str], pairs: list[tuple[int, int]],
+                   refused: int | None, inits: tuple[int, int], late_iters: int):
+    """A consumer window `prog` (counter reads into `pairs`) followed by the count read-back
+    of B2B_COUNT_LOCKS; the producer releases `refused` (if any) after `late_iters`."""
+    body = [*setup, *[N] * 2, *prog, *[N] * 8]
+    body += [f"  st r{lo}, [p0, #{4 * i}]" for i, (_, lo) in enumerate(pairs)]
     body += base.delay_loop(late_iters + B2B_SPACING_ITERS // 2, ".Lcons")
     for i, lock in enumerate(l for l in B2B_COUNT_LOCKS for _ in range(2)):
         body += [f"  acq #{48 + lock}, r3", *[N] * LOCK_SETTLE_BUNDLES, _ts(i)]
     body += [*[N] * 8, *[f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (8 + i)}]" for i in range(4)]]
-    lock = b2b_refused_lock(variant)
     prod = ["  mov r1, #1", *[N] * 2, *base.delay_loop(late_iters, ".Lprod"), _ts(0)]
-    prod += [f"  rel #{lock}, r1"] if lock is not None else [N]
+    prod += [f"  rel #{refused}, r1"] if refused is not None else [N]
     for k, fb in enumerate(l for l in B2B_COUNT_LOCKS for _ in range(2)):
         gap = late_iters + 3 * B2B_SPACING_ITERS // 2 if k == 0 else B2B_SPACING_ITERS
         prod += [*base.delay_loop(gap, f".Lfb{k}"), _ts(k + 1), f"  rel #{fb}, r1"]
     prod += [*[N] * 8, *_store_ts(5, 0)]
-    first, second = b2b_inits(pair, variant)
     topo = Topology(
-        name=f"b2b_{pair}_{variant}_d{d}{window}",
+        name=name,
         cores=(Core("producer", PRODUCER_TILE, Path("producer.s"), args=(Buffer("ts", "out", TS_BYTES),)),
                Core("consumer", CONSUMER_TILE, Path("consumer.s"), args=(Buffer("log", "out", LOG_BYTES),))),
-        links=(SharedLock("consumer", "producer", B2B_FIRST, init=first),
-               SharedLock("consumer", "producer", LOCK_ID, init=second)))
+        links=(SharedLock("consumer", "producer", B2B_FIRST, init=inits[0]),
+               SharedLock("consumer", "producer", LOCK_ID, init=inits[1])))
     return topo, {"producer.s": _frame(prod), "consumer.s": _frame(body)}
+
+
+def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
+    prog = b2b_program(pair, variant, d, window)
+    return _two_lock_case(f"b2b_{pair}_{variant}_d{d}{window}", ["  mov r2, #1", "  mov r3, #-1"],
+                          prog, TS_PAIRS, b2b_refused_lock(variant), b2b_inits(pair, variant),
+                          late_iters)
 
 
 def parse_b2b_counts(consumer_log: bytes, producer_ts: bytes) -> dict[int, int]:
@@ -327,23 +335,37 @@ COND_LAYOUT = [-1, 0, 1, 2, 3, 4, 5]     # bundle offset from the request of eac
 COND_LAST = 8
 
 
-def cond_program(kind: str) -> list[str]:
-    """Consumer window of cond: `kind`.cond at offset 0, counter reads at COND_LAYOUT."""
+def cond_layout(writer: tuple[int, int] | None = None) -> list[int]:
+    """Bundle offsets of the cond counter reads: COND_LAYOUT, or with a r26 writer (its
+    `mov` shares the move slot with a counter read) a baseline at -3 and the first six of
+    -2..+5 that the writer's bundle leaves free."""
+    if writer is None:
+        return COND_LAYOUT
+    return [-3] + [o for o in range(-2, 6) if o != writer[0]][:6]
+
+
+def cond_program(kind: str, writer: tuple[int, int] | None = None) -> list[str]:
+    """Consumer window of cond: `kind`.cond at offset 0, counter reads at COND_LAYOUT.
+    `writer` = (offset, value): a `mov r26, #value` at that bundle (-2, -1, 0 = with the
+    request): does the request see the old or the new r26?"""
     if kind not in COND_STATES:
         raise ValueError(f"cond kind is one of {tuple(COND_STATES)}")
     slots: dict[int, list[str]] = {0: [f"{kind}.cond #{48 + LOCK_ID}, {'r3' if kind == 'acq' else 'r2'}, r26"]}
-    for (hi, lo), off in zip(COND_PAIRS, COND_LAYOUT):
+    layout = cond_layout(writer)
+    for (hi, lo), off in zip(COND_PAIRS, layout):
         slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
-    return [("  " + " ; ".join(slots[o])) if o in slots else N for o in range(-1, COND_LAST + 1)]
+    if writer is not None:
+        slots.setdefault(writer[0], []).append(f"mov r26, #{writer[1]}")
+    return [("  " + " ; ".join(slots[o])) if o in slots else N for o in range(layout[0], COND_LAST + 1)]
 
 
-def cond_case(kind: str, state: str, vkey: str, late_iters: int):
+def cond_case(kind: str, state: str, vkey: str, late_iters: int, writer: tuple[int, int] | None = None):
     if state not in COND_STATES.get(kind, ()):
         raise ValueError(f"no cond case {kind}_{state}")
     value = COND_VALUES[vkey]
     init = 1 if state == "free" else 0
     body = ["  mov r2, #1", "  mov r3, #-1", f"  movxm r26, #{value}", *[N] * 3,
-            *cond_program(kind), *[N] * 8]
+            *cond_program(kind, writer), *[N] * 8]
     body += [f"  st r{lo}, [p0, #{4 * i}]" for i, (_, lo) in enumerate(COND_PAIRS)]
     body += base.delay_loop(late_iters + B2B_SPACING_ITERS // 2, ".Lcons")
     for i in range(2):
@@ -355,18 +377,56 @@ def cond_case(kind: str, state: str, vkey: str, late_iters: int):
         gap = late_iters + 3 * B2B_SPACING_ITERS // 2 if k == 0 else B2B_SPACING_ITERS
         prod += [*base.delay_loop(gap, f".Lfb{k}"), _ts(k + 1), f"  rel #{RAW_SOUTH}, r1"]
     prod += [*[N] * 8, *_store_ts(3, 0)]
-    return _topology(f"cond_{kind}_{state}_{vkey}", _frame(body), _frame(prod), init)
+    name = f"cond_{kind}_{state}_{vkey}" + (f"_w{-writer[0]}to{writer[1]}" if writer else "")
+    return _topology(name, _frame(body), _frame(prod), init)
 
 
-def parse_cond(consumer_log: bytes, producer_ts: bytes) -> dict:
+def parse_cond(consumer_log: bytes, producer_ts: bytes, layout: list[int] = COND_LAYOUT) -> dict:
     """Cycles lost beyond one per bundle at each read since the one in front of the request,
     and the count the lock held after the window (0, 1, or 2 = 2 or more)."""
     ts = struct.unpack_from("<7I", consumer_log)
-    lost = [((ts[i] - ts[0]) & 0xFFFFFFFF) - (COND_LAYOUT[i] - COND_LAYOUT[0]) for i in range(7)]
+    lost = [((ts[i] - ts[0]) & 0xFFFFFFFF) - (layout[i] - layout[0]) for i in range(7)]
     tests = struct.unpack_from("<2I", consumer_log, 32)
     first_release = struct.unpack_from("<3I", producer_ts)[1]
     count = sum(((first_release - t) & 0xFFFFFFFF) < 1 << 31 for t in tests)
     return {"lost": lost, "count": count}
+
+
+# condwin: a skipped (or performed) conditional request next to a real one. B2B_FIRST holds
+# the conditional request, LOCK_ID the plain release; does a skipped request open a window
+# the other joins (the real release then resolves in front of +4), or is it nothing at all
+# (in front of +d+4)? Reads: in front of the first request and six consecutive bundles.
+CONDWIN_VARIANTS = {
+    "sk_re": ("acq.cond", 0, "first"),    # skipped acq.cond, then a plain rel at +d
+    "skr_re": ("rel.cond", 0, "first"),   # skipped rel.cond, then a plain rel at +d
+    "cp_re": ("rel.cond", 1, "first"),    # performed rel.cond, then a plain rel at +d
+    "re_sk": ("acq.cond", 0, "second"),   # a plain rel, then a skipped acq.cond at +d
+}
+CONDWIN_WINDOWS = {"a": [-1, 0, 1, 2, 3, 4, 5], "b": [-1, 4, 5, 6, 7, 8, 9]}
+CONDWIN_MAX_D = 3
+
+
+def condwin_program(variant: str, d: int, window: str) -> list[str]:
+    cond, _, which = CONDWIN_VARIANTS[variant]
+    reg = "r3" if cond == "acq.cond" else "r2"
+    conditional = f"{cond} #{48 + B2B_FIRST}, {reg}, r26"
+    plain = f"rel #{48 + LOCK_ID}, r2"
+    first, second = (conditional, plain) if which == "first" else (plain, conditional)
+    slots: dict[int, list[str]] = {0: [first], d: [second]}
+    for (hi, lo), off in zip(COND_PAIRS, CONDWIN_WINDOWS[window]):
+        slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
+    return [("  " + " ; ".join(slots[o])) if o in slots else N for o in range(-1, B2B_LAST + 1)]
+
+
+def condwin_case(variant: str, d: int, window: str, late_iters: int):
+    if variant not in CONDWIN_VARIANTS or not 1 <= d <= CONDWIN_MAX_D:
+        raise ValueError(f"no condwin case {variant} d{d}")
+    cond, value, _ = CONDWIN_VARIANTS[variant]
+    # an acq.cond that is performed would take lock 14 from 1 to 0; a rel.cond, 0 to 1
+    inits = (1 if cond == "acq.cond" else 0, 0)
+    setup = ["  mov r2, #1", "  mov r3, #-1", f"  movxm r26, #{value}", *[N] * 3]
+    return _two_lock_case(f"condwin_{variant}_d{d}{window}", setup,
+                          condwin_program(variant, d, window), COND_PAIRS, None, inits, late_iters)
 
 
 # -- eq: acquires with a change >= 0 -----------------------------------------------
@@ -561,6 +621,16 @@ def cmd_generate(args) -> int:
                         made.append(b2b_case(pair, v, d, w, args.late_iters))
                         metas.append({"family": "b2b", "pair": pair, "variant": v, "d": d,
                                       "window": w, "late_iters": args.late_iters})
+        elif fam == "condlat":
+            # r26 written 2, 1 and 0 (same bundle) bundles before an acq.cond / rel.cond
+            made, metas = [], []
+            for kind, st in (("acq", "free"), ("rel", "rel")):
+                for vk, new in (("z", 1), ("o", 0)):
+                    for off in (-2, -1, 0):
+                        made.append(cond_case(kind, st, vk, args.late_iters, (off, new)))
+                        metas.append({"family": "cond", "kind": kind, "state": st, "v": vk,
+                                      "value": COND_VALUES[vk], "late_iters": args.late_iters,
+                                      "writer": [off, new], "layout": cond_layout((off, new))})
         elif fam == "cond" or fam.startswith("cond_"):
             # cond (every case), cond_KIND, cond_KIND_STATE, cond_KIND_STATE_V
             parts = fam.split("_")[1:]
@@ -575,6 +645,20 @@ def cmd_generate(args) -> int:
                                       "value": COND_VALUES[vk], "late_iters": args.late_iters})
             if not made:
                 raise SystemExit(f"no cond case matches {fam!r}")
+        elif fam.startswith("condwin"):
+            # condwin (every variant) or condwin_VARIANT, at every distance 1..CONDWIN_MAX_D
+            parts = fam.split("_", 1)[1:]
+            made, metas = [], []
+            for v in CONDWIN_VARIANTS:
+                if parts and v != parts[0]:
+                    continue
+                for d in range(1, CONDWIN_MAX_D + 1):
+                    for w in CONDWIN_WINDOWS:
+                        made.append(condwin_case(v, d, w, args.late_iters))
+                        metas.append({"family": "condwin", "variant": v, "d": d, "window": w,
+                                      "late_iters": args.late_iters})
+            if not made:
+                raise SystemExit(f"no condwin case matches {fam!r}")
         elif fam.startswith("eq_"):
             name = fam[3:]
             made = [eq_case(name, args.step_iters)]
@@ -612,10 +696,20 @@ def cmd_analyze(args) -> int:
             cnt = " ".join(f"L{k}={v}" for k, v in counts.items())
             print(f"{name:24s} lost {cells}  {cnt}{res}")
             continue
+        if meta["family"] == "condwin":
+            layout = CONDWIN_WINDOWS[meta["window"]]
+            ts = struct.unpack_from("<8I", log)
+            lost = [((ts[i] - ts[0]) & 0xFFFFFFFF) - (layout[i] - layout[0]) for i in range(1, 7)]
+            counts = parse_b2b_counts(log, (cdir / "producer.ts.bin").read_bytes())
+            cells = " ".join(f"{o:+d}:{x}" for o, x in zip(layout[1:], lost))
+            print(f"{name:24s} lost {cells}  " + " ".join(f"L{k}={v}" for k, v in counts.items()))
+            continue
         if meta["family"] == "cond":
-            r = parse_cond(log, (cdir / "producer.ts.bin").read_bytes())
-            cells = " ".join(f"{o:+d}:{x}" for o, x in zip(COND_LAYOUT[1:], r["lost"][1:]))
-            print(f"{name:20s} r26={meta['value']:#010x} lost {cells}  count={r['count']}")
+            layout = meta.get("layout", COND_LAYOUT)
+            r = parse_cond(log, (cdir / "producer.ts.bin").read_bytes(), layout)
+            cells = " ".join(f"{o:+d}:{x}" for o, x in zip(layout[1:], r["lost"][1:]))
+            w = f"  then mov r26,#{meta['writer'][1]} at {meta['writer'][0]:+d}" if "writer" in meta else ""
+            print(f"{name:24s} r26={meta['value']:#010x} lost {cells}  count={r['count']}{w}")
             continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
@@ -639,7 +733,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, same, pos, relpos, b2b_<pair>, cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)

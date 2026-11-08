@@ -231,3 +231,33 @@ def test_parse_cond():
     log = struct.pack("<8I", *reads, 0) + struct.pack("<2I", 500, 1010)
     prod = struct.pack("<3I", 100, 1000, 2000)
     assert g.parse_cond(log, prod) == {"lost": [0, 0, 0, 0, 0, 1, 1], "count": 1}
+
+
+@pytest.mark.parametrize("variant,d", [("sk_re", 1), ("re_sk", 3), ("cp_re", 2)])
+def test_condwin_program_places_both_requests_and_reads_around_them(variant, d):
+    for w, layout in g.CONDWIN_WINDOWS.items():
+        prog = g.condwin_program(variant, d, w)
+        assert sum("cntr" in l for l in prog) == 7
+        reqs = [i for i, l in enumerate(prog) if ".cond " in l or "rel #" in l]
+        assert [reqs[1] - reqs[0]] == [d]
+        assert not any("r27:r26" in l for l in prog)
+
+
+@pytest.mark.parametrize("variant", list(g.CONDWIN_VARIANTS))
+def test_condwin_cases_validate_and_load_the_condition(variant):
+    topo, files = g.condwin_case(variant, 2, "a", 100)
+    assert validate(topo, load_device_model("npu1")) == []
+    value = g.CONDWIN_VARIANTS[variant][1]
+    assert f"movxm r26, #{value}" in files["consumer.s"]
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("variant", list(g.CONDWIN_VARIANTS))
+def test_condwin_asm_assembles(variant, tmp_path):
+    _, files = g.condwin_case(variant, 1, "b", 100)
+    for fname, text in files.items():
+        s = tmp_path / fname
+        s.write_text(text)
+        res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
+                              str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
