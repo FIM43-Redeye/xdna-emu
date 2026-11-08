@@ -466,6 +466,7 @@ impl Lock {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     // Silicon, one rule for every requestor: the host Lock_Request path
     // (build/experiments/objectfifo-wedges lockrange-probe), the core `acq` and a tile-DMA
@@ -495,7 +496,6 @@ mod tests {
         frozen.overflow = true;
         assert_eq!(frozen.acquire_change(0), LockResult::Frozen);
     }
-    use super::*;
 
     #[test]
     fn lock_bounds_match_archspec() {
