@@ -146,10 +146,10 @@ def test_b2b_cases_validate_and_release_only_the_refused_lock():
             inits = {l.lock_id: l.init for l in topo.links}
             assert (inits[g.B2B_FIRST], inits[g.LOCK_ID]) == g.b2b_inits(pair, v)
             lock = g.b2b_refused_lock(v)
-            if lock is None:
-                assert "rel #" not in files["producer.s"]
-            else:
-                assert f"rel #{lock}," in files["producer.s"]
+            rels = [l.split()[1].strip("#,") for l in files["producer.s"].splitlines() if "rel #" in l]
+            fallbacks = [str(l) for l in g.B2B_COUNT_LOCKS for _ in range(2)]
+            assert rels == ([] if lock is None else [str(lock)]) + fallbacks
+            if lock is not None:
                 assert inits[lock] == 0
 
 
@@ -173,3 +173,11 @@ def test_b2b_asm_assembles(pv, tmp_path):
             res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
                                   str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
             assert res.returncode == 0, res.stderr
+
+
+def test_parse_b2b_counts():
+    # producer: window release at 100, fallbacks for lock 14 at 1000, 2000, lock 15 at 3000,
+    # 4000; lock 14 tests at 500 (before its first fallback), 1010; lock 15 at 3010, 4010
+    log = bytes(32) + struct.pack("<4I", 500, 1010, 3010, 4010) + bytes(16)
+    prod = struct.pack("<5I", 100, 1000, 2000, 3000, 4000) + bytes(12)
+    assert g.parse_b2b_counts(log, prod) == {g.B2B_FIRST: 1, g.LOCK_ID: 0}

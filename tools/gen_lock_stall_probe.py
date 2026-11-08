@@ -246,15 +246,29 @@ def b2b_refused_lock(variant: str) -> int | None:
     return {"gr": LOCK_ID, "rg": B2B_FIRST, "same": LOCK_ID}.get(variant)
 
 
+# After the window each lock's count is read back without risking a hang: the consumer
+# takes each lock twice (-1, first B2B_FIRST then LOCK_ID) once the window's release has
+# landed, and the producer releases each lock twice later on, B2B_SPACING_ITERS apart. A
+# test acquire that completes before the producer's first fallback release of its lock was
+# granted from the count the window left (0, 1, or 2 = "2 or more").
+B2B_COUNT_LOCKS = (B2B_FIRST, LOCK_ID)
+B2B_SPACING_ITERS = 1000
+
+
 def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
     prog = b2b_program(pair, variant, d, window)
     body = ["  mov r2, #1", "  mov r3, #-1", *[N] * 2, *prog, *[N] * 8, *_store_ts(8, 0)]
+    body += base.delay_loop(late_iters + B2B_SPACING_ITERS // 2, ".Lcons")
+    for i, lock in enumerate(l for l in B2B_COUNT_LOCKS for _ in range(2)):
+        body += [f"  acq #{48 + lock}, r3", *[N] * LOCK_SETTLE_BUNDLES, _ts(i)]
+    body += [*[N] * 8, *[f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (8 + i)}]" for i in range(4)]]
     lock = b2b_refused_lock(variant)
-    if lock is None:
-        prod = _frame([*[N] * 2])
-    else:
-        prod = _frame([*base.delay_loop(late_iters, ".Lprod"), "  mov r1, #1", *[N] * 2, _ts(0),
-                       f"  rel #{lock}, r1", *[N] * 8, *_store_ts(1, 0)])
+    prod = ["  mov r1, #1", *[N] * 2, *base.delay_loop(late_iters, ".Lprod"), _ts(0)]
+    prod += [f"  rel #{lock}, r1"] if lock is not None else [N]
+    for k, fb in enumerate(l for l in B2B_COUNT_LOCKS for _ in range(2)):
+        gap = late_iters + 3 * B2B_SPACING_ITERS // 2 if k == 0 else B2B_SPACING_ITERS
+        prod += [*base.delay_loop(gap, f".Lfb{k}"), _ts(k + 1), f"  rel #{fb}, r1"]
+    prod += [*[N] * 8, *_store_ts(5, 0)]
     first, second = b2b_inits(pair, variant)
     topo = Topology(
         name=f"b2b_{pair}_{variant}_d{d}{window}",
@@ -262,7 +276,18 @@ def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
                Core("consumer", CONSUMER_TILE, Path("consumer.s"), args=(Buffer("log", "out", LOG_BYTES),))),
         links=(SharedLock("consumer", "producer", B2B_FIRST, init=first),
                SharedLock("consumer", "producer", LOCK_ID, init=second)))
-    return topo, {"producer.s": prod, "consumer.s": _frame(body)}
+    return topo, {"producer.s": _frame(prod), "consumer.s": _frame(body)}
+
+
+def parse_b2b_counts(consumer_log: bytes, producer_ts: bytes) -> dict[int, int]:
+    """Count each of B2B_COUNT_LOCKS held after the window (2 = 2 or more)."""
+    tests = struct.unpack_from("<4I", consumer_log, 32)
+    fb = struct.unpack_from("<5I", producer_ts)[1:]
+    out = {}
+    for j, lock in enumerate(B2B_COUNT_LOCKS):
+        first_release = fb[2 * j]
+        out[lock] = sum(((first_release - t) & 0xFFFFFFFF) < 1 << 31 for t in tests[2 * j:2 * j + 2])
+    return out
 
 
 def parse_b2b(window: str, consumer_log: bytes, producer_ts: bytes | None) -> dict:
@@ -502,10 +527,13 @@ def cmd_analyze(args) -> int:
         if meta["family"] == "b2b":
             pts = cdir / "producer.ts.bin"
             refused = b2b_refused_lock(meta["variant"]) is not None
-            r = parse_b2b(meta["window"], log, pts.read_bytes() if refused and pts.exists() else None)
+            prod = pts.read_bytes()
+            r = parse_b2b(meta["window"], log, prod if refused else None)
             cells = " ".join(f"{o:+d}:{x}" for o, x in zip(r["layout"][1:], r["lost"][1:]))
             res = f"  resume=P+{r['resume']}" if r["resume"] is not None else ""
-            print(f"{name:24s} lost {cells}{res}")
+            counts = parse_b2b_counts(log, prod)
+            cnt = " ".join(f"L{k}={v}" for k, v in counts.items())
+            print(f"{name:24s} lost {cells}  {cnt}{res}")
             continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
