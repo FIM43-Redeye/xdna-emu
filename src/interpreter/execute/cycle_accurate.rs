@@ -76,6 +76,12 @@ pub struct CycleAccurateExecutor {
     /// Lock requests (`acq` / `rel`) that have issued but not resolved yet.
     pending_lock: Option<PendingLockRequests>,
 
+    /// Lock requests that issued and have not raised their INSTR_LOCK_*_REQ event yet. Silicon
+    /// raises it the cycle after the request issues, granted or refused
+    /// (`tools/gen_lock_pulse_probe.py`: REQ at c+1; a core held on an acquire across the trace
+    /// start has none for it), or later if the pipeline is frozen for the arbitration cycle.
+    req_events_due: smallvec::SmallVec<[super::control::LockRequest; 4]>,
+
     /// Cycles the next bundle stays frozen after a lock request's arbitration cycle (the
     /// resume phase of a held acquire), each one an engine step of its own.
     frozen_cycles: u8,
@@ -91,11 +97,6 @@ struct PendingLockRequests {
     resolve_at: u64,
     /// The cycle the held bundle first tried to issue, once an acquire refused it.
     held_since: Option<u64>,
-    /// How many of `reqs`, from the front, have raised their INSTR_LOCK_*_REQ event. Silicon
-    /// raises it the cycle after the request issues, granted or refused
-    /// (`tools/gen_lock_pulse_probe.py`: REQ at c+1, a core held across the trace start has
-    /// none for its acquire).
-    reported: usize,
 }
 
 impl CycleAccurateExecutor {
@@ -113,6 +114,7 @@ impl CycleAccurateExecutor {
             total_branch_stalls: 0,
             detailed_stats: HazardStats::default(),
             pending_lock: None,
+            req_events_due: smallvec::SmallVec::new(),
             frozen_cycles: 0,
         }
     }
@@ -132,17 +134,14 @@ impl CycleAccurateExecutor {
     }
 
     /// Raise INSTR_LOCK_ACQUIRE_REQ / INSTR_LOCK_RELEASE_REQ for the requests that issued in
-    /// an earlier step and have not raised theirs. The event carries the PC of the request;
-    /// the trace unit's mode-1 PC is the fetch PC, which `crate::trace` derives from it.
+    /// an earlier step (called by the next step that issues a bundle). The event carries the
+    /// PC of the request; the trace unit's mode-1 PC is the fetch PC, which `crate::trace`
+    /// derives from it.
     fn report_lock_requests(&mut self, ctx: &mut ExecutionContext) {
-        let Some(p) = self.pending_lock.as_mut() else {
-            return;
-        };
         let cycle = ctx.cycles;
-        for req in p.reqs.iter().skip(p.reported) {
-            ControlUnit::record_request_event(ctx, req, cycle);
+        for req in self.req_events_due.drain(..) {
+            ControlUnit::record_request_event(ctx, &req, cycle);
         }
-        p.reported = p.reqs.len();
     }
 
     /// PC of the oldest lock request in flight, if any (while the core is held on an
@@ -398,6 +397,7 @@ impl CycleAccurateExecutor {
         self.total_branch_stalls = 0;
         self.detailed_stats = HazardStats::default();
         self.pending_lock = None;
+        self.req_events_due.clear();
         self.frozen_cycles = 0;
     }
 
@@ -692,9 +692,6 @@ impl CycleAccurateExecutor {
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
 
-        // The cycle after a lock request issued, its REQ event
-        self.report_lock_requests(ctx);
-
         // Phase 1: No scoreboard stalls
         //
         // AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard.
@@ -834,6 +831,12 @@ impl CycleAccurateExecutor {
                 return ExecuteResult::LockArbitration;
             }
         }
+
+        // A lock request's REQ event is raised by the next step that issues a bundle: the
+        // cycle after the request in a free pipeline, a cycle later when that one is frozen
+        // by the requests' own arbitration cycle (silicon, acqacq_d3: REQ at c+1 and, for the
+        // second request issued at c+3, at c+5 behind the LOCK_STALL pulse of c+4).
+        self.report_lock_requests(ctx);
 
         // A cascade read issued five bundles ago holds this bundle until its word
         // arrives (the vmov itself, and the four bundles after it, did not wait).
@@ -994,6 +997,7 @@ impl CycleAccurateExecutor {
                 // with any request already in flight.
                 if is_lock_request(op) {
                     if let Some(req) = ControlUnit::lock_request(op, ctx) {
+                        self.req_events_due.push(req);
                         match self.pending_lock.as_mut() {
                             Some(p) => p.reqs.push(req),
                             None => {
@@ -1003,7 +1007,6 @@ impl CycleAccurateExecutor {
                                         + 1
                                         + xdna_archspec::aie2::locks::CORE_REQUEST_BUNDLES_IN_FLIGHT,
                                     held_since: None,
-                                    reported: 0,
                                 })
                             }
                         }
@@ -1107,11 +1110,8 @@ impl CycleAccurateExecutor {
                 // A lock request still in flight completes as the pipeline drains (a
                 // release just before `done`); an acquire that cannot be granted is
                 // dropped with the core.
-                let reported = self.pending_lock.as_ref().map_or(0, |p| p.reported);
-                for (i, req) in self.pending_lock.take().into_iter().flat_map(|p| p.reqs).enumerate() {
-                    if i >= reported {
-                        ControlUnit::record_request_event(ctx, &req, start_cycle);
-                    }
+                self.report_lock_requests(ctx);
+                for req in self.pending_lock.take().into_iter().flat_map(|p| p.reqs) {
                     if let ExecuteResult::WaitLock { raw_lock_id } =
                         ControlUnit::perform_lock_request(&req, ctx, tile, neighbor_locks)
                     {
@@ -2174,6 +2174,29 @@ mod tests {
                 }
             }
             assert_eq!(request_event_cycles(&ctx).len(), 1, "{req:?} free={free}: one REQ per request");
+        }
+    }
+
+    // Silicon (lock-pulse probe, acqacq_d1..d5): the REQ of a request issued 3 bundles after
+    // another, at c + 3, is raised at c + 5, behind the arbitration cycle (c + 4) the pipeline
+    // is frozen for; one issued 1 or 2 bundles after raises it the cycle after, c + d + 1.
+    #[test]
+    fn a_req_event_waits_out_the_arbitration_cycle_of_the_window() {
+        for (d, second_req_at) in [(1usize, 2u64), (2, 3), (3, 5)] {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            ctx.timing_context_mut().enable_tracing();
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = 2;
+            let issue = ctx.cycles;
+            let mut bundles = vec![make_bundle(vec![acquire_own_lock_5()])];
+            bundles.extend(nops(d - 1));
+            bundles.push(make_bundle(vec![acquire_own_lock_5()]));
+            bundles.extend(nops(8));
+            for b in &bundles {
+                while matches!(executor.execute(b, &mut ctx, &mut tile), ExecuteResult::LockArbitration) {}
+            }
+            assert_eq!(request_event_cycles(&ctx), vec![issue + 1, issue + second_req_at], "d={d}");
         }
     }
 
