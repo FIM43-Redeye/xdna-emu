@@ -43,7 +43,7 @@ branch on.
 
 Concretely:
 
-- **AIE2 (NPU1/NPU2/NPU4/NPU5/NPU6):** 8-deep task queue per channel, out-of-order
+- **AIE2 (NPU1/NPU2/NPU4/NPU5/NPU6):** task queue per channel (4 deep behind the channel's own BD pipeline: see fidelity-gaps/dma-stream-resources.md), out-of-order
   S2MM completion, sparsity compression, BD iteration, independent acquire / release
   lock IDs, memtile DMA with 4D addressing and zero-padding, tile DMA with 3D
   addressing, 128-bit memory bus (4 words/cycle), 6-word tile BD, 8-word shim BD.

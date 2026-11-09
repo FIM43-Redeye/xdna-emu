@@ -1,5 +1,6 @@
 //! Task queue operations for DMA engine.
 
+use super::pipeline::HeadStall;
 use super::*;
 
 impl DmaEngine {
@@ -183,33 +184,24 @@ impl DmaEngine {
     /// The queue behind the staging is 4 deep (aie-rt StartQSizeMax) in every case: a push that
     /// finds `staged + 4` tasks waiting blocks its writer.
     pub fn staged_task_slots(&self, channel: u8) -> usize {
-        let Some(ch) = self.channels.get(channel as usize) else {
-            return 0;
-        };
-        if matches!(ch.fsm, ChannelFsm::AcquiringLock { acquired: false, .. }) {
-            2
-        } else if self.tile_kind.is_shim() {
-            6
-        } else {
-            4
+        match self.head_stall(channel) {
+            Some((stall, _)) => self.pipeline_geometry(stall).depth - 1,
+            // between BDs or past an error: the data-stage pipeline
+            None if self
+                .channels
+                .get(channel as usize)
+                .is_some_and(|c| !matches!(c.fsm, ChannelFsm::Idle)) =>
+            {
+                self.pipeline_geometry(HeadStall::Data).depth - 1
+            }
+            // nothing executing: the channel takes the next task as its head
+            None => 0,
         }
     }
 
     /// Whether a Start_Queue write would be accepted now (otherwise the writer blocks).
     pub fn task_queue_has_space(&self, channel: u8) -> bool {
         self.pending_tasks(channel) < self.staged_task_slots(channel) + MAX_TASK_QUEUE_DEPTH
-    }
-
-    /// The BD `Cur_BD` names while tasks wait: the last one the channel's staging has taken.
-    pub(super) fn staged_cur_bd(&self, channel: u8) -> Option<u8> {
-        let ch = self.channels.get(channel as usize)?;
-        let staged = self.pending_tasks(channel).min(self.staged_task_slots(channel));
-        ch.task_queue.iter().nth(staged.checked_sub(1)?).map(|t| t.start_bd)
-    }
-
-    /// Whether the channel's staging is full (the status `Status` field reads STARTING).
-    pub fn staging_full(&self, channel: u8) -> bool {
-        self.pending_tasks(channel) > 0 && self.pending_tasks(channel) >= self.staged_task_slots(channel)
     }
 
     /// Pending task-queue BD ids in hardware FIFO order.

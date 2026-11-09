@@ -4446,7 +4446,9 @@ fn a_channel_parked_on_its_stream_stages_four_tasks_on_compute_and_memtile_and_s
         let expect: Vec<u32> = (1..=total).map(|n| (n + 1).saturating_sub(staged + 2)).collect();
         assert_eq!(sizes, expect, "{name}: Task_Queue_Size after each push");
         assert_eq!(*sizes.last().unwrap(), 4, "{name}: the queue is full on the last push");
-        assert_eq!(seen.last().unwrap().1, 4 + staged, "{name}: Cur_BD is the last staged task's BD");
+        // Cur_BD stops one short of the pipeline's end on a shim (silicon: BD 9 of 4..)
+        let reach = if name == "shim" { staged - 1 } else { staged };
+        assert_eq!(seen.last().unwrap().1, 4 + reach, "{name}: Cur_BD is the last BD the pipeline names");
         assert!(!space, "{name}: the next push finds no room");
     }
 }
@@ -4462,4 +4464,165 @@ fn a_push_into_a_full_queue_is_refused_and_flags_the_overflow() {
     }
     assert!(!engine.enqueue_task(0, 4, 0, false));
     assert!(engine.task_queue_overflow(0));
+}
+
+// Silicon (shim-queue absorb probes): a shim MM2S streaming into its own S2MM backpressures after
+// 8 words while the S2MM has no task, and absorbs 76 while the S2MM's task is parked on a lock.
+// The ingress a task-holding shim S2MM opens is the difference; compute and mem tiles keep theirs.
+#[test]
+fn a_shim_s2mm_opens_its_ingress_once_it_holds_a_task() {
+    let depth = xdna_archspec::aie2::timing::DMA_SHIM_S2MM_INGRESS_DEPTH as usize;
+    let mut shim = DmaEngine::new_shim_tile(1, 0);
+    let idle = shim.channel_input_capacity(0);
+    assert_eq!(idle, shim.input_fifo_capacity(), "no task: the master port FIFO alone");
+    shim.configure_bd(4, BdConfig::simple_1d(0x100, 64).with_acquire(5, -1))
+        .unwrap();
+    assert!(shim.enqueue_task(0, 4, 0, false));
+    assert_eq!(shim.channel_input_capacity(0), idle + depth, "a parked task opens the ingress");
+
+    let mut compute = DmaEngine::new_compute_tile(1, 2);
+    compute
+        .configure_bd(4, BdConfig::simple_1d(0x100, 64).with_acquire(5, -1))
+        .unwrap();
+    let base = compute.channel_input_capacity(0);
+    assert!(compute.enqueue_task(0, 4, 0, false));
+    assert_eq!(compute.channel_input_capacity(0), base, "compute tiles are unchanged");
+}
+
+// === BD pipeline of a stalled channel (silicon: shim-queue stall probes, Phoenix) ===
+//
+// One task of `chain` equal BDs of `words` words, its first BD parked on a lock (`gated`) or on
+// its stream (an S2MM that gets no data). Every row below is a silicon read of the channel status:
+// (chain, words, Status[1:0], Cur_BD relative to the first BD). Compute tile and memtile agree.
+
+/// Status[1:0] and Cur_BD (relative to the chain's first BD) of the parked channel.
+fn parked_chain(
+    mut engine: DmaEngine,
+    mut tile: Tile,
+    gate_lock: u8,
+    gated: bool,
+    chain: u8,
+    words: u32,
+) -> (u32, u32) {
+    let mut host_mem = make_host_memory();
+    host_mem.allocate_region("bds".to_string(), 0x100, 0x1000).unwrap();
+    for i in 0..chain {
+        let mut cfg = BdConfig::simple_1d(0x100 + 0x40 * i as u64, words * 4);
+        if gated && i == 0 {
+            cfg = cfg.with_acquire(gate_lock, -1);
+        }
+        if i + 1 < chain {
+            cfg = cfg.with_next(4 + i + 1);
+        }
+        engine.configure_bd(4 + i, cfg).unwrap();
+    }
+    assert!(engine.enqueue_task(0, 4, 0, false));
+    run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 400);
+    let status = engine.get_channel_status(0);
+    (status & 3, ((status >> 24) & 0x3F) - 4)
+}
+
+fn assert_parked_rows(
+    name: &str,
+    gated: bool,
+    rows: &[(u8, u32, u32, u32)],
+    make: impl Fn() -> (DmaEngine, Tile, u8),
+) {
+    for &(chain, words, status, cur_bd) in rows {
+        let (engine, tile, lock) = make();
+        let got = parked_chain(engine, tile, lock, gated, chain, words);
+        assert_eq!(got, (status, cur_bd), "{name}: {chain} BDs of {words} words (Status[1:0], Cur_BD)");
+    }
+}
+
+#[test]
+fn a_lock_parked_compute_or_mem_channel_reads_the_silicon_pipeline_state() {
+    // (chain, words, Status[1:0], Cur_BD)
+    let rows = [
+        (1, 2, 0, 0),
+        (1, 20, 0, 0),
+        (1, 21, 2, 0),
+        (1, 64, 2, 0),
+        (2, 8, 0, 1),
+        (2, 11, 2, 1),
+        (2, 18, 2, 1),
+        (2, 19, 1, 0),
+        (2, 20, 1, 0),
+        (2, 21, 2, 0),
+        (3, 8, 1, 2),
+        (3, 13, 2, 1),
+        (3, 14, 2, 1),
+        (4, 2, 1, 2),
+    ];
+    assert_parked_rows("compute", true, &rows, || (DmaEngine::new_compute_tile(1, 2), make_tile(), 5));
+    assert_parked_rows("memtile", true, &rows, || {
+        (DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 64 + 5)
+    });
+}
+
+#[test]
+fn a_lock_parked_shim_channel_reads_the_silicon_pipeline_state() {
+    let rows = [
+        (1, 2, 0, 0),
+        (1, 136, 0, 0),
+        (1, 137, 2, 0),
+        (2, 64, 0, 1),
+        (2, 69, 2, 1),
+        (2, 100, 2, 1),
+        (3, 32, 1, 2),
+        (3, 66, 1, 2),
+        (3, 67, 1, 1),
+        (3, 68, 1, 1),
+        (3, 69, 2, 1),
+    ];
+    assert_parked_rows("shim", true, &rows, || (DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 5));
+}
+
+#[test]
+fn a_starved_s2mm_channel_reads_the_silicon_pipeline_state() {
+    let tiles = [("compute", true), ("memtile", true)];
+    let rows = [
+        (1, 2, 0, 0),
+        (1, 14, 0, 0),
+        (1, 15, 2, 0),
+        (2, 6, 0, 1),
+        (2, 7, 0, 1),
+        (2, 8, 2, 1),
+        (2, 12, 2, 1),
+        (2, 13, 1, 0),
+        (2, 15, 2, 0),
+        (3, 2, 0, 2),
+        (3, 12, 2, 1),
+        (3, 13, 1, 0),
+        (4, 4, 2, 3),
+        (4, 5, 2, 2),
+        (5, 2, 1, 4),
+        (7, 2, 1, 4),
+    ];
+    for (name, _) in tiles {
+        let make = || {
+            if name == "compute" {
+                (DmaEngine::new_compute_tile(1, 2), make_tile(), 5)
+            } else {
+                (DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 64 + 5)
+            }
+        };
+        assert_parked_rows(name, false, &rows, make);
+    }
+    let shim_rows = [
+        (1, 2, 0, 0),
+        (1, 68, 0, 0),
+        (1, 69, 2, 0),
+        (2, 32, 0, 1),
+        (2, 34, 0, 1),
+        (2, 35, 2, 1),
+        (2, 66, 2, 1),
+        (2, 67, 1, 0),
+        (2, 68, 1, 0),
+        (2, 69, 2, 0),
+        (6, 2, 0, 5),
+        (7, 2, 1, 5),
+        (8, 2, 1, 5),
+    ];
+    assert_parked_rows("shim", false, &shim_rows, || (DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 5));
 }

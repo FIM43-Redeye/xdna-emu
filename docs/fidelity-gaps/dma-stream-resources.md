@@ -111,6 +111,44 @@ under-emission) is closed and lives in
 | `DMA_MM2S_n_MEMORY_STARVATION` cold-fetch residual | EMU 0 on `of_q0_rich` (**HW 0**, exact match). In a synthetic worst case (core hammering the DMA's bank every cycle) EMU emits a few cycles where HW emits 0. | `src/device/dma/engine/stepping.rs` (`next_granule_fetch`) | **CLOSED for the measured workloads (0 == 0 again on the 2026-11-04 of_q0_rich rebuild); one known residual, OPEN.** The event is now driven by the MM2S egress staging FIFO running dry (`DMA_MM2S_EGRESS_FIFO_DEPTH` = 25). Silicon's 0 EMERGES -- the MM2S in `of_q0_rich` loses bank arbitrations and the staging absorbs every one, and a unit test proves losing EVERY arbitration costs zero cycles and zero starvation (HW: `T_collide/T_apart` = 1.0000). Residual: a transfer's very FIRST granule fetch has an empty staging behind it, so losing THAT one does bubble the port for a cycle. Silicon apparently primes its egress before the port opens (it reported 0 starvation across 112 losses and 16 transfer starts). Bounded by transfer starts, not by denials; needs a capture that starves an egress on purpose (a core hammering the MM2S's bank from the transfer's first cycle, `MM2S_MEMORY_STARVATION` traced) to pin; not taken in the 2026-11-04 wave. | confirmed |
 
 
+## Task queue, BD pipeline and shim S2MM ingress (modelled 2026-11-09, NPU1 silicon)
+
+Probes: `tools/gen_dma_queue_probe.py` (push ramps, parked-chain `stall` sweeps, `absorb` sweeps), every
+status word read over control packets; results are compared word by word against the emulator
+(`src/device/dma/engine/pipeline.rs` documents the rules, `tests.rs` replays the silicon rows).
+
+**What a channel holds.** A stalled channel keeps its stalled BD and the BDs behind it (the rest of the task's
+chain, then the first BDs of the queued tasks) loaded in a short pipeline, and `Task_Queue_Size` counts only
+what does not fit. The pipeline holds 3 BDs when the head is parked on a lock acquire (every tile kind),
+5 when it is stalled on its stream on a compute tile or memtile, 7 on a shim; the queue behind it is 4 deep
+(aie-rt `StartQSizeMax`). So 7, 9 and 11 pushes are accepted, and `Task_Queue_Size` reads 4 at the last one.
+A BD joins the pipeline only while the loaded BDs fit a word budget (the BDs behind the head cost 4 words
+more each); the budgets are known to within a few words (lock: 38..41 compute and memtile, 206..208 shim;
+stream: 28..29 and 136..137). `Cur_BD` names the last loaded BD (at most 2 / 4 / 5 past the head).
+`Status[1:0]` reads 1 (STARTING) when the pipeline is full by count, 2 (RUNNING) when the loaded BDs together
+move at least a threshold number of words (lock: 21 compute and memtile, 137 shim S2MM; starved S2MM: 15 and 69;
+backpressured MM2S: 57 compute and memtile, never on a shim up to 512 words), 1 when the next BD did not fit the
+budget, otherwise 0. Every other stall reads 0 (lock acquire, parked releases, backpressure, starvation).
+
+**A push into a full queue blocks the writer.** The register write itself stalls, so a runtime sequence whose
+later writes would drain the queue deadlocks (the emulator halts with a deadlock diagnostic naming the tile,
+channel and queue state). Whether the overflow flag is ever set on silicon is not observed. Control-packet and
+CDO pushes into a full queue are still dropped with the overflow flag (blocking a stream write is unprobed).
+`dma_rel_c6` queues six transfers on one shim S2MM whose head waits on its stream: well inside the 11 that fit,
+and the emulator now runs it identically to silicon.
+
+**Shim S2MM ingress.** A shim MM2S streaming into its own S2MM backpressures after 8 words while the S2MM has
+no task (the stream path: slave 4 + master 4), and absorbs up to 76 words (every length to 74 and 76 do; 75 and 77 up
+backpressure) while the S2MM's task is parked on a lock acquire, in order, all of it landing once the lock is
+granted: the channel holds 68 words. `dma.shim_s2mm_ingress_depth` (65 in the emulator's accounting) opens once
+the channel holds a task. The compute and memtile numbers above (hop 8, ingress 18, egress 25) and the route
+absorb counts are unchanged; the shim path itself is one word longer in the emulator (9, silicon 8).
+
+**Open.** The MM2S backpressure pipeline (depth and `Cur_BD` of a chain stuck behind a stalled consumer; only the
+2-word chains and the 57-word threshold are probed), the status of a TCT stall, how chain BDs and queued tasks
+share the pipeline when both are present, the exact budgets and the 4-word per-BD overhead, absorb length 75, the
+shim path's extra word.
+
 ## Stream wedges: switch FIFO route and core stream writes (FIXED, NPU1 silicon 2026-11-03)
 
 Two designs wedged the emulator that silicon runs: a flow routed through the stream switch's FIFO

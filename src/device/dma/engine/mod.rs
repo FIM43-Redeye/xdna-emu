@@ -34,6 +34,7 @@
 
 mod locks;
 mod ooo;
+mod pipeline;
 mod status;
 mod stepping;
 mod stream_io;

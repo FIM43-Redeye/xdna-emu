@@ -52,7 +52,6 @@ impl DmaEngine {
             ChannelFsm::Idle => {}
             ChannelFsm::AcquiringLock { acquired: false, .. } => {
                 // Stalled on lock acquire
-                status = layout.status.insert(status, 0b10);
                 status = layout.channel_running.set_bit(status);
                 status = layout.stalled_lock_acq.set_bit(status);
             }
@@ -69,16 +68,22 @@ impl DmaEngine {
             }
             _ => {
                 // All other active states
-                status = layout.status.insert(status, 0b10);
                 status = layout.channel_running.set_bit(status);
             }
         }
 
-        // Cur_BD while the channel is stalled on a lock acquire names a BD the chain prefetch
-        // has already loaded, not the one holding the channel (silicon, lock-leftovers): on a
-        // memtile the next BD of the chain, on a shim the end of it. Compute channels are
-        // unprobed and keep the executing BD.
-        if let ChannelFsm::AcquiringLock { acquired: false, transfer, .. } = &ch.fsm {
+        // Cur_BD while the head is stalled names the last BD the channel's pipeline has loaded
+        // behind it (see `pipeline.rs`). With releases parked behind a frozen lock the pipeline
+        // is shorter and tile-specific (silicon, lock-leftovers): on a memtile the next BD of the
+        // chain, on a shim the end of it; compute channels are unprobed there and keep the
+        // executing BD.
+        if ch.parked_releases.is_empty() {
+            if let Some(bd) = self.pipeline_cur_bd(channel) {
+                status = layout.cur_bd.insert(status, bd as u32);
+            } else if let ChannelFsm::AcquiringLock { acquired: false, transfer, .. } = &ch.fsm {
+                status = layout.cur_bd.insert(status, transfer.bd_index as u32);
+            }
+        } else if let ChannelFsm::AcquiringLock { acquired: false, transfer, .. } = &ch.fsm {
             let lookahead = if self.tile_kind.is_shim() {
                 self.bd_configs.len()
             } else if self.tile_kind.is_mem() {
@@ -93,12 +98,6 @@ impl DmaEngine {
                     None => break,
                 }
             }
-            status = layout.cur_bd.insert(status, bd as u32);
-        }
-
-        // Tasks waiting behind the executing one: Cur_BD names the last BD the channel's
-        // staging has taken (silicon, shim-queue probes), whatever stalls the head.
-        if let Some(bd) = self.staged_cur_bd(channel) {
             status = layout.cur_bd.insert(status, bd as u32);
         }
 
@@ -119,7 +118,6 @@ impl DmaEngine {
         // shim_*_rel_c1..c7). Memtile channels stop at the next acquire instead, which the
         // AcquiringLock arm above already reports.
         if self.tile_kind.is_shim() && ch.parked_releases.len() >= Self::SHIM_PARKED_RELEASE_STALL {
-            status = layout.status.insert(status, 0b10);
             status = layout.channel_running.set_bit(status);
             status = layout.stalled_lock_rel.set_bit(status);
         }
@@ -147,6 +145,9 @@ impl DmaEngine {
                 }
             }
         }
+
+        // Status[1:0]: the pipeline's state, not "running" (silicon reads 0 in most stalls).
+        status = layout.status.insert(status, self.status_field(channel));
 
         status
     }
