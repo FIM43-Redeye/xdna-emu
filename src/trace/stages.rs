@@ -3,8 +3,8 @@
 //! Persists the ad-hoc analysis used to recover from the 2026-05-25 ts/soc
 //! misdiagnosis. Consumes the events JSON produced by tools/parse-trace.py
 //! (same input shape as [`crate::trace::compare`]) and reports per-stage HW
-//! vs EMU cycle deltas using the `soc` field, falling back to `ts` only
-//! when `soc` is absent (older snapshots).
+//! vs EMU cycle deltas using the `ts` field (a frame's cycles field is the idle
+//! cycles on both sides since 2026-11-09, so `ts` is the cycle).
 //!
 //! Default stages match the Phase C 5-stage decomposition for add_one-style
 //! single-column flows: shim_dispatch -> shim_done -> memtile_s2mm_done ->
@@ -26,8 +26,6 @@ struct RawEvent {
     row: u8,
     name: String,
     ts: u64,
-    #[serde(default)]
-    soc: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -211,7 +209,7 @@ impl StageRow {
 
 #[derive(Default)]
 struct LoadedSide {
-    /// Flat list of (col, row, name, cycle); cycle is `soc` if present else `ts`.
+    /// Flat list of (col, row, name, cycle); cycle is `ts`.
     events: Vec<(u8, u8, String, u64)>,
 }
 
@@ -221,7 +219,7 @@ fn load_side(path: &Path) -> Result<LoadedSide, String> {
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     let mut out = LoadedSide::default();
     for rec in file.events {
-        let cyc = rec.soc.unwrap_or(rec.ts);
+        let cyc = rec.ts;
         out.events.push((rec.col, rec.row, rec.name, cyc));
     }
     out.events.sort_by_key(|(_, _, _, c)| *c);
@@ -280,7 +278,7 @@ pub fn compute_stages_single_from_path(path: &Path, stages: &[StageDef]) -> Resu
 
 pub fn format_stages_report(rows: &[StageRow]) -> String {
     let mut out = String::new();
-    writeln!(out, "Stage decomposition (soc-based)").ok();
+    writeln!(out, "Stage decomposition (ts-based)").ok();
     writeln!(out, "{:<45}  {:>10}  {:>10}  {:>10}", "stage", "HW (cyc)", "EMU (cyc)", "gap").ok();
     writeln!(out, "{}", "-".repeat(45 + 2 + 10 + 2 + 10 + 2 + 10)).ok();
     let mut hw_total: i64 = 0;
@@ -321,7 +319,7 @@ mod tests {
     use super::*;
 
     fn ev(col: u8, row: u8, name: &str, soc: u64) -> RawEvent {
-        RawEvent { col, row, name: name.into(), ts: soc, soc: Some(soc) }
+        RawEvent { col, row, name: name.into(), ts: soc }
     }
 
     fn dump_to_tmp(rec: &[RawEvent]) -> tempfile::NamedTempFile {
@@ -335,7 +333,7 @@ mod tests {
                     "slot": 0,
                     "name": r.name,
                     "ts": r.ts,
-                    "soc": r.soc.unwrap_or(r.ts),
+                    "soc": r.ts,
                 })
             })
             .collect();
