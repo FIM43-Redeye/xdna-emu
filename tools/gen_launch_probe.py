@@ -22,11 +22,14 @@ Output words (8 x u32 per core): t0 low, t0 high, before, after low, after high,
 iterations left, 0.
 
 Run: python3 tools/gen_launch_probe.py <suite_dir>; then `python3 -m harness suite build/hw/emu`
-(PYTHONPATH=tools).
+(PYTHONPATH=tools); `python3 tools/gen_launch_probe.py <suite_dir> --analyze <tag>` prints each
+core's lead (cycles it started ahead of the reset write) per repeat.
 """
 from __future__ import annotations
 
 import argparse
+import json
+import struct
 import sys
 from pathlib import Path
 
@@ -125,11 +128,48 @@ def write_suite(out: Path) -> list[str]:
     return names
 
 
+def lead(words: tuple[int, ...]) -> int:
+    """Cycles a core started ahead of the reset write (negative: after it)."""
+    t0, before, jumped = words[0], words[2], words[5]
+    return (before - t0) & 0xFFFFFFFF if jumped else -t0
+
+
+def analyze(suite_dir: Path, tag: str) -> list[str]:
+    """One line per case: each core's lead over every repeat, last core first in the gaps."""
+    meta = json.loads((suite_dir / "suite.json").read_text())
+    lines = []
+    for case in meta["cases"]:
+        base = suite_dir / "runs" / tag / case
+        runs = [base] + sorted(base.glob("repeat_*"))
+        rows = []
+        for r in runs:
+            files = sorted(r.glob("*.ts.bin"))
+            if files:
+                rows.append({f.name.split(".")[0]: lead(struct.unpack("<8I", f.read_bytes()[:32]))
+                             for f in files})
+        if not rows:
+            lines.append(f"{case:10} no output")
+            continue
+        cores = sorted(rows[0])
+        text = " | ".join(f"{k}: {[r.get(k) for r in rows]}" for k in cores)
+        if len(cores) > 1:
+            gaps = [[r[cores[i]] - r[cores[i + 1]] for i in range(len(cores) - 1)]
+                    for r in rows if all(k in r for k in cores)]
+            text += f"  gaps {gaps}"
+        lines.append(f"{case:10} {text}")
+    return lines
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("suite_dir", type=Path)
+    ap.add_argument("--analyze", metavar="TAG",
+                    help="print each core's start lead over the reset write for run TAG")
     a = ap.parse_args(argv)
+    if a.analyze:
+        print("\n".join(analyze(a.suite_dir, a.analyze)))
+        return 0
     names = write_suite(a.suite_dir)
     print(f"{len(names)} cases in {a.suite_dir}")
     return 0
