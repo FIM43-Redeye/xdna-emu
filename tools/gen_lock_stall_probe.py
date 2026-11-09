@@ -1186,7 +1186,7 @@ def frozen_run(args) -> int:
         rd.mkdir(parents=True)
         meta = json.loads((d / "case.json").read_text())
         cmd = [str(host), str(d / "aie.xclbin"), str(d / "insts.bin"), str(d / "pkts.bin"),
-               str(len(meta["labels"])), str(meta.get("passes", 2) * FZ_STAMP_WORDS), str(rd / "out.bin"), *meta.get("host_args", [])]
+               str(len(meta["labels"])), str(meta.get("n_data", meta.get("passes", 2) * FZ_STAMP_WORDS)), str(rd / "out.bin"), *meta.get("host_args", [])]
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True,
                                timeout=60 if args.backend == "hw" else 1800)
