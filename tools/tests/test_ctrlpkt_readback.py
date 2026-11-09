@@ -47,3 +47,8 @@ def test_sequence_waits_for_the_transfer_between_packets():
     waits = [i for i, l in enumerate(ops) if "dma_wait" in l]
     assert "@ctrlin0" in ops[waits[0]] and "@stamp0" in ops[waits[1]]
     assert "@ctrl0" in ops[waits[-1]], "the host ends by waiting for the last response"
+
+
+def test_register_offsets_come_from_the_am025_database():
+    assert (cp.LOCKS_OVERFLOW, cp.LOCKS_UNDERFLOW) == (0x1F120, 0x1F128)
+    assert cp.MEM_EVENT_STATUS3 == 0x1420C

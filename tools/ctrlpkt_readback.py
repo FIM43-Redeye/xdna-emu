@@ -21,12 +21,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-# AM025 register offsets in a compute tile's memory module, one bit per lock (16 locks).
-LOCK_VALUE_BASE = 0x1F000          # Lock<n>_value at + 0x10 * n
-LOCKS_OVERFLOW = 0x1F120           # write 1 to clear
-LOCKS_UNDERFLOW = 0x1F128          # write 1 to clear
-LOCK_STRIDE = 0x10
-MEM_EVENT_STATUS3 = 0x1420C        # memory-module events 96..127 (LOCK_ERROR is 101: bit 5)
+def _memory_module_registers() -> dict[str, int]:
+    """Offsets of the compute tile's memory-module registers, from the AM025 database."""
+    import json
+    import toolchain_paths
+    path = toolchain_paths.resolve_mlir_aie(Path(__file__)) / toolchain_paths.MLIR_AIE_SENTINEL
+    regs = json.loads(path.read_text())["modules"]["memory"]["registers"]
+    return {r["name"]: int(r["offset"], 16) for r in regs}
+
+
+# One bit per lock (16 locks) in Locks_Overflow / Locks_Underflow, write 1 to clear;
+# Lock<n>_value at a 0x10 stride; Event_Status3 holds memory-module events 96..127
+# (LOCK_ERROR is 101: bit 5).
+_REGS = _memory_module_registers()
+LOCK_VALUE_BASE = _REGS["Lock0_value"]
+LOCK_STRIDE = _REGS["Lock1_value"] - _REGS["Lock0_value"]
+LOCKS_OVERFLOW = _REGS["Locks_Overflow"]
+LOCKS_UNDERFLOW = _REGS["Locks_Underflow"]
+MEM_EVENT_STATUS3 = _REGS["Event_Status3"]
 
 CTRL_PKT_ID = 5                    # stream id of the packet flow into the tile's TileControl
 RESPONSE_ID = 2                    # stream id of the packet flow back to shim S2MM 0
