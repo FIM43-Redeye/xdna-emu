@@ -23,7 +23,7 @@ our typed command stream.  The mode-1 timeline hooks in through an
 alternative rebuild function on the same EventCmd schema.
 
 NOT THE REGRESSION ORACLE.  The emulator-vs-HW trace comparison decodes with
-**upstream** ``aie.utils.trace.parse_trace`` (the skip-token model: a held
+**upstream** ``aie.utils.trace.parse_trace`` (the model silicon follows: a held
 level is ``Single(cycles=0)`` + ``Repeat`` tokens, closed by the next
 ``cycles>0`` frame).  This local decoder is a development/inspection aid only;
 the held-level *emitter* (``src/device/trace_unit``) is tuned to the upstream

@@ -1,6 +1,6 @@
 # Trace unit wire-format compression gap
 
-**Status**: OPEN, unscheduled. Carved out from
+**Status**: CLOSED 2026-11-09 (the encoder writes silicon's frames: `docs/fidelity-gaps/trace-encoding.md`). Was OPEN, unscheduled. Carved out from
 `xdna-emu-priv: research/coverage/cycle-accuracy-mission.md` item #9 on 2026-05-25 after that item's
 H1 (perf-counter-driven LOCK_STALL emission) was refuted.
 

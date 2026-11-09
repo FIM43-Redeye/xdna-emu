@@ -181,15 +181,10 @@ pub struct TraceUnit {
     /// the state the first frame reports (silicon: a core held on an acquire since before the
     /// start shows LOCK_STALL in the first frame), so the unit tracks every edge it sees.
     level_signals: u128,
-    /// Held-level mask as of the *last emitted frame*. Distinct from
-    /// `held_mask` (the live state): this records what was asserted when the
-    /// previous frame went out, so `commit_pending_frame` knows whether a level
-    /// was held *across the gap* since that frame. If so, the gap must be
-    /// carried by skip tokens (`Repeat`) rather than the frame's `cycles`
-    /// field -- upstream `parse_trace` deactivates all active events on any
-    /// `cycles>0` frame, so a held level only survives a gap encoded as
-    /// `cycles==0` + Repeat. See
-    /// `xdna-emu-priv: research/specs/2026-06-08-skip-token-held-level-encoding.md`.
+    /// Held-level mask as of the *last commit*, i.e. what was asserted in every cycle since
+    /// the last frame. Distinct from `held_mask` (the live state): a commit writes the
+    /// cycles between it and the previous one as frames of this mask (silicon writes a frame
+    /// in every cycle a level is asserted), then the frame of its own cycle.
     frame_held: u8,
     /// The last mode-0 event frame handed to the encoder, `(mask, cycles field)`. Silicon
     /// writes a frame for every cycle in which anything is asserted and run-length
@@ -953,7 +948,7 @@ impl TraceUnit {
 
     /// Emit one mode-0 event frame for the asserted snapshot `active` with the
     /// given `cycles` delta: a Single0/1/2 when exactly one slot is set, a
-    /// Multiple0/1/2 otherwise. Shared by the skip-token commit paths.
+    /// Multiple0/1/2 otherwise. Shared by the commit paths.
     fn emit_event_frame(&mut self, active: u8, cycles: u64) {
         debug_assert!(active != 0, "emit_event_frame called with empty mask");
         if active.count_ones() == 1 {
