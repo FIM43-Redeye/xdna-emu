@@ -1399,6 +1399,25 @@ pub struct DmaTiming {
     /// (xdna-emu-priv: research/findings/2026-07-15-mm2s-egress-fifo-depth.md)
     /// could only bound the whole source-to-shim pipeline at 48 words.
     pub mm2s_egress_fifo_depth: u8,
+
+    /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
+    /// the channel opens once it has a task, on top of the 8 words the stream path itself
+    /// holds (local slave 4 + master 4).
+    ///
+    /// The value is in the emulator's accounting, calibrated so that a parked shim S2MM absorbs
+    /// 76 words in all, as silicon does (68 beyond the path): 65. The emulator's shim path holds
+    /// 9 words with no task where silicon holds 8, and a channel that holds a task takes 2 more
+    /// than the 2-deep master-port FIFO alone gives; those 3 are not separated here.
+    ///
+    /// **Measured on silicon (Phoenix NPU1, 2026-11-09, shim-queue absorb probes,
+    /// stable over three runs):** a shim MM2S 1 streaming into its own S2MM 1 through the
+    /// switch is backpressured after 8 words when the S2MM has no task, and absorbs 74 words
+    /// (73, 76 too; 75 is the one length below the limit that still backpressures, 77 and up
+    /// backpressure) when the S2MM's task is parked on a lock acquire: 76 - 8 = 68 words
+    /// sit in the S2MM channel. The words land in order once the lock is granted. The
+    /// structure (a 64-word write buffer plus a 4-word stage, or one FIFO) is not separated,
+    /// and neither is whether a running (not parked) shim S2MM uses the same depth.
+    pub shim_s2mm_ingress_depth: u8,
 }
 
 /// Stream switch timing and physical constants.

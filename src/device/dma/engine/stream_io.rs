@@ -58,6 +58,23 @@ impl DmaEngine {
         }
     }
 
+    /// The ingress capacity of one S2MM channel: `input_fifo_capacity()`, plus on a shim the
+    /// channel's own ingress once it holds a task (silicon, shim-queue absorb probes: a shim MM2S
+    /// into its own S2MM backpressures after 8 words while the S2MM has no task, after 76 while
+    /// the task is parked on a lock acquire; see `DmaTiming::shim_s2mm_ingress_depth`).
+    pub fn channel_input_capacity(&self, channel: u8) -> usize {
+        let base = self.input_fifo_capacity();
+        let has_task = self
+            .channels
+            .get(channel as usize)
+            .is_some_and(|c| !matches!(c.fsm, ChannelFsm::Idle));
+        if self.tile_kind.is_shim() && has_task {
+            base + xdna_archspec::aie2::timing::DMA_SHIM_S2MM_INGRESS_DEPTH as usize
+        } else {
+            base
+        }
+    }
+
     /// Map a combined channel index (S2MM_count + MM2S_offset) to the
     /// per-channel `stream_out` slot.  Returns `usize::MAX` if the channel
     /// isn't an MM2S channel on this tile -- callers that hit that case have
@@ -224,7 +241,7 @@ impl DmaEngine {
             self.fatal_errors.push(msg);
             return false;
         }
-        if self.stream_in[ch].len() < self.input_fifo_capacity() {
+        if self.stream_in[ch].len() < self.channel_input_capacity(ch as u8) {
             // This word is accepted only because the gate allowed it -- which, if
             // a next-BD drain block was armed, means the prior BD has drained and
             // this is the first word of the next BD. Clear the block so the rest
@@ -245,7 +262,7 @@ impl DmaEngine {
                  backpressure violation",
                 self.col,
                 self.row,
-                self.input_fifo_capacity(),
+                self.channel_input_capacity(ch as u8),
                 data.channel,
                 data.data,
             );
@@ -379,7 +396,7 @@ impl DmaEngine {
         if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain) && current > 0 {
             return false;
         }
-        current < self.input_fifo_capacity()
+        current < self.channel_input_capacity(channel)
     }
 
     /// Get the total number of words across all MM2S channel stream output
@@ -564,7 +581,7 @@ impl DmaEngine {
         {
             return false;
         }
-        let cap = self.input_fifo_capacity();
+        let cap = self.channel_input_capacity(channel);
         let current = self.stream_in.get(channel as usize).map_or(0, |q| q.len());
         let drained = self.stream_in_drained_this_cycle.get(channel as usize).copied().unwrap_or(0);
         // One-BD-lookahead bound (#140): hold the next BD off until the prior BD

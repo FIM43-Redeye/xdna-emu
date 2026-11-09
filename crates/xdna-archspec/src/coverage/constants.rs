@@ -146,6 +146,10 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.s2mm_ingress_skid_depth", HOP_SLOPE, "18 in all after the switch crossings and the sources' 1-word \
             registers (core: 1 + 1 + 6 + 18 = 26), less the 15 the backpressure onset pins; which structure holds the 3 \
             words is not separated."),
+        measured("dma.shim_s2mm_ingress_depth", "NPU1 shim absorb sweep (tools/gen_dma_queue_probe.py, absorb family): \
+            MM2S 1 -> S2MM 1 on the shim, S2MM parked on a lock 76 words absorbed, 8 with no task, 3 runs identical",
+            "A running (unparked) shim S2MM is not separated from a parked one; length 75 is a silicon oddity \
+            not modelled."),
         measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
             (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles only; mem tiles inherit it unverified. \
             Assumes a stalled core holds one word (+/-1)."),

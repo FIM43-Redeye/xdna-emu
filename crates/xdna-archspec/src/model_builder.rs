@@ -239,6 +239,11 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // a compute-tile MM2S ahead of a stalled consumer, upstream of the
             // switch's local-slave port. See the DmaTiming field doc.
             mm2s_egress_fifo_depth: 25,
+            // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
+            // words, 68 beyond the stream path. 65 in the emulator's accounting, whose shim
+            // path is one word longer and whose task-holding S2MM takes two more. See the
+            // field doc.
+            shim_s2mm_ingress_depth: 65,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
