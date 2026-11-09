@@ -1446,3 +1446,39 @@ fn a_level_asserted_before_the_start_is_in_the_first_frame() {
     assert_eq!(tu.byte_buffer.len(), start_len);
     assert_eq!(tu.held_mask, 0);
 }
+
+/// A gap too long for the 18-bit cycles field is Sync tokens, one per wrap of the field,
+/// then the frame with the remainder. Silicon (quiet traces, idle 262142..1000000 cycles
+/// between PERF_CNT_2 pulses): a wrap that lands in the frame's own cycle is lost.
+#[test]
+fn idle_longer_than_the_cycles_field_is_sync_tokens() {
+    for (idle, syncs, field) in [
+        (262_143u64, 0u64, 262_143u64),
+        (262_144, 0, 0),
+        (262_145, 1, 1),
+        (524_287, 1, 262_143),
+        (524_288, 1, 0),
+        (524_289, 2, 1),
+        (600_000, 2, 75_712),
+        (1_000_000, 3, 213_568),
+    ] {
+        assert_eq!(split_idle(idle), (syncs, field), "idle {idle}");
+    }
+
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37);
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+    notify_commit(&mut tu, 37, 600_001); // 600_000 idle cycles: Sync + Repeat(1), then 75712
+    notify_commit(&mut tu, 37, 1_200_002); // the same again; not merged across the Syncs
+    tu.flush_repeats();
+    // Single2 slot 0, 75712 = 0x127C0
+    let frame = [0xA1, 0x27, 0xC0];
+    let mut expected = vec![0xFF, 0xE1];
+    expected.extend_from_slice(&frame);
+    expected.extend_from_slice(&[0xFF, 0xE1]);
+    expected.extend_from_slice(&frame);
+    let body: Vec<u8> = tu.byte_buffer[start_len..].iter().copied().filter(|&b| b != 0xFE).collect();
+    assert_eq!(body, expected);
+}

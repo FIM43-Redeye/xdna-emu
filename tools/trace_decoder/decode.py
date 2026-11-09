@@ -53,11 +53,12 @@ from .modes import mode0, mode1
 from .packet import deinterleave_packets, trim_trailing_padding, words_to_bytes
 
 
-# Sync advances the timer by a fixed value documented in mlir-aie's
-# convert_commands_to_json with a "Typo in spec" annotation -- the value
-# is what the on-tile encoder actually emits, so we match it for
-# bit-equivalence.
-_SYNC_CYCLE_ADVANCE = 0x3FFFF
+# One Sync is one wrap of the 18-bit cycles field: 2^18 cycles. Silicon (quiet traces,
+# build/experiments/trace-frame-pc/q1: PERF_CNT_2 1000001 cycles apart decode as Sync + Repeat(2)
+# and a field of 213568, 3 * 2^18 + 213569) and upstream mlir-aie's parse.py EVENT_SYNC_CYCLES
+# agree; the 0x3FFFF "typo in spec" of its older event_ir.py undercounts a cycle per Sync. A
+# Repeat that follows a Sync repeats the Sync.
+_SYNC_CYCLE_ADVANCE = 1 << 18
 
 
 _MODE_DECODER = {
@@ -207,6 +208,7 @@ def rebuild_timeline_mode0(
         # implicit increment that the mlir-aie convention bakes into ts.
         # Reset on every Start (mid-stream re-anchor in modes 1/2).
         cmd_index = 0
+        after_sync = False
         prev_event: EventCmd | None = None
         # Keys are stringified row,col (matching mlir-aie's convention)
         names_for_pt = slot_names.get(pkt_type, {})
@@ -220,7 +222,12 @@ def rebuild_timeline_mode0(
                 continue
             if isinstance(cmd, SyncCmd):
                 timer += _SYNC_CYCLE_ADVANCE
+                after_sync = True
                 continue
+            if isinstance(cmd, RepeatCmd) and after_sync:
+                timer += cmd.count * _SYNC_CYCLE_ADVANCE
+                continue
+            after_sync = False
             if isinstance(cmd, StopCmd):
                 # No timeline contribution; mode 0 doesn't actually emit
                 # a Stop opcode in the byte stream (it terminates with
@@ -345,6 +352,7 @@ def rebuild_perfetto_mode0(
             )
 
         timer = 0
+        after_sync = False
         active: set[int] = set()  # currently-asserted slots
         prev_event: EventCmd | None = None
 
@@ -404,7 +412,12 @@ def rebuild_perfetto_mode0(
                 continue
             if isinstance(cmd, SyncCmd):
                 timer += _SYNC_CYCLE_ADVANCE
+                after_sync = True
                 continue
+            if isinstance(cmd, RepeatCmd) and after_sync:
+                timer += cmd.count * _SYNC_CYCLE_ADVANCE
+                continue
+            after_sync = False
             if isinstance(cmd, StopCmd):
                 continue
             if isinstance(cmd, EventCmd):

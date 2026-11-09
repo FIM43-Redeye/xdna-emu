@@ -79,13 +79,18 @@ class Case:
     inits: dict[int, int] = field(default_factory=dict)       # lock id -> initial count
     producer_release: int | None = None   # lock the producer releases after SPACING_ITERS
     end_gap: int = 12                 # nops between the window and the closing marker
+    # PERF_CNT_2's period when it is not the default, and the tail loop that keeps the core
+    # running long enough for the trace to fill a packet at that period (`quiet_*` cases:
+    # frames hundreds of thousands of cycles apart)
+    perfcnt_period: int | None = None
+    tail_iters: int | None = None
 
     def consumer_asm(self) -> str:
         setup = ["  mov r2, #1", "  mov r3, #-1", *nops(2)]
         # markers: event 0 opens the window, event 1 closes it; padding keeps the window's
         # bundles away from the setup and the epilogue
         return frame([*setup, *delay_loop(HEAD_ITERS, ".Lhead"), *nops(8), "  event #0", *self.window, *nops(self.end_gap), "  event #1", *nops(8),
-                       *delay_loop(TAIL_ITERS, ".Ltail")])
+                       *delay_loop(self.tail_iters or TAIL_ITERS, ".Ltail")])
 
     def producer_asm(self) -> str | None:
         if self.producer_release is None:
@@ -121,6 +126,11 @@ def cases() -> dict[str, Case]:
                            "  st r16, [p0, #0]", "  st r18, [p0, #4]", "  st r20, [p0, #8]",
                            "  st r22, [p0, #12]"]))
     add(Case("none", [N]))
+    # Frames further apart than the 18-bit cycles field reaches (262143 idle cycles): the
+    # core trace carries PERF_CNT_2 every P + 1 cycles and the two markers; a tail of ten
+    # periods fills the packet. P = 262142 and 262143 fit the field, 262144 overflows it.
+    for period in (262142, 262143, 262144, 262145, 524287, 524288, 524289, 600000, 1000000):
+        add(Case(f"quiet_p{period}", [N], perfcnt_period=period, tail_iters=(period + 1) * 10 // 10))
     for gap in (20, 100, 300, 1500):
         add(Case(f"none_g{gap}", [N], end_gap=gap))
     for gap in range(0, 7):
@@ -239,7 +249,9 @@ def build_case(case: Case, out: Path) -> None:
     sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
         "--out", "aie.mlir", "--trace-mode", "event_time", "--core-sweep-events", TRACE_EVENTS,
         "--trace-config-out", "trace_config.json", "--config-test-name", case.name,
-        "--config-src-mlir", "base.mlir", "--buffer-size", "65536"], cwd=d, log=d / "inject.log")
+        "--config-src-mlir", "base.mlir", "--buffer-size", "65536",
+        *(["--perfcnt-period", str(case.perfcnt_period)] if case.perfcnt_period else [])],
+       cwd=d, log=d / "inject.log")
     sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
         "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"], cwd=d, log=d / "aiecc.log")
 
@@ -294,12 +306,11 @@ def core_events(path: Path, row: int = 2) -> list[dict]:
     return [e for e in ev if e["pkt_type"] == 0 and e["row"] == row]
 
 
-# The cycle each decoded event happened at. The decoder's `ts` adds 1 + the frame's cycles
-# field per frame. Silicon writes the idle cycles between frames there (probe: INSTR_EVENT_0
-# and _1 a known 2..1500 bundles apart decode 2..1502 apart in `ts`), so `ts` is exact for
-# silicon; the emulator writes the full elapsed cycles (docs/fidelity-gaps/trace-encoding.md),
-# so its `ts` is one late per frame and its `soc` (= ts minus frames) is exact.
-TRUE_CYCLE = {"hw": "ts", "emu": "soc"}
+# The cycle each decoded event happened at. A frame's cycles field is the idle cycles since the
+# previous frame on silicon (probe: INSTR_EVENT_0 and _1 a known 2..1500 bundles apart decode
+# 2..1502 apart in `ts`) and, since 2026-11-09, in the emulator too, so `ts` is exact for both;
+# `soc` (= ts minus frames) drifts one cycle per frame on both.
+TRUE_CYCLE = {"hw": "ts", "emu": "ts"}
 
 
 def levels(events: list[dict], name: str, field: str) -> list[tuple[int, int]]:

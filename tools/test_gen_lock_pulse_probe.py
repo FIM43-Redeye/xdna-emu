@@ -44,7 +44,7 @@ def test_levels_merge_consecutive_cycles_and_split_gaps():
     assert g.levels(ev, "LOCK_STALL", "ts") == [(5, 6), (9, 9), (20, 22)]
 
 
-def test_silicon_is_read_in_ts_and_the_emulator_in_soc():
-    # silicon writes idle cycles between frames, the emulator the elapsed cycles: only
-    # `ts` is exact for the first, only `soc` for the second
-    assert g.TRUE_CYCLE == {"hw": "ts", "emu": "soc"}
+def test_both_backends_are_read_in_ts():
+    # a frame's cycles field is the idle cycles since the previous frame on silicon and in the
+    # emulator, so `ts` is the cycle for both
+    assert g.TRUE_CYCLE == {"hw": "ts", "emu": "ts"}

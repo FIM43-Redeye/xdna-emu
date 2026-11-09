@@ -236,6 +236,18 @@ pub struct TraceUnit {
     armed_start_cycle: Option<u64>,
 }
 
+/// Idle cycles in a mode-0 frame's cycles field: 18 bits.
+const CYCLES_FIELD_RANGE: u64 = 1 << 18;
+
+/// Split `idle` cycles between two frames into the Sync tokens that precede the second and
+/// its cycles field. Each Sync is one wrap of the field (2^18 cycles); silicon (quiet traces,
+/// `tools/gen_lock_pulse_probe.py` quiet_p*, idle 262142..1000000) writes `idle mod 2^18` in
+/// the field and one Sync per wrap, except that the wrap landing in the very cycle of the
+/// frame is lost: idle = 2^18 is no Sync and a field of 0, idle = 2 * 2^18 one Sync and 0.
+fn split_idle(idle: u64) -> (u64, u64) {
+    (idle.saturating_sub(1) / CYCLES_FIELD_RANGE, idle % CYCLES_FIELD_RANGE)
+}
+
 impl TraceUnit {
     /// Create a new trace unit for the given tile location.
     pub fn new(col: u8, row: u8) -> Self {
@@ -877,7 +889,9 @@ impl TraceUnit {
                 }
                 if active != 0 {
                     let idle = t.saturating_sub(self.last_event_cycle + 1);
-                    self.push_frame_run(active, idle, 1);
+                    let (syncs, field) = split_idle(idle);
+                    self.push_syncs(syncs);
+                    self.push_frame_run(active, field, 1);
                     self.last_event_cycle = t;
                 }
                 // A level that dropped with nothing else asserted writes no frame: the
@@ -975,6 +989,19 @@ impl TraceUnit {
         self.emit_event_frame(mask, cycles);
         self.last_frame = Some((mask, cycles));
         self.repeat_pending = count - 1;
+    }
+
+    /// Write `n` Sync tokens (one 0xFF and a Repeat for the rest, like any other run). They
+    /// break a run of identical frames: the frames on either side are never merged.
+    fn push_syncs(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.flush_repeats();
+        self.last_frame = None;
+        self.push_op(&[0xFF]);
+        self.repeat_pending = n - 1;
+        self.flush_repeats();
     }
 
     /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15).

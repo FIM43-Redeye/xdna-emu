@@ -645,3 +645,18 @@ def test_mode0_perfetto_spans_match_oracle():
             if ours.get(k, {}).get(s) != oracle.get(k, {}).get(s)
         )
     )
+
+
+def test_a_sync_is_one_wrap_of_the_cycles_field_and_a_repeat_repeats_it():
+    """Silicon (quiet traces, trace-frame-pc q1): PERF_CNT_2 1000001 cycles apart is
+    `Sync Repeat(2) Single2(213568)`: three wraps of 2^18 and the field, plus the frame's own
+    cycle."""
+    from trace_decoder.decode import rebuild_timeline_mode0
+    from trace_decoder.frame import EventCmd, RepeatCmd, StartCmd, SyncCmd
+
+    cmds = {(0, 2, 1): [StartCmd(100), SyncCmd(), RepeatCmd(2), EventCmd(1, 213568),
+                        SyncCmd(), RepeatCmd(2), EventCmd(1, 213568)]}
+    events = rebuild_timeline_mode0(cmds, {0: {"2,1": ["PERF"] + [""] * 7}})
+    ts = [e.ts for e in events]
+    assert ts == [100 + 3 * (1 << 18) + 213569, 100 + 2 * (3 * (1 << 18) + 213569)]
+    assert ts[1] - ts[0] == 1_000_001
