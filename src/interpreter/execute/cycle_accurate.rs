@@ -777,7 +777,9 @@ impl CycleAccurateExecutor {
         }
         if let Some(p) = self.pending_lock.as_mut() {
             if ctx.bundle_seq >= p.resolve_at {
+                let mut last_pc = pc;
                 while let Some(req) = p.reqs.first() {
+                    last_pc = req.pc;
                     if let ExecuteResult::WaitLock { raw_lock_id } =
                         ControlUnit::perform_lock_request(req, ctx, tile, neighbor_locks, pc)
                     {
@@ -801,6 +803,9 @@ impl CycleAccurateExecutor {
                 self.frozen_cycles = p.held_since.map_or(0, |held| {
                     u8::from((issue_at - held) % xdna_archspec::aie2::locks::CORE_RESUME_PHASE_CYCLES == 0)
                 });
+                if p.held_since.is_none() {
+                    ControlUnit::record_arbitration_pulse(ctx, last_pc);
+                }
                 self.pending_lock = None;
                 ctx.record_stall(1);
                 ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
@@ -1086,6 +1091,8 @@ impl CycleAccurateExecutor {
                         log::warn!(
                             "core halted with an acquire of raw lock {raw_lock_id} in flight; dropped"
                         );
+                    } else {
+                        ControlUnit::record_arbitration_pulse(ctx, req.pc);
                     }
                 }
                 // Flush remaining pending stores: advance cycles and drain until empty.
@@ -1520,6 +1527,82 @@ mod tests {
         tile.resolve_lock_requests(ctx.cycles); // own-tile releases go through the lock arbiter
         let lost = reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
         (lost, [tile.locks[5].value, tile.locks[6].value])
+    }
+
+    /// Cycles at which the core trace saw a LOCK_STALL pulse while `bundles` issued.
+    fn lock_stall_pulses(ctx: &ExecutionContext) -> Vec<u64> {
+        ctx.timing_context()
+            .events
+            .events()
+            .iter()
+            .filter(|e| matches!(e.event, EventType::LockStall { .. }))
+            .map(|e| e.cycle)
+            .collect()
+    }
+
+    // Silicon (build/experiments/lock-stall-pulse, `tools/gen_lock_pulse_probe.py`, r1): every
+    // lock request window, acquire or release, shows one 1-cycle LOCK_STALL in the core trace
+    // on its arbitration cycle -- the cycle in front of the fourth bundle after the first
+    // request, 3 cycles after INSTR_LOCK_*_REQ. Requests inside one window share the pulse;
+    // from 4 bundles apart each window has its own.
+    #[test]
+    fn each_lock_request_window_pulses_lock_stall_once_on_its_arbitration_cycle() {
+        for (first_acq, second_acq) in [(false, true), (true, true), (true, false), (false, false)] {
+            for d in 1..=5usize {
+                let mut executor = CycleAccurateExecutor::new();
+                let mut ctx = ExecutionContext::new();
+                let mut tile = Tile::compute(0, 2);
+                tile.locks[5].value = u8::from(first_acq);
+                tile.locks[6].value = u8::from(second_acq);
+                let bundles: Vec<VliwBundle> = (0..=12)
+                    .map(|i| match i {
+                        0 => make_bundle(vec![own_lock_request(first_acq, 5)]),
+                        i if i == d => make_bundle(vec![own_lock_request(second_acq, 6)]),
+                        _ => make_bundle(vec![]),
+                    })
+                    .collect();
+                issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, false);
+                // request 1 issues on cycle 0 and resolves on cycle 4; request 2 (d >= 4)
+                // issues on cycle d + 1 (one arbitration cycle already passed) and
+                // resolves 4 cycles later
+                let expect: Vec<u64> = if d < 4 { vec![4] } else { vec![4, d as u64 + 5] };
+                assert_eq!(lock_stall_pulses(&ctx), expect, "acq {first_acq} -> acq {second_acq}, d {d}");
+            }
+        }
+    }
+
+    // A refused acquire is one held LOCK_STALL level; its arbitration cycle at the grant
+    // is inside that level, not a pulse after it (silicon, acq_refused: no LOCK_STALL
+    // between the held frames and the first release pulse).
+    #[test]
+    fn a_granted_wait_adds_no_pulse_after_the_held_level() {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[5].value = 0;
+        let mut bundles = vec![make_bundle(vec![acquire_own_lock_5()])];
+        bundles.extend(nops(7));
+        issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 40, false);
+        assert_eq!(lock_stall_pulses(&ctx), Vec::<u64>::new());
+    }
+
+    // The tile timer is a 64-bit counter the host can reset below the core's own cycle
+    // count; the base (`timer - cycles`) is then a wrapped value and the read must wrap too
+    // (a debug build panicked on the plain add).
+    #[test]
+    fn a_counter_read_wraps_when_the_timer_was_reset_below_the_core_cycles() {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        ctx.record_stall(10);
+        ctx.cycle_counter_base = 5u64.wrapping_sub(ctx.cycles);
+        let read = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::ReadCycleCounter)
+            .with_dest(Operand::ScalarReg(16));
+        assert!(matches!(
+            executor.execute(&make_bundle(vec![read]), &mut ctx, &mut tile),
+            ExecuteResult::Continue
+        ));
+        assert_eq!(ctx.scalar.read(16), 5, "timer 5 at the read");
     }
 
     // Silicon (build/experiments/lock-b2b, `tools/gen_lock_stall_probe.py` b2b gg, rel->acq,

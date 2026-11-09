@@ -250,7 +250,11 @@ impl ControlUnit {
                     return Some(ExecuteResult::Continue); // a skipped acq.cond / rel.cond
                 };
                 let pc = ctx.pc();
-                Some(Self::perform_lock_request(&req, ctx, tile, neighbor_locks, pc))
+                let result = Self::perform_lock_request(&req, ctx, tile, neighbor_locks, pc);
+                if matches!(result, ExecuteResult::Continue) {
+                    Self::record_arbitration_pulse(ctx, req.pc);
+                }
+                Some(result)
             }
 
             Some(SemanticOp::DmaStart) => {
@@ -536,6 +540,18 @@ impl ControlUnit {
         }
     }
 
+    /// The 1-cycle LOCK_STALL pulse of a lock request window's arbitration cycle, at the PC
+    /// of the window's last request. Silicon (build/experiments/lock-stall-pulse,
+    /// `tools/gen_lock_pulse_probe.py`) pulses it for every window of granted acquires and
+    /// releases alike, uncontended, 3 cycles after INSTR_LOCK_*_REQ; requests that share a
+    /// window (issued within 3 bundles of the first) share the pulse. A window that was held
+    /// on a refused acquire has no pulse: its arbitration cycle is inside the held level.
+    pub fn record_arbitration_pulse(ctx: &mut ExecutionContext, pc: u32) {
+        let cycle = ctx.cycles;
+        ctx.timing_context_mut()
+            .record_event(cycle, crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) });
+    }
+
     /// Perform a lock request: `WaitLock` for a refused acquire (nothing changes),
     /// else `Continue`. `stamp_pc` is the issue PC the trace controller sees when the
     /// request completes (it stamps INSTR_LOCK_ACQUIRE_REQ with it).
@@ -664,18 +680,13 @@ impl ControlUnit {
                         lock.value
                     );
                 }
-                // Trace: INSTR_LOCK_RELEASE_REQ (hw_id 45), once per release, plus
-                // the 1-cycle LOCK_STALL of the request's arbitration (add_one_using_dma
-                // chess trace: one per release, beside the held acquire's thousands),
-                // both at the release's own PC.
+                // Trace: INSTR_LOCK_RELEASE_REQ (hw_id 45), once per release, at the
+                // release's own PC. The LOCK_STALL of the request's arbitration cycle is
+                // `record_arbitration_pulse`, once per window of requests.
                 let cycle = ctx.cycles;
                 let pc = req.pc;
                 ctx.timing_context_mut()
                     .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
-                ctx.timing_context_mut().record_event(
-                    cycle,
-                    crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) },
-                );
                 ExecuteResult::Continue
             }
         }
