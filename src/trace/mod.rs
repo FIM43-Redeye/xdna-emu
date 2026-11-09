@@ -155,17 +155,6 @@ pub(crate) fn dma_level_active(event: &EventType) -> Option<bool> {
     }
 }
 
-/// Extract the PC field from an EventType variant, if it carries one.
-///
-/// Returns `Some(pc)` for instruction-class events (InstrVector, InstrLoad,
-/// InstrStore, InstrCall, InstrReturn, InstrLockAcquireReq, InstrLockReleaseReq,
-/// InstrStreamGet, InstrStreamPut, InstrEvent). These are the 10 variants that
-/// carry an actual program counter at the point the instruction retired.
-///
-/// Returns `None` for core-state events (CoreActive, CoreDisabled), stall events
-/// (MemoryStall, LockStall, StreamStall), memory-module events (DMA, lock, port),
-/// branch events, and any other variant whose PC is either not meaningful or not
-/// directly available at notify time.
 /// Bundles the core's fetch stage runs ahead of the bundle executing in the cycle an
 /// INSTR_* event is stamped, for the PC a mode-1 frame carries. Silicon
 /// (`tools/gen_fetch_pc_probe.py`, 100+ sites in straight-line code): the PC of
@@ -202,6 +191,17 @@ fn bundles_after(program_mem: &[u8], mut pc: u32, n: u32) -> u32 {
     pc
 }
 
+/// Extract the PC field from an EventType variant, if it carries one.
+///
+/// Returns `Some(pc)` for instruction-class events (InstrVector, InstrLoad,
+/// InstrStore, InstrCall, InstrReturn, InstrLockAcquireReq, InstrLockReleaseReq,
+/// InstrStreamGet, InstrStreamPut, InstrEvent). These are the 10 variants that
+/// carry an actual program counter at the point the instruction retired.
+///
+/// Returns `None` for core-state events (CoreActive, CoreDisabled), stall events
+/// (MemoryStall, LockStall, StreamStall), memory-module events (DMA, lock, port),
+/// branch events, and any other variant whose PC is either not meaningful or not
+/// directly available at notify time.
 pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
     match event {
         EventType::InstrVector { pc }
