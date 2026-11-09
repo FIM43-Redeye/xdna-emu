@@ -133,6 +133,43 @@ Probe-design findings (silicon):
   the whole load/store family and fixed in the emulator: see "Unaligned accesses" in
   [`addressing.md`](addressing.md).
 
+## Zero-overhead loop set-up: the loop registers are read at fetch (FIXED 2026-11-09, NPU1 silicon)
+
+Hand-written loops (`add.nc lc`, `movxm ls`, `movxm le`, a body of 12 or 40 nop bundles) ran once on
+silicon and four times in the emulator. The rule silicon enforces is that the loop registers are read
+when a 16-byte program line is *fetched*, and the fetch runs four lines ahead of issue; the emulator
+now models that front end (`src/interpreter/state/fetch.rs`).
+
+Probe: `tools/gen_zol_probe.py` (84 loops, one per kernel; each stores its pass count, LC afterwards,
+and counters for the bundle after LE, a bundle before LS and the line after LE's to the output buffer).
+Silicon and emulator agree on all of them (`build/experiments/front-end/z6`, tags `h1.hw` / `e1.emu`).
+Before the change the emulator iterated every ill-formed variant below.
+
+| Observation (silicon) | Rule |
+|---|---|
+| LE not a multiple of 16: one pass, whatever the distance (offsets 2..14 tried, 100+ bytes from the set-up) | the fetch compares a line address with LE exactly |
+| LE a line start, set-up too close: one pass. The last of the three writes to LE, LC or LS, a bundle ending at `end`: loops iff `LE >= line(end) + 80`. Same threshold for 2-byte nops, 6-byte and 16-byte bundles | the writing bundle's lines are already fetched up to four beyond the line of the next PC (`FETCH_AHEAD_LINES`); LE written after its line was fetched is never compared |
+| LC written last and late (`add.nc lc`, 4 bytes, `LE < line(end)+80`): five passes with LC left at 1 (stale LC was 0) | the fetch read the stale LC = 0, looped without a real count, then the late write of 4 gave three more |
+| LS written last and late: one pass, LC 3, the bundle after LE run twice | the fetch redirected once to the stale LS (here a label inside the LE line) and the comparator then stayed disarmed |
+| LC = n (n >= 1): n passes, LC afterwards 1 (not 0). LC = 1: one pass, LC unchanged | the loop-back needs LC != 1 and decrements it |
+| LC = 0: loops on, LC counts down through 0 (12 passes, LC = -11, bounded by a `jz` in the body) | LC = 0 is not a zero count |
+| The bundle after LE in its line runs on every pass; the next line's first bundle only after the last | the loop-back reaches issue once the last bundle of the LE line has issued |
+| LS off a line start (offsets 4..14 tried): two passes, the bundle before LS in its line runs twice, LC 3 | the redirect lands on LS's line start; fetching a line equal to LS exactly re-arms the comparator, which an unaligned LS never gets |
+| LS and LE in one line, or a loop of two lines: loop normally | the re-arm happens before the LE compare of the same line |
+
+llvm-aie agrees: `getZOLSupport` demands 7 bundles of 16 bytes (112) between the last set-up bundle
+and the loop end (`LoopSetupDistance`), the loop-end bundle is its own aligned region
+(`AIEMachineAlignment.cpp`), and LS is a block start, so compiled loops are always well-formed. The
+silicon threshold is 70..72 bytes, so the compiler keeps a margin.
+
+State the model does not reach (each reproduced on silicon, deterministic, not modelled):
+- An *aborted* ill-formed loop (left by a `jz` mid-body, or one whose redirect went to a stale LS)
+  changes how the **next loop in the same kernel** behaves: in the early multi-loop probes the
+  following loops lost redirects or ran a fifth pass. The probe therefore runs one loop per kernel.
+  Whatever program-control state survives an abnormal loop exit is not identified.
+- Where the comparator is armed from reset is not pinned: the model arms it on a change of LE.
+- Bundles that straddle a line boundary are treated as belonging to the line they start in.
+
 ## Scalar write-port collisions: a delayed write dropped or ORed (FIXED, NPU1 silicon 2026-11-03)
 
 `mov.dN dst, src` (N = 1..6) writes `dst` N+1 cycles after issue, from the source read at issue

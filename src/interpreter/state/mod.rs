@@ -33,6 +33,7 @@ pub mod write_collision;
 pub mod scalar_collision;
 mod event_trace;
 mod timing_context;
+pub mod fetch;
 mod context;
 mod sparse_load;
 pub mod load_ring;

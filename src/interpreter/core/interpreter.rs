@@ -351,6 +351,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         };
 
         let bundle_size = bundle.size();
+        ctx.fetch_ahead(bundle_size as u32);
 
         // Execute bundle with neighbor locks and neighbor memory for proper routing
         self.status = CoreStatus::Running;
@@ -661,6 +662,7 @@ where
         };
 
         let bundle_size = bundle.size();
+        ctx.fetch_ahead(bundle_size as u32);
 
         // Execute bundle
         self.status = CoreStatus::Running;

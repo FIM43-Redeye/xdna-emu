@@ -444,6 +444,10 @@ pub struct ExecutionContext {
     /// `st rX` must capture rX's pre-write value). (reg, value), last writer wins.
     bundle_shift_forward: Vec<(u8, u32)>,
 
+    // === Instruction fetch front end ===
+    /// The line stream the fetch reads ahead of issue; zero-overhead-loop decisions are taken on it.
+    fetch: super::fetch::FetchStage,
+
     // === Branch Delay Slot Support ===
     /// Pending branch waiting for delay slots to complete.
     /// AIE2 has 5-cycle branch delay slots - after a branch is decided,
@@ -726,6 +730,7 @@ impl ExecutionContext {
             modifier_snapshot: None,
             bundle_shift_forward: Vec::new(),
             pending_branch: None,
+            fetch: super::fetch::FetchStage::default(),
             pending_writes: Vec::new(),
             load_address_overrides: SmallVec::new(),
             result_latency: 0,
@@ -790,7 +795,38 @@ impl ExecutionContext {
     /// Set the program counter.
     #[inline]
     pub fn set_pc(&mut self, pc: u32) {
+        if pc != self.pc {
+            // a taken branch (or a restart): the fetch stream is dropped, with the loop-back
+            // decisions it had taken
+            let mut regs = self.loop_regs();
+            self.fetch.flush(&mut regs);
+            self.store_lc(regs.lc);
+        }
         self.pc = pc;
+    }
+
+    fn loop_regs(&self) -> super::fetch::LoopRegs {
+        super::fetch::LoopRegs {
+            ls: self.scalar.read(super::registers::LS_REG_INDEX),
+            le: self.scalar.read(super::registers::LE_REG_INDEX),
+            lc: self.scalar.read(super::registers::LC_REG_INDEX),
+        }
+    }
+
+    fn store_lc(&mut self, lc: u32) {
+        if self.scalar.read(super::registers::LC_REG_INDEX) != lc {
+            self.scalar.write(super::registers::LC_REG_INDEX, lc);
+        }
+    }
+
+    /// The fetch reads ahead for the bundle of `bundle_size` bytes about to issue at the PC (see
+    /// [`super::fetch`]): loop-back decisions are taken here, on the loop registers as the
+    /// earlier bundles left them.
+    #[inline]
+    pub fn fetch_ahead(&mut self, bundle_size: u32) {
+        let mut regs = self.loop_regs();
+        self.fetch.fetch_ahead(self.pc, self.pc.wrapping_add(bundle_size), &mut regs);
+        self.store_lc(regs.lc);
     }
 
     /// Advance PC by the given offset.
@@ -799,75 +835,42 @@ impl ExecutionContext {
         self.pc = self.pc.wrapping_add(offset);
     }
 
-    /// Check the hardware zero-overhead loop (ZLS/ZLE/LC).
+    /// Apply the zero-overhead loop-back the fetch took (see [`super::fetch`]) once issue has
+    /// left the line that carries it: the PC becomes the line holding LS.
     ///
-    /// AIE2 cores have a hardware loop mechanism: the LE register holds the
-    /// address of the last instruction in the loop body. After that instruction
-    /// executes, if LC > 0, the hardware decrements LC. If the new LC is
-    /// still > 0, it redirects PC to LS; otherwise it falls through.
-    ///
-    /// This gives exactly LC iterations: the loop body executes, LC
-    /// decrements, and the back-edge is taken while the decremented LC
-    /// remains positive. When LC reaches 0, the current execution is
-    /// the last and control falls through.
-    ///
-    /// Note: this differs from JNZD, which tests-before-decrement and
-    /// needs trip_count - 1 loaded (see AIEBaseHardwareLoops.cpp). ZLS
-    /// hardware loops load trip_count directly into LC.
-    ///
-    /// `fetch_pc` is the address of the instruction that just executed (before
-    /// advance_pc). The check compares this against LE, because LE marks the
-    /// last instruction to execute before looping, not the first instruction
-    /// after the loop.
-    ///
-    /// If a branch resolved this cycle, the branch target takes priority
-    /// and this check is skipped by the caller.
+    /// Call after [`Self::advance_pc`] when no branch resolved this bundle (a taken branch takes
+    /// priority and flushes the fetch stream). `_issued_pc` is the PC of the bundle that just
+    /// issued.
     #[inline]
-    pub fn check_hardware_loop(&mut self, fetch_pc: u32) -> Option<LoopBoundaryInfo> {
-        let le = self.scalar.read(super::registers::LE_REG_INDEX);
-        if fetch_pc != le {
-            return None;
+    pub fn check_hardware_loop(&mut self, _issued_pc: u32) -> Option<LoopBoundaryInfo> {
+        let redirect = self.fetch.retire(self.pc)?;
+        // A partial-word store (st.s8/st.s16) issued *in the LE bundle* is in the redirect
+        // shadow and is flushed before it commits to memory -- the every-4th-element drop seen
+        // on silicon for a Peano-unrolled i8 loop that parks a store at LE. Stores issued
+        // earlier in the body have already entered the decoupled store pipeline (and commit at
+        // E11 even across the back-edge -- software pipelining relies on this), and
+        // loads/register writes retire into the register file, so only stores with
+        // issue_pc == LE are dropped.
+        //
+        // The squash only reaches the LE store when the whole loop body fits in the front-end
+        // fetch window (<= ZOL_FLUSH_MAX_BODY_BYTES, six 16-byte fetch packets). A larger body
+        // has already streamed past the squash point by the time the LE bundle issues, so its
+        // store commits -- see ZOL_FLUSH_MAX_BODY_BYTES for the silicon basis.
+        if redirect.le.wrapping_sub(redirect.ls) <= ZOL_FLUSH_MAX_BODY_BYTES {
+            self.pending_stores.retain(|ps| ps.issue_pc != redirect.le);
         }
-        let lc = self.scalar.read(super::registers::LC_REG_INDEX);
-        if lc == 0 {
-            return None;
-        }
-        let new_lc = lc - 1;
-        self.scalar.write(super::registers::LC_REG_INDEX, new_lc);
-        if new_lc > 0 {
-            // Back-edge: the program-control-unit redirects fetch from LE to LS.
-            // A partial-word store (st.s8/st.s16) issued *in the LE bundle* is in
-            // that redirect shadow and is flushed before it commits to memory --
-            // the every-4th-element drop seen on silicon for a Peano-unrolled i8
-            // loop that parks a store at LE. Stores issued earlier in the body
-            // have already entered the decoupled store pipeline (and commit at
-            // E11 even across the back-edge -- software pipelining relies on
-            // this), and loads/register writes retire into the register file, so
-            // only stores with issue_pc == LE are dropped.
-            //
-            // The squash only reaches the LE store when the whole loop body fits
-            // in the front-end fetch window (<= ZOL_FLUSH_MAX_BODY_BYTES, six
-            // 16-byte fetch packets). A larger body has already streamed past
-            // the squash point by the time the LE bundle issues, so its store
-            // commits -- see ZOL_FLUSH_MAX_BODY_BYTES for the silicon basis.
-            let ls = self.scalar.read(super::registers::LS_REG_INDEX);
-            let body_bytes = le.wrapping_sub(ls);
-            if body_bytes <= ZOL_FLUSH_MAX_BODY_BYTES {
-                self.pending_stores.retain(|ps| ps.issue_pc != le);
-            }
-
-            self.pc = ls;
-            log::debug!(
-                "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
-                le,
-                lc,
-                new_lc,
-                ls
-            );
-        } else {
-            log::debug!("ZLS loop: final iteration at LE=0x{:X}, LC {} -> 0, falling through", le, lc);
-        }
-        Some(LoopBoundaryInfo { lc_before: lc, lc_after: new_lc, le_pc: le })
+        self.pc = redirect.target;
+        log::debug!(
+            "ZLS loop: LE line done, LC {} -> {}, jumping to LS=0x{:X}",
+            redirect.lc_before,
+            redirect.lc_after,
+            redirect.target
+        );
+        Some(LoopBoundaryInfo {
+            lc_before: redirect.lc_before,
+            lc_after: redirect.lc_after,
+            le_pc: redirect.le,
+        })
     }
 
     /// Get the condition flags. The carry is the `srCarry` status register, read as an
@@ -2451,34 +2454,53 @@ impl std::fmt::Debug for ExecutionContext {
 mod tests {
     use super::*;
 
-    #[test]
-    fn check_hardware_loop_returns_some_on_boundary() {
+    /// Issue one bundle of `size` bytes the way the interpreter step does: the fetch reads ahead,
+    /// the PC advances, and a loop-back the fetch took applies once issue leaves the LE line.
+    fn issue(ctx: &mut ExecutionContext, size: u32) -> Option<LoopBoundaryInfo> {
+        let pc = ctx.pc();
+        ctx.fetch_ahead(size);
+        ctx.advance_pc(size);
+        ctx.check_hardware_loop(pc)
+    }
+
+    /// A loop of LS..=LE line, `lc` passes, set up long before (the fetch is far ahead of the set-up).
+    fn loop_ctx(ls: u32, le: u32, lc: u32) -> ExecutionContext {
         use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
         let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-        let info = ctx.check_hardware_loop(0x200);
-        assert_eq!(info, Some(LoopBoundaryInfo { lc_before: 3, lc_after: 2, le_pc: 0x200 }));
+        ctx.scalar.write(LS_REG_INDEX, ls);
+        ctx.scalar.write(LE_REG_INDEX, le);
+        ctx.scalar.write(LC_REG_INDEX, lc);
+        ctx.set_pc(ls);
+        ctx
+    }
+
+    #[test]
+    fn check_hardware_loop_returns_some_on_boundary() {
+        let mut ctx = loop_ctx(0x100, 0x140, 3);
+        let mut info = None;
+        while info.is_none() {
+            info = issue(&mut ctx, 2);
+        }
+        // the loop-back applied after the last bundle of the LE line (0x140..0x150)
+        assert_eq!(info, Some(LoopBoundaryInfo { lc_before: 3, lc_after: 2, le_pc: 0x140 }));
+        assert_eq!(ctx.pc(), 0x100);
     }
 
     #[test]
     fn check_hardware_loop_returns_none_off_boundary() {
-        use crate::interpreter::state::LE_REG_INDEX;
-        let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        let info = ctx.check_hardware_loop(0x180);
-        assert_eq!(info, None);
+        let mut ctx = loop_ctx(0x100, 0x140, 3);
+        assert_eq!(issue(&mut ctx, 2), None);
+        assert_eq!(ctx.pc(), 0x102);
     }
 
     #[test]
-    fn check_hardware_loop_returns_none_when_lc_zero() {
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 0);
-        let info = ctx.check_hardware_loop(0x200);
-        assert_eq!(info, None);
+    fn lc_zero_loops_on_and_counts_down_through_zero() {
+        // silicon (probe `lc_00`, LC=0, left by a `jz` after 12 passes): LC=0 is not a zero count
+        let mut ctx = loop_ctx(0x100, 0x120, 0);
+        for _ in 0..8 * 3 * 4 {
+            issue(&mut ctx, 2);
+        }
+        assert!(ctx.scalar.read(crate::interpreter::state::LC_REG_INDEX) > 0xFFFF_FF00);
     }
 
     #[test]
@@ -2630,55 +2652,31 @@ mod tests {
 
     #[test]
     fn test_hardware_loop_basic() {
-        use crate::interpreter::state::{LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-
-        // Set up loop: LS=0x100, LE=0x200, LC=3
-        // ZLS hardware loops load trip_count directly into LC.
-        // LC=3 means 3 body executions: 2 back-edges + 1 fall-through.
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-        ctx.set_pc(0x204); // PC after advance_pc from LE
-
-        // First check: LC 3->2, still > 0, loop back
-        ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x100); // Redirected to LS
-        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 2);
-
-        // Second check: LC 2->1, still > 0, loop back
-        ctx.set_pc(0x204);
-        ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x100);
+        use crate::interpreter::state::LC_REG_INDEX;
+        // LC=3 gives three passes: two loop-backs, the third falls through with LC left at 1
+        let mut ctx = loop_ctx(0x100, 0x140, 3);
+        let (mut passes, mut post_le) = (0, 0);
+        for _ in 0..8 * 5 * 3 + 40 {
+            let pc = ctx.pc();
+            passes += usize::from(pc == 0x100);
+            post_le += usize::from(pc == 0x142);
+            issue(&mut ctx, 2);
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(post_le, 3, "the bundles after LE in its line run on every pass");
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 1);
-
-        // Third check: LC 1->0, fall through (this was the last iteration)
-        ctx.set_pc(0x204);
-        ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x204); // Falls through -- LC hit 0
-        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
-
-        // LC already 0: no action
-        ctx.set_pc(0x208);
-        ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x208); // Not at LE, unchanged
-        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
     }
 
     #[test]
     fn test_hardware_loop_no_match() {
-        use crate::interpreter::state::{LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-
-        ctx.scalar.write(LS_REG_INDEX, 0x100);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 5);
-        ctx.set_pc(0x180);
-
-        // fetch_pc != LE -> no loop
-        ctx.check_hardware_loop(0x17C);
-        assert_eq!(ctx.pc(), 0x180); // Unchanged
-        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 5); // Unchanged
+        use crate::interpreter::state::LC_REG_INDEX;
+        // LE not on a fetch-line start: the fetch never compares equal, one pass
+        let mut ctx = loop_ctx(0x100, 0x144, 5);
+        for _ in 0..8 * 5 * 2 {
+            issue(&mut ctx, 2);
+        }
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 5);
+        assert!(ctx.pc() > 0x150);
     }
 
     // =====================================================================
@@ -2699,24 +2697,36 @@ mod tests {
     // any correctly-scheduled store (committed >=11 cycles before LE) has
     // already drained and is unaffected.
 
+    /// Issue 2-byte bundles from the loop start to the LE bundle, run `at_le` there (the
+    /// executor queueing what the LE bundle issues), then finish the LE line.
+    fn run_to_loop_back(
+        ctx: &mut ExecutionContext,
+        le: u32,
+        at_le: impl FnOnce(&mut ExecutionContext),
+    ) -> bool {
+        while ctx.pc() != le {
+            issue(ctx, 2);
+        }
+        at_le(ctx);
+        let mut backed = false;
+        while ctx.pc() < le + 16 && !backed {
+            backed = issue(ctx, 2).is_some();
+        }
+        backed
+    }
+
     #[test]
     fn zol_backedge_flushes_pending_store() {
         use crate::interpreter::bundle::slot::MemWidth;
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        // Body span le-ls = 0x60 (96 bytes, six fetch packets): inside the
-        // flush window, so the LE-bundle store is squashed on the back-edge.
-        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-
-        // A store issued in the LE bundle is still pending at the back-edge.
-        ctx.set_pc(0x200);
-        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
-        assert!(!ctx.pending_stores_empty());
-
-        ctx.check_hardware_loop(0x200); // back-edge: LC 3 -> 2
-        assert_eq!(ctx.pc(), 0x1A0);
+        // Body span le-ls = 0x60 (96 bytes, six fetch packets): inside the flush window, so the
+        // LE-bundle store is squashed on the back-edge.
+        let mut ctx = loop_ctx(0x1A0, 0x200, 3);
+        let mut queued = false;
+        let backed = run_to_loop_back(&mut ctx, 0x200, |c| {
+            c.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+            queued = !c.pending_stores_empty();
+        });
+        assert!(queued && backed);
         assert!(
             ctx.pending_stores_empty(),
             "a store issued in the LE bundle must be flushed by the ZOL back-edge"
@@ -2725,48 +2735,31 @@ mod tests {
 
     #[test]
     fn zol_backedge_large_body_keeps_le_store() {
-        // A loop body that does NOT fit in the front-end fetch window
-        // (le-ls > ZOL_FLUSH_MAX_BODY_BYTES) streams past the squash point
-        // before the LE bundle issues, so even the LE-bundle store commits.
-        // This is the seed_1826 / seed_1781 case (112-byte / seven-packet body)
-        // that the unconditional issue_pc==LE flush wrongly dropped.
         use crate::interpreter::bundle::slot::MemWidth;
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        // Body span le-ls = 0x70 (112 bytes, seven fetch packets): outside the
-        // flush window.
-        ctx.scalar.write(LS_REG_INDEX, 0x190);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-
-        ctx.set_pc(0x200);
-        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
-        assert!(!ctx.pending_stores_empty());
-
-        ctx.check_hardware_loop(0x200); // back-edge: LC 3 -> 2
-        assert_eq!(ctx.pc(), 0x190);
+        // A loop body that does NOT fit in the front-end fetch window (le-ls > ZOL_FLUSH_MAX_BODY_BYTES)
+        // streams past the squash point before the LE bundle issues, so even the LE-bundle store
+        // commits. This is the seed_1826 / seed_1781 case (112-byte / seven-packet body).
+        let mut ctx = loop_ctx(0x190, 0x200, 3);
+        let backed = run_to_loop_back(&mut ctx, 0x200, |c| {
+            c.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        });
+        assert!(backed);
         assert!(!ctx.pending_stores_empty(), "a large-body loop commits its LE-bundle store -- no flush");
     }
 
     #[test]
     fn zol_backedge_preserves_earlier_body_store() {
-        // A store issued by a body bundle (PC < LE) has already entered the
-        // store pipeline and commits across the back-edge -- only the LE-bundle
-        // store is in the fetch-redirect shadow. This is the seed_13 case the
-        // "flush all pending stores" model wrongly broke.
         use crate::interpreter::bundle::slot::MemWidth;
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-
-        // Store issued at a body bundle (0x1F0), still pending when LE is hit.
-        ctx.set_pc(0x1F0);
+        // A store issued by a body bundle (PC < LE) has already entered the store pipeline and
+        // commits across the back-edge -- only the LE-bundle store is in the fetch-redirect
+        // shadow. This is the seed_13 case the "flush all pending stores" model wrongly broke.
+        let mut ctx = loop_ctx(0x1A0, 0x200, 3);
+        while ctx.pc() != 0x1F0 {
+            issue(&mut ctx, 2);
+        }
         ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
-        ctx.set_pc(0x200);
-
-        ctx.check_hardware_loop(0x200); // back-edge
+        let backed = run_to_loop_back(&mut ctx, 0x200, |_| {});
+        assert!(backed);
         assert!(
             !ctx.pending_stores_empty(),
             "an earlier body store (issue_pc != LE) must survive the back-edge"
@@ -2776,18 +2769,11 @@ mod tests {
     #[test]
     fn zol_final_iteration_keeps_pending_store() {
         use crate::interpreter::bundle::slot::MemWidth;
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 1); // last iteration
-
-        ctx.set_pc(0x200);
-        ctx.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
-        ctx.set_pc(0x204); // models advance_pc past the LE bundle
-
-        ctx.check_hardware_loop(0x200); // fall-through: LC 1 -> 0
-        assert_eq!(ctx.pc(), 0x204);
+        let mut ctx = loop_ctx(0x1A0, 0x200, 1); // last iteration
+        let backed = run_to_loop_back(&mut ctx, 0x200, |c| {
+            c.queue_pending_store(0x400, Operand::ScalarReg(1), MemWidth::Byte);
+        });
+        assert!(!backed, "LC=1: fall through");
         assert!(
             !ctx.pending_stores_empty(),
             "a store on the final (fall-through) iteration commits -- no flush"
@@ -2796,19 +2782,13 @@ mod tests {
 
     #[test]
     fn zol_backedge_preserves_pending_register_write() {
-        use crate::interpreter::state::{LC_REG_INDEX, LE_REG_INDEX, LS_REG_INDEX};
-        let mut ctx = ExecutionContext::new();
-        ctx.scalar.write(LS_REG_INDEX, 0x1A0);
-        ctx.scalar.write(LE_REG_INDEX, 0x200);
-        ctx.scalar.write(LC_REG_INDEX, 3);
-
-        // A load (deferred register write) in the LE bundle -- must survive,
-        // unlike a memory store. This is the seed_13 case the crude squash broke.
-        ctx.set_pc(0x200);
-        ctx.queue_scalar_load(Operand::ScalarReg(5), 0xDEAD, 7);
-        assert!(!ctx.pending_writes_is_empty());
-
-        ctx.check_hardware_loop(0x200); // back-edge
+        // A load (deferred register write) in the LE bundle -- must survive, unlike a memory
+        // store. This is the seed_13 case the crude squash broke.
+        let mut ctx = loop_ctx(0x1A0, 0x200, 3);
+        let backed = run_to_loop_back(&mut ctx, 0x200, |c| {
+            c.queue_scalar_load(Operand::ScalarReg(5), 0xDEAD, 7);
+        });
+        assert!(backed);
         assert!(!ctx.pending_writes_is_empty(), "loads/register writes are NOT flushed by the back-edge");
     }
 
