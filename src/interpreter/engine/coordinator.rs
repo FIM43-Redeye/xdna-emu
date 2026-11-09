@@ -2655,12 +2655,39 @@ mod tests {
         assert_eq!(engine.core_context(col, row).unwrap().pc(), held_pc, "the launch left the held PC alone");
     }
 
+    // Silicon (build/experiments/lock-leftovers mem_dmaerr, 2026-11-08): on an ordinary xclbin,
+    // which programs no error network, a memtile channel started on an unconfigured BD latches
+    // DMA_S2MM_ERROR (133) and GROUP_ERRORS (128) in Event_Status4 and the run completes
+    // normally -- no TDR, nothing in the kernel log, no async error for the driver. The
+    // forwarding below needs the network (the signed-firmware proofs used an error PDI).
+    #[test]
+    fn a_dma_error_without_an_error_network_latches_the_event_but_is_not_forwarded() {
+        use xdna_archspec::aie2::trace_events::memtile_events;
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        let (col, row) = (1, 1);
+        let layout = crate::device::regdb::device_reg_layout();
+        let start_queue = layout.memtile_channel_s2mm_base + 4;
+        let start_bd_3 = layout.memtile_channel.start_bd_id.insert(0, 3);
+        engine.device_mut().write_tile_register(col, row, start_queue, start_bd_3);
+        engine.force_running();
+        engine.step();
+
+        let events = engine.device().array.get(col, row).unwrap().mem_events.as_ref().unwrap();
+        assert!(events.is_event_active(memtile_events::DMA_S2MM_ERROR));
+        assert!(events.is_event_active(memtile_events::GROUP_ERRORS));
+        assert!(engine.device().async_errors.last_cache().is_none());
+        assert_eq!(engine.device().async_errors.ring(col).unwrap().header().err_cnt, 0);
+    }
+
     #[test]
     fn memtile_invalid_bd_bank_start_publishes_dma_error_once() {
         use xdna_archspec::aie2::trace_events::memtile_events;
 
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
+        engine.device_mut().arm_error_network_for_test();
         let (col, row) = (1, 1);
 
         engine
@@ -2727,6 +2754,7 @@ mod tests {
         for (channel, expected_event, name) in cases {
             let mut engine = InterpreterEngine::new_npu1();
             engine.ungate_all_for_test();
+            engine.device_mut().arm_error_network_for_test();
             let (col, row) = (1, 2);
 
             engine
@@ -3295,6 +3323,7 @@ mod tests {
 
         let mut engine = InterpreterEngine::new_npu1();
         engine.ungate_all_for_test();
+        engine.device_mut().arm_error_network_for_test();
         for (col, row) in [(1, 2), (2, 2)] {
             engine.enable_core(col, row);
             engine.device_mut().tile_mut(col, row).unwrap().write_program(0, &[0; 16]);

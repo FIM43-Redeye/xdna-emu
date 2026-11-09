@@ -18,6 +18,32 @@ impl DeviceState {
         self.publish_tile_event_to(col, row, module_type, event_id, true);
     }
 
+    /// Whether the array's error network is programmed: some shim interrupt controller (an L1
+    /// switch or the L2 NoC controller) has an enabled input. Silicon (lock-leftovers
+    /// mem_dmaerr, lock-frozen): on an ordinary xclbin, which programs none, an error event only
+    /// latches in Event_Status and the firmware never hears of it; the signed-firmware proofs
+    /// needed an error PDI (aie-rt XAie_ErrorHandlingInit plus the shim L1 / L2 setup) before a
+    /// DMA or core error reached the driver. Which part of that network is the necessary one
+    /// is unprobed, so this is the weakest condition both observations allow.
+    pub(crate) fn error_network_armed(&self) -> bool {
+        use crate::device::interrupts::SwitchId;
+        self.array.iter().any(|t| {
+            t.l2_irq.as_ref().is_some_and(|l2| l2.read_mask() != 0)
+                || t.l1_irq
+                    .as_ref()
+                    .is_some_and(|l1| [SwitchId::A, SwitchId::B].into_iter().any(|sw| l1.read_mask(sw) != 0))
+        })
+    }
+
+    /// Program the one thing `error_network_armed` looks for: shim (1,0)'s L2 interrupt
+    /// controller enabled on channel 0 (the error PDI's L2 enable).
+    #[cfg(test)]
+    pub(crate) fn arm_error_network_for_test(&mut self) {
+        use crate::device::interrupts::L2_REG_ENABLE;
+        let shim = self.array.get_mut(1, 0).expect("shim (1,0)");
+        shim.l2_irq.as_mut().expect("shim L2").write_register(L2_REG_ENABLE, 1);
+    }
+
     /// Raise the LOCK_ERROR event of every tile that has a newly flagged lock. Silicon
     /// (build/experiments/lock-frozen, Event_Status3 bit 5 of the compute memory module): the
     /// event latches in the status register, and with an ordinary xclbin it reaches no
@@ -86,7 +112,7 @@ impl DeviceState {
             tile.tap_l1_interrupt(group_event);
         }
 
-        if forward_to_driver && is_error_event(event_id, origin) {
+        if forward_to_driver && is_error_event(event_id, origin) && self.error_network_armed() {
             self.async_errors.record_error(col, row, origin, event_id, current_cycle);
         }
     }
@@ -1103,6 +1129,7 @@ mod interrupt_path_tests {
     fn event_generate_for_instr_error_populates_async_cache_and_ring() {
         use xdna_archspec::aie2::async_errors::{self, AieErrorOrigin, AmdxdnaErrorModule, AmdxdnaErrorNum};
         let mut dev = DeviceState::new_npu1();
+        dev.arm_error_network_for_test();
         // Drive simulated time so ts_us is nonzero -- proves the cycle-as-ts
         // conversion is wired (not a literal 0 from absent cycle plumbing).
         dev.array.set_dma_cycle(50_000);
@@ -1392,6 +1419,7 @@ mod interrupt_path_tests {
         use xdna_archspec::aie2::trace_events::memtile_events;
 
         let mut dev = DeviceState::new_npu1();
+        dev.arm_error_network_for_test();
         let (col, row) = (1, 1);
         let event_generate = regdb::device_reg_layout().memtile_events.event_generate;
         dev.array

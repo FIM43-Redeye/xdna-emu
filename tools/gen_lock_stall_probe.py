@@ -867,6 +867,7 @@ LEFT_AUX_LOCK = {"shim": 14, "mem": 41}
 LEFT_GATE_LOCKS = {"shim": (13, 12, 11, 10, 9, 8), "mem": (42, 43, 44, 45, 46, 47)}
 LEFT_WITNESS_LOCKS = {"shim": (6, 5, 4, 3, 2, 1), "mem": (48, 49, 50, 51, 52, 53)}
 LEFT_PROBE_LOCK = {"shim": 7, "mem": 54}
+LEFT_DMAERR_CHANNEL, LEFT_DMAERR_BD = 0, 3        # memtile S2MM 0, a BD no design configures
 LEFT_WORDS = 16                                    # words a BD moves
 LEFT_CHAIN = 4                                     # BDs of a release case's chain, by default
 LEFT_MAX_CHAIN = 7
@@ -878,7 +879,7 @@ LEFT_DMA_STATUS = {"shim": ("DMA_S2MM_Status_1", "DMA_MM2S_Status_1"),
 @dataclass(frozen=True)
 class LeftCase:
     kind: str                            # "shim" | "mem": the tile kind under test
-    mode: str                            # "host" | "bd"
+    mode: str                            # "host" | "bd" | "dmaerr" (an invalid BD queued on a channel)
     direction: str = ""                  # bd: "mm2s" | "s2mm", the channel whose BD takes the lock
     act: str = ""                        # bd: "rel" (release meets the frozen lock) | "acq"
     chain: int = 1                       # bd: BDs on the locked channel (rel: the frozen one + witnesses)
@@ -904,6 +905,9 @@ def _left_cases() -> dict[str, LeftCase]:
             # where does the channel stop? one BD's gate is held shut until the flag is cleared
             for h in (2, 3, 4):
                 out[f"{kind}_{direction}_rel_c5_hold{h}"] = LeftCase(kind, "bd", direction, "rel", 5, h)
+    # Does an ordinary xclbin forward a DMA error event to the driver? Queue an unconfigured BD
+    # on a memtile channel (the shim channel's error latches past a context load: not probed)
+    out["mem_dmaerr"] = LeftCase("mem", "dmaerr", "s2mm")
     return out
 
 
@@ -929,7 +933,7 @@ def left_steps(case: LeftCase) -> list:
             out += [cp.Read(a, f"{tag} {t} unf{i}", t) for i, a in enumerate(r.underflow)]
             out += [cp.Read(a, f"{tag} {t} ev{i}", t) for i, a in enumerate(r.events)]
         out += [cp.Read(k.value(n), f"{tag} {case.kind} L{n}", case.kind) for n in locks]
-        if case.mode == "bd":
+        if case.mode in ("bd", "dmaerr"):
             for t in regs:
                 out += [cp.Read(a, f"{tag} {t} {n}", t) for n, a in status[t]]
         return out
@@ -958,6 +962,16 @@ def left_steps(case: LeftCase) -> list:
             req(a, False, 1, "(cleared)"), req(b, True, -1, "(cleared, 63)"),
             *snap("s4", locks),
             *clear(), *snap("s5", locks),                         # clear-and-reread
+        ]
+    if case.mode == "dmaerr":
+        ch = LEFT_DMAERR_CHANNEL
+        queue, ctrl = k.regs[f"DMA_S2MM_{ch}_Start_Queue"], k.regs[f"DMA_S2MM_{ch}_Ctrl"]
+        return [
+            *snap("s0", ()),
+            cp.Write(queue, LEFT_DMAERR_BD, "start an unconfigured BD", case.kind),
+            *snap("s1", ()), *snap("s2", ()),
+            cp.Write(ctrl, 0x2, "channel reset", case.kind), cp.Write(ctrl, 0x0, "reset released", case.kind),
+            *snap("s3", ()),
         ]
     lock, aux = LEFT_BD_LOCK[case.kind], LEFT_AUX_LOCK[case.kind]
     gates = LEFT_GATE_LOCKS[case.kind][:case.chain - 1]

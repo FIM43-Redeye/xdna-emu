@@ -415,7 +415,7 @@ fn a_shim_release_on_a_frozen_lock_is_parked_and_the_chain_runs_on() {
         rig.engine.configure_bd(i as u8, bd).unwrap();
     }
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
-    let mut run = |rig: &mut Rig, cycles: u32| {
+    let run = |rig: &mut Rig, cycles: u32| {
         for _ in 0..cycles {
             rig.engine.submit_lock_requests(&mut rig.tile, &mut NeighborTiles::empty());
             rig.tile.resolve_lock_requests(rig.cycle);
