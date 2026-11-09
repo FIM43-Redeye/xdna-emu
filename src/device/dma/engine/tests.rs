@@ -411,12 +411,23 @@ fn a_bd_acquire_with_a_change_of_zero_or_more_is_an_equal_acquire() {
     assert_eq!(run_bd_acquire(-1, 2), (true, 1));
 }
 
-// Silicon (build/experiments/lock-frozen, dma_rel, r1): a BD whose release meets a lock holding
-// an overflow / underflow flag is not completed: the channel stays on the release (its data
-// has gone out, the next BD of the chain does not start) until the flag is cleared, and then
-// the release is performed. It is not dropped.
+// Silicon (build/experiments/lock-leftovers, 2026-11-08): a BD whose release meets a lock
+// holding an overflow / underflow flag does NOT hold its channel. The release is parked, in
+// order, and the channel runs on: the next BD acquires its lock and moves its data (compute
+// dma_rel_c4..c6, shim and memtile chains), while every release behind the parked one -- even
+// to an unflagged lock -- waits too. The clear lets them all through, in order. (The earlier
+// lock-frozen reading, "BD3 does not run", only looked at BD3's witness lock.)
+fn run_with_stream_drain(engine: &mut DmaEngine, tile: &mut Tile, host_mem: &mut HostMemory, cycles: u32) {
+    for _ in 0..cycles {
+        engine.submit_lock_requests(tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(0);
+        engine.step(tile, &mut NeighborTiles::empty(), host_mem);
+        while engine.pop_stream_out().is_some() {}
+    }
+}
+
 #[test]
-fn a_bd_release_on_a_frozen_lock_holds_the_channel_until_the_flag_clears() {
+fn a_bd_release_on_a_frozen_lock_is_parked_and_the_channel_runs_on() {
     for flag_is_overflow in [true, false] {
         let mut engine = DmaEngine::new_compute_tile(1, 2);
         let mut tile = make_tile();
@@ -424,26 +435,76 @@ fn a_bd_release_on_a_frozen_lock_holds_the_channel_until_the_flag_clears() {
         tile.locks[5].set(0);
         tile.locks[5].overflow = flag_is_overflow;
         tile.locks[5].underflow = !flag_is_overflow;
+        tile.locks[6].set(1); // BD1's gate
         engine
-            .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_release(5, 1))
+            .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_release(5, 1).with_next(1))
+            .unwrap();
+        engine
+            .configure_bd(1, BdConfig::simple_1d(0x200, 32).with_acquire(6, -1).with_release(7, 1))
             .unwrap();
         engine.start_channel(2, 0).unwrap();
-        let mut run = |engine: &mut DmaEngine, tile: &mut Tile, cycles: u32| {
-            for _ in 0..cycles {
-                engine.submit_lock_requests(tile, &mut NeighborTiles::empty());
-                tile.resolve_lock_requests(0);
-                engine.step(tile, &mut NeighborTiles::empty(), &mut host_mem);
-                while engine.pop_stream_out().is_some() {}
-            }
-        };
-        run(&mut engine, &mut tile, 300);
-        assert!(engine.channel_active(2), "the BD is held on its release while the lock is frozen");
-        assert_eq!(tile.locks[5].value, 0, "nothing was released");
+        run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 600);
+        assert_eq!(tile.locks[6].value, 0, "BD1 acquired its gate while BD0's release is parked");
+        assert_eq!(tile.locks[5].value, 0, "BD0's release waits for the clear");
+        assert_eq!(tile.locks[7].value, 0, "BD1's release queues behind it, though its lock is not flagged");
         tile.locks[5].clear_flags();
-        run(&mut engine, &mut tile, 20);
-        assert!(!engine.channel_active(2), "the clear lets the BD complete");
-        assert_eq!(tile.locks[5].value, 1, "and its release is performed");
+        run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 20);
+        assert_eq!(tile.locks[5].value, 1, "the clear lets BD0's release through");
+        assert_eq!(tile.locks[7].value, 1, "and then BD1's");
     }
+}
+
+// Memtile: the channel gets one BD past the parked release -- the next BD's acquire is
+// performed (it was issued while the first BD was still transferring), but with two releases
+// parked the third BD's acquire is not (lock-leftovers mem_*_rel_c3..c7: only the second gate
+// consumed).
+#[test]
+fn a_memtile_channel_stops_acquiring_once_two_releases_are_parked() {
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+    // own-tile locks are BD ids 64 + n
+    tile.locks[0].set(0);
+    tile.locks[0].overflow = true;
+    for gate in [1, 3, 5] {
+        tile.locks[gate].set(1);
+    }
+    engine
+        .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_release(64, 1).with_next(1))
+        .unwrap();
+    engine
+        .configure_bd(
+            1,
+            BdConfig::simple_1d(0x200, 32)
+                .with_acquire(65, -1)
+                .with_release(66, 1)
+                .with_next(2),
+        )
+        .unwrap();
+    engine
+        .configure_bd(
+            2,
+            BdConfig::simple_1d(0x300, 32)
+                .with_acquire(67, -1)
+                .with_release(68, 1)
+                .with_next(3),
+        )
+        .unwrap();
+    engine
+        .configure_bd(3, BdConfig::simple_1d(0x400, 32).with_acquire(69, -1).with_release(70, 1))
+        .unwrap();
+    engine.start_channel(6, 0).unwrap();
+    run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 800);
+    assert_eq!(tile.locks[1].value, 0, "the second BD's gate is taken");
+    assert_eq!(tile.locks[3].value, 1, "the third BD's acquire waits behind two parked releases");
+    assert_eq!(tile.locks[2].value, 0);
+    tile.locks[0].clear_flags();
+    run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 800);
+    assert_eq!(
+        (tile.locks[0].value, tile.locks[2].value, tile.locks[4].value, tile.locks[6].value),
+        (1, 1, 1, 1)
+    );
+    assert_eq!((tile.locks[3].value, tile.locks[5].value), (0, 0));
 }
 
 #[test]

@@ -25,6 +25,9 @@ impl DmaEngine {
         for ch_idx in 0..self.channels.len() {
             match &self.channels[ch_idx].fsm {
                 ChannelFsm::AcquiringLock { lock_id, acquired: false, transfer, .. } => {
+                    if self.acquire_blocked_by_parked_releases(ch_idx) {
+                        continue;
+                    }
                     self.submit_acquire_request(*lock_id, transfer, tile, neighbors, ch_idx as u8);
                 }
                 ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. }
@@ -36,6 +39,18 @@ impl DmaEngine {
             }
         }
     }
+
+    /// Memtile: a channel with two releases parked performs no further acquire. Silicon
+    /// (lock-leftovers mem_*_rel_c3..c7): with one release parked the next BD's acquire is
+    /// still performed (the memtile issues it while the previous BD is transferring), with two
+    /// parked the third BD's is not. Compute and shim channels are not limited (compute
+    /// dma_rel_c6, shim *_rel_c7: every later gate taken).
+    fn acquire_blocked_by_parked_releases(&self, ch_idx: usize) -> bool {
+        self.tile_kind.is_mem()
+            && self.channels[ch_idx].parked_releases.len() >= Self::MEMTILE_PARKED_RELEASE_LIMIT
+    }
+
+    const MEMTILE_PARKED_RELEASE_LIMIT: usize = 2;
 
     /// Submit an acquire request to the appropriate tile's arbiter.
     fn submit_acquire_request(
@@ -106,6 +121,36 @@ impl DmaEngine {
     ) {
         self.release_lock_value(lock_id, release_value, tile, neighbors, ch_idx);
         self.emit_lock_release_trace_at(lock_id, self.current_cycle, tile, neighbors);
+    }
+
+    /// Whether a release now has to wait: its lock holds an overflow / underflow flag, or an
+    /// earlier release of the channel is still parked (they are performed in order).
+    pub(super) fn release_must_park(
+        &self,
+        ch_idx: usize,
+        lock_id: u8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> bool {
+        !self.channels[ch_idx].parked_releases.is_empty()
+            || self.release_target_frozen(lock_id, tile, neighbors)
+    }
+
+    /// Perform the channel's parked releases, oldest first, up to the first whose lock still
+    /// holds a flag.
+    pub(super) fn drain_parked_releases(
+        &mut self,
+        ch_idx: usize,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) {
+        while let Some(&(lock_id, value)) = self.channels[ch_idx].parked_releases.front() {
+            if self.release_target_frozen(lock_id, tile, neighbors) {
+                break;
+            }
+            self.channels[ch_idx].parked_releases.pop_front();
+            self.apply_lock_release_direct(lock_id, value, tile, neighbors, ch_idx);
+        }
     }
 
     /// Whether the lock a BD releases holds an overflow / underflow flag (and so refuses).

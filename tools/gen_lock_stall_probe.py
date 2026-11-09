@@ -593,6 +593,7 @@ class FrozenCase:
     dma: str = ""                        # "rel" | "acq": a BD chain on FZ_P instead of core requests
     init_q: int = 0                      # FZ_Q's count at load (b2b cases)
     b2b: tuple[str, str, int] | None = None  # (pair, variant, d): a lock-b2b window instead
+    chain: int = 3                       # dma "rel": BDs in the chain (BDs 4.. gate on their own lock)
 
 
 FROZEN_CASES: dict[str, FrozenCase] = {
@@ -613,6 +614,8 @@ FROZEN_CASES: dict[str, FrozenCase] = {
     "dma_rel": FrozenCase(63, (), dma="rel"),
     # the core overflows FZ_P to count 1, BD2 acquires it (>= 1) while it is frozen
     "dma_acq": FrozenCase(63, (("rel", 2),), dma="acq"),
+    # BDs behind the one that meets the frozen lock: how far does the channel run ahead?
+    **{f"dma_rel_c{n}": FrozenCase(63, (), dma="rel", chain=n) for n in (4, 5, 6)},
     "ovf1_keep": FrozenCase(63, (("rel", 1),), keep=True),    # leaves the flag set after the run
     "unf1_keep": FrozenCase(0, (("rel", -1),), keep=True),
 }
@@ -695,6 +698,8 @@ FROZEN_CASES.update(_b2b_frozen_cases())
 
 def frozen_passes(case: FrozenCase) -> int:
     """Stamps transfers the design makes: two timed passes, or one per BD of a DMA chain."""
+    if case.dma == "rel":
+        return case.chain
     return 3 if case.dma else 2
 
 
@@ -703,7 +708,8 @@ def frozen_steps(case: FrozenCase) -> list:
     (DMA cases: see the comments in the branches)."""
     import ctrlpkt_readback as cp
     lv = cp.lock_value_addr
-    extra = (FZ_D2, FZ_D3) if case.dma else ()
+    extra = ((FZ_D, FZ_D2, FZ_D3) if case.dma else ()) + tuple(
+        x for pair in FZ_EXTRA_BDS[:max(case.chain - 3, 0)] for x in pair)
 
     def snap(tag: str) -> list:
         return [cp.Read(cp.LOCKS_OVERFLOW, f"{tag} ovf"), cp.Read(cp.LOCKS_UNDERFLOW, f"{tag} unf"),
@@ -728,7 +734,8 @@ def frozen_steps(case: FrozenCase) -> list:
         # its data arrives, then its release meets the frozen lock; BD3 runs only if that
         # release completed (FZ_D3 counts it). Clear, then BD3 must run.
         return [*go, *snap("s1"), cp.Write(lv(FZ_C2), 1), cp.Wait("stamp0"), *snap("s2"),
-                *clear(), *snap("s3"), cp.Wait("stamp0"), *snap("s4"), *clear(), *snap("s5")]
+                *clear(), *snap("s3"), *[cp.Wait("stamp0")] * (case.chain - 2), *snap("s4"), *clear(),
+                *snap("s5")]
     if case.dma == "acq":
         # the core froze FZ_P at count 1; BD2 acquires it right after BD1 (timer-gated)
         return [*go, *snap("s1"), *clear(), *snap("s2"), cp.Wait("stamp0"), cp.Wait("stamp0"),
@@ -739,13 +746,16 @@ def frozen_steps(case: FrozenCase) -> list:
 
 
 FZ_X = 6                                 # DMA cases: a release target nobody reads
+# BDs 4.. of a longer "rel" chain: (gate lock, witness lock) of BD n; gates start at 1, witnesses at 0
+FZ_EXTRA_BDS = ((5, 2), (4, 1), (3, 0))
 
 
 def frozen_chain(case: FrozenCase) -> list[tuple[str, str]]:
     """The tile DMA's BD chain as (acquire lock, release lock) symbols; each acquires >= 1 and
     releases +1. Core cases ship the stamps twice (timer-gated). DMA cases: see FrozenCase."""
     if case.dma == "rel":
-        return [("lC1", "lP"), ("lC2", "lP"), ("lD", "lD3")]
+        return [("lC1", "lP"), ("lC2", "lP"), ("lD", "lD3"),
+                *[(f"lG{k}", f"lW{k}") for k in range(4, case.chain + 1)]]
     if case.dma == "acq":
         return [("lC1", "lX"), ("lP", "lD2"), ("lD", "lD3")]
     return [("lC1", "lD"), ("lC2", "lD")]
@@ -781,6 +791,8 @@ def frozen_design(case: FrozenCase) -> tuple[str, list, "object"]:
                  (FZ_C1, "lC1", 0), (FZ_C2, "lC2", 0), (FZ_D, "lD", 1 if dma else 0)]
     if dma:
         lock_defs += [(FZ_D2, "lD2", 0), (FZ_D3, "lD3", 0), (FZ_X, "lX", 0)]
+        for k, (gate, witness) in enumerate(FZ_EXTRA_BDS[:max(case.chain - 3, 0)], start=4):
+            lock_defs += [(gate, f"lG{k}", 1), (witness, f"lW{k}", 0)]
     text = "\n".join([
         "module {",
         "  aie.device(npu1_1col) {",
@@ -833,6 +845,240 @@ def frozen_lost(stamps: list[int], n_reqs: int) -> list[list[int | None]]:
     return out
 
 
+# -- left: lock flags on the memtile and the shim, host requests and DMA BDs -----------------
+#
+# No cores. The host talks to the memtile's and the shim's own control port (the shim's by a
+# packet flow from its DMA 0 into its TileControl, a loop through its switch): it sets lock
+# values, issues lock requests (a read in the Lock_Request space), reads the flag registers,
+# Event_Status and the DMA channel status. "host" cases need nothing else; "bd" cases also
+# start one DMA task on a lock the host froze (overflowed or underflowed) beforehand, between
+# two snapshots, so the channel's status says whether it is held on the lock.
+
+LEFT_LOCKS = {"shim": (15, 14), "mem": (40, 5)}   # (overflow lock, underflow lock) of the host cases
+LEFT_BD_LOCK = {"shim": 15, "mem": 40}
+# A BD uses either no lock or one acquire and one release, so the frozen lock is paired with an
+# auxiliary one: a release BD acquires it first (host-set to 1), an acquire BD releases it after
+# (starts at 0): its value says how far the BD got.
+LEFT_AUX_LOCK = {"shim": 14, "mem": 41}
+# Release cases chain three more BDs behind the one that meets the frozen lock: each acquires a
+# gate lock (host-set to 1) and releases a witness lock, so a gate at 0 says the channel moved
+# on to that BD and a witness at 1 says its release was performed. LEFT_PROBE_LOCK is an
+# unfrozen lock the host requests while a release is parked.
+LEFT_GATE_LOCKS = {"shim": (13, 12, 11, 10, 9, 8), "mem": (42, 43, 44, 45, 46, 47)}
+LEFT_WITNESS_LOCKS = {"shim": (6, 5, 4, 3, 2, 1), "mem": (48, 49, 50, 51, 52, 53)}
+LEFT_PROBE_LOCK = {"shim": 7, "mem": 54}
+LEFT_WORDS = 16                                    # words a BD moves
+LEFT_CHAIN = 4                                     # BDs of a release case's chain, by default
+LEFT_MAX_CHAIN = 7
+LEFT_MODULE = {"shim": "shim", "mem": "memory_tile"}
+LEFT_DMA_STATUS = {"shim": ("DMA_S2MM_Status_1", "DMA_MM2S_Status_1"),
+                   "mem": ("DMA_S2MM_Status_0", "DMA_MM2S_Status_0")}
+
+
+@dataclass(frozen=True)
+class LeftCase:
+    kind: str                            # "shim" | "mem": the tile kind under test
+    mode: str                            # "host" | "bd"
+    direction: str = ""                  # bd: "mm2s" | "s2mm", the channel whose BD takes the lock
+    act: str = ""                        # bd: "rel" (release meets the frozen lock) | "acq"
+    chain: int = 1                       # bd: BDs on the locked channel (rel: the frozen one + witnesses)
+    hold: int = 0                        # rel: index (>= 1) of the chain BD whose gate stays 0 until after the clear
+
+    @property
+    def data_words(self) -> int:
+        """The data BO: source BDs, then room for them."""
+        return 2 * self.chain * LEFT_WORDS
+
+
+def _left_cases() -> dict[str, LeftCase]:
+    out = {}
+    for kind in ("shim", "mem"):
+        out[f"{kind}_host"] = LeftCase(kind, "host")
+        for direction in ("mm2s", "s2mm"):
+            out[f"{kind}_{direction}_acq"] = LeftCase(kind, "bd", direction, "acq")
+            out[f"{kind}_{direction}_rel"] = LeftCase(kind, "bd", direction, "rel", LEFT_CHAIN)
+            # how many BDs run ahead of a parked release: sweep the chain length
+            for n in range(1, LEFT_MAX_CHAIN + 1):
+                if n != LEFT_CHAIN:
+                    out[f"{kind}_{direction}_rel_c{n}"] = LeftCase(kind, "bd", direction, "rel", n)
+            # where does the channel stop? one BD's gate is held shut until the flag is cleared
+            for h in (2, 3, 4):
+                out[f"{kind}_{direction}_rel_c5_hold{h}"] = LeftCase(kind, "bd", direction, "rel", 5, h)
+    return out
+
+
+LEFT_CASES = _left_cases()
+
+
+def left_targets(case: LeftCase) -> list[str]:
+    """Control targets the case reads: the tile under test, plus the shim for bd cases (its DMA
+    status is the other end of every transfer)."""
+    return [case.kind] if case.mode == "host" or case.kind == "shim" else [case.kind, "shim"]
+
+
+def left_steps(case: LeftCase) -> list:
+    import ctrlpkt_readback as cp
+    regs = {t: cp.TileRegs(t) for t in left_targets(case)}
+    k = regs[case.kind]
+    status = {t: [(n, regs[t].regs[n]) for n in LEFT_DMA_STATUS[t]] for t in regs}
+
+    def snap(tag: str, locks: tuple[int, ...]) -> list:
+        out = []
+        for t, r in regs.items():
+            out += [cp.Read(a, f"{tag} {t} ovf{i}", t) for i, a in enumerate(r.overflow)]
+            out += [cp.Read(a, f"{tag} {t} unf{i}", t) for i, a in enumerate(r.underflow)]
+            out += [cp.Read(a, f"{tag} {t} ev{i}", t) for i, a in enumerate(r.events)]
+        out += [cp.Read(k.value(n), f"{tag} {case.kind} L{n}", case.kind) for n in locks]
+        if case.mode == "bd":
+            for t in regs:
+                out += [cp.Read(a, f"{tag} {t} {n}", t) for n, a in status[t]]
+        return out
+
+    def clear() -> list:
+        return [cp.Write(a, 0xFFFFFFFF, f"clear {case.kind}", case.kind) for a in (*k.overflow, *k.underflow)]
+
+    def req(lock: int, acquire: bool, change: int, what: str) -> cp.Read:
+        return cp.Read(k.request(lock, acquire, change),
+                       f"req {case.kind} L{lock} {'acq' if acquire else 'rel'} {change:+d} {what}", case.kind)
+
+    def setv(lock: int, v: int) -> cp.Write:
+        return cp.Write(k.value(lock), v, f"set {case.kind} L{lock}", case.kind)
+
+    if case.mode == "host":
+        a, b = LEFT_LOCKS[case.kind]
+        locks = (a, b)
+        return [
+            *snap("s0", locks),                                   # clean baseline
+            setv(a, 63), setv(b, 0),
+            req(a, False, 1, "(63: overflow)"), req(b, False, -1, "(0: underflow)"),
+            *snap("s1", locks),
+            req(a, False, 1, "(frozen)"), req(b, True, -1, "(frozen, 63)"),
+            *snap("s2", locks),
+            *clear(), *snap("s3", locks),
+            req(a, False, 1, "(cleared)"), req(b, True, -1, "(cleared, 63)"),
+            *snap("s4", locks),
+            *clear(), *snap("s5", locks),                         # clear-and-reread
+        ]
+    lock, aux = LEFT_BD_LOCK[case.kind], LEFT_AUX_LOCK[case.kind]
+    gates = LEFT_GATE_LOCKS[case.kind][:case.chain - 1]
+    witnesses = LEFT_WITNESS_LOCKS[case.kind][:case.chain - 1]
+    probe = LEFT_PROBE_LOCK[case.kind]
+    rel = case.act == "rel"
+    locks = (lock, aux, *(gates + witnesses if rel else ()), probe)
+    held = gates[case.hold - 1] if case.hold else None
+    freeze = [setv(lock, 63), setv(aux, 1 if rel else 0),
+              *([setv(g, 1) for g in gates if g != held] if rel else []),
+              req(lock, False, 1 if rel else 2, "(63: overflow)")]
+    return [
+        *snap("s0", locks),
+        *freeze, *snap("s1", locks),
+        cp.Raw(left_task_lines(case)),
+        *snap("s2", locks), *snap("s3", locks),                   # time for the transfer: held?
+        req(probe, False, 1, "(an unfrozen lock, requests pending)"), *snap("s3b", locks),
+        *clear(), *snap("s4", locks),
+        *([setv(held, 1)] if held is not None else []), *snap("s5", locks),
+        *clear(), *snap("s6", locks),
+    ]
+
+
+def left_task_lines(case: LeftCase) -> tuple[str, ...]:
+    """Runtime-sequence lines that configure and start the case's DMA tasks (receiver first).
+    The lock end's first BD takes the frozen lock: a release after its data, or an acquire
+    before it; a release case chains a witness BD behind it. The other end is a plain BD."""
+    w, d = LEFT_WORDS, case.data_words
+    m = f"memref<{d}xi32>"
+    rel = case.act == "rel"
+    # (acquire lock, release lock) of the locked end's BDs
+    locked_bds = [("lx", "lk") if rel else ("lk", "lx")]
+    if rel:
+        locked_bds += [(f"ly{i}", f"lw{i}") for i in range(case.chain - 1)]
+
+    def use(var: str, action: str, sym: str) -> list[str]:
+        kind = "Release" if action == "rel" else "AcquireGreaterEqual"
+        return [f"%c_{var}_{action} = arith.constant 1 : i32",
+                f"aie.use_lock(%{sym}, {kind}, %c_{var}_{action})"]
+
+    def task(var: str, tile: str, dir_: str, ch: int, bds: list[tuple[str, tuple | None]]) -> list[str]:
+        """bds: (dma_bd text, (acquire sym, release sym) | None) per chained BD."""
+        out = [f"%{var} = aiex.dma_configure_task(%{tile}, {dir_}, {ch}) {{"]
+        for i, (bd, locks) in enumerate(bds):
+            out.append(f"^bd{i}:" if i else "")
+            if locks:
+                out += [f"  {x}" for x in use(f"{var}{i}", "acq", locks[0])]
+            out.append(f"  {bd}")
+            if locks:
+                out += [f"  {x}" for x in use(f"{var}{i}", "rel", locks[1])]
+            out.append(f"  aie.next_bd ^bd{i + 1}" if i + 1 < len(bds) else "  aie.end")
+        out.append("}")
+        return [x for x in out if x]
+
+    def shim_bd(off: int, n: int, bd_id: int) -> str:
+        return f"aie.dma_bd(%data : {m} offset = {off} len = {n}) {{bd_id = {bd_id} : i32}}"
+
+    def mem_bd(off: int, n: int, bd_id: int) -> str:
+        return f"aie.dma_bd(%mbuf : memref<{case.chain * w}xi32> offset = {off} len = {n}) {{bd_id = {bd_id} : i32}}"
+
+    nb = len(locked_bds)
+    locked = lambda mk, base_off, base_id: [(mk(base_off + i * w, w, base_id + i), locked_bds[i])
+                                             for i in range(nb)]
+    plain = lambda mk, off, base_id: [(mk(off, nb * w, base_id), None)]
+    dst_off, src_off = case.chain * w, 0
+    locked_mm2s = case.direction == "mm2s"
+    if case.kind == "shim":
+        if locked_mm2s:
+            recv = task("tr", "t00", "S2MM", 1, plain(shim_bd, dst_off, 12))
+            send = task("ts", "t00", "MM2S", 1, locked(shim_bd, src_off, 4))
+        else:
+            recv = task("tr", "t00", "S2MM", 1, locked(shim_bd, dst_off, 4))
+            send = task("ts", "t00", "MM2S", 1, plain(shim_bd, src_off, 12))
+    elif not locked_mm2s:      # shim MM2S 1 -> memtile S2MM 0 (locked)
+        recv = task("tr", "t01", "S2MM", 0, locked(mem_bd, 0, 0))
+        send = task("ts", "t00", "MM2S", 1, plain(shim_bd, src_off, 12))
+    else:                      # memtile MM2S 0 (locked) -> shim S2MM 1
+        recv = task("tr", "t00", "S2MM", 1, plain(shim_bd, dst_off, 12))
+        send = task("ts", "t01", "MM2S", 0, locked(mem_bd, 0, 0))
+    return (*recv, *send, "aiex.dma_start_task(%tr)", "aiex.dma_start_task(%ts)")
+
+
+def left_design(case: LeftCase) -> tuple[str, list, "object"]:
+    """(aie.mlir text, host steps, packet layout) of a left case."""
+    import ctrlpkt_readback as cp
+    steps = left_steps(case)
+    layout = cp.encode(steps)
+    d = case.data_words
+    m = f"memref<{d}xi32>"
+    tiles = {"shim": "%t00", "mem": "%t01"}
+    flows = []
+    for t in left_targets(case):
+        flows += cp.packet_flows(tiles[t], "%t00", t)
+    lines = ["module {", "  aie.device(npu1_1col) {",
+             "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
+             "    %t01 = aie.tile(0, 1) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 6>}",
+             *flows, *cp.shim_allocations("%t00")]
+    if case.mode == "bd":
+        t = case.kind
+        tile = tiles[t]
+        syms = [("lk", LEFT_BD_LOCK[t]), ("lx", LEFT_AUX_LOCK[t]), ("lz", LEFT_PROBE_LOCK[t]),
+                *[(f"ly{i}", g) for i, g in enumerate(LEFT_GATE_LOCKS[t][:case.chain - 1])],
+                *[(f"lw{i}", g) for i, g in enumerate(LEFT_WITNESS_LOCKS[t][:case.chain - 1])]]
+        for sym, lid in syms:
+            lines.append(f'    %{sym} = aie.lock({tile}, {lid}) {{init = 0 : i32, sym_name = "{sym}"}}')
+        if t == "mem":
+            lines += [f'    %mbuf = aie.buffer(%t01) {{sym_name = "mbuf"}} : memref<{case.chain * LEFT_WORDS}xi32>']
+        # the receiver's and sender's stream flow
+        src, dst = {("shim", "mm2s"): ("%t00, DMA : 1", "%t00, DMA : 1"),
+                    ("shim", "s2mm"): ("%t00, DMA : 1", "%t00, DMA : 1"),
+                    ("mem", "s2mm"): ("%t00, DMA : 1", "%t01, DMA : 0"),
+                    ("mem", "mm2s"): ("%t01, DMA : 0", "%t00, DMA : 1")}[(t, case.direction)]
+        lines += [f"    aie.flow({src}, {dst})",
+                  "    aie.shim_dma_allocation @dout (%t00, MM2S, 1)",
+                  "    aie.shim_dma_allocation @din (%t00, S2MM, 1)"]
+    lines += [f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: {m}) {{",
+              *cp.sequence_lines(steps, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
+    return "\n".join(lines), steps, layout
+
+
 # -- results ---------------------------------------------------------------------
 
 def parse_sampler(consumer_log: bytes) -> dict:
@@ -862,9 +1108,20 @@ def frozen_generate(args) -> int:
     import ctrlpkt_readback as cp
     out = Path(args.out_dir)
     for name in args.cases:
-        case = FROZEN_CASES[name]
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
+        if name in LEFT_CASES:
+            case = LEFT_CASES[name]
+            text, steps, layout = left_design(case)
+            (d / "aie.mlir").write_text(text)
+            (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
+            (d / "case.json").write_text(json.dumps(
+                {"case": name, "family": "left", "kind": case.kind, "mode": case.mode,
+                 "direction": case.direction, "act": case.act, "labels": list(layout.labels),
+                 "n_words": len(layout.words), "passes": case.data_words // FZ_STAMP_WORDS, "chain": case.chain, "hold": case.hold,
+                 "host_args": ["seq"]}, indent=1) + "\n")
+            continue
+        case = FROZEN_CASES[name]
         text, steps, layout = frozen_design(case)
         (d / "aie.mlir").write_text(text)
         (d / "core.s").write_text(frozen_core_asm(case))
@@ -882,6 +1139,8 @@ def frozen_build(args) -> int:
     from harness.build import _peano_tool, aiecc_command, aiecc_path
     for d in sorted(p for p in Path(args.out_dir).iterdir() if (p / "aie.mlir").exists()):
         for k in ("core", "timer"):
+            if not (d / f"{k}.s").exists():
+                continue
             subprocess.run([_peano_tool("llvm-mc"), "--triple=aie2", "--filetype=obj",
                             "-o", str(d / f"{k}.o"), str(d / f"{k}.s")], check=True)
             subprocess.run([_peano_tool("llvm-objcopy"), "--redefine-sym", f"test_kernel=k_{k}",
@@ -913,7 +1172,7 @@ def frozen_run(args) -> int:
         rd.mkdir(parents=True)
         meta = json.loads((d / "case.json").read_text())
         cmd = [str(host), str(d / "aie.xclbin"), str(d / "insts.bin"), str(d / "pkts.bin"),
-               str(len(meta["labels"])), str(meta.get("passes", 2) * FZ_STAMP_WORDS), str(rd / "out.bin")]
+               str(len(meta["labels"])), str(meta.get("passes", 2) * FZ_STAMP_WORDS), str(rd / "out.bin"), *meta.get("host_args", [])]
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True,
                                timeout=60 if args.backend == "hw" else 1800)
@@ -925,6 +1184,33 @@ def frozen_run(args) -> int:
         if rc != 0:
             return 1
     return 0
+
+
+def left_report(name: str, meta: dict, r: dict) -> str:
+    """One line per snapshot (flags, lock values, event words that are not 0, DMA status words),
+    then the data halves."""
+    c = r["ctrl"]
+    lines = [f"{name:14s} kind={meta['kind']} mode={meta['mode']} {meta['direction']} {meta['act']}"]
+    tags = list(dict.fromkeys(k.split()[0] for k in c))
+    for t in tags:
+        parts = []
+        for k, v in c.items():
+            tag, _, rest = k.partition(" ")
+            if tag != t:
+                continue
+            tile, _, reg = rest.partition(" ")
+            if reg.startswith("ev") and v == 0:
+                continue
+            if reg.startswith(("ovf", "unf")) and v == 0:
+                continue
+            parts.append(f"{tile}.{reg}={v:#x}")
+        lines.append(f"   {t}: " + " ".join(parts))
+    for k, v in c.items():
+        if k.startswith("req"):
+            lines.append(f"   {k}: {v:#x}")
+    data = [x for i in range(meta["passes"]) for x in r[f"pass{i + 1}"]]
+    lines.append("   dst per BD: " + " ".join(f"{x:#x}" for x in data[meta["chain"] * LEFT_WORDS::LEFT_WORDS]))
+    return "\n".join(lines)
 
 
 def frozen_analyze(args) -> int:
@@ -940,6 +1226,9 @@ def frozen_analyze(args) -> int:
             continue
         r = parse_frozen(out.read_bytes(), meta["labels"], meta.get("passes", 2))
         c = r["ctrl"]
+        if meta.get("family") == "left":
+            print(left_report(d.name, meta, r))
+            continue
         tags = sorted({k.split()[0] for k in c})
         locks = sorted({int(k.split()[1][1:]) for k in c if k.split()[1].startswith("L")})
         snaps = [f"{t}: ovf={c[t + ' ovf']:#x} unf={c[t + ' unf']:#x} "

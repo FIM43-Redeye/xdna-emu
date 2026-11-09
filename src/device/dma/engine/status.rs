@@ -3,6 +3,8 @@
 use super::*;
 
 impl DmaEngine {
+    const SHIM_PARKED_RELEASE_STALL: usize = 3;
+
     /// Get the current status register value for a channel.
     ///
     /// The status register format (AM025):
@@ -65,6 +67,16 @@ impl DmaEngine {
                 status = layout.status.insert(status, 0b10);
                 status = layout.channel_running.set_bit(status);
             }
+        }
+
+        // Shim: three releases parked behind a flagged lock leave the channel running with
+        // Stalled_Lock_Rel; up to two read as an idle channel (silicon, lock-leftovers
+        // shim_*_rel_c1..c7). Memtile channels stop at the next acquire instead, which the
+        // AcquiringLock arm above already reports.
+        if self.tile_kind.is_shim() && ch.parked_releases.len() >= Self::SHIM_PARKED_RELEASE_STALL {
+            status = layout.status.insert(status, 0b10);
+            status = layout.channel_running.set_bit(status);
+            status = layout.stalled_lock_rel.set_bit(status);
         }
 
         // Bit 4 of the status register reports a stream-side stall, but

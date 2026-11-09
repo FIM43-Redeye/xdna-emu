@@ -451,6 +451,12 @@ pub struct ChannelContext {
     /// each completion enqueues rather than overwrites.
     pub pending_releases: Vec<PendingRelease>,
 
+    /// BD releases that could not be performed yet: `(lock_id, release_value)`, oldest first.
+    /// A release that meets a lock holding an overflow / underflow flag is parked here and the
+    /// channel runs on; every later release of the channel queues behind it, whichever lock it
+    /// targets, and the queue drains in order once the flag is cleared (silicon, lock-leftovers).
+    pub parked_releases: std::collections::VecDeque<(u8, i8)>,
+
     /// Swap-enable watch for the end-of-stream release tail: `(acquire_lock_id,
     /// last_value)` of the producer's acquire lock (FREE) while the channel is
     /// stream-stalled. HW fires a deferred full-release on the SWAP-enable -- the
@@ -590,6 +596,7 @@ impl ChannelContext {
             prev_starving: false,
             prev_lock_stalled: false,
             pending_releases: Vec::new(),
+            parked_releases: std::collections::VecDeque::new(),
             swap_free_watch: None,
             startup_hold_cycles: 0,
             bd_switch_accept_block: 0,
@@ -689,6 +696,7 @@ impl ChannelContext {
             || self.queued_bd.is_some()
             || !self.task_queue.is_empty()
             || self.has_outstanding_reads()
+            || !self.parked_releases.is_empty()
     }
 
     /// Shim MM2S read-ahead state still in flight: words not yet in the

@@ -385,3 +385,55 @@ fn channel_reset_drops_outstanding_reads() {
     assert_eq!(rig.engine.read_ahead_words(rig.ch), 0);
     assert!(!rig.engine.channel_has_pending_work(rig.ch));
 }
+
+/// Silicon (lock-leftovers shim_mm2s_rel_c1..c7): a shim BD whose release meets a flagged lock
+/// does not hold the channel -- the release is parked and the chain runs to its end (every
+/// later BD's gate is taken), later releases queue behind the parked one. The channel reads as
+/// idle with up to two releases parked, and as running with Stalled_Lock_Rel from three on.
+/// After the clear every release is performed.
+#[test]
+fn a_shim_release_on_a_frozen_lock_is_parked_and_the_chain_runs_on() {
+    let mut rig = Rig::new(host_with(&[(IN_A, 16, 0), (IN_B, 16, 100)]));
+    rig.tile.locks[5].set(0);
+    rig.tile.locks[5].overflow = true;
+    for gate in [6, 8, 10] {
+        rig.tile.locks[gate].set(1);
+    }
+    let bds = [
+        BdConfig::simple_1d(IN_A, 64).with_release(5, 1).with_next(1),
+        BdConfig::simple_1d(IN_B, 64)
+            .with_acquire(6, -1)
+            .with_release(7, 1)
+            .with_next(2),
+        BdConfig::simple_1d(IN_A, 64)
+            .with_acquire(8, -1)
+            .with_release(9, 1)
+            .with_next(3),
+        BdConfig::simple_1d(IN_B, 64).with_acquire(10, -1).with_release(11, 1),
+    ];
+    for (i, bd) in bds.into_iter().enumerate() {
+        rig.engine.configure_bd(i as u8, bd).unwrap();
+    }
+    assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
+    let mut run = |rig: &mut Rig, cycles: u32| {
+        for _ in 0..cycles {
+            rig.engine.submit_lock_requests(&mut rig.tile, &mut NeighborTiles::empty());
+            rig.tile.resolve_lock_requests(rig.cycle);
+            rig.step(true);
+        }
+    };
+    run(&mut rig, 4000);
+    let gates: Vec<u8> = [6, 8, 10].iter().map(|&l| rig.tile.locks[l].value).collect();
+    assert_eq!(gates, [0, 0, 0], "the chain ran to its end with the first release parked");
+    let releases: Vec<u8> = [5, 7, 9, 11].iter().map(|&l| rig.tile.locks[l].value).collect();
+    assert_eq!(releases, [0, 0, 0, 0], "every release waits behind the flagged one");
+    let status = rig.engine.get_channel_status(rig.ch);
+    assert_ne!(status & (1 << 19), 0, "three or more parked releases keep the channel running");
+    assert_ne!(status & (1 << 3), 0, "and Stalled_Lock_Rel is set");
+    assert_eq!(rig.received.len(), 64, "all four BDs' data went out");
+    rig.tile.locks[5].clear_flags();
+    run(&mut rig, 50);
+    let releases: Vec<u8> = [5, 7, 9, 11].iter().map(|&l| rig.tile.locks[l].value).collect();
+    assert_eq!(releases, [1, 1, 1, 1], "the clear lets all four through");
+    assert_eq!(rig.engine.get_channel_status(rig.ch) & (1 << 3), 0);
+}

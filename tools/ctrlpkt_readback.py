@@ -21,13 +21,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-def _memory_module_registers() -> dict[str, int]:
-    """Offsets of the compute tile's memory-module registers, from the AM025 database."""
+def module_registers(module: str) -> dict[str, int]:
+    """Register offsets of one AM025 module ("memory", "memory_tile", "shim", ...)."""
     import json
     import toolchain_paths
     path = toolchain_paths.resolve_mlir_aie(Path(__file__)) / toolchain_paths.MLIR_AIE_SENTINEL
-    regs = json.loads(path.read_text())["modules"]["memory"]["registers"]
+    regs = json.loads(path.read_text())["modules"][module]["registers"]
     return {r["name"]: int(r["offset"], 16) for r in regs}
+
+
+def _memory_module_registers() -> dict[str, int]:
+    """Offsets of the compute tile's memory-module registers, from the AM025 database."""
+    return module_registers("memory")
 
 
 # One bit per lock (16 locks) in Locks_Overflow / Locks_Underflow, write 1 to clear;
@@ -42,8 +47,60 @@ MEM_EVENT_STATUS3 = _REGS["Event_Status3"]
 
 CTRL_PKT_ID = 5                    # stream id of the packet flow into the tile's TileControl
 RESPONSE_ID = 2                    # stream id of the packet flow back to shim S2MM 0
+
+
+@dataclass(frozen=True)
+class Target:
+    """A tile whose TileControl port the host talks to: the packet flow ids in and out, and
+    the AM025 module that describes its registers. The shim target is the shim itself: its
+    control port is reached by a packet flow from its own DMA 0 (a loop through its switch)."""
+    pkt_id: int
+    response_id: int
+    module: str
+
+
+TARGETS: dict[str, Target] = {
+    "core": Target(CTRL_PKT_ID, RESPONSE_ID, "memory"),
+    "mem": Target(6, 3, "memory_tile"),
+    "shim": Target(4, 1, "shim"),
+}
 # A BD id per packet, cycled: the shim has 16 and the last ones belong to the data transfers.
 BD_IDS = 4
+
+
+class TileRegs:
+    """The lock and event registers of one target tile kind, by AM025 name. Lock<n>_value are
+    16 bytes apart; Lock_Request is a read-to-request space (Lock_Id at bit 10, Acq_Rel at
+    bit 9, Change_Value at bits 8:2; bit 0 of the response is the result); the overflow /
+    underflow flags are one register of 16 locks (compute, shim) or two of 32 (memtile)."""
+
+    def __init__(self, target: str):
+        self.target = target
+        regs = module_registers(TARGETS[target].module)
+        self.regs = regs
+
+        def indexed(base: str) -> list[int]:
+            names = [n for n in (base, f"{base}_0", f"{base}_1") if n in regs]
+            return [regs[n] for n in names]
+        self.overflow = indexed("Locks_Overflow")
+        self.underflow = indexed("Locks_Underflow")
+        self.flag_bits = 32 if len(self.overflow) > 1 else 16
+        self.events = [regs[f"Event_Status{i}"] for i in range(6) if f"Event_Status{i}" in regs]
+        self.value_base = regs["Lock0_value"]
+        self.value_stride = regs["Lock1_value"] - regs["Lock0_value"]
+        self.request_base = regs["Lock_Request"]
+
+    def value(self, lock: int) -> int:
+        return self.value_base + self.value_stride * lock
+
+    def request(self, lock: int, acquire: bool, change: int) -> int:
+        return self.request_base + (lock << 10) + (0x200 if acquire else 0) + ((change & 0x7F) << 2)
+
+    def flag_reg(self, flags: list[int], lock: int) -> int:
+        return flags[lock // self.flag_bits]
+
+    def flag_bit(self, lock: int) -> int:
+        return 1 << (lock % self.flag_bits)
 
 
 def lock_value_addr(lock: int) -> int:
@@ -69,12 +126,14 @@ class Write:
     addr: int
     value: int
     label: str = ""
+    tile: str = "core"                        # key of TARGETS
 
 
 @dataclass(frozen=True)
 class Read:
     addr: int
     label: str = ""
+    tile: str = "core"
 
 
 @dataclass(frozen=True)
@@ -83,7 +142,13 @@ class Wait:
     transfer: str
 
 
-Step = Write | Read | Wait
+@dataclass(frozen=True)
+class Raw:
+    """Runtime-sequence lines emitted verbatim at this point (start a DMA task, ...)."""
+    lines: tuple[str, ...]
+
+
+Step = Write | Read | Wait | Raw
 
 
 @dataclass(frozen=True)
@@ -101,7 +166,7 @@ def encode(steps: list[Step]) -> Layout:
         if isinstance(s, Write):
             pkt = [header(s.addr, 0), s.value & 0xFFFFFFFF]
         elif isinstance(s, Read):
-            pkt = [header(s.addr, 1, RESPONSE_ID)]
+            pkt = [header(s.addr, 1, TARGETS[s.tile].response_id)]
             labels.append(s.label or f"{s.addr:#x}")
         else:
             continue
@@ -125,9 +190,12 @@ def sequence_lines(steps: list[Step], layout: Layout, ctrlout: str, ctrlin: str,
         if isinstance(s, Wait):
             out.append(f"      aiex.npu.dma_wait {{symbol = @{s.transfer}}}")
             continue
+        if isinstance(s, Raw):
+            out += [f"      {line}" for line in s.lines]
+            continue
         off, n = by_step[i]
         out.append(f"      aiex.npu.dma_memcpy_nd(%{ctrlin}[0, 0, 0, {off}][1, 1, 1, {n}][0, 0, 0, 1], "
-                   f"packet = <pkt_id = {CTRL_PKT_ID}, pkt_type = 0>) "
+                   f"packet = <pkt_id = {TARGETS[s.tile].pkt_id}, pkt_type = 0>) "
                    f"{{id = {sent % BD_IDS} : i64, issue_token = true, metadata = @ctrlin0}} "
                    f": memref<{n_in}xi32>")
         out.append("      aiex.npu.dma_wait {symbol = @ctrlin0}")
@@ -136,20 +204,29 @@ def sequence_lines(steps: list[Step], layout: Layout, ctrlout: str, ctrlin: str,
     return out
 
 
-def flow_lines(tile: str, shim: str) -> list[str]:
-    """Packet flows and shim allocations: ctrlin into `tile`'s TileControl, responses back."""
+def packet_flows(tile: str, shim: str, target: str = "core") -> list[str]:
+    """The packet flows for one target: ctrlin into `tile`'s TileControl, responses back."""
+    t = TARGETS[target]
     return [
-        f"    aie.packet_flow({CTRL_PKT_ID}) {{",
+        f"    aie.packet_flow({t.pkt_id}) {{",
         f"      aie.packet_source<{shim}, DMA : 0>",
         f"      aie.packet_dest<{tile}, TileControl : 0>",
         "    }",
-        f"    aie.packet_flow({RESPONSE_ID}) {{",
+        f"    aie.packet_flow({t.response_id}) {{",
         f"      aie.packet_source<{tile}, TileControl : 0>",
         f"      aie.packet_dest<{shim}, DMA : 0>",
         "    }",
-        f"    aie.shim_dma_allocation @ctrlin0 ({shim}, MM2S, 0)",
-        f"    aie.shim_dma_allocation @ctrl0 ({shim}, S2MM, 0)",
     ]
+
+
+def shim_allocations(shim: str) -> list[str]:
+    return [f"    aie.shim_dma_allocation @ctrlin0 ({shim}, MM2S, 0)",
+            f"    aie.shim_dma_allocation @ctrl0 ({shim}, S2MM, 0)"]
+
+
+def flow_lines(tile: str, shim: str) -> list[str]:
+    """Packet flows and shim allocations: ctrlin into `tile`'s TileControl, responses back."""
+    return [*packet_flows(tile, shim), *shim_allocations(shim)]
 
 
 def pack_words(words) -> bytes:
@@ -158,7 +235,7 @@ def pack_words(words) -> bytes:
 
 # The host: runs the xclbin with (ctrlout, ctrlin, data) as the kernel's three buffers and
 # writes ctrlout then data to a file. A response not delivered stays 0xEEEEEEEE.
-HOST_CPP = r'''// ctrlpkt_readback host: usage host xclbin insts.bin pkts.bin n_ctrlout n_data out.bin
+HOST_CPP = r'''// ctrlpkt_readback host: usage host xclbin insts.bin pkts.bin n_ctrlout n_data out.bin [seq]
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -180,7 +257,7 @@ static std::vector<uint32_t> load(const char *p) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 7) { std::cerr << "usage: host xclbin insts.bin pkts.bin n_ctrlout n_data out.bin\n"; return 2; }
+  if (argc < 7) { std::cerr << "usage: host xclbin insts.bin pkts.bin n_ctrlout n_data out.bin [seq]\n"; return 2; }
   int n_ctrl = std::stoi(argv[4]), n_data = std::stoi(argv[5]);
   auto instr = load(argv[2]);
   auto pkts = load(argv[3]);
@@ -200,6 +277,10 @@ int main(int argc, char **argv) {
   memcpy(bo_in.map<void *>(), pkts.data(), pkts.size() * 4);
   memset(bo_ctrl.map<void *>(), 0xEE, n_ctrl * 4);
   memset(bo_data.map<void *>(), 0xEE, n_data * 4);
+  // "seq" as a seventh argument: the first half of the data buffer holds a known pattern
+  // (a source for a transfer; the second half stays 0xEE until something is written there)
+  if (argc > 7 && std::string(argv[7]) == "seq")
+    for (int i = 0; i < n_data / 2; i++) bo_data.map<uint32_t *>()[i] = 0xD0000000u + i;
   bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   bo_ctrl.sync(XCL_BO_SYNC_BO_TO_DEVICE);

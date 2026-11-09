@@ -559,6 +559,12 @@ impl DmaEngine {
         for ch_idx in 0..self.channels.len() {
             let phase_before = self.channels[ch_idx].fsm.phase_name();
 
+            // Releases parked behind a flagged lock go through once the flag is cleared.
+            if !self.channels[ch_idx].parked_releases.is_empty() {
+                self.drain_parked_releases(ch_idx, tile, neighbors);
+                any_waiting |= !self.channels[ch_idx].parked_releases.is_empty();
+            }
+
             // Shim MM2S read-ahead: returned reads enter the stream before this
             // cycle's issue decision, whatever the FSM is doing.
             if !self.channels[ch_idx].read_ahead.is_empty() || self.channels[ch_idx].read_backpressure {
@@ -1574,11 +1580,13 @@ impl DmaEngine {
 
         if let Some(lock_id) = transfer.release_lock {
             let release_value = transfer.release_value;
-            // A lock holding an overflow / underflow flag refuses the release: the BD does not
-            // complete, the channel retries it through the arbiter until the flag is cleared
-            // (silicon, lock-frozen dma_rel). The data has already gone out.
-            if self.release_target_frozen(lock_id, tile, neighbors) {
-                return ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining: 1, completion };
+            // A lock holding an overflow / underflow flag refuses the release, but the channel
+            // does not wait for it: the release is parked (with everything the channel releases
+            // after it) and the chain runs on; the clear lets the queue through, in order
+            // (silicon, lock-leftovers).
+            if self.release_must_park(ch_idx, lock_id, tile, neighbors) {
+                self.channels[ch_idx].parked_releases.push_back((lock_id, release_value));
+                return self.after_transfer_done(ch_idx, completion, tile, neighbors);
             }
             // The FUNCTIONAL semaphore release is ALWAYS prompt (inline at
             // completion): the lock value a waiting consumer acquires must be
@@ -1702,7 +1710,11 @@ impl DmaEngine {
         {
             let done = self.channels[ch_idx].read_completions.pop_front().expect("front checked");
             if let Some((lock_id, value)) = done.release {
-                self.apply_lock_release_direct(lock_id, value, tile, neighbors, ch_idx);
+                if self.release_must_park(ch_idx, lock_id, tile, neighbors) {
+                    self.channels[ch_idx].parked_releases.push_back((lock_id, value));
+                } else {
+                    self.apply_lock_release_direct(lock_id, value, tile, neighbors, ch_idx);
+                }
             }
             self.note_bd_finished(ch_idx, &done.completion);
             if done.task_end {
