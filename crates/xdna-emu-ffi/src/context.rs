@@ -77,6 +77,7 @@ mod tests {
                     dma_states: vec![],
                     data_in_flight: false,
                     pending_syncs: vec![],
+                    blocked_writes: vec![],
                 },
             );
             assert!(device.contexts[0].is_failed());
