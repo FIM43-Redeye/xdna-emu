@@ -1,0 +1,50 @@
+"""The lock LOCK_STALL trace probe: case table, kernel text, and the trace reductions."""
+import re
+
+import gen_lock_pulse_probe as g
+
+
+def test_every_case_keeps_the_aiecc_mains_live_registers_and_brackets_the_window():
+    for name, case in g.cases().items():
+        asm = case.consumer_asm()
+        assert "st r16, [sp, #-4]" in asm and "lda r16, [sp, #-4]" in asm, name
+        assert "st r17, [sp, #-8]" in asm and "lda r17, [sp, #-8]" in asm, name
+        assert asm.index("event #0") < asm.index("event #1"), name
+        if name == "cnt_event":      # the cycle accounting case carries markers of its own
+            continue
+        # only the window bundles sit between the markers, plus the closing gap
+        between = asm[asm.index("event #0"):asm.index("event #1")].splitlines()[1:]
+        between = [line for line in between if line.strip()]
+        assert len(between) == len(case.window) + case.end_gap, name
+
+
+def test_a_producer_exists_exactly_for_the_cases_with_a_refused_acquire():
+    for name, case in g.cases().items():
+        assert (case.producer_asm() is not None) == (case.producer_release is not None), name
+    assert g.cases()["acq_refused"].producer_release == g.A
+
+
+def test_bundles_places_slots_at_their_offsets_and_pads_with_nops():
+    assert g.bundles({0: "acq #62, r3", 2: "rel #63, r2"}, 3) == ["  acq #62, r3", g.N, "  rel #63, r2", g.N]
+
+
+def test_pair_cases_put_the_second_request_d_bundles_after_the_first():
+    window = g.cases()["relacq_d3"].window
+    assert [i for i, b in enumerate(window) if b != g.N] == [0, 3]
+    assert "rel" in window[0] and "acq" in window[3]
+
+
+def test_conditional_requests_carry_the_condition_register():
+    window = g.cases()["cond_acq_skipped"].window
+    assert any(re.search(r"acq\.cond #\d+, r3, r26", b) for b in window)
+
+
+def test_levels_merge_consecutive_cycles_and_split_gaps():
+    ev = [{"name": "LOCK_STALL", "ts": t, "soc": t} for t in (5, 6, 9, 20, 21, 22)]
+    assert g.levels(ev, "LOCK_STALL", "ts") == [(5, 6), (9, 9), (20, 22)]
+
+
+def test_silicon_is_read_in_ts_and_the_emulator_in_soc():
+    # silicon writes idle cycles between frames, the emulator the elapsed cycles: only
+    # `ts` is exact for the first, only `soc` for the second
+    assert g.TRUE_CYCLE == {"hw": "ts", "emu": "soc"}
