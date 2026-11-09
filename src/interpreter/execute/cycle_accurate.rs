@@ -91,6 +91,11 @@ struct PendingLockRequests {
     resolve_at: u64,
     /// The cycle the held bundle first tried to issue, once an acquire refused it.
     held_since: Option<u64>,
+    /// How many of `reqs`, from the front, have raised their INSTR_LOCK_*_REQ event. Silicon
+    /// raises it the cycle after the request issues, granted or refused
+    /// (`tools/gen_lock_pulse_probe.py`: REQ at c+1, a core held across the trace start has
+    /// none for its acquire).
+    reported: usize,
 }
 
 impl CycleAccurateExecutor {
@@ -124,6 +129,20 @@ impl CycleAccurateExecutor {
             .and_then(|p| p.reqs.first())
             .filter(|req| ControlUnit::request_blocked(req, tile, neighbor_locks))
             .map(|req| req.raw_lock_id)
+    }
+
+    /// Raise INSTR_LOCK_ACQUIRE_REQ / INSTR_LOCK_RELEASE_REQ for the requests that issued in
+    /// an earlier step and have not raised theirs. The event carries the PC of the request;
+    /// the trace unit's mode-1 PC is the fetch PC, which `crate::trace` derives from it.
+    fn report_lock_requests(&mut self, ctx: &mut ExecutionContext) {
+        let Some(p) = self.pending_lock.as_mut() else {
+            return;
+        };
+        let cycle = ctx.cycles;
+        for req in p.reqs.iter().skip(p.reported) {
+            ControlUnit::record_request_event(ctx, req, cycle);
+        }
+        p.reported = p.reqs.len();
     }
 
     /// PC of the oldest lock request in flight, if any (while the core is held on an
@@ -673,6 +692,9 @@ impl CycleAccurateExecutor {
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
 
+        // The cycle after a lock request issued, its REQ event
+        self.report_lock_requests(ctx);
+
         // Phase 1: No scoreboard stalls
         //
         // AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard.
@@ -781,7 +803,7 @@ impl CycleAccurateExecutor {
                 while let Some(req) = p.reqs.first() {
                     last_pc = req.pc;
                     if let ExecuteResult::WaitLock { raw_lock_id } =
-                        ControlUnit::perform_lock_request(req, ctx, tile, neighbor_locks, pc)
+                        ControlUnit::perform_lock_request(req, ctx, tile, neighbor_locks)
                     {
                         let stall_cycle = ctx.cycles;
                         p.held_since.get_or_insert(stall_cycle);
@@ -981,6 +1003,7 @@ impl CycleAccurateExecutor {
                                         + 1
                                         + xdna_archspec::aie2::locks::CORE_REQUEST_BUNDLES_IN_FLIGHT,
                                     held_since: None,
+                                    reported: 0,
                                 })
                             }
                         }
@@ -1084,9 +1107,13 @@ impl CycleAccurateExecutor {
                 // A lock request still in flight completes as the pipeline drains (a
                 // release just before `done`); an acquire that cannot be granted is
                 // dropped with the core.
-                for req in self.pending_lock.take().into_iter().flat_map(|p| p.reqs) {
+                let reported = self.pending_lock.as_ref().map_or(0, |p| p.reported);
+                for (i, req) in self.pending_lock.take().into_iter().flat_map(|p| p.reqs).enumerate() {
+                    if i >= reported {
+                        ControlUnit::record_request_event(ctx, &req, start_cycle);
+                    }
                     if let ExecuteResult::WaitLock { raw_lock_id } =
-                        ControlUnit::perform_lock_request(&req, ctx, tile, neighbor_locks, pc)
+                        ControlUnit::perform_lock_request(&req, ctx, tile, neighbor_locks)
                     {
                         log::warn!(
                             "core halted with an acquire of raw lock {raw_lock_id} in flight; dropped"
@@ -2095,6 +2122,59 @@ mod tests {
         );
         tile.locks[5].value = 1;
         assert_eq!(executor.held_lock_acquire(&tile, None), None);
+    }
+
+    /// The cycles at which INSTR_LOCK_ACQUIRE_REQ / INSTR_LOCK_RELEASE_REQ were recorded.
+    fn request_event_cycles(ctx: &ExecutionContext) -> Vec<u64> {
+        ctx.timing_context()
+            .events
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event,
+                    EventType::InstrLockAcquireReq { .. } | EventType::InstrLockReleaseReq { .. }
+                )
+            })
+            .map(|e| e.cycle)
+            .collect()
+    }
+
+    // Silicon (build/experiments/trace-frame-pc, lock-pulse probe, 54 cases): a request issued
+    // in the bundle at cycle c raises its REQ event at c + 1, granted or refused, not when it
+    // completes (c + 4, or the end of a hold). A core held on an acquire across the trace
+    // start therefore has no REQ for it.
+    #[test]
+    fn a_lock_request_raises_its_req_event_the_cycle_after_it_issues() {
+        for (req, free) in
+            [(acquire_own_lock_5(), true), (release_own_lock_5(), true), (acquire_own_lock_5(), false)]
+        {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            ctx.timing_context_mut().enable_tracing();
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = u8::from(free);
+            let issue = ctx.cycles;
+            assert!(matches!(
+                executor.execute(&make_bundle(vec![req.clone()]), &mut ctx, &mut tile),
+                ExecuteResult::Continue
+            ));
+            assert!(request_event_cycles(&ctx).is_empty(), "not in the issuing step");
+            for _ in 0..3 {
+                executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile);
+            }
+            assert_eq!(request_event_cycles(&ctx), vec![issue + 1], "{req:?} free={free}");
+            // the held bundle and the grant raise nothing more
+            for _ in 0..6 {
+                if matches!(
+                    executor.execute(&make_bundle(vec![]), &mut ctx, &mut tile),
+                    ExecuteResult::WaitLock { .. }
+                ) {
+                    tile.locks[5].value = 1;
+                }
+            }
+            assert_eq!(request_event_cycles(&ctx).len(), 1, "{req:?} free={free}: one REQ per request");
+        }
     }
 
     // Silicon (build/experiments/lock-frozen, `frozen` family, ovf_rel / ovf_acq / unf_rel /

@@ -244,7 +244,8 @@ def build_case(case: Case, out: Path) -> None:
         "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"], cwd=d, log=d / "aiecc.log")
 
 
-def run_case(out: Path, name: str, tag: str, backend: str) -> bool:
+def run_case_raw(out: Path, name: str, tag: str, backend: str) -> bool:
+    """Run one built case to `TAG.BACKEND/trace_raw.bin`; no decoding."""
     d = out / name
     r = d / f"{tag}.{backend}"
     r.mkdir(parents=True, exist_ok=True)
@@ -274,6 +275,14 @@ def run_case(out: Path, name: str, tag: str, backend: str) -> bool:
     if p.returncode != 0:
         print(f"{name} {backend}: runner failed rc={p.returncode}")
         return False
+    return True
+
+
+def run_case(out: Path, name: str, tag: str, backend: str) -> bool:
+    if not run_case_raw(out, name, tag, backend):
+        return False
+    r = out / name / f"{tag}.{backend}"
+    d = out / name
     sh([sys.executable, str(REPO / "tools" / "parse-trace.py"), "--trace-bin", str(r / "trace_raw.bin"),
         "--xclbin-mlir", str(d / "input_with_addresses.mlir"),
         "--trace-mode", "event_time", "--out-events", str(r / "events.json")], log=r / "parse.log")

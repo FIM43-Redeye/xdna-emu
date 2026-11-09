@@ -249,8 +249,9 @@ impl ControlUnit {
                 let Some(req) = Self::lock_request(op, ctx) else {
                     return Some(ExecuteResult::Continue); // a skipped acq.cond / rel.cond
                 };
-                let pc = ctx.pc();
-                let result = Self::perform_lock_request(&req, ctx, tile, neighbor_locks, pc);
+                let cycle = ctx.cycles;
+                Self::record_request_event(ctx, &req, cycle);
+                let result = Self::perform_lock_request(&req, ctx, tile, neighbor_locks);
                 if matches!(result, ExecuteResult::Continue) {
                     Self::record_arbitration_pulse(ctx, req.pc);
                 }
@@ -552,15 +553,30 @@ impl ControlUnit {
             .record_event(cycle, crate::interpreter::state::EventType::LockStall { cycles: 1, pc: Some(pc) });
     }
 
+    /// INSTR_LOCK_ACQUIRE_REQ / INSTR_LOCK_RELEASE_REQ for `req` at `cycle`, with the PC of the
+    /// request. Raised once per request, the cycle after it issues, whether or not it is
+    /// granted (the executor that holds requests does that; `execute_slot` raises it with
+    /// its immediate request).
+    pub fn record_request_event(ctx: &mut ExecutionContext, req: &LockRequest, cycle: u64) {
+        let pc = req.pc;
+        let event = match req.kind {
+            LockRequestKind::Acquire { .. } => {
+                crate::interpreter::state::EventType::InstrLockAcquireReq { pc }
+            }
+            LockRequestKind::Release { .. } => {
+                crate::interpreter::state::EventType::InstrLockReleaseReq { pc }
+            }
+        };
+        ctx.timing_context_mut().record_event(cycle, event);
+    }
+
     /// Perform a lock request: `WaitLock` for a refused acquire (nothing changes),
-    /// else `Continue`. `stamp_pc` is the issue PC the trace controller sees when the
-    /// request completes (it stamps INSTR_LOCK_ACQUIRE_REQ with it).
+    /// else `Continue`.
     pub fn perform_lock_request(
         req: &LockRequest,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
         neighbor_locks: &mut NeighborLocks,
-        stamp_pc: u32,
     ) -> ExecuteResult {
         let raw_lock_id = req.raw_lock_id;
         let tile_col = tile.col;
@@ -587,16 +603,7 @@ impl ControlUnit {
                             lock.value,
                             is_own_tile
                         );
-                        // Trace event: INSTR_LOCK_ACQUIRE_REQ (hw_id 44), once per
-                        // acquire, when it completes (so a refused acquire's wait does
-                        // not inflate the count). HW stamps the frame with the issue PC
-                        // of that moment, the bundle the request held the core in front
-                        // of (add_one_using_dma: acq at 0x330, frame PC 0x33C).
                         let cycle = ctx.cycles;
-                        ctx.timing_context_mut().record_event(
-                            cycle,
-                            crate::interpreter::state::EventType::InstrLockAcquireReq { pc: stamp_pc },
-                        );
                         // Core-relay recorder (P6): own-tile acquires only; cross-tile
                         // acquires are not part of the through-core relay pattern.
                         if is_own_tile {
@@ -680,13 +687,6 @@ impl ControlUnit {
                         lock.value
                     );
                 }
-                // Trace: INSTR_LOCK_RELEASE_REQ (hw_id 45), once per release, at the
-                // release's own PC. The LOCK_STALL of the request's arbitration cycle is
-                // `record_arbitration_pulse`, once per window of requests.
-                let cycle = ctx.cycles;
-                let pc = req.pc;
-                ctx.timing_context_mut()
-                    .record_event(cycle, crate::interpreter::state::EventType::InstrLockReleaseReq { pc });
                 ExecuteResult::Continue
             }
         }

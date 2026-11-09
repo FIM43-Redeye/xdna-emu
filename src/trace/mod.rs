@@ -166,6 +166,42 @@ pub(crate) fn dma_level_active(event: &EventType) -> Option<bool> {
 /// (MemoryStall, LockStall, StreamStall), memory-module events (DMA, lock, port),
 /// branch events, and any other variant whose PC is either not meaningful or not
 /// directly available at notify time.
+/// Bundles the core's fetch stage runs ahead of the bundle executing in the cycle an
+/// INSTR_* event is stamped, for the PC a mode-1 frame carries. Silicon
+/// (`tools/gen_fetch_pc_probe.py`, 100+ sites in straight-line code): the PC of
+/// INSTR_EVENT_0/1, INSTR_CALL, INSTR_RETURN and INSTR_VECTOR is the third bundle after the
+/// issuing one; INSTR_LOCK_*_REQ (and INSTR_LOAD / INSTR_STORE) are stamped a cycle after
+/// issue, so theirs is the fourth. Near taken branches the lead is not constant (see
+/// docs/fidelity-gaps/trace-encoding.md); the walk here is sequential.
+pub(crate) const FETCH_LEAD_BUNDLES: u32 = 3;
+
+/// The fetch-stage PC a mode-1 frame carries for `event`, from the issue PC it records.
+/// Events other than the ones silicon has been measured for keep their issue PC.
+pub(crate) fn trace_pc(event: &EventType, program_mem: &[u8]) -> Option<u32> {
+    let pc = event_pc(event)?;
+    let lead = match event {
+        EventType::InstrEvent { .. } | EventType::InstrCall { .. } | EventType::InstrReturn { .. } => {
+            FETCH_LEAD_BUNDLES
+        }
+        EventType::InstrLockAcquireReq { .. } | EventType::InstrLockReleaseReq { .. } => {
+            FETCH_LEAD_BUNDLES + 1
+        }
+        _ => 0,
+    };
+    Some(bundles_after(program_mem, pc, lead))
+}
+
+/// The address `n` bundles after the one at `pc`, walking the program memory sequentially.
+fn bundles_after(program_mem: &[u8], mut pc: u32, n: u32) -> u32 {
+    for _ in 0..n {
+        let Some(bytes) = program_mem.get(pc as usize..) else {
+            break;
+        };
+        pc += crate::interpreter::bundle::detect_format(bytes).size_bytes() as u32;
+    }
+    pc
+}
+
 pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
     match event {
         EventType::InstrVector { pc }
@@ -986,6 +1022,26 @@ mod tests {
         // Pulse / non-level events return None (routed via core_event_to_hw_id).
         assert_eq!(core_level_edge(&EventType::InstrLoad { pc: 0 }), None);
         assert_eq!(core_level_edge(&EventType::MemoryStall { cycles: 1, pc: None }), None);
+    }
+
+    // Silicon (tools/gen_fetch_pc_probe.py, straight-line code): a mode-1 frame carries the
+    // fetch PC, three bundles after the bundle that raised INSTR_EVENT / CALL / RETURN and four
+    // after a lock request (its event is a cycle later).
+    #[test]
+    fn mode_1_pc_is_the_fetch_pc_a_fixed_number_of_bundles_ahead() {
+        let mut mem = vec![0u8; 0x200];
+        let nop = |n: u32| 0x100 + 2 * n;
+        for i in 0..8usize {
+            mem[0x100 + 2 * i..0x102 + 2 * i].copy_from_slice(&[0x01, 0x00]);
+        }
+        assert_eq!(trace_pc(&EventType::InstrEvent { pc: nop(0), id: 0 }, &mem), Some(nop(3)));
+        assert_eq!(trace_pc(&EventType::InstrCall { pc: nop(0) }, &mem), Some(nop(3)));
+        assert_eq!(trace_pc(&EventType::InstrReturn { pc: nop(1) }, &mem), Some(nop(4)));
+        assert_eq!(trace_pc(&EventType::InstrLockAcquireReq { pc: nop(0) }, &mem), Some(nop(4)));
+        assert_eq!(trace_pc(&EventType::InstrLockReleaseReq { pc: nop(2) }, &mem), Some(nop(6)));
+        // not measured: the issue PC
+        assert_eq!(trace_pc(&EventType::InstrStreamGet { pc: nop(0) }, &mem), Some(nop(0)));
+        assert_eq!(trace_pc(&EventType::CoreActive, &mem), None);
     }
 
     #[test]

@@ -1171,7 +1171,10 @@ impl InterpreterEngine {
                         if let Some((hw_id, active)) = crate::trace::core_level_edge(&evt.event) {
                             tile.notify_core_trace_level(hw_id, cycle, active);
                         } else if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                            let pc = crate::trace::event_pc(&evt.event);
+                            let pc = match tile.program_memory() {
+                                Some(mem) => crate::trace::trace_pc(&evt.event, mem),
+                                None => crate::trace::event_pc(&evt.event),
+                            };
                             tile.notify_core_trace_event(hw_id, cycle, pc);
                         }
                     }
