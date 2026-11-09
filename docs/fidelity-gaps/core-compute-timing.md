@@ -170,6 +170,52 @@ State the model does not reach (each reproduced on silicon, deterministic, not m
 - Where the comparator is armed from reset is not pinned: the model arms it on a change of LE.
 - Bundles that straddle a line boundary are treated as belonging to the line they start in.
 
+## Taken branches cost no extra cycles; the "0..7 stall" was line re-execution (silicon 2026-11-09, EMU already agrees)
+
+`trace-encoding.md` recorded that the same 45-bundle `br_j` sites cost 0..7 extra cycles between
+consecutive events, cycling with the site's alignment, and concluded that the front end stalls on a
+taken branch. Counter reads (`mov r17:r16, cntr`) around the branch show no stall:
+
+- `tools/gen_branch_stall_probe.py` brackets a `j`, a taken or not-taken `jnz`, or a `jl` + `ret`
+  with two counter reads and compares the cycles to the number of bundles actually issued (derived
+  from the linked ELF's disassembly, target addresses truncated to their 16-byte line). 70 sites on
+  silicon: `extra = 0` at every alignment of the branch against the fetch lines (lead 0..7, read to
+  branch 0..4 bundles), every distance past the target (0..47 bundles), with 2-byte, 6-byte and
+  16-byte bundles around it and in the five delay slots. The emulator's counter deltas are
+  identical to silicon's on all of them (`build/experiments/front-end/b1`, tags `h*.hw` / `e*.emu`),
+  because it charges no branch penalty (the delay slots are the cost, `cycle_accurate.rs`).
+- The 45..52 gaps are real cycles but not stalls: a taken branch resumes at the *start of the line*
+  holding the target, so the bundles before the label in that line run again, 0..7 two-byte nops
+  depending on where the label sits. The `event #0` / counter-read bundle is 4 bytes, so every site
+  shifts the following code by 2 bytes and the count cycles with the site, exactly as measured. The
+  chained counter reads (`chain_j`) give 46, 49, 52, 48, 50, 45, 48 on silicon and in the emulator.
+- Two `jl` sites showed negative "extras": the return address's line start fell inside a 4-byte
+  bundle that straddles the line, so the return resumed in the middle of a bundle (silicon runs
+  whatever that decodes to, the emulator stops with an unknown instruction). Not a timing effect;
+  the probe now keeps to `jl` placements where no bundle straddles that line.
+
+So there is no taken-branch fetch stall to model. Cycle counts did not move.
+
+### Mode-1 (EventPc) PC around branches: still open
+
+The PC carried by a mode-1 frame is **not** a fetch-line quantity. Straight-line code
+(`gen_fetch_pc_probe.py scan`, `scan_wide`, `scan_mid`; PC minus the event bundle's address):
+
+| bundles around the event | PC lead in bytes | in bundles |
+|---|---|---|
+| 2-byte nops | 8 (10 when the event bundle's line offset is 0 or 4) | 4 |
+| 6-byte bundles | 12..16 | ~2.7 |
+| 16-byte bundles | 22..36 (36 for most) | ~2.3 |
+
+so it is neither a fixed byte count nor a fixed bundle count, and it moves with the event's offset
+in its line. Around a taken `j` the PC minus the issue address in bytes is 8, 20, 10, 20, 26 for the
+events 5..1 bundles before it, 12 and 18 in the first two delay slots (both in the skipped
+fall-through code), and 32 in delay slots 3..5 (at the target), with the PC one or two lines beyond
+the issue line (not the four a line-granular fetch pointer would give). A fetch-stage pointer
+(`state/fetch.rs`) does not produce this; the mechanism (a decode-stage pointer whose lead depends on
+bundle sizes and on the redirect timing) is not settled by these data, so `trace_pc` keeps its
+sequential walk and the `br_j` / `br_jl` rows stay OPEN.
+
 ## Scalar write-port collisions: a delayed write dropped or ORed (FIXED, NPU1 silicon 2026-11-03)
 
 `mov.dN dst, src` (N = 1..6) writes `dst` N+1 cycles after issue, from the source read at issue

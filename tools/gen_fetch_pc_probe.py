@@ -160,6 +160,15 @@ def cases() -> dict[str, FetchCase]:
         scan += [*site(f"site_s{k:02d}", "event #0"), *nops(1 + (k * 3) % 7)]
     add(FetchCase("scan", [*pad(), *scan, *pad()],
                   sites=[("INSTR_EVENT_0", f"site_s{k:02d}") for k in range(40)]))
+    # the same, between bundles of other sizes: is the lead a number of bundles or of bytes?
+    wide = ["  nopa ; nopb ; nops ; nopxm ; nopv"]
+    mid = ["  nopb ; mov r8, #5"]
+    for tag, filler in (("wide", wide), ("mid", mid)):
+        sc = []
+        for k in range(24):
+            sc += [*site(f"site_s{k:02d}", "event #0"), *(filler * (1 + (k * 3) % 5)), *nops(k % 3)]
+        add(FetchCase(f"scan_{tag}", [*pad(), *sc, *pad()],
+                      sites=[("INSTR_EVENT_0", f"site_s{k:02d}") for k in range(24)]))
     for kind in ("j", "jl"):
         body, sites, callees = branch_variants(kind)
         add(FetchCase(f"br_{kind}", body, sites=sites, funcs=callees))
