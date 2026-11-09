@@ -840,6 +840,15 @@ impl InterpreterEngine {
                     continue;
                 }
 
+                // `MOV_CNTR` reads the core module timer (silicon: a host `Timer_Control`
+                // reset moves what a running core reads, launch probe): keep the counter base
+                // on the timer, which only differs from the engine count once something
+                // resets or writes it.
+                if let Some(timer) = self.device.tile(col, row).map(|t| t.core_timer.value()) {
+                    let ctx = &mut self.cores[idx].context;
+                    ctx.cycle_counter_base = timer.wrapping_sub(ctx.cycles);
+                }
+
                 // Phase D (core): this core lost a bank it needs, so its
                 // bundle does NOT commit this cycle. `stall_for_bank` already
                 // charged the one-cycle stall during arbitration; calling
@@ -5382,6 +5391,34 @@ mod tests {
         assert!(engine.is_core_enabled(1, 3));
         assert_eq!(engine.core_context(1, 3).unwrap().cycle_counter_base, CORE_RELEASE_SPACING_CYCLES);
         assert_eq!(engine.core_context(1, 2).unwrap().cycle_counter_base, 0);
+    }
+
+    /// `MOV_CNTR` reads the core module timer, so a host reset of that timer
+    /// (`Timer_Control.Reset`) moves what a running core reads: silicon, launch probe
+    /// (`tools/gen_launch_probe.py`), where a spinning core sees its stamp run backwards
+    /// at the runtime sequence's reset write.
+    #[test]
+    fn cycle_counter_follows_a_reset_of_the_core_timer() {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &[0; 256]);
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x1);
+        for _ in 0..100 {
+            engine.step();
+        }
+        let read = |e: &InterpreterEngine| {
+            let ctx = e.core_context(1, 2).unwrap();
+            ctx.cycle_counter_base.wrapping_add(ctx.cycles)
+        };
+        let timer = |e: &mut InterpreterEngine| e.device_mut().tile_mut(1, 2).unwrap().core_timer.value();
+        assert_eq!(read(&engine), timer(&mut engine));
+        assert!(read(&engine) >= 100);
+        engine.device_mut().write_tile_register(1, 2, 0x34000, 0x8000_0000);
+        for _ in 0..10 {
+            engine.step();
+        }
+        assert_eq!(timer(&mut engine), 10);
+        assert_eq!(read(&engine), 10);
     }
 
     #[test]
