@@ -1134,3 +1134,29 @@ fn test_ctrl_packet_read_performs_lock_request() {
     assert_eq!(response[1], 1, "request granted");
     assert_eq!(array.tile(col, row).locks[5].value, 39);
 }
+
+/// A control-packet read of a DMA channel status register returns the live channel state, as
+/// a register-bus read does (silicon, lock-leftovers: the host read the memtile and shim
+/// channel status over control packets and saw Running, Stalled_Lock_Acq and Cur_BD).
+#[test]
+fn test_ctrl_packet_read_of_a_dma_status_register_returns_the_channel_status() {
+    use crate::device::regdb::device_reg_layout;
+    let layout = device_reg_layout();
+    for (row, status_offset, channel) in
+        [(0u8, layout.shim_status_base + 4 * 2, 2u8), (1u8, layout.memtile_status_mm2s_base, 6u8)]
+    {
+        let mut array = TileArray::npu1();
+        let col = 1u8;
+        // A task on an unconfigured BD: Error_BD_Invalid is set in the channel status.
+        array.dma_engine_mut(col, row).unwrap().enqueue_task(channel, 3, 0, false);
+        let live = array.dma_engine(col, row).unwrap().get_channel_status(channel);
+        assert_ne!(live, 0, "row {row}: the channel has a visible status");
+        assert!(array.handle_read_registers(col, row, status_offset, 1, 0));
+        array.drain_ctrl_responses();
+        let ctrl_idx = array.tile(col, row).stream_switch.tile_ctrl_slave_port().unwrap();
+        let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_idx).unwrap();
+        slave.pop_with_tlast().unwrap();
+        let (data, _) = slave.pop_with_tlast().unwrap();
+        assert_eq!(data, live, "row {row}");
+    }
+}

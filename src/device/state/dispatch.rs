@@ -53,32 +53,13 @@ impl DeviceState {
         if row == 0 && offset == crate::device::clock_control::COLUMN_CLOCK_CONTROL_OFFSET {
             return self.array.clock().read_register(col, row, offset).unwrap_or(0);
         }
-        if let Some(status) = self.dma_channel_status(col, row, offset) {
+        if let Some(status) = self.array.dma_channel_status(col, row, offset) {
             return status;
         }
         match self.array.get_mut(col, row) {
             Some(tile) => tile.read_register(offset),
             None => 0,
         }
-    }
-
-    /// A read of a DMA channel status register (DMA_S2MM_Status_n /
-    /// DMA_MM2S_Status_n): the live channel state, task-queue size included,
-    /// which a controller polls before pushing a task onto a full queue.
-    fn dma_channel_status(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
-        let layout = regdb::device_reg_layout();
-        let dma = self.array.dma_engine(col, row)?;
-        let (s2mm, mm2s) = (dma.s2mm_channel_count() as u32, dma.mm2s_channel_count() as u32);
-        let word = |base: u32, count: u32| {
-            (offset >= base && offset < base + count * 4 && offset % 4 == 0).then(|| (offset - base) / 4)
-        };
-        let channel = match tile_kind_from_row(row) {
-            TileKind::Compute => word(layout.memory_status_base, s2mm + mm2s),
-            TileKind::ShimNoc | TileKind::ShimPl => word(layout.shim_status_base, s2mm + mm2s),
-            TileKind::Mem => word(layout.memtile_status_s2mm_base, s2mm)
-                .or_else(|| word(layout.memtile_status_mm2s_base, mm2s).map(|index| s2mm + index)),
-        }?;
-        Some(dma.get_channel_status(channel as u8))
     }
 
     /// Internal register bus dispatch. Decodes an encoded tile address and

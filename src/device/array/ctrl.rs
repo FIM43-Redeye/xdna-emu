@@ -94,6 +94,29 @@ impl TileArray {
     /// space permits (same backpressure-aware pattern as trace injection).
     ///
     /// Returns true if the response was successfully queued.
+    /// A read of a DMA channel status register (DMA_S2MM_Status_n /
+    /// DMA_MM2S_Status_n): the live channel state, task-queue size included,
+    /// which a controller polls before pushing a task onto a full queue.
+    /// `None` when `offset` is not one. Both the register bus and control-packet
+    /// reads answer these from the DMA engine.
+    pub fn dma_channel_status(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
+        use crate::device::regdb;
+        use xdna_archspec::types::TileKind;
+        let layout = regdb::device_reg_layout();
+        let dma = self.dma_engine(col, row)?;
+        let (s2mm, mm2s) = (dma.s2mm_channel_count() as u32, dma.mm2s_channel_count() as u32);
+        let word = |base: u32, count: u32| {
+            (offset >= base && offset < base + count * 4 && offset % 4 == 0).then(|| (offset - base) / 4)
+        };
+        let channel = match self.arch().tile_kind(col, row) {
+            TileKind::Compute => word(layout.memory_status_base, s2mm + mm2s),
+            TileKind::ShimNoc | TileKind::ShimPl => word(layout.shim_status_base, s2mm + mm2s),
+            TileKind::Mem => word(layout.memtile_status_s2mm_base, s2mm)
+                .or_else(|| word(layout.memtile_status_mm2s_base, mm2s).map(|index| s2mm + index)),
+        }?;
+        Some(dma.get_channel_status(channel as u8))
+    }
+
     pub fn handle_read_registers(
         &mut self,
         col: u8,
@@ -104,6 +127,9 @@ impl TileArray {
     ) -> bool {
         use crate::device::stream_switch::{PacketHeader, PacketType};
 
+        let statuses: Vec<Option<u32>> = (0..count as u32)
+            .map(|i| self.dma_channel_status(col, row, offset + i * 4))
+            .collect();
         let tile = match self.get_mut(col, row) {
             Some(t) => t,
             None => {
@@ -124,7 +150,10 @@ impl TileArray {
         // side effects.
         let mut values = Vec::with_capacity(count as usize);
         for i in 0..count as u32 {
-            values.push(tile.read_register_for_ctrl_packet(offset + i * 4));
+            values.push(match statuses[i as usize] {
+                Some(status) => status,
+                None => tile.read_register_for_ctrl_packet(offset + i * 4),
+            });
         }
 
         // Build stream packet header: pkt_id = response_id, type = Data,
