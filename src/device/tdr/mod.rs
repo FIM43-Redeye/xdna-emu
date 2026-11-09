@@ -95,6 +95,8 @@ pub struct ExecutorSignals {
     pub is_blocked_on_poll: bool,
     /// (col, row, channel, direction) for each pending sync.
     pub pending_syncs: Vec<(u8, u8, u8, u8)>,
+    /// What a blocked Start_Queue write is stuck on, if the executor is blocked on one.
+    pub blocked_write: Option<String>,
 }
 
 /// Per-context classifier composing the lifted Quiescence/Stall detectors
@@ -297,6 +299,7 @@ impl TdrDetector {
                         .collect()
                 })
                 .unwrap_or_default(),
+            blocked_writes: executor.and_then(|e| e.blocked_write.clone()).into_iter().collect(),
         }
     }
 }
@@ -328,6 +331,7 @@ mod tests {
             dma_states: vec![],
             data_in_flight: false,
             pending_syncs: vec![],
+            blocked_writes: vec![],
         };
         let v = TdrVerdict::Wedged { reason: WedgeReason::Quiescent, diagnosis: diag };
         match v {
@@ -355,6 +359,7 @@ mod tests {
             syncs_satisfied: true,
             is_blocked_on_poll: false,
             pending_syncs: vec![],
+            blocked_write: None,
         }
     }
 
@@ -408,6 +413,7 @@ mod tests {
             syncs_satisfied: false,
             is_blocked_on_poll: false,
             pending_syncs: vec![(1, 0, 0, 0)],
+            blocked_write: None,
         };
         let mut carried = TdrDetector::new(DEFAULT_CONTEXT);
         let mut fresh = TdrDetector::new(DEFAULT_CONTEXT);
@@ -427,6 +433,7 @@ mod tests {
             syncs_satisfied: false,
             is_blocked_on_poll: true,
             pending_syncs: vec![],
+            blocked_write: None,
         }
     }
 
@@ -509,6 +516,7 @@ mod tests {
             syncs_satisfied: false,
             is_blocked_on_poll: false,
             pending_syncs: vec![(0, 0, 0, 0)],
+            blocked_write: None,
         };
         // StallDetector fires after DEFAULT_STALL_CYCLES of no byte/lock progress.
         let mut fired = false;
@@ -584,6 +592,7 @@ mod tests {
             syncs_satisfied: false,
             is_blocked_on_poll: false,
             pending_syncs: vec![(0, 0, 0, 0)], // satisfies stall precondition too
+            blocked_write: None,
         };
         // Burn enough cycles for quiescence threshold to fire.
         let mut fired_as = None;

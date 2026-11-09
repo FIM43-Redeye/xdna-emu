@@ -73,6 +73,9 @@ pub struct DeviceRegLayout {
     pub memory_channel_stride: u32,
     /// DMA channel status base address (memory module)
     pub memory_status_base: u32,
+    /// MM2S status base (memory module): the MM2S status registers sit past a gap after the
+    /// S2MM ones, so they are not contiguous with `memory_status_base`.
+    pub memory_status_mm2s_base: u32,
 
     // -- MemTile lock layout (derived from Lock0_value, Lock1_value) --
     /// Lock register base offset (memory tile)
@@ -236,6 +239,7 @@ impl DeviceRegLayout {
         let memory_channel_base = reg_offset("memory", "DMA_S2MM_0_Ctrl")?;
         let memory_channel_stride = reg_offset("memory", "DMA_S2MM_1_Ctrl")? - memory_channel_base;
         let memory_status_base = reg_offset("memory", "DMA_S2MM_Status_0")?;
+        let memory_status_mm2s_base = reg_offset("memory", "DMA_MM2S_Status_0")?;
 
         // -- MemTile locks --
         let memtile_lock_base = reg_offset("memory_tile", "Lock0_value")?;
@@ -363,6 +367,7 @@ impl DeviceRegLayout {
             memory_channel_base,
             memory_channel_stride,
             memory_status_base,
+            memory_status_mm2s_base,
             memtile_lock_base,
             memtile_lock_stride,
             memtile_locks_overflow_0,

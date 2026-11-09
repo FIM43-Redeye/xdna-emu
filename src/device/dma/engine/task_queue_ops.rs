@@ -34,19 +34,25 @@ impl DmaEngine {
             return false;
         }
 
-        let ch = &mut self.channels[ch_idx];
-
-        // Push to task queue (handles overflow flag internally)
-        let entry = TaskQueueEntry::new(start_bd, repeat_count, enable_token_issue);
-        if ch.task_queue.push(entry).is_err() {
+        // The channel holds `staged_task_slots` tasks of its own before the 4-deep queue
+        // starts to fill (silicon, shim-queue probes); past both, a push finds no room.
+        if !self.task_queue_has_space(channel) {
+            let ch = &mut self.channels[ch_idx];
+            ch.task_queue.flag_overflow();
             log::trace!(
-                "DMA tile({},{}) ch{} task queue full (BD {} rejected, queue_len={})",
+                "DMA tile({},{}) ch{} task queue full (BD {} rejected, waiting={})",
                 self.col,
                 self.row,
                 channel,
                 start_bd,
                 ch.task_queue.len()
             );
+            return false;
+        }
+
+        let ch = &mut self.channels[ch_idx];
+        let entry = TaskQueueEntry::new(start_bd, repeat_count, enable_token_issue);
+        if ch.task_queue.push(entry).is_err() {
             return false;
         }
 
@@ -153,12 +159,57 @@ impl DmaEngine {
             .unwrap_or(0)
     }
 
-    /// Get the current task queue size for a channel.
-    pub fn task_queue_size(&self, channel: u8) -> usize {
+    /// Tasks waiting behind the one the channel is executing (staged plus queued).
+    pub fn pending_tasks(&self, channel: u8) -> usize {
         if !self.dma_model.supports_task_queue() {
             return 0;
         }
         self.channels.get(channel as usize).map(|ch| ch.task_queue.len()).unwrap_or(0)
+    }
+
+    /// `Task_Queue_Size` as the status register reports it: the waiting tasks the channel's
+    /// staging has no room for.
+    pub fn task_queue_size(&self, channel: u8) -> usize {
+        self.pending_tasks(channel).saturating_sub(self.staged_task_slots(channel))
+    }
+
+    /// Tasks a channel holds past the one executing before `Task_Queue_Size` starts counting.
+    ///
+    /// Silicon (Phoenix, shim-queue probes, every channel kind: one task parked on a lock
+    /// acquire or a starved stream, N more pushed, the status read after each):
+    /// - head parked on a lock acquire: 2 staged tasks on every tile kind (the first reads
+    ///   Cur_BD = its BD, the next two follow in Cur_BD; the queue counts from the fourth push);
+    /// - head parked on its stream (S2MM starved): 4 on a compute tile or memtile, 6 on a shim.
+    /// The queue behind the staging is 4 deep (aie-rt StartQSizeMax) in every case: a push that
+    /// finds `staged + 4` tasks waiting blocks its writer.
+    pub fn staged_task_slots(&self, channel: u8) -> usize {
+        let Some(ch) = self.channels.get(channel as usize) else {
+            return 0;
+        };
+        if matches!(ch.fsm, ChannelFsm::AcquiringLock { acquired: false, .. }) {
+            2
+        } else if self.tile_kind.is_shim() {
+            6
+        } else {
+            4
+        }
+    }
+
+    /// Whether a Start_Queue write would be accepted now (otherwise the writer blocks).
+    pub fn task_queue_has_space(&self, channel: u8) -> bool {
+        self.pending_tasks(channel) < self.staged_task_slots(channel) + MAX_TASK_QUEUE_DEPTH
+    }
+
+    /// The BD `Cur_BD` names while tasks wait: the last one the channel's staging has taken.
+    pub(super) fn staged_cur_bd(&self, channel: u8) -> Option<u8> {
+        let ch = self.channels.get(channel as usize)?;
+        let staged = self.pending_tasks(channel).min(self.staged_task_slots(channel));
+        ch.task_queue.iter().nth(staged.checked_sub(1)?).map(|t| t.start_bd)
+    }
+
+    /// Whether the channel's staging is full (the status `Status` field reads STARTING).
+    pub fn staging_full(&self, channel: u8) -> bool {
+        self.pending_tasks(channel) > 0 && self.pending_tasks(channel) >= self.staged_task_slots(channel)
     }
 
     /// Pending task-queue BD ids in hardware FIFO order.

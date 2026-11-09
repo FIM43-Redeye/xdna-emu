@@ -627,6 +627,7 @@ fn build_executor_signals(
             .iter()
             .map(|s| (s.column, s.row, s.channel, s.direction))
             .collect(),
+        blocked_write: executor.blocked_write_description(engine.device()),
     }
 }
 

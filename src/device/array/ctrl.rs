@@ -109,7 +109,8 @@ impl TileArray {
             (offset >= base && offset < base + count * 4 && offset % 4 == 0).then(|| (offset - base) / 4)
         };
         let channel = match self.arch().tile_kind(col, row) {
-            TileKind::Compute => word(layout.memory_status_base, s2mm + mm2s),
+            TileKind::Compute => word(layout.memory_status_base, s2mm)
+                .or_else(|| word(layout.memory_status_mm2s_base, mm2s).map(|index| s2mm + index)),
             TileKind::ShimNoc | TileKind::ShimPl => word(layout.shim_status_base, s2mm + mm2s),
             TileKind::Mem => word(layout.memtile_status_s2mm_base, s2mm)
                 .or_else(|| word(layout.memtile_status_mm2s_base, mm2s).map(|index| s2mm + index)),

@@ -1142,9 +1142,11 @@ fn test_ctrl_packet_read_performs_lock_request() {
 fn test_ctrl_packet_read_of_a_dma_status_register_returns_the_channel_status() {
     use crate::device::regdb::device_reg_layout;
     let layout = device_reg_layout();
-    for (row, status_offset, channel) in
-        [(0u8, layout.shim_status_base + 4 * 2, 2u8), (1u8, layout.memtile_status_mm2s_base, 6u8)]
-    {
+    for (row, status_offset, channel) in [
+        (0u8, layout.shim_status_base + 4 * 2, 2u8),
+        (1u8, layout.memtile_status_mm2s_base, 6u8),
+        (2u8, layout.memory_status_mm2s_base, 2u8),
+    ] {
         let mut array = TileArray::npu1();
         let col = 1u8;
         // A task on an unconfigured BD: Error_BD_Invalid is set in the channel status.

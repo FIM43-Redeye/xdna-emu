@@ -34,6 +34,9 @@ pub struct TdrDiagnosis {
     pub data_in_flight: bool,
     /// Unsatisfied pending sync descriptions.
     pub pending_syncs: Vec<String>,
+    /// The NPU instruction stream's blocked register write, if it is stuck on one
+    /// (a Start_Queue push into a full task queue).
+    pub blocked_writes: Vec<String>,
 }
 
 impl fmt::Display for TdrDiagnosis {
@@ -75,6 +78,10 @@ impl fmt::Display for TdrDiagnosis {
                 }
                 write!(f, "{}", sync)?;
             }
+        }
+
+        for blocked in &self.blocked_writes {
+            write!(f, "; {}", blocked)?;
         }
 
         Ok(())
@@ -237,11 +244,17 @@ impl QuiescenceDetector {
             Vec::new()
         };
 
+        let blocked_writes = npu_executor
+            .and_then(|e| e.blocked_write_description(device))
+            .into_iter()
+            .collect();
+
         TdrDiagnosis {
             core_states,
             dma_states,
             data_in_flight: device.array.any_data_in_flight(),
             pending_syncs,
+            blocked_writes,
         }
     }
 }
@@ -430,6 +443,7 @@ mod tests {
             dma_states: vec![],
             data_in_flight: false,
             pending_syncs: vec!["col=0 row=0 ch=0 S2MM".to_string()],
+            blocked_writes: vec![],
         };
         let s = diag.to_string();
         assert!(s.contains("all cores halted"), "got: {}", s);
@@ -444,6 +458,7 @@ mod tests {
             dma_states: vec![(0, 2, 0, "WaitingForLock(5)".to_string())],
             data_in_flight: false,
             pending_syncs: vec![],
+            blocked_writes: vec![],
         };
         let s = diag.to_string();
         assert!(s.contains("core(0,2) WaitingLock(5)"), "got: {}", s);

@@ -345,7 +345,8 @@ pub struct ChannelContext {
     /// Repeat count for current task.
     pub repeat_count: u32,
 
-    /// Task queue (4-deep FIFO; aie-rt XAIE_DMA_MAX_QUEUE_SIZE, see token.rs).
+    /// Tasks waiting behind the one executing: the channel's staged tasks, then the 4-deep
+    /// queue (aie-rt XAIE_DMA_MAX_QUEUE_SIZE, see token.rs and `DmaEngine::staged_task_slots`).
     pub task_queue: TaskQueue,
 
     /// Per-task configuration (token issue, FoT mode, compression).
@@ -583,7 +584,7 @@ impl ChannelContext {
             chain_start_bd: None,
             queued_bd: None,
             repeat_count: 0,
-            task_queue: TaskQueue::new_default(),
+            task_queue: TaskQueue::new(super::MAX_TASK_QUEUE_DEPTH + super::MAX_STAGED_TASKS),
             task_config: ChannelTaskConfig::default(),
             error_bd_unavailable: false,
             error_event_reported: false,

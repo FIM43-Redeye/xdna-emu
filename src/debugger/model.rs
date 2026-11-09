@@ -296,7 +296,7 @@ pub fn tile_snapshot(engine: &InterpreterEngine, col: u8, row: u8) -> Option<Til
                 state: format!("{:?}", eng.channel_state(ch)),
                 current_bd: eng.current_bd(ch),
                 queued_bd: eng.queued_bd(ch),
-                queue_len: eng.task_queue_size(ch),
+                queue_len: eng.pending_tasks(ch),
                 progress: eng.get_transfer(ch).map_or(0.0, |transfer| transfer.progress()),
                 phase: eng.channel_phase(ch),
                 stall: eng.channel_stall_reason(ch),

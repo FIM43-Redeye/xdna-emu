@@ -825,6 +825,7 @@ fn device_state_reset_context_transitions_failed_to_connected() {
         dma_states: vec![],
         data_in_flight: false,
         pending_syncs: vec![],
+        blocked_writes: vec![],
     };
     state.contexts[0].mark_failed(WedgeReason::Quiescent, diag);
     assert!(state.contexts[0].is_failed());
@@ -908,6 +909,7 @@ mod tier_c_integration {
             dma_states: vec![],
             data_in_flight: false,
             pending_syncs: vec![],
+            blocked_writes: vec![],
         };
         state.contexts[0].mark_failed(WedgeReason::Quiescent, diag);
         assert!(state.contexts[0].is_failed(), "context must be Failed after mark_failed");

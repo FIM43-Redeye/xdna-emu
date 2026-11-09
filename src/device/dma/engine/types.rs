@@ -138,7 +138,9 @@ pub struct ChannelTaskConfig {
 
 // Task queue entry and token types are now in super::token.
 // Re-export for backward compatibility.
-pub use super::super::token::{TaskQueueEntry, TaskQueue, Token, TokenState, MAX_TASK_QUEUE_DEPTH};
+pub use super::super::token::{
+    TaskQueueEntry, TaskQueue, Token, TokenState, MAX_STAGED_TASKS, MAX_TASK_QUEUE_DEPTH,
+};
 
 /// Transfer operation result (internal).
 #[derive(Debug, Clone, Copy)]

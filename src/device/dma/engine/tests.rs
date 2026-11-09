@@ -1087,7 +1087,8 @@ fn test_task_queue_enqueue() {
 
     // Enqueue second task - should be queued (channel is busy)
     assert!(engine.enqueue_task(2, 1, 0, true));
-    assert_eq!(engine.task_queue_size(2), 1);
+    assert_eq!(engine.pending_tasks(2), 1);
+    assert_eq!(engine.task_queue_size(2), 0, "one waiting task sits in the channel's staging");
 }
 
 #[test]
@@ -1098,8 +1099,8 @@ fn test_task_queue_overflow() {
     // First task starts immediately
     assert!(engine.enqueue_task(2, 0, 0, false));
 
-    // Fill the queue to its hardware depth
-    for i in 0..MAX_TASK_QUEUE_DEPTH {
+    // Fill the channel's staging and its 4-deep queue (a running head stages four tasks)
+    for i in 0..(engine.staged_task_slots(2) + MAX_TASK_QUEUE_DEPTH) {
         assert!(engine.enqueue_task(2, 0, 0, false), "Task {} should enqueue", i);
     }
 
@@ -1121,10 +1122,11 @@ fn test_task_queue_status_register() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
 
-    // Enqueue some tasks (first starts, rest are queued)
-    engine.enqueue_task(2, 0, 0, false); // Starts immediately
-    engine.enqueue_task(2, 0, 0, false); // Queued
-    engine.enqueue_task(2, 0, 0, false); // Queued
+    // The first task starts; the channel stages four more before the queue counts, so
+    // two further pushes read as a queue of 2.
+    for _ in 0..7 {
+        assert!(engine.enqueue_task(2, 0, 0, false));
+    }
 
     let status = engine.get_channel_status(2);
 
@@ -4373,4 +4375,91 @@ fn unstarted_s2mm_channel_reads_as_unstarted_until_task_enqueued() {
     engine.configure_bd(0, BdConfig::simple_1d(0x1000, 256)).unwrap();
     engine.start_channel(0, 0).unwrap();
     assert!(engine.channel_is_started(0), "after configure + start (dispatch), the channel reads as started");
+}
+
+// === Task queue depth (silicon: shim-queue probes, Phoenix) ===
+//
+// One S2MM task parked, N more pushed with a status read after each: the channel stages some
+// tasks of its own before Task_Queue_Size counts, and the 4-deep queue sits behind that.
+
+/// Push `pushes` one-BD S2MM tasks on channel 0 (BD ids from 4); the first parks on a lock
+/// acquire (`gated`) or on its stream. Returns (Task_Queue_Size, Cur_BD, Status) after each push,
+/// then whether one more push would be accepted.
+fn push_sweep(
+    mut engine: DmaEngine,
+    mut tile: Tile,
+    gate_lock: u8,
+    gated: bool,
+    pushes: u32,
+) -> (Vec<(u32, u32, u32)>, bool) {
+    let layout = &crate::device::regdb::device_reg_layout().memory_status;
+    let mut host_mem = make_host_memory();
+    host_mem.allocate_region("bds".to_string(), 0x100, 0x1000).unwrap();
+    let mut seen = Vec::new();
+    for i in 0..pushes {
+        let bd = 4 + i as u8;
+        let mut cfg = BdConfig::simple_1d(0x100 + 0x40 * i as u64, 8);
+        if gated {
+            cfg = cfg.with_acquire(gate_lock, -1);
+        }
+        engine.configure_bd(bd, cfg).unwrap();
+        assert!(engine.enqueue_task(0, bd, 0, false), "push {} is accepted", i + 1);
+        run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 300);
+        let status = engine.get_channel_status(0);
+        seen.push((
+            layout.task_queue_size.extract(status),
+            layout.cur_bd.extract(status),
+            engine.staging_full(0) as u32,
+        ));
+    }
+    (seen, engine.task_queue_has_space(0))
+}
+
+#[test]
+fn a_channel_parked_on_a_lock_stages_two_tasks_then_queues_four_on_every_tile_kind() {
+    for (name, engine, tile, lock) in [
+        ("compute", DmaEngine::new_compute_tile(1, 2), make_tile(), 5u8),
+        ("memtile", DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 64 + 5),
+        ("shim", DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 5),
+    ] {
+        let (seen, space) = push_sweep(engine, tile, lock, true, 7);
+        let sizes: Vec<u32> = seen.iter().map(|s| s.0).collect();
+        let cur: Vec<u32> = seen.iter().map(|s| s.1).collect();
+        let full: Vec<u32> = seen.iter().map(|s| s.2).collect();
+        assert_eq!(sizes, [0, 0, 0, 1, 2, 3, 4], "{name}: Task_Queue_Size after each push");
+        assert_eq!(cur, [4, 5, 6, 6, 6, 6, 6], "{name}: Cur_BD follows the staged tasks");
+        assert_eq!(full, [0, 0, 1, 1, 1, 1, 1], "{name}: staging full from the third push");
+        assert!(!space, "{name}: the eighth push finds no room");
+    }
+}
+
+#[test]
+fn a_channel_parked_on_its_stream_stages_four_tasks_on_compute_and_memtile_and_six_on_a_shim() {
+    for (name, engine, tile, staged) in [
+        ("compute", DmaEngine::new_compute_tile(1, 2), make_tile(), 4u32),
+        ("memtile", DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 4),
+        ("shim", DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 6),
+    ] {
+        let total = staged + 1 + 4;
+        let (seen, space) = push_sweep(engine, tile, 0, false, total);
+        let sizes: Vec<u32> = seen.iter().map(|s| s.0).collect();
+        let expect: Vec<u32> = (1..=total).map(|n| (n + 1).saturating_sub(staged + 2)).collect();
+        assert_eq!(sizes, expect, "{name}: Task_Queue_Size after each push");
+        assert_eq!(*sizes.last().unwrap(), 4, "{name}: the queue is full on the last push");
+        assert_eq!(seen.last().unwrap().1, 4 + staged, "{name}: Cur_BD is the last staged task's BD");
+        assert!(!space, "{name}: the next push finds no room");
+    }
+}
+
+#[test]
+fn a_push_into_a_full_queue_is_refused_and_flags_the_overflow() {
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    engine
+        .configure_bd(4, BdConfig::simple_1d(0x100, 8).with_acquire(5, -1))
+        .unwrap();
+    for _ in 0..7 {
+        assert!(engine.enqueue_task(0, 4, 0, false));
+    }
+    assert!(!engine.enqueue_task(0, 4, 0, false));
+    assert!(engine.task_queue_overflow(0));
 }

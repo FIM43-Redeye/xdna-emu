@@ -317,6 +317,33 @@ impl NpuExecutor {
         &self.pending_syncs
     }
 
+    /// What the instruction stream is stuck on, when it is blocked on a Start_Queue write.
+    ///
+    /// A Start_Queue push into a full task queue blocks the writer (silicon, shim-queue probes).
+    /// When the write that would drain the queue sits behind the blocked push, nothing can make
+    /// progress: the emulator halts with this diagnosis (a deadlock) instead of spinning.
+    pub fn blocked_write_description(&self, device: &DeviceState) -> Option<String> {
+        let ExecutorState::BlockedOnQueue { col, row, channel, bd_id, .. } = self.state else {
+            return None;
+        };
+        let dma = device.array.dma_engine(col, row)?;
+        let s2mm = dma.s2mm_channel_count() as u8;
+        let (dir, ch) = if channel < s2mm {
+            ("S2MM", channel)
+        } else {
+            ("MM2S", channel - s2mm)
+        };
+        Some(format!(
+            "NPU instruction stream blocked on a Start_Queue write (BD {bd_id}) to tile ({col},{row}) {dir} ch{ch}: \
+             task queue full ({} waiting, {} of them staged, queue {}/{}); nothing else can drain it (deadlock: \
+             the push blocks the writer, and the writes behind it never run)",
+            dma.pending_tasks(channel),
+            dma.staged_task_slots(channel),
+            dma.task_queue_size(channel),
+            crate::device::dma::MAX_TASK_QUEUE_DEPTH,
+        ))
+    }
+
     /// Map a sync's (direction, channel) to absolute DMA channel index.
     fn sync_abs_channel(sync: &PendingSync, device: &DeviceState) -> u8 {
         // S2MM channels come first, then MM2S. The number of S2MM channels
@@ -386,7 +413,7 @@ impl NpuExecutor {
         // 2. Fast completion: channel finished before we first polled. No
         //    pending work AND at least one transfer retired (not initial idle).
         if let Some(stats) = dma.channel_stats(abs_channel) {
-            if stats.transfers_completed > 0 && dma.task_queue_size(abs_channel) == 0 {
+            if stats.transfers_completed > 0 && dma.pending_tasks(abs_channel) == 0 {
                 return SyncSignal::Fallback;
             }
         }
@@ -676,13 +703,11 @@ impl NpuExecutor {
                 enable_token,
                 ..
             } => {
-                use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
-
                 // Check if the queue has drained enough for our enqueue
                 let has_space = device
                     .array
                     .dma_engine(col, row)
-                    .map_or(true, |dma| dma.task_queue_size(channel) < MAX_TASK_QUEUE_DEPTH);
+                    .map_or(true, |dma| dma.task_queue_has_space(channel));
 
                 if has_space {
                     // Re-parse BD before snapshot (control packets may have deferred parsing)
@@ -1238,8 +1263,6 @@ impl NpuExecutor {
         value: u32,
         device: &DeviceState,
     ) -> bool {
-        use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
-
         let tile_kind = match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
             Some(tt) => tt,
             None => return false,
@@ -1306,7 +1329,7 @@ impl NpuExecutor {
         let queue_full = device
             .array
             .dma_engine(col, row)
-            .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
+            .map_or(false, |dma| !dma.task_queue_has_space(abs_channel));
 
         if queue_full {
             let bd_mask = match tile_kind {
@@ -2172,6 +2195,103 @@ mod tests {
         // executed while the poll is unsatisfied -- no OP_READ skip).
         let sentinel_val = device.tile_mut(1, 2).map(|t| t.read_register(sentinel_reg)).unwrap_or(0);
         assert_eq!(sentinel_val, 0, "sentinel Write32 must not execute while poll is unsatisfied");
+    }
+
+    // -----------------------------------------------------------------
+    // Start_Queue pushes into a full task queue (silicon: shim-queue probes)
+    // -----------------------------------------------------------------
+
+    /// A shim S2MM 0 on (1,0) whose first task parks on lock 5 (value 0), and a runtime sequence
+    /// that pushes `pushes` tasks and then opens the gate.
+    fn queue_push_sequence(pushes: u32) -> (NpuExecutor, DeviceState, HostMemory) {
+        use crate::device::BdConfig;
+        let mut device = DeviceState::new_npu1();
+        device.array.clock_mut().ungate_all();
+        let mut host_mem = HostMemory::new();
+        host_mem.allocate_region("bds".to_string(), 0x100, 0x1000).unwrap(); // a shim reads its BDs from here
+        let dma = device.array.dma_engine_mut(1, 0).unwrap();
+        for bd in 0..pushes as u8 {
+            dma.configure_bd(bd, BdConfig::simple_1d(0x100 + 0x40 * bd as u64, 8).with_acquire(5, -1))
+                .unwrap();
+        }
+        let reg = |offset: u32| offset; // column 0 of the NPU address is physical column 1
+        let mut stream = vec![];
+        for bd in 0..pushes {
+            stream.push(NpuInstruction::Write32 { reg_off: reg(shim_task_queue_offset(0)), value: bd });
+        }
+        let lock5 = 0x14000 + 5 * 0x10; // shim Lock<n>_value
+        stream.push(NpuInstruction::Write32 { reg_off: reg(lock5), value: 20 });
+        let mut executor = NpuExecutor::new();
+        executor.load_instructions(stream);
+        (executor, device, host_mem)
+    }
+
+    fn run_until_settled(
+        executor: &mut NpuExecutor,
+        device: &mut DeviceState,
+        host_mem: &mut HostMemory,
+    ) -> AdvanceResult {
+        let mut last = AdvanceResult::Progressed;
+        // the controller paces Start_Queue dispatches, so give it plenty of cycles
+        for _ in 0..200_000 {
+            device.array.step_data_movement_with_denied(host_mem, &[]);
+            last = executor.try_advance(device, host_mem);
+            if matches!(last, AdvanceResult::Done | AdvanceResult::Idle)
+                || executor.blocked_write_description(device).is_some()
+            {
+                break;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn seven_pushes_into_a_lock_parked_shim_channel_all_go_through_and_the_gate_opens() {
+        // dma_rel_c6 queues six; the staging and the 4-deep queue hold seven.
+        for pushes in [6, 7] {
+            let (mut executor, mut device, mut host_mem) = queue_push_sequence(pushes);
+            let last = run_until_settled(&mut executor, &mut device, &mut host_mem);
+            assert!(matches!(last, AdvanceResult::Done | AdvanceResult::Idle), "{pushes} pushes: {last:?}");
+            assert!(executor.blocked_write_description(&device).is_none());
+            // the gate write ran behind the pushes: the head takes its lock and waits for data
+            for _ in 0..5000 {
+                device.array.step_data_movement_with_denied(&mut host_mem, &[]);
+            }
+            assert_eq!(
+                device.tile(1, 0).unwrap().locks[5].value,
+                19,
+                "{pushes} pushes: the head acquired the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn an_eighth_push_blocks_the_instruction_stream_and_the_diagnosis_says_what_silicon_does() {
+        let (mut executor, mut device, mut host_mem) = queue_push_sequence(8);
+        let last = run_until_settled(&mut executor, &mut device, &mut host_mem);
+        assert_eq!(last, AdvanceResult::Blocked, "the push into a full queue stalls the writer");
+        let text = executor.blocked_write_description(&device).expect("blocked on a queue write");
+        for needle in ["Start_Queue", "(1,0)", "S2MM ch0", "deadlock", "blocks the writer"] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        // the gate write sits behind the blocked push, so nothing can drain the queue
+        for _ in 0..5000 {
+            device.array.step_data_movement_with_denied(&mut host_mem, &[]);
+        }
+        assert_eq!(device.array.dma_engine(1, 0).unwrap().pending_tasks(0), 6);
+    }
+
+    #[test]
+    fn a_blocked_push_resumes_once_the_channel_drains() {
+        let (mut executor, mut device, mut host_mem) = queue_push_sequence(8);
+        let last = run_until_settled(&mut executor, &mut device, &mut host_mem);
+        assert_eq!(last, AdvanceResult::Blocked);
+        // something else (a core, a control packet) opens the gate: the head takes it, the
+        // queue moves up, and the blocked write goes through
+        device.tile_mut(1, 0).unwrap().locks[5].set(20);
+        let last = run_until_settled(&mut executor, &mut device, &mut host_mem);
+        assert!(matches!(last, AdvanceResult::Done | AdvanceResult::Idle), "{last:?}");
+        assert!(executor.blocked_write_description(&device).is_none());
     }
 
     // -----------------------------------------------------------------

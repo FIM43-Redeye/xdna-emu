@@ -108,6 +108,12 @@ pub const START_BD_ID_WIDTH_MEMTILE: u32 = 6;
 /// `DmaModel::supports_task_queue()` before using.
 pub const MAX_TASK_QUEUE_DEPTH: usize = 4;
 
+/// Most tasks a channel can hold ahead of `Task_Queue_Size` (shim: six, see `DmaEngine::staged_task_slots`).
+///
+/// Silicon (Phoenix, shim-queue probes): the status field counts a task only once the channel's
+/// own staging is full, so the same 4-deep queue sits behind 2 to 6 staged tasks.
+pub const MAX_STAGED_TASKS: usize = 6;
+
 /// Maximum repeat count (8-bit field encodes actual-1, so max actual is 256).
 pub const MAX_REPEAT_COUNT: u32 = 256;
 
@@ -243,6 +249,12 @@ impl TaskQueue {
         }
         self.entries.push_back(entry);
         Ok(())
+    }
+
+    /// Set the sticky overflow flag for a push the caller refused (the engine's staged-slot
+    /// limit sits above this queue's own capacity check).
+    pub fn flag_overflow(&mut self) {
+        self.overflow = true;
     }
 
     /// Pop the oldest task entry from the queue.

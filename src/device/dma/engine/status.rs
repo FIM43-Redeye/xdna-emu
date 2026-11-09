@@ -34,7 +34,7 @@ impl DmaEngine {
         // Task_Queue_Size + Task_Queue_Overflow (AIE2+ only; AIE1
         // status register has StartQSize/Stalled instead).
         if self.dma_model.supports_task_queue() {
-            let queue_size = ch.task_queue.len() as u32;
+            let queue_size = self.task_queue_size(channel) as u32;
             status = layout.task_queue_size.insert(status, queue_size);
 
             if ch.task_queue.has_overflow() {
@@ -93,6 +93,12 @@ impl DmaEngine {
                     None => break,
                 }
             }
+            status = layout.cur_bd.insert(status, bd as u32);
+        }
+
+        // Tasks waiting behind the executing one: Cur_BD names the last BD the channel's
+        // staging has taken (silicon, shim-queue probes), whatever stalls the head.
+        if let Some(bd) = self.staged_cur_bd(channel) {
             status = layout.cur_bd.insert(status, bd as u32);
         }
 

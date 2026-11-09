@@ -218,6 +218,7 @@ mod tests {
         assert_eq!(layout.memory_channel_base, 0x1DE00, "Compute channel base");
         assert_eq!(layout.memory_channel_stride, 0x08, "Compute channel stride");
         assert_eq!(layout.memory_status_base, 0x1DF00, "Compute status base");
+        assert_eq!(layout.memory_status_mm2s_base, 0x1DF10, "Compute MM2S status base");
 
         // Verify memtile BD layout (AM025)
         assert_eq!(layout.memtile_bd_base, 0xA0000, "MemTile BD base");
