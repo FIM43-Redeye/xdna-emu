@@ -411,6 +411,41 @@ fn a_bd_acquire_with_a_change_of_zero_or_more_is_an_equal_acquire() {
     assert_eq!(run_bd_acquire(-1, 2), (true, 1));
 }
 
+// Silicon (build/experiments/lock-frozen, dma_rel, r1): a BD whose release meets a lock holding
+// an overflow / underflow flag is not completed: the channel stays on the release (its data
+// has gone out, the next BD of the chain does not start) until the flag is cleared, and then
+// the release is performed. It is not dropped.
+#[test]
+fn a_bd_release_on_a_frozen_lock_holds_the_channel_until_the_flag_clears() {
+    for flag_is_overflow in [true, false] {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+        let mut host_mem = make_host_memory();
+        tile.locks[5].set(0);
+        tile.locks[5].overflow = flag_is_overflow;
+        tile.locks[5].underflow = !flag_is_overflow;
+        engine
+            .configure_bd(0, BdConfig::simple_1d(0x100, 32).with_release(5, 1))
+            .unwrap();
+        engine.start_channel(2, 0).unwrap();
+        let mut run = |engine: &mut DmaEngine, tile: &mut Tile, cycles: u32| {
+            for _ in 0..cycles {
+                engine.submit_lock_requests(tile, &mut NeighborTiles::empty());
+                tile.resolve_lock_requests(0);
+                engine.step(tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while engine.pop_stream_out().is_some() {}
+            }
+        };
+        run(&mut engine, &mut tile, 300);
+        assert!(engine.channel_active(2), "the BD is held on its release while the lock is frozen");
+        assert_eq!(tile.locks[5].value, 0, "nothing was released");
+        tile.locks[5].clear_flags();
+        run(&mut engine, &mut tile, 20);
+        assert!(!engine.channel_active(2), "the clear lets the BD complete");
+        assert_eq!(tile.locks[5].value, 1, "and its release is performed");
+    }
+}
+
 #[test]
 fn test_direct_lock_release_emits_trace_event() {
     // GAP A (tenant-4 grant-order spike): the pipelined BD-completion release

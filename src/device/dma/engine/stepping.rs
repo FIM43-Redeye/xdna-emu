@@ -1172,10 +1172,16 @@ impl DmaEngine {
 
             ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, completion } => {
                 if cycles_remaining <= 1 {
-                    // Execute the lock release
-                    self.execute_lock_release(lock_id, release_value, tile, neighbors);
-                    // Update stats and handle chaining/repeat
-                    self.after_transfer_done(ch_idx, completion, tile, neighbors)
+                    // The release goes through the arbiter, which refuses it on a frozen
+                    // lock: the channel retries every cycle until the flag is cleared.
+                    if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
+                        // Execute the lock release
+                        self.execute_lock_release(lock_id, release_value, tile, neighbors);
+                        // Update stats and handle chaining/repeat
+                        self.after_transfer_done(ch_idx, completion, tile, neighbors)
+                    } else {
+                        ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, completion }
+                    }
                 } else {
                     ChannelFsm::ReleasingLock {
                         lock_id,
@@ -1568,6 +1574,12 @@ impl DmaEngine {
 
         if let Some(lock_id) = transfer.release_lock {
             let release_value = transfer.release_value;
+            // A lock holding an overflow / underflow flag refuses the release: the BD does not
+            // complete, the channel retries it through the arbiter until the flag is cleared
+            // (silicon, lock-frozen dma_rel). The data has already gone out.
+            if self.release_target_frozen(lock_id, tile, neighbors) {
+                return ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining: 1, completion };
+            }
             // The FUNCTIONAL semaphore release is ALWAYS prompt (inline at
             // completion): the lock value a waiting consumer acquires must be
             // available immediately. Deferring it deadlocks a DMA->core handoff

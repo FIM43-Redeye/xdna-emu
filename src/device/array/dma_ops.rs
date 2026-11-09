@@ -95,6 +95,28 @@ impl TileArray {
         all_events
     }
 
+    /// Tiles with a lock that gained an overflow / underflow flag since the last call (once per
+    /// flag: a lock raises again only after its flag was cleared and set anew).
+    pub fn drain_new_lock_errors(&mut self) -> Vec<(u8, u8)> {
+        let mut tiles = Vec::new();
+        for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
+            if !present {
+                continue;
+            }
+            let frozen = tile
+                .locks
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.is_frozen())
+                .fold(0u64, |m, (i, _)| m | 1 << i);
+            if frozen & !tile.lock_error_latch != 0 {
+                tiles.push((tile.col, tile.row));
+            }
+            tile.lock_error_latch = frozen;
+        }
+        tiles
+    }
+
     /// Drain newly raised DMA channel errors from every present tile.
     pub fn drain_dma_errors(&mut self) -> Vec<(u8, u8, ChannelType, u8)> {
         let mut errors = Vec::new();

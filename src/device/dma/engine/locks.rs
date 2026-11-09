@@ -108,6 +108,18 @@ impl DmaEngine {
         self.emit_lock_release_trace_at(lock_id, self.current_cycle, tile, neighbors);
     }
 
+    /// Whether the lock a BD releases holds an overflow / underflow flag (and so refuses).
+    pub(super) fn release_target_frozen(
+        &self,
+        lock_id: u8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> bool {
+        self.resolve_lock_tile(lock_id, tile, neighbors)
+            .and_then(|(t, local)| t.locks.get(local as usize).map(|l| l.is_frozen()))
+            .unwrap_or(false)
+    }
+
     /// Resolve a (possibly-neighbor) lock id to its tile and local index.
     fn resolve_lock_tile<'t>(
         &self,

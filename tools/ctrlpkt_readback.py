@@ -26,6 +26,7 @@ LOCK_VALUE_BASE = 0x1F000          # Lock<n>_value at + 0x10 * n
 LOCKS_OVERFLOW = 0x1F120           # write 1 to clear
 LOCKS_UNDERFLOW = 0x1F128          # write 1 to clear
 LOCK_STRIDE = 0x10
+MEM_EVENT_STATUS3 = 0x1420C        # memory-module events 96..127 (LOCK_ERROR is 101: bit 5)
 
 CTRL_PKT_ID = 5                    # stream id of the packet flow into the tile's TileControl
 RESPONSE_ID = 2                    # stream id of the packet flow back to shim S2MM 0

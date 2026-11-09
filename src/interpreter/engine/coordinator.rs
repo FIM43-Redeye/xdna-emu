@@ -1300,6 +1300,9 @@ impl InterpreterEngine {
             self.device.propagate_broadcasts_fixpoint(col, row);
         }
 
+        // A lock gaining an overflow / underflow flag pulses its tile's LOCK_ERROR event.
+        self.device.raise_lock_error_events();
+
         // Check for fatal errors from data movement (impossible-on-hardware
         // conditions like missing packet routes or stream buffer overflows).
         let fatal_errors = self.device.array.drain_fatal_errors();

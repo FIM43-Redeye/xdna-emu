@@ -591,6 +591,8 @@ class FrozenCase:
     reqs: tuple[Op, ...]                 # one or two ("rel" | "acq", change) requests on FZ_P
     keep: bool = False                   # never clear the flags: do they outlive the run?
     dma: str = ""                        # "rel" | "acq": a BD chain on FZ_P instead of core requests
+    init_q: int = 0                      # FZ_Q's count at load (b2b cases)
+    b2b: tuple[str, str, int] | None = None  # (pair, variant, d): a lock-b2b window instead
 
 
 FROZEN_CASES: dict[str, FrozenCase] = {
@@ -620,6 +622,19 @@ def _own(lock: int) -> int:
     return 48 + lock
 
 
+def _b2b_frozen_cases() -> dict[str, "FrozenCase"]:
+    """The refused-acquire-in-a-window cases of lock-b2b (window a, d = 1..3), read back."""
+    out = {}
+    for pair, variants in B2B_VARIANTS.items():
+        for variant in variants:
+            if b2b_refused_lock(variant) is None:
+                continue
+            q, p = b2b_inits(pair, variant)
+            for d in (1, 2, 3):
+                out[f"b2b_{pair}_{variant}_d{d}"] = FrozenCase(p, (), init_q=q, b2b=(pair, variant, d))
+    return out
+
+
 def frozen_core_asm(case: FrozenCase) -> str:
     """p0 = stamps. Words 0..7: counter reads at FZ_READ_OFFSETS around each request, word 8:
     the progress marker (FZ_PROGRESS). The marker moves before each request, so a core held by
@@ -632,6 +647,12 @@ def frozen_core_asm(case: FrozenCase) -> str:
             f"  movxm r6, #{FZ_PROGRESS[1]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8,
             f"  acq #{_own(FZ_G)}, r4", *[N] * LOCK_SETTLE_BUNDLES,
             f"  movxm r6, #{FZ_PROGRESS[2]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
+    if case.b2b:
+        pair, variant, d = case.b2b
+        body += ["  mov r2, #1", "  mov r3, #-1", *[N] * 2, *b2b_program(pair, variant, d, "a"), *[N] * 8,
+                 *[f"  st r{lo}, [p0, #{4 * i}]" for i, (_, lo) in enumerate(TS_PAIRS)],
+                 f"  movxm r6, #{FZ_PROGRESS[4]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
+        return _frame(body)
     for k, (kind, _) in enumerate(case.reqs):
         if k:
             body += [f"  movxm r6, #{FZ_PROGRESS[3]}", *[N] * 3, "  st r6, [p0, #32]", *[N] * 8]
@@ -669,6 +690,9 @@ def frozen_timer_asm(second: bool = True) -> str:
     return _frame(body)
 
 
+FROZEN_CASES.update(_b2b_frozen_cases())
+
+
 def frozen_passes(case: FrozenCase) -> int:
     """Stamps transfers the design makes: two timed passes, or one per BD of a DMA chain."""
     return 3 if case.dma else 2
@@ -685,12 +709,20 @@ def frozen_steps(case: FrozenCase) -> list:
         return [cp.Read(cp.LOCKS_OVERFLOW, f"{tag} ovf"), cp.Read(cp.LOCKS_UNDERFLOW, f"{tag} unf"),
                 cp.Read(lv(FZ_P), f"{tag} L{FZ_P}"), cp.Read(lv(FZ_Q), f"{tag} L{FZ_Q}"),
                 cp.Read(lv(FZ_G), f"{tag} L{FZ_G}"),
-                *[cp.Read(lv(x), f"{tag} L{x}") for x in extra]]
+                *[cp.Read(lv(x), f"{tag} L{x}") for x in extra],
+                cp.Read(cp.MEM_EVENT_STATUS3, f"{tag} ev3")]
 
     def clear() -> list:
         return [cp.Write(cp.LOCKS_OVERFLOW, 0xFFFF), cp.Write(cp.LOCKS_UNDERFLOW, 0xFFFF)]
 
     go = [*snap("s0"), cp.Write(lv(FZ_G), 1), cp.Write(lv(FZ_GT), 1), cp.Wait("stamp0")]
+    if case.b2b:
+        # the window is over: what became of the refused acquire? s1 = the state it left (flags,
+        # counts). Setting the refused lock's count to 1 lets a request still waiting on it
+        # through (count 0 afterwards) while one that was dropped leaves the 1 (s2).
+        refused = b2b_refused_lock(case.b2b[1])
+        return [*go, *snap("s1"), cp.Write(lv(refused), 1), *snap("s2"), *clear(), cp.Wait("stamp0"),
+                *snap("s3"), *clear(), *snap("s4")]
     if case.dma == "rel":
         # pass 1: BD1 sent and released FZ_P (+1 on 63: overflow). Open BD2 (host-written gate):
         # its data arrives, then its release meets the frozen lock; BD3 runs only if that
@@ -745,7 +777,7 @@ def frozen_design(case: FrozenCase) -> tuple[str, list, "object"]:
     for i, (acq, rel) in enumerate(chain):
         blocks += [f"    ^b{i + 1}:", bd(i, acq, rel, f"^b{i + 2}" if i + 1 < len(chain) else "^end")]
     dma = bool(case.dma)
-    lock_defs = [(FZ_P, "lP", case.init), (FZ_Q, "lQ", 0), (FZ_G, "lG", 0), (FZ_GT, "lGT", 0),
+    lock_defs = [(FZ_P, "lP", case.init), (FZ_Q, "lQ", case.init_q), (FZ_G, "lG", 0), (FZ_GT, "lGT", 0),
                  (FZ_C1, "lC1", 0), (FZ_C2, "lC2", 0), (FZ_D, "lD", 1 if dma else 0)]
     if dma:
         lock_defs += [(FZ_D2, "lD2", 0), (FZ_D3, "lD3", 0), (FZ_X, "lX", 0)]
@@ -841,7 +873,7 @@ def frozen_generate(args) -> int:
         (d / "case.json").write_text(json.dumps(
             {"case": name, "init": case.init, "reqs": case.reqs, "labels": list(layout.labels),
              "n_words": len(layout.words), "passes": frozen_passes(case), "dma": case.dma,
-             "keep": case.keep}, indent=1) + "\n")
+             "keep": case.keep, "b2b": case.b2b}, indent=1) + "\n")
     return 0
 
 
@@ -881,7 +913,7 @@ def frozen_run(args) -> int:
         rd.mkdir(parents=True)
         meta = json.loads((d / "case.json").read_text())
         cmd = [str(host), str(d / "aie.xclbin"), str(d / "insts.bin"), str(d / "pkts.bin"),
-               str(len(meta["labels"])), str(meta["passes"] * FZ_STAMP_WORDS), str(rd / "out.bin")]
+               str(len(meta["labels"])), str(meta.get("passes", 2) * FZ_STAMP_WORDS), str(rd / "out.bin")]
         try:
             r = subprocess.run(cmd, env=env, capture_output=True, text=True,
                                timeout=60 if args.backend == "hw" else 1800)
@@ -911,13 +943,20 @@ def frozen_analyze(args) -> int:
         tags = sorted({k.split()[0] for k in c})
         locks = sorted({int(k.split()[1][1:]) for k in c if k.split()[1].startswith("L")})
         snaps = [f"{t}: ovf={c[t + ' ovf']:#x} unf={c[t + ' unf']:#x} "
-                 + " ".join(f"L{x}={c[f'{t} L{x}']}" for x in locks if x != FZ_Q) for t in tags]
+                 + " ".join(f"L{x}={c[f'{t} L{x}']}" for x in locks)
+                 + (f" ev3={c[t + ' ev3']:#x}" if t + ' ev3' in c else "") for t in tags]
         n = len(meta["reqs"])
         print(f"{d.name:8s} init={meta['init']} reqs={meta['reqs']} dma={meta.get('dma', '')}")
         for sn in snaps:
             print("   " + sn)
         for i in range(meta.get("passes", 2)):
             st = r[f"pass{i + 1}"]
+            if meta.get("b2b"):
+                layout = b2b_layout("a")
+                lost = (None if FZ_SENTINEL in st[:8] else
+                        [((st[j] - st[0]) & 0xFFFFFFFF) - (layout[j] - layout[0]) for j in range(1, 8)])
+                print(f"   pass{i + 1}: marker={st[8]:#010x} lost at {layout[1:]}: {lost}")
+                continue
             print(f"   pass{i + 1}: marker={st[8]:#010x} lost={frozen_lost(st, n)} "
                   f"raw={[hex(x) for x in st[:4 * n]]}")
     return 0

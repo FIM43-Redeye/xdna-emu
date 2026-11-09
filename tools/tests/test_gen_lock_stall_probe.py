@@ -261,3 +261,74 @@ def test_condwin_asm_assembles(variant, tmp_path):
         res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
                               str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
+
+
+# -- frozen: overflow / underflow probes read back over control packets ----------------------
+
+import ctrlpkt_readback as cp
+
+
+@pytest.mark.parametrize("name", list(g.FROZEN_CASES))
+def test_every_frozen_case_reads_a_clean_baseline_first_and_leaves_the_flags_clear(name):
+    case = g.FROZEN_CASES[name]
+    steps = g.frozen_steps(case)
+    first_write = next(i for i, s in enumerate(steps) if isinstance(s, cp.Write))
+    labels = [s.label for s in steps[:first_write]]
+    assert labels[:2] == ["s0 ovf", "s0 unf"], "the baseline read of both flag registers comes first"
+    clears = [i for i, s in enumerate(steps)
+              if isinstance(s, cp.Write) and s.addr in (cp.LOCKS_OVERFLOW, cp.LOCKS_UNDERFLOW)]
+    if case.keep:
+        assert not clears
+        return
+    assert clears, "every overflow probe clears its flags"
+    tail = [s.label for s in steps[clears[-1] + 1:] if isinstance(s, cp.Read)]
+    assert tail[:2] == [tail[0].replace("unf", "ovf"), tail[0].replace("ovf", "unf")] and "ovf" in tail[0], \
+        "and reads both registers again"
+
+
+@pytest.mark.parametrize("name", list(g.FROZEN_CASES))
+def test_frozen_designs_are_self_consistent(name):
+    case = g.FROZEN_CASES[name]
+    text, steps, layout = g.frozen_design(case)
+    assert f"memref<{len(layout.labels)}xi32>" in text
+    assert text.count("aie.next_bd") == g.frozen_passes(case)
+    assert text.count("metadata = @stamp0") == g.frozen_passes(case)
+    # a core held by a frozen lock must not be able to hang the host: the host never waits for
+    # more stamps transfers than the design makes
+    assert sum(isinstance(s, cp.Wait) for s in steps) <= g.frozen_passes(case)
+
+
+def test_frozen_keep_cases_never_clear_but_others_do():
+    assert g.FROZEN_CASES["ovf1_keep"].keep and not g.FROZEN_CASES["ovf1"].keep
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("name", ["ovf1", "ovf_acq", "unf_rel", "dma_acq", "b2b_acqrel_rg_d2"])
+def test_frozen_asm_assembles(name, tmp_path):
+    case = g.FROZEN_CASES[name]
+    for fname, text in (("core.s", g.frozen_core_asm(case)), ("timer.s", g.frozen_timer_asm())):
+        s = tmp_path / fname
+        s.write_text(text)
+        res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o",
+                              str(tmp_path / (fname + ".o")), str(s)], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+
+def test_frozen_core_requests_the_probe_lock_after_the_go_gate():
+    asm = g.frozen_core_asm(g.FROZEN_CASES["ovf_rel"]).splitlines()
+    gate = next(i for i, l in enumerate(asm) if f"acq #{48 + g.FZ_G}" in l)
+    reqs = [i for i, l in enumerate(asm) if f"rel #{48 + g.FZ_P}" in l]
+    assert len(reqs) == 2 and reqs[0] > gate
+
+
+def test_frozen_lost_reports_cycles_beyond_one_per_bundle():
+    ts = [100, 104, 106, 107]                     # reads at -1, +3, +4, +5: one lost at +4
+    stamps = ts + [g.FZ_SENTINEL] * 4 + [0] * 8
+    assert g.frozen_lost(stamps, 2) == [[0, 1, 1], [None, None, None]]
+
+
+def test_parse_frozen_splits_responses_and_passes():
+    labels = ["s0 ovf", "s0 unf"]
+    words = [0x8000, 0] + list(range(16)) + list(range(100, 116))
+    r = g.parse_frozen(struct.pack(f"<{len(words)}I", *words), labels)
+    assert r["ctrl"] == {"s0 ovf": 0x8000, "s0 unf": 0} and r["pass2"][0] == 100

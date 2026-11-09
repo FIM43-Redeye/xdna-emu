@@ -15,6 +15,36 @@ impl DeviceState {
         module_type: crate::device::events::EventModuleType,
         event_id: u8,
     ) {
+        self.publish_tile_event_to(col, row, module_type, event_id, true);
+    }
+
+    /// Raise the LOCK_ERROR event of every tile that has a newly flagged lock. Silicon
+    /// (build/experiments/lock-frozen, Event_Status3 bit 5 of the compute memory module): the
+    /// event latches in the status register, and with an ordinary xclbin it reaches no
+    /// firmware error handling (no TDR, no kernel-log line), so it is not forwarded to the
+    /// async-error sink.
+    pub(crate) fn raise_lock_error_events(&mut self) {
+        use crate::device::events::EventModuleType;
+        use xdna_archspec::aie2::trace_events::{mem_events, memtile_events, shim_events};
+        for (col, row) in self.array.drain_new_lock_errors() {
+            let (module, event) = match self.array.arch().tile_kind(col, row) {
+                k if k.is_shim() => (EventModuleType::Pl, shim_events::LOCK_ERROR),
+                k if k.is_mem() => (EventModuleType::MemTile, memtile_events::LOCK_ERROR),
+                _ => (EventModuleType::Memory, mem_events::LOCK_ERROR),
+            };
+            self.publish_tile_event_to(col, row, module, event, false);
+            self.propagate_broadcasts_fixpoint(col, row);
+        }
+    }
+
+    fn publish_tile_event_to(
+        &mut self,
+        col: u8,
+        row: u8,
+        module_type: crate::device::events::EventModuleType,
+        event_id: u8,
+        forward_to_driver: bool,
+    ) {
         use crate::device::events::EventModuleType;
         use xdna_archspec::aie2::async_errors::{is_error_event, AieErrorOrigin};
 
@@ -56,7 +86,7 @@ impl DeviceState {
             tile.tap_l1_interrupt(group_event);
         }
 
-        if is_error_event(event_id, origin) {
+        if forward_to_driver && is_error_event(event_id, origin) {
             self.async_errors.record_error(col, row, origin, event_id, current_cycle);
         }
     }
@@ -1291,6 +1321,45 @@ mod interrupt_path_tests {
 
         dev.write_tile_register(col, row, status2, error_bit);
         assert_eq!(dev.read_tile_register(col, row, status2) & error_bit, 0);
+    }
+
+    // Silicon (lock-frozen, Event_Status3): an overflow / underflow flag raises the memory
+    // module's LOCK_ERROR event once, and the status bit stays after the flag is cleared.
+    // No async error reaches the driver.
+    #[test]
+    fn a_lock_flag_raises_lock_error_once_without_an_async_error() {
+        use xdna_archspec::aie2::trace_events::mem_events;
+        let mut dev = DeviceState::new_npu1();
+        let (col, row) = (1, 2);
+        let active = |dev: &DeviceState| {
+            dev.array
+                .get(col, row)
+                .unwrap()
+                .mem_events
+                .as_ref()
+                .unwrap()
+                .is_event_active(mem_events::LOCK_ERROR)
+        };
+        dev.raise_lock_error_events();
+        assert!(!active(&dev), "no flag, no event");
+        dev.array.get_mut(col, row).unwrap().locks[3].overflow = true;
+        dev.raise_lock_error_events();
+        assert!(active(&dev));
+        dev.array
+            .get_mut(col, row)
+            .unwrap()
+            .mem_events
+            .as_mut()
+            .unwrap()
+            .clear_event(mem_events::LOCK_ERROR);
+        dev.raise_lock_error_events();
+        assert!(!active(&dev), "the same flag does not raise it again");
+        dev.array.get_mut(col, row).unwrap().locks[3].clear_flags();
+        dev.raise_lock_error_events();
+        dev.array.get_mut(col, row).unwrap().locks[3].underflow = true;
+        dev.raise_lock_error_events();
+        assert!(active(&dev), "a new flag raises it again");
+        assert!(dev.async_errors.last_cache().is_none(), "nothing is forwarded to the driver");
     }
 
     #[test]

@@ -422,6 +422,11 @@ pub struct Tile {
     /// shim has no packet handler.
     pub pkt_handler_status: u32,
 
+    /// Locks whose overflow / underflow flag has already raised the tile's LOCK_ERROR event
+    /// (bit n = lock n). Cleared per lock when its flag clears, so the next overflow raises
+    /// the event again.
+    pub lock_error_latch: u64,
+
     /// Tile_Control isolation bits (bit 0=S, 1=W, 2=N, 3=E).
     ///
     /// Bit layout per AM025 / aie-rt `xaiemlgbl_params.h`
@@ -570,6 +575,7 @@ impl Tile {
             lock_release_count: 0,
             memtile_dma_event_chan_sel: 0,
             pkt_handler_status: 0,
+            lock_error_latch: 0,
             isolation: 0,
             core_relay_recorder: None,
         }
