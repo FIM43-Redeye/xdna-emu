@@ -437,3 +437,33 @@ fn a_shim_release_on_a_frozen_lock_is_parked_and_the_chain_runs_on() {
     assert_eq!(releases, [1, 1, 1, 1], "the clear lets all four through");
     assert_eq!(rig.engine.get_channel_status(rig.ch) & (1 << 3), 0);
 }
+
+/// Silicon (lock-leftovers mem_s2mm_rel): a shim MM2S whose BDs are all issued but whose sink
+/// takes nothing still reads Channel_Running with Stalled_Stream_Backpressure -- the window is
+/// undelivered -- though its BDs have FINISHED.
+#[test]
+fn a_shim_mm2s_with_an_undelivered_window_reads_running_and_back_pressured() {
+    let words = 2048;
+    let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
+    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
+    let w = window_words(&rig.engine);
+    for _ in 0..20_000 {
+        let take = rig.received.len() < words - w;
+        rig.step(take);
+        if rig.finished_bd().is_some() {
+            break;
+        }
+    }
+    assert!(rig.finished_bd().is_some());
+    for _ in 0..10 {
+        rig.step(false);
+    }
+    let status = rig.engine.get_channel_status(rig.ch);
+    assert_ne!(status & (1 << 19), 0, "Channel_Running while the window is undelivered");
+    assert_ne!(status & (1 << 4), 0, "Stalled_Stream_Backpressure");
+    for _ in 0..(w as u64 + 10) {
+        rig.step(true);
+    }
+    assert_eq!(rig.engine.get_channel_status(rig.ch) & ((1 << 19) | (1 << 4)), 0, "idle once drained");
+}

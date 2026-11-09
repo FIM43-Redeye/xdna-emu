@@ -69,6 +69,40 @@ impl DmaEngine {
             }
         }
 
+        // Cur_BD while the channel is stalled on a lock acquire names a BD the chain prefetch
+        // has already loaded, not the one holding the channel (silicon, lock-leftovers): on a
+        // memtile the next BD of the chain, on a shim the end of it. Compute channels are
+        // unprobed and keep the executing BD.
+        if let ChannelFsm::AcquiringLock { acquired: false, transfer, .. } = &ch.fsm {
+            let lookahead = if self.tile_kind.is_shim() {
+                self.bd_configs.len()
+            } else if self.tile_kind.is_mem() {
+                1
+            } else {
+                0
+            };
+            let mut bd = transfer.bd_index;
+            for _ in 0..lookahead {
+                match self.bd_configs.get(bd as usize).and_then(|c| c.next_bd) {
+                    Some(next) => bd = next,
+                    None => break,
+                }
+            }
+            status = layout.cur_bd.insert(status, bd as u32);
+        }
+
+        // A shim MM2S whose BDs have all FINISHED but whose window is still undelivered keeps
+        // running, back-pressured (silicon, lock-leftovers mem_s2mm_rel).
+        if self.tile_kind.is_shim()
+            && matches!(self.channel_type(channel), ChannelType::MM2S)
+            && !ch.read_ahead.is_empty()
+        {
+            status = layout.channel_running.set_bit(status);
+            if !self.can_push_stream_out_for_channel(channel) {
+                status = layout.stalled_stream_backpressure.set_bit(status);
+            }
+        }
+
         // Shim: three releases parked behind a flagged lock leave the channel running with
         // Stalled_Lock_Rel; up to two read as an idle channel (silicon, lock-leftovers
         // shim_*_rel_c1..c7). Memtile channels stop at the next acquire instead, which the

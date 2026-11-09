@@ -422,7 +422,9 @@ fn run_with_stream_drain(engine: &mut DmaEngine, tile: &mut Tile, host_mem: &mut
         engine.submit_lock_requests(tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(0);
         engine.step(tile, &mut NeighborTiles::empty(), host_mem);
-        while engine.pop_stream_out().is_some() {}
+        for channel in 0..engine.num_channels() as u8 {
+            while engine.pop_stream_out_for_channel(channel).is_some() {}
+        }
     }
 }
 
@@ -505,6 +507,52 @@ fn a_memtile_channel_stops_acquiring_once_two_releases_are_parked() {
         (1, 1, 1, 1)
     );
     assert_eq!((tile.locks[3].value, tile.locks[5].value), (0, 0));
+}
+
+// Silicon (lock-leftovers mem_*_rel_c3..c7, shim *_hold*): while a channel is stalled on a
+// lock acquire, Cur_BD names a BD the chain prefetch has already loaded, not the one holding the
+// channel: on a memtile the next one, on a shim the end of the chain.
+fn cur_bd_while_stalled_on_acquire(
+    mut engine: DmaEngine,
+    mut tile: Tile,
+    channel: u8,
+    first_lock: u8,
+) -> u32 {
+    let mut host_mem = make_host_memory();
+    host_mem.allocate_region("bds".to_string(), 0x100, 0x1000).unwrap(); // a shim reads its BDs from here
+                                                                         // BD0 and BD1 run; BD2 acquires a lock that is never available; BD3 follows it.
+    for (bd, acquire) in [(0u8, None), (1, None), (2, Some(first_lock)), (3, None)] {
+        let mut cfg = BdConfig::simple_1d(0x100 * (bd as u64 + 1), 32);
+        if let Some(l) = acquire {
+            cfg = cfg.with_acquire(l, -1);
+        }
+        if bd < 3 {
+            cfg = cfg.with_next(bd + 1);
+        }
+        engine.configure_bd(bd, cfg).unwrap();
+    }
+    engine.start_channel(channel, 0).unwrap();
+    run_with_stream_drain(&mut engine, &mut tile, &mut host_mem, 6000);
+    let status = engine.get_channel_status(channel);
+    assert_ne!(
+        status & (1 << 2),
+        0,
+        "stalled on the acquire: status {status:#x} fsm {}",
+        engine.channels[channel as usize].fsm.phase_name()
+    );
+    (status >> 24) & 0x3F
+}
+
+#[test]
+fn a_memtile_channel_stalled_on_an_acquire_reports_the_next_bd_as_current() {
+    let cur = cur_bd_while_stalled_on_acquire(DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 6, 64 + 5);
+    assert_eq!(cur, 3, "BD2 holds the channel; BD3 is already loaded");
+}
+
+#[test]
+fn a_shim_channel_stalled_on_an_acquire_reports_the_end_of_the_chain_as_current() {
+    let cur = cur_bd_while_stalled_on_acquire(DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 2, 5);
+    assert_eq!(cur, 3);
 }
 
 #[test]
