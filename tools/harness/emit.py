@@ -40,7 +40,7 @@ from dataclasses import dataclass
 
 from .device_model import DeviceModel, load_device_model
 from .plan import BufferRoute, ChannelPlan, Phase, StagingGroup
-from .topology import Cascade, Core, CoreStream, SharedLock, Topology
+from .topology import Cascade, Core, CoreStream, SequenceWrite, SharedLock, Topology
 
 
 class EmitError(ValueError):
@@ -117,7 +117,7 @@ def emit_mlir(topology: Topology, plan: ChannelPlan, phase: int = 0,
     _emit_kernels(out, cores)
     for core in cores:
         _emit_core(out, core, plan)
-    _emit_sequence(out, ph, transfers)
+    _emit_sequence(out, ph, transfers, topology.sequence_writes)
     out += ["  }", "}", ""]
     return "\n".join(out)
 
@@ -281,7 +281,13 @@ def _emit_core(out: list[str], core: Core, plan: ChannelPlan) -> None:
     out += ["      aie.end", "    }", ""]
 
 
-def _emit_sequence(out: list[str], ph: Phase, transfers: list[_Transfer]) -> None:
+def _i32(v: int) -> int:
+    """An unsigned 32-bit value spelled as the signed i32 MLIR constant with its bits."""
+    return v - (1 << 32) if v >= 1 << 31 else v
+
+
+def _emit_sequence(out: list[str], ph: Phase, transfers: list[_Transfer],
+                   writes: tuple[SequenceWrite, ...] = ()) -> None:
     n_in, n_out = _elems(ph.host_in_bytes), _elems(ph.host_out_bytes)
     out.append(f"    aie.runtime_sequence(%in : memref<{n_in}xi32>, "
                f"%buf : memref<{n_in}xi32>, %out : memref<{n_out}xi32>) {{")
@@ -318,6 +324,11 @@ def _emit_sequence(out: list[str], ph: Phase, transfers: list[_Transfer]) -> Non
                 f"{{metadata = @{t.fifo}, id = {ids[t.fifo]} : i64{extra}}} "
                 f": memref<{size}xi32>")
 
+    for k, w in enumerate(writes):
+        out.append(f"      %w{k}_addr = arith.constant {_i32(w.address)} : i32")
+        out.append(f"      %w{k}_val = arith.constant {_i32(w.value)} : i32")
+        out.append(f"      aiex.npu.write32(%w{k}_addr, %w{k}_val) "
+                   f"{{column = {w.col} : i32, row = {w.row} : i32}} : i32, i32")
     for t in outputs:
         out.append(op(t, "%out", n_out, True))
     for t in inputs:

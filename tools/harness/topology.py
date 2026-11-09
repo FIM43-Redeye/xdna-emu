@@ -82,6 +82,18 @@ Link = Cascade | CoreStream | SharedLock
 
 
 @dataclass(frozen=True)
+class SequenceWrite:
+    """A host register write (`aiex.npu.write32`) the runtime sequence issues before its
+    transfers, in list order. Logical tile coordinates, a tile-local address and a 32-bit
+    value. Probes use it to place host-side events against the first transfer (a timer
+    reset, padding instructions)."""
+    col: int
+    row: int
+    address: int
+    value: int
+
+
+@dataclass(frozen=True)
 class Topology:
     name: str
     cores: tuple[Core, ...]
@@ -92,6 +104,7 @@ class Topology:
     # aiecc picks the linker per package, so the compiler belongs to the package, not to a
     # core. Only "peano" is accepted until the C++ source kind lands (validate.py).
     compiler: str = "peano"
+    sequence_writes: tuple[SequenceWrite, ...] = ()
 
 
 # -- serialization -----------------------------------------------------------
@@ -124,11 +137,15 @@ def to_dict(t: Topology) -> dict[str, Any]:
                 d["via_fifo"] = True
         return d
 
-    return {"name": t.name, "device": t.device,
-            "cores": [core(c) for c in t.cores],
-            "links": [link(l) for l in t.links],
-            "reserve_shim_s2mm": t.reserve_shim_s2mm, "seed": t.seed,
-            "compiler": t.compiler}
+    d = {"name": t.name, "device": t.device,
+         "cores": [core(c) for c in t.cores],
+         "links": [link(l) for l in t.links],
+         "reserve_shim_s2mm": t.reserve_shim_s2mm, "seed": t.seed,
+         "compiler": t.compiler}
+    if t.sequence_writes:
+        d["sequence_writes"] = [{"col": w.col, "row": w.row, "address": w.address,
+                                 "value": w.value} for w in t.sequence_writes]
+    return d
 
 
 def _fields(d: Any, required: set[str], optional: set[str], where: str) -> dict:
@@ -146,7 +163,8 @@ def _fields(d: Any, required: set[str], optional: set[str], where: str) -> dict:
 def topology_from_dict(d: dict[str, Any]) -> Topology:
     """Strict inverse of `to_dict`: unknown or missing keys raise."""
     d = _fields(d, {"name", "cores"},
-                {"device", "links", "reserve_shim_s2mm", "seed", "compiler"}, "topology")
+                {"device", "links", "reserve_shim_s2mm", "seed", "compiler",
+                 "sequence_writes"}, "topology")
 
     def buffer(b: Any, where: str) -> Buffer:
         b = _fields(b, {"name", "direction", "size_bytes"}, {"data"}, where)
@@ -183,6 +201,14 @@ def topology_from_dict(d: dict[str, Any]) -> Topology:
         return CoreStream(l["src"], l["dst"], l.get("src_port", 0), l.get("dst_port", 0),
                           bool(l.get("via_fifo", False)))
 
+    def sequence_write(w: Any, i: int) -> SequenceWrite:
+        where = f"sequence_writes[{i}]"
+        w = _fields(w, {"col", "row", "address", "value"}, set(), where)
+        for key in ("address", "value"):
+            if not isinstance(w[key], int) or not 0 <= w[key] < 1 << 32:
+                raise TopologyFormatError(f"{where}: {key} must be an unsigned 32-bit integer")
+        return SequenceWrite(w["col"], w["row"], w["address"], w["value"])
+
     return Topology(
         name=d["name"],
         cores=tuple(core(c, i) for i, c in enumerate(d["cores"])),
@@ -191,6 +217,8 @@ def topology_from_dict(d: dict[str, Any]) -> Topology:
         reserve_shim_s2mm=d.get("reserve_shim_s2mm", 0),
         seed=d.get("seed", 1),
         compiler=d.get("compiler", "peano"),
+        sequence_writes=tuple(sequence_write(w, i)
+                              for i, w in enumerate(d.get("sequence_writes", []))),
     )
 
 

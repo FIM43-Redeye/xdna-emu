@@ -152,3 +152,20 @@ def test_shared_lock_is_declared_on_the_owner_tile_with_its_init(dev):
     assert ('%lock_0_2_15 = aie.lock(%tile_0_2, 15) {init = 2 : i32, sym_name = "lock_0_2_15"}'
             in text)
     assert text.index("aie.lock(") > text.index("%tile_0_3 = aie.tile(0, 3)")
+
+
+def test_sequence_writes_precede_the_transfers_in_order(dev):
+    """Host register writes run first, in the order given: probes place them relative to the
+    first transfer (e.g. a timer reset, then padding)."""
+    from harness.topology import SequenceWrite
+    t = dataclasses.replace(topo(core("a", 0, 2, outs=(64,))), sequence_writes=(
+        SequenceWrite(0, 2, 0x34000, 0x80000000), SequenceWrite(0, 2, 0x3152C, 7)))
+    text = emit(t, dev)
+    first = text.index("aiex.npu.write32(%w0_addr, %w0_val) {column = 0 : i32, row = 2 : i32} : i32, i32")
+    second = text.index("aiex.npu.write32(%w1_addr, %w1_val) {column = 0 : i32, row = 2 : i32} : i32, i32")
+    assert first < second < text.index("aiex.npu.dma_memcpy_nd")
+    assert "%w0_addr = arith.constant 213000 : i32" not in text
+    assert "%w0_addr = arith.constant 212992 : i32" in text
+    assert "%w0_val = arith.constant -2147483648 : i32" in text
+    assert "%w1_val = arith.constant 7 : i32" in text
+    assert "aiex.npu.write32" not in emit(topo(core("a", 0, 2, outs=(64,))), dev)

@@ -170,3 +170,21 @@ def test_shared_lock_needs_an_id():
     d = {"name": "t", "cores": [], "links": [{"kind": "lock", "src": "a", "dst": "b"}]}
     with pytest.raises(TopologyFormatError, match="lock_id"):
         topology_from_dict(d)
+
+
+def test_sequence_writes_round_trip_and_default_to_none():
+    from harness.topology import SequenceWrite
+    assert Topology("t", cores=()).sequence_writes == ()
+    t = dataclasses.replace(_topology(), sequence_writes=(
+        SequenceWrite(0, 2, 0x34000, 0x80000000), SequenceWrite(0, 0, 0x3452C, 0)))
+    d = to_dict(t)
+    assert d["sequence_writes"][0] == {"col": 0, "row": 2, "address": 0x34000, "value": 0x80000000}
+    assert topology_from_dict(json.loads(json.dumps(d))) == t
+    assert "sequence_writes" not in to_dict(_topology())
+
+
+def test_sequence_write_value_must_fit_32_bits():
+    d = to_dict(_topology())
+    d["sequence_writes"] = [{"col": 0, "row": 2, "address": 0x34000, "value": 1 << 32}]
+    with pytest.raises(TopologyFormatError):
+        topology_from_dict(d)
