@@ -176,25 +176,29 @@ State the model does not reach (each reproduced on silicon, deterministic, not m
 consecutive events, cycling with the site's alignment, and concluded that the front end stalls on a
 taken branch. Counter reads (`mov r17:r16, cntr`) around the branch show no stall:
 
-- `tools/gen_branch_stall_probe.py` brackets a `j`, a taken or not-taken `jnz`, or a `jl` + `ret`
-  with two counter reads and compares the cycles to the number of bundles actually issued (derived
-  from the linked ELF's disassembly, target addresses truncated to their 16-byte line). 70 sites on
-  silicon: `extra = 0` at every alignment of the branch against the fetch lines (lead 0..7, read to
-  branch 0..4 bundles), every distance past the target (0..47 bundles), with 2-byte, 6-byte and
-  16-byte bundles around it and in the five delay slots. The emulator's counter deltas are
-  identical to silicon's on all of them (`build/experiments/front-end/b1`, tags `h*.hw` / `e*.emu`),
-  because it charges no branch penalty (the delay slots are the cost, `cycle_accurate.rs`).
+- `tools/gen_branch_stall_probe.py` brackets a `j`, or a taken or not-taken `jnz`, with two counter
+  reads and compares the cycles to the number of bundles actually issued (derived from the linked
+  ELF's disassembly, targets truncated to their 16-byte line). 190 sites on silicon: `extra = 0` at
+  every one that does not involve `jl`, at every alignment of the branch against the fetch lines
+  (lead 0..7, read to branch 0..4 bundles), every distance past the target (0..47 bundles), with
+  2-byte, 6-byte and 16-byte bundles around it, and with 16-byte bundles in the five delay slots.
+  The emulator's counter deltas are identical to silicon's on every one of those sites
+  (`build/experiments/front-end/b1`, tags `h*.hw` / `e*.emu`), because it charges no branch
+  penalty (the delay slots are the cost, `cycle_accurate.rs`).
 - The 45..52 gaps are real cycles but not stalls: a taken branch resumes at the *start of the line*
   holding the target, so the bundles before the label in that line run again, 0..7 two-byte nops
   depending on where the label sits. The `event #0` / counter-read bundle is 4 bytes, so every site
   shifts the following code by 2 bytes and the count cycles with the site, exactly as measured. The
   chained counter reads (`chain_j`) give 46, 49, 52, 48, 50, 45, 48 on silicon and in the emulator.
-- Two `jl` sites showed negative "extras": the return address's line start fell inside a 4-byte
-  bundle that straddles the line, so the return resumed in the middle of a bundle (silicon runs
-  whatever that decodes to, the emulator stops with an unknown instruction). Not a timing effect;
-  the probe now keeps to `jl` placements where no bundle straddles that line.
+- `jl` + `ret` is **not closed**: of the first four `jl` sites two gave `extra = 0`, two a negative
+  "extra" (the return address's line start fell inside a bundle that straddles the line, so the return
+  resumed in the middle of a bundle: silicon runs whatever that decodes to, the emulator stops with an
+  unknown instruction), and the rebuilt pair (`kinds_nop`, the last two sites) did something on
+  silicon the site model does not describe (a negative counter delta at one site, no store at the
+  other) where the emulator gives 28 and 26. Nothing says a call or return costs a stall, but the
+  probe does not show that they do not.
 
-So there is no taken-branch fetch stall to model. Cycle counts did not move.
+So there is no `j` / `jnz` fetch stall to model, and the emulator's cycle counts did not move.
 
 ### Mode-1 (EventPc) PC around branches: still open
 
