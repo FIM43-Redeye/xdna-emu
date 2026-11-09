@@ -1771,6 +1771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)] // the check is a debug_assert: release builds compile it out
     #[should_panic(expected = "sticky served-ports mask")]
     fn stall_for_bank_debug_assert_catches_a_skipped_reset() {
         let (mut core, mut ctx, _tile) = fixture_core_at_nop_bundle();
