@@ -70,11 +70,15 @@ ENABLE, one write per core, column-major): the launch path applies them one gap 
 The emulator starts the first core at its enable write and stages each later start one more
 `CORE_RELEASE_SPACING_CYCLES` (1448, the median, a deterministic representative) after it
 (`DeviceState::stagger_core_starts`); cores a CDO leaves held in reset take the following slots at
-the release seam (`release_core_resets`). A core's `MOV_CNTR` reads engine cycles, so cores started
-at different times read one timebase, and it writes both halves of its register pair (the EMU used
-to leave the high register untouched; silicon writes the timer's high word, 0 here). Where the
-start sits relative to the runtime sequence is the open `core-launch-timing` question
-(host-firmware-dispatch.md); the order and spacing hold wherever it lands.
+the release seam (`release_core_resets`). A core's `MOV_CNTR` reads its core module timer, so
+cores started at different times read one timebase, a host `Timer_Control` reset moves what a
+running core reads (silicon, launch probe; the EMU read engine cycles and ignored the reset until
+2026-11-08, `cycle_counter_follows_a_reset_of_the_core_timer`), and it writes both halves of its
+register pair (the EMU used to leave the high register untouched; silicon writes the timer's high
+word, 0 here). Where the start sits relative to the runtime sequence: "Core launch against the
+runtime sequence" in [`host-firmware-dispatch.md`](host-firmware-dispatch.md). The launch probe
+(2026-11-08) measured the same order with gaps of 946-1188 cycles (24 gaps, median about 1100),
+inside this jitter range but under its median; the real-firmware backend gives 1100-1144.
 
 ### Cross-tile memory visibility depends on core step order (EMU, open; found 2026-11-04)
 
