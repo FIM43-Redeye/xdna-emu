@@ -40,3 +40,16 @@ path carries no PC, matching the LOCK_STALL precedent), and the executor-level
 *intra-bundle* structural bank conflict stays a bounded MEMORY_STALL pulse (it
 resolves within one executor step, so a same-step rising+falling would encode as
 a zero-width span).
+
+## Found with the LOCK_STALL pulse probe (2026-11-09, silicon vs emulator, not yet fixed)
+
+`build/experiments/lock-stall-pulse`, `tools/gen_lock_pulse_probe.py`. Two markers
+(`event #0` / `event #1`) a known number of bundles apart, decoded with the in-tree decoder
+(`ts` adds `1 + cycles` per frame, `soc` removes the `1`):
+
+| Gap | Silicon | Emulator | Status |
+|-----|---------|----------|--------|
+| Cycles field of a pure-pulse frame | the idle cycles between the frames: markers 2, 3, 5, 22, 102, 302 bundles apart decode `ts` 2, 3, 5, 22, 102, 302 apart (`soc` one less) | the full elapsed cycles: `ts` one late per frame (3, 4, 6, 23, ...), `soc` exact | **OPEN.** `emit_event_frame(active, gap)` in the pure-pulse branch of `commit_pending_frame` passes the elapsed gap; the decoder adds its own implicit 1 on top. The comparator reads `soc`, where the emulator is exact and silicon drifts one cycle low per frame, so tiles with many frames shift against each other; the fix is a convention change for every pulse frame (a held-level hold has its own `skip_debt` bookkeeping), held back as a design choice of the encoder. |
+| INSTR_LOCK_ACQUIRE_REQ / _RELEASE_REQ stamp | request bundle at cycle c: REQ at c+1 (refused acquire too: a core held across the trace start has no REQ for it) | stamped when the request completes: c+4, or the end of a hold | **OPEN.** Needs the REQ recorded one step after issue; mode-1 (EventPc) frames carry the fetch PC at the REQ, which at c+1 is the fourth bundle after the request (the PC the emulator takes at completion today), not known until then. |
+| LOCK_STALL pulse of a request window | one 1-cycle pulse at c+4 | **FIXED** 2026-11-09 (releases pulsed already, acquires did not) | closed |
+| Held level at the start of the trace | first frame, one cycle after the start event | **FIXED** 2026-11-09 (`level_signals`) | closed |

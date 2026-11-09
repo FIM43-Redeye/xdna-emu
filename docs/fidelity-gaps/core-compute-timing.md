@@ -255,15 +255,31 @@ are now slots that keep what a move wrote, masked to their width. `srCarry`, `sr
 
 The pre-existing status slots (`srSS0`, `srMS0`, `srCompr_uf`, `srSparse_of`) keep their producers.
 
-## Related: lock-arbitration cost (modeled) vs pulse emission (pending)
+## Related: lock-arbitration cost and its LOCK_STALL pulse (modeled)
 
 The per-lock-transaction arbitration **cycle cost** (HW trails every lock request
-with a 1-cycle arbitration stall, even uncontended) is **modeled** in core cycle
-timing (`f22e301c`, `cycle_accurate.rs`; HW-exact on the tenant-4 core loop
-2125->2129, full bridge corpus clean); since 2026-11-08 it is charged where silicon
+with a 1-cycle arbitration stall, even uncontended) is modeled in core cycle
+timing (`f22e301c`, `cycle_accurate.rs`); since 2026-11-08 it is charged where silicon
 puts it, in front of the fourth bundle after the request ("Lock request resolution
-point" above). What remains open is the *trace-event* half
--- emitting the per-transaction `LOCK_STALL` pulse on the uncontended path -- which
-is a trace-encoding concern, cross-referenced from the aiesim "Trace
-stall/starvation micro-timing" row in `xdna-emu-priv: research/aiesim/aiesim-oracle.md` and
-the count-under-emission row in [`trace-encoding.md`](trace-encoding.md).
+point" above). Its **trace pulse** is modeled since 2026-11-09
+(`build/experiments/lock-stall-pulse`, `tools/gen_lock_pulse_probe.py`, silicon r1 == r2):
+
+- Every window of lock requests, acquire or release, uncontended, puts one 1-cycle
+  LOCK_STALL in the core trace on its arbitration cycle: request bundle at cycle c,
+  INSTR_LOCK_*_REQ at c+1, LOCK_STALL at c+4. Requests inside one window (d = 1..3
+  bundles apart) share the one pulse; from d = 4 each window has its own (c+4 and
+  c+d+5). Only acquires lacked it in the emulator (releases pulsed already), which is the
+  HW/EMU 2:1 LOCK_STALL interval ratio of the trace-gate core triage.
+- A refused acquire is one held level from c+4; the arbitration cycle of the grant is
+  inside it, no pulse follows (`a_granted_wait_adds_no_pulse_after_the_held_level`).
+- A skipped `acq.cond` / `rel.cond` pulses nothing; a performed one pulses like the plain
+  request.
+- A core held on an acquire since before the trace started shows LOCK_STALL in the first
+  frame (one cycle after the start event); the trace unit now tracks level edges from
+  before it runs (`level_signals`).
+
+Open (not a lock-arbitration cost, a trace-stamping rule): INSTR_LOCK_ACQUIRE_REQ /
+INSTR_LOCK_RELEASE_REQ sit at c+1 on silicon, for a refused acquire too (so a core held
+across the trace start has no REQ in the trace for that acquire), where the emulator
+stamps them when the request completes (c+4, or the end of the hold). See
+[`trace-encoding.md`](trace-encoding.md).
