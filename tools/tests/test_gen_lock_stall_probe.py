@@ -332,3 +332,72 @@ def test_parse_frozen_splits_responses_and_passes():
     words = [0x8000, 0] + list(range(16)) + list(range(100, 116))
     r = g.parse_frozen(struct.pack(f"<{len(words)}I", *words), labels)
     assert r["ctrl"] == {"s0 ovf": 0x8000, "s0 unf": 0} and r["pass2"][0] == 100
+
+
+# -- left: memtile and shim lock flags --------------------------------------------------------
+
+@pytest.mark.parametrize("name", list(g.LEFT_CASES))
+def test_every_left_case_starts_with_a_clean_baseline_and_ends_with_a_clear_and_reread(name):
+    case = g.LEFT_CASES[name]
+    steps = g.left_steps(case)
+    assert not any(isinstance(s, cp.Write) for s in steps[: next(
+        i for i, s in enumerate(steps) if isinstance(s, cp.Write))] ), "reads only before the first write"
+    first_write = next(i for i, s in enumerate(steps) if isinstance(s, cp.Write))
+    assert all(s.label.startswith("s0 ") for s in steps[:first_write] if isinstance(s, cp.Read))
+    if case.mode == "dmaerr":
+        # a channel reset, not a lock-flag clear, undoes the error; the last snapshot follows it
+        last_write = max(i for i, s in enumerate(steps) if isinstance(s, cp.Write))
+        assert steps[last_write].label == "reset released"
+        assert any(isinstance(s, cp.Read) for s in steps[last_write + 1:])
+        return
+    k = cp.TileRegs(case.kind)
+    flags = {*k.overflow, *k.underflow}
+    clears = [i for i, s in enumerate(steps) if isinstance(s, cp.Write) and s.addr in flags]
+    assert clears, "the flags are cleared"
+    after = [s for s in steps[clears[-1] + 1:] if isinstance(s, cp.Read)]
+    read_back = {s.addr for s in after if s.addr in flags}
+    assert read_back == flags, "and every flag register is read again after the last clear"
+
+
+@pytest.mark.parametrize("name", list(g.LEFT_CASES))
+def test_left_designs_are_self_consistent(name):
+    case = g.LEFT_CASES[name]
+    text, steps, layout = g.left_design(case)
+    assert f"memref<{len(layout.labels)}xi32>" in text
+    assert f"%data: memref<{case.data_words}xi32>" in text
+    # the host waits for nothing it could wait on forever: only the ctrl transfers
+    assert not any(isinstance(s, cp.Wait) for s in steps)
+    assert ("aiex.dma_configure_task" in text) == (case.mode == "bd")
+    if case.mode == "bd":
+        starts = text.count("aiex.dma_start_task")
+        assert starts == 2
+        # one lock-using BD per chained BD on the locked channel, none on the plain end
+        uses = text.count("aie.use_lock")
+        assert uses == 2 * case.chain
+
+
+def test_left_release_cases_chain_witness_bds_behind_the_frozen_one():
+    case = g.LEFT_CASES["shim_mm2s_rel_c5"]
+    text, steps, _ = g.left_design(case)
+    assert text.count("aie.next_bd") == case.chain - 1
+    gates = g.LEFT_GATE_LOCKS["shim"][: case.chain - 1]
+    set_gates = [s.value for s in steps if isinstance(s, cp.Write) and s.label.startswith("set shim L")
+                 and s.addr in [cp.TileRegs("shim").value(x) for x in gates]]
+    assert set_gates == [1] * (case.chain - 1)
+
+
+def test_left_hold_cases_keep_one_gate_shut_until_after_the_clear():
+    case = g.LEFT_CASES["mem_mm2s_rel_c5_hold3"]
+    steps = g.left_steps(case)
+    held = g.LEFT_GATE_LOCKS["mem"][case.hold - 1]
+    addr = cp.TileRegs("mem").value(held)
+    sets = [i for i, s in enumerate(steps) if isinstance(s, cp.Write) and s.addr == addr]
+    clears = [i for i, s in enumerate(steps) if isinstance(s, cp.Write) and s.label.startswith("clear")]
+    assert len(sets) == 1 and sets[0] > clears[0], "set only after the first clear"
+
+
+def test_left_shim_and_memtile_use_their_own_flag_registers():
+    shim, mem = cp.TileRegs("shim"), cp.TileRegs("mem")
+    assert shim.overflow == [0x14120] and shim.underflow == [0x14128]
+    assert mem.overflow == [0xC0420, 0xC0424] and mem.underflow == [0xC0428, 0xC042C]
+    assert 0x94210 in mem.events and 0x3420C in shim.events

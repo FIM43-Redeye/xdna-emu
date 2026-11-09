@@ -52,3 +52,36 @@ def test_sequence_waits_for_the_transfer_between_packets():
 def test_register_offsets_come_from_the_am025_database():
     assert (cp.LOCKS_OVERFLOW, cp.LOCKS_UNDERFLOW) == (0x1F120, 0x1F128)
     assert cp.MEM_EVENT_STATUS3 == 0x1420C
+
+
+def test_each_target_tile_has_its_own_packet_and_response_ids():
+    ids = [(t.pkt_id, t.response_id) for t in cp.TARGETS.values()]
+    assert len({p for p, _ in ids}) == len(ids) and len({r for _, r in ids}) == len(ids)
+    steps = [cp.Read(0x14120, "shim", tile="shim"), cp.Read(0xC0420, "mem", tile="mem")]
+    lay = cp.encode(steps)
+    assert (lay.words[0] >> 24) & 0xF == cp.TARGETS["shim"].response_id
+    assert (lay.words[1] >> 24) & 0xF == cp.TARGETS["mem"].response_id
+    ops = cp.sequence_lines(steps, lay, "o", "i")
+    assert f"pkt_id = {cp.TARGETS['shim'].pkt_id}," in ops[1]
+    assert f"pkt_id = {cp.TARGETS['mem'].pkt_id}," in ops[3]
+
+
+def test_a_raw_step_is_emitted_where_it_stands_and_sends_no_packet():
+    steps = [cp.Read(0x1F120, "a"), cp.Raw(("aiex.dma_start_task(%t)",)), cp.Read(0x1F128, "b")]
+    lay = cp.encode(steps)
+    assert lay.packets == ((0, 0, 1), (2, 1, 1))
+    ops = cp.sequence_lines(steps, lay, "o", "i")
+    at = [i for i, l in enumerate(ops) if "dma_start_task" in l]
+    assert at and "ctrlin" in ops[at[0] - 1] and "ctrlin" in ops[at[0] + 1]
+
+
+@pytest.mark.parametrize("target, flags, locks", [("shim", 1, 16), ("mem", 2, 64), ("core", 1, 16)])
+def test_tile_registers_come_from_the_am025_database_per_tile_kind(target, flags, locks):
+    r = cp.TileRegs(target)
+    assert len(r.overflow) == flags == len(r.underflow)
+    assert r.flag_bits * len(r.overflow) == locks
+    assert r.value(1) - r.value(0) == 0x10
+    # Lock_Id sits at bit 10, Acq_Rel at 9, the 7-bit change at 2
+    assert r.request(3, True, -1) == r.request_base + (3 << 10) + 0x200 + (0x7F << 2)
+    assert r.request(3, False, 1) == r.request_base + (3 << 10) + 4
+    assert (r.flag_reg(r.overflow, locks - 1), r.flag_bit(locks - 1)) == (r.overflow[-1], 1 << (r.flag_bits - 1))
