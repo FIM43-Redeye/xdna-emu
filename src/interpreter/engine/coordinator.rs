@@ -1932,14 +1932,9 @@ impl InterpreterEngine {
         // Each tile has two 64-bit timers (core module and memory module)
         // that increment every cycle.
         //
-        // Core module perf counters are dispatched to tick_active_cycles or
-        // tick_idle_cycles based on whether the core executed an instruction
-        // (StepResult::Continue) this cycle. Counters configured with
-        // ACTIVE_CORE (0x1C) as start_event are level-gated: they tick only
-        // when the core is in Execute state, matching hardware behavior.
-        //
-        // Memory module perf counters are not gated on core Execute state;
-        // they always use tick_active_cycles (existing semantics preserved).
+        // Core module perf counters see TRUE every cycle and ACTIVE_CORE (0x1C)
+        // every cycle the core is enabled; once started, a counter ticks every
+        // cycle until its stop event.
         //
         // Tiles and cores share compact physical-column order, so cores[i] is
         // the CoreState for tiles[i].
@@ -1963,7 +1958,7 @@ impl InterpreterEngine {
             use xdna_archspec::aie2::trace_events::core_events::PERF_CNT_0 as PERF_CNT_BASE;
             // TRUE (event 1) and ACTIVE_CORE (event 0x1C) are level-asserted
             // start events on real hardware: TRUE is always asserted, and
-            // ACTIVE_CORE is asserted while the core is in Execute state.
+            // ACTIVE_CORE is asserted while the core is enabled (stalled or not).
             // A counter configured with either as its start event needs to
             // see the corresponding handle_event() each cycle to transition
             // Idle->Active before the tick logic runs. Without this, the
@@ -2026,21 +2021,14 @@ impl InterpreterEngine {
                 if core_clocked {
                     tile.core_timer.tick();
 
-                    let core_active = self.cores.get(i).map_or(false, |c| c.active_this_cycle);
-
-                    // Re-assert TRUE every cycle and ACTIVE_CORE only when the
-                    // core is executing. handle_event() is idempotent: an
-                    // already-Active counter stays Active; counters whose start
-                    // event doesn't match are unaffected. Stop and reset events
-                    // still take priority inside handle_event() per its existing
-                    // ordering.
-                    //
-                    // ACTIVE_CORE is an edge-style start event: it pulses on
-                    // transition to Execute and arms the counter. Once Active,
-                    // the counter ticks every cycle regardless of whether the
-                    // core is still in Execute -- HW perf counters are duration
-                    // counters started by ACTIVE_CORE and stopped by
-                    // DISABLED_CORE, not gated per cycle on Execute state.
+                    // ACTIVE_CORE is asserted while the core is enabled, whether it executes
+                    // or stalls (silicon: a counter configured from the runtime sequence arms
+                    // and counts inside a lock stall that began long before; see
+                    // `active_core_arms_a_counter_while_the_core_is_lock_stalled`).
+                    // handle_event() is idempotent: an already-Active counter stays Active;
+                    // counters whose start event doesn't match are unaffected. Stop and reset
+                    // events still take priority inside handle_event().
+                    let core_active = self.cores.get(i).map_or(false, |c| c.enabled);
                     tile.core_perf_counters.handle_event(TRUE_EVENT);
                     if core_active {
                         tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
@@ -3974,6 +3962,47 @@ mod tests {
              (#354 regression)",
             encoded
         );
+    }
+
+    /// ACTIVE_CORE is asserted while the core is enabled, stalled or not: on silicon a
+    /// counter started by it and configured from the runtime sequence counts while the core
+    /// sits in a lock stall that began ~28k cycles earlier (bridge trace gate: HW PERF_CNT_2
+    /// fires every 1023 cycles inside the first LOCK_STALL, before the first grant). A core
+    /// that is not enabled does not assert it.
+    #[test]
+    fn active_core_arms_a_counter_while_the_core_is_lock_stalled() {
+        // `mov r4, #-2 ; nop ; acq #63, r4 ; nop x 7`: waits on own lock 15 (count 0) forever.
+        const ACQ_GE2_PROGRAM: [u8; 24] = [
+            0x99, 0xfe, 0x0f, 0x19, 0x01, 0x00, 0x19, 0x42, 0xe2, 0x17, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+        ];
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        for row in [2u8, 3] {
+            engine
+                .device_mut()
+                .tile_mut(1, row as usize)
+                .unwrap()
+                .write_program(0, &ACQ_GE2_PROGRAM);
+        }
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x1);
+        for _ in 0..50 {
+            engine.step();
+        }
+        assert_eq!(engine.core_context(1, 2).unwrap().pc(), 0x10, "held on the acquire");
+        for row in [2usize, 3] {
+            let tile = engine.device_mut().array.tile_mut(1, row as u8);
+            tile.core_perf_counters.write_control_start_stop(0x1C, 0, 1, 7); // start=ACTIVE_CORE
+            tile.core_perf_counters.write_event_value(0, u32::MAX);
+        }
+        for _ in 0..20 {
+            engine.step();
+        }
+        let stalled = &engine.device().array.tile(1, 2).core_perf_counters;
+        assert!(stalled.is_active(0), "ACTIVE_CORE arms the counter during the lock stall");
+        assert!(stalled.read_counter(0) >= 19, "counts every cycle of the stall");
+        let disabled = &engine.device().array.tile(1, 3).core_perf_counters;
+        assert!(!disabled.is_active(0), "a core that is not enabled is not active");
     }
 
     /// A clock-gated module has no clock, so its performance counters must
