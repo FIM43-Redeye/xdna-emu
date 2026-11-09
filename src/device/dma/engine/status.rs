@@ -61,6 +61,11 @@ impl DmaEngine {
             }
             ChannelFsm::Error => {
                 status = layout.error_bd_invalid.set_bit(status);
+                // A memtile channel on an invalid BD still reads Channel_Running (silicon,
+                // lock-leftovers mem_dmaerr); shim and compute channels are unprobed.
+                if self.tile_kind.is_mem() {
+                    status = layout.channel_running.set_bit(status);
+                }
             }
             _ => {
                 // All other active states

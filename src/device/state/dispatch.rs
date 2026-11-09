@@ -628,6 +628,21 @@ mod tests {
         assert_eq!(status(&mut d, 1, layout.memtile_status_mm2s_base), mt);
     }
 
+    // Silicon (lock-leftovers mem_dmaerr h140): a memtile channel started on an unconfigured BD
+    // reads Channel_Running with Error_BD_Invalid (0x80800), and the channel reset clears both.
+    #[test]
+    fn a_memtile_channel_on_an_invalid_bd_reads_running_with_the_error_bit() {
+        use crate::device::regdb::device_reg_layout;
+        let layout = device_reg_layout();
+        let mut d = DeviceState::new_npu1();
+        d.assign_partition_columns(1, 1);
+        let status_reg = layout.memtile_status_s2mm_base;
+        d.write_tile_register(1, 1, layout.memtile_channel_s2mm_base + 4, 3);
+        let status = d.read_tile_register(1, 1, status_reg);
+        assert!(layout.memtile_status.error_bd_invalid.extract_bool(status));
+        assert!(layout.memtile_status.channel_running.extract_bool(status), "status {status:#x}");
+    }
+
     #[test]
     fn assign_partition_columns_ungates_only_target_columns() {
         let mut d = DeviceState::new_npu1();
