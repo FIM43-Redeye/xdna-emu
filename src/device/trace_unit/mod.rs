@@ -174,6 +174,11 @@ pub struct TraceUnit {
     /// early-returns when no pulse fired, and `set_event_level` only commits
     /// on an actual assert/deassert edge.
     pub(super) held_mask: u8,
+    /// Hardware event ids whose level signal is asserted right now, whether or not the unit
+    /// is configured or running. A level that rose before the trace started is still part of
+    /// the state the first frame reports (silicon: a core held on an acquire since before the
+    /// start shows LOCK_STALL in the first frame), so the unit tracks every edge it sees.
+    level_signals: u128,
     /// Held-level mask as of the *last emitted frame*. Distinct from
     /// `held_mask` (the live state): this records what was asserted when the
     /// previous frame went out, so `commit_pending_frame` knows whether a level
@@ -250,6 +255,7 @@ impl TraceUnit {
             pending_cycle: 0,
             pending_slot_mask: 0,
             held_mask: 0,
+            level_signals: 0,
             frame_held: 0,
             skip_debt: 0,
             level_dirty: false,
@@ -654,6 +660,14 @@ impl TraceUnit {
     /// Callers classify level vs pulse via the archspec `is_level_event`
     /// authority and route accordingly (levels here, pulses to `notify_event`).
     pub fn set_event_level(&mut self, hw_event_id: u8, cycle: u64, active: bool) {
+        if hw_event_id < 128 {
+            let bit = 1u128 << hw_event_id;
+            self.level_signals = if active {
+                self.level_signals | bit
+            } else {
+                self.level_signals & !bit
+            };
+        }
         if !self.configured {
             return;
         }
@@ -1200,6 +1214,21 @@ impl TraceUnit {
         // current_cycle onward, since events from the arm cycle were
         // dropped while state == Idle.
         let _ = arm_cycle; // arm_cycle now lives only in the timer field
+
+        // Levels already asserted open the first frame (silicon: LOCK_STALL of a core held
+        // since before the start is in the first frame, one cycle after the start event).
+        let already_asserted = self.event_slots.iter().enumerate().fold(0u8, |mask, (slot, &id)| {
+            if id < 128 && self.level_signals & (1u128 << id) != 0 {
+                mask | (1 << slot)
+            } else {
+                mask
+            }
+        });
+        if already_asserted != 0 && self.held_mask & already_asserted != already_asserted {
+            self.held_mask |= already_asserted;
+            self.pending_cycle = current_cycle;
+            self.level_dirty = true;
+        }
         log::debug!(
             "TraceUnit ({},{}) START activated: arm_cycle={} current_cycle={} mode={:?}",
             self.col,

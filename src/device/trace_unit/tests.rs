@@ -1495,3 +1495,34 @@ fn n_isolated_one_cycle_memory_stalls_decode_as_n_events() {
         );
     }
 }
+
+/// Silicon (build/experiments/lock-stall-pulse, a core held on an acquire since before the
+/// trace started): the first frame after the Start already reports the LOCK_STALL level,
+/// one cycle after the start event, and the later falling edge closes it as usual. The
+/// level rose before the unit ran (here even before it was configured), so the unit has to
+/// know what is asserted when it starts.
+#[test]
+fn a_level_asserted_before_the_start_is_in_the_first_frame() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.set_event_level(26, 3, true); // the core stalls before any trace register is written
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot3 = LOCK_STALL
+    tu.notify_event(28, 100, None); // start event: arms, Start marker
+    let start_len = tu.byte_buffer.len();
+    tu.notify_event(1, 101, None); // the TRUE metronome promotes the armed start
+    tu.commit_cycle(101);
+    assert!(tu.byte_buffer.len() > start_len, "the held level must open in the first frame");
+    assert_eq!(tu.held_mask, 1 << 3);
+    // a level that fell before the start is not reported
+    let mut tu = TraceUnit::new(0, 2);
+    tu.set_event_level(26, 3, true);
+    tu.set_event_level(26, 4, false);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    tu.notify_event(28, 100, None);
+    let start_len = tu.byte_buffer.len();
+    tu.notify_event(1, 101, None);
+    tu.commit_cycle(101);
+    assert_eq!(tu.byte_buffer.len(), start_len);
+    assert_eq!(tu.held_mask, 0);
+}
