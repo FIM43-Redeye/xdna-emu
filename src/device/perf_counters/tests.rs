@@ -245,10 +245,12 @@ fn reset_event_zeroes_counter_and_keeps_running() {
     assert_eq!(bank.read_counter(0), 0);
     assert!(bank.is_active(0));
 
+    // the cycle after a reset counts nothing (silicon: a self-resetting counter's period is
+    // its threshold + 1), so five ticks leave 4
     for _ in 0..5 {
         bank.tick();
     }
-    assert_eq!(bank.read_counter(0), 5);
+    assert_eq!(bank.read_counter(0), 4);
 }
 
 #[test]
@@ -788,16 +790,15 @@ fn self_reset_counter_recycles_via_handle_event_feedback() {
 
     assert_eq!(
         firings,
-        vec![(5, 0), (10, 0)],
-        "self-reset counter should fire at cycles 5 and 10 (5-cycle period); \
+        vec![(5, 0), (11, 0)],
+        "self-reset counter should fire at cycles 5 and 11 (threshold + 1 period); \
          got {:?}",
         firings
     );
 
-    // After cycle 10's reset, cycles 11 and 12 each re-arm and tick once,
-    // so the counter holds 2.
+    // After cycle 11's reset, cycle 12 counts nothing.
     assert!(bank.is_active(0));
-    assert_eq!(bank.read_counter(0), 2);
+    assert_eq!(bank.read_counter(0), 0);
 }
 
 #[test]
@@ -815,4 +816,26 @@ fn deprecated_tick_shim_behaves_as_active_cycles() {
         }
     }
     assert_eq!(bank.read_counter(0), 5);
+}
+
+/// A counter that resets itself at its threshold fires every threshold + 1 cycles: the
+/// cycle after a reset counts nothing. Silicon: PERF_CNT_2 at 1024 shows in the core trace
+/// 1025 cycles apart (206 of 206 clean captures in the bridge corpus).
+#[test]
+fn a_self_resetting_counter_fires_every_threshold_plus_one_cycles() {
+    const PERF_CNT_0: u8 = 5;
+    let mut bank = PerfCounterBank::new(4);
+    bank.write_control_start_stop(10, 0, 1, 7);
+    bank.write_control_reset(PERF_CNT_0 as u32, 7);
+    bank.write_event_value(0, 4);
+    bank.handle_event(10);
+
+    let mut fired = Vec::new();
+    for cycle in 0..20u32 {
+        if !bank.tick().is_empty() {
+            fired.push(cycle);
+            bank.handle_event(PERF_CNT_0); // the coordinator routes the threshold event back
+        }
+    }
+    assert_eq!(fired, vec![3, 8, 13, 18]);
 }

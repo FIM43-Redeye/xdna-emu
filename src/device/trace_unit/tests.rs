@@ -122,303 +122,223 @@ fn test_single0_encoding() {
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len(); // Start marker = 8 bytes
 
-    // Event with delta=5 (fits in Single0: 4-bit delta)
-    notify_commit(&mut tu, 37, 5);
+    // 5 idle cycles (fits in Single0: 4-bit field): the event is in cycle 6
+    notify_commit(&mut tu, 37, 6);
     assert_eq!(tu.byte_buffer.len(), start_len + 1); // Single0 = 1 byte
 
-    // Verify encoding: slot=0, delta=5 -> 0b00000101 = 0x05
+    // Verify encoding: slot=0, cycles field 5 -> 0b00000101 = 0x05
     assert_eq!(tu.byte_buffer[start_len], 0x05);
 }
 
-/// A held LEVEL must encode in the upstream skip-token model: a rising-edge
-/// frame, NO per-cycle frames during the hold, and the hold duration carried as
-/// a `Repeat` skip-token run flushed lazily at the closing frame -- NOT a mask
-/// re-asserted per frame (the snapshot encoding upstream renders as `dur=1`
-/// spans). See xdna-emu-priv: research/specs/2026-06-08-skip-token-held-level-encoding.md.
+/// A frame's cycles field is the number of idle cycles since the previous frame (silicon:
+/// markers 2..1500 bundles apart decode 2..1502 apart, so the frame's own cycle is the
+/// decoder's implicit +1). The start cycle counts as the previous frame.
 #[test]
-fn held_level_emits_skip_token_run_not_per_cycle() {
+fn cycles_field_is_the_idle_cycles_between_frames() {
     let mut tu = TraceUnit::new(0, 2);
-    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // mode0, start 28, stop 29
-                                                          // slot0=37 (pulse), slot3=26 (LOCK_STALL, a level event)
-    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
-    tu.notify_event(28, 0, None); // arm start + emit Start marker
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8));
+    tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    // Rising edge: assert LOCK_STALL (level) at cycle 10. Level edges are
-    // deferred and coalesced; the rising-edge frame is emitted by commit_cycle
-    // (Phase 3f), which the coordinator drives every cycle.
-    tu.set_event_level(26, 10, true);
-    tu.commit_cycle(10);
-    let after_assert = tu.byte_buffer.len();
-    assert!(after_assert > start_len, "level assert must emit a rising-edge frame");
-
-    // Hold ~1000 cycles. The coordinator calls commit_cycle every cycle; a held
-    // level must emit NO per-cycle frames -- the duration is a skip-token run
-    // emitted lazily at the closing frame.
-    for c in 11..=1009 {
-        tu.commit_cycle(c);
-    }
-    assert_eq!(
-        tu.byte_buffer.len(),
-        after_assert,
-        "held level must emit no per-cycle frames during the hold"
-    );
-
-    // Falling edge at 1010 with a coincident closing pulse (slot0), mirroring
-    // stall -> acquire. The reduced snapshot deactivates LOCK_STALL; the
-    // ~1000-cycle hold is encoded as a Repeat skip-token run.
-    tu.notify_event(37, 1010, None);
-    tu.set_event_level(26, 1010, false);
-    tu.commit_cycle(1010);
-    assert!(tu.byte_buffer.len() > after_assert, "deassert + close must emit frames");
-    assert_eq!(tu.held_mask, 0, "level must be deasserted");
-
-    // The hold duration must be a Repeat1 skip-token frame (`0b110110xx` =>
-    // 0xD8..=0xDB), NOT ~1000 per-cycle frames.
-    let closing = &tu.byte_buffer[after_assert..];
-    assert!(
-        closing.iter().any(|&b| (b & 0b1111_1100) == 0b1101_1000),
-        "hold must encode as a Repeat1 skip run, got {:02x?}",
-        closing
-    );
-    assert!(
-        tu.byte_buffer.len() - start_len < 16,
-        "held span must be a handful of bytes, got {}",
-        tu.byte_buffer.len() - start_len
-    );
+    notify_commit(&mut tu, 37, 1); // the very next cycle: nothing idle
+    notify_commit(&mut tu, 38, 2); // and again
+    notify_commit(&mut tu, 37, 7); // 4 idle cycles (3..6)
+    tu.flush_repeats();
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x00, 0x10, 0x04]);
 }
 
-/// A one-cycle pulse fired DURING a held level must be closed by a follow-up
-/// held-only frame. Upstream `parse_trace` only deactivates an active event
-/// when a later frame's mask omits it; inside a hold every frame is `cycles==0`,
-/// so without the close frame the pulse stays asserted and merges with the next
-/// same-slot pulse (dropping its count). Mirrors HW's
-/// `Multiple(held|pulse) ; Multiple(held)` pattern.
+/// Identical consecutive frames are one frame plus Repeat tokens (silicon: a periodic
+/// PERF_CNT_2 is `Single2(cyc 1024)` plus a Repeat, never one frame per period).
 #[test]
-fn pulse_during_hold_emits_close_frame() {
+fn identical_consecutive_frames_become_a_repeat() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37);
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+
+    for n in 1..=4u64 {
+        notify_commit(&mut tu, 37, 100 * n); // frames 99 idle cycles apart; the first is 99 too
+    }
+    tu.flush_repeats();
+    // Single0 holds 4 bits only: 99 idle cycles is a Single1: 0x80 | slot 0 | hi 0, lo 99
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x80, 99, 0xE3]);
+}
+
+/// A held level writes a frame in every cycle it is asserted, run-length compressed: the
+/// opening frame carries the idle cycles before it, the rest of the hold is a second frame
+/// (cycles 0) plus a Repeat of the remaining cycles. An 8-cycle PORT_RUNNING hold after a
+/// gap decodes on silicon as `Single0(gap) Single0(0) Repeat0(6)`.
+#[test]
+fn a_lone_hold_is_an_opening_frame_a_cycles_0_frame_and_a_repeat() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    force_start(&mut tu, 28);
+    let start_len = tu.byte_buffer.len();
+
+    // slot1 asserts at cycle 10 (9 idle cycles after the start at 0), is asserted in 10..=17
+    // and drops at 18 with nothing coincident
+    tu.set_event_level(38, 10, true);
+    tu.commit_cycle(10);
+    tu.set_event_level(38, 18, false);
+    tu.commit_cycle(18);
+    tu.flush_repeats();
+
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x19, 0x10, 0xE6]);
+}
+
+/// A hold opened in the very cycle after the previous frame has no distinct opening frame:
+/// the frames are all `(mask, 0)` and compress into one frame plus a Repeat. A hold of
+/// 6353 cycles is six Repeat1(1023) and a Repeat1(215) (silicon's first LOCK_STALL hold).
+#[test]
+fn a_long_hold_chunks_its_repeats_like_silicon() {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+
+    tu.set_event_level(26, 1, true); // frames in 1..=6353
+    tu.commit_cycle(1);
+    tu.set_event_level(26, 6354, false);
+    tu.commit_cycle(6354);
+    tu.flush_repeats();
+
+    // one frame plus 6352 repeats: 6 x 1023 + 214 (the fills keep each opcode in a word)
+    let mut expected = vec![0x30];
+    for _ in 0..6 {
+        expected.extend_from_slice(&[0xDB, 0xFF]);
+    }
+    expected.extend_from_slice(&[0xD8, 0xD6]);
+    let body: Vec<u8> = tu.byte_buffer[start_len..].iter().copied().filter(|&b| b != 0xFE).collect();
+    assert_eq!(body, expected);
+}
+
+/// Repeat counts up to 15 are a Repeat0, up to 1023 a Repeat1 (silicon corpus: no Repeat1 of
+/// 15 or fewer, none of 0), longer runs are chunks of 1023.
+#[test]
+fn repeat_tokens_use_the_smallest_opcode() {
+    for (owed, expected) in [
+        (0u64, vec![]),
+        (6, vec![0xE6]),
+        (15, vec![0xEF]),
+        (16, vec![0xD8, 0x10]),
+        (1023, vec![0xDB, 0xFF]),
+        (1024, vec![0xDB, 0xFF, 0xE1]),
+    ] {
+        let mut tu = TraceUnit::new(0, 2);
+        tu.repeat_pending = owed;
+        tu.flush_repeats();
+        assert_eq!(tu.byte_buffer, expected, "{owed} repeats");
+    }
+}
+
+/// A one-cycle pulse inside a hold is its own frame with the held mask; the cycle after it
+/// is a held-only frame again (silicon: `Multiple(held|pulse) ; Multiple(held)`).
+#[test]
+fn pulse_during_hold_is_followed_by_a_held_only_frame() {
     let mut tu = TraceUnit::new(0, 2);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     // slot0=37 (pulse), slot3=26 (LOCK_STALL, a level)
     tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
     tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
 
-    tu.set_event_level(26, 10, true); // assert level (slot3 -> bit 0x08)
-    for c in 11..40 {
-        tu.commit_cycle(c);
-    }
-    let before = tu.byte_buffer.len();
-
-    // Pulse slot0 (bit 0x01) at cycle 40, while LOCK_STALL is held.
+    tu.set_event_level(26, 1, true);
+    tu.commit_cycle(1);
     tu.notify_event(37, 40, None);
     tu.commit_cycle(40);
+    tu.set_event_level(26, 50, false);
+    tu.commit_cycle(50);
+    tu.flush_repeats();
 
-    // The level stays held across the pulse...
-    assert_eq!(tu.held_mask, 0x08, "level stays held across the pulse");
-    // ...and the pulse is closed by a trailing held-only frame:
-    // Single0(slot3, cycles=0) = (3<<4)|0 = 0x30.
+    // 1: (slot3, 0); 2..=39: the same, 38 frames; 40: (slot0|slot3, 0); 41..=49: (slot3, 0)
+    // again, 9 frames; nothing at 50
     assert_eq!(
-        *tu.byte_buffer.last().unwrap(),
-        0x30,
-        "pulse during hold must be closed by a held-only frame; got {:02x?}",
-        &tu.byte_buffer[before..]
+        &tu.byte_buffer[start_len..],
+        &[0x30, 0xD8, 38, 0xFE, 0xC0, 0x90, 0x30, 0xE8],
+        "got {:02x?}",
+        &tu.byte_buffer[start_len..]
     );
+    assert_eq!(tu.held_mask, 0);
 }
 
-/// Isolating test for P1 (encoder) vs P2 (timeline): given HW's exact
-/// re-pulse edges, does EMU's encoder reproduce HW's re-checkpoint structure?
-///
-/// HW's memtile PORT_RUNNING_0 holds with periodic 1-cycle drops, encoded as
-/// `Event(cyc=0), Repeat(14), Event(cyc=1), Event(cyc=0), Repeat(14)` -- each
-/// momentary deassert/reassert is re-checkpointed, splitting the hold into
-/// multiple Repeat runs with a `cyc>0` re-pulse frame between them.
-///
-/// This drives the encoder directly with a held level that drops for one
-/// cycle and reasserts, isolating the encoder from any timeline gap. A
-/// faithful encoder preserves the re-pulse (>=2 Repeat runs); the current
-/// encoder's `active==0 -> return` path merges the drop into one continuous
-/// hold (1 Repeat run).
-///
-/// P2 (the per-BD-switch bubble) now feeds 1-cycle re-pulses to the encoder, so
-/// this is live: the encoder must re-checkpoint the drop into >=2 Repeat runs
-/// the way HW does, rather than merging it into one continuous hold.
+/// A level that drops and re-asserts a cycle later is two holds: the frame in the re-asserted
+/// cycle follows an idle cycle (silicon's PORT_RUNNING re-pulses are `Event(cyc=0) Repeat(14)
+/// Event(cyc=1) Event(cyc=0) Repeat(14)`).
 #[test]
-fn held_level_repulse_is_recheckpointed_not_merged() {
+fn a_dropped_and_reasserted_level_is_two_holds() {
     let mut tu = TraceUnit::new(0, 2);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
-    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot3=26 level
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    // Assert level (slot3) at cycle 10, hold 14 cycles.
-    tu.set_event_level(26, 10, true);
-    for c in 11..=24 {
-        tu.commit_cycle(c);
-    }
-    // Re-pulse: momentary 1-cycle drop (deassert@25, reassert@26).
-    tu.set_event_level(26, 25, false);
-    tu.commit_cycle(25);
-    tu.set_event_level(26, 26, true);
-    // Hold 14 more cycles, then close.
-    for c in 27..=40 {
-        tu.commit_cycle(c);
-    }
-    tu.set_event_level(26, 41, false);
-    tu.commit_cycle(41);
+    tu.set_event_level(26, 1, true); // frames 1..=15
+    tu.commit_cycle(1);
+    tu.set_event_level(26, 16, false); // cycle 16 idle
+    tu.commit_cycle(16);
+    tu.set_event_level(26, 17, true); // frames 17..=31
+    tu.commit_cycle(17);
+    tu.set_event_level(26, 32, false);
+    tu.commit_cycle(32);
+    tu.flush_repeats();
 
-    // Count Repeat runs: Repeat0 (0xE0..=0xEF) or Repeat1 (0xD8..=0xDB lead byte).
-    let body = &tu.byte_buffer[start_len..];
-    let repeat_runs = body.iter().filter(|&&b| (b & 0xF0) == 0xE0 || (b & 0xFC) == 0xD8).count();
-    assert!(
-        repeat_runs >= 2,
-        "re-pulse must be re-checkpointed into >=2 Repeat runs like HW, got \
-         {} run(s); body {:02x?}",
-        repeat_runs,
-        body
+    assert_eq!(
+        &tu.byte_buffer[start_len..],
+        &[0x30, 0xEE, 0x31, 0x30, 0xED],
+        "got {:02x?}",
+        &tu.byte_buffer[start_len..]
     );
 }
 
-/// With no levels asserted (`held_mask == 0`) the held-level mechanism is
-/// inert: pulse-event encoding is byte-identical to the pre-held-mask encoder.
+/// With no levels asserted the encoder is a plain pulse encoder.
 #[test]
-fn pulse_events_byte_identical_with_no_held_levels() {
+fn pulse_events_with_no_held_levels() {
     let mut tu = TraceUnit::new(0, 2);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x10, 37 | (38 << 8)); // slot0=37, slot1=38
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    notify_commit(&mut tu, 37, 5); // slot0, delta 5 -> Single0 0x05
-    notify_commit(&mut tu, 38, 9); // slot1, delta 4 -> Single0 (1<<4)|4 = 0x14
+    notify_commit(&mut tu, 37, 5); // 4 idle cycles: Single0 0x04
+    notify_commit(&mut tu, 38, 9); // 3 idle cycles: Single0 (1<<4)|3 = 0x13
     assert_eq!(tu.byte_buffer.len(), start_len + 2);
-    assert_eq!(tu.byte_buffer[start_len], 0x05);
-    assert_eq!(tu.byte_buffer[start_len + 1], 0x14);
+    assert_eq!(tu.byte_buffer[start_len], 0x04);
+    assert_eq!(tu.byte_buffer[start_len + 1], 0x13);
     assert_eq!(tu.held_mask, 0, "no levels asserted");
 }
 
-/// The mode-0 skip-run chunker must reproduce HW's exact held-level duration
-/// encoding: HW's first long LOCK_STALL hold (6353 cycles) decodes to six
-/// `Repeat1(1023)` frames + one `Repeat1(215)`. Bytes verified against the
-/// upstream `utils.py::convert_to_commands` opcode table.
+/// Silicon never lets a multi-byte opcode straddle a 32-bit word of the payload: the rest of
+/// the word is Skip (0xFE) and the opcode starts in the next one.
 #[test]
-fn mode0_skip_run_chunks_like_hw() {
+fn multi_byte_opcodes_do_not_straddle_a_word() {
     let mut tu = TraceUnit::new(0, 2);
-    tu.emit_skip_run(6353);
-    // Repeat1(1023) = [0xDB, 0xFF]; Repeat1(215) = [0xD8, 0xD7].
-    let mut expected = Vec::new();
-    for _ in 0..6 {
-        expected.push(0xDB);
-        expected.push(0xFF);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8));
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+    assert_eq!(start_len % 4, 0);
+
+    notify_commit(&mut tu, 37, 2); // Single0 at offset 0
+    notify_commit(&mut tu, 38, 4); // Single0 at offset 1
+    notify_commit(&mut tu, 37, 7); // Single0 at offset 2
+    notify_commit(&mut tu, 38, 200); // Single1 (2 bytes) would start at offset 3
+    tu.flush_repeats();
+    let body = &tu.byte_buffer[start_len..];
+    for op_at in 0..body.len() {
+        if body[op_at] & 0xE0 == 0x80 {
+            assert!(op_at % 4 < 3, "a Single1 at word offset {} straddles: {:02x?}", op_at % 4, body);
+        }
     }
-    expected.push(0xD8);
-    expected.push(0xD7);
-    assert_eq!(tu.byte_buffer, expected, "6353 must chunk as 6x1023 + 215");
+    assert!(body.contains(&0xFE), "the straddling opcode needs a fill: {:02x?}", body);
 }
 
-/// Small remainders (<=15) use the 1-byte Repeat0 frame, not Repeat1.
-#[test]
-fn mode0_skip_run_small_uses_repeat0() {
-    let mut tu = TraceUnit::new(0, 2);
-    tu.emit_skip_run(6);
-    assert_eq!(tu.byte_buffer, vec![0xE6], "Repeat0(6) = 0b1110_0110");
-}
-
-/// Exact-boundary chunking: 1024 = Repeat1(1023) + Repeat0(1).
-#[test]
-fn mode0_skip_run_boundary_1024() {
-    let mut tu = TraceUnit::new(0, 2);
-    tu.emit_skip_run(1024);
-    assert_eq!(tu.byte_buffer, vec![0xDB, 0xFF, 0xE1]);
-}
-
-/// A zero-length run emits nothing.
-#[test]
-fn mode0_skip_run_zero_is_empty() {
-    let mut tu = TraceUnit::new(0, 2);
-    tu.emit_skip_run(0);
-    assert!(tu.byte_buffer.is_empty());
-}
-
-/// A lone held level opened after an idle gap (`gap > 0`) emits a *two-frame*
-/// open: a position frame carrying the gap, then a separate `cycles=0` arming
-/// frame. Under upstream decode each frame contributes an implicit `timer += 1`,
-/// so the separate arming frame advances the decoder one uncompensated cycle
-/// beyond the level's B mark. The closing skip-run must therefore cover
-/// `D - 2` cycles (not `D - 1`) for the decoded span to equal the true hold `D`.
-///
-/// HW ground truth: an 8-cycle PORT_RUNNING hold opened after a gap decodes as
-/// `Single0(cyc=gap) + Single0(cyc=0) + Repeat0(6)` -- 6 == D - 2, not 7.
-/// (A `gap == 0` open folds position+arm into a single `cycles=0` frame and
-/// correctly uses `D - 1`; that path is covered by `mode0_skip_run_chunks_like_hw`
-/// and the LOCK_STALL 6353 == span-1 reference. This `D-2` correction is scoped
-/// to the gap-opened lone-hold close so it cannot regress the gap==0 case.)
-#[test]
-fn gap_opened_lone_hold_skip_run_is_d_minus_2() {
-    let mut tu = TraceUnit::new(0, 2);
-    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // start=28, stop=29
-    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot1=38
-    force_start(&mut tu, 28);
-    let start_len = tu.byte_buffer.len();
-
-    // slot1 asserts at cycle 10 (gap 10 since the start baseline at cycle 0),
-    // holds 8 cycles, deasserts at cycle 18 with nothing coincident (lone close).
-    // Level edges are committed once per cycle by commit_cycle (Phase 3f), so
-    // flush the closing cycle.
-    tu.set_event_level(38, 10, true);
-    tu.set_event_level(38, 18, false);
-    tu.commit_cycle(18);
-
-    let body = &tu.byte_buffer[start_len..];
-    // position Single0(slot1, cyc=10) = 0x1A; arm Single0(slot1, cyc=0) = 0x10;
-    // close Repeat0(6) = 0xE6 (D-2). The pre-fix encoder emitted 0xE7 (D-1).
-    assert_eq!(
-        body,
-        &[0x1A, 0x10, 0xE6],
-        "gap-opened 8-cycle lone hold must close with Repeat0(6)=D-2, got {:02x?}",
-        body
-    );
-}
-
-/// The gap-open's extra arming frame injects a +1 decoder-timeline skew that
-/// must be paid down at the NEXT skip-run regardless of which path emits it --
-/// not only the lone close. When a second level joins (a held-across-gap
-/// re-checkpoint) before the first closes, that continuation's skip-run is the
-/// next one and must absorb the debt: `Repeat(gap - 2)`, not `Repeat(gap - 1)`.
-/// Otherwise the skew survives and inflates the held span (the #140 concurrent
-/// PORT_RUNNING +1/+2/+3 over-count). Mirror of the lone-hold `D-2` rule for the
-/// concurrent path.
-#[test]
-fn gap_opened_hold_pays_skew_debt_on_continuation_skip_run() {
-    let mut tu = TraceUnit::new(0, 2);
-    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24)); // start=28, stop=29
-    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24)); // slot1=38, slot2=39
-    force_start(&mut tu, 28);
-    let start_len = tu.byte_buffer.len();
-
-    // slot1 gap-opens at cycle 10 (gap 10), then slot2 joins at cycle 20 while
-    // slot1 is still held (a held-across-gap re-checkpoint, gap 10).
-    tu.set_event_level(38, 10, true);
-    tu.set_event_level(39, 20, true);
-    tu.commit_cycle(20);
-
-    let body = &tu.byte_buffer[start_len..];
-    // position Single0(slot1,10)=0x1A; arm Single0(slot1,0)=0x10;
-    // continuation Repeat0(8)=0xE8 (gap 10 - 1 baseline - 1 debt); then the
-    // re-checkpoint Multiple0[1,2] cyc=0 = [0xC0, 0x60].
-    // Pre-fix the continuation emitted Repeat0(9)=0xE9 (debt dropped).
-    assert_eq!(
-        body,
-        &[0x1A, 0x10, 0xE8, 0xC0, 0x60],
-        "continuation skip-run after a gap-open must pay the +1 debt (Repeat0(8)), got {:02x?}",
-        body
-    );
-}
-
-/// Several level edges on the SAME cycle must coalesce into ONE frame (AM020's
-/// one-frame-per-cycle rule). `set_event_level` accumulates same-cycle held-mask
-/// changes; commit_cycle (Phase 3f) emits the single snapshot frame. Without
-/// coalescing each same-cycle edge emits its own `cycles=0` frame, and the
-/// decoder's +1-per-frame inflates every level held across that cycle -- the
-/// #140 PORT_RUNNING +2/+3 on re-asserted concurrent spans.
+/// Several level edges on the SAME cycle coalesce into ONE frame (AM020's one-frame-per-cycle
+/// rule): `set_event_level` accumulates same-cycle held-mask changes and `commit_cycle`
+/// writes the single snapshot.
 #[test]
 fn same_cycle_level_edges_coalesce_into_one_frame() {
     let mut tu = TraceUnit::new(0, 2);
@@ -427,8 +347,7 @@ fn same_cycle_level_edges_coalesce_into_one_frame() {
     force_start(&mut tu, 28);
     let start_len = tu.byte_buffer.len();
 
-    // slot1 gap-opens @10; @20 BOTH slot2 and slot3 assert (same cycle);
-    // slot1 deasserts @30. Driven like the coordinator: edges then commit_cycle.
+    // slot1 asserts @10; @20 both slot2 and slot3 assert; slot1 deasserts @30
     tu.set_event_level(38, 10, true);
     tu.commit_cycle(10);
     tu.set_event_level(39, 20, true);
@@ -436,17 +355,15 @@ fn same_cycle_level_edges_coalesce_into_one_frame() {
     tu.commit_cycle(20);
     tu.set_event_level(38, 30, false);
     tu.commit_cycle(30);
+    tu.flush_repeats();
 
+    // 10: slot1 after 9 idle cycles; 11..=19 slot1 alone (a cycles-0 frame, 8 repeats);
+    // 20..=29: slots 1-3 in ONE frame, 9 repeats; 30: slots 2-3 (the fills keep each
+    // two-byte opcode inside a word)
     let body = &tu.byte_buffer[start_len..];
-    // 1A 10        slot1 gap-open (position + arm; debt=1)
-    // E8 C0 E0     @20 coalesced: Repeat0(8)=10-1-1(debt), Multiple0[1,2,3] cyc=0
-    // E9 C0 C0     @30 slot1 close: Repeat0(9)=10-1, Multiple0[2,3] cyc=0
-    // slot1's decoded span is then 20 (= true hold 10->30). Without coalescing
-    // the @20 edges emit two frames (Multiple0[1,2] then Multiple0[1,2,3]) and
-    // slot1 inflates by 1.
     assert_eq!(
         body,
-        &[0x1A, 0x10, 0xE8, 0xC0, 0xE0, 0xE9, 0xC0, 0xC0],
+        &[0x19, 0x10, 0xE8, 0xFE, 0xC0, 0xE0, 0xE9, 0xFE, 0xC0, 0xC0],
         "same-cycle level edges must coalesce into one frame, got {:02x?}",
         body
     );
@@ -461,8 +378,8 @@ fn test_single1_encoding() {
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    // Event with delta=500 (fits in Single1: 10-bit delta)
-    notify_commit(&mut tu, 37, 500);
+    // 500 idle cycles (fits in Single1: 10-bit field)
+    notify_commit(&mut tu, 37, 501);
     assert_eq!(tu.byte_buffer.len(), start_len + 2); // Single1 = 2 bytes
 
     // Verify encoding: slot=0, delta=500
@@ -485,7 +402,7 @@ fn test_single1_encoding_nonzero_slot() {
     // Slot 1, delta=500: format 0b100EEETT
     // byte0 = 0x80 | (1 << 2) | (500 >> 8 = 1) = 0x80 | 0x04 | 0x01 = 0x85
     // byte1 = 500 & 0xFF = 0xF4
-    notify_commit(&mut tu, 38, 500);
+    notify_commit(&mut tu, 38, 501);
     assert_eq!(tu.byte_buffer[start_len], 0x85);
     assert_eq!(tu.byte_buffer[start_len + 1], 0xF4);
 
@@ -501,8 +418,8 @@ fn test_single2_encoding() {
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    // Event with delta=100000 (fits in Single2: 18-bit delta)
-    notify_commit(&mut tu, 37, 100000);
+    // 100000 idle cycles (fits in Single2: 18-bit field)
+    notify_commit(&mut tu, 37, 100001);
     assert_eq!(tu.byte_buffer.len(), start_len + 3); // Single2 = 3 bytes
 
     // Verify encoding: slot=0, delta=100000 = 0x186A0
@@ -529,7 +446,7 @@ fn test_single2_encoding_nonzero_slot() {
     // Format: 0b101EEETT TTTTTTTT TTTTTTTT
     // byte0 = 0xA0 | (3 << 2) | (0x186A0 >> 16 = 1) = 0xA0 | 0x0C | 0x01 = 0xAD
     // byte1 = 0x86, byte2 = 0xA0
-    notify_commit(&mut tu, 40, 100000);
+    notify_commit(&mut tu, 40, 100001);
     assert_eq!(tu.byte_buffer[start_len], 0xAD);
     assert_eq!(tu.byte_buffer[start_len + 1], 0x86);
     assert_eq!(tu.byte_buffer[start_len + 2], 0xA0);
@@ -555,8 +472,9 @@ fn test_packet_formation() {
     // Generate enough Single0 events to fill 28 bytes. Each event fires on
     // its own cycle and the per-cycle commit encodes it as 1 byte.
     // Start marker is 8 bytes, so we need 20 more Single0 events.
+    // Alternate two slots: identical consecutive frames would be one frame plus a Repeat.
     for i in 1..=20 {
-        notify_commit(&mut tu, 37, i as u64); // delta=1 each time
+        notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
     }
 
     // Should have exactly one packet now (28 bytes consumed)
@@ -655,12 +573,12 @@ fn test_packet_header_parity() {
     let mut tu = TraceUnit::new(2, 4);
     tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
     tu.write_register(0x04, (3 << 12) | 7); // pkt_type=3, pkt_id=7
-    tu.write_register(0x10, 37);
+    tu.write_register(0x10, 37 | (38 << 8));
 
     tu.notify_event(28, 0, None);
-    // Generate 20 events (each on its own cycle) to fill a packet
+    // Generate 20 events (each on its own cycle, alternating slots) to fill a packet
     for i in 1..=20 {
-        notify_commit(&mut tu, 37, i as u64);
+        notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
     }
 
     let packet = tu.pop_packet().unwrap();
@@ -680,21 +598,21 @@ fn test_slot_index_in_encoding() {
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    // Slot 0, delta=1: 0b00000001 = 0x01
+    // Slot 0, cycles field 0 (the cycle after the start): 0b00000000 = 0x00
     notify_commit(&mut tu, 37, 1);
-    assert_eq!(tu.byte_buffer[start_len], 0x01);
+    assert_eq!(tu.byte_buffer[start_len], 0x00);
 
-    // Slot 1, delta=1: 0b00010001 = 0x11
+    // Slot 1: 0b00010000 = 0x10
     notify_commit(&mut tu, 38, 2);
-    assert_eq!(tu.byte_buffer[start_len + 1], 0x11);
+    assert_eq!(tu.byte_buffer[start_len + 1], 0x10);
 
-    // Slot 2, delta=1: 0b00100001 = 0x21
+    // Slot 2: 0b00100000 = 0x20
     notify_commit(&mut tu, 39, 3);
-    assert_eq!(tu.byte_buffer[start_len + 2], 0x21);
+    assert_eq!(tu.byte_buffer[start_len + 2], 0x20);
 
-    // Slot 3, delta=1: 0b00110001 = 0x31
+    // Slot 3: 0b00110000 = 0x30
     notify_commit(&mut tu, 40, 4);
-    assert_eq!(tu.byte_buffer[start_len + 3], 0x31);
+    assert_eq!(tu.byte_buffer[start_len + 3], 0x30);
 }
 
 /// Verify our encoder matches mlir-aie's decoder (utils/trace/utils.py).
@@ -765,7 +683,7 @@ fn test_roundtrip_all_slots_all_formats() {
             let start_len = tu.byte_buffer.len(); // 8 bytes start marker
 
             let event_id = 37 + slot;
-            notify_commit(&mut tu, event_id, d); // delta = d (from start cycle 0)
+            notify_commit(&mut tu, event_id, d + 1); // d idle cycles after the start cycle 0
             let base = start_len;
             assert!(
                 tu.byte_buffer.len() >= base + expected_size,
@@ -871,11 +789,11 @@ fn test_packet_header_matches_mlir_aie_decoder() {
         let mut tu = TraceUnit::new(col, row);
         tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
         tu.write_register(0x04, ((pkt_type as u32) << 12) | (pkt_id as u32));
-        tu.write_register(0x10, 37);
+        tu.write_register(0x10, 37 | (38 << 8));
 
         tu.notify_event(28, 0, None);
         for i in 1..=20 {
-            notify_commit(&mut tu, 37, i as u64);
+            notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
         }
 
         let packet = tu.pop_packet().unwrap();
@@ -926,9 +844,9 @@ fn test_multiple0_two_slots_same_cycle() {
     );
 
     // byte0 bits [7:4] = 0b1100, bits [3:0] = mask[7:4] = 0b0000
-    // byte1 bits [7:4] = mask[3:0] = 0b1001, bits [3:0] = delta = 5
+    // byte1 bits [7:4] = mask[3:0] = 0b1001, bits [3:0] = idle cycles = 4
     assert_eq!(tu.byte_buffer[start_len], 0xC0);
-    assert_eq!(tu.byte_buffer[start_len + 1], (0b1001 << 4) | 5);
+    assert_eq!(tu.byte_buffer[start_len + 1], (0b1001 << 4) | 4); // cycle 5: 4 idle cycles
 }
 
 /// Three simultaneous events with delta too large for Multiple0 must use
@@ -942,10 +860,10 @@ fn test_multiple1_three_slots_delta_500() {
     tu.notify_event(28, 0, None);
     let start_len = tu.byte_buffer.len();
 
-    tu.notify_event(37, 500, None);
-    tu.notify_event(38, 500, None);
-    tu.notify_event(40, 500, None);
-    tu.commit_cycle(500);
+    tu.notify_event(37, 501, None);
+    tu.notify_event(38, 501, None);
+    tu.notify_event(40, 501, None);
+    tu.commit_cycle(501); // 500 idle cycles
 
     // Multiple1 = 3 bytes, mask=0b00001011, delta=500=0x1F4
     assert_eq!(tu.byte_buffer.len(), start_len + 3);
@@ -974,9 +892,9 @@ fn test_multiple2_all_slots_delta_100000() {
     let start_len = tu.byte_buffer.len();
 
     for id in 37..=44 {
-        tu.notify_event(id, 100000, None);
+        tu.notify_event(id, 100001, None);
     }
-    tu.commit_cycle(100000);
+    tu.commit_cycle(100001); // 100000 idle cycles
 
     // Multiple2 = 4 bytes, mask=0xFF, delta=100000=0x186A0 (18 bits)
     assert_eq!(tu.byte_buffer.len(), start_len + 4);
@@ -1035,10 +953,10 @@ fn test_multiple_roundtrip_matches_mlir_aie() {
 
         for i in 0u8..8 {
             if mask & (1 << i) != 0 {
-                tu.notify_event(37 + i, delta, None);
+                tu.notify_event(37 + i, delta + 1, None); // delta idle cycles
             }
         }
-        tu.commit_cycle(delta);
+        tu.commit_cycle(delta + 1);
 
         assert_eq!(
             tu.byte_buffer.len(),
@@ -1073,16 +991,16 @@ fn test_lazy_commit_on_cycle_change() {
 
     // Cycle 10: slot 1 fires. Previous cycle's frame commits first.
     tu.notify_event(38, 10, None);
-    // Single0 for slot 0 delta=5 = 0x05 (1 byte committed)
+    // Single0 for slot 0, 4 idle cycles = 0x04 (1 byte committed)
     assert_eq!(tu.byte_buffer.len(), start_len + 1);
-    assert_eq!(tu.byte_buffer[start_len], 0x05);
+    assert_eq!(tu.byte_buffer[start_len], 0x04);
     assert_eq!(tu.pending_slot_mask, 0b0000_0010);
 
     // commit_cycle(10) flushes the cycle-10 frame.
     tu.commit_cycle(10);
-    // Single0 for slot 1 delta=5 = 0b00010101 = 0x15
+    // Single0 for slot 1, 4 idle cycles = 0b00010100 = 0x14
     assert_eq!(tu.byte_buffer.len(), start_len + 2);
-    assert_eq!(tu.byte_buffer[start_len + 1], 0x15);
+    assert_eq!(tu.byte_buffer[start_len + 1], 0x14);
 }
 
 /// With 8 slots firing every cycle for many cycles, the byte rate must stay
@@ -1101,7 +1019,9 @@ fn test_per_cycle_coalesce_bounds_byte_rate() {
 
     const CYCLES: u64 = 100;
     for cycle in 1..=CYCLES {
-        for id in 37..=44 {
+        // alternate 8 and 7 slots: identical consecutive frames would be one frame and a Repeat
+        let ids = if cycle % 2 == 0 { 37..=44 } else { 37..=43 };
+        for id in ids {
             tu.notify_event(id, cycle, None);
         }
         tu.commit_cycle(cycle);

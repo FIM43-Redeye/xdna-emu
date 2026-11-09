@@ -3357,7 +3357,7 @@ mod tests {
         assert!(!tile.core_debug.is_done());
         assert_eq!(
             tile.core_trace.encoded_bytes()[8..],
-            [0xc0, 0x35],
+            [0xc0, 0x34],
             "raw event 65 and promoted group 46 must coalesce in the same cycle",
         );
         let ring = engine.device().async_errors.ring(1).unwrap();
@@ -4142,7 +4142,8 @@ mod tests {
     /// 0..4). Trace slots: slot 0 = PERF_CNT_0 (hw_id=5), slot 1 = TRUE
     /// (hw_id=1). After 6 steps the byte buffer contains an 8-byte Start
     /// marker plus a stream of Single0 TRUE frames, with one Multiple0
-    /// frame at cycle 4 carrying mask=0b11.
+    /// frame at cycle 4 carrying mask=0b11 (the TRUE frames of cycles 1..3 are one frame and
+    /// a Repeat).
     ///
     /// Multiple0 byte format (from encode_multiple):
     ///   byte0 = 0xC0 | (mask >> 4)
@@ -4224,6 +4225,12 @@ mod tests {
                 // Multiple2: 4 bytes
                 multiple_count += 1;
                 i += 4;
+            } else if b & 0xFC == 0xD8 {
+                // Repeat1: 2 bytes
+                i += 2;
+            } else if b & 0xF0 == 0xE0 || b == 0xFE {
+                // Repeat0 / Skip fill: 1 byte
+                i += 1;
             } else if b & 0x80 == 0 {
                 // Single0: 1 byte
                 i += 1;

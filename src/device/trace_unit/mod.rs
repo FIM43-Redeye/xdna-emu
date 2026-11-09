@@ -145,8 +145,10 @@ pub struct TraceUnit {
     /// = behavior-neutral. Applied ONLY in `encode_start`; every delta
     /// bookkeeping value stays in the raw cycle frame.
     origin_offset: u64,
-    /// Cycle of the last *emitted* frame (for delta computation). Updated
-    /// when `commit_cycle()` flushes the pending slot mask.
+    /// Cycle of the last frame silicon would have written (the start cycle before the
+    /// first one): the cycles field of the next frame is the idle cycles after it. A level
+    /// that is held writes a frame every cycle, so across a hold this is the cycle before
+    /// the next commit. Updated by `commit_pending_frame`.
     last_event_cycle: u64,
     /// Cycle that `pending_slot_mask` is being accumulated for. All slot
     /// bits set before this cycle advances are coalesced into one frame.
@@ -189,18 +191,14 @@ pub struct TraceUnit {
     /// `cycles==0` + Repeat. See
     /// `xdna-emu-priv: research/specs/2026-06-08-skip-token-held-level-encoding.md`.
     frame_held: u8,
-    /// Decoder-timeline skew the encoder owes the decoder, in cycles. Upstream
-    /// advances its timer `+1` for every frame, so any *extra* frame the encoder
-    /// emits beyond the one that positions a level's B mark -- the `cycles=0`
-    /// arming frame after a gap-positioned open, or the held-only close frame
-    /// `close_pulses_during_hold` emits -- pushes the decoder one cycle past the
-    /// logical timeline. That debt is paid down at the next skip-run
-    /// (`emit_skip_run_paying_debt`), which covers that many fewer cycles, so
-    /// the decoded spans stay exact regardless of how many re-checkpoints a hold
-    /// survives. Left unpaid, the skew accumulates across concurrent levels and
-    /// inflates every held span (#140 PORT_RUNNING +1/+2/+3 over-count). See
-    /// `xdna-emu-priv: research/specs/2026-06-08-skip-token-held-level-encoding.md`.
-    skip_debt: u64,
+    /// The last mode-0 event frame handed to the encoder, `(mask, cycles field)`. Silicon
+    /// writes a frame for every cycle in which anything is asserted and run-length
+    /// compresses identical consecutive frames into the frame plus Repeat tokens; this is
+    /// the frame those tokens repeat.
+    last_frame: Option<(u8, u64)>,
+    /// Repeats of `last_frame` counted but not yet written as Repeat tokens. Written when a
+    /// different frame (or the end of the trace) follows.
+    repeat_pending: u64,
     /// PC value associated with the most recent event in `pending_cycle`
     /// (mode 1 only). Mode 0 ignores this field entirely.
     pending_pc: u32,
@@ -257,7 +255,8 @@ impl TraceUnit {
             held_mask: 0,
             level_signals: 0,
             frame_held: 0,
-            skip_debt: 0,
+            last_frame: None,
+            repeat_pending: 0,
             level_dirty: false,
             pending_pc: 0,
             pc_truncate_warnings: 0,
@@ -449,6 +448,8 @@ impl TraceUnit {
                 // buffers) so the next start_event begins recording cleanly.
                 self.state = TraceState::Idle;
                 self.byte_buffer.clear();
+                self.last_frame = None;
+                self.repeat_pending = 0;
                 self.pending_words.clear();
                 self.pending_slot_mask = 0;
                 self.pending_pc = 0;
@@ -813,6 +814,8 @@ impl TraceUnit {
         if self.pending_slot_mask != 0 || self.level_dirty {
             self.commit_pending_frame();
         }
+        // Repeats still owed to the last frame belong before the padding.
+        self.flush_repeats();
 
         if self.byte_buffer.is_empty() {
             return;
@@ -853,89 +856,32 @@ impl TraceUnit {
         // this cycle's pulses. Pulses are consumed (cleared) after; held bits
         // persist in `held_mask` until deasserted.
         let active = self.held_mask | self.pending_slot_mask;
-        // Pulse-only bits (one-cycle events not held as levels). Inside a hold
-        // these need an explicit close frame, since upstream does not
-        // deactivate events on a cycles==0 frame.
-        let pulses = self.pending_slot_mask & !self.held_mask;
         self.pending_slot_mask = 0;
         // This commit flushes any deferred level change for `pending_cycle`.
         self.level_dirty = false;
 
         match self.mode {
             TraceMode::EventTime => {
-                // Skip-token model, matching upstream `aie.utils.trace.parse_trace`
-                // (the decoder the regression comparison actually runs). Upstream
-                // deactivates ALL active events on any `cycles>0` frame, so a held
-                // level only survives a multi-cycle gap if that gap is encoded as a
-                // `cycles==0` frame plus `Repeat` tokens. Design + HW reference:
-                // xdna-emu-priv: research/specs/2026-06-08-skip-token-held-level-encoding.md.
-                if active == 0 {
-                    // A held level deasserted with nothing coincident. HW emits
-                    // the hold's Repeat tokens at the drop (not deferred), then
-                    // closes the level at the following frame. Emit the skip run
-                    // for the hold's real duration now, advance the anchor to the
-                    // drop, and clear frame_held -- so a re-assertion re-opens via
-                    // the normal hold-open path, whose `Event(cyc=drop_gap),
-                    // Event(cyc=0)` IS the HW re-checkpoint that deactivates the
-                    // survivor and re-activates it, splitting a momentary drop
-                    // into two Repeat runs. (Previously a bare no-op return, which
-                    // merged drop+reassert into one continuous hold and
-                    // over-extended a pure-deassert close to the next event.)
-                    if self.frame_held != 0 {
-                        let hold = self.pending_cycle.saturating_sub(self.last_event_cycle);
-                        if hold > 1 {
-                            // The closing frame's implicit +1 supplies the final
-                            // hold cycle, so the run is `hold - 1` -- less any
-                            // skew debt this hold accrued (e.g. a gap-positioned
-                            // open's arming frame).
-                            self.emit_skip_run_paying_debt(hold - 1);
-                        }
-                        self.last_event_cycle = self.pending_cycle;
-                        self.frame_held = 0;
-                        self.try_emit_packet();
-                    }
-                    return;
-                }
-                let gap = self.pending_cycle.saturating_sub(self.last_event_cycle);
+                // Silicon writes one frame for every cycle in which an event is asserted
+                // (held levels included) and run-length compresses identical consecutive
+                // frames into the frame plus Repeat tokens. A frame's cycles field is the
+                // number of idle cycles since the previous frame (its own cycle is the
+                // decoder's implicit +1), so a frame in the very next cycle has 0. Levels
+                // only change at commits, so the cycles between two commits repeat the
+                // held snapshot of the earlier one; they are written here as one run.
+                let t = self.pending_cycle;
                 if self.frame_held != 0 {
-                    // A level was held across the gap: cover it with skip tokens so
-                    // upstream keeps survivors active, then emit this frame at
-                    // cycles=0. The closing frame's implicit +1 supplies the final
-                    // hold cycle, so the run is `gap - 1` -- less any skew debt
-                    // accrued since the last skip-run (a gap-positioned open's arm
-                    // frame, or a prior held-only close frame). This is the
-                    // re-checkpoint's chance to settle the debt; left unpaid it
-                    // would inflate every concurrent held span.
-                    if gap > 1 {
-                        self.emit_skip_run_paying_debt(gap - 1);
-                    }
-                    self.emit_event_frame(active, 0);
-                    self.close_pulses_during_hold(pulses);
-                } else if self.held_mask != 0 {
-                    // Opening a hold (no level was held across the gap). With an
-                    // idle gap, position+activate with the gap in the cycles field
-                    // first; then an immediate cycles=0 frame arms the skip
-                    // mechanism for the upcoming hold (mirrors HW's pulse-then-
-                    // cycles=0 hold open). At gap 0 the single cycles=0 frame
-                    // suffices.
-                    if gap > 0 {
-                        self.emit_event_frame(active, gap);
-                        // Two-frame open: the `cycles=0` arming frame below is an
-                        // extra frame beyond the one that positioned/activated B,
-                        // so it advances the decoder one cycle the logical
-                        // timeline lacks. Record the debt; the next skip-run pays
-                        // it. (A gap==0 open folds position+arm into one frame and
-                        // accrues no debt.)
-                        self.skip_debt += 1;
-                    }
-                    self.emit_event_frame(active, 0);
-                    self.close_pulses_during_hold(pulses);
-                } else {
-                    // Pure pulse / nothing held across the gap: the gap rides in the
-                    // frame's cycles field, as before.
-                    self.emit_event_frame(active, gap);
+                    let between = t.saturating_sub(self.last_event_cycle + 1);
+                    self.push_frame_run(self.frame_held, 0, between);
+                    self.last_event_cycle = self.last_event_cycle.max(t.saturating_sub(1));
                 }
-                self.last_event_cycle = self.pending_cycle;
+                if active != 0 {
+                    let idle = t.saturating_sub(self.last_event_cycle + 1);
+                    self.push_frame_run(active, idle, 1);
+                    self.last_event_cycle = t;
+                }
+                // A level that dropped with nothing else asserted writes no frame: the
+                // decoder closes it at the next frame, as silicon does.
                 self.frame_held = self.held_mask;
             }
             TraceMode::EventPc => {
@@ -1003,39 +949,45 @@ impl TraceUnit {
         }
     }
 
-    /// After a `cycles==0` frame that carried one-cycle `pulses` alongside held
-    /// levels, emit a follow-up `held_mask, cycles=0` frame to deactivate those
-    /// pulses. Upstream `parse_trace` only deactivates an active event when a
-    /// later frame's mask omits it; inside a hold every frame is `cycles==0`, so
-    /// without this close frame the pulse would stay asserted and merge with the
-    /// next same-slot pulse (dropping its count). Mirrors HW's
-    /// `Multiple(held|pulse) ; Multiple(held)` pattern (e.g. commands [42]->[43]
-    /// of the distribute_lateral core stream). No-op when no pulse fired or no
-    /// level remains held -- a lone pulse closes at the next frame as before.
-    fn close_pulses_during_hold(&mut self, pulses: u8) {
-        if pulses != 0 && self.held_mask != 0 {
-            self.emit_event_frame(self.held_mask, 0);
-            // This held-only frame is an extra frame at the same edge -- it
-            // advances the decoder one cycle the logical timeline lacks. Owe it;
-            // the next skip-run pays it (see `emit_skip_run_paying_debt`).
-            self.skip_debt += 1;
+    /// Append one mode-0 opcode. Silicon never lets a multi-byte opcode straddle a 32-bit
+    /// word of the packet payload: it fills the rest of the word with Skip (0xFE) and starts
+    /// the opcode in the next one (all 12.8k fills in the silicon corpus are of this kind).
+    fn push_op(&mut self, op: &[u8]) {
+        let used = self.byte_buffer.len() % 4;
+        if op.len() > 1 && used + op.len() > 4 {
+            self.byte_buffer.extend(std::iter::repeat(0xFE).take(4 - used));
         }
+        self.byte_buffer.extend_from_slice(op);
     }
 
-    /// Emit a skip run of `cycles` cycles, first settling any `skip_debt` the
-    /// encoder owes the decoder. Each unit of debt is an extra frame already
-    /// emitted that advanced the decoder timer one cycle beyond the logical
-    /// timeline, so the run covers that many fewer cycles. If the debt exceeds
-    /// this run it is absorbed in full (no Repeat emitted) and the remainder
-    /// carries to the next run -- the skew is global to the decoder timeline,
-    /// not scoped to one hold.
-    fn emit_skip_run_paying_debt(&mut self, cycles: u64) {
-        if self.skip_debt >= cycles {
-            self.skip_debt -= cycles;
-        } else {
-            let paid = cycles - self.skip_debt;
-            self.skip_debt = 0;
-            self.emit_skip_run(paid);
+    /// Write `count` consecutive identical frames: the frame itself, then Repeat tokens for
+    /// the rest, and fold the run into a previous identical frame so a periodic pulse is
+    /// one frame plus a Repeat however often it fires.
+    fn push_frame_run(&mut self, mask: u8, cycles: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if self.last_frame == Some((mask, cycles)) {
+            self.repeat_pending += count;
+            return;
+        }
+        self.flush_repeats();
+        self.emit_event_frame(mask, cycles);
+        self.last_frame = Some((mask, cycles));
+        self.repeat_pending = count - 1;
+    }
+
+    /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15).
+    fn flush_repeats(&mut self) {
+        let mut n = std::mem::take(&mut self.repeat_pending);
+        while n > 1023 {
+            self.encode_mode0_repeat1(1023);
+            n -= 1023;
+        }
+        match n {
+            0 => {}
+            1..=15 => self.encode_mode0_repeat0(n as u8),
+            _ => self.encode_mode0_repeat1(n as u16),
         }
     }
 
@@ -1062,14 +1014,13 @@ impl TraceUnit {
         if delta <= 15 {
             // Single0: 0b0EEETTTT (1 byte)
             let byte = (slot << 4) | (delta as u8 & 0x0F);
-            self.byte_buffer.push(byte);
+            self.push_op(&[byte]);
         } else if delta <= 1023 {
             // Single1: 0b100EEETT TTTTTTTT (2 bytes)
             let d = delta as u16;
             let byte0 = 0x80 | (slot << 2) | ((d >> 8) as u8 & 0x03);
             let byte1 = (d & 0xFF) as u8;
-            self.byte_buffer.push(byte0);
-            self.byte_buffer.push(byte1);
+            self.push_op(&[byte0, byte1]);
         } else {
             // Single2: 0b101EEETT TTTTTTTT TTTTTTTT (3 bytes)
             // Clamp to 18 bits (262143)
@@ -1077,9 +1028,7 @@ impl TraceUnit {
             let byte0 = 0xA0 | (slot << 2) | ((d >> 16) as u8 & 0x03);
             let byte1 = ((d >> 8) & 0xFF) as u8;
             let byte2 = (d & 0xFF) as u8;
-            self.byte_buffer.push(byte0);
-            self.byte_buffer.push(byte1);
-            self.byte_buffer.push(byte2);
+            self.push_op(&[byte0, byte1, byte2]);
         }
     }
 
@@ -1114,17 +1063,14 @@ impl TraceUnit {
             // Multiple0 (2 bytes)
             let byte0 = 0xC0 | (mask >> 4);
             let byte1 = ((mask & 0x0F) << 4) | (delta as u8 & 0x0F);
-            self.byte_buffer.push(byte0);
-            self.byte_buffer.push(byte1);
+            self.push_op(&[byte0, byte1]);
         } else if delta <= 1023 {
             // Multiple1 (3 bytes)
             let d = delta as u16;
             let byte0 = 0xD0 | (mask >> 6);
             let byte1 = ((mask & 0x3F) << 2) | ((d >> 8) as u8 & 0x03);
             let byte2 = (d & 0xFF) as u8;
-            self.byte_buffer.push(byte0);
-            self.byte_buffer.push(byte1);
-            self.byte_buffer.push(byte2);
+            self.push_op(&[byte0, byte1, byte2]);
         } else {
             // Multiple2 (4 bytes), clamp delta to 18 bits
             let d = delta.min(0x3FFFF) as u32;
@@ -1132,10 +1078,7 @@ impl TraceUnit {
             let byte1 = ((mask & 0x3F) << 2) | ((d >> 16) as u8 & 0x03);
             let byte2 = ((d >> 8) & 0xFF) as u8;
             let byte3 = (d & 0xFF) as u8;
-            self.byte_buffer.push(byte0);
-            self.byte_buffer.push(byte1);
-            self.byte_buffer.push(byte2);
-            self.byte_buffer.push(byte3);
+            self.push_op(&[byte0, byte1, byte2, byte3]);
         }
     }
 
@@ -1147,38 +1090,14 @@ impl TraceUnit {
     /// duration is encoded.
     fn encode_mode0_repeat0(&mut self, n: u8) {
         debug_assert!(n < 16, "Repeat0 count {} exceeds 4 bits", n);
-        self.byte_buffer.push(0xE0 | (n & 0x0F));
+        self.push_op(&[0xE0 | (n & 0x0F)]);
     }
 
     /// Mode-0 Repeat1 frame: `0b110110_RR RRRRRRRR` (2 bytes), 10-bit count
     /// (0..1023).
     fn encode_mode0_repeat1(&mut self, n: u16) {
         debug_assert!(n < 1024, "Repeat1 count {} exceeds 10 bits", n);
-        self.byte_buffer.push(0xD8 | ((n >> 8) as u8 & 0x03));
-        self.byte_buffer.push((n & 0xFF) as u8);
-    }
-
-    /// Emit a skip-token run covering `cycles` cycles of held-level hold time,
-    /// using `Repeat1(1023)` chunks plus a final `Repeat0`/`Repeat1` remainder.
-    ///
-    /// Matches HW's held-level duration encoding exactly: HW's first long
-    /// LOCK_STALL hold (6353 cycles) decodes to six `Repeat1(1023)` + one
-    /// `Repeat1(215)`, which this reproduces. The caller must have emitted the
-    /// opening `cycles==0` frame first so the decoder treats these as linear
-    /// timer extension rather than a deactivate/activate replay.
-    fn emit_skip_run(&mut self, mut cycles: u64) {
-        while cycles >= 1024 {
-            self.encode_mode0_repeat1(1023);
-            cycles -= 1023;
-        }
-        if cycles == 0 {
-            return;
-        }
-        if cycles <= 15 {
-            self.encode_mode0_repeat0(cycles as u8);
-        } else {
-            self.encode_mode0_repeat1(cycles as u16);
-        }
+        self.push_op(&[0xD8 | ((n >> 8) as u8 & 0x03), (n & 0xFF) as u8]);
     }
 
     /// Encode a Start marker with 56-bit timer value.

@@ -144,6 +144,12 @@ pub struct PerfCounterBank {
 
     /// Runtime state for each counter.
     state: [CounterState; MAX_PERF_COUNTERS],
+
+    /// A reset event zeroed the counter in the cycle before: the next cycle's count is
+    /// lost. Silicon: a PERF_CNT_N that resets itself at threshold T fires every T + 1
+    /// cycles, not every T (core trace, PERF_CNT_2 at 1024: frames 1025 cycles apart in
+    /// all 206 clean core captures of the bridge corpus).
+    reset_hold: [bool; MAX_PERF_COUNTERS],
 }
 
 impl PerfCounterBank {
@@ -169,6 +175,7 @@ impl PerfCounterBank {
             counter_value: [0; MAX_PERF_COUNTERS],
             event_value: [0; MAX_PERF_COUNTERS],
             state: [CounterState::Idle; MAX_PERF_COUNTERS],
+            reset_hold: [false; MAX_PERF_COUNTERS],
         }
     }
 
@@ -344,6 +351,7 @@ impl PerfCounterBank {
             // Reset zeros the counter value but does not change run state.
             if self.reset_event[i] == event_id && self.reset_event[i] != 0 {
                 self.counter_value[i] = 0;
+                self.reset_hold[i] = true;
             }
 
             // Stop takes priority over start (if same event is both start and stop,
@@ -381,6 +389,10 @@ impl PerfCounterBank {
         let mut threshold_events = Vec::new();
 
         for i in 0..self.num_counters {
+            // The cycle after a reset counts nothing (see `reset_hold`).
+            if std::mem::take(&mut self.reset_hold[i]) {
+                continue;
+            }
             if self.state[i] != CounterState::Active {
                 continue;
             }
