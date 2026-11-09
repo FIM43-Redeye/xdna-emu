@@ -646,8 +646,8 @@ pub fn subsystem_from_offset(offset: u32, tile_kind: TileKind) -> SubsystemKind 
                 SubsystemKind::StreamSwitch
             } else if in_range(
                 offset,
-                subsystem::shim::lock_request::OFFSET_START,
-                subsystem::shim::lock_request::OFFSET_END,
+                arch::registers::shim::LOCK_REQUEST_BASE,
+                arch::registers::shim::LOCK_REQUEST_END,
             ) {
                 SubsystemKind::LockRequest
             }

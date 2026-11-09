@@ -4,6 +4,7 @@
 //!   - (top-level): core module register offsets (CORE_CONTROL, etc.)
 //!   - `memory`: memory-module Lock_Request bitfield constants
 //!   - `mem_tile`: mem-tile-module Lock_Request bitfield constants
+//!   - `shim`: shim-module Lock_Request bitfield constants
 //!   - `dma`: compute-tile DMA channel control register offsets
 //!   - `ctrl_regs`: control-register IDs (crRnd, crSat, crSRSSign)
 
@@ -19,6 +20,12 @@ pub mod memory {
 pub mod mem_tile {
     //! AM025 memory_tile_module Lock_Request bit layout.
     include!(concat!(env!("OUT_DIR"), "/gen_memtile_lock.rs"));
+}
+
+/// Shim-module register constants.
+pub mod shim {
+    //! AM025 shim_module Lock_Request bit layout.
+    include!(concat!(env!("OUT_DIR"), "/gen_shim_lock.rs"));
 }
 
 /// Compute-tile DMA channel control register offsets.

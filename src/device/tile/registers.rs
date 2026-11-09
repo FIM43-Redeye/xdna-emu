@@ -18,6 +18,7 @@ impl Tile {
     pub fn read_register(&mut self, offset: u32) -> u32 {
         use xdna_archspec::aie2::registers::mem_tile as mt;
         use xdna_archspec::aie2::registers::memory as mm;
+        use xdna_archspec::aie2::registers::shim as sh;
         let reg_layout = super::super::regdb::device_reg_layout();
 
         // Lock_Request register - address encodes operation parameters
@@ -27,6 +28,8 @@ impl Tile {
                 return self.handle_lock_request(offset, true);
             }
         } else if self.is_compute() && (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
+            return self.handle_lock_request(offset, false);
+        } else if self.is_shim() && (sh::LOCK_REQUEST_BASE..sh::LOCK_REQUEST_END).contains(&offset) {
             return self.handle_lock_request(offset, false);
         }
         if let Some(bits) = self.lock_status_register(offset) {
@@ -143,10 +146,14 @@ impl Tile {
     pub fn read_register_for_ctrl_packet(&mut self, offset: u32) -> u32 {
         use xdna_archspec::aie2::registers::mem_tile as mt;
         use xdna_archspec::aie2::registers::memory as mm;
+        use xdna_archspec::aie2::registers::shim as sh;
         if self.is_mem() && (mt::LOCK_REQUEST_BASE..mt::LOCK_REQUEST_END).contains(&offset) {
             return self.handle_lock_request(offset, true);
         }
         if self.is_compute() && (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
+            return self.handle_lock_request(offset, false);
+        }
+        if self.is_shim() && (sh::LOCK_REQUEST_BASE..sh::LOCK_REQUEST_END).contains(&offset) {
             return self.handle_lock_request(offset, false);
         }
         self.read_register_pure(offset)
@@ -380,6 +387,12 @@ impl Tile {
                 o if o == reg_layout.memory_locks_underflow => Some(self.get_lock_underflow_bits(0, 16)),
                 _ => None,
             }
+        } else if self.is_shim() {
+            match offset {
+                o if o == reg_layout.shim_locks_overflow => Some(self.get_lock_overflow_bits(0, 16)),
+                o if o == reg_layout.shim_locks_underflow => Some(self.get_lock_underflow_bits(0, 16)),
+                _ => None,
+            }
         } else {
             None
         }
@@ -399,25 +412,16 @@ impl Tile {
     fn handle_lock_request(&mut self, offset: u32, is_memtile: bool) -> u32 {
         use xdna_archspec::aie2::registers::mem_tile as mt;
         use xdna_archspec::aie2::registers::memory as mm;
+        use xdna_archspec::aie2::registers::shim as sh;
 
-        let base = if is_memtile {
-            mt::LOCK_REQUEST_BASE
+        let (base, id_shift, id_mask) = if is_memtile {
+            (mt::LOCK_REQUEST_BASE, mt::LOCK_REQUEST_ID_SHIFT, mt::LOCK_REQUEST_ID_MASK)
+        } else if self.is_shim() {
+            (sh::LOCK_REQUEST_BASE, sh::LOCK_REQUEST_ID_SHIFT, sh::LOCK_REQUEST_ID_MASK)
         } else {
-            mm::LOCK_REQUEST_BASE
+            (mm::LOCK_REQUEST_BASE, mm::LOCK_REQUEST_ID_SHIFT, mm::LOCK_REQUEST_ID_MASK)
         };
         let addr = offset - base;
-
-        // Extract fields from address
-        let id_shift = if is_memtile {
-            mt::LOCK_REQUEST_ID_SHIFT
-        } else {
-            mm::LOCK_REQUEST_ID_SHIFT
-        };
-        let id_mask = if is_memtile {
-            mt::LOCK_REQUEST_ID_MASK
-        } else {
-            mm::LOCK_REQUEST_ID_MASK
-        };
 
         let lock_id = ((addr >> id_shift) & id_mask) as usize;
         let is_acquire = (addr >> mm::LOCK_REQUEST_ACQ_REL_BIT) & 1 != 0;

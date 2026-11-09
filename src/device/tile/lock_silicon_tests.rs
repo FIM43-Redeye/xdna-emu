@@ -416,3 +416,46 @@ pub(super) const RUN3: &[ProbeOp] = &[
     R(1, 0xD1BFC, 0x0),  // L6 (=7, ovf set) acq -1 result
     R(1, 0xC0060, 0x7),  // L6 value after
 ];
+
+// Shim tile, silicon 2026-11-08 (build/experiments/lock-leftovers, shim_host h1): the same
+// request/flag behaviour as the compute and memtile locks, on the shim's own register blocks
+// (Lock<n>_value 0x14000 + 0x10 n, flags 0x14120 / 0x14128, Lock_Request 0x40000 + lock << 10
+// + acq << 9 + change << 2). Lock 15 is overflowed (63 + 1 -> 0), lock 14 underflowed
+// (0 - 1 -> 63); requests on either are refused until the flag is cleared.
+const SHIM_PROBE: &[ProbeOp] = &[
+    R(0, 0x14120, 0x0),
+    R(0, 0x14128, 0x0),
+    W(0, 0x140F0, 0x3F), // Lock15_value = 63
+    W(0, 0x140E0, 0x0),  // Lock14_value = 0
+    R(0, 0x43C04, 0x1),  // L15 rel +1 result
+    R(0, 0x439FC, 0x1),  // L14 rel -1 result
+    R(0, 0x14120, 0x8000),
+    R(0, 0x14128, 0x4000),
+    R(0, 0x140F0, 0x0),
+    R(0, 0x140E0, 0x3F),
+    R(0, 0x43C04, 0x0), // L15 rel +1 on the frozen lock
+    R(0, 0x43BFC, 0x0), // L14 acq -1 on the frozen lock (count 63)
+    R(0, 0x14120, 0x8000),
+    W(0, 0x14120, 0xFFFF),
+    W(0, 0x14128, 0xFFFF),
+    R(0, 0x14120, 0x0),
+    R(0, 0x14128, 0x0),
+    R(0, 0x43C04, 0x1), // L15 rel +1, cleared
+    R(0, 0x43BFC, 0x1), // L14 acq -1, cleared
+    R(0, 0x140F0, 0x1),
+    R(0, 0x140E0, 0x3E),
+];
+
+#[test]
+fn shim_locks_match_the_silicon_probe() {
+    replay("shim", SHIM_PROBE);
+}
+
+#[test]
+fn the_whole_shim_lock_request_space_decodes_for_control_packets() {
+    let state = DeviceState::new_npu1();
+    for offset in [0x40000, 0x43C04, 0x439FC, 0x43FFC] {
+        assert!(state.ctrl_pkt_read_range_decodes(0, offset, 1), "shim Lock_Request {offset:#x}");
+    }
+    assert!(!state.ctrl_pkt_read_range_decodes(0, 0x44000, 1), "past the 16 kB request space");
+}

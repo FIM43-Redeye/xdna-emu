@@ -17,6 +17,7 @@
 //! - `gen_core_module.rs`     -- core module register offsets
 //! - `gen_memory_lock.rs`     -- memory tile Lock_Request bit constants
 //! - `gen_memtile_lock.rs`    -- mem tile Lock_Request bit constants
+//! - `gen_shim_lock.rs`       -- shim tile Lock_Request bit constants
 //! - `gen_stream_ranges.rs`   -- stream switch port index ranges
 //! - `gen_tct_actors.rs`      -- mlir-aie DMA channel-to-TCT actor tables
 //! - `trace_event_codes.rs`   -- trace event code tables
@@ -139,6 +140,7 @@ fn main() {
     gen_core_module(&regdb, &out_dir);
     gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
     gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
+    gen_lock_request(&regdb, &out_dir, "shim", "gen_shim_lock.rs");
 
     // Generate stream switch port type arrays and per-tile-type port ranges.
     let port_data = gen_stream_ports(&regdb, &out_dir);
