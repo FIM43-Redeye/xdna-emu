@@ -195,8 +195,8 @@ shim-queue MM2S stall probes now differ from silicon on 24 of 164 cases (50 befo
 unchanged; full bridge suite 207 pass / 0 fail on both compilers, 40 emulator traces changed against the
 branch base, scored against the same silicon capture: cleanly matching edge event types 46 -> 49, level
 interval-count mismatches 143 -> 149, summed edge |dt| -0.1% (`build/experiments/pipeline-fill/bridge-emu-ab.txt`).
-The new level mismatches are mostly memtile send-port (`PORT_RUNNING`) interval counts one higher: the
-port-side BD bubble, not separately probed.
+The level mismatches that moved include memtile send-port (`PORT_RUNNING_4`) interval counts one higher (the
+port-side BD bubble, not separately probed) and S2MM stream-starvation counts in both directions.
 
 **Open (not modelled):** every memtile-sourced path holds 4 words more than the emulator (the memtile egress
 staging or its DMA slave port: not separated; mem tiles had inherited the compute tile's 25), and every path
