@@ -190,6 +190,14 @@ read before the overwrite; prod = compute (0,2), consA = (0,3)):
 | prod -> idle shim S2MM | 52 | 48 |
 | consA -> idle shim S2MM | 60 | 56 |
 
+Regression evidence for the change (2026-11-10): R4-D3 all 25 points unchanged (EMU == HW); the banked
+shim-queue MM2S stall probes now differ from silicon on 24 of 164 cases (50 before, none newly); absorb probes
+unchanged; full bridge suite 207 pass / 0 fail on both compilers, 40 emulator traces changed against the
+branch base, scored against the same silicon capture: cleanly matching edge event types 46 -> 49, level
+interval-count mismatches 143 -> 149, summed edge |dt| -0.1% (`build/experiments/pipeline-fill/bridge-emu-ab.txt`).
+The new level mismatches are mostly memtile send-port (`PORT_RUNNING`) interval counts one higher: the
+port-side BD bubble, not separately probed.
+
 **Open (not modelled):** every memtile-sourced path holds 4 words more than the emulator (the memtile egress
 staging or its DMA slave port: not separated; mem tiles had inherited the compute tile's 25), and every path
 into an idle shim S2MM from the north holds 4 more (memtile South master or shim North slave: not separated;
