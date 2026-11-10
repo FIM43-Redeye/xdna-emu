@@ -979,7 +979,7 @@ spills) exposed:
 | how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | **pinned 2026-11-10**: raw-asm sweep, +5 used, +6 not; EMU == HW | confirmed |
 | descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) | confirmed |
 | negative or very large counts and sizes | compared unsigned over the 20 bits kept | **confirmed 2026-11-10** with the other 2D / 3D families, see [addressing.md](addressing.md) "Large and negative counts" | confirmed |
-| cross-tile fused unpack loads | go through the shared vector read, not captured | open | confirmable: cross-tile fused unpack capture |
+| cross-tile fused unpack loads | go through the shared neighbour-aware row fetch | **confirmed 2026-11-10**: ISA batch 219 (`CrossTileUnpackStrategy`), all four `vldb.unpack` forms read a copy stored into the north neighbour (own copy zeroed, so a fallback to own memory would show), EMU == HW, r1 == r2 | confirmed |
 | AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred | confirmable: Strix capture (halo) |
 
 ## Pack: fused `vst.pack.*` and standalone `vpack.*`

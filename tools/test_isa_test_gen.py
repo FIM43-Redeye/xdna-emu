@@ -4474,8 +4474,8 @@ class TestScalarCollisionStrategy:
         at = batches.index(mine[0])
         assert mine and batches[at:at + len(mine)] == mine, "collision batches are contiguous"
         # only the standalone batches generated after them follow: register width, cycle
-        # counter, control timing, vmov quarter, descriptor count
-        later = ("width", "cntr", "ctl", "vmovq", "desc")
+        # counter, control timing, vmov quarter, descriptor count, cross-tile unpack
+        later = ("width", "cntr", "ctl", "vmovq", "desc", "xunpack")
         assert all(any(k in t["operands"] for k in later for t in b["tests"]) for b in batches[at + len(mine):])
         for b in mine:
             for t in b["tests"]:
@@ -4545,7 +4545,7 @@ class TestScalarWidthStrategy:
         assert mine and batches[at:at + len(mine)] == mine
         # only the cycle-counter and control-timing batches come after them
         rest = batches[at + len(mine):]
-        assert all(any(k in t["operands"] for k in ("cntr", "ctl", "vmovq", "desc") for t in b["tests"]) for b in rest)
+        assert all(any(k in t["operands"] for k in ("cntr", "ctl", "vmovq", "desc", "xunpack") for t in b["tests"]) for b in rest)
         size = 4 * len(self.S.PATTERNS)
         for b in mine:
             for t in b["tests"]:
@@ -4789,6 +4789,37 @@ class TestDescriptorCountStrategy:
         vq = [i for i, b in enumerate(batches) if any("vmovq" in t["operands"] for t in b["tests"])]
         assert mine and min(mine) > max(vq)
         assert sum(len(batches[i]["tests"]) for i in mine) == len(self.S.cases())
+
+
+class TestCrossTileUnpackStrategy:
+    S = isa_test_gen.CrossTileUnpackStrategy
+
+    def _lines(self, name):
+        c = self.S.case(name)
+        asm = self.S().generate_test_point({"name": c["isa"]}, {"xunpack": name}, in_offset=0, out_offset=0)
+        return [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
+
+    def test_leads_are_real_isa_records(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        isa = json.load(open(path))
+        names = {i["name"] for ins in isa.values() for i in (ins.values() if isinstance(ins, dict) else ins)
+                 if isinstance(i, dict)}
+        assert set(self.S.FORMS.values()) <= names
+
+    def test_north_copy_then_own_zeroed_then_both_unpacked(self):
+        for c in self.S.cases():
+            lines = self._lines(c["name"])
+            north, own = lines.index("vst wl0, [p2, #0]"), lines.index("vst wl1, [p3, #0]")
+            op = f"vldb.unpack.{c['form']}"
+            assert north < own < lines.index(f"{op} x2, [p2], m0") < lines.index(f"{op} x4, [p3], m0")
+            assert "xor r1, r0, r2" in lines and "movxm r2, #0x10000" in lines
+            assert lines[0] == "mov r24, m0" and "mov m0, r24" in lines
+
+    def test_never_writes_the_stack_pointer_copy(self):
+        for c in self.S.cases():
+            isa_test_gen._check_reserved_registers(["\n".join(self._lines(c["name"]))])
 
 
 class TestReservedRegisterGuard:

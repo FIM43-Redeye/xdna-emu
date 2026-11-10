@@ -4246,6 +4246,72 @@ class DescriptorCountStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# CrossTileUnpackStrategy: fused vldb.unpack from the north neighbour's memory
+# ---------------------------------------------------------------------------
+
+class CrossTileUnpackStrategy(TestStrategy):
+    """`vldb.unpack.*` through a north-neighbour address, beside the same load from own memory.
+
+    The test point copies its 32 input bytes into the north neighbour at the input's offset
+    (address bit 16 flipped: bits 16-17 = 2 select north, docs/fidelity-gaps/addressing.md; the
+    window the LUT-address probe already stores into), zeroes the own copy, then runs the fused
+    unpack from both and stores both results: north must unpack the data, own must give zeros.  `m0` (the post-modify, 0
+    here) is saved and restored; p2 / p3 are reset to p1 afterwards.
+    """
+
+    # form -> post-modify record (TableGen names the d8.d4 one without the `ag_` infix)
+    FORMS = {"s16.s8": "VLDB_UNPACK_S16_S8_ag_pstm_nrm", "d16.d8": "VLDB_UNPACK_D16_D8_ag_pstm_nrm",
+             "s8.s4": "VLDB_UNPACK_S8_S4_ag_pstm_nrm", "d8.d4": "VLDB_UNPACK_D8_D4_pstm_nrm"}
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        return [{"name": f"xunpack_{f.replace('.', '_')}", "form": f, "isa": isa}
+                for f, isa in cls.FORMS.items()]
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if any(c["isa"] == instr["name"] for c in self.cases()):
+            return (True, "")
+        return (False, "not a cross-tile unpack lead")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"xunpack": c["name"]} for c in self.cases() if c["isa"] == instr["name"]]
+
+    def compute_input_size(self, instr, regs):
+        return 32
+
+    def compute_output_size(self, instr):
+        return 128      # north result, own result
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["xunpack"])
+        in_offset, out_offset = _align(in_offset, 32), _align(out_offset, 32)
+        op = f"vldb.unpack.{c['form']}"
+        lines = [f"  // ---- test (cross-tile unpack): {op} north vs own ----"]
+        lines += ["  mov r24, m0", "  movxm r0, #0", "  mov m0, r0"]
+        lines += ["  mov r0, p0", f"  movxm r1, #{in_offset}", "  movxm r2, #0x10000"] + _nop_sled(1)
+        lines += ["  add r0, r0, r1"] + _nop_sled(1) + ["  xor r1, r0, r2"] + _nop_sled(1)
+        lines += ["  mov p3, r0", "  mov p2, r1"] + _nop_sled(3)
+        lines += _vector_load("wl0", "p3", 0) + _nop_sled(8)
+        # The own copy is then overwritten with zeros (the output slot, zeroed by the preamble),
+        # so a north address that fell back to own memory would show as zeros, not the data.
+        lines += ["  vst wl0, [p2, #0]"] + _vector_load("wl1", "p1", out_offset) + _nop_sled(8)
+        lines += ["  vst wl1, [p3, #0]"] + _nop_sled(8)
+        lines += [f"  {op} x2, [p2], m0"] + _nop_sled(1) + [f"  {op} x4, [p3], m0"] + _nop_sled(8)
+        lines += (_vector_store("wl2", "p1", out_offset) + _vector_store("wh2", "p1", out_offset + 32)
+                  + _vector_store("wl4", "p1", out_offset + 64) + _vector_store("wh4", "p1", out_offset + 96))
+        lines += ["  mov m0, r24", "  mov p2, p1", "  mov p3, p1"] + _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # VmovQuarterStrategy: 256-bit moves between a w register and an accumulator quarter
 # ---------------------------------------------------------------------------
 
@@ -6246,6 +6312,12 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     desc_specs = [(by_name[c["isa"]], k, {"desc": c["name"], "_combo_idx": 0}, desc_strategy)
                   for k, c in enumerate(DescriptorCountStrategy.cases())]
 
+    # Fused unpack from the north neighbour (CrossTileUnpackStrategy): standalone batch after
+    # the descriptor-count ones.
+    xunpack_strategy = CrossTileUnpackStrategy()
+    xunpack_specs = [(by_name[c["isa"]], k, {"xunpack": c["name"], "_combo_idx": 0}, xunpack_strategy)
+                     for k, c in enumerate(CrossTileUnpackStrategy.cases())]
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6581,7 +6653,8 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs, vmovq_specs, desc_specs):
+    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs, vmovq_specs, desc_specs,
+                  xunpack_specs):
         chunk, chunk_bundles = [], 0
         for spec in specs:
             instr, _, regs, strategy = spec
@@ -6600,7 +6673,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
                          + len(collision_specs) + len(width_specs) + len(cntr_specs) + len(ctl_specs) + len(vmovq_specs)
-                         + len(desc_specs)
+                         + len(desc_specs) + len(xunpack_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())
