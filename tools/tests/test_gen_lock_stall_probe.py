@@ -445,3 +445,24 @@ def test_vlk_ups_window_starts_later_and_keeps_every_acquire_distance():
     assert prog[2].startswith("  acq ") and prog[3] == g.N and prog[4] == g.VLK_KINDS["ups"].copy(0)
     _, files = g.vlk_case("ups", 1, "stall", 100)
     assert sum(l.startswith("  vst wl") for l in files["consumer.s"].splitlines()) == 9  # data + 8 copies
+
+
+@pytest.mark.parametrize("lanes", list(g.GPOS_LANES))
+def test_gpos_reads_the_counter_in_every_bundle_after_the_load(lanes):
+    prog = g.gpos_program("4x32.lo", lanes)
+    assert prog[1] == "  vldb.4x32.lo wl10, wl8"
+    assert [l for l in prog if "cntr" in l] == [g._ts(i) for i in range(8)]
+    _, files = g.gpos_case("4x32.lo", lanes)
+    inserts = [l for l in files["consumer.s"].splitlines() if "vinsert" in l]
+    assert len(inserts) == sum(1 for o in g.GPOS_LANES[lanes] if o)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("form", ["vldb", *g.GPOS_FORMS])
+def test_gpos_assembles(form, tmp_path):
+    _, files = g.gpos_case(form, "far")
+    s = tmp_path / "c.s"
+    s.write_text(files["consumer.s"])
+    res = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "c.o"), str(s)],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr

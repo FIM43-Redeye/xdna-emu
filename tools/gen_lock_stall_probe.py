@@ -293,6 +293,40 @@ def pos_case(kind: str, mode: str, late_iters: int):
     return _topology(name, _frame(body), prod, 0)
 
 
+# -- gpos: where the vldb.4x gather costs the core a cycle -----------------------------
+
+# lane byte offsets from the gather base (lanes 0..7) for each address pattern
+GPOS_LANES = {
+    "same": [0] * 8,
+    "word": [4 * k for k in range(8)],          # one 32-byte row
+    "row": [16 * k for k in range(8)],          # consecutive 16-byte rows
+    "far": [128 * k for k in range(8)],
+}
+GPOS_FORMS = [f"4x{w}.{h}" for w in (16, 32, 64) for h in ("lo", "hi")]
+GPOS_BASE, GPOS_LOG_BYTES = 64, 64 + 1024 + 64
+
+
+def gpos_program(form: str, lanes: str) -> list[str]:
+    """Counter reads before and in each of the 7 bundles after one load (`form` a gather
+    form, or `vldb` for the plain-load control)."""
+    load = "  vldb wl10, [p0, #32]" if form == "vldb" else f"  vldb.{form} wl10, wl8"
+    return [_ts(0), load, *[_ts(i) for i in range(1, 8)]]
+
+
+def gpos_case(form: str, lanes: str):
+    if form != "vldb" and form not in GPOS_FORMS:
+        raise ValueError(f"form is vldb or one of {GPOS_FORMS}")
+    offs = GPOS_LANES[lanes]
+    body = ["  mov r7, p0", *[N] * 2, f"  add r7, r7, #{GPOS_BASE}", *[N] * 2, "  vbcst.32 x8, r7", *[N] * 2]
+    for lane, off in enumerate(offs):
+        if off:
+            body += [f"  add r9, r7, #{off}", f"  mov r29, #{lane}", *[N] * 2,
+                     "  vinsert.32 x8, x8, r29, r9", *[N] * 6]
+    body += [*[N] * 8, *gpos_program(form, lanes), *[N] * 8, *_store_ts(8, 0)]
+    name = f"gpos_{form.replace('.', '')}_{lanes}"
+    return _topology(name, _frame(body), _frame([*[N] * 2]), 0, GPOS_LOG_BYTES)
+
+
 def parse_pos(consumer_log: bytes) -> list[int]:
     """Cycle differences between consecutive counter reads (read 0 before the request)."""
     ts = struct.unpack_from("<8I", consumer_log)
@@ -1392,6 +1426,15 @@ def cmd_generate(args) -> int:
             made = [vlk_case(kind, d, m, args.late_iters) for d in ds for m in args.modes]
             metas = [{"family": "vlk", "kind": kind, "d": d, "mode": m, "late_iters": args.late_iters}
                      for d in ds for m in args.modes]
+        elif fam.startswith("gpos"):
+            # gpos (every form and lane pattern, plus the vldb control) or gpos_LANES
+            parts = fam.split("_")[1:]
+            pats = parts or list(GPOS_LANES)
+            made, metas = [], []
+            for lanes in pats:
+                for form in ["vldb", *GPOS_FORMS] if lanes == pats[0] else GPOS_FORMS:
+                    made.append(gpos_case(form, lanes))
+                    metas.append({"family": "gpos", "form": form, "lanes": lanes})
         elif fam == "same":
             made = [same_case(m, args.late_iters) for m in args.modes]
             metas = [{"family": "same", "mode": m, "late_iters": args.late_iters} for m in args.modes]
@@ -1513,7 +1556,7 @@ def cmd_analyze(args) -> int:
             nf = f"+{r['new_from'] + w0 - 1}" if r["new_from"] else "none"
             print(f"{name:20s} from+{w0} {caps}  new_from={nf} window={r['window']}")
             continue
-        if meta["family"] in ("pos", "relpos"):
+        if meta["family"] in ("pos", "relpos", "gpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
             continue
         if meta["family"] in ("lk", "same"):
