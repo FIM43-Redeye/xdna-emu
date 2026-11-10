@@ -2082,6 +2082,21 @@ def output_zeroing_bundles(out_size: int) -> int:
 PREAMBLE_BUNDLES = 9 + 111 + 22  # = 142 (excludes output zeroing)
 
 
+# A test point's own code must not write r8: the preamble keeps the stack pointer there and
+# the epilogue restores sp from it, so a clobbered r8 returns through a wrong stack and the
+# kernel hangs (on silicon: a TDR).  Destination-first syntax: the first operand is written,
+# except for stores, which read it.
+_WRITES_R8 = re.compile(r"^\s*(?!st\b|vst\b|st\.)[a-z][\w.]*\s+(r9:)?r8\b")
+
+
+def _check_reserved_registers(test_points: list[str]) -> None:
+    for point in test_points:
+        for line in point.splitlines():
+            code = line.split("//", 1)[0]
+            if _WRITES_R8.match(code):
+                raise ValueError(f"test point writes r8 (the preamble's stack pointer copy): {line.strip()}")
+
+
 def build_mega_program(test_points: list[str], out_size: int = 0) -> str:
     """Build a complete .s file from a list of test point assembly strings.
 
@@ -2093,6 +2108,7 @@ def build_mega_program(test_points: list[str], out_size: int = 0) -> str:
     Returns:
         Complete assembly program as a string.
     """
+    _check_reserved_registers(test_points)
     # Callee-saved registers per AIE2 ABI (AIE2CallingConv.td):
     #   r16-r23, p6, p7, lr
     # Some test instructions are hardware-constrained to write these

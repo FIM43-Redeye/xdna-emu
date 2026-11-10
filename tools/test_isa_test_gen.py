@@ -420,7 +420,7 @@ class TestClassifyInstruction:
         ])
         status, reason = classify_instruction(instr)
         assert status == "skipped", f"Expected skipped, got {status}: {reason}"
-        assert "nondeterministic" in reason
+        assert "absolute cycle counter" in reason
 
     def test_imm_only_skipped(self):
         """Instructions with only immediate operands (no register output)."""
@@ -4473,8 +4473,10 @@ class TestScalarCollisionStrategy:
         mine = [b for b in batches if any("case" in t["operands"] for t in b["tests"])]
         at = batches.index(mine[0])
         assert mine and batches[at:at + len(mine)] == mine, "collision batches are contiguous"
-        # only the register-width batches (ScalarWidthStrategy) follow them
-        assert all(any("width" in t["operands"] for t in b["tests"]) for b in batches[at + len(mine):])
+        # only the standalone batches generated after them follow: register width, cycle
+        # counter, control timing
+        later = ("width", "cntr", "ctl")
+        assert all(any(k in t["operands"] for k in later for t in b["tests"]) for b in batches[at + len(mine):])
         for b in mine:
             for t in b["tests"]:
                 assert t["payload"] == [{"core": "core", "buffer": "out", "offset": t["out_offset"], "size": 8}]
@@ -4539,7 +4541,11 @@ class TestScalarWidthStrategy:
             pytest.skip("aie2-isa.json not found")
         batches = generate_all(path, str(tmp_path / "isa"))["batches"]
         mine = [b for b in batches if any("width" in t["operands"] for t in b["tests"])]
-        assert mine and batches[-len(mine):] == mine
+        at = batches.index(mine[0])
+        assert mine and batches[at:at + len(mine)] == mine
+        # only the cycle-counter and control-timing batches come after them
+        rest = batches[at + len(mine):]
+        assert all(any(k in t["operands"] for k in ("cntr", "ctl") for t in b["tests"]) for b in rest)
         size = 4 * len(self.S.PATTERNS)
         for b in mine:
             for t in b["tests"]:
@@ -4659,3 +4665,66 @@ class TestBranchLlJzTaken:
         assert "store volatile i32 0, ptr %slot" in body
         assert "load volatile i32, ptr %slot" in body
         assert "%in" not in body.split("entry:")[1], "random input is never zero"
+
+
+class TestCycleCounterStrategy:
+    S = isa_test_gen.CycleCounterStrategy
+
+    def test_reads_twice_gap_bundles_apart(self):
+        instr = {"name": "MOV_CNTR", "mnemonic": "mov"}
+        for c in self.S.cases():
+            asm = self.S().generate_test_point(instr, {"cntr": c["name"]}, in_offset=0, out_offset=64)
+            lines = [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
+            first, second = lines.index("mov r25:r24, cntr"), lines.index("mov r27:r26, cntr")
+            assert second - first - 1 == c["gap"]
+            assert "st r6, [p1, #64]" in lines and "st r7, [p1, #68]" in lines
+
+    def test_batches_come_after_the_width_batches(self, tmp_path):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        batches = generate_all(path, str(tmp_path / "isa"))["batches"]
+        mine = [i for i, b in enumerate(batches) if any("cntr" in t["operands"] for t in b["tests"])]
+        width = [i for i, b in enumerate(batches) if any("width" in t["operands"] for t in b["tests"])]
+        assert mine and min(mine) > max(width)
+        assert sum(len(batches[i]["tests"]) for i in mine) == len(self.S.GAPS)
+
+
+class TestControlTimingStrategy:
+    S = isa_test_gen.ControlTimingStrategy
+
+    def _lines(self, name):
+        c = self.S.case(name)
+        asm = self.S().generate_test_point({"name": c["isa"]}, {"ctl": name}, in_offset=0, out_offset=0)
+        return [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
+
+    def test_write_sits_dist_bundles_from_the_op(self):
+        for c in self.S.cases():
+            t = self.S.TARGETS[c["target"]]
+            lines = self._lines(c["name"])
+            op = next(i for i, l in enumerate(lines) if l.startswith(("vpack", "vunpack")))
+            write = lines.index(f"movx {t['reg']}, r11")
+            assert write - op == c["dist"], c["name"]
+
+    def test_registers_are_saved_and_restored(self):
+        for c in self.S.cases():
+            t = self.S.TARGETS[c["target"]]
+            lines = self._lines(c["name"])
+            assert lines[0] == f"mov r13, {t['reg']}" and f"movx {t['reg']}, r13" in lines
+            if t["fixed"]:
+                reg = t["fixed"][0]
+                assert f"mov r12, {reg}" in lines and f"movx {reg}, r12" in lines
+
+    def test_never_writes_the_stack_pointer_copy(self):
+        for c in self.S.cases():
+            isa_test_gen._check_reserved_registers(["\n".join(self._lines(c["name"]))])
+
+
+class TestReservedRegisterGuard:
+    def test_rejects_writes_to_r8_and_its_pair(self):
+        for line in ("  movxm r8, #0", "  mov r8, r0", "  add r8, r8, r9", "  mov r9:r8, cntr"):
+            with pytest.raises(ValueError):
+                isa_test_gen._check_reserved_registers([line])
+
+    def test_allows_reads_of_r8(self):
+        isa_test_gen._check_reserved_registers(["  st r8, [p1, #0]", "  movx crSat, r8", "  mov r1, r8"])
