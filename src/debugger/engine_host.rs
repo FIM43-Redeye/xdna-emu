@@ -233,11 +233,14 @@ mod tests {
             .join("../mlir-aie/build/test/npu-xrt/matrix_multiplication_using_cascade/chess")
     }
 
-    fn total_dma_bytes(host: &EngineHost) -> u64 {
+    /// Bytes moved by the memtile and compute-tile DMAs: the design's own data. Shim DMAs are
+    /// left out because a traced design also drains its trace packets through one, and trace
+    /// volume says nothing about whether the design runs.
+    fn array_dma_bytes(host: &EngineHost) -> u64 {
         let array = &host.engine.device().array;
         let mut bytes = 0;
         for col in 0..array.cols() {
-            for row in 0..array.rows() {
+            for row in (0..array.rows()).filter(|r| *r != xdna_archspec::aie2::SHIM_ROW) {
                 if let Some(eng) = array.dma_engine(col, row) {
                     for ch in 0..eng.channel_count() as u8 {
                         if let Some(st) = eng.channel_stats(ch) {
@@ -343,9 +346,10 @@ mod tests {
             "variant design must resolve a control program, got {:?}",
             host.control_program
         );
-        host.step_bounded(20_000);
+        // The first design transfers land near cycle 24k (the runtime sequence runs first).
+        host.step_bounded(60_000);
         assert!(
-            total_dma_bytes(&host) > 0,
+            array_dma_bytes(&host) > 0,
             "with its control program loaded the design must actually move data"
         );
     }
