@@ -149,6 +149,33 @@ impl DmaEngine {
         }
     }
 
+    /// Move one staged word of a compute / memtile MM2S into its stream output
+    /// register, and drive the stream-side STREAM_BACKPRESSURE level: the
+    /// register is still occupied while a staged word (or a BD still being
+    /// fetched) waits behind it. Runs every step whatever the FSM is doing,
+    /// so the words of a finished BD keep draining (`staged_mm2s_cycle`).
+    pub(super) fn drain_egress_staging(&mut self, ch_idx: usize) {
+        let channel = ch_idx as u8;
+        let blocked = !self.can_push_stream_out_for_channel(channel);
+        if self.channels[ch_idx].egress_gap > 0 {
+            self.channels[ch_idx].egress_gap -= 1;
+        } else if !blocked {
+            if let Some(word) = self.channels[ch_idx].egress_staging.pop_front() {
+                self.push_stream_out(word.data);
+                if word.ends_bd {
+                    self.channels[ch_idx].egress_gap = self.timing_config.bd_switch_bubble_cycles;
+                }
+            }
+        }
+        let fetching = matches!(&self.channels[ch_idx].fsm, ChannelFsm::Transferring { transfer }
+            if self.uses_egress_staging(transfer));
+        let held = blocked && (!self.channels[ch_idx].egress_staging.is_empty() || fetching);
+        if held != self.channels[ch_idx].egress_backpressure {
+            self.channels[ch_idx].egress_backpressure = held;
+            self.trace(EventType::DmaStreamStarvation { channel, active: held });
+        }
+    }
+
     /// Pop a word from any non-empty MM2S channel's stream output buffer.
     ///
     /// Used by callers that want to drain the engine without caring about
@@ -510,12 +537,9 @@ impl DmaEngine {
     }
 
     /// Words currently held in flat channel `ch`'s egress staging FIFO (MM2S;
-    /// always 0 for an S2MM channel or an idle one). Inspection only.
+    /// always 0 for an S2MM channel). Inspection only.
     pub fn staged_words(&self, ch: u8) -> usize {
-        self.channels
-            .get(ch as usize)
-            .and_then(|c| c.fsm.transfer())
-            .map_or(0, |t| t.staged_words)
+        self.channels.get(ch as usize).map_or(0, |c| c.egress_staging.len())
     }
 
     /// Is S2MM channel `ch` currently stalled waiting for its acquire lock?

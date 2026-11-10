@@ -193,28 +193,6 @@ pub struct Transfer {
     /// leaves it untouched and re-presents the identical demand next cycle.
     pub last_access_addr: Option<u64>,
 
-    /// MM2S only: words fetched from memory into the channel's egress staging
-    /// FIFO but not yet handed to the stream port.
-    ///
-    /// The memory side reads a whole 16-byte granule in one bank slot; the
-    /// stream side drains one 32-bit word per cycle. This is the occupancy
-    /// between them, and it is what lets the DMA lose a bank arbitration
-    /// without bubbling the stream. The words themselves are in `staged_data`.
-    ///
-    /// The fetch position is always `address_gen.current()` advanced by
-    /// `staged_words`, so draining a word (address_gen += 1, staged -= 1)
-    /// leaves the next granule fetch's address -- and therefore its bank
-    /// demand -- unchanged. That is what keeps a bank-denied channel
-    /// re-presenting the identical demand next cycle.
-    pub staged_words: usize,
-
-    /// The staged words' data, read from memory when their granule was fetched
-    /// (oldest first; `staged_words` long). Memory written after the fetch does
-    /// not change them: a host overwrite of a buffer an MM2S is streaming from
-    /// reaches the stream only past the staged words (R4-D3 data race, the
-    /// silicon measurement of the staging depth).
-    pub staged_data: std::collections::VecDeque<u32>,
-
     /// Last error (if any)
     pub error: Option<DmaError>,
 }
@@ -326,8 +304,6 @@ impl Transfer {
             total_bytes,
             cycles_elapsed: 0,
             last_access_addr: None,
-            staged_words: 0,
-            staged_data: std::collections::VecDeque::new(),
             zero_pad_state,
             error: None,
         })
@@ -368,8 +344,6 @@ impl Transfer {
             total_bytes: length as u64,
             cycles_elapsed: 0,
             last_access_addr: None,
-            staged_words: 0,
-            staged_data: std::collections::VecDeque::new(),
             zero_pad_state: None,
             error: None,
         }
@@ -410,8 +384,6 @@ impl Transfer {
             total_bytes: length as u64,
             cycles_elapsed: 0,
             last_access_addr: None,
-            staged_words: 0,
-            staged_data: std::collections::VecDeque::new(),
             zero_pad_state: None,
             error: None,
         }
@@ -452,8 +424,6 @@ impl Transfer {
             total_bytes: length as u64,
             cycles_elapsed: 0,
             last_access_addr: None,
-            staged_words: 0,
-            staged_data: std::collections::VecDeque::new(),
             zero_pad_state: None,
             error: None,
         }

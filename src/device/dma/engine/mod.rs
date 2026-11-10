@@ -54,7 +54,7 @@ pub use types::*;
 
 use std::collections::VecDeque;
 
-use super::channel::{ChannelContext, ChannelFsm, CompletionInfo};
+use super::channel::{ChannelContext, ChannelFsm, CompletionInfo, StagedWord};
 use super::compression;
 use super::timing::DmaTimingConfig;
 use super::transfer::{PadAction, Transfer, TransferDirection, TransferEndpoint};
@@ -159,9 +159,6 @@ pub struct DmaEngine {
     /// true so a transfer helper called outside the FSM (tests, static
     /// transfers) still records its access.
     pub(super) word_opens_granule: bool,
-    /// The word a staged MM2S drain sends: read from memory when its granule was
-    /// fetched (`Transfer::staged_data`), so `transfer_mm2s` must not re-read it.
-    pub(super) mm2s_staged_word: Option<u32>,
 
     /// Per-channel count of words drained from stream_in during Phase 3 this
     /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
@@ -248,7 +245,6 @@ impl DmaEngine {
             num_locks,
             cycle_dma_banks: 0,
             word_opens_granule: true,
-            mm2s_staged_word: None,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             s2mm_ingress_full_offered: vec![false; s2mm_channels],
             mm2s_egress_empty_wanted: vec![false; mm2s_channels],
@@ -666,7 +662,10 @@ impl DmaEngine {
         if self.channels[ch_idx].prev_lock_stalled {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
         }
-        if self.channels[ch_idx].prev_starving || self.channels[ch_idx].read_backpressure {
+        if self.channels[ch_idx].prev_starving
+            || self.channels[ch_idx].read_backpressure
+            || self.channels[ch_idx].egress_backpressure
+        {
             self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
         }
 
@@ -674,6 +673,9 @@ impl DmaEngine {
         ch.read_ahead.clear();
         ch.read_completions.clear();
         ch.read_backpressure = false;
+        ch.egress_staging.clear();
+        ch.egress_gap = 0;
+        ch.egress_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;
         ch.queued_bd = None;
@@ -892,6 +894,12 @@ impl DmaEngine {
         let ch = self.channels.get(channel as usize)?;
         if matches!(ch.state(), ChannelState::WaitingForLock(_)) {
             return Some(DmaStall::LockWait);
+        }
+
+        // A staged MM2S whose port refuses its staged words is backpressured
+        // whatever its FSM is doing (`drain_egress_staging`).
+        if ch.egress_backpressure && !matches!(ch.fsm, ChannelFsm::AcquiringLock { acquired: false, .. }) {
+            return Some(DmaStall::Backpressure);
         }
 
         match &ch.fsm {

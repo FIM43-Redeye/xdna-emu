@@ -43,20 +43,20 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
     }
 }
 
-/// Is `transfer`'s MM2S egress staging near underflow: at/below
-/// `DmaEngine::URGENT_WATERMARK` words with the stream still owed data?
+/// Is a staged MM2S near underflow: its channel's egress staging holds
+/// `staged` words, at/below `DmaEngine::URGENT_WATERMARK`, while `transfer`
+/// still has words to fetch?
 ///
 /// Defined once so `next_granule_fetch` (the backoff override -- an urgent
 /// channel must never stall itself out via its own backoff) and
 /// `DmaEngine::urgent_channels` (the arbiter's urgency override) read the
 /// identical predicate and can never disagree about which MM2S channels are
-/// urgent. Callers gate on `DmaEngine::uses_egress_staging` first --
-/// `staged_words` is only a meaningful FIFO-occupancy signal for a channel
-/// that actually stages.
-fn transfer_is_urgent(transfer: &Transfer) -> bool {
-    let words_to_drain = (transfer.remaining_bytes() as usize).div_ceil(4);
-    let unfetched = words_to_drain.saturating_sub(transfer.staged_words);
-    unfetched > 0 && transfer.staged_words <= DmaEngine::URGENT_WATERMARK
+/// urgent. Callers gate on `DmaEngine::uses_egress_staging` first -- the
+/// staging occupancy is only meaningful for a channel that actually stages.
+/// Every word a transfer still has to move is unfetched: a fetched word
+/// leaves the transfer for the channel's staging (`egress_staging`).
+fn transfer_is_urgent(transfer: &Transfer, staged: usize) -> bool {
+    transfer.remaining_bytes() > 0 && staged <= DmaEngine::URGENT_WATERMARK
 }
 
 /// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
@@ -133,7 +133,7 @@ impl DmaEngine {
     /// cycle -- the arbiter must serve them over the core or the stream
     /// stalls. A companion to `peek_bank_demand`, not a replacement: it does
     /// not change that method's return type (other callers depend on it),
-    /// and it reads the SAME per-transfer `staged_words` state through the
+    /// and it reads the SAME channel staging occupancy through the
     /// same `transfer_is_urgent` predicate `next_granule_fetch` uses for its
     /// backoff override, so peek and urgency can never disagree about which
     /// channel is which.
@@ -159,7 +159,7 @@ impl DmaEngine {
             let ChannelFsm::Transferring { transfer } = &ch.fsm else {
                 continue;
             };
-            if self.uses_egress_staging(transfer) && transfer_is_urgent(transfer) {
+            if self.uses_egress_staging(transfer) && transfer_is_urgent(transfer, ch.egress_staging.len()) {
                 urgent.push(self.channel_requester(ch_idx as u8));
             }
         }
@@ -372,7 +372,7 @@ impl DmaEngine {
     /// - a zero-padding or compressing MM2S, whose stream output is not a 1:1
     ///   image of the words it reads from memory, so "words fetched but not yet
     ///   sent" is not a well-defined quantity.
-    fn uses_egress_staging(&self, transfer: &Transfer) -> bool {
+    pub(super) fn uses_egress_staging(&self, transfer: &Transfer) -> bool {
         transfer.direction == TransferDirection::MM2S
             && !transfer.involves_host_memory()
             && !transfer.has_zero_padding()
@@ -389,11 +389,11 @@ impl DmaEngine {
     /// and `do_transfer_cycle` (which runs after it) can call it and get the same
     /// answer.
     ///
-    /// The fetch starts at the first word the staging does not already hold: the
-    /// drain cursor (`address_gen.current()`) advanced by `staged_words`. Because
-    /// draining a word advances the cursor by one and drops `staged_words` by one,
-    /// that position -- and hence the bank this returns -- is INVARIANT under a
-    /// drain, so a re-presented demand (once the backoff below clears) is always
+    /// The fetch starts at the transfer's cursor (`address_gen.current()`): a
+    /// fetched word leaves the transfer at once (it moves to the channel's
+    /// `egress_staging`), so the cursor is always the first unfetched word, and
+    /// a drain -- which touches only the staging -- never moves it. A
+    /// re-presented demand (once the backoff below clears) is therefore always
     /// identical to the one that lost, honouring the arbiter's retry contract
     /// (AM020 ch.2:166) even though the RE-PRESENTATION is no longer immediate.
     ///
@@ -413,21 +413,18 @@ impl DmaEngine {
     ) -> Option<GranuleFetch> {
         use crate::device::banking::banks_for_access;
 
-        let words_to_drain = (transfer.remaining_bytes() as usize).div_ceil(4);
-        let unfetched = words_to_drain.checked_sub(transfer.staged_words)?;
+        let unfetched = (transfer.remaining_bytes() as usize).div_ceil(4);
         if unfetched == 0 {
             return None;
         }
+        let ch = &self.channels[transfer.channel as usize];
+        let staged = ch.egress_staging.len();
 
-        if self.channels[transfer.channel as usize].backoff_left > 0 && !transfer_is_urgent(transfer) {
+        if ch.backoff_left > 0 && !transfer_is_urgent(transfer, staged) {
             return None;
         }
 
-        // Walk the clone to the first unfetched word.
         let mut probe = transfer.address_gen.clone();
-        for _ in 0..transfer.staged_words {
-            probe.next()?;
-        }
         let first = probe.current();
 
         // The fetch brings in every word of `first`'s granule that this transfer
@@ -451,7 +448,7 @@ impl DmaEngine {
             words += 1;
         }
 
-        if transfer.staged_words + words > self.egress_staging_capacity() {
+        if staged + words > self.egress_staging_capacity() {
             return None; // no room for the whole granule; wait for the stream to drain one
         }
 
@@ -653,6 +650,16 @@ impl DmaEngine {
                         }
                     }
                 }
+            }
+
+            // A staged MM2S hands one staged word to its output register per
+            // cycle, after the FSM step so a word fetched this cycle can leave
+            // in it, and whatever the FSM is doing, so the words of a finished
+            // BD keep flowing while the next one starts.
+            let ch = &self.channels[ch_idx];
+            if !ch.egress_staging.is_empty() || ch.egress_backpressure || ch.egress_gap > 0 {
+                self.drain_egress_staging(ch_idx);
+                any_active = true;
             }
 
             // BDs whose last read returns this cycle complete now: after the FSM
@@ -1494,10 +1501,15 @@ impl DmaEngine {
         }
     }
 
-    /// Gate `begin_completion` on the channel's egress stream having drained.
+    /// Gate `begin_completion` on the channel's egress stream having drained,
+    /// for an MM2S that does not stage (zero padding, compression).
     ///
-    /// An MM2S channel has not truly finished its BD until the last word has
-    /// handshaked downstream (TVALID&&TREADY), not merely left memory. If the
+    /// A staged compute / memtile MM2S finishes its BD once the last word is
+    /// fetched into the channel's egress staging (silicon,
+    /// build/experiments/pipeline-fill/chain): its words drain from there after
+    /// the BD, so it completes at once. Any other MM2S writes straight into the
+    /// output register and keeps the older rule: it has not finished its BD
+    /// until the last word has handshaked downstream (TVALID&&TREADY). If the
     /// sink is BEHIND -- the egress FIFO still held words from previous cycles
     /// when this step began (`ChannelContext::egress_backlog`) -- hold the
     /// channel in `DrainingEgress`, deferring the lock release, FINISHED_BD and
@@ -1521,8 +1533,10 @@ impl DmaEngine {
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
+        // A staged MM2S's words are in the channel's egress staging, which
+        // outlives the BD: it is done (`staged_mm2s_cycle`).
         let is_mm2s = matches!(self.channel_type(ch_idx as u8), ChannelType::MM2S);
-        if is_mm2s && self.channels[ch_idx].egress_backlog > 0 {
+        if is_mm2s && !self.uses_egress_staging(&transfer) && self.channels[ch_idx].egress_backlog > 0 {
             // The DrainingEgress cycle(s) are port-idle boundary cycles (the
             // last beat leaving the egress FIFO), so they spend the BD-switch
             // bubble budget -- the chained-BD entry must not add a full bubble
@@ -1887,26 +1901,17 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
-        let words_per_cycle = self.words_per_cycle_for(transfer);
-
-        // MM2S memory side: refill the egress staging FIFO with one 16-byte
-        // granule, which is this channel's entire bank demand for the cycle
-        // (`next_granule_fetch`). A channel that lost the arbitration does not
-        // get its granule -- but it keeps whatever the FIFO already holds, and
-        // the drain below runs on that. `staged_words` is the only thing this
-        // touches, so the fetch cursor (and therefore the demand it re-presents
-        // next cycle) is unchanged by a denial.
-        if self.uses_egress_staging(transfer) && !mem_denied {
-            let layout = self.bank_layout();
-            if let Some(fetch) = self.next_granule_fetch(transfer, layout) {
-                self.cycle_dma_banks |= fetch.bank_mask;
-                transfer.staged_words += fetch.words;
-                for &addr in &fetch.addrs[..fetch.words] {
-                    let word = self.read_staged_word(addr, tile, neighbors);
-                    transfer.staged_data.push_back(word);
-                }
-            }
+        if self.uses_egress_staging(transfer) {
+            return self.staged_mm2s_cycle(ch_idx, mem_denied, transfer, tile, neighbors);
         }
+        // Any other MM2S (zero padding, compression, shim) writes its words
+        // straight into the output register, so it waits behind words a
+        // finished BD left in the channel's egress staging.
+        if transfer.direction == TransferDirection::MM2S && !self.channels[ch_idx].egress_staging.is_empty() {
+            return TransferCycleResult::Stalled;
+        }
+
+        let words_per_cycle = self.words_per_cycle_for(transfer);
 
         // SP-4a (#140): shim S2MM cold-start DDR-write drain throttle.  While the
         // cooldown is counting down the DDR row-open / NoC path is still warming,
@@ -2007,44 +2012,15 @@ impl DmaEngine {
             let tlast_suppress = transfer.effective_tlast_suppress();
             let mut fot_finished = false;
 
-            // MM2S stream side: the port can only send words the staging FIFO
-            // already holds. If it holds none and the port could have taken a
-            // beat, the channel is memory-starved -- the egress ran dry waiting
-            // on a granule the memory side has not delivered. That is the whole
-            // of DMA_MM2S_n_MEMORY_STARVATION, and with three spare memory
-            // cycles in four it should essentially never happen: silicon reads 0
-            // on every workload measured, including one where the MM2S lost 112
-            // bank arbitrations (2026-07-14-dma-bank-access-width.md).
-            let staging = self.uses_egress_staging(transfer);
-            if staging {
-                words_this_cycle = words_this_cycle.min(transfer.staged_words);
-                if words_this_cycle == 0 {
-                    if self.can_push_stream_out_for_channel(channel) {
-                        let dir_ch = self.per_direction_channel(channel) as usize;
-                        if let Some(f) = self.mm2s_egress_empty_wanted.get_mut(dir_ch) {
-                            *f = true;
-                        }
-                        return TransferCycleResult::MemoryStarved;
-                    }
-                    // The port is backpressured anyway: an empty FIFO the stream
-                    // is not asking to drain is not starvation.
-                    return TransferCycleResult::Stalled;
-                }
-            }
-
             // Non-staged memory side (every S2MM; an MM2S over host memory,
             // zero-padding or compression): the words move THROUGH the memory
             // port this cycle, so the port's one 16-byte access per cycle caps
             // them -- stop at the first word that would open a second granule
             // (`granule_capped_words`). Without the cap a strided BD claimed up
             // to four banks in one cycle, i.e. a DMA with four memory ports.
-            // A staged MM2S is exempt: its memory side is the granule fetch
-            // above, already one access, and the words it drains here come out
-            // of the egress FIFO and touch no bank at all.
+            // A staged MM2S never gets here (`staged_mm2s_cycle`).
             let layout = self.bank_layout();
-            if !staging {
-                words_this_cycle = self.granule_capped_words(transfer, words_this_cycle, layout).0;
-            }
+            words_this_cycle = self.granule_capped_words(transfer, words_this_cycle, layout).0;
 
             let granule = layout.access_granule_bytes();
             for w in 0..words_this_cycle {
@@ -2055,18 +2031,7 @@ impl DmaEngine {
                 // remaining beats of that granule move through the staging
                 // buffer and claim no bank (`word_opens_granule`).  Set BEFORE
                 // the word moves: `transfer.advance` updates `last_access_addr`.
-                //
-                // A staged MM2S word claims NOTHING: its bank access already
-                // happened, on the cycle the granule was fetched into the egress
-                // FIFO above. Recording it again here would double-count the
-                // access and put it in the wrong cycle.
-                self.word_opens_granule =
-                    !staging && word_opens_granule(transfer.last_access_addr, addr, granule);
-                self.mm2s_staged_word = if staging {
-                    transfer.staged_data.front().copied()
-                } else {
-                    None
-                };
+                self.word_opens_granule = word_opens_granule(transfer.last_access_addr, addr, granule);
 
                 let result = self.do_transfer(
                     source,
@@ -2080,7 +2045,6 @@ impl DmaEngine {
                     neighbors,
                     host_memory,
                 );
-                self.mm2s_staged_word = None; // consumed, or the word stalled and stays staged
 
                 if result.stall {
                     // Mid-chunk stall: if any word made it through this
@@ -2097,10 +2061,6 @@ impl DmaEngine {
                 }
 
                 transfer.advance(4);
-                if staging {
-                    transfer.staged_words -= 1;
-                    transfer.staged_data.pop_front();
-                }
                 self.channels[ch_idx].stats.bytes_transferred += 4;
 
                 if result.fot_finish {
@@ -2274,6 +2234,13 @@ impl DmaEngine {
                 // The DMA builds the header itself (no DDR read, no latency),
                 // but it enters the stream behind the data still returning.
                 self.issue_host_read(header, 0);
+            } else if self.uses_egress_staging(transfer)
+                || !self.channels[transfer.channel as usize].egress_staging.is_empty()
+            {
+                // Behind the words still staged (a previous BD's, or this one's).
+                self.channels[transfer.channel as usize]
+                    .egress_staging
+                    .push_back(StagedWord { data: header, ends_bd: false });
             } else {
                 self.push_stream_out(header);
             }
@@ -2520,20 +2487,104 @@ impl DmaEngine {
         }
     }
 
-    /// Read the word at BD address `addr` for the egress staging FIFO: the
-    /// memory side of a staged MM2S, on the cycle its granule is fetched. Same
-    /// address resolution as `transfer_mm2s`; an unresolvable or out-of-range
-    /// address stages 0 and the drain reports the error as before.
-    fn read_staged_word(&mut self, addr: u64, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) -> u32 {
+    /// One cycle of a compute / memtile MM2S (`uses_egress_staging`): the memory
+    /// side only. The channel fetches one 16-byte granule into its egress
+    /// staging (`next_granule_fetch`, the whole of its bank demand this cycle)
+    /// and the fetched words leave the transfer at once, each carrying its
+    /// TLAST, so the BD is done when its last granule is fetched -- silicon
+    /// finishes a BD with its words still staged (`ChannelContext::egress_staging`).
+    /// The stream side is the staging drain, which runs whatever the FSM is
+    /// doing (`drain_egress_staging`).
+    ///
+    /// A channel that lost the arbitration fetches nothing; the drain runs on
+    /// what the staging holds, and the cursor, hence the demand re-presented
+    /// next cycle, is unchanged.
+    ///
+    /// DMA_MM2S_n_MEMORY_STARVATION is the staging empty while the port could
+    /// take a beat and the BD still has words to fetch: the egress ran dry
+    /// waiting on a granule the memory side has not delivered. With three
+    /// spare memory cycles in four it should essentially never happen: silicon
+    /// reads 0 on every workload measured, including one where the MM2S lost
+    /// 112 bank arbitrations (2026-07-14-dma-bank-access-width.md).
+    fn staged_mm2s_cycle(
+        &mut self,
+        ch_idx: usize,
+        mem_denied: bool,
+        transfer: &mut Transfer,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> TransferCycleResult {
+        if !mem_denied {
+            let layout = self.bank_layout();
+            if let Some(fetch) = self.next_granule_fetch(transfer, layout) {
+                self.cycle_dma_banks |= fetch.bank_mask;
+                let channel = transfer.channel;
+                let tlast_suppress = transfer.effective_tlast_suppress();
+                for &addr in &fetch.addrs[..fetch.words] {
+                    let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
+                        return TransferCycleResult::Error;
+                    };
+                    let ends_bd = transfer.remaining_bytes() <= 4;
+                    let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
+                    self.channels[ch_idx].egress_staging.push_back(StagedWord { data, ends_bd });
+                    transfer.advance(4);
+                    self.channels[ch_idx].stats.bytes_transferred += 4;
+                }
+            }
+        }
+        if transfer.remaining_bytes() > 0
+            && self.channels[ch_idx].egress_staging.is_empty()
+            && self.can_push_stream_out_for_channel(transfer.channel)
+        {
+            let dir_ch = self.per_direction_channel(transfer.channel) as usize;
+            if let Some(f) = self.mm2s_egress_empty_wanted.get_mut(dir_ch) {
+                *f = true;
+            }
+            return TransferCycleResult::MemoryStarved;
+        }
+        TransferCycleResult::Continue
+    }
+
+    /// Read one word of a staged MM2S granule from tile memory, at fetch time:
+    /// the staged word carries the data read now, not when it reaches the
+    /// stream (R4-D3 data race). This is the word's memory access, so the
+    /// watch log and the target tile's WATCHPOINT events fire here. `None` (a
+    /// recorded bus error) when the address runs past the end of memory.
+    fn fetch_staged_word(
+        &mut self,
+        addr: u64,
+        channel: u8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> Option<u32> {
         let mem_size = tile.data_memory().len();
-        let Some((_, target_tile, offset)) = self.resolve_mm2s_target(addr, mem_size, tile, neighbors) else {
-            return 0;
-        };
+        let cycle = self.current_cycle;
+        let (col, row) = (self.col, self.row);
+        let (target_kind, target_tile, offset) = self.resolve_mm2s_target(addr, mem_size, tile, neighbors)?;
         let data = target_tile.data_memory();
         if offset + 4 > data.len() {
-            return 0;
+            let msg = format!(
+                "DMA({},{}) MM2S addr=0x{:X} bytes=4 wraps past memory end (size=0x{:X}) -- bus error",
+                col, row, addr, mem_size,
+            );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
+            return None;
         }
-        u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+        let word = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        if crate::debug::watch::is_watched(offset as u64, 4) {
+            crate::debug::watch::log_dma_read(
+                cycle,
+                col,
+                row,
+                offset as u64,
+                word,
+                &format!("MM2S{}", channel),
+            );
+        }
+        let origin = dma_access_origin(target_kind);
+        fire_watchpoint_events_with_origin(target_tile, offset as u32, false, cycle, None, origin);
+        Some(word)
     }
 
     /// MM2S: Read from tile memory and queue to stream output.
@@ -2598,12 +2649,10 @@ impl DmaEngine {
             );
         }
 
-        let staged_word = self.mm2s_staged_word.take();
         let data = target_tile.data_memory();
 
         // Uncompressed path: read data from tile memory in 32-bit words
         let word_count = (bytes + 3) / 4;
-        debug_assert!(staged_word.is_none() || word_count == 1, "a staged drain sends one word");
 
         log::debug!(
             "DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
@@ -2618,9 +2667,7 @@ impl DmaEngine {
 
         for i in 0..word_count {
             let word_offset = offset + i * 4;
-            let word = if let Some(w) = staged_word {
-                w
-            } else if word_offset + 4 <= data.len() {
+            let word = if word_offset + 4 <= data.len() {
                 u32::from_le_bytes([
                     data[word_offset],
                     data[word_offset + 1],
@@ -3637,9 +3684,10 @@ mod bank_demand_tests {
             assert!(guard < 50, "fixture did not reach Transferring in time");
         }
 
+        // The BD finishes once its second granule is staged; the six beats
+        // still in the staging then stream out with the channel idle.
         let mut claimed = Vec::new();
         for _ in 0..8 {
-            assert_eq!(eng.channel_phase(2), "Transferring", "fixture must still have words to move");
             let demand = eng.peek_bank_demand(BankLayout::Compute);
             claimed.push(demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0));
             eng.cycle_dma_banks = 0;
@@ -3871,6 +3919,64 @@ mod bank_demand_tests {
         );
     }
 
+    /// An MM2S BD finishes once its last word is FETCHED into the egress
+    /// staging, not once it leaves the port: silicon finishes as many BDs of a
+    /// chain into a held consumer as fit the whole absorb (48 words at 0 hops,
+    /// BDs of 2..24 words, compute tile and memtile alike;
+    /// build/experiments/pipeline-fill/chain). Here nothing drains the port,
+    /// so the absorb is the output register plus the staging: 24 words at
+    /// phase 0 (see `stalled_mm2s_fills_staging_to_the_silicon_pinned_depth`), i.e.
+    /// three 8-word BDs finish -- and the words still in order, behind each
+    /// other, the next BD's fetched in behind a finished one's.
+    #[test]
+    fn an_mm2s_bd_finishes_when_its_last_word_is_staged() {
+        const L: u32 = 8;
+        const K: u8 = 6;
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        for w in 0..(L * K as u32) {
+            let off = 0x400 + 4 * w as usize;
+            tile.data_memory_mut()[off..off + 4].copy_from_slice(&(0xD000_0000u32 + w).to_le_bytes());
+        }
+        for j in 0..K {
+            let mut bd = BdConfig::simple_1d(0x400 + 4 * L as u64 * j as u64, L * 4).with_release(5, 1);
+            if j + 1 < K {
+                bd = bd.with_next(j + 1);
+            }
+            eng.configure_bd(j, bd).unwrap();
+        }
+        eng.start_channel(2, 0).unwrap();
+        for _ in 0..400 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        assert_eq!(
+            tile.locks[5].value, 3,
+            "BDs finished with the port held: those whose words are all staged"
+        );
+        assert_eq!(eng.staged_words(2) + eng.output_fifo_capacity(), 24);
+
+        let mut out = Vec::new();
+        for _ in 0..400 {
+            while let Some(w) = eng.pop_stream_out_for_channel(2) {
+                out.push(w);
+            }
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        while let Some(w) = eng.pop_stream_out_for_channel(2) {
+            out.push(w);
+        }
+        assert_eq!(tile.locks[5].value, K);
+        let data: Vec<u32> = out.iter().map(|w| w.data).collect();
+        assert_eq!(data, (0..L * K as u32).map(|w| 0xD000_0000 + w).collect::<Vec<_>>());
+        let tlasts: Vec<usize> = out.iter().enumerate().filter(|(_, w)| w.tlast).map(|(i, _)| i).collect();
+        assert_eq!(
+            tlasts,
+            (1..=K as usize).map(|j| j * L as usize - 1).collect::<Vec<_>>(),
+            "TLAST closes each BD"
+        );
+    }
+
     /// A staged word is read from memory when its granule is fetched, not when it
     /// leaves the staging FIFO: overwriting the source while the MM2S is stalled
     /// changes only the words not yet fetched. This is how silicon measures the
@@ -4095,7 +4201,9 @@ mod bank_demand_tests {
 
             let (mut cycles, mut starved, mut granted, mut presented) = (0usize, 0usize, 0usize, 0usize);
             let mut denied_last = false;
-            while eng.channel_phase(2) != "Idle" && cycles < 500 {
+            // Until the last word has left the port: the BD itself finishes as
+            // soon as its last granule is staged.
+            while (eng.channel_phase(2) != "Idle" || eng.staged_words(2) > 0) && cycles < 500 {
                 eng.reset_cycle_drain_counters();
                 let demand = eng.peek_bank_demand(BankLayout::Compute);
                 let mask = demand

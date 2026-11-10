@@ -1391,8 +1391,12 @@ pub struct DmaTiming {
     /// except 3 on the switch-FIFO route at phase 0.
     ///
     /// Caveats: `c` is assumed to be 1 (if the core stream port holds a second
-    /// word the value is 26); measured on a compute tile only, so mem tiles
-    /// inherit it unverified. This is the DMA-side staging only: the
+    /// word the value is 26); measured on a compute tile. Mem tiles use it
+    /// too, though every memtile-sourced path holds 4 words more on silicon
+    /// (data race, 2026-11-10, `tools/gen_pipeline_fill_probe.py` `race`:
+    /// memtile -> own S2MM 52 vs compute 48, memtile -> compute 60 vs 56); the
+    /// staging and the memtile switch's DMA slave port are not separated, so
+    /// the 4 are not modelled. This is the DMA-side staging only: the
     /// downstream local-slave port FIFO is modelled separately
     /// (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`). Rig and evidence:
     /// `tools/experiments/r4d3_*.py`. The earlier trace-event experiment

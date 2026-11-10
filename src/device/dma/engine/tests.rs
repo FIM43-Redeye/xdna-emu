@@ -112,10 +112,10 @@ fn dma_read_only_stall_reason_prioritizes_mm2s_memory_starvation() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
     let mut tile = make_tile();
     let mut host_mem = make_host_memory();
-    let capacity = engine.output_fifo_capacity();
-    engine
-        .configure_bd(0, BdConfig::simple_1d(0x100, (capacity as u32 + 4) * 4))
-        .unwrap();
+    // Longer than the register and the whole staging, so the BD is still
+    // fetching when the port backs up.
+    let words = (engine.output_fifo_capacity() + engine.egress_staging_capacity()) as u32 + 8;
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, words * 4)).unwrap();
     engine.start_channel(2, 0).unwrap();
 
     let mut guard = 0;
@@ -124,12 +124,16 @@ fn dma_read_only_stall_reason_prioritizes_mm2s_memory_starvation() {
         guard += 1;
         assert!(guard < 100, "MM2S fixture never reached backpressure");
     }
+    assert!(engine.channels[2].egress_backpressure);
     while engine.pop_stream_out_for_channel(2).is_some() {}
-    engine.channels[2].fsm.transfer_mut().unwrap().staged_words = 0;
+    engine.channels[2].egress_staging.clear();
     engine.reset_cycle_drain_counters();
     engine.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
 
-    assert!(engine.channels[2].prev_starving);
+    assert!(
+        !engine.channels[2].egress_backpressure,
+        "an empty staging behind a free port is not backpressure"
+    );
     assert!(engine.mm2s_memory_starvation(0));
     assert_eq!(engine.channel_stall_reason(2), Some(DmaStall::Other));
 }
@@ -874,7 +878,9 @@ fn test_non_shim_startup_is_post_transfer_hold() {
         engine.start_channel(2, 0).unwrap();
         let mut cycles = 0u64;
         let mut saw_hold = false;
-        while engine.channel_active(2) {
+        // Until the BD has finished: its words drain from the staging
+        // alongside the hold.
+        while engine.channels[2].is_active() {
             engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host);
             while engine.pop_stream_out().is_some() {}
             if engine.channels[2].fsm.phase_name() == "StartupHold" {
@@ -2889,8 +2895,8 @@ fn test_per_direction_channel() {
     assert_eq!(engine.per_direction_channel(11), 5);
 }
 
-/// Chained BDs with acquire+release locks on a private lock pair finish with
-/// `interval == data_cycles + bd_switch_bubble_cycles`. The #26 pipelining
+/// Chained BDs with acquire+release locks on a private lock pair stream with
+/// `run == data_cycles` and a `bd_switch_bubble_cycles` gap per BD. The #26 pipelining
 /// optimizations (inline release, inline grant, inline first-data) removed the
 /// EMU-only dead cycles -- correct -- but the inline-first-data step also
 /// hid the ONE real cycle HW keeps: the per-BD `next_bd`-fetch/lock-handshake
@@ -2928,12 +2934,17 @@ fn chained_bd_lock_interval_baseline() {
 
     let mut cycle: u64 = 0;
     let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    let mut beats: Vec<usize> = Vec::new();
     while engine.channel_active(2) {
         engine.set_current_cycle(cycle);
         engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(cycle);
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-        while engine.pop_stream_out().is_some() {}
+        let mut n = 0;
+        while engine.pop_stream_out().is_some() {
+            n += 1;
+        }
+        beats.push(n);
         all_events.extend(engine.drain_trace_events());
         cycle += 1;
         if cycle > 50 {
@@ -2954,21 +2965,54 @@ fn chained_bd_lock_interval_baseline() {
         "expected exactly 2 FINISHED_BD events, got cycles {:?}",
         finished_bd_cycles
     );
-    let interval = finished_bd_cycles[1] - finished_bd_cycles[0];
-    assert_eq!(
-        interval, 3,
-        "chained-BD FINISHED_BD interval == data cycles (2w @ 1 word/cyc stream rate) \
-         + BD-switch bubble (1); matches HW off1. cycles={:?}",
-        finished_bd_cycles
-    );
+    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, &finished_bd_cycles);
+}
+
+/// The port side of a chained MM2S: one run of `words` beats per BD (1 word/cyc
+/// stream rate), separated by the 1-cycle BD-switch bubble HW keeps (`off1`);
+/// and each FINISHED_BD lands no later than its BD's last beat -- a staged
+/// MM2S finishes a BD when its last word is fetched, not when it leaves
+/// (silicon, pipeline-fill chain probe).
+fn assert_port_runs_with_boundary_bubbles(beats: &[usize], bds: usize, words: usize, finished: &[u64]) {
+    let first = beats.iter().position(|&n| n > 0).expect("no beat left the port");
+    let last = beats.iter().rposition(|&n| n > 0).unwrap();
+    let mut runs = Vec::new();
+    let mut gaps = Vec::new();
+    let (mut run, mut gap) = (0usize, 0usize);
+    for &n in &beats[first..=last] {
+        assert!(n <= 1, "the port moves one word per cycle: {beats:?}");
+        if n == 1 {
+            if gap > 0 {
+                gaps.push(gap);
+                gap = 0;
+            }
+            run += 1;
+        } else {
+            if run > 0 {
+                runs.push(run);
+                run = 0;
+            }
+            gap += 1;
+        }
+    }
+    runs.push(run);
+    assert_eq!(runs, vec![words; bds], "one beat run per BD: {beats:?}");
+    assert_eq!(gaps, vec![1; bds - 1], "a 1-cycle bubble at each BD boundary (HW off1): {beats:?}");
+    assert_eq!(finished.len(), bds, "one FINISHED_BD per BD: {finished:?}");
+    let mut end = first as u64;
+    for (j, &f) in finished.iter().enumerate() {
+        end += words as u64 + if j > 0 { 1 } else { 0 };
+        assert!(f < end, "BD {j} finished at {f}, after its last beat left at {}: {finished:?}", end - 1);
+    }
 }
 
 /// 4-BD chain of 16-word locked MM2S (memory -> stream) BDs. Stream egress
 /// meters at the 32-bit AXI4-Stream rate (1 word/cyc), so `16w / 1wpc = 16`
-/// data cycles per BD, plus the 1-cycle per-BD-switch bubble HW keeps
-/// => interval 17 per BD. This is exactly HW's add_one slot0 `on16 off1`
-/// (16 cycles asserted per 16-word BD, 1 cycle bubble) -- before #140 the
-/// model used the 4-word data-bus rate here and produced the wrong `on4`.
+/// beats per BD, plus the 1-cycle per-BD-switch bubble HW keeps: the port
+/// traces `on16 off1`, HW's add_one slot0 (before #140 the model used the
+/// 4-word data-bus rate here and produced the wrong `on4`). The BDs finish
+/// when their words are staged, ahead of their beats (silicon, pipeline-fill
+/// chain probe), so FINISHED_BD no longer marks the port cadence.
 #[test]
 fn chained_bd_16w_lock_interval_diagnostic() {
     use crate::interpreter::state::EventType;
@@ -3018,12 +3062,17 @@ fn chained_bd_16w_lock_interval_diagnostic() {
 
     let mut cycle: u64 = 0;
     let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    let mut beats: Vec<usize> = Vec::new();
     while engine.channel_active(2) {
         engine.set_current_cycle(cycle);
         engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(cycle);
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-        while engine.pop_stream_out().is_some() {}
+        let mut n = 0;
+        while engine.pop_stream_out().is_some() {
+            n += 1;
+        }
+        beats.push(n);
         all_events.extend(engine.drain_trace_events());
         cycle += 1;
         if cycle > 100 {
@@ -3038,14 +3087,7 @@ fn chained_bd_16w_lock_interval_diagnostic() {
             _ => None,
         })
         .collect();
-    let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
-    assert_eq!(
-        intervals,
-        vec![17u64, 17, 17],
-        "16w chained-BD intervals = 16 data (1 word/cyc stream) + 1 BD-switch bubble \
-         = HW on16/off1; FINISHED_BD cycles={:?}",
-        finished_bd_cycles
-    );
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &finished_bd_cycles);
 }
 
 /// Diagnostic: chained BDs *without* locks. Pure chain overhead, no
@@ -3070,12 +3112,17 @@ fn chained_bd_no_lock_interval_diagnostic() {
 
     let mut cycle: u64 = 0;
     let mut all_events: Vec<(u64, EventType)> = Vec::new();
+    let mut beats: Vec<usize> = Vec::new();
     while engine.channel_active(2) {
         engine.set_current_cycle(cycle);
         engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
         tile.resolve_lock_requests(cycle);
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-        while engine.pop_stream_out().is_some() {}
+        let mut n = 0;
+        while engine.pop_stream_out().is_some() {
+            n += 1;
+        }
+        beats.push(n);
         all_events.extend(engine.drain_trace_events());
         cycle += 1;
         if cycle > 100 {
@@ -3090,18 +3137,11 @@ fn chained_bd_no_lock_interval_diagnostic() {
             _ => None,
         })
         .collect();
-    let intervals: Vec<u64> = finished_bd_cycles.windows(2).map(|w| w[1] - w[0]).collect();
     // 16w MM2S (memory -> stream) BD at the 1-word/cyc stream rate = 16 data
-    // cycles. Without locks, enter_chained_bd routes through the BD-switch
-    // bubble (BdSwitchBubble for 1 cycle) before Transferring, so interval =
-    // 16 data + 1 bubble = 17. The bubble is the same per-BD `off1` HW shows
-    // whether or not the BD carries locks (#140 stream-rate metering).
-    assert_eq!(
-        intervals,
-        vec![17u64, 17, 17],
-        "no-lock chained-BD intervals = 16 data + 1 bubble; FINISHED_BD cycles={:?}",
-        finished_bd_cycles
-    );
+    // cycles, then the per-BD `off1` HW shows whether or not the BD carries
+    // locks (#140 stream-rate metering); the bubble sits on the port side
+    // (`ChannelContext::egress_gap`).
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &finished_bd_cycles);
 }
 
 /// Cross-lock handoff: a chained BD's release is DEFERRED to the next BD's

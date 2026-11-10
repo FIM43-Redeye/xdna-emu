@@ -101,11 +101,12 @@ impl DmaEngine {
             status = layout.cur_bd.insert(status, bd as u32);
         }
 
-        // A shim MM2S whose BDs have all FINISHED but whose window is still undelivered keeps
-        // running, back-pressured (silicon, lock-leftovers mem_s2mm_rel).
-        if self.tile_kind.is_shim()
-            && matches!(self.channel_type(channel), ChannelType::MM2S)
-            && !ch.read_ahead.is_empty()
+        // An MM2S whose BDs have all FINISHED but whose words are still undelivered keeps
+        // running, back-pressured: a shim's read-ahead window (silicon, lock-leftovers
+        // mem_s2mm_rel), a compute tile's or memtile's egress staging (silicon, pipeline-fill
+        // chain_mem_L4: Running + Stalled_Stream_Backpressure with every BD finished).
+        if matches!(self.channel_type(channel), ChannelType::MM2S)
+            && (!ch.read_ahead.is_empty() || !ch.egress_staging.is_empty())
         {
             status = layout.channel_running.set_bit(status);
             if !self.can_push_stream_out_for_channel(channel) {

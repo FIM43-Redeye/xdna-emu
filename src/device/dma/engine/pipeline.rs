@@ -163,7 +163,16 @@ impl DmaEngine {
             return 0;
         };
         let (loaded, budget_limited) = self.loaded_bds(channel, stall);
-        let moved = loaded.iter().map(|l| l.words).sum::<u32>();
+        let mut moved = loaded.iter().map(|l| l.words).sum::<u32>();
+        // A backpressured staged MM2S counts its head BD whole: its fetched words have left the
+        // transfer (they wait in the channel's staging and the route) but silicon still reads a
+        // single 57-word BD stalled on its stream as RUNNING whatever it has fetched (shim-queue
+        // stall probes, BDs of 57, 60 and 64 words into a consumer that never starts).
+        if let Some(transfer) = self.channels[channel as usize].fsm.transfer() {
+            if stall == HeadStall::Data && self.uses_egress_staging(transfer) {
+                moved += ((transfer.total_bytes - transfer.remaining_bytes()) / 4) as u32;
+            }
+        }
         if loaded.len() >= self.pipeline_geometry(stall).depth {
             1
         } else if self.running_threshold_words(stall, direction).is_some_and(|t| moved >= t) {
