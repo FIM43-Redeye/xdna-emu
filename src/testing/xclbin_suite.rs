@@ -1784,9 +1784,10 @@ mod tests {
         let (outcome, _out, _trace) = suite.run_single_with_trace(&test);
         let records = bank_census::take();
 
-        // Tiles of interest, in MLIR/in-process coordinates (HW capture is the
-        // same array shifted one column east).
-        const TILES: [(u8, u8, &str); 3] = [(0, 2, "Producer"), (0, 3, "ConsA"), (1, 3, "ConsB")];
+        // Tiles of interest, in physical coordinates: the in-process run places
+        // the design at physical column 1 like the HW capture, so the census
+        // keys match the capture's tiles directly.
+        const TILES: [(u8, u8, &str); 3] = [(1, 2, "Producer"), (1, 3, "ConsA"), (2, 3, "ConsB")];
 
         let mut stalls_by_tile = [0u64; 3];
         let mut bank_cycles = [[0u64; 8]; 3];
