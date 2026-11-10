@@ -87,7 +87,7 @@ WITNESS_C = "vldb wl5, [p5, #0]"      # p5 addresses WNEW
 
 # Units of the accumulator datapath the design space is derived from.
 ACC_UNITS = ("CM_RM_PORT", "CM_WA_PORT", "CM_WM_PORT", "UPS_UNIT", "UPPER_SRS",
-             "W_WA_PORT", "W_WM_PORT")
+             "W_WA_PORT", "W_WM_PORT", "W_RS_PORT")
 READ_UNITS = ("CM_RM_PORT", "UPPER_SRS")
 # The two ports that write the accumulator register file (names: CM = accumulator, W = write).
 # Two instructions that write one register in one cycle collide whichever port each uses.
@@ -405,8 +405,21 @@ CATALOGUE_CASCADE = [
     Ins("vmov_bm_scd", "vmov bml{D}, SCD", None, (), "bml"),
     Ins("vmov_bmh_scd", "vmov bmh{D}, SCD", None, (), "bmh"),
 ]
+# vunpack: the only instructions that write the vector file through W_RS_PORT (the tables give
+# them W_RS_PORT at their landing cycle 6 and nothing else; vpack and vst hold W_RS_PORT at 0 as a
+# read). W_RS_PORT pairs are generated only when a vunpack is in them, and a vunpack also gets
+# starred W_WA / W_WM holds at its landing cycle (UNPACK_WRITE_ALIASES) so it meets the other
+# vector-file writers landing on the same register.
+CATALOGUE_2E = [
+    Ins("vunpack_s16_s8", "vunpack.s16.s8 {DW}, wl0", None, (), "x"),
+    Ins("vunpack_d16_d8", "vunpack.d16.d8 {DW}, wl0", None, (), "x"),
+    Ins("vunpack_s8_s4", "vunpack.s8.s4 {DW}, wl0", None, (), "x"),
+    Ins("vunpack_d8_d4", "vunpack.d8.d4 {DW}, wl0", None, (), "x"),
+]
+UNPACK_KEYS = {i.key for i in CATALOGUE_2E}
+UNPACK_WRITE_ALIASES = ("W_WA_PORT*", "W_WM_PORT*")
 NEW_KEYS = {i.key for i in CATALOGUE_2B}
-CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D
+CATALOGUE = CATALOGUE + CATALOGUE_2B + CATALOGUE_2C + CATALOGUE_2D + CATALOGUE_2E
 BY_KEY = {i.key: i for i in CATALOGUE + CATALOGUE_CASCADE}
 
 
@@ -484,6 +497,9 @@ def reservations_of_catalogue() -> dict[str, list[tuple[str, int]]]:
     out = {ins.key: held[i] for i, ins in enumerate(CATALOGUE)}
     for key, off in UNRESERVED_READS.items():
         out[key] = out[key] + [("CM_RM_PORT*", off)]       # * = not in the tables
+    for key in UNPACK_KEYS & out.keys():
+        land = next(o for u, o in out[key] if u == "W_RS_PORT")
+        out[key] = out[key] + [(u, land) for u in UNPACK_WRITE_ALIASES]
     return out
 
 
@@ -517,6 +533,9 @@ def derive_collisions(res, only_new: bool = False, unit: Optional[str] = None) -
                     if not same_resource(ua, ub) or not (g > 0 or (g == 0 and ia <= ib)):
                         continue
                     if ua.endswith("*") and ub.endswith("*"):
+                        continue
+                    if (ua.rstrip("*") == "W_RS_PORT"
+                            and a.key not in UNPACK_KEYS and b.key not in UNPACK_KEYS):
                         continue
                     if only_new and a.key not in NEW_KEYS and b.key not in NEW_KEYS:
                         continue
@@ -566,8 +585,12 @@ def configs_for(coll: dict, a: Ins, b: Ins) -> list[str]:
     cfgs = ["sep"]
     if any(u.rstrip("*") in READ_UNITS for u in coll["units"]) and a.srcs and b.srcs:
         cfgs.append("srcshare")
-    if any(u.split("~")[0] in ("CM_WA_PORT", "CM_WM_PORT", "W_WA_PORT", "W_WM_PORT", "UPS_UNIT")
-           for u in coll["units"]):
+    # a write-port collision on either side; starred (extension) holds count, and W_RS_PORT is
+    # a write only for vunpack (the other holders read through it)
+    writes = ("CM_WA_PORT", "CM_WM_PORT", "W_WA_PORT", "W_WM_PORT", "UPS_UNIT")
+    if any(part.rstrip("*") in writes or (part == "W_RS_PORT" and a.key in UNPACK_KEYS
+                                          and b.key in UNPACK_KEYS)
+           for u in coll["units"] for part in u.split("~")):
         if allocate(a, b, "dstshare"):
             cfgs.append("dstshare")
     return cfgs
