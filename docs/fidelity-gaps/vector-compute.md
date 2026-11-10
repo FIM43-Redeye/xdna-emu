@@ -421,9 +421,20 @@ conv_even (13 of 64 lanes differ) and 5/7 from conv_odd (11 of 64).
 **Saturation.** Rounding happens first, then: `crSat` none wraps to the output
 width (low bits kept); saturate clamps to `[-2^(n-1), 2^(n-1)-1]`; symmetric
 clamps to `[-(2^(n-1)-1), 2^(n-1)-1]`. A rounding carry is saturated, not wrapped.
-Unsigned outputs clamp to `[0, 2^n-1]` (symmetric makes no difference). Int16
-output is what the captures exercise; the unsigned and 8/32-bit paths follow the
-same rule but have no dedicated silicon capture.
+Unsigned outputs clamp to `[0, 2^n-1]` (symmetric makes no difference). The
+unsigned and 8/32-bit paths are silicon-confirmed by the dynsign suite (every
+`crSat`, `crRnd` 0) and, for rounding, by the srs-rnd sweep below.
+
+**Every SRS form under every `crRnd`** (2026-11-10). `tools/gen_dynamic_sign_probe.py
+--family srs-rnd` writes 12 Peano cases: each `SRS_PEANO` form (`d8.s32`, `d16.s32` bm and
+x, `d16.s64`, `d32.s64` bm and x) as register `vsrs` and fused `vst.srs`, `crRnd` 0..15,
+output sign 0 and 1 (crSRSSign), shifts 1, 4, 15, `crSat` 1; lanes put the dropped bits at
+exact, tie, one either side of the tie and all ones, on even and odd quotients of both signs
+near the saturation edges. 1152 records, 23040 lanes: HW r1 == r2, EMU == HW, and an
+independent model of the table above (`tools/check_srs_rnd_capture.py`: rounding, then the clamp) matches every lane; each of
+four wrong models (12/13 swapped, 8/9 swapped, 4/6 even-odd swapped, sym_floor sign flipped)
+fails on 450..1303 lanes. The rounding rule does not depend on the output width, the
+accumulator width, the sign or the register vs fused form.
 
 **f32 -> bf16 (`to_v16bfloat16`, governed by `crRnd`).** The modes act as an
 SRS shift of 16 on the signed f32 bit pattern (sign-magnitude, rounded by value):
@@ -441,7 +452,7 @@ SRS shift of 16 on the signed f32 bit pattern (sign-magnitude, rounded by value)
 
 | Gap | Model vs hardware | Where | Status / rationale | Obs. |
 |-----|-------------------|-------|--------------------|------|
-| SRS paths other than int32 -> int16, signed | unsigned and signed 8/16/32-bit outputs of 32- and 64-bit accumulators, register `vsrs` and fused `vst.srs`, every `crSat`, shifts 0/1/4/8/15: exact against silicon (dynsign probe suite, see "Run-time sign") | `srs_lane` callers in `vector_srs.rs` | **RESOLVED** 2026-11-04 for those shifts and `crRnd` 0 (the `crRnd` sweep above is int16 only) | confirmed |
+| SRS paths other than int32 -> int16, signed | unsigned and signed 8/16/32-bit outputs of 32- and 64-bit accumulators, register `vsrs` and fused `vst.srs`, every `crSat`, shifts 0/1/4/8/15: exact against silicon (dynsign probe suite, see "Run-time sign") | `srs_lane` callers in `vector_srs.rs` | **RESOLVED** 2026-11-04 for those shifts and `crRnd` 0; every `crRnd` value on every form 2026-11-10 (srs-rnd sweep, "Saturation" above) | confirmed |
 | `crSat` value 2 | saturates exactly like 3 (symmetric for a signed output, `[0, umax]` for an unsigned one) | `SrsConfig::saturate` / `symmetric_saturate` | **RESOLVED** 2026-11-04 (dynsign probe suite, every `d` SRS form) | confirmed |
 
 ## Run-time sign (`d` forms) and UPS saturation

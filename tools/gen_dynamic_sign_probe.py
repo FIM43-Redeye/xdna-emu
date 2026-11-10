@@ -96,6 +96,7 @@ class Form:
     body: str               # C++ statements; `p` = record input, `o` = record output (int32_t *)
     records: tuple          # tuple of record-builder arguments
     build: Callable[..., bytes]  # (rng, *record) -> bytes of length rec_in
+    epilogue: str = ""      # C++ statements after the record loop
 
 
 def kernel_source(form: Form, n: int) -> str:
@@ -110,7 +111,7 @@ void test_kernel(const int32_t *restrict in, int32_t *restrict out) {{
         int32_t *o = out + t * {form.rec_out // 4};
 {form.body}
     }}
-}}
+{form.epilogue}}}
 }} // extern "C"
 """
 
@@ -223,6 +224,57 @@ def srs_form(name: str, spec, register: bool) -> Form:
     return Form(name + ("_reg" if register else "_st"), "peano", rec_in, rec_out, body, records, build)
 
 
+# -- SRS rounding (crRnd) on every SRS form ------------------------------------------------
+
+# crRnd is control register 6 (llvm-aie aiev2_defines.h). Every value 0..15 (4..7 and 14..15
+# are undefined modes), both output signs, shifts that drop 1, 4 and 15 bits; crSat 1.
+RND_MODES = tuple(range(16))
+RND_SHIFTS = (1, 4, 15)
+RND_SIGNS = (0, 1)
+
+
+def rnd_acc_lanes_bytes(acc_bits: int, out_bits: int, n: int, shift: int, rng: random.Random,
+                        rotate: int) -> bytes:
+    """Accumulator lanes whose dropped bits hit every rounding case: exact, tie, one below and
+    one above the tie, all ones; quotients even and odd, both signs, near the saturation edges."""
+    m = (1 << acc_bits) - 1
+    half = 1 << (shift - 1)
+    fracs = sorted({0, half, half - 1, half + 1, (1 << shift) - 1, 1})
+    fracs = [f for f in fracs if 0 <= f < (1 << shift)]
+    smax, smin, umax = (1 << (out_bits - 1)) - 1, -(1 << (out_bits - 1)), (1 << out_bits) - 1
+    quots = [0, 1, 2, 3, -1, -2, -3, smax, smax - 1, smin, smin + 1, umax, umax - 1, 5, -6]
+    combos = [(q, f) for q in quots for f in fracs]
+    vals = []
+    for i in range(n):
+        if i % 4 == 3:
+            vals.append(rng.getrandbits(acc_bits))
+        else:
+            q, f = combos[(i + rotate * 7) % len(combos)]
+            vals.append(((q << shift) + f) & m)
+    return pack_lanes(acc_bits, vals)
+
+
+def srs_rnd_form(name: str, spec, register: bool) -> Form:
+    """`srs_form` with crRnd set per record from the record's fifth scalar, reset to 0 after."""
+    base = srs_form(name, spec, register)
+    fn, aty, acc_bits, lanes, rty, out_bits, wide = spec
+    soff = acc_bits * lanes // 8 // 4
+    body = f"        __builtin_aiev2_set_ctrl_reg(6, p[{soff + 4}]);\n" + base.body
+    records = tuple((s, sh, rnd) for rnd in RND_MODES for sh in RND_SHIFTS for s in RND_SIGNS)
+    rec_in = base.rec_in
+
+    def build(rng, sign, shift, rnd, k):
+        acc = rnd_acc_lanes_bytes(acc_bits, out_bits, lanes, shift, rng, k)
+        return (acc + scalars(shift, sign, 1, 0, rnd)).ljust(rec_in, b"\0")
+
+    return Form("rnd_" + base.name, "peano", rec_in, base.rec_out, body, records, build,
+                epilogue="    __builtin_aiev2_set_ctrl_reg(6, 0);\n")
+
+
+def rnd_forms() -> list[Form]:
+    return [srs_rnd_form(n, s, reg) for n, s in SRS_PEANO.items() for reg in (False, True)]
+
+
 # -- crVaddSign family ----------------------------------------------------------------------
 
 LANE = {8: ("v64int8", "unsigned long long"), 16: ("v32int16", "unsigned int"), 32: ("v16int32", "unsigned int")}
@@ -315,13 +367,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--suite-dir", required=True, help="root; writes <dir>/peano and <dir>/chess")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--family", choices=("dynsign", "srs-rnd"), default="dynsign",
+                    help="dynsign: the run-time sign forms; srs-rnd: crRnd on every SRS form")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     by_compiler: dict[str, list[CxxKernel]] = {"peano": [], "chess": []}
-    for form in all_forms():
+    for form in (all_forms() if args.family == "dynsign" else rnd_forms()):
         by_compiler[form.compiler] += kernels_for(form, rng)
     for compiler, kernels in by_compiler.items():
-        write_cxx_suite(Path(args.suite_dir) / compiler, f"dynsign-{compiler}",
+        if not kernels:
+            continue
+        write_cxx_suite(Path(args.suite_dir) / compiler, f"{args.family}-{compiler}",
                         "tools/gen_dynamic_sign_probe.py", compiler, kernels, meta={"seed": args.seed})
         print(f"{len(kernels)} {compiler} cases -> {Path(args.suite_dir) / compiler}")
 

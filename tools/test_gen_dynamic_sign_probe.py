@@ -56,3 +56,38 @@ def test_register_ups_routes_through_a_runtime_zero_shift():
     reg = [f for f in g.all_forms() if f.name.startswith("ups_") and f.name.endswith("_reg")]
     assert len(reg) == len(g.UPS_PEANO)
     assert all("vshift_I512_I512" in f.body for f in reg)
+
+
+def test_rnd_forms_cover_every_srs_form_mode_and_sign():
+    forms = g.rnd_forms()
+    assert len(forms) == 2 * len(g.SRS_PEANO)
+    for f in forms:
+        assert {r[2] for r in f.records} == set(range(16)), f.name
+        assert {r[0] for r in f.records} == {0, 1}, f.name
+        assert "__builtin_aiev2_set_ctrl_reg(6, " in f.body, f.name
+        assert f.epilogue.strip() == "__builtin_aiev2_set_ctrl_reg(6, 0);", f.name
+
+
+def test_rnd_records_carry_mode_as_fifth_scalar():
+    rng = random.Random(1)
+    for f in g.rnd_forms():
+        key = f.name.removeprefix("rnd_").rsplit("_", 1)[0]
+        _, _, acc_bits, lanes, *_ = g.SRS_PEANO[key]
+        off = acc_bits * lanes // 8
+        sign, shift, mode = f.records[-1]
+        b = f.build(rng, sign, shift, mode, 0)
+        assert len(b) == f.rec_in
+        assert struct.unpack("<5I", b[off:off + 20]) == (shift, sign, 1, 0, mode)
+
+
+def test_rnd_lanes_include_ties_and_inexact_values():
+    rng = random.Random(1)
+    for shift in g.RND_SHIFTS:
+        raw = g.rnd_acc_lanes_bytes(32, 16, 64, shift, rng, 0)
+        vals = [int.from_bytes(raw[i:i + 4], "little") for i in range(0, len(raw), 4)]
+        dropped = {v & ((1 << shift) - 1) for v in vals}
+        assert {0, 1 << (shift - 1), (1 << shift) - 1} <= dropped
+
+
+def test_dynsign_kernels_have_no_epilogue():
+    assert all(f.epilogue == "" for f in g.all_forms())
