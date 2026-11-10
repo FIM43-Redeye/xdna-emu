@@ -85,6 +85,10 @@ pub struct CycleAccurateExecutor {
     /// Cycles the next bundle stays frozen after a lock request's arbitration cycle (the
     /// resume phase of a held acquire), each one an engine step of its own.
     frozen_cycles: u8,
+
+    /// The cycle each `vldb.4x` gather in flight freezes the core for its memory cycle
+    /// (see `take_due_gather`).
+    gather_freezes: smallvec::SmallVec<[u64; 2]>,
 }
 
 /// Core lock requests in flight: they resolve together, in order, in front of the bundle
@@ -97,6 +101,10 @@ struct PendingLockRequests {
     resolve_at: u64,
     /// The cycle the held bundle first tried to issue, once an acquire refused it.
     held_since: Option<u64>,
+    /// A gather's memory cycle froze the core while these requests were in flight: it serves
+    /// as their arbitration cycle (silicon, vec-gather-cycle `b2b_gatacq_gg` d = 1..3: no
+    /// cycle and no LOCK_STALL for the acquire; still performed at its own fourth bundle).
+    arbitrated: bool,
 }
 
 impl CycleAccurateExecutor {
@@ -116,7 +124,27 @@ impl CycleAccurateExecutor {
             pending_lock: None,
             req_events_due: smallvec::SmallVec::new(),
             frozen_cycles: 0,
+            gather_freezes: smallvec::SmallVec::new(),
         }
+    }
+
+    /// Whether a gather's memory cycle freezes the core this cycle. A `vldb.4x` gather costs
+    /// the core one frozen cycle (MEMORY_STALL) `GATHER_MEMORY_STALL_CYCLES` cycles after it
+    /// issues, whatever its form and lane addresses. The deadline is on the cycle clock: a
+    /// lock request's arbitration cycle does not move it, another gather's frozen cycle does
+    /// (it freezes the gather too), and one that passes while the core is held on an acquire
+    /// costs nothing. Silicon: build/experiments/vec-gather-cycle (g1, g2 b2b gather pairs,
+    /// t1/t2 traces).
+    fn take_due_gather(&mut self, now: u64) -> bool {
+        self.gather_freezes.retain(|at| *at >= now);
+        let Some(i) = self.gather_freezes.iter().position(|at| *at == now) else {
+            return false;
+        };
+        self.gather_freezes.remove(i);
+        for at in &mut self.gather_freezes {
+            *at += 1;
+        }
+        true
     }
 
     /// The raw lock ID of the in-flight acquire if it is due and cannot be granted now:
@@ -786,13 +814,16 @@ impl CycleAccurateExecutor {
         // here; the falling edge in try_resume_stall once the acquire can be granted.
         // Requests issued inside the window resolve with the first (lock-b2b gg).
         //
-        // Every frozen cycle is a step of its own (`LockArbitration`), so the core's cycle
-        // counter stays on its tile's timer like every other core's.
+        // Every frozen cycle is a step of its own (`Frozen`), so the core's cycle counter
+        // stays on its tile's timer like every other core's. A gather's memory cycle that
+        // falls on a lock-frozen cycle is that same cycle (silicon `gatacq_d0`: LOCK_STALL and
+        // MEMORY_STALL together, one cycle).
+        let gather_due = self.take_due_gather(ctx.cycles);
         if self.frozen_cycles > 0 {
             self.frozen_cycles -= 1;
             ctx.record_stall(1);
             ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
-            return ExecuteResult::LockArbitration;
+            return ExecuteResult::Frozen { lock_stall: true, memory_stall: gather_due };
         }
         if let Some(p) = self.pending_lock.as_mut() {
             if ctx.bundle_seq >= p.resolve_at {
@@ -818,18 +849,39 @@ impl CycleAccurateExecutor {
                 // other stall. After a refusal the held bundle issues off a 3-cycle phase
                 // of the cycle it was first held (silicon, lock-b2b resume samples: never
                 // at a cycle I with (I - held_since) % 3 == 0).
-                let issue_at = ctx.cycles + 1;
-                self.frozen_cycles = p.held_since.map_or(0, |held| {
-                    u8::from((issue_at - held) % xdna_archspec::aie2::locks::CORE_RESUME_PHASE_CYCLES == 0)
-                });
-                if p.held_since.is_none() {
-                    ControlUnit::record_arbitration_pulse(ctx, last_pc);
+                // A gather's memory cycle in the window already gave the requests theirs:
+                // the bundle issues now, and no LOCK_STALL is raised.
+                if p.arbitrated && p.held_since.is_none() && !gather_due {
+                    self.pending_lock = None;
+                } else {
+                    let issue_at = ctx.cycles + 1;
+                    self.frozen_cycles = p.held_since.map_or(0, |held| {
+                        u8::from(
+                            (issue_at - held) % xdna_archspec::aie2::locks::CORE_RESUME_PHASE_CYCLES == 0,
+                        )
+                    });
+                    if p.held_since.is_none() {
+                        ControlUnit::record_arbitration_pulse(ctx, last_pc);
+                    }
+                    self.pending_lock = None;
+                    ctx.record_stall(1);
+                    ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
+                    return ExecuteResult::Frozen { lock_stall: true, memory_stall: gather_due };
                 }
-                self.pending_lock = None;
-                ctx.record_stall(1);
-                ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
-                return ExecuteResult::LockArbitration;
             }
+        }
+
+        // A gather's memory cycle: the bundle waits one frozen cycle (MEMORY_STALL, raised by
+        // the engine from this result), before the REQ events of requests issued just ahead
+        // of it (silicon `gatacq_d3`: REQ a cycle late behind the memory stall). Requests in
+        // flight take it as their arbitration cycle.
+        if gather_due {
+            if let Some(p) = self.pending_lock.as_mut() {
+                p.arbitrated = true;
+            }
+            ctx.record_stall(1);
+            ctx.timing_context_mut().hazard_stalls = self.total_hazard_stalls;
+            return ExecuteResult::Frozen { lock_stall: false, memory_stall: true };
         }
 
         // A lock request's REQ event is raised by the next step that issues a bundle: the
@@ -995,6 +1047,12 @@ impl CycleAccurateExecutor {
                 // A lock request is issued here and performed
                 // CORE_REQUEST_BUNDLES_IN_FLIGHT bundles later (see the resolution above),
                 // with any request already in flight.
+                if super::memory::MemoryUnit::is_load_4x(op) {
+                    self.gather_freezes.push(
+                        start_cycle + xdna_archspec::aie2::instruction_latency::GATHER_MEMORY_STALL_CYCLES,
+                    );
+                }
+
                 if is_lock_request(op) {
                     if let Some(req) = ControlUnit::lock_request(op, ctx) {
                         self.req_events_due.push(req);
@@ -1007,6 +1065,7 @@ impl CycleAccurateExecutor {
                                         + 1
                                         + xdna_archspec::aie2::locks::CORE_REQUEST_BUNDLES_IN_FLIGHT,
                                     held_since: None,
+                                    arbitrated: false,
                                 })
                             }
                         }
@@ -1028,7 +1087,7 @@ impl CycleAccurateExecutor {
                         | ExecuteResult::WaitStream { .. } => {
                             final_result = result;
                         }
-                        ExecuteResult::Continue | ExecuteResult::LockArbitration => {}
+                        ExecuteResult::Continue | ExecuteResult::Frozen { .. } => {}
                         ExecuteResult::Error { .. } => {
                             return result;
                         }
@@ -1953,7 +2012,7 @@ mod tests {
                         }
                         tile.locks[5].value = 1;
                     }
-                    ExecuteResult::LockArbitration => {}
+                    ExecuteResult::Frozen { .. } => {}
                     ExecuteResult::Continue => break,
                     other => panic!("bundle {i}: {other:?}"),
                 }
@@ -2125,6 +2184,129 @@ mod tests {
     }
 
     /// The cycles at which INSTR_LOCK_ACQUIRE_REQ / INSTR_LOCK_RELEASE_REQ were recorded.
+    /// `vldb.4x32.lo wl10, wl8`: lane addresses from x8 (zero: the tile's word 0).
+    fn gather() -> SlotOp {
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+            .with_dest(Operand::VectorReg(10))
+            .with_source(Operand::VectorReg(8));
+        op.encoding_name = Some("vldb.4x32.lo".to_string());
+        op
+    }
+
+    /// Bundles 0..=last, `at[i]` the ops of bundle i, issued with a counter read in each
+    /// (lock 5 holding `lock_count`, a refused acquire waiting `wait` cycles): the cycles
+    /// lost in front of each bundle beyond one per bundle, counted from bundle 0.
+    fn lost_cycles(at: &[(usize, Vec<SlotOp>)], last: usize, lock_count: u8, wait: u32) -> Vec<u64> {
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        tile.locks[5].value = lock_count;
+        let bundles: Vec<VliwBundle> = (0..=last)
+            .map(|i| {
+                make_bundle(at.iter().filter(|(b, _)| *b == i).flat_map(|(_, ops)| ops.clone()).collect())
+            })
+            .collect();
+        let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, wait, true);
+        reads.iter().enumerate().map(|(i, (c, _))| c - reads[0].0 - i as u64).collect()
+    }
+
+    // Silicon (build/experiments/vec-gather-cycle g1: counter reads around one gather, every
+    // form and lane pattern; g2: b2b gather pairs): the bundle 4 after a gather is one cycle
+    // late; a second gather's cycle comes 4 bundles after it (the first one's frozen cycle
+    // freezes it too); after a lock request, a gather's cycle is 4 cycles after it issued
+    // (the request's arbitration cycle does not move it).
+    #[test]
+    fn a_gather_freezes_the_core_one_cycle_four_cycles_after_it_issues() {
+        assert_eq!(lost_cycles(&[(0, vec![gather()])], 7, 1, 0), vec![0, 0, 0, 0, 1, 1, 1, 1]);
+        for (d, want) in [
+            (1, vec![0, 0, 0, 0, 1, 2, 2, 2, 2, 2]),
+            (2, vec![0, 0, 0, 0, 1, 1, 2, 2, 2, 2]),
+            (3, vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 2]),
+            (5, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 2]),
+        ] {
+            assert_eq!(
+                lost_cycles(&[(0, vec![gather()]), (d, vec![gather()])], 9, 1, 0),
+                want,
+                "gat gat d={d}"
+            );
+        }
+        for (d, want) in [
+            (1, vec![0, 0, 0, 0, 2, 2, 2, 2, 2, 2]),
+            (2, vec![0, 0, 0, 0, 1, 2, 2, 2, 2, 2]),
+            (3, vec![0, 0, 0, 0, 1, 1, 2, 2, 2, 2]),
+            (4, vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2]),
+        ] {
+            let at = [(0, vec![acquire_own_lock_5()]), (d, vec![gather()])];
+            assert_eq!(lost_cycles(&at, 9, 1, 0), want, "acq gat d={d}");
+        }
+    }
+
+    // Silicon (vec-gather-cycle g2 gatacq/gatrel gg, t1 traces): a granted request issued 1..3
+    // bundles after a gather costs nothing of its own -- the gather's frozen cycle is its
+    // arbitration cycle, and no LOCK_STALL is raised -- and is still performed; 4 or more
+    // bundles after, it has its own cycle at +d+4. In the same bundle the two are one cycle
+    // with LOCK_STALL (t1 gatacq_d0).
+    #[test]
+    fn a_gather_cycle_in_a_lock_window_is_the_requests_arbitration_cycle() {
+        for (d, want) in [
+            (0, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 1]),
+            (1, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 1]),
+            (3, vec![0, 0, 0, 0, 1, 1, 1, 1, 1, 1]),
+            (4, vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2]),
+        ] {
+            for req in [acquire_own_lock_5(), release_own_lock_5()] {
+                let at = [(0, vec![gather()]), (d, vec![req.clone()])];
+                assert_eq!(lost_cycles(&at, 9, 1, 0), want, "gat {:?} d={d}", req.semantic);
+            }
+        }
+        for (d, pulses) in [(0usize, 1usize), (2, 0)] {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            ctx.timing_context_mut().enable_tracing();
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = 1;
+            let mut bundles = nops(10);
+            bundles[0] = make_bundle(vec![gather()]);
+            bundles[d].set_slot(acquire_own_lock_5());
+            let mut frozen = vec![];
+            for b in &bundles {
+                loop {
+                    match executor.execute(b, &mut ctx, &mut tile) {
+                        ExecuteResult::Frozen { lock_stall, memory_stall } => {
+                            frozen.push((lock_stall, memory_stall))
+                        }
+                        ExecuteResult::Continue => break,
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            let lock_stalls = ctx
+                .timing_context()
+                .events
+                .events()
+                .iter()
+                .filter(|e| matches!(e.event, EventType::LockStall { .. }))
+                .count();
+            assert_eq!(frozen, vec![(d == 0, true)], "d={d}: one frozen cycle");
+            assert_eq!(lock_stalls, pulses, "d={d}: LOCK_STALL pulses");
+            assert_eq!(tile.locks[5].value, 0, "d={d}: the acquire is performed");
+        }
+    }
+
+    // Silicon (vec-gather-cycle g2 acqgat_rg / gatacq_gr): a gather's cycle that falls due
+    // while the core is held on a refused acquire costs nothing after the hold; a refused
+    // acquire issued after a gather is held from its own fourth bundle.
+    #[test]
+    fn a_gather_cycle_inside_a_lock_hold_costs_nothing_more() {
+        let hold = 50;
+        let plain = lost_cycles(&[(0, vec![acquire_own_lock_5()])], 9, 0, hold);
+        let with_gather = lost_cycles(&[(0, vec![acquire_own_lock_5()]), (1, vec![gather()])], 9, 0, hold);
+        assert_eq!(with_gather, plain);
+        let held = lost_cycles(&[(0, vec![gather()]), (2, vec![acquire_own_lock_5()])], 9, 0, hold);
+        assert_eq!(&held[..6], &[0, 0, 0, 0, 1, 1], "not held before bundle 6");
+        assert!(held[6] > u64::from(hold), "held in front of bundle 6: {held:?}");
+    }
+
     fn request_event_cycles(ctx: &ExecutionContext) -> Vec<u64> {
         ctx.timing_context()
             .events
@@ -2194,7 +2376,7 @@ mod tests {
             bundles.push(make_bundle(vec![acquire_own_lock_5()]));
             bundles.extend(nops(8));
             for b in &bundles {
-                while matches!(executor.execute(b, &mut ctx, &mut tile), ExecuteResult::LockArbitration) {}
+                while matches!(executor.execute(b, &mut ctx, &mut tile), ExecuteResult::Frozen { .. }) {}
             }
             assert_eq!(request_event_cycles(&ctx), vec![issue + 1, issue + second_req_at], "d={d}");
         }
@@ -2233,7 +2415,7 @@ mod tests {
             loop {
                 match executor.execute(&probe, &mut ctx, &mut tile) {
                     ExecuteResult::Continue => break,
-                    ExecuteResult::LockArbitration => {}
+                    ExecuteResult::Frozen { .. } => {}
                     other => panic!("{other:?}"),
                 }
             }

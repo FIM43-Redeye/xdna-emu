@@ -73,8 +73,13 @@ pub enum StepResult {
     Continue,
     /// Stalled waiting on lock. Stores raw lock ID (0-63) with quadrant.
     WaitLock { raw_lock_id: u8 },
-    /// Frozen for a lock request's arbitration cycle; the bundle issues next step.
-    LockArbitration,
+    /// Frozen for one cycle (see `ExecuteResult::Frozen`); the bundle issues next step.
+    Frozen {
+        /// A lock request's arbitration cycle.
+        lock_stall: bool,
+        /// A gather's memory cycle.
+        memory_stall: bool,
+    },
     /// Stalled waiting on DMA.
     WaitDma { channel: u8 },
     /// Stalled waiting on stream data.
@@ -438,9 +443,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             }
 
             // The bundle did not issue (the PC stays): it issues next step.
-            crate::interpreter::traits::ExecuteResult::LockArbitration => {
+            crate::interpreter::traits::ExecuteResult::Frozen { lock_stall, memory_stall } => {
                 self.status = CoreStatus::Ready;
-                StepResult::LockArbitration
+                StepResult::Frozen { lock_stall, memory_stall }
             }
 
             crate::interpreter::traits::ExecuteResult::WaitDma { channel } => {
@@ -761,9 +766,9 @@ where
 
             // A lock request's arbitration cycle: the bundle did not issue (the PC stays)
             // and issues next step.
-            ExecuteResult::LockArbitration => {
+            ExecuteResult::Frozen { lock_stall, memory_stall } => {
                 self.status = CoreStatus::Ready;
-                StepResult::LockArbitration
+                StepResult::Frozen { lock_stall, memory_stall }
             }
 
             ExecuteResult::WaitDma { channel } => {
@@ -1035,7 +1040,7 @@ where
                 result @ StepResult::ExecError(_) => return (result, ctx.cycles - start_cycles),
                 // On stall, count as one cycle and continue
                 StepResult::WaitLock { .. }
-                | StepResult::LockArbitration
+                | StepResult::Frozen { .. }
                 | StepResult::WaitDma { .. }
                 | StepResult::WaitStream { .. } => continue,
             }
@@ -1495,7 +1500,10 @@ mod tests {
         tile.locks[15].value = 2;
         // The grant's arbitration cycle, then the held bundle (7 cycles after the stall
         // began: off the 3-cycle resume phase, no extra cycle).
-        assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::LockArbitration));
+        assert!(matches!(
+            interp.step(&mut ctx, &mut tile),
+            StepResult::Frozen { lock_stall: true, memory_stall: false }
+        ));
         assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::Continue));
         assert_eq!(tile.locks[15].value, 0, "acquired once");
         assert_eq!(ctx.instructions, instrs_at_entry + 1, "the held bundle retires once");
@@ -1526,7 +1534,7 @@ mod tests {
         for step in 1..=11u64 {
             match interp.step(&mut ctx, &mut tile) {
                 StepResult::Continue => {}
-                StepResult::LockArbitration => frozen += 1,
+                StepResult::Frozen { lock_stall: true, memory_stall: false } => frozen += 1,
                 other => panic!("step {step}: {other:?}"),
             }
             assert_eq!(ctx.cycles, step, "step {step}");

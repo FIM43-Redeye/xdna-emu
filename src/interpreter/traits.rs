@@ -107,10 +107,16 @@ pub enum ExecuteResult {
         raw_lock_id: u8,
     },
 
-    /// The bundle did not issue this cycle: the pipeline is frozen for a lock request's
-    /// arbitration cycle (the request has been performed). The same bundle issues next
-    /// cycle.
-    LockArbitration,
+    /// The bundle did not issue this cycle: the pipeline is frozen for one cycle, for a lock
+    /// request's arbitration (`lock_stall`: the request has been performed; LOCK_STALL), for
+    /// a `vldb.4x` gather's memory cycle (`memory_stall`: MEMORY_STALL), or both at once.
+    /// The same bundle issues next cycle.
+    Frozen {
+        /// A lock request's arbitration cycle (or the resume phase after a held acquire).
+        lock_stall: bool,
+        /// A gather's memory cycle.
+        memory_stall: bool,
+    },
 
     /// Stall waiting on DMA completion.
     WaitDma {

@@ -187,6 +187,15 @@ pub mod instruction_latency {
     /// Source: `AIE2Schedule.td` `II_VPACK` itinerary,
     /// `operand_cycles[0] = 2`.
     pub const VECTOR_PACK: u8 = 2;
+
+    /// Cycles after a `vldb.4x` gather issues at which it freezes the core for one cycle
+    /// (MEMORY_STALL): 4, whatever the gather's width, half and lane addresses.
+    ///
+    /// Source: silicon (Phoenix, `tools/gen_lock_stall_probe.py` `gpos` and `b2b` gather
+    /// pairs, `tools/gen_lock_pulse_probe.py` gather cases; build/experiments/vec-gather-cycle).
+    /// llvm-aie models no stall: `II_VLDB_4X` holds W_RS_PORT and LOAD_UNIT_A besides its
+    /// own unit and has `MemoryCycles<[5]>`, like every load.
+    pub const GATHER_MEMORY_STALL_CYCLES: u64 = 4;
 }
 
 /// Stream switch port type identifier (xdna-emu convention, not hardware).

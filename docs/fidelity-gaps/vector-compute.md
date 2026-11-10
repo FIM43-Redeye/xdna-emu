@@ -109,10 +109,26 @@ Silicon confirms the issued-bundle clock across a stall (2026-11-10, `tools/gen_
 sampled register): a load in flight while the core waits ~15k cycles on a refused acquire D = 1..8
 bundles later lands exactly where it does without the stall, for `vlda` w, `vldb` (B channel),
 `vlda amll`, `vlda.conv`, `vldb.unpack`, the `vldb.4x` gather and the mask load `lda q` (+7 issued
-bundles) and `vlda.ups` (+9). **Open:** the gather costs the core one cycle the emulator does not
-charge. With every lane addressing one word and a granted acquire D bundles later, the measured
-window is one cycle longer than for any other load when D = 4..8, and equal when D = 1..3, where
-the extra cycle coincides with the acquire's arbitration cycle (s4 `free` cases).
+bundles) and `vlda.ups` (+9).
+**The gather's memory cycle (modelled 2026-11-10).** A `vldb.4x` gather freezes the core for one
+cycle 4 cycles after it issues, raising MEMORY_STALL, whatever its width, half and lane addresses
+(`gpos` counter reads, 25 cases; `b2b` gather pairs, 90 cases; trace cases of
+`tools/gen_lock_pulse_probe.py`; all r1 == r2, no TDR; `build/experiments/vec-gather-cycle`
+g1/g2/t1/t2). The deadline is on the cycle clock. Another gather's frozen cycle pushes it back
+(gather-gather d = 1: +4, +5). A lock request's arbitration cycle does not (request-gather d = 1:
+two cycles in front of +4; d = 2: MEMORY_STALL at gather + 4 behind LOCK_STALL). One that falls
+due while the core is held on a refused acquire costs nothing after the hold. A granted request
+issued 1..3 bundles after a gather needs no arbitration cycle of its own and raises no LOCK_STALL:
+the gather's cycle serves. It is still performed at its own fourth bundle, and a refused one holds
+from there. In the same bundle the two are one cycle with both pulses. The EMU charged nothing
+(s4 free windows one cycle short for D = 4..8). Now `CycleAccurateExecutor` keeps each gather's
+deadline (`take_due_gather`, `aie2::instruction_latency::GATHER_MEMORY_STALL_CYCLES`) and returns
+`ExecuteResult::Frozen { memory_stall }`, which the engine turns into MEMORY_STALL and the Core_Status
+memory-stall bit. Tests `a_gather_freezes_the_core_one_cycle_four_cycles_after_it_issues`,
+`a_gather_cycle_in_a_lock_window_is_the_requests_arbitration_cycle` and
+`a_gather_cycle_inside_a_lock_hold_costs_nothing_more`. Unprobed: whether bank or hazard stalls
+also stand in for a lock request's arbitration cycle; CONFLICT_DM_BANK_n on the gather cycle
+(edge-observable); a gather deadline passing during a bank stall (the EMU lets it go).
 Same-cycle ties and same-bundle schedules are where the old path differed (31 points); the rules
 silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, both r1 == r2):
 

@@ -123,6 +123,10 @@ struct CoreState {
     /// a multi-cycle conflict renders as one B..E span rather than one pulse
     /// per conflicting cycle. See `mem_stall_edge`.
     mem_stall_active: bool,
+    /// The core was frozen for a gather's memory cycle in this cycle's execute phase
+    /// (`StepResult::Frozen { memory_stall: true, .. }`): a MEMORY_STALL cycle like a lost
+    /// bank arbitration. Consumed by Phase E.
+    memory_frozen: bool,
 }
 
 /// Held-level edge decision for a per-cycle win/loss boolean against its
@@ -164,6 +168,7 @@ impl CoreState {
             trace_events_consumed: 0,
             active_this_cycle: false,
             mem_stall_active: false,
+            memory_frozen: false,
         }
     }
 
@@ -181,6 +186,7 @@ impl CoreState {
         // The tile-side pressure level resets with the core. Keeping this set
         // would emit a phantom falling edge after reset.
         self.mem_stall_active = false;
+        self.memory_frozen = false;
     }
 }
 
@@ -1089,10 +1095,12 @@ impl InterpreterEngine {
                             tile.core_debug.update_pc(pipeline_pc);
                         }
                     }
-                    // Frozen for a lock request's arbitration cycle (silicon trails every
-                    // request with a 1-cycle LOCK_STALL): a lock-stall cycle, nothing retired.
-                    StepResult::LockArbitration => {
-                        tile.core_debug.update_stalls(false, true, false, false);
+                    // Frozen for one cycle, nothing retired: a lock request's arbitration
+                    // cycle (silicon trails every request with a 1-cycle LOCK_STALL), a
+                    // gather's memory cycle (MEMORY_STALL, emitted by Phase E), or both.
+                    StepResult::Frozen { lock_stall, memory_stall } => {
+                        tile.core_debug.update_stalls(memory_stall, lock_stall, false, false);
+                        core.memory_frozen = memory_stall;
                         all_halted = false;
                         any_running = true;
                     }
@@ -1724,7 +1732,7 @@ impl InterpreterEngine {
                     // cycle (AM020 ch.4:69 -- a conflict on any port stalls the
                     // whole datapath). Cycle-stat counter ticks every stalled
                     // cycle, independent of the trace-edge collapsing.
-                    let stalled = arb.core_lost;
+                    let stalled = arb.core_lost || std::mem::take(&mut self.cores[core_idx].memory_frozen);
                     if stalled {
                         self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
                     }
