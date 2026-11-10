@@ -93,6 +93,7 @@ def test_parse_eq_quantizes_waits_to_producer_steps():
     lambda: g.same_case("stall", 100), lambda: g.pos_case("pos", "free", 100),
     lambda: g.pos_case("relpos", "stall", 0), *[(lambda n=n: g.eq_case(n, 50)) for n in g.EQ_CASES],
     *[(lambda k=k: g.vlk_case(k, 3, "stall", 100)) for k in g.VLK_KINDS],
+    *[(lambda k=k: g.vlk_case(k, 8, "free", 100)) for k in g.VLK_KINDS],
     lambda: g.vlk_case("vldb", 8, "free", 100)])
 def test_asm_assembles(made, tmp_path):
     _, files = made()
@@ -409,12 +410,13 @@ def test_left_shim_and_memtile_use_their_own_flag_registers():
 @pytest.mark.parametrize("d", range(1, 9))
 def test_vlk_program_copies_the_target_around_the_acquire(kind, d):
     prog = g.vlk_program(kind, d)
-    load, target = g.VLK_KINDS[kind]
-    assert prog[1] == load
-    window = prog[2:10]
+    k = g.VLK_KINDS[kind]
+    assert prog[1] == k.load
+    window = prog[2:2 + k.window_from + 7]
     assert window[d - 1].startswith("  acq ")
-    copies = [w for j, w in enumerate(window, 1) if j != d]
-    assert copies == [f"  vmov wl{j - 1}, {target}" for j in range(1, 9) if j != d]
+    copies = [w for j, w in enumerate(window, 1) if j != d and j >= k.window_from]
+    assert copies == [k.copy(c) for c in range(8) if c + k.window_from != d]
+    assert all(w == g.N for j, w in enumerate(window, 1) if j != d and j < k.window_from)
 
 
 def test_vlk_case_validates_and_stores_every_copy_but_the_acquire():
@@ -424,9 +426,22 @@ def test_vlk_case_validates_and_stores_every_copy_but_the_acquire():
     assert len(stores) == 7 and "  vst wl3, [p0, #160]" not in stores
 
 
+def test_vlk_q_copies_go_to_distinct_accumulator_quarters():
+    copies = [g.VLK_KINDS["q"].copy(j) for j in range(8)]
+    assert len(set(copies)) == 8 and all(c.endswith(", q1") for c in copies)
+
+
 def test_parse_vlk():
-    copies = [[111] * 8] * 6 + [[222] * 8, [222] * 7 + [111]]
+    old, new = [111] * 8, [222] * 8
+    copies = [old] * 3 + [[0] * 8] + [old] * 2 + [new, new]
     words = [1000, 1040] + [0] * 6 + [222] * 8 + [w for c in copies for w in c]
     r = g.parse_vlk(struct.pack(f"<{len(words)}I", *words))
-    assert r["caps"][:7] == [111] * 6 + [222] and r["caps"][7] is None
+    assert r["caps"] == [111, 111, 111, 0, 111, 111, 222, 222]
     assert (r["new_from"], r["window"]) == (7, 40)
+
+
+def test_vlk_ups_window_starts_later_and_keeps_every_acquire_distance():
+    prog = g.vlk_program("ups", 1)
+    assert prog[2].startswith("  acq ") and prog[3] == g.N and prog[4] == g.VLK_KINDS["ups"].copy(0)
+    _, files = g.vlk_case("ups", 1, "stall", 100)
+    assert sum(l.startswith("  vst wl") for l in files["consumer.s"].splitlines()) == 9  # data + 8 copies

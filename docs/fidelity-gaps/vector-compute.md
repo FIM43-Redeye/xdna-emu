@@ -105,9 +105,14 @@ clock (`ExecutionContext::queue_vector_load` -> `VectorRegisterFile::queue_write
 load-commit phantoms are gone, and the gather reads its address register like any reader (it used to
 force-commit every pending write, scalar loads included). Only mask (`q`) loads keep the load queue.
 Silicon confirms the issued-bundle clock across a stall (2026-11-10, `tools/gen_lock_stall_probe.py`
-`vlk_<vlda|vldb|am>_D`, 48 cases, `build/experiments/vec-load-stalls/s1`, r1 == r2, EMU == HW): a `vlda`
-w load, a `vldb` (B channel) and a `vlda amll` in flight while the core waits ~15k cycles on a refused
-acquire D = 1..8 bundles later land 7 issued bundles after the load, exactly as without the stall.
+`vlk_<kind>_D`, `build/experiments/vec-load-stalls/s1..s4`, 128 cases, r1 == r2, EMU == HW on every
+sampled register): a load in flight while the core waits ~15k cycles on a refused acquire D = 1..8
+bundles later lands exactly where it does without the stall, for `vlda` w, `vldb` (B channel),
+`vlda amll`, `vlda.conv`, `vldb.unpack`, the `vldb.4x` gather and the mask load `lda q` (+7 issued
+bundles) and `vlda.ups` (+9). **Open:** the gather costs the core one cycle the emulator does not
+charge. With every lane addressing one word and a granted acquire D bundles later, the measured
+window is one cycle longer than for any other load when D = 4..8, and equal when D = 1..3, where
+the extra cycle coincides with the acquire's arbitration cycle (s4 `free` cases).
 Same-cycle ties and same-bundle schedules are where the old path differed (31 points); the rules
 silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, both r1 == r2):
 

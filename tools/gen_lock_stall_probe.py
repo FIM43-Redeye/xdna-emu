@@ -171,10 +171,41 @@ def same_case(mode: str, late_iters: int):
 
 # -- vlk: a vector load in flight across a lock stall --------------------------------
 
+@dataclass(frozen=True)
+class VlkKind:
+    """One load class of the vlk family: `old` puts LDA_OLD in the target, `load` is the
+    measured load, `copy(j)` copies the target into the j-th sample register (j = 0..7) and
+    `store(j, at)` stores that register at byte offset `at`. The copies sample bundles
+    `window_from` .. `window_from + 7` after the load (a later-landing load needs a later
+    window); bundles before the window that are not the acquire are nops."""
+    old: tuple[str, ...]
+    load: str
+    copy: "object"
+    store: "object"
+    window_from: int = 1
+
+
+def _w_copies(target: str) -> tuple:
+    return (lambda j: f"  vmov wl{j}, {target}", lambda j, at: f"  vst wl{j}, [p0, #{at}]")
+
+
+# accumulator quarters that hold the copies of a mask register (q is 128 bits, a quarter 256)
+_Q_COPIES = [f"am{q}{n}" for n in (1, 2) for q in ("ll", "lh", "hl", "hh")]
+
 VLK_KINDS = {
-    "vlda": ("  vlda wl10, [p0, #32]", "wl10"),
-    "vldb": ("  vldb wl10, [p0, #32]", "wl10"),
-    "am": ("  vlda amll0, [p0, #32]", "amll0"),
+    "vlda": VlkKind(("  vmov wl10, wl11",), "  vlda wl10, [p0, #32]", *_w_copies("wl10")),
+    "vldb": VlkKind(("  vmov wl10, wl11",), "  vldb wl10, [p0, #32]", *_w_copies("wl10")),
+    "am": VlkKind(("  vmov amll0, wl11",), "  vlda amll0, [p0, #32]", *_w_copies("amll0")),
+    "ups": VlkKind(("  vmov amll0, wl11", "  mov s3, #0"), "  vlda.ups.s32.s16 bml0, s3, [p0, #32]",
+                   *_w_copies("amll0"), window_from=3),
+    "conv": VlkKind(("  vmov amll0, wl11",), "  vlda.conv.fp32.bf16 bml0, [p0, #32]", *_w_copies("amll0")),
+    "unpack": VlkKind(("  vmov wl10, wl11", "  mov m0, #0", "  mov p1, p0", *[N] * 2, "  paddb [p1], #32"),
+                      "  vldb.unpack.s16.s8 x10, [p1], m0", *_w_copies("wl10")),
+    # the gather's lanes all address the data (x8 = its address in every lane)
+    "gather": VlkKind(("  vmov wl10, wl11", "  mov r7, p0", *[N] * 2, "  add r7, r7, #32", *[N] * 2,
+                       "  vbcst.32 x8, r7", *[N] * 2), "  vldb.4x32.lo wl10, wl8", *_w_copies("wl10")),
+    "q": VlkKind(("  vmov amll0, wl11", *[N] * 2, "  vmov q1, amll0"), "  lda q1, [p0, #32]",
+                 lambda j: f"  vmov {_Q_COPIES[j]}, q1", lambda j, at: f"  vst {_Q_COPIES[j]}, [p0, #{at}]"),
 }
 # Layout: the two counter reads, the loaded data, the eight copies (`vldb` and `st` take
 # immediate offsets below 128 only).
@@ -184,20 +215,24 @@ VLOG_BYTES = VLK_COPY_AT + 8 * 32
 
 def _vlk_setup(kind: str) -> list[str]:
     # The target holds LDA_OLD in every word until the load lands; the load reads LDA_NEW.
-    old = (["  vmov amll0, wl11"] if kind == "am" else ["  vmov wl10, wl11"])
     return [f"  mov r5, #{LDA_NEW}", f"  mov r6, #{LDA_OLD}", "  mov r4, #-1", *[N] * 2,
             "  vbcst.32 x9, r5", "  vbcst.32 x11, r6", *[N] * 2,
-            f"  vst wl9, [p0, #{VLK_DATA_AT}]", *old, *[N] * 8]
+            f"  vst wl9, [p0, #{VLK_DATA_AT}]", *VLK_KINDS[kind].old, *[N] * 8]
 
 
 def vlk_program(kind: str, d: int) -> list[str]:
     """Consumer measured window of vlk_KIND_D: the load, then bundles +1..+8 (+D = acquire)."""
     if not 1 <= d <= 8:
         raise ValueError("vlk needs 1 <= D <= 8")
-    load, target = VLK_KINDS[kind]
-    body = [_ts(0), load]
-    for j in range(1, 9):
-        body.append(f"  acq #{RAW_OWN}, r4" if j == d else f"  vmov wl{j - 1}, {target}")
+    k = VLK_KINDS[kind]
+    body = [_ts(0), k.load]
+    for j in range(1, k.window_from + 8):
+        if j == d:
+            body.append(f"  acq #{RAW_OWN}, r4")
+        elif j >= k.window_from:
+            body.append(k.copy(j - k.window_from))
+        else:
+            body.append(N)
     return body + [_ts(1)]
 
 
@@ -211,7 +246,8 @@ def vlk_case(kind: str, d: int, mode: str, late_iters: int):
     if not stall:
         body += base.delay_loop(late_iters, ".Lcons")
     body += vlk_program(kind, d) + [*[N] * 8]
-    body += [f"  vst wl{j - 1}, [p0, #{VLK_COPY_AT + 32 * (j - 1)}]" for j in range(1, 9) if j != d]
+    k = VLK_KINDS[kind]
+    body += [k.store(c, VLK_COPY_AT + 32 * c) for c in range(8) if c + k.window_from != d]
     body += [f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (VLK_TS_WORD + i)}]" for i in range(2)]
     cons = _frame(body)
     return _topology(f"vlk_{kind}_{d}_{mode}", cons, _releaser(late_iters if stall else 0), 0,
@@ -219,12 +255,17 @@ def vlk_case(kind: str, d: int, mode: str, late_iters: int):
 
 
 def parse_vlk(consumer_log: bytes) -> dict:
-    """Word 0 of each copy (every word of a copy is equal unless a copy tore)."""
-    copies = [struct.unpack_from("<8I", consumer_log, VLK_COPY_AT + 32 * j) for j in range(8)]
-    caps = [c[0] if len(set(c)) == 1 else None for c in copies]
-    first = next((i + 1 for i, v in enumerate(caps) if v == LDA_NEW), None)
+    """Each copy as its first word and a short hash of all its bytes (the loads that convert
+    or unpack do not leave LDA_NEW in every word). `new_from` is the first copy that differs
+    from the copy at +1 (the old value; +1 is never the landing bundle)."""
+    import zlib
+    raw = [consumer_log[VLK_COPY_AT + 32 * j:VLK_COPY_AT + 32 * (j + 1)] for j in range(8)]
+    caps = [struct.unpack_from("<I", r)[0] for r in raw]
+    crcs = [zlib.crc32(r) & 0xFFFF for r in raw]
+    old = next(r for r in raw if any(r))
+    first = next((j + 1 for j, r in enumerate(raw) if any(r) and r != old), None)
     w = struct.unpack_from(f"<{VLOG_BYTES // 4}I", consumer_log)
-    return {"caps": caps, "new_from": first,
+    return {"caps": caps, "crcs": crcs, "new_from": first,
             "window": (w[VLK_TS_WORD + 1] - w[VLK_TS_WORD]) & 0xFFFFFFFF}
 
 
@@ -1466,9 +1507,11 @@ def cmd_analyze(args) -> int:
             continue
         if meta["family"] == "vlk":
             r = parse_vlk(log)
-            caps = " ".join("A" if meta["d"] == i + 1 else ("torn" if v is None else f"{v}")
-                            for i, v in enumerate(r["caps"]))
-            print(f"{name:20s} {caps}  new_from=+{r['new_from']} window={r['window']}")
+            w0 = VLK_KINDS[meta["kind"]].window_from
+            caps = " ".join("A" if meta["d"] == i + w0 else f"{v}/{c:04x}"
+                            for i, (v, c) in enumerate(zip(r["caps"], r["crcs"])))
+            nf = f"+{r['new_from'] + w0 - 1}" if r["new_from"] else "none"
+            print(f"{name:20s} from+{w0} {caps}  new_from={nf} window={r['window']}")
             continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
@@ -1492,7 +1535,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, vlk_<vlda|vldb|am>[_D], same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, vlk_<vlda|vldb|am|ups|conv|unpack|gather|q>[_D], same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)
