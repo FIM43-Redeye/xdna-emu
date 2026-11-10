@@ -611,8 +611,9 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     # 4a. MOV_CNTR reads the hardware cycle counter, which is inherently
     # nondeterministic across runs (varies with DMA/lock handshake timing).
     # Confirmed nondeterministic across 10 runs on real NPU (2026-04-01).
+    # Its deltas are deterministic: CycleCounterStrategy tests those in batches of their own.
     if instr.get("name") == "MOV_CNTR":
-        return ("skipped", "cycle counter (hardware-nondeterministic)")
+        return ("skipped", "absolute cycle counter (deltas: CycleCounterStrategy)")
 
     # 4b. Stream switch status reads and stream instructions are now handled
     # by StreamStrategy in the strategy chain.
@@ -4005,6 +4006,57 @@ class ScalarWidthStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# CycleCounterStrategy: MOV_CNTR read twice, the delta observed
+# ---------------------------------------------------------------------------
+
+class CycleCounterStrategy(TestStrategy):
+    """`mov rH:rL, cntr` reads the 64-bit tile timer; its absolute value depends on when the core
+    started, so only the difference of two reads a known number of bundles apart is a
+    deterministic observation.  One test point per gap: read into r25:r24, GAP nops, read into
+    r27:r26, then store the low-word and high-word differences (the high word stays 0 for gaps
+    this short unless the low word wraps between the reads, which the low difference absorbs
+    modulo 2^32 and the high difference then shows as 1).
+    """
+
+    GAPS = (0, 1, 2, 3, 4, 8, 16, 31)
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        return [{"name": f"cntr_gap{g}", "gap": g, "isa": "MOV_CNTR"} for g in cls.GAPS]
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if instr["name"] == "MOV_CNTR":
+            return (True, "")
+        return (False, "not the cycle counter read")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"cntr": c["name"]} for c in self.cases()]
+
+    def compute_input_size(self, instr, regs):
+        return 4    # a batch never has an empty input buffer
+
+    def compute_output_size(self, instr):
+        return 8
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        gap = self.case(regs["cntr"])["gap"]
+        lines = [f"  // ---- test (cycle counter delta): {gap} nops ----"]
+        lines += ["  mov r25:r24, cntr"] + _nop_sled(gap) + ["  mov r27:r26, cntr"] + _nop_sled(3)
+        lines += ["  sub r6, r26, r24", "  sub r7, r27, r25"] + _nop_sled(3)
+        lines += _scalar_store("r6", "p1", out_offset) + _scalar_store("r7", "p1", out_offset + 4)
+        lines += _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -5916,6 +5968,11 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         width_specs.append((by_name[case["isa"]], len(width_specs), {"width": case["name"], "_combo_idx": 0},
                             width_strategy))
 
+    # Cycle-counter deltas (CycleCounterStrategy): standalone batches after the width ones.
+    cntr_strategy = CycleCounterStrategy()
+    cntr_specs = [(by_name["MOV_CNTR"], k, {"cntr": c["name"], "_combo_idx": 0}, cntr_strategy)
+                  for k, c in enumerate(CycleCounterStrategy.cases())]
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6251,7 +6308,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    for specs in (collision_specs, width_specs):
+    for specs in (collision_specs, width_specs, cntr_specs):
         chunk, chunk_bundles = [], 0
         for spec in specs:
             instr, _, regs, strategy = spec
@@ -6269,7 +6326,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
-                         + len(collision_specs) + len(width_specs)
+                         + len(collision_specs) + len(width_specs) + len(cntr_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())

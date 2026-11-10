@@ -200,8 +200,10 @@ python3 tools/isa-test-analyze.py build/isa-suite --failing
 
 **Determinism check.** `harness suite hw <suite> d5 --repeat 5` followed by
 `harness suite repeats <suite> d5` replaces the old shell loops. On the ISA suite it is how
-nondeterministic instructions were found (the cycle counter `MOV_CNTR` is skipped by the
-generator for that reason; cold-start state leaking across launches was fixed by resetting
+nondeterministic instructions were found (the cycle counter `MOV_CNTR`: its absolute value
+is not tested, only the difference of two reads a known number of bundles apart, which is
+deterministic, `CycleCounterStrategy`; silicon reads gap + 1 for 0..31 nops between the reads,
+2026-11-10; cold-start state leaking across launches was fixed by resetting
 the compress and sparse state and clearing the MAC destination in the kernels).
 
 ## Test Validation Architecture
