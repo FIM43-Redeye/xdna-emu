@@ -195,16 +195,21 @@ shim-queue MM2S stall probes now differ from silicon on 24 of 164 cases (50 befo
 unchanged; full bridge suite 207 pass / 0 fail on both compilers, 40 emulator traces changed against the
 branch base, scored against the same silicon capture: cleanly matching edge event types 46 -> 49, level
 interval-count mismatches 143 -> 149, summed edge |dt| -0.1% (`build/experiments/pipeline-fill/bridge-emu-ab.txt`).
-The level mismatches that moved include memtile send-port (`PORT_RUNNING_4`) interval counts one higher (the
-port-side BD bubble, not separately probed) and S2MM stream-starvation counts in both directions.
+Level rows: 9 became exact, 15 stopped being exact (`bridge-emu-ab-rows.txt`). Most of the 15 are the memtile
+send port of the `memtile_dmas/dma_configure_task_*` tests, `PORT_RUNNING_4` 2/2 -> 2/3, which stays 2/3 with the
+BD bubble off (`XDNA_EMU_BD_SWITCH_BUBBLE=0`), so it is not the port-side bubble (unattributed: the earlier
+retirement or the removed source gate). `add_256_using_dma_op_no_double_buffering` moved most (`PORT_RUNNING_0`
+6/6 -> 6/7, `PORT_RUNNING_4` 9/9 -> 9/11, shim S2MM 0 starvation 15/15 -> 15/8); with the bubble off its port
+rows undershoot instead (6/5, 9/8), so the bubble's placement matters there and is not settled.
 
 **Open (not modelled):** every memtile-sourced path holds 4 words more than the emulator (the memtile egress
 staging or its DMA slave port: not separated; mem tiles had inherited the compute tile's 25), and every path
 into an idle shim S2MM from the north holds 4 more (memtile South master or shim North slave: not separated;
 the shim's own MM2S -> S2MM loop holds 8, one less than the emulator). The hop slope is 8 words on both
 sides. On `of_q0_rich` neither moves the depth (its drain BDs are 32 words); a drain BD of 41..48 words
-would. Also open: a stalled MM2S has already acquired the lock of the BD after the one it works on (compute
-and memtile chains, the `of_q0_rich` drain), with `Cur_BD` one BD further than the emulator's; `Status[1:0]`
+would. Also open: a stalled MM2S has already acquired the locks of BDs beyond the one it works on (compute
+chain one, memtile chain two: at 8-word BDs 8 and 9 acquires for 6 finished BDs, the emulator 7; the
+`of_q0_rich` memtile drain one), with `Cur_BD` one BD further than the emulator's; `Status[1:0]`
 reads 2 where the emulator reads 1 on a backpressured chain; a compute chain of 4-word BDs stops one BD short
 (11 of 12, the next BD reading Stalled_Lock_Acq with its lock available; also a memtile chain of twenty
 4-word BDs into an idle shim: 11).
