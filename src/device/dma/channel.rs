@@ -67,6 +67,16 @@ pub struct ReturningRead {
     pub data: StreamData,
 }
 
+/// A word in a compute / memtile MM2S's egress staging
+/// (`ChannelContext::egress_staging`).
+#[derive(Debug, Clone)]
+pub struct StagedWord {
+    pub data: StreamData,
+    /// The last word of its BD: the port idles `bd_switch_bubble_cycles` after
+    /// it (`drain_egress_staging`).
+    pub ends_bd: bool,
+}
+
 /// A shim MM2S BD whose reads have all been issued, waiting for its last read
 /// to return: then its lock release, FINISHED_BD and (on a task's last BD)
 /// FINISHED_TASK and TCT token happen (`ChannelContext::read_completions`).
@@ -573,6 +583,27 @@ pub struct ChannelContext {
     /// Held level of the stream-side STREAM_BACKPRESSURE for a read-ahead
     /// channel: a returned word is waiting on a full output register.
     pub read_backpressure: bool,
+
+    /// Compute / memtile MM2S egress staging FIFO: words read from tile memory
+    /// (a 16-byte granule per bank access), in order, not yet handed to the
+    /// stream output register, each already carrying its TLAST. It belongs to
+    /// the channel, not to a BD: a BD finishes once its last word is FETCHED
+    /// into it, and the next BD fetches in behind words still waiting here.
+    /// Silicon: an MM2S chain into a held consumer finishes exactly as many BDs
+    /// as fit the path's whole absorb (48 words at 0 hops on a compute tile and
+    /// a memtile, BDs of 2..24 words), not the absorb less this FIFO
+    /// (build/experiments/pipeline-fill/chain). Drained one word per cycle
+    /// whatever the FSM is doing (`drain_egress_staging`). The depth is
+    /// `DMA_MM2S_EGRESS_FIFO_DEPTH`, shared by every BD in it.
+    pub egress_staging: VecDeque<StagedWord>,
+    /// Port-idle cycles still owed after the last word of a BD left the
+    /// staging: the BD-boundary bubble (NPU1 add_one memtile MM2S `off1` per
+    /// BD), which now sits on the port side because the next BD is already
+    /// fetching behind the finished one's words.
+    pub egress_gap: u16,
+    /// Held level of the stream-side STREAM_BACKPRESSURE for a staged MM2S: a
+    /// staged word is waiting on a full output register.
+    pub egress_backpressure: bool,
 }
 
 impl ChannelContext {
@@ -612,6 +643,9 @@ impl ChannelContext {
             cold_drain_cooldown: 0,
             cold_drain_word_index: 0,
             read_ahead: VecDeque::new(),
+            egress_staging: VecDeque::new(),
+            egress_gap: 0,
+            egress_backpressure: false,
             read_completions: VecDeque::new(),
             read_backpressure: false,
         }
@@ -700,10 +734,11 @@ impl ChannelContext {
             || !self.parked_releases.is_empty()
     }
 
-    /// Shim MM2S read-ahead state still in flight: words not yet in the
-    /// stream, or BDs whose last read has not returned.
+    /// MM2S words still in flight after their BD: shim read-ahead words not
+    /// yet in the stream or BDs whose last read has not returned, and words in
+    /// a compute / memtile egress staging FIFO.
     pub fn has_outstanding_reads(&self) -> bool {
-        !self.read_ahead.is_empty() || !self.read_completions.is_empty()
+        !self.read_ahead.is_empty() || !self.read_completions.is_empty() || !self.egress_staging.is_empty()
     }
 
     /// Access the in-flight Transfer, if any.
@@ -755,6 +790,9 @@ impl ChannelContext {
         self.read_ahead.clear();
         self.read_completions.clear();
         self.read_backpressure = false;
+        self.egress_staging.clear();
+        self.egress_gap = 0;
+        self.egress_backpressure = false;
     }
 }
 
