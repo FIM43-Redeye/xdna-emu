@@ -816,7 +816,9 @@ impl VectorAlu {
                     ctx.queue_acc_quarter_write(Operand::AccumReg(dst), quarter_base, lanes);
                 }
             } else {
-                // Narrow cross-register-file move (vector <-> accumulator).
+                // Narrow cross-register-file move (vector <-> accumulator) with no quarter
+                // width. No AIE2 vmov encoding reaches this: VMOV_mv_w's accumulator operands
+                // are quarters (handled above) and 512-bit moves are wide (VMOV_mv_x).
                 // get_vector_source handles AccumReg sources (truncates u64->u32).
                 // write_vector_dest handles AccumReg dests (zero-extends u32->u64).
                 let src = Self::get_vector_source(op, ctx, 0);

@@ -4474,8 +4474,8 @@ class TestScalarCollisionStrategy:
         at = batches.index(mine[0])
         assert mine and batches[at:at + len(mine)] == mine, "collision batches are contiguous"
         # only the standalone batches generated after them follow: register width, cycle
-        # counter, control timing
-        later = ("width", "cntr", "ctl")
+        # counter, control timing, vmov quarter
+        later = ("width", "cntr", "ctl", "vmovq")
         assert all(any(k in t["operands"] for k in later for t in b["tests"]) for b in batches[at + len(mine):])
         for b in mine:
             for t in b["tests"]:
@@ -4545,7 +4545,7 @@ class TestScalarWidthStrategy:
         assert mine and batches[at:at + len(mine)] == mine
         # only the cycle-counter and control-timing batches come after them
         rest = batches[at + len(mine):]
-        assert all(any(k in t["operands"] for k in ("cntr", "ctl") for t in b["tests"]) for b in rest)
+        assert all(any(k in t["operands"] for k in ("cntr", "ctl", "vmovq") for t in b["tests"]) for b in rest)
         size = 4 * len(self.S.PATTERNS)
         for b in mine:
             for t in b["tests"]:
@@ -4718,6 +4718,38 @@ class TestControlTimingStrategy:
     def test_never_writes_the_stack_pointer_copy(self):
         for c in self.S.cases():
             isa_test_gen._check_reserved_registers(["\n".join(self._lines(c["name"]))])
+
+
+class TestVmovQuarterStrategy:
+    S = isa_test_gen.VmovQuarterStrategy
+
+    def _lines(self, name):
+        asm = self.S().generate_test_point({"name": "VMOV_mv_w"}, {"vmovq": name}, in_offset=0, out_offset=0)
+        return [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
+
+    def test_every_quarter_is_read_then_written(self):
+        assert {c["quarter"] for c in self.S.cases()} == set(self.S.QUARTERS)
+        for c in self.S.cases():
+            q = f"{c['quarter']}{c['acc']}"
+            lines = self._lines(c["name"])
+            read, write = lines.index(f"vmov {c['dst']}, {q}"), lines.index(f"vmov {q}, {c['src']}")
+            fill = lines.index(f"vmov bmh{c['acc']}, x1")
+            back = lines.index(f"vmov x0, bml{c['acc']}")
+            assert fill < read < write < back, c["name"]
+
+    def test_touches_no_scalar_register(self):
+        for c in self.S.cases():
+            assert not any(re.search(r"\br\d+\b", l) for l in self._lines(c["name"])), c["name"]
+
+    def test_batch_comes_after_the_control_timing_batches(self, tmp_path):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        batches = generate_all(path, str(tmp_path / "isa"))["batches"]
+        mine = [i for i, b in enumerate(batches) if any("vmovq" in t["operands"] for t in b["tests"])]
+        ctl = [i for i, b in enumerate(batches) if any("ctl" in t["operands"] for t in b["tests"])]
+        assert mine and min(mine) > max(ctl)
+        assert sum(len(batches[i]["tests"]) for i in mine) == len(self.S.cases())
 
 
 class TestReservedRegisterGuard:

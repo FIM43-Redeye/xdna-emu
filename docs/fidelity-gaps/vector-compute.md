@@ -759,9 +759,14 @@ accumulator-to-w move took one 32-bit lane from each u64 word (and the reverse
 zero-extended), which duplicated lanes and failed `vec_acc_addsub_f32` on the
 emulator. A quarter (`QuarterLow` / `QuarterHigh`) is now moved raw as four u64
 words of two 32-bit lanes, matching the quarter loads and stores
-(`test_vmov_w_acc_quarter_is_a_raw_256_bit_move`). The remaining narrow
-`vmov w, am` widths (Half) keep the legacy one-lane-per-word behavior,
-unverified.
+(`test_vmov_w_acc_quarter_is_a_raw_256_bit_move`). **Silicon-confirmed
+2026-11-10** by ISA batch 210 (`VmovQuarterStrategy` in `tools/isa-test-gen.py`):
+all four quarter names on `bm1`/`bm6`, read and write, each filled through the raw
+`vmov bm, x`; `amll`/`amlh` are the low/high 256 bits of `bml`, `amhl`/`amhh` of
+`bmh`, the other three quarters stay untouched, EMU == HW on two runs. There is no
+Half form of `vmov w, am`: VMOV_mv_w's operand class is `mMvAMWQ` = `mAMm` (the
+quarters), `mWm`, `mQQm` (TableGen `AIE2GenRegisterInfo.td`), and every 512-bit
+accumulator move is VMOV_mv_x (`bm` / `x`), the wide path above.
 
 ## Integer MAC modes without a matmul tile (elementwise, convolution, two-channel)
 

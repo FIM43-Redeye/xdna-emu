@@ -4166,6 +4166,72 @@ class ControlTimingStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# VmovQuarterStrategy: 256-bit moves between a w register and an accumulator quarter
+# ---------------------------------------------------------------------------
+
+class VmovQuarterStrategy(TestStrategy):
+    """`vmov w, amXXk` / `vmov amXXk, w` (VMOV_mv_w with an accumulator quarter operand).
+
+    The ordinary combinations of VMOV_mv_w pick w registers only, so the quarter forms had no
+    silicon test of their own.  One test point per quarter name and accumulator index: the two
+    halves `bmlk` / `bmhk` are filled with random bits through the wide moves `vmov bm, x` (raw
+    512-bit, tested by their own combinations), the quarter is read into a w register, then
+    overwritten from another w register, and both halves are read back with `vmov x, bm`.  The
+    output shows which 256 bits the quarter name selects, in which lane order, and that the
+    other three quarters are untouched.  No scalar register is used.
+    """
+
+    QUARTERS = ("amll", "amlh", "amhl", "amhh")
+    # (accumulator index, w source of the write, w destination of the read)
+    SLOTS = ((1, "wl2", "wh3"), (6, "wh2", "wl3"))
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        return [{"name": f"vmovq_{q}{k}", "quarter": q, "acc": k, "src": s, "dst": d}
+                for k, s, d in cls.SLOTS for q in cls.QUARTERS]
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if instr["name"] == "VMOV_mv_w":
+            return (True, "")
+        return (False, "not the w / accumulator-quarter move")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"vmovq": c["name"]} for c in self.cases()]
+
+    def compute_input_size(self, instr, regs):
+        return 160      # x0, x1 (the accumulator halves) and the 32-byte write source
+
+    def compute_output_size(self, instr):
+        return 160      # the quarter as read, then both halves after the write
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["vmovq"])
+        k, q, src, dst = c["acc"], f"{c['quarter']}{c['acc']}", c["src"], c["dst"]
+        in_offset, out_offset = _align(in_offset, 32), _align(out_offset, 32)
+        lines = [f"  // ---- test (vmov quarter): {dst} <- {q}, then {q} <- {src} ----"]
+        lines += (_vector_load("wl0", "p0", in_offset) + _vector_load("wh0", "p0", in_offset + 32)
+                  + _vector_load("wl1", "p0", in_offset + 64) + _vector_load("wh1", "p0", in_offset + 96)
+                  + _vector_load(src, "p0", in_offset + 128) + _nop_sled(8))
+        lines += [f"  vmov bml{k}, x0"] + _nop_sled(1) + [f"  vmov bmh{k}, x1"] + _nop_sled(8)
+        lines += [f"  vmov {dst}, {q}"] + _nop_sled(8)
+        lines += [f"  vmov {q}, {src}"] + _nop_sled(8)
+        lines += [f"  vmov x0, bml{k}"] + _nop_sled(1) + [f"  vmov x1, bmh{k}"] + _nop_sled(8)
+        lines += (_vector_store(dst, "p1", out_offset)
+                  + _vector_store("wl0", "p1", out_offset + 32) + _vector_store("wh0", "p1", out_offset + 64)
+                  + _vector_store("wl1", "p1", out_offset + 96) + _vector_store("wh1", "p1", out_offset + 128))
+        lines += _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -6088,6 +6154,12 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     ctl_specs = [(by_name[c["isa"]], k, {"ctl": c["name"], "_combo_idx": 0}, ctl_strategy)
                  for k, c in enumerate(ControlTimingStrategy.cases())]
 
+    # w / accumulator-quarter moves (VmovQuarterStrategy): standalone batch after the
+    # control-timing ones.
+    vmovq_strategy = VmovQuarterStrategy()
+    vmovq_specs = [(by_name["VMOV_mv_w"], k, {"vmovq": c["name"], "_combo_idx": 0}, vmovq_strategy)
+                   for k, c in enumerate(VmovQuarterStrategy.cases())]
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6423,7 +6495,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs):
+    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs, vmovq_specs):
         chunk, chunk_bundles = [], 0
         for spec in specs:
             instr, _, regs, strategy = spec
@@ -6441,7 +6513,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
-                         + len(collision_specs) + len(width_specs) + len(cntr_specs) + len(ctl_specs)
+                         + len(collision_specs) + len(width_specs) + len(cntr_specs) + len(ctl_specs) + len(vmovq_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())
