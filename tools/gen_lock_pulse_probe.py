@@ -32,8 +32,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 TRACE_EVENTS = "INSTR_LOCK_ACQUIRE_REQ,INSTR_LOCK_RELEASE_REQ,LOCK_STALL"
-RUNNER = REPO.parent.parent / "bridge-runner" / "build" / "bridge-trace-runner"
-HW_LOCK = REPO.parent.parent / "build" / "experiments" / ".npu-hw.lock"
+RUNNER = REPO / "bridge-runner" / "build" / "bridge-trace-runner"
+HW_LOCK = REPO / "build" / "experiments" / ".npu-hw.lock"
 N = "  nop"
 OWN, SOUTH = 48, 0          # raw lock id bases: the consumer's own tile, the producer's south quadrant
 A, B = 14, 15               # the two locks of the consumer tile the probes use
@@ -84,9 +84,12 @@ class Case:
     # frames hundreds of thousands of cycles apart)
     perfcnt_period: int | None = None
     tail_iters: int | None = None
+    gather: bool = False              # x8 holds the log buffer's address in every lane
 
     def consumer_asm(self) -> str:
         setup = ["  mov r2, #1", "  mov r3, #-1", *nops(2)]
+        if self.gather:
+            setup += ["  mov r7, p0", *nops(2), "  vbcst.32 x8, r7", *nops(2)]
         # markers: event 0 opens the window, event 1 closes it; padding keeps the window's
         # bundles away from the setup and the epilogue
         return frame([*setup, *delay_loop(HEAD_ITERS, ".Lhead"), *nops(8), "  event #0", *self.window, *nops(self.end_gap), "  event #1", *nops(8),
@@ -103,6 +106,11 @@ class Case:
 def req(kind: str, lock: int, cond: bool = False) -> str:
     reg = {"acq": "r3", "rel": "r2"}[kind]
     return f"{kind}{'.cond' if cond else ''} #{OWN + lock}, {reg}{', r26' if cond else ''}"
+
+
+# A vldb.4x gather: silicon charges the core one cycle in front of the 4th bundle after it,
+# as a granted lock request (vec-gather-cycle); these cases ask whether it pulses LOCK_STALL.
+GATHER = "vldb.4x32.lo wl10, wl8"
 
 
 def single(name: str, kind: str, init: int) -> Case:
@@ -147,6 +155,14 @@ def cases() -> dict[str, Case]:
         add(pair(f"acqacq_d{d}", "acq", "acq", d, {A: 1, B: 1}))
         add(pair(f"relrel_d{d}", "rel", "rel", d, {A: 0, B: 0}))
         add(pair(f"relacq_d{d}", "rel", "acq", d, {A: 0, B: 1}))
+    add(Case("gat", bundles({0: GATHER}, 0), gather=True))
+    add(Case("gat_x2", bundles({0: GATHER, 8: GATHER}, 8), gather=True))
+    for d in (1, 2, 3, 4, 5):
+        add(Case(f"gatacq_d{d}", bundles({0: GATHER, d: req("acq", B)}, d), {B: 1}, gather=True))
+        add(Case(f"acqgat_d{d}", bundles({0: req("acq", A), d: GATHER}, d), {A: 1}, gather=True))
+    add(Case("gatacq_d0", bundles({0: f"{GATHER} ; {req('acq', B)}"}, 0), {B: 1}, gather=True))
+    add(Case("gatrel_d0", bundles({0: f"{GATHER} ; {req('rel', B)}"}, 0), {B: 0}, gather=True))
+    add(Case("gatacq_refused", bundles({0: GATHER, 2: req("acq", A)}, 2), {A: 0}, A, gather=True))
     # a refused acquire granted when the producer releases, with a trailing request
     add(Case("acq_refused", bundles({0: req("acq", A)}, 0), {A: 0}, A))
     add(Case("acq_refused_rel", bundles({0: req("acq", A), 8: req("rel", B)}, 8), {A: 0, B: 0}, A))
@@ -239,7 +255,7 @@ def assemble(src: str, dest: Path, symbol: str) -> None:
     sh([peano("llvm-objcopy"), "--redefine-sym", f"test_kernel={symbol}", str(dest)])
 
 
-def build_case(case: Case, out: Path) -> None:
+def build_case(case: Case, out: Path, events: str = TRACE_EVENTS) -> None:
     d = out / case.name
     d.mkdir(parents=True, exist_ok=True)
     assemble(case.consumer_asm(), d / "consumer.o", "k_consumer")
@@ -247,7 +263,7 @@ def build_case(case: Case, out: Path) -> None:
         assemble(p, d / "producer.o", "k_producer")
     (d / "base.mlir").write_text(design_mlir(case))
     sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-        "--out", "aie.mlir", "--trace-mode", "event_time", "--core-sweep-events", TRACE_EVENTS,
+        "--out", "aie.mlir", "--trace-mode", "event_time", "--core-sweep-events", events,
         "--trace-config-out", "trace_config.json", "--config-test-name", case.name,
         "--config-src-mlir", "base.mlir", "--buffer-size", "65536",
         *(["--perfcnt-period", str(case.perfcnt_period)] if case.perfcnt_period else [])],
@@ -332,7 +348,10 @@ def summarize(path: Path, backend: str) -> str:
     if base is None:
         return "no INSTR_EVENT_0"
     parts = []
-    for name in ("INSTR_EVENT_0", "INSTR_LOCK_ACQUIRE_REQ", "INSTR_LOCK_RELEASE_REQ", "LOCK_STALL", "INSTR_EVENT_1"):
+    for name in ("INSTR_EVENT_0", "INSTR_LOCK_ACQUIRE_REQ", "INSTR_LOCK_RELEASE_REQ", "LOCK_STALL",
+                 "MEMORY_STALL", "INSTR_EVENT_1"):
+        if name == "MEMORY_STALL" and not any(e["name"] == name for e in ev):
+            continue
         iv = [(a - base, b - base) for a, b in levels(ev, name, field)]
         parts.append(f"{name}={iv}")
     return " ".join(parts)
@@ -355,6 +374,8 @@ def main(argv=None) -> int:
     b = sub.add_parser("build")
     b.add_argument("out_dir")
     b.add_argument("--cases", nargs="*", default=[])
+    b.add_argument("--events", default=TRACE_EVENTS,
+                   help=f"core trace events, comma separated (default {TRACE_EVENTS})")
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
@@ -375,7 +396,7 @@ def main(argv=None) -> int:
     table = cases()
     if a.cmd == "build":
         for name in a.cases or table:
-            build_case(table[name], out)
+            build_case(table[name], out, a.events)
             print("built", name)
         return 0
     names = [n for n in table if (not a.only or n in a.only) and (out / n).is_dir()]

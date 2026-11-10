@@ -338,13 +338,19 @@ def parse_pos(consumer_log: bytes) -> list[int]:
 # Request 1 is on lock B2B_FIRST, request 2 on LOCK_ID; both locks live in the consumer's
 # memory module and the producer reaches both (to release whichever acquire is refused).
 B2B_FIRST = 14
-B2B_PAIRS = ("relacq", "acqacq", "acqrel", "relrel")
+B2B_PAIRS = ("relacq", "acqacq", "acqrel", "relrel", "gatacq", "acqgat", "gatgat", "gatrel", "relgat")
 # Variants: "gg" every acquire granted on issue; "gr" the second acquire refused until the
 # producer releases it; "rg" the first acquire refused; "same" (relacq only) both requests
 # on LOCK_ID, count 0: the release is what lets the acquire through, unless silicon takes
 # the acquire first, in which case the producer's release lets it through late.
+# "gat" is not a lock request but a vldb.4x gather (x8 holds the log address in every lane),
+# which silicon charges one cycle in front of the 4th bundle after it, like a granted request
+# (vec-gather-cycle): the gat pairs ask whether the two share one window.
 B2B_VARIANTS = {"relacq": ("gg", "gr", "same"), "acqacq": ("gg", "gr", "rg"),
-                "acqrel": ("gg", "rg"), "relrel": ("gg",)}
+                "acqrel": ("gg", "rg"), "relrel": ("gg",),
+                "gatacq": ("gg", "gr"), "acqgat": ("gg", "rg"), "gatgat": ("gg",),
+                "gatrel": ("gg",), "relgat": ("gg",)}
+B2B_GATHER = "vldb.4x32.lo wl10, wl8"
 B2B_MAX_D = 5
 # Counter reads co-issue with every bundle, the requests included, but only the eight
 # eL pairs r16..r31 take `mov rH:rL, cntr`: each case reads the counter in front of
@@ -374,8 +380,11 @@ def b2b_program(pair: str, variant: str, d: int, window: str) -> list[str]:
     k1, k2 = _b2b_requests(pair)
     lock1 = LOCK_ID if variant == "same" else B2B_FIRST
     regs = {"acq": "r3", "rel": "r2"}
-    slots: dict[int, list[str]] = {0: [f"{k1} #{48 + lock1}, {regs[k1]}"],
-                                   d: [f"{k2} #{48 + LOCK_ID}, {regs[k2]}"]}
+
+    def request(kind: str, lock: int) -> str:
+        return B2B_GATHER if kind == "gat" else f"{kind} #{48 + lock}, {regs[kind]}"
+
+    slots: dict[int, list[str]] = {0: [request(k1, lock1)], d: [request(k2, LOCK_ID)]}
     for i, off in enumerate(b2b_layout(window)):
         hi, lo = TS_PAIRS[i]
         slots.setdefault(off, []).append(f"mov r{hi}:r{lo}, cntr")
@@ -433,7 +442,10 @@ def _two_lock_case(name: str, setup: list[str], prog: list[str], pairs: list[tup
 
 def b2b_case(pair: str, variant: str, d: int, window: str, late_iters: int):
     prog = b2b_program(pair, variant, d, window)
-    return _two_lock_case(f"b2b_{pair}_{variant}_d{d}{window}", ["  mov r2, #1", "  mov r3, #-1"],
+    setup = ["  mov r2, #1", "  mov r3, #-1"]
+    if "gat" in _b2b_requests(pair):
+        setup += ["  mov r7, p0", *[N] * 2, "  vbcst.32 x8, r7"]
+    return _two_lock_case(f"b2b_{pair}_{variant}_d{d}{window}", setup,
                           prog, TS_PAIRS, b2b_refused_lock(variant), b2b_inits(pair, variant),
                           late_iters)
 
@@ -1578,7 +1590,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, vlk_<vlda|vldb|am|ups|conv|unpack|gather|q>[_D], same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, vlk_<vlda|vldb|am|ups|conv|unpack|gather|q>[_D], same, pos, relpos, b2b_<pair> (gat = a vldb.4x gather), condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)

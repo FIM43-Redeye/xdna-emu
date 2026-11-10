@@ -135,6 +135,17 @@ def test_b2b_program_puts_request_2_d_bundles_after_request_1(d, window):
     assert len(prog) == g.B2B_LAST + 2
 
 
+@pytest.mark.parametrize("d", range(1, g.B2B_MAX_D + 1))
+def test_b2b_gather_pairs_put_the_gather_where_its_request_would_be(d):
+    prog = g.b2b_program("gatacq", "gg", d, "a")
+    at = [i for i, l in enumerate(prog) if g.B2B_GATHER in l]
+    acq = [i for i, l in enumerate(prog) if "acq #" in l]
+    assert len(at) == 1 and acq == [at[0] + d]
+    assert g.b2b_inits("gatacq", "gg") == (0, 1) and g.b2b_inits("gatacq", "gr") == (0, 0)
+    _, files = g.b2b_case("gatgat", "gg", d, "a", 100)
+    assert files["consumer.s"].count(g.B2B_GATHER) == 2 and "vbcst.32 x8, r7" in files["consumer.s"]
+
+
 def test_b2b_windows_overlap_in_one_read():
     a, b = (set(g.b2b_layout(w)[1:]) for w in ("a", "b"))
     assert a & b == {6} and a | b == set(range(0, 13))

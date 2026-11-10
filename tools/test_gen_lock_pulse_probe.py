@@ -48,3 +48,11 @@ def test_both_backends_are_read_in_ts():
     # a frame's cycles field is the idle cycles since the previous frame on silicon and in the
     # emulator, so `ts` is the cycle for both
     assert g.TRUE_CYCLE == {"hw": "ts", "emu": "ts"}
+
+
+def test_gather_cases_set_up_the_lane_addresses_before_the_window():
+    case = g.cases()["gatacq_d3"]
+    asm = case.consumer_asm()
+    assert asm.index("vbcst.32 x8, r7") < asm.index("event #0") < asm.index(g.GATHER)
+    assert [i for i, b in enumerate(case.window) if b != g.N] == [0, 3]
+    assert "vbcst" not in g.cases()["acq_free"].consumer_asm()
