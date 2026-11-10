@@ -37,7 +37,7 @@ def predict_hi(vsrsm_reg, partner_reg, table):
 
 def main(d):
     table = open(f"{d}/input.bin", "rb").read()
-    _, hw = an.load_points(d, "r1")
+    hw = an.load_points(d, "r1")
     refs = {}
     for pid, (p, rec, dom) in hw.items():
         if p["kind"].startswith("ref"):

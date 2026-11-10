@@ -114,6 +114,14 @@ silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, bo
   beats it on that bank; writes to other registers or the other bank are untouched. `vlda` instead
   wins a W_WM tie by rule 2. Rule 3 of `state::write_collision`; `PortUse::b_channel` is derived in
   `decode::ports` (a vector-file load with no write unit at its result cycle).
+- *`vunpack` writes over the B channel too* (collision probe13, 1369 points, 2026-11-10, r1 == r2).
+  The tables give `vunpack` a write port of its own, W_RS, which every other itinerary that holds
+  it holds outside its result cycle (the stores, `vpack`, `vfloor`, `vldb.4x` read through it). On
+  silicon that borrowed read port's write behaves exactly like a B-channel load: ORed with a W_WM
+  write landing on the same register and bank, overwritten on that bank by a W_WA write (`vlda`,
+  `vpack`, `vsrs`, `vconv`, `vfloor`), the other bank kept. `decode::ports` derives the borrowed
+  read port (a vector write port held off its result cycle) and tags its writes `b_channel` on the
+  last port; silicon replay `collision_goldens::every_silicon_unpack_collision_replays_exactly`.
 - *Gather read port.* A `vldb.4x` in one bundle with a `vst` of a W register or a `vpack` (the other
   W_RS_PORT holders that read in its cycle): both read the OR of the gather's address register and the
   other's W source (the `vst` data register, the low half of the `vpack` source), so the store writes
@@ -333,8 +341,8 @@ remain unprobed (a lock under a cascade read needs a lock the harness does not a
   the write port exactly two cycles later (`vups` 0 and 2, `vlda.ups` 6 and 8), so two instructions
   colliding on the UPS unit collide on the write port at the same instant and no probe can tell which
   one silicon arbitrates on. The model treats the pair as the write-port collision it is.
-- Unprobed classes follow the same rules without silicon: a `vunpack` landing on the vector file
-  (`W_RS`, the third write port). (`vlda.am` quarters were probed 2026-11-04, see "Accumulator
+- Every vector and accumulator write class has now been probed (`vunpack`, the last, 2026-11-10,
+  see "Vector loads"). (`vlda.am` quarters were probed 2026-11-04, see "Accumulator
   loads"; the vector loads, the B load channel and the gather's same-bundle hazards were probed
   2026-11-04, see "Vector loads". Open there: a redirected load's own offset and post-modify,
   `vldb.sparse` ties, and B-channel ties against two same-port writers at once.)

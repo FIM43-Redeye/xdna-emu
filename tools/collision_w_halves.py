@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--tag", default="r1")
     ap.add_argument("--detail", action="store_true")
     args = ap.parse_args()
-    _, hw = an.load_points(args.dir, args.tag)
+    hw = an.load_points(args.dir, args.tag)
     refs = {}
     for pid, (p, rec, dom) in hw.items():
         if p["kind"].startswith("ref"):

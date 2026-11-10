@@ -34,6 +34,8 @@
 //!    rule 1: landing with a write through that port on the same register and bank, the two are
 //!    ORed (both chunks carry the OR); with writes to other registers or banks nothing happens;
 //!    against a lower-indexed port rule 2 applies (it loses).
+//!    `vunpack`, whose tables write port is a borrowed read port, writes over the same channel
+//!    (probe13; derived in `decode::ports`).
 //!
 //! "Latest-issued" is the issue sequence number of the writing instruction (bundle, then slot
 //! order within a bundle).

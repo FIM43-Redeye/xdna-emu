@@ -30,7 +30,7 @@ def tags(out, size):
 
 
 def main(d):
-    _, hw = an.load_points(d, "r1")
+    hw = an.load_points(d, "r1")
     verdict = collections.defaultdict(list)
     for pid, (p, rec, dom) in sorted(hw.items()):
         if p["kind"] != "pair":

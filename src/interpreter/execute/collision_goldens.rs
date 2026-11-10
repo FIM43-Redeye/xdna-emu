@@ -13,6 +13,7 @@
 
 use super::collision_goldens_cascade_data::{CASCADE_GOLDENS, CASCADE_VARIANTS};
 use super::collision_goldens_data::{Golden, Out, Variant, GOLDENS, VARIANTS};
+use super::collision_goldens_unpack_data::{UNPACK_GOLDENS, UNPACK_VARIANTS};
 use super::cycle_accurate::CycleAccurateExecutor;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{SlotOp, VliwBundle};
@@ -180,6 +181,21 @@ fn every_silicon_cascade_read_collision_replays_exactly() {
         "{} of {} cascade goldens differ from silicon:\n{}",
         bad.len(),
         CASCADE_GOLDENS.len(),
+        bad.join("\n")
+    );
+}
+
+/// The unpack pairs (probe13): `vunpack` writes through a borrowed read port, which silicon
+/// shows riding the last vector port's B channel: ORed with a last-port write into the same
+/// register, overwritten bank by bank by a lower-indexed port.
+#[test]
+fn every_silicon_unpack_collision_replays_exactly() {
+    let bad = failures(UNPACK_GOLDENS, UNPACK_VARIANTS, |_| true);
+    assert!(
+        bad.is_empty(),
+        "{} of {} unpack goldens differ from silicon:\n{}",
+        bad.len(),
+        UNPACK_GOLDENS.len(),
         bad.join("\n")
     );
 }

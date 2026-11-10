@@ -10,7 +10,10 @@
 //!
 //! A third property is inferred from the vector-load probes (`tools/gen_vec_load_timing_probe.py`):
 //! a vector-file load whose itinerary holds no write unit at its result cycle (the B load channel)
-//! writes over the bus of the vector file's last write port.
+//! writes over the bus of the vector file's last write port. The collision probes (probe13) add
+//! a second B-channel writer: an instruction whose result write goes through a *borrowed read
+//! port*, a vector write port that other itineraries hold outside their result cycle (to read
+//! their operands). Its write rides the same bus as a B-channel load.
 //!
 //! No unit name appears in this file: units are indices into `TblgenOutput::functional_units`
 //! and every classification below is read off the itinerary tables and the destination register
@@ -85,6 +88,9 @@ pub struct PortModel {
     /// Per file: the highest-indexed write port. The last port of a file is the one the moves
     /// and the non-accumulating converts use; the others serve the arithmetic and the loads.
     last: [Option<u16>; 2],
+    /// Per unit: some itinerary holds it in a cycle that is not the one before its result
+    /// lands. For a write port that marks a read port borrowed for a write.
+    held_off_result: Vec<bool>,
 }
 
 impl PortModel {
@@ -102,6 +108,7 @@ impl PortModel {
             .map(|(i, u)| (u.as_str(), i as u16))
             .collect();
         let mut write_files = vec![0u8; n];
+        let mut held_off_result = vec![false; n];
         for (class, reg_class) in &tbl.itinerary_output_classes {
             let Some(itin) = tbl.itineraries.get(class) else {
                 continue;
@@ -111,6 +118,9 @@ impl PortModel {
             };
             if def == 0 {
                 continue;
+            }
+            for r in reservations(itin).into_iter().filter(|r| r.offset + 1 != def as u32) {
+                held_off_result[index[r.unit.as_str()] as usize] = true;
             }
             let Some(file) = Self::class_file(tbl, reg_class) else {
                 continue;
@@ -128,7 +138,7 @@ impl PortModel {
         }
         let last = [RegFile::Vector, RegFile::Accum]
             .map(|f| (0..n as u16).filter(|u| write_files[*u as usize] & f.bit() != 0).max());
-        Self { write_files, last }
+        Self { write_files, last, held_off_result }
     }
 
     /// The register file of a register class: that of its first leaf register (classes may
@@ -150,6 +160,22 @@ impl PortModel {
     pub(crate) fn write_ports(&self) -> (Vec<u16>, Vec<u16>) {
         let of = |f: RegFile| (0..self.write_files.len() as u16).filter(|u| self.writes(*u, f)).collect();
         (of(RegFile::Vector), of(RegFile::Accum))
+    }
+
+    /// The vector write ports that are borrowed read ports (tests).
+    #[cfg(test)]
+    pub(crate) fn borrowed_read_ports(&self) -> Vec<u16> {
+        (0..self.write_files.len() as u16)
+            .filter(|u| self.is_borrowed_read_port(*u))
+            .collect()
+    }
+
+    /// A vector write port that itineraries also hold outside their result cycle: a read port
+    /// that an instruction borrows to write. Not the last port, whose bus it rides.
+    fn is_borrowed_read_port(&self, unit: u16) -> bool {
+        self.writes(unit, RegFile::Vector)
+            && self.held_off_result.get(unit as usize).copied().unwrap_or(false)
+            && self.last[RegFile::Vector as usize] != Some(unit)
     }
 
     fn writes(&self, unit: u16, file: RegFile) -> bool {
@@ -239,7 +265,12 @@ impl PortModel {
                 cand.sort_unstable();
                 cand.dedup();
                 if let [unit] = cand[..] {
-                    out.write_port = Some(unit);
+                    if file == RegFile::Vector && self.is_borrowed_read_port(unit) {
+                        out.write_port = self.last[RegFile::Vector as usize];
+                        out.b_channel = true;
+                    } else {
+                        out.write_port = Some(unit);
+                    }
                 } else if cand.is_empty() && is_load && file == RegFile::Vector {
                     out.write_port = self.last[RegFile::Vector as usize];
                     out.b_channel = out.write_port.is_some();

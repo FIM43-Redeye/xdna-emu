@@ -137,6 +137,8 @@ mod wide_cmp_goldens;
 mod collision_goldens_data;
 #[cfg(test)]
 mod collision_goldens_cascade_data;
+#[cfg(test)]
+mod collision_goldens_unpack_data;
 
 #[cfg(test)]
 mod vector_validate;

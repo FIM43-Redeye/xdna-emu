@@ -145,6 +145,10 @@ const CATALOGUE_BYTES: &[(&str, &str, &str)] = &[
     ("vbcstshfl16_bm", "vbcstshfl.16 bml0, r12, r29", "b9 67 26 18 37 88 03 00 00 00 00 00 00 00 00 00"),
     ("vbcstshfl8_x", "vbcstshfl.8 x8, r12, r29", "b9 27 06 1c 37 88 03 00 00 00 00 00 00 00 00 00"),
     ("vbcstshfl16_x", "vbcstshfl.16 x8, r12, r29", "b9 27 26 1c 37 88 03 00 00 00 00 00 00 00 00 00"),
+    ("vunpack_s16_s8", "vunpack.s16.s8 x8, wl0", "19 30 12 38 37 88 03 00 00 00 00 00 00 00 00 00"),
+    ("vunpack_d16_d8", "vunpack.d16.d8 x8, wl0", "19 10 12 38 37 88 03 00 00 00 00 00 00 00 00 00"),
+    ("vunpack_s8_s4", "vunpack.s8.s4 x8, wl0", "19 20 12 38 37 88 03 00 00 00 00 00 00 00 00 00"),
+    ("vunpack_d8_d4", "vunpack.d8.d4 x8, wl0", "19 00 12 38 37 88 03 00 00 00 00 00 00 00 00 00"),
 ];
 
 fn bytes(hex: &str) -> Vec<u8> {
@@ -152,7 +156,7 @@ fn bytes(hex: &str) -> Vec<u8> {
 }
 
 /// `key -> "write port | accumulator read port@offset+secondary | mover"` for every catalogue
-/// instruction, as decoded; `-` means none.
+/// instruction, as decoded; `-` means none, `(B)` a write over the port's B channel.
 const EXPECTED: &[(&str, &str)] = &[
     ("vmov_cm", "CM_WM_PORT | CM_RM_PORT@0+- | true"),
     ("vmov_bm", "CM_WM_PORT | CM_RM_PORT@0+- | true"),
@@ -239,6 +243,10 @@ const EXPECTED: &[(&str, &str)] = &[
     ("vbcstshfl16_bm", "CM_WM_PORT | - | false"),
     ("vbcstshfl8_x", "W_WM_PORT | - | false"),
     ("vbcstshfl16_x", "W_WM_PORT | - | false"),
+    ("vunpack_s16_s8", "W_WM_PORT(B) | - | false"),
+    ("vunpack_d16_d8", "W_WM_PORT(B) | - | false"),
+    ("vunpack_s8_s4", "W_WM_PORT(B) | - | false"),
+    ("vunpack_d8_d4", "W_WM_PORT(B) | - | false"),
 ];
 
 /// Decode one catalogue instruction and describe its ports with unit names.
@@ -254,7 +262,11 @@ fn describe(key: &str) -> String {
         .find(|s| !s.is_nop())
         .unwrap_or_else(|| panic!("{asm}: no op"));
     let name = |u: u16| units[u as usize].as_str();
-    let write = op.ports.write_port.map(name).unwrap_or("-");
+    let write = match op.ports.write_port {
+        Some(u) if op.ports.b_channel => format!("{}(B)", name(u)),
+        Some(u) => name(u).to_string(),
+        None => "-".into(),
+    };
     let read = match op.ports.acc_read {
         Some(r) => format!("{}@{}+{}", name(r.primary), r.offset, r.secondary.map(name).unwrap_or("-")),
         None => "-".into(),
@@ -341,4 +353,15 @@ fn derived_write_ports_per_register_file() {
     let names = |l: Vec<u16>| l.iter().map(|u| t.functional_units[*u as usize].clone()).collect::<Vec<_>>();
     assert_eq!(names(vector), ["W_RS_PORT", "W_WA_PORT", "W_WM_PORT"]);
     assert_eq!(names(accum), ["CM_WA_PORT", "CM_WM_PORT"]);
+}
+
+/// The vector write ports the tables also hold outside a result cycle: a read port that one
+/// instruction class (the unpack) borrows to write. Silicon (probe13) shows such a write riding
+/// the B channel of the last vector port, like a B-channel load.
+#[test]
+fn the_borrowed_read_port_is_the_only_shared_vector_write_port() {
+    let t = xdna_archspec::aie2::isa::load_from_generated();
+    let borrowed = super::ports::PortModel::derive(&t).borrowed_read_ports();
+    let names: Vec<_> = borrowed.iter().map(|u| t.functional_units[*u as usize].as_str()).collect();
+    assert_eq!(names, ["W_RS_PORT"]);
 }

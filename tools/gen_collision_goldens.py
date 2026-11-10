@@ -45,6 +45,19 @@ def assemble(asm: str) -> bytes:
         return open(b, "rb").read()
 
 
+def input_table(d: str) -> bytes:
+    """The input table a probe ran on: `input.bin` of a pre-harness probe directory, else the
+    input buffer of the suite's first case (every case of a probe suite shares one table)."""
+    legacy = os.path.join(d, "input.bin")
+    if os.path.exists(legacy):
+        return open(legacy, "rb").read()
+    import json
+    first = json.load(open(os.path.join(d, "suite.json")))["cases"][0]
+    topo = json.load(open(os.path.join(d, "cases", first, "topology.json")))
+    arg = next(a for a in topo["cores"][0]["args"] if a["direction"] == "in")
+    return bytes.fromhex(arg["data"])
+
+
 def sext16(v):
     return v - 0x10000 if v & 0x8000 else v
 
@@ -134,9 +147,9 @@ def main():
         d, tag, shift = src.split(":")
         shift = int(shift)
         d = os.path.abspath(d)
-        table = open(os.path.join(d, "input.bin"), "rb").read()
+        table = input_table(d)
         rows = an.classify(d, tag)
-        _, hw = an.load_points(d, tag)
+        hw = an.load_points(d, tag)
         for row in rows:
             if row["kind"] != "pair":
                 continue

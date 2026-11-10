@@ -74,7 +74,7 @@ def main():
     ap.add_argument("--show-misses", action="store_true")
     ap.add_argument("--family", choices=sorted(FAMILIES), default="w")
     args = ap.parse_args()
-    _, hw = an.load_points(args.dir, args.tag)
+    hw = an.load_points(args.dir, args.tag)
     refs = {}
     for pid, (p, rec, dom) in hw.items():
         if p["kind"].startswith("ref"):
