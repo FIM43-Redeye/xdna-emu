@@ -97,7 +97,7 @@ impl InstructionDecoder {
     ///
     /// `source_forward` is aligned 1:1 with `sources`: `source_forward[k]` is
     /// `(use_cycle, use_bypass)` for `sources[k]`, from the register-aware
-    /// resolved itinerary.  `result_bypass` is the resolved def bypass for the
+    /// resolved itinerary entry of the MI operand `sources[k]` was built from.  `result_bypass` is the resolved def bypass for the
     /// instruction's first (and typically only) def operand.
     ///
     /// The DecodedInstr is still needed for build_slot_op() which reads
@@ -145,35 +145,28 @@ impl InstructionDecoder {
         let encoding = encoding?;
 
         // Map LLVM operands to our Operand type.
-        let (dest, sources, post_modify, extra_defs, accum_width) =
+        let (dest, sources, post_modify, extra_defs, accum_width, source_use_index) =
             Self::extract_operands_from_ffi(&ffi_result, encoding);
 
         // Resolved register-aware forwarding (producer side): def bypass for this
         // instruction's result.
         let result_bypass = Bypass::from_forwarding_id(ffi_result.resolved_def_bypass());
 
-        // Resolved register-aware forwarding (consumer side): one (use_cycle,
-        // use_bypass) per source, from the itinerary at num_defs+k.
-        // source_forward is aligned 1:1 with the `sources` vec above, so k
-        // here indexes into `sources` (i.e. the extracted use operands, not the
-        // full MI operand list which includes defs first).
-        //
-        // FIXME(source-forward-memory-alignment): positional indexing into the
-        // resolved itinerary (resolved_use_cycle(k) / resolved_use_bypass_raw(k))
-        // is exact only for vector COMPUTE ops, where `sources` order matches the
-        // raw MI use-operand order. For MEMORY instructions, extract_operands_from_ffi
-        // merges/filters pointer and modifier operands, so sources[k] no longer maps
-        // to MI use k -- the forwarding pair recorded here may belong to a different
-        // operand. Benign today: the bypass model only reads source_forward for
-        // vector-register COMPUTE sources (stores fall back to the read_store()
-        // default). A future consumer over memory operands must fix the alignment
-        // (track the MI operand index per source rather than relying on position).
-        let mut source_forward: SmallVec<[(u8, Bypass); 4]> = SmallVec::new();
-        for k in 0..sources.len() {
-            let uc = ffi_result.resolved_use_cycle(k);
-            let ub = Bypass::from_forwarding_id(ffi_result.resolved_use_bypass_raw(k));
-            source_forward.push((uc, ub));
-        }
+        // Resolved register-aware forwarding (consumer side): one (use_cycle, use_bypass) per
+        // source, from the itinerary entry of the MI use operand the source was built from
+        // (`source_use_index`; extraction merges and reorders the address operands, so a
+        // source's position is not its MI index). A def moved into the sources has no use
+        // entry and reads at cycle 1 without forwarding.
+        let source_forward: SmallVec<[(u8, Bypass); 4]> = source_use_index
+            .iter()
+            .map(|k| match *k {
+                Some(k) => (
+                    ffi_result.resolved_use_cycle(k),
+                    Bypass::from_forwarding_id(ffi_result.resolved_use_bypass_raw(k)),
+                ),
+                None => (1, Bypass::No),
+            })
+            .collect();
 
         let def_cycle = (ffi_result.res_num_defs >= 1 && ffi_result.res_num_operand_cycles >= 1)
             .then(|| ffi_result.res_operand_cycle[0]);
@@ -226,6 +219,11 @@ impl InstructionDecoder {
     /// Uses num_defs to split outputs from inputs, then applies addressing
     /// mode logic from InstrEncoding to construct Memory operands and
     /// PostModify metadata.
+    ///
+    /// The last element is aligned 1:1 with the sources: the MI use-operand index each source
+    /// was built from (`None` for a def moved into the sources), so the caller can look up its
+    /// itinerary forwarding even after the address operands were merged and reordered. A
+    /// `Memory` operand carries the index of its base pointer.
     pub(super) fn extract_operands_from_ffi(
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
@@ -235,6 +233,7 @@ impl InstructionDecoder {
         Option<PostModify>,
         Vec<Operand>,
         (Option<AccumWidth>, Option<AccumWidth>),
+        Vec<Option<usize>>,
     ) {
         let num_defs = ffi_result.num_defs as usize;
 
@@ -271,10 +270,20 @@ impl InstructionDecoder {
             })
             .collect();
 
-        // Split into defs (outputs) and uses (inputs).
+        // Split into defs (outputs) and uses (inputs). Each use keeps its MI use index.
         let split_at = num_defs.min(mapped.len());
         let def_ops: Vec<Operand> = mapped[..split_at].iter().filter_map(|o| o.clone()).collect();
-        let mut use_ops: Vec<Operand> = mapped[split_at..].iter().filter_map(|o| o.clone()).collect();
+        let mut use_ops: Vec<(Operand, Option<usize>)> = mapped[split_at..]
+            .iter()
+            .enumerate()
+            .filter_map(|(k, o)| o.clone().map(|o| (o, Some(k))))
+            .collect();
+        let finish = |use_ops: Vec<(Operand, Option<usize>)>| -> (Vec<Operand>, Vec<Option<usize>>) {
+            use_ops.into_iter().unzip()
+        };
+        let operands = |use_ops: &[(Operand, Option<usize>)]| -> Vec<Operand> {
+            use_ops.iter().map(|(o, _)| o.clone()).collect()
+        };
 
         // Destination: first def operand (if any and writable).
         // Remaining defs (e.g., cmp register in dual-result instructions)
@@ -285,7 +294,7 @@ impl InstructionDecoder {
         if let Some(ref d) = dest {
             if !can_be_dest(d) {
                 // Non-writable in dest position (config immediate, etc.) -- move to sources.
-                use_ops.insert(0, d.clone());
+                use_ops.insert(0, (d.clone(), None));
                 dest = None;
             }
         }
@@ -305,7 +314,7 @@ impl InstructionDecoder {
         // For load instructions, promote the first writable non-address register
         // to dest so the executor writes the loaded data.
         if dest.is_none() && encoding.may_load {
-            if let Some(pos) = use_ops.iter().position(|o| {
+            if let Some(pos) = use_ops.iter().position(|(o, _)| {
                 matches!(
                     o,
                     Operand::ControlReg(_)
@@ -315,7 +324,7 @@ impl InstructionDecoder {
                         | Operand::SparseQxReg(_)
                 )
             }) {
-                dest = Some(use_ops.remove(pos));
+                dest = Some(use_ops.remove(pos).0);
             }
         }
 
@@ -327,17 +336,18 @@ impl InstructionDecoder {
         if encoding.is_ptr_arithmetic {
             if dest.is_none() {
                 // Find the first PointerReg in uses and promote it to dest.
-                if let Some(pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
-                    dest = Some(use_ops.remove(pos));
+                if let Some(pos) = use_ops.iter().position(|(o, _)| matches!(o, Operand::PointerReg(_))) {
+                    dest = Some(use_ops.remove(pos).0);
                 }
             }
             // Remove any self-referencing pointer from sources.
             if let Some(Operand::PointerReg(dest_p)) = &dest {
                 let dp = *dest_p;
-                use_ops.retain(|o| !matches!(o, Operand::PointerReg(p) if *p == dp));
+                use_ops.retain(|(o, _)| !matches!(o, Operand::PointerReg(p) if *p == dp));
             }
             // Sources are whatever remains (offset immediate or modifier reg).
-            return (dest, use_ops, post_modify, extra_defs, (first_accum_width, src_accum_width));
+            let (sources, index) = finish(use_ops);
+            return (dest, sources, post_modify, extra_defs, (first_accum_width, src_accum_width), index);
         }
 
         // Handle memory addressing modes: combine pointer + offset into Memory
@@ -345,16 +355,16 @@ impl InstructionDecoder {
         match encoding.addressing_mode {
             AddressingMode::IndexedImmediate => {
                 // Find PointerReg + Immediate pair in uses, combine into Memory.
-                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
-                    let ptr_reg = match use_ops.remove(ptr_pos) {
-                        Operand::PointerReg(p) => p,
+                if let Some(ptr_pos) = address_pointer_position(&operands(&use_ops), encoding.may_store) {
+                    let (ptr_reg, ptr_idx) = match use_ops.remove(ptr_pos) {
+                        (Operand::PointerReg(p), k) => (p, k),
                         _ => unreachable!(),
                     };
                     // Next Immediate after the pointer (now at ptr_pos since we removed ptr).
                     let offset = if let Some(imm_pos) =
-                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::Immediate(_)))
+                        use_ops[ptr_pos..].iter().position(|(o, _)| matches!(o, Operand::Immediate(_)))
                     {
-                        match use_ops.remove(ptr_pos + imm_pos) {
+                        match use_ops.remove(ptr_pos + imm_pos).0 {
                             Operand::Immediate(v) => v as i16,
                             _ => unreachable!(),
                         }
@@ -362,17 +372,17 @@ impl InstructionDecoder {
                         0
                     };
                     // SP-relative: handled naturally since SP maps to PointerReg(SP_PTR_INDEX).
-                    use_ops.push(Operand::Memory { base: ptr_reg, offset });
+                    use_ops.push((Operand::Memory { base: ptr_reg, offset }, ptr_idx));
                 }
             }
             AddressingMode::PostModifyImmediate => {
-                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
+                if let Some(ptr_pos) = address_pointer_position(&operands(&use_ops), encoding.may_store) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modify amount.
                     let modify = if let Some(imm_pos) =
-                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::Immediate(_)))
+                        use_ops[ptr_pos..].iter().position(|(o, _)| matches!(o, Operand::Immediate(_)))
                     {
-                        match use_ops.remove(ptr_pos + imm_pos) {
+                        match use_ops.remove(ptr_pos + imm_pos).0 {
                             Operand::Immediate(v) => v as i16,
                             _ => 0,
                         }
@@ -384,13 +394,14 @@ impl InstructionDecoder {
                 }
             }
             AddressingMode::PostModifyRegister => {
-                if let Some(ptr_pos) = address_pointer_position(&use_ops, encoding.may_store) {
+                if let Some(ptr_pos) = address_pointer_position(&operands(&use_ops), encoding.may_store) {
                     let ptr_reg = use_ops.remove(ptr_pos);
                     // Find the modifier register.
-                    if let Some(mod_pos) =
-                        use_ops[ptr_pos..].iter().position(|o| matches!(o, Operand::ModifierReg(_)))
+                    if let Some(mod_pos) = use_ops[ptr_pos..]
+                        .iter()
+                        .position(|(o, _)| matches!(o, Operand::ModifierReg(_)))
                     {
-                        let mod_reg = match use_ops.remove(ptr_pos + mod_pos) {
+                        let mod_reg = match use_ops.remove(ptr_pos + mod_pos).0 {
                             Operand::ModifierReg(r) => r,
                             _ => 0,
                         };
@@ -410,9 +421,9 @@ impl InstructionDecoder {
                 // as a modifier register. The count outputs stay in `extra_defs`.
                 if let Some(desc_pos) = use_ops
                     .iter()
-                    .position(|o| matches!(o, Operand::ModifierReg(r) if crate::interpreter::state::is_descriptor_operand(*r)))
+                    .position(|(o, _)| matches!(o, Operand::ModifierReg(r) if crate::interpreter::state::is_descriptor_operand(*r)))
                 {
-                    if let Operand::ModifierReg(desc) = use_ops.remove(desc_pos) {
+                    if let (Operand::ModifierReg(desc), _) = use_ops.remove(desc_pos) {
                         post_modify = Some(PostModify::Descriptor(desc));
                     }
                 }
@@ -425,17 +436,21 @@ impl InstructionDecoder {
 
         // SP-relative load/store: uses = [SP] in TableGen.
         // Convert standalone immediate to Memory { base: SP, offset: imm }.
+        // The stack pointer is an implicit use, not an MI operand: the Memory operand carries
+        // the immediate's index.
         if encoding.is_sp_relative && !encoding.is_ptr_arithmetic {
-            if let Some(imm_pos) = use_ops.iter().position(|o| matches!(o, Operand::Immediate(_))) {
-                let offset = match use_ops.remove(imm_pos) {
+            if let Some(imm_pos) = use_ops.iter().position(|(o, _)| matches!(o, Operand::Immediate(_))) {
+                let (imm, imm_idx) = use_ops.remove(imm_pos);
+                let offset = match imm {
                     Operand::Immediate(v) => v as i16,
                     _ => 0,
                 };
-                use_ops.push(Operand::Memory { base: SP_PTR_INDEX, offset });
+                use_ops.push((Operand::Memory { base: SP_PTR_INDEX, offset }, imm_idx));
             }
         }
 
-        (dest, use_ops, post_modify, extra_defs, (first_accum_width, src_accum_width))
+        let (sources, index) = finish(use_ops);
+        (dest, sources, post_modify, extra_defs, (first_accum_width, src_accum_width), index)
     }
 
     // -----------------------------------------------------------------------

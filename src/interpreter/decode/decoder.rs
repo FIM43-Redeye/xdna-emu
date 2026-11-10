@@ -2244,6 +2244,20 @@ mod tests {
         }
     }
 
+    /// A source's forwarding pair is that of the MI operand it was built from, not of the MI
+    /// operand at its position. `st.s16 r5, [p1, dj0]` is a read-modify-write (it may load), so
+    /// extraction lifts the data register r5 (MI use 0, read late) out of the sources: the
+    /// pointer that ends up first must keep its own address-read cycle.
+    #[test]
+    fn a_source_keeps_the_forwarding_of_its_own_mi_operand() {
+        let decoder = InstructionDecoder::load_default();
+        let bundle = decoder.decode(&[0x19, 0x0a, 0x13, 0x01], 0).expect("st.s16 decodes");
+        let slot = bundle.slots().iter().flatten().find(|s| !s.is_nop()).expect("an op");
+        assert_eq!(slot.sources[..], [Operand::PointerReg(1), Operand::ModifierReg(16)]);
+        assert_eq!(slot.source_forward.len(), 2);
+        assert_eq!(slot.source_forward[0].0, 1, "p1 is read at the address cycle: {:?}", slot.source_forward);
+    }
+
     /// TDD anchor: source_forward aligned 1:1 with sources for VEXTRACT.
     ///
     /// VEXTRACT_D8 (Mv slot 0x35) has a vector source (x0) at source_idx 0.
