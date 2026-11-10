@@ -397,6 +397,218 @@ def chain_report(d: Path, tag: str) -> str:
     return "\n".join(lines)
 
 
+
+# -- sink family: a memtile MM2S chain into a shim S2MM that holds no task -----------------
+#
+# The of_q0_rich drain path in isolation: the memtile's MM2S 0 sends K BDs of L words through
+# the memtile and shim switches to shim S2MM 1, which has no task while the sender settles
+# (the drain is armed late). The count lock says how many BDs finished, i.e. how many words
+# the path from the memtile staging to the idle shim channel holds. The host then arms the
+# S2MM for every word and checks they all land in order.
+
+SINK_WORDS = 80
+SINK_LENGTHS = (4, 8, 16)
+
+
+def sink_name(length: int) -> str:
+    return f"sink_mem_L{length}"
+
+
+def sink_steps(length: int) -> list:
+    import gen_dma_queue_probe as q
+    kind = "mem"
+    k = cp.TileRegs(kind)
+    mm2s, count = k.regs["DMA_MM2S_Status_0"], k.value(q.COUNT_LOCK[kind])
+    lock_o = k.value(q.GATE_LOCKS[kind][2])
+    n = SINK_WORDS // length
+
+    def snap(tag: str) -> list:
+        return [cp.Read(mm2s, f"{tag} mm2s", kind), cp.Read(count, f"{tag} C", kind),
+                cp.Read(lock_o, f"{tag} O", kind)]
+
+    out: list = [cp.Write(q.SRC_ADDR + 4 * j, q.SRC_MARK + j, f"src {j}", kind) for j in range(SINK_WORDS)]
+    out += snap("s0")
+    send = [f"%ts = aiex.dma_configure_task({q.TILES[kind]}, MM2S, 0) {{"]
+    for j in range(n):
+        if j:
+            send.append(f"^bd{j}:")
+        send += [f"  %c_ts{j}_a = arith.constant 1 : i32", f"  aie.use_lock(%lO, AcquireGreaterEqual, %c_ts{j}_a)",
+                 f"  aie.dma_bd(%src : memref<{SINK_WORDS}xi32> offset = {j * length} len = {length}) "
+                 f"{{bd_id = {1 + j} : i32}}",
+                 f"  %c_ts{j} = arith.constant 1 : i32", f"  aie.use_lock(%lC, Release, %c_ts{j})",
+                 f"  aie.next_bd ^bd{j + 1}" if j + 1 < n else "  aie.end"]
+    send += ["}", "aiex.dma_start_task(%ts)"]
+    out.append(cp.Raw(tuple(send)))
+    for i in range(CHAIN_SNAPS):
+        out += snap(f"a{i + 1}")
+    out.append(cp.Raw((f"aiex.npu.dma_memcpy_nd(%data[0, 0, 0, 0][1, 1, 1, {SINK_WORDS}][0, 0, 0, 1]) "
+                       f"{{id = 4 : i64, issue_token = true, metadata = @sink}} : memref<{SINK_WORDS}xi32>",)))
+    out.append(cp.Wait("sink"))
+    out += snap("b1")
+    return out
+
+
+def sink_design(length: int) -> tuple[str, list, "cp.Layout"]:
+    import gen_dma_queue_probe as q
+    kind = "mem"
+    st = sink_steps(length)
+    layout = cp.encode(st)
+    t = q.TILES[kind]
+    lines = ["module {", "  aie.device(npu1_1col) {",
+             "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
+             f"    {t} = aie.tile{q.TILE_COORDS[kind]} "
+             f"{{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {q.PKT_IDS[kind]}>}}",
+             *cp.packet_flows(t, "%t00", kind), *cp.shim_allocations("%t00")]
+    for sym, lid, init in (("lC", q.COUNT_LOCK[kind], 0), ("lO", q.GATE_LOCKS[kind][2], SINK_WORDS // length)):
+        lines.append(f'    %{sym} = aie.lock({t}, {lid}) {{init = {init} : i32, sym_name = "{sym}"}}')
+    lines += [f"    aie.flow({t}, DMA : 0, %t00, DMA : 1)",
+              "    aie.shim_dma_allocation @sink (%t00, S2MM, 1)",
+              f'    %src = aie.buffer({t}) {{address = {q.SRC_ADDR} : i32, sym_name = "src"}} : memref<{SINK_WORDS}xi32>',
+              f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{SINK_WORDS}xi32>) {{",
+              *cp.sequence_lines(st, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
+    return "\n".join(lines), st, layout
+
+
+def sink_generate(out_dir: Path, lengths) -> None:
+    for length in lengths:
+        text, st, layout = sink_design(length)
+        d = out_dir / sink_name(length)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "aie.mlir").write_text(text)
+        (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
+        meta = {"case": d.name, "family": "sink", "length": length, "k": SINK_WORDS // length,
+                "labels": list(layout.labels), "n_words": len(layout.words), "n_data": SINK_WORDS, "host_args": []}
+        (d / "case.json").write_text(json.dumps(meta, indent=1) + "\n")
+
+
+def sink_report(d: Path, tag: str) -> str:
+    import gen_dma_queue_probe as q
+    meta = json.loads((d / "case.json").read_text())
+    r = parse(d, tag)
+    length, k = meta["length"], meta["k"]
+    lines = [f"{d.name}: memtile MM2S 0 -> idle shim S2MM 1, {k} BDs of {length} words"]
+    for tag_ in [f"a{i + 1}" for i in range(CHAIN_SNAPS)] + ["b1"]:
+        lines.append(f"  {tag_}: C={r[f'{tag_} C']:2d} O={r[f'{tag_} O']:2d}  mm2s {q.status_text(r[f'{tag_} mm2s'], 'mem')}")
+    got = sum(1 for j in range(SINK_WORDS) if r["data"][j] == q.SRC_MARK + j)
+    lines.append(f"  BDs finished with the shim channel idle: {r['a3 C']}  ({r['a3 C'] * length} words); "
+                 f"landed in order once armed: {got}/{SINK_WORDS}")
+    return "\n".join(lines)
+
+
+# -- race family: a path's capacity measured to the word by a data race -------------------
+#
+# One MM2S BD of RACE_WORDS words (pattern A) into a consumer that takes nothing: a shim S2MM
+# that holds no task, or an S2MM whose one BD is parked on a gate lock. Once the sender has
+# settled, the host overwrites the source with pattern B and only then lets the consumer run:
+# every word that lands as A had been read from memory before the overwrite, so the A count
+# is exactly the words the path holds (the R4-D3 method, which pinned the 25-word egress
+# staging). Tiles are named as in TILES (prod = (0,2), consA = (0,3)).
+
+RACE_WORDS = 96
+RACE_MARK_B = 0xB0000000
+RACE_SRC, RACE_DST = 0x1000, 0x2000
+GATE = {"memory": (1, 4), "memory_tile": (42, 45)}    # (gate lock, spare release lock) per module
+RACE_CASES = {                                        # name -> (source tile, consumer tile or "shim")
+    "race_mem_shim": ("mem", "shim"),
+    "race_prod_shim": ("prod", "shim"),
+    "race_consA_shim": ("consA", "shim"),
+    "race_mem_loop": ("mem", "mem"),
+    "race_prod_loop": ("prod", "prod"),
+    "race_prod_mem": ("prod", "mem"),
+    "race_mem_prod": ("mem", "prod"),
+}
+
+
+def race_steps(src: str, dst: str) -> list:
+    import gen_dma_queue_probe as q
+    mm2s = cp.TileRegs(src).regs["DMA_MM2S_Status_0"]
+    out: list = [cp.Write(RACE_SRC + 4 * j, q.SRC_MARK + j, f"src {j}", src) for j in range(RACE_WORDS)]
+    if dst != "shim":
+        out.append(cp.Raw((f"%tr = aiex.dma_configure_task({VAR[dst]}, S2MM, 0) {{",
+                           "  %c_tr = arith.constant 1 : i32", "  aie.use_lock(%lG, AcquireGreaterEqual, %c_tr)",
+                           f"  aie.dma_bd(%dst : memref<{RACE_WORDS}xi32> offset = 0 len = {RACE_WORDS}) {{bd_id = 0 : i32}}",
+                           "  aie.use_lock(%lD, Release, %c_tr)", "  aie.end", "}", "aiex.dma_start_task(%tr)")))
+    out.append(cp.Raw((f"%ts = aiex.dma_configure_task({VAR[src]}, MM2S, 0) {{",
+                       f"  aie.dma_bd(%src : memref<{RACE_WORDS}xi32> offset = 0 len = {RACE_WORDS}) {{bd_id = 1 : i32}}",
+                       "  aie.end", "}", "aiex.dma_start_task(%ts)")))
+    out += [cp.Read(mm2s, f"a{i + 1} mm2s", src) for i in range(CHAIN_SNAPS)]
+    out += [cp.Write(RACE_SRC + 4 * j, RACE_MARK_B + j, f"over {j}", src) for j in range(RACE_WORDS)]
+    out.append(cp.Read(mm2s, "o mm2s", src))
+    if dst == "shim":
+        out.append(cp.Raw((f"aiex.npu.dma_memcpy_nd(%data[0, 0, 0, 0][1, 1, 1, {RACE_WORDS}][0, 0, 0, 1]) "
+                           f"{{id = 4 : i64, issue_token = true, metadata = @sink}} : memref<{RACE_WORDS}xi32>",)))
+        out.append(cp.Wait("sink"))
+    else:
+        k = cp.TileRegs(dst)
+        out.append(cp.Write(k.value(GATE[TILES[dst][1]][0]), 1, "open the gate", dst))
+        out += [cp.Read(mm2s, "b0 mm2s", src)] * 2
+        out += [cp.Read(RACE_DST + 4 * j, f"dst {j}", dst) for j in range(RACE_WORDS)]
+    out.append(cp.Read(mm2s, "b1 mm2s", src))
+    return out
+
+
+def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
+    src, dst = RACE_CASES[name]
+    st = race_steps(src, dst)
+    layout = cp.encode(st)
+    shim = VAR["shim"]
+    tiles = ["shim", src] + ([dst] if dst not in ("shim", src) else [])
+    lines = ["module {", "  aie.device(npu1_1col) {"]
+    for t in tiles:
+        (c, r), _m, pkt, _resp = TILES[t]
+        lines.append(f"    {VAR[t]} = aie.tile({c}, {r}) {{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {pkt}>}}")
+    for t in tiles[1:]:
+        _xy, _m, pkt, resp = TILES[t]
+        lines += [f"    aie.packet_flow({pkt}) {{", f"      aie.packet_source<{shim}, DMA : 0>",
+                  f"      aie.packet_dest<{VAR[t]}, TileControl : 0>", "    }",
+                  f"    aie.packet_flow({resp}) {{", f"      aie.packet_source<{VAR[t]}, TileControl : 0>",
+                  f"      aie.packet_dest<{shim}, DMA : 0>", "    }"]
+    lines += [f"    aie.shim_dma_allocation @ctrlin0 ({shim}, MM2S, 0)",
+              f"    aie.shim_dma_allocation @ctrl0 ({shim}, S2MM, 0)",
+              f'    %src = aie.buffer({VAR[src]}) {{address = {RACE_SRC} : i32, sym_name = "src"}} : memref<{RACE_WORDS}xi32>']
+    if dst == "shim":
+        lines += [f"    aie.flow({VAR[src]}, DMA : 0, {shim}, DMA : 1)",
+                  f"    aie.shim_dma_allocation @sink ({shim}, S2MM, 1)"]
+    else:
+        gate, spare = GATE[TILES[dst][1]]
+        lines += [f'    %lG = aie.lock({VAR[dst]}, {gate}) {{init = 0 : i32, sym_name = "lG"}}',
+                  f'    %lD = aie.lock({VAR[dst]}, {spare}) {{init = 0 : i32, sym_name = "lD"}}',
+                  f'    %dst = aie.buffer({VAR[dst]}) {{address = {RACE_DST} : i32, sym_name = "dst"}} : memref<{RACE_WORDS}xi32>',
+                  f"    aie.flow({VAR[src]}, DMA : 0, {VAR[dst]}, DMA : 0)"]
+    lines += [f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{RACE_WORDS}xi32>) {{",
+              *cp.sequence_lines(st, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
+    return "\n".join(lines), st, layout
+
+
+def race_generate(out_dir: Path, names) -> None:
+    for name in names or RACE_CASES:
+        text, st, layout = race_design(name)
+        d = out_dir / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "aie.mlir").write_text(text)
+        (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
+        src, dst = RACE_CASES[name]
+        meta = {"case": name, "family": "race", "src": src, "dst": dst,
+                "labels": list(layout.labels), "n_words": len(layout.words), "n_data": RACE_WORDS, "host_args": []}
+        (d / "case.json").write_text(json.dumps(meta, indent=1) + "\n")
+
+
+def race_report(d: Path, tag: str) -> str:
+    import gen_dma_queue_probe as q
+    meta = json.loads((d / "case.json").read_text())
+    r = parse(d, tag)
+    src, dst = meta["src"], meta["dst"]
+    landed = r["data"] if dst == "shim" else [r[f"dst {j}"] for j in range(RACE_WORDS)]
+    old = sum(1 for j in range(RACE_WORDS) if landed[j] == q.SRC_MARK + j)
+    new = sum(1 for j in range(RACE_WORDS) if landed[j] == RACE_MARK_B + j)
+    prefix = next((j for j in range(RACE_WORDS) if landed[j] != q.SRC_MARK + j), RACE_WORDS)
+    kind = "mem" if src == "mem" else "core"
+    return (f"{d.name}: {src} MM2S 0 -> {dst} ({'idle shim S2MM 1' if dst == 'shim' else 'S2MM 0 held'}): "
+            f"read before the overwrite {old} (prefix {prefix}), after {new}, other {RACE_WORDS - old - new}; "
+            f"held mm2s {q.status_text(r['a3 mm2s'], kind)}")
+
 def main(argv=None) -> int:
     import gen_lock_stall_probe as lock
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -404,7 +616,9 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--chain", nargs="*", metavar="KIND", help="the chain family for these tile kinds (core, mem)")
-    gen.add_argument("--lengths", type=int, nargs="*", default=list(CHAIN_LENGTHS))
+    gen.add_argument("--sink", action="store_true", help="the sink family (memtile MM2S into an idle shim S2MM)")
+    gen.add_argument("--race", nargs="*", metavar="CASE", help="the race family (no names: every case)")
+    gen.add_argument("--lengths", type=int, nargs="*", default=None)
     sub.add_parser("build").add_argument("out_dir")
     run = sub.add_parser("run")
     run.add_argument("out_dir")
@@ -416,8 +630,12 @@ def main(argv=None) -> int:
     an.add_argument("tag")
     args = ap.parse_args(argv)
     if args.cmd == "generate":
-        if args.chain:
-            chain_generate(Path(args.out_dir), args.chain, args.lengths)
+        if args.race is not None:
+            race_generate(Path(args.out_dir), args.race)
+        elif args.sink:
+            sink_generate(Path(args.out_dir), args.lengths or SINK_LENGTHS)
+        elif args.chain:
+            chain_generate(Path(args.out_dir), args.chain, args.lengths or CHAIN_LENGTHS)
         else:
             write_case(Path(args.out_dir) / CASE, None)
         return 0
@@ -434,6 +652,12 @@ def main(argv=None) -> int:
     for d in sorted(root.glob("chain_*"), key=lambda p: (p.name.split("_L")[0], int(p.name.split("_L")[1]))):
         if (d / "runs" / args.tag / "out.bin").exists():
             print(chain_report(d, args.tag))
+    for d in sorted(root.glob("sink_*"), key=lambda p: int(p.name.split("_L")[1])):
+        if (d / "runs" / args.tag / "out.bin").exists():
+            print(sink_report(d, args.tag))
+    for d in sorted(root.glob("race_*")):
+        if (d / "runs" / args.tag / "out.bin").exists():
+            print(race_report(d, args.tag))
     return 0
 
 

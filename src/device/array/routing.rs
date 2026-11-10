@@ -953,34 +953,19 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         use std::collections::VecDeque;
         let mut words_routed = 0;
 
-        // Terminal-send backpressure gate (#140 SP-4a). An MM2S whose circuit
-        // flow terminates at an un-armed S2MM (the runtime-dispatched shim DDR
-        // drain -- Idle until `npu_dma_memcpy_nd`, since mlir-aie's `createShimDMA`
-        // emits no static CDO config for it) must NOT drain into the fabric. On
-        // HW a circuit route holds TREADY low end-to-end from the un-armed sink,
-        // so the source MM2S stalls and the whole objectfifo chain stays cold; the
-        // EMU otherwise dribbles the object into the ~1-BD-deep fabric, retires the
-        // BD, releases the lock, and refills -- keeping the chain warm and feeding
-        // the shim continuously (the +1492-vs-HW-+13 first-starvation over-feed).
-        // The last-hop accept-gate in `route_tile_switches_to_dma` alone leaves
-        // ~one fabric depth of pre-fill; this closes it at the source. Interior
-        // memtile/compute S2MMs are CDO-started from cy0 -> never blocked
-        // (byte-identical); only the pre-dispatch shim drain gates.
+        // No source-side gate for an MM2S whose circuit ends at an un-armed S2MM
+        // (the runtime-dispatched shim DDR drain): silicon does NOT hold TREADY
+        // low end-to-end from the un-armed sink. A memtile MM2S chain into a shim
+        // S2MM that holds no task finishes 48 words of BDs before it stalls --
+        // its staging plus ~24 words past its port, in the memtile and shim
+        // switches (build/experiments/pipeline-fill/sink, NPU1, r1 == r2). The
+        // un-armed S2MM itself takes nothing (`route_tile_switches_to_dma`); the
+        // switch FIFOs in front of it fill like any other route. (The #140
+        // SP-4a gate that held such a source completely is gone.)
         if self.mm2s_terminal_s2mm.is_none() {
             let m = self.build_mm2s_terminal_map();
             self.mm2s_terminal_s2mm = Some(m);
         }
-        let blocked_sources: std::collections::HashSet<(usize, u8)> = {
-            let map = self.mm2s_terminal_s2mm.as_ref().unwrap();
-            let mut b = std::collections::HashSet::new();
-            for (&(sc, sr, sch), &(tc, tr, tch)) in map.iter() {
-                let tidx = self.tile_index(tc, tr);
-                if !self.dma_engines[tidx].channel_is_started(tch) {
-                    b.insert((self.tile_index(sc, sr), sch));
-                }
-            }
-            b
-        };
 
         // Combinational cold-terminal backpressure (#140 SP-4a campaign): the
         // drain gate holds every MM2S that transitively feeds a cold terminal
@@ -1009,10 +994,8 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             // Iterate MM2S channels independently.  Each has its own
             // stream_out queue; backpressure on one does not gate any other.
             for mm2s_ch in 0..mm2s_count {
-                // Terminal-send gate: retain this channel's stream_out (skip the
-                // drain entirely) when its flow ends at an un-armed S2MM -- the
-                // fabric would otherwise absorb the object ahead of the sink.
-                if blocked_sources.contains(&(i, mm2s_ch)) || campaign_drain.contains(&(i, mm2s_ch)) {
+                // Campaign drain gate (opt-in, `XDNA_EMU_SP4A_BP_MODE` >= 2).
+                if campaign_drain.contains(&(i, mm2s_ch)) {
                     continue;
                 }
                 let combined_ch = s2mm_count + mm2s_ch;

@@ -1770,9 +1770,9 @@ mod tests {
     fn of_q0_rich_bank_arbitration_vs_hw() {
         use crate::interpreter::engine::bank_census;
 
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let xclbin_path =
-            manifest.join("../mlir-aie/test/npu-xrt/spike_bringup/build_q0_rich_bankcap/aie.xclbin");
+        // Through the configured mlir-aie checkout, so a worktree finds it too.
+        let xclbin_path = crate::config::Config::get()
+            .mlir_aie_subpath("test/npu-xrt/spike_bringup/build_q0_rich_bankcap/aie.xclbin");
         if !xclbin_path.exists() {
             eprintln!("SKIP: traced of_q0_rich not built at {}", xclbin_path.display());
             return;
@@ -2113,6 +2113,25 @@ mod tests {
                 count >= 10,
                 "{name}: only {count} of {REPS} rep-bursts have HW's steady-state (24, 47) \
                  shape: {shapes:?}",
+            );
+        }
+
+        // 2b. Pipeline-fill depth: the cores run from CDO enable and the drain is
+        //     armed late, so each consumer free-runs some reps, blocks, and runs
+        //     the rest once the drain opens. Silicon, read over control packets
+        //     before the drain is armed (build/experiments/pipeline-fill/probe,
+        //     three runs identical): ConsA has released 7 reps, ConsB 6. The block
+        //     is the one gap of thousands of cycles between rep-bursts.
+        for (t, depth) in [(cons_a, 7usize), (cons_b, 6usize)] {
+            let name = TILES[t].2;
+            let reps: Vec<_> = bursts[t].iter().filter(|(_, _, n)| *n >= 10).collect();
+            let free_run = reps
+                .windows(2)
+                .position(|w| w[1].0 - w[0].1 > 1000)
+                .map_or(reps.len(), |i| i + 1);
+            assert_eq!(
+                free_run, depth,
+                "{name}: reps before the pipeline blocks on the un-armed drain (HW: {depth})"
             );
         }
 
