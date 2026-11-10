@@ -151,7 +151,7 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "A running (unparked) shim S2MM is not separated from a parked one; length 75 is a silicon oddity \
             not modelled."),
         measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
-            (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles only; mem tiles inherit it unverified. \
+            (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles; a memtile-sourced path holds 4 words more (pipeline-fill race probe), not modelled. \
             Assumes a stalled core holds one word (+/-1)."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },

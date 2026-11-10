@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-granule pulse, memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads
+status: stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-granule pulse, memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; open: memtile-sourced paths +4 words, paths into an idle shim from the north +4, next-BD lock pre-acquire)
 ---
 
 # DMA & Stream Resource Gaps
@@ -107,7 +107,7 @@ under-emission) is closed and lives in
 | Gap | Model vs hardware | Where | Status / rationale | Obs. |
 |-----|-------------------|-------|--------------------|------|
 | `DMA_S2MM_n_MEMORY_BACKPRESSURE` window shape | Per steady-state lock-stall window, backpressure opens **+15** cycles into the stall and closes **1** cycle after it, EMU == HW on every steady window (of_q0_rich rebuilt from its traced MLIR, 2026-11-04: HW r1/r2 and EMU all `(len 85, onset 15, held 71, end +1)`; the 2026-07-14 capture's 39 windows also +15). | `src/device/dma/engine/stream_io.rs` (`note_ingress_offer`, `input_fifo_capacity`), `src/device/array/routing.rs` (`route_tile_switches_to_dma`) | **CLOSED 2026-11-04.** The S2MM ingress is a 15-deep FIFO (`DMA_S2MM_INGRESS_FIFO_DEPTH`, which the event watches) behind a 3-word skid (`DMA_S2MM_INGRESS_SKID_DEPTH`): 18 in all, as the R4-D3 data race requires, with the event asserting while a beat is on offer and the FIFO's level after the cycle's drain is 15. Formerly +16 (one 16-deep FIFO, onset counted at the refusal) and +2 at the close (the registered start-of-cycle level, which still gates TREADY). Evidence `build/experiments/harness/dmastream/bp/`. **Do NOT compare run totals against `of_q0_rich` captures** (the trace holds a window of the kernel's iterations; see `xdna-emu-priv: research/findings/2026-07-13-memory-stall-bank-arbitration.md`). | confirmed |
-| MM2S egress staging depth (25) and the route downstream of it | `DMA_MM2S_EGRESS_FIFO_DEPTH = 25`, **measured** (R4-D3, Phoenix NPU1, 2026-10-28) by data race: overwrite the source buffer while the consumer is held and count words still carrying the old pattern. | `crates/xdna-archspec` (`DMA_MM2S_EGRESS_FIFO_DEPTH`), `src/device/dma/engine/stepping.rs` (`next_granule_fetch`, `Transfer::staged_data`), rig `tools/experiments/r4d3_*.py` | **CLOSED 2026-11-04, EMU == HW on all 25 route x phase points** (staging + route; see "Stream buffering and latency"). Two defects hid the staging from the race: staged words were re-read from memory at drain time (now read at fetch time, `staged_words_carry_the_data_read_at_fetch_time`), and the MM2S output buffer was a 4-word second copy of the slave FIFO (now the 1-word hand-off register, `MM2S_OUTPUT_REGISTER_DEPTH`). Mem tiles inherit 25 unverified. | confirmed |
+| MM2S egress staging depth (25) and the route downstream of it | `DMA_MM2S_EGRESS_FIFO_DEPTH = 25`, **measured** (R4-D3, Phoenix NPU1, 2026-10-28) by data race: overwrite the source buffer while the consumer is held and count words still carrying the old pattern. | `crates/xdna-archspec` (`DMA_MM2S_EGRESS_FIFO_DEPTH`), `src/device/dma/engine/stepping.rs` (`next_granule_fetch`, `staged_mm2s_cycle`), `ChannelContext::egress_staging`, rig `tools/experiments/r4d3_*.py` | **CLOSED 2026-11-04, EMU == HW on all 25 route x phase points** (staging + route; see "Stream buffering and latency"). Two defects hid the staging from the race: staged words were re-read from memory at drain time (now read at fetch time, `staged_words_carry_the_data_read_at_fetch_time`), and the MM2S output buffer was a 4-word second copy of the slave FIFO (now the 1-word hand-off register, `MM2S_OUTPUT_REGISTER_DEPTH`). Mem tiles inherit 25; silicon gives a memtile-sourced path 4 words more (not modelled, see "MM2S BD retirement"). | confirmed |
 | `DMA_MM2S_n_MEMORY_STARVATION` cold-fetch residual | EMU 0 on `of_q0_rich` (**HW 0**, exact match). In a synthetic worst case (core hammering the DMA's bank every cycle) EMU emits a few cycles where HW emits 0. | `src/device/dma/engine/stepping.rs` (`next_granule_fetch`) | **CLOSED for the measured workloads (0 == 0 again on the 2026-11-04 of_q0_rich rebuild); one known residual, OPEN.** The event is now driven by the MM2S egress staging FIFO running dry (`DMA_MM2S_EGRESS_FIFO_DEPTH` = 25). Silicon's 0 EMERGES -- the MM2S in `of_q0_rich` loses bank arbitrations and the staging absorbs every one, and a unit test proves losing EVERY arbitration costs zero cycles and zero starvation (HW: `T_collide/T_apart` = 1.0000). Residual: a transfer's very FIRST granule fetch has an empty staging behind it, so losing THAT one does bubble the port for a cycle. Silicon apparently primes its egress before the port opens (it reported 0 starvation across 112 losses and 16 transfer starts). Bounded by transfer starts, not by denials; needs a capture that starves an egress on purpose (a core hammering the MM2S's bank from the transfer's first cycle, `MM2S_MEMORY_STARVATION` traced) to pin; not taken in the 2026-11-04 wave. | confirmed |
 
 
@@ -148,6 +148,58 @@ absorb counts are unchanged; the shim path itself is one word longer in the emul
 2-word chains and the 57-word threshold are probed), the status of a TCT stall, how chain BDs and queued tasks
 share the pipeline when both are present, the exact budgets and the 4-word per-BD overhead, absorb length 75, the
 shim path's extra word.
+
+## MM2S BD retirement and the path to an un-armed drain (modelled 2026-11-10, NPU1 silicon)
+
+Probe: `tools/gen_pipeline_fill_probe.py` (families `chain`, `sink`, `race`, and the `of_q0_rich` readback);
+data in `build/experiments/pipeline-fill/`. Every count below is stable over two or three silicon runs.
+
+**A compute or memtile MM2S BD finishes once its last word is fetched into the egress staging**, not once it
+leaves the port. A chain of K BDs of L words into an S2MM parked on a lock finishes as many BDs as fit the
+whole absorb (`chain`, 0 hops, 12 BDs; BDs finished x L):
+
+| L (words) | 2 | 4 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|
+| compute, silicon | 24 (all) | 44 | 48 | 48 | 48 | 48 |
+| memtile, silicon | 24 (all) | 48 | 48 | 48 | 48 | 48 |
+| emulator, port-exit rule (before) | 24 | 24 | 24 | 24 | 16 | 24 |
+| emulator now | 24 | 48 | 48 | 48 | 48 | 48 |
+
+48 is the R4-D3 0-hop absorb, so the whole path holds the finished BDs. The emulator's egress staging
+(`ChannelContext::egress_staging`) now belongs to the channel: a fetched word leaves the transfer with its
+TLAST, the BD completes when its last granule is fetched, the next BD fetches in behind, and the staging drains
+one word per cycle whatever the FSM is doing. The BD-boundary bubble (`off1`) is a port-side idle cycle after a
+BD's last word (`egress_gap`). A channel whose BDs have all finished with words still staged reads Running with
+Stalled_Stream_Backpressure (silicon `chain_mem_L4`), like the shim read-ahead window.
+
+**No source gate in front of an un-armed S2MM.** A memtile MM2S chain into a shim S2MM that holds no task
+finishes 48 words of BDs (`sink`, L = 8 and 16); the emulator held such a source completely (#140 SP-4a
+terminal-send gate, removed) and finished 24. The opt-in `XDNA_EMU_SP4A_BP_MODE` campaign gates rest on the
+same refuted premise (TREADY low end-to-end from the un-armed sink) and are left off by default.
+
+**Path capacities by data race** (`race`: one 96-word BD, the source overwritten once the sender settled, words
+read before the overwrite; prod = compute (0,2), consA = (0,3)):
+
+| Path | Silicon | Emulator |
+|---|---|---|
+| prod -> own S2MM (held) | 48 | 48 |
+| prod -> memtile S2MM (held) | 56 | 56 |
+| memtile -> own S2MM (held) | 52 | 48 |
+| memtile -> prod S2MM (held) | 60 | 56 |
+| memtile -> idle shim S2MM | 48 | 40 |
+| prod -> idle shim S2MM | 52 | 48 |
+| consA -> idle shim S2MM | 60 | 56 |
+
+**Open (not modelled):** every memtile-sourced path holds 4 words more than the emulator (the memtile egress
+staging or its DMA slave port: not separated; mem tiles had inherited the compute tile's 25), and every path
+into an idle shim S2MM from the north holds 4 more (memtile South master or shim North slave: not separated;
+the shim's own MM2S -> S2MM loop holds 8, one less than the emulator). The hop slope is 8 words on both
+sides. On `of_q0_rich` neither moves the depth (its drain BDs are 32 words); a drain BD of 41..48 words
+would. Also open: a stalled MM2S has already acquired the lock of the BD after the one it works on (compute
+and memtile chains, the `of_q0_rich` drain), with `Cur_BD` one BD further than the emulator's; `Status[1:0]`
+reads 2 where the emulator reads 1 on a backpressured chain; a compute chain of 4-word BDs stops one BD short
+(11 of 12, the next BD reading Stalled_Lock_Acq with its lock available; also a memtile chain of twenty
+4-word BDs into an idle shim: 11).
 
 ## Stream wedges: switch FIFO route and core stream writes (FIXED, NPU1 silicon 2026-11-03)
 
