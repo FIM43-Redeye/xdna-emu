@@ -956,7 +956,7 @@ spills) exposed:
 | Gap | Model vs hardware | Status | Obs. |
 |---|---|---|------|
 | unaligned fused loads | silicon rounds the address down to 32 bytes (`vlda.ups`, `vlda.conv`, `vldb.unpack`, 328-case probe); the emulator does the same | resolved: [`addressing.md`](addressing.md), "Unaligned accesses" | confirmed |
-| `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `unpack(v, bool)`, needs a raw register write | confirmable: raw control-register write asm |
+| `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | **settled 2026-11-10** by the register itself: on silicon `crUnpackSign` keeps one bit (`movx` of `0x66666666` reads back 0, `0xFFFFFFFF` reads 1; register-width table in `core-compute-timing.md`), so no higher bit is ever stored for the unit to see | confirmed (register state) |
 | how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
 | descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) | confirmed |
 | negative or very large counts and sizes | compared unsigned | open; only 0..7 observed | confirmable: counts above 7 / negative via asm |
@@ -1069,8 +1069,8 @@ are deleted; a non-wide pack now logs an error and does nothing.
 
 | Gap | Model vs hardware | Status | Obs. |
 |---|---|---|------|
-| `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | open; unobservable from `pack(v, int)` as used, needs a raw register write | confirmable: raw control-register write asm |
-| `crSat` values above 3 | only the low two bits are used | open; not captured | confirmable: raw control-register write asm |
+| `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | **settled 2026-11-10** by the register itself: `crPackSign` keeps one bit on silicon (register-width table in `core-compute-timing.md`), so no higher bit is stored | confirmed (register state) |
+| `crSat` values above 3 | only the low two bits are used | **settled 2026-11-10** by the register itself: `crSat` keeps two bits on silicon (`0xFFFFFFFF` reads back 3; register-width table in `core-compute-timing.md`) | confirmed (register state) |
 | how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
 | unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation | confirmed |
 | 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only | confirmable: 2D/3D vst.pack capture |
