@@ -4166,6 +4166,86 @@ class ControlTimingStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# DescriptorCountStrategy: 2D / 3D count-vs-size comparison at large and "negative" values
+# ---------------------------------------------------------------------------
+
+class DescriptorCountStrategy(TestStrategy):
+    """`padda.2d [p2], d0` / `padda.3d [p2], d0` (TableGen `d0_3d`) with sizes and counts far outside 0..7.
+
+    The 2D update is `if dc < dn { p += dj; dc += 1 } else { p += m; dc = 0 }`; earlier captures
+    only had small counts, so whether the comparison is unsigned over the 20-bit registers (a
+    scalar read sign-extends bit 19) was open.  Each test point writes the descriptor with
+    `movxm` (32-bit values; the registers keep 20 bits), steps a copy of p1 once, and stores the
+    pointer delta, the inner count and the outer count afterwards, and the sizes as read back.
+    The stride and the modifier differ (dj0 = 8, dj4 = 16, m0 = 96), so the delta tells which
+    branch ran.  For 3D the inner count starts at its size 0, so the outer pair decides.  The
+    touched registers are saved before and restored after; nothing touches memory but the store.
+    """
+
+    SIZES = (3, 0x7FFFF, 0x80000, 0xFFFFF, 0x100003, 0xFFFFFFFF)
+    COUNTS = (0, 2, 3, 0x7FFFF, 0x80000, 0xFFFFF, 0x100000)
+    # register -> save slot
+    SAVED = {"m0": "r24", "dn0": "r25", "dj0": "r26", "dc0": "r27", "dn4": "r28", "dj4": "r29",
+             "dc4": "r30"}
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        out = []
+        for dim in (2, 3):
+            for n in cls.SIZES:
+                for c in cls.COUNTS:
+                    out.append({"name": f"desc{dim}d_n{n:x}_c{c:x}", "dim": dim, "size": n,
+                                "count": c, "isa": f"PADDA_{dim}D"})
+        return out
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if instr["name"] in ("PADDA_2D", "PADDA_3D"):
+            return (True, "")
+        return (False, "not a descriptor-count lead")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"desc": c["name"]} for c in self.cases() if c["isa"] == instr["name"]]
+
+    def compute_input_size(self, instr, regs):
+        return 4    # a batch never has an empty input buffer
+
+    def compute_output_size(self, instr):
+        return 20   # delta, dc0, dc4, dn0, dn4
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["desc"])
+        out_offset = _align(out_offset, 4)
+        if c["dim"] == 2:
+            inner, outer, op = (c["size"], c["count"]), (0, 0), "padda.2d [p2], d0"
+        else:
+            inner, outer, op = (0, 0), (c["size"], c["count"]), "padda.3d [p2], d0"
+        values = {"m0": 96, "dj0": 8, "dn0": inner[0], "dc0": inner[1],
+                  "dj4": 16, "dn4": outer[0], "dc4": outer[1]}
+        lines = [f"  // ---- test (descriptor count): {c['dim']}D size 0x{c['size']:x} "
+                 f"count 0x{c['count']:x} ----"]
+        lines += [f"  mov {slot}, {reg}" for reg, slot in self.SAVED.items()]
+        for reg in ("m0", "dj0", "dn0", "dc0", "dj4", "dn4", "dc4"):
+            lines += [f"  movxm r0, #0x{values[reg] & 0xFFFFFFFF:x}", f"  mov {reg}, r0"]
+        lines += _nop_sled(3) + ["  mov p2, p1"] + _nop_sled(3) + [f"  {op}"] + _nop_sled(6)
+        lines += ["  mov r1, p2", "  mov r2, p1", "  mov r3, dc0", "  mov r4, dc4",
+                  "  mov r5, dn0", "  mov r6, dn4"] + _nop_sled(3)
+        lines += ["  sub r1, r1, r2"] + _nop_sled(1)
+        for k, reg in enumerate(("r1", "r3", "r4", "r5", "r6")):
+            lines += _scalar_store(reg, "p1", out_offset + 4 * k)
+        lines += [f"  mov {reg}, {slot}" for reg, slot in self.SAVED.items()]
+        lines += ["  mov p2, p1"] + _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # VmovQuarterStrategy: 256-bit moves between a w register and an accumulator quarter
 # ---------------------------------------------------------------------------
 
@@ -6160,6 +6240,12 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     vmovq_specs = [(by_name["VMOV_mv_w"], k, {"vmovq": c["name"], "_combo_idx": 0}, vmovq_strategy)
                    for k, c in enumerate(VmovQuarterStrategy.cases())]
 
+    # 2D / 3D count-vs-size comparison at large values (DescriptorCountStrategy): standalone
+    # batches after the vmov-quarter one.
+    desc_strategy = DescriptorCountStrategy()
+    desc_specs = [(by_name[c["isa"]], k, {"desc": c["name"], "_combo_idx": 0}, desc_strategy)
+                  for k, c in enumerate(DescriptorCountStrategy.cases())]
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6495,7 +6581,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs, vmovq_specs):
+    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs, vmovq_specs, desc_specs):
         chunk, chunk_bundles = [], 0
         for spec in specs:
             instr, _, regs, strategy = spec
@@ -6514,6 +6600,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
                          + len(collision_specs) + len(width_specs) + len(cntr_specs) + len(ctl_specs) + len(vmovq_specs)
+                         + len(desc_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())

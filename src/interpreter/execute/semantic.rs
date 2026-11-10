@@ -230,8 +230,9 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar_read(*r),
         Operand::PointerReg(r) => ctx.pointer_read(*r),
-        // A scalar move out of an m / dn / dj / dc register sign-extends its 20 bits (NPU1
-        // silicon: `vec_unpack_addr` reads a negative dj back as base + dj and gets base - 32).
+        // A scalar move out of an m or dj register sign-extends its 20 bits, out of dn or dc
+        // zero-extends (NPU1 silicon: `vec_unpack_addr` reads a negative dj back as base + dj
+        // and gets base - 32; ISA batches 211..218 read dn = 0xFFFFF back as 0x000FFFFF).
         Operand::ModifierReg(r) => ctx.modifier_read_as_scalar(*r),
         Operand::Immediate(v) => *v as u32,
         Operand::VectorReg(r) => {

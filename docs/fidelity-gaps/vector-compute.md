@@ -962,8 +962,9 @@ spills) exposed:
 
 - `padda/paddb/padds.2d` and `.3d` (pointer arithmetic with a descriptor) were treated as
   adds of the descriptor operand; they now run the same descriptor update as the 2D/3D loads.
-- A scalar read of an `m`, `dn`, `dj` or `dc` register zero-extended its 20 bits; silicon
+- A scalar read of an `m` or `dj` register zero-extended its 20 bits; silicon
   sign-extends (`vec_unpack_addr` computes `base + dj` for negative `dj` and gets `base - 32`).
+  `dn` and `dc` read back zero-extended (register-width table in `core-compute-timing.md`).
 - A store whose data is a pointer register with a post-increment or immediate offset
   (`st p6, [p3], #4`, a spill) took the data pointer for the address and the address pointer
   for the data. The decoder now keeps the address pointer last for stores, and the store and
@@ -977,7 +978,7 @@ spills) exposed:
 | `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | **settled 2026-11-10** by the register itself: on silicon `crUnpackSign` keeps one bit (`movx` of `0x66666666` reads back 0, `0xFFFFFFFF` reads 1; register-width table in `core-compute-timing.md`), so no higher bit is ever stored for the unit to see | confirmed (register state) |
 | how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | **pinned 2026-11-10**: raw-asm sweep, +5 used, +6 not; EMU == HW | confirmed |
 | descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) | confirmed |
-| negative or very large counts and sizes | compared unsigned | open; only 0..7 observed | confirmable: counts above 7 / negative via asm |
+| negative or very large counts and sizes | compared unsigned over the 20 bits kept | **confirmed 2026-11-10** with the other 2D / 3D families, see [addressing.md](addressing.md) "Large and negative counts" | confirmed |
 | cross-tile fused unpack loads | go through the shared vector read, not captured | open | confirmable: cross-tile fused unpack capture |
 | AIE2P | `unpackSign0` / `unpackSign1`: the form table names the register and `PendingUnpack` resolves it by id, so no single register is assumed; not implemented | deferred | confirmable: Strix capture (halo) |
 

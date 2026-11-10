@@ -4474,8 +4474,8 @@ class TestScalarCollisionStrategy:
         at = batches.index(mine[0])
         assert mine and batches[at:at + len(mine)] == mine, "collision batches are contiguous"
         # only the standalone batches generated after them follow: register width, cycle
-        # counter, control timing, vmov quarter
-        later = ("width", "cntr", "ctl", "vmovq")
+        # counter, control timing, vmov quarter, descriptor count
+        later = ("width", "cntr", "ctl", "vmovq", "desc")
         assert all(any(k in t["operands"] for k in later for t in b["tests"]) for b in batches[at + len(mine):])
         for b in mine:
             for t in b["tests"]:
@@ -4545,7 +4545,7 @@ class TestScalarWidthStrategy:
         assert mine and batches[at:at + len(mine)] == mine
         # only the cycle-counter and control-timing batches come after them
         rest = batches[at + len(mine):]
-        assert all(any(k in t["operands"] for k in ("cntr", "ctl", "vmovq") for t in b["tests"]) for b in rest)
+        assert all(any(k in t["operands"] for k in ("cntr", "ctl", "vmovq", "desc") for t in b["tests"]) for b in rest)
         size = 4 * len(self.S.PATTERNS)
         for b in mine:
             for t in b["tests"]:
@@ -4749,6 +4749,45 @@ class TestVmovQuarterStrategy:
         mine = [i for i, b in enumerate(batches) if any("vmovq" in t["operands"] for t in b["tests"])]
         ctl = [i for i, b in enumerate(batches) if any("ctl" in t["operands"] for t in b["tests"])]
         assert mine and min(mine) > max(ctl)
+        assert sum(len(batches[i]["tests"]) for i in mine) == len(self.S.cases())
+
+
+class TestDescriptorCountStrategy:
+    S = isa_test_gen.DescriptorCountStrategy
+
+    def _lines(self, name):
+        c = self.S.case(name)
+        asm = self.S().generate_test_point({"name": c["isa"]}, {"desc": name}, in_offset=0, out_offset=0)
+        return [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith("//")]
+
+    def test_sets_the_pair_under_test_and_steps_once(self):
+        for c in self.S.cases():
+            lines = self._lines(c["name"])
+            size_reg, count_reg = ("dn0", "dc0") if c["dim"] == 2 else ("dn4", "dc4")
+            for reg, val in ((size_reg, c["size"]), (count_reg, c["count"])):
+                at = lines.index(f"mov {reg}, r0")
+                assert lines[at - 1] == f"movxm r0, #0x{val:x}", (c["name"], reg)
+            assert sum(l.startswith("padda.") for l in lines) == 1
+            assert f"padda.{c['dim']}d [p2], d0" in lines
+
+    def test_saves_and_restores_every_descriptor_register(self):
+        for c in self.S.cases():
+            lines = self._lines(c["name"])
+            for reg, slot in self.S.SAVED.items():
+                assert lines.index(f"mov {slot}, {reg}") < lines.index(f"mov {reg}, {slot}")
+
+    def test_never_writes_the_stack_pointer_copy(self):
+        for c in self.S.cases():
+            isa_test_gen._check_reserved_registers(["\n".join(self._lines(c["name"]))])
+
+    def test_batches_come_after_the_vmov_quarter_batch(self, tmp_path):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        batches = generate_all(path, str(tmp_path / "isa"))["batches"]
+        mine = [i for i, b in enumerate(batches) if any("desc" in t["operands"] for t in b["tests"])]
+        vq = [i for i, b in enumerate(batches) if any("vmovq" in t["operands"] for t in b["tests"])]
+        assert mine and min(mine) > max(vq)
         assert sum(len(batches[i]["tests"]) for i in mine) == len(self.S.cases())
 
 

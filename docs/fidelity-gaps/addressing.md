@@ -49,6 +49,15 @@ sizes, size 0, negative strides and negative modifiers. The captured Chess disas
 the goldens next to the data) shows `d0`..`d3` for the 2D forms and `d0_3d`..`d3_3d` for the 3D
 forms; every family was seen with at least `d0`, most with all four.
 
+**Large and negative counts** (2026-11-10, ISA batches 211..218, `DescriptorCountStrategy` in
+`tools/isa-test-gen.py`). `padda.2d` / `padda.3d` with sizes 3, 0x7FFFF, 0x80000, 0xFFFFF,
+0x100003, 0xFFFFFFFF against counts 0, 2, 3, 0x7FFFF, 0x80000, 0xFFFFF, 0x100000 (84 points, the
+3D ones on the outer pair): every write keeps the low 20 bits (0x100003 reads back 3,
+0xFFFFFFFF reads back 0xFFFFF, zero-extended), and the comparison is unsigned over those 20
+bits (size 0xFFFFF with count 0x80000 steps, size 0x80000 with count 0x7FFFF steps, count
+0x80000 against size 0x80000 wraps). The count carries into bit 19 without sign effects
+(0x7FFFF steps to 0x80000). HW r1 == r2, EMU == HW on every point.
+
 Findings:
 
 - **One rule for all of them.** Loads, stores, scalar, vector, accumulator, q-register, fused
@@ -255,7 +264,7 @@ family), `state/load_ring.rs`, `memory/neighbor.rs`. EMU == HW on all 12 probe c
 |---|---|------|
 | count-write latency | at most two bundles (observed); not pinned lower | confirmable: sweep count-write to use distance |
 | `d4`..`d7` as 2D operands | the compiler allocated `d0`..`d3` for four walkers; the 3D forms use `d4`..`d7` as the outer dimension, which the 3D captures exercise | confirmable: hand-written asm, d4..d7 |
-| counts and sizes above 20 bits or negative | counts are masked to 20 bits on write like every modifier; values above 2^20 not captured | confirmable: raw write of oversize/negative counts |
+| counts and sizes above 20 bits or negative | masked to 20 bits on write, compared unsigned; **confirmed 2026-11-10** (see "Large and negative counts") | confirmed |
 | west of column 1 | silicon returns the DPU-reserved column 0's contents, which the emulator does not have (`load4x/wrap3` `lut_unwritten`: its west lanes, and through the rings most of its south lanes) | confirmed |
 | ring state across kernel launches | **modelled (2026-11-06)**: a core reset keeps both rings, within one emulator instance and, with `XDNA_EMU_STATE_DIR`, across processes. The harness still differs: every phase is a new process on a fresh emulated device (zero rings), while silicon holds the previous case's rings (the scrub loads only through port A), so `lut_unwritten` keeps its 6 port-B lanes | confirmed |
 | loads into an isolated direction | `Tile_Control` isolation: the emulator returns zeros and writes zeros to the ring; unprobed | confirmable: load into isolated direction |
