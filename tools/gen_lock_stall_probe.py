@@ -15,6 +15,11 @@ lk_D_MODE   the consumer issues `lda r6` and, D bundles after it, `acq` with cha
             acquire blocks for about 10 cycles per iteration. MODE `free`: the producer
             releases at once and the consumer waits `late_iters` iterations before its
             program, so the acquire is granted on issue (the no-stall control).
+vlk_KIND_D_MODE  the lk_D experiment for a vector load: KIND `vlda` (`vlda wl10`, load unit
+            A), `vldb` (`vldb wl10`, the B load channel) or `am` (`vlda amll0`, an
+            accumulator quarter), then `acq` at +D; the loaded register is copied into a
+            fresh w register at every other bundle +1..+8 (`vmov wlN, wl10` /
+            `vmov wlN, amll0`) and the copies are stored afterwards.
 same_MODE   `lda r6 ; paddb [p2], #4 ; acq` in one bundle, then r6 sampled at +1..+8: is
             a load bundled with a blocked acquire issued once, and when; and is the
             pointer add applied once.
@@ -37,6 +42,9 @@ Consumer output (`consumer.log`, 64 bytes, little-endian u32):
   lk/same: words 0..7 = r6 at +1..+8 (0 where bundle +D is the acquire), word 8/9 = the
            counter before the load / after the last sample, word 10 = p2 - p0 (same only),
            word 15 = the value the load reads.
+  vlk:     (VLOG_BYTES) words 0/1 = the counter before the load / after the last copy, bytes
+           32..63 = the loaded data (LDA_NEW in every word), bytes 64+32*(j-1) = the copy
+           at +j (zero where +j is the acquire).
   eq:      word i = the counter low word before request 1 (i = 0) and after request i.
 Producer output (`producer.ts`, 32 bytes): word k = the counter before its request k + 1.
 """
@@ -88,11 +96,12 @@ def _store_ts(n: int, first_word: int) -> list[str]:
     return [f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (first_word + i)}]" for i in range(n)]
 
 
-def _topology(name: str, cons: str, prod: str, init: int) -> tuple[Topology, dict[str, str]]:
+def _topology(name: str, cons: str, prod: str, init: int,
+              log_bytes: int = LOG_BYTES) -> tuple[Topology, dict[str, str]]:
     topo = Topology(
         name=name,
         cores=(Core("producer", PRODUCER_TILE, Path("producer.s"), args=(Buffer("ts", "out", TS_BYTES),)),
-               Core("consumer", CONSUMER_TILE, Path("consumer.s"), args=(Buffer("log", "out", LOG_BYTES),))),
+               Core("consumer", CONSUMER_TILE, Path("consumer.s"), args=(Buffer("log", "out", log_bytes),))),
         links=(SharedLock("consumer", "producer", LOCK_ID, init=init),))
     return topo, {"producer.s": prod, "consumer.s": cons}
 
@@ -158,6 +167,65 @@ def same_case(mode: str, late_iters: int):
     stall = mode == "stall"
     cons = _sampler_asm(same_program(), list(range(1, 9)), 0 if stall else late_iters, True)
     return _topology(f"same_{mode}", cons, _releaser(late_iters if stall else 0), 0)
+
+
+# -- vlk: a vector load in flight across a lock stall --------------------------------
+
+VLK_KINDS = {
+    "vlda": ("  vlda wl10, [p0, #32]", "wl10"),
+    "vldb": ("  vldb wl10, [p0, #32]", "wl10"),
+    "am": ("  vlda amll0, [p0, #32]", "amll0"),
+}
+# Layout: the two counter reads, the loaded data, the eight copies (`vldb` and `st` take
+# immediate offsets below 128 only).
+VLK_TS_WORD, VLK_DATA_AT, VLK_COPY_AT = 0, 32, 64
+VLOG_BYTES = VLK_COPY_AT + 8 * 32
+
+
+def _vlk_setup(kind: str) -> list[str]:
+    # The target holds LDA_OLD in every word until the load lands; the load reads LDA_NEW.
+    old = (["  vmov amll0, wl11"] if kind == "am" else ["  vmov wl10, wl11"])
+    return [f"  mov r5, #{LDA_NEW}", f"  mov r6, #{LDA_OLD}", "  mov r4, #-1", *[N] * 2,
+            "  vbcst.32 x9, r5", "  vbcst.32 x11, r6", *[N] * 2,
+            f"  vst wl9, [p0, #{VLK_DATA_AT}]", *old, *[N] * 8]
+
+
+def vlk_program(kind: str, d: int) -> list[str]:
+    """Consumer measured window of vlk_KIND_D: the load, then bundles +1..+8 (+D = acquire)."""
+    if not 1 <= d <= 8:
+        raise ValueError("vlk needs 1 <= D <= 8")
+    load, target = VLK_KINDS[kind]
+    body = [_ts(0), load]
+    for j in range(1, 9):
+        body.append(f"  acq #{RAW_OWN}, r4" if j == d else f"  vmov wl{j - 1}, {target}")
+    return body + [_ts(1)]
+
+
+def vlk_case(kind: str, d: int, mode: str, late_iters: int):
+    if kind not in VLK_KINDS:
+        raise ValueError(f"kind is one of {tuple(VLK_KINDS)}")
+    if mode not in MODES:
+        raise ValueError(f"mode is one of {MODES}")
+    stall = mode == "stall"
+    body = _vlk_setup(kind)
+    if not stall:
+        body += base.delay_loop(late_iters, ".Lcons")
+    body += vlk_program(kind, d) + [*[N] * 8]
+    body += [f"  vst wl{j - 1}, [p0, #{VLK_COPY_AT + 32 * (j - 1)}]" for j in range(1, 9) if j != d]
+    body += [f"  st r{TS_PAIRS[i][1]}, [p0, #{4 * (VLK_TS_WORD + i)}]" for i in range(2)]
+    cons = _frame(body)
+    return _topology(f"vlk_{kind}_{d}_{mode}", cons, _releaser(late_iters if stall else 0), 0,
+                     VLOG_BYTES)
+
+
+def parse_vlk(consumer_log: bytes) -> dict:
+    """Word 0 of each copy (every word of a copy is equal unless a copy tore)."""
+    copies = [struct.unpack_from("<8I", consumer_log, VLK_COPY_AT + 32 * j) for j in range(8)]
+    caps = [c[0] if len(set(c)) == 1 else None for c in copies]
+    first = next((i + 1 for i, v in enumerate(caps) if v == LDA_NEW), None)
+    w = struct.unpack_from(f"<{VLOG_BYTES // 4}I", consumer_log)
+    return {"caps": caps, "new_from": first,
+            "window": (w[VLK_TS_WORD + 1] - w[VLK_TS_WORD]) & 0xFFFFFFFF}
 
 
 # -- pos / relpos: where in the pipeline a lock request stalls the core ---------------
@@ -1275,6 +1343,14 @@ def cmd_generate(args) -> int:
             d = int(fam.split("_")[1])
             made = [lk_case(d, m, args.late_iters) for m in args.modes]
             metas = [{"family": "lk", "d": d, "mode": m, "late_iters": args.late_iters} for m in args.modes]
+        elif fam.startswith("vlk_"):
+            # vlk_KIND (every D) or vlk_KIND_D
+            parts = fam.split("_")[1:]
+            kind = parts[0]
+            ds = [int(parts[1])] if len(parts) > 1 else list(range(1, 9))
+            made = [vlk_case(kind, d, m, args.late_iters) for d in ds for m in args.modes]
+            metas = [{"family": "vlk", "kind": kind, "d": d, "mode": m, "late_iters": args.late_iters}
+                     for d in ds for m in args.modes]
         elif fam == "same":
             made = [same_case(m, args.late_iters) for m in args.modes]
             metas = [{"family": "same", "mode": m, "late_iters": args.late_iters} for m in args.modes]
@@ -1388,6 +1464,12 @@ def cmd_analyze(args) -> int:
             w = f"  then mov r26,#{meta['writer'][1]} at {meta['writer'][0]:+d}" if "writer" in meta else ""
             print(f"{name:24s} r26={meta['value']:#010x} lost {cells}  count={r['count']}{w}")
             continue
+        if meta["family"] == "vlk":
+            r = parse_vlk(log)
+            caps = " ".join("A" if meta["d"] == i + 1 else ("torn" if v is None else f"{v}")
+                            for i, v in enumerate(r["caps"]))
+            print(f"{name:20s} {caps}  new_from=+{r['new_from']} window={r['window']}")
+            continue
         if meta["family"] in ("pos", "relpos"):
             print(f"{name:14s} deltas after the request: {parse_pos(log)}")
             continue
@@ -1410,7 +1492,7 @@ def main(argv=None) -> int:
     gen = sub.add_parser("generate")
     gen.add_argument("out_dir")
     gen.add_argument("--cases", nargs="+", required=True,
-                     help="lk_1..lk_8, same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
+                     help="lk_1..lk_8, vlk_<vlda|vldb|am>[_D], same, pos, relpos, b2b_<pair>, condwin[_variant], cond[_kind[_state[_v]]], eq_<name> (" + ", ".join(EQ_CASES) + ")")
     gen.add_argument("--modes", nargs="+", default=list(MODES))
     gen.add_argument("--late-iters", type=int, default=1500)
     gen.add_argument("--step-iters", type=int, default=400)

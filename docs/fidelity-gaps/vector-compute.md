@@ -104,6 +104,10 @@ later-landing one wins. The loads are now ordinary in-flight vector-file writes 
 clock (`ExecutionContext::queue_vector_load` -> `VectorRegisterFile::queue_write`, no bypass), the
 load-commit phantoms are gone, and the gather reads its address register like any reader (it used to
 force-commit every pending write, scalar loads included). Only mask (`q`) loads keep the load queue.
+Silicon confirms the issued-bundle clock across a stall (2026-11-10, `tools/gen_lock_stall_probe.py`
+`vlk_<vlda|vldb|am>_D`, 48 cases, `build/experiments/vec-load-stalls/s1`, r1 == r2, EMU == HW): a `vlda`
+w load, a `vldb` (B channel) and a `vlda amll` in flight while the core waits ~15k cycles on a refused
+acquire D = 1..8 bundles later land 7 issued bundles after the load, exactly as without the stall.
 Same-cycle ties and same-bundle schedules are where the old path differed (31 points); the rules
 silicon follows there (`ldvec/tie1`, 120 points, and `ldvec/hz2`, 264 points, both r1 == r2):
 

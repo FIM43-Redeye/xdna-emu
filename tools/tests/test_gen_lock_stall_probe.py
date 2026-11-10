@@ -91,7 +91,9 @@ def test_parse_eq_quantizes_waits_to_producer_steps():
 @pytest.mark.parametrize("made", [
     lambda: g.lk_case(1, "stall", 100), lambda: g.lk_case(8, "free", 100),
     lambda: g.same_case("stall", 100), lambda: g.pos_case("pos", "free", 100),
-    lambda: g.pos_case("relpos", "stall", 0), *[(lambda n=n: g.eq_case(n, 50)) for n in g.EQ_CASES]])
+    lambda: g.pos_case("relpos", "stall", 0), *[(lambda n=n: g.eq_case(n, 50)) for n in g.EQ_CASES],
+    *[(lambda k=k: g.vlk_case(k, 3, "stall", 100)) for k in g.VLK_KINDS],
+    lambda: g.vlk_case("vldb", 8, "free", 100)])
 def test_asm_assembles(made, tmp_path):
     _, files = made()
     for fname, text in files.items():
@@ -401,3 +403,30 @@ def test_left_shim_and_memtile_use_their_own_flag_registers():
     assert shim.overflow == [0x14120] and shim.underflow == [0x14128]
     assert mem.overflow == [0xC0420, 0xC0424] and mem.underflow == [0xC0428, 0xC042C]
     assert 0x94210 in mem.events and 0x3420C in shim.events
+
+
+@pytest.mark.parametrize("kind", list(g.VLK_KINDS))
+@pytest.mark.parametrize("d", range(1, 9))
+def test_vlk_program_copies_the_target_around_the_acquire(kind, d):
+    prog = g.vlk_program(kind, d)
+    load, target = g.VLK_KINDS[kind]
+    assert prog[1] == load
+    window = prog[2:10]
+    assert window[d - 1].startswith("  acq ")
+    copies = [w for j, w in enumerate(window, 1) if j != d]
+    assert copies == [f"  vmov wl{j - 1}, {target}" for j in range(1, 9) if j != d]
+
+
+def test_vlk_case_validates_and_stores_every_copy_but_the_acquire():
+    topo, files = g.vlk_case("am", 4, "stall", 100)
+    assert validate(topo, load_device_model("npu1")) == []
+    stores = [l for l in files["consumer.s"].splitlines() if l.startswith("  vst wl") and "#32]" not in l]
+    assert len(stores) == 7 and "  vst wl3, [p0, #160]" not in stores
+
+
+def test_parse_vlk():
+    copies = [[111] * 8] * 6 + [[222] * 8, [222] * 7 + [111]]
+    words = [1000, 1040] + [0] * 6 + [222] * 8 + [w for c in copies for w in c]
+    r = g.parse_vlk(struct.pack(f"<{len(words)}I", *words))
+    assert r["caps"][:7] == [111] * 6 + [222] and r["caps"][7] is None
+    assert (r["new_from"], r["window"]) == (7, 40)
