@@ -4057,6 +4057,99 @@ class CycleCounterStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# ControlTimingStrategy: how far from a pack / unpack a control-register write still counts
+# ---------------------------------------------------------------------------
+
+class ControlTimingStrategy(TestStrategy):
+    """A `movx` of `crPackSign` / `crSat` / `crUnpackSign` placed `dist` bundles before
+    (negative) or after (positive) the `vpack.d8.d16` / `vunpack.d16.d8` it controls.
+
+    The register holds OLD from well before the test; the move writes NEW.  Comparing the
+    result with the far-before and far-after points tells which value the instruction used, so
+    the sweep pins the last bundle before which a write is too late and the first after which
+    it is too early (docs/fidelity-gaps/vector-compute.md, pack and unpack "Not pinned" rows).
+    The source data is the batch's random input, so about half the lanes are negative and both
+    the sign and the saturation choice change the result.  One move per test point, in a
+    bundle of its own; a write in the operation's own bundle is not part of this sweep.
+    """
+
+    TARGETS = {
+        # `fixed`: the other register the result depends on, held for the whole test point
+        # (truncation, crSat 0, makes the pack sign invisible).
+        "pack_sign": {"reg": "crPackSign", "old": 0, "new": 1, "op": "pack", "fixed": ("crSat", 1)},
+        "pack_sat": {"reg": "crSat", "old": 0, "new": 1, "op": "pack", "fixed": ("crPackSign", 1)},
+        "unpack_sign": {"reg": "crUnpackSign", "old": 0, "new": 1, "op": "unpack", "fixed": None},
+    }
+    BEFORE = (-8, -6, -5, -4, -3, -2, -1)
+    AFTER = (1, 2, 3, 4, 5, 6, 7, 8)
+
+    @classmethod
+    def cases(cls) -> list[dict]:
+        out = []
+        for key, t in cls.TARGETS.items():
+            dists = cls.BEFORE + (cls.AFTER if t["op"] == "unpack" else (1, 8))
+            isa = "VPACK_D8_D16" if t["op"] == "pack" else "VUNPACK_D16_D8"
+            for d in dists:
+                tag = f"m{-d}" if d < 0 else f"p{d}"
+                out.append({"name": f"ctl_{key}_{tag}", "target": key, "dist": d, "isa": isa})
+        return out
+
+    @classmethod
+    def case(cls, name: str) -> dict:
+        return next(c for c in cls.cases() if c["name"] == name)
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if any(c["isa"] == instr["name"] for c in self.cases()):
+            return (True, "")
+        return (False, "not a control-timing lead")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"ctl": c["name"]} for c in self.cases() if c["isa"] == instr["name"]]
+
+    def compute_input_size(self, instr, regs):
+        return 64
+
+    def compute_output_size(self, instr):
+        return 64 if instr["name"].startswith("VUNPACK") else 32
+
+    def payload_variants(self, instr: dict) -> list[list[dict]]:
+        return []
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        c = self.case(regs["ctl"])
+        t = self.TARGETS[c["target"]]
+        reg, d = t["reg"], c["dist"]
+        in_offset, out_offset = _align(in_offset, 32), _align(out_offset, 32)
+        write = [f"  movx {reg}, r11"]
+        if t["op"] == "pack":
+            loads = _vector_load("wl0", "p0", in_offset) + _vector_load("wh0", "p0", in_offset + 32)
+            op = ["  vpack.d8.d16 wl2, x0"]
+            stores = _vector_store("wl2", "p1", out_offset)
+        else:
+            loads = _vector_load("wl4", "p0", in_offset)
+            op = ["  vunpack.d16.d8 x2, wl4"]
+            stores = _vector_store("wl2", "p1", out_offset) + _vector_store("wh2", "p1", out_offset + 32)
+        lines = [f"  // ---- test (control timing): {reg} write {d:+d} bundles from the {t['op']} ----"]
+        # r8 holds the stack pointer copy the epilogue restores: OLD / NEW live in r10 / r11,
+        # and r12 / r13 keep the registers' values from before the test (silicon keeps register
+        # state across kernels).
+        fixed = t["fixed"]
+        lines += [f"  mov r13, {reg}"] + ([f"  mov r12, {fixed[0]}"] if fixed else [])
+        lines += [f"  movxm r10, #{t['old']}", f"  movxm r11, #{t['new']}", f"  movx {reg}, r10"]
+        if fixed:
+            lines += [f"  movxm r9, #{fixed[1]}", f"  movx {fixed[0]}, r9"]
+        lines += loads + _nop_sled(8)
+        if d < 0:
+            lines += write + _nop_sled(-d - 1) + op + _nop_sled(8)
+        else:
+            lines += op + _nop_sled(d - 1) + write + _nop_sled(8)
+        lines += stores + [f"  movx {reg}, r13"] + ([f"  movx {fixed[0]}, r12"] if fixed else [])
+        lines += _nop_sled(3)
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -5973,6 +6066,12 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     cntr_specs = [(by_name["MOV_CNTR"], k, {"cntr": c["name"], "_combo_idx": 0}, cntr_strategy)
                   for k, c in enumerate(CycleCounterStrategy.cases())]
 
+    # Control-register write timing around pack / unpack (ControlTimingStrategy): standalone
+    # batches after the cycle-counter one.
+    ctl_strategy = ControlTimingStrategy()
+    ctl_specs = [(by_name[c["isa"]], k, {"ctl": c["name"], "_combo_idx": 0}, ctl_strategy)
+                 for k, c in enumerate(ControlTimingStrategy.cases())]
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -6308,7 +6407,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     if delay_specs:
         emit_standalone(delay_specs, declare_payload=False)
 
-    for specs in (collision_specs, width_specs, cntr_specs):
+    for specs in (collision_specs, width_specs, cntr_specs, ctl_specs):
         chunk, chunk_bundles = [], 0
         for spec in specs:
             instr, _, regs, strategy = spec
@@ -6326,7 +6425,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
                          + len(cascade_specs) + len(stream_specs) + len(delay_specs)
-                         + len(collision_specs) + len(width_specs) + len(cntr_specs)
+                         + len(collision_specs) + len(width_specs) + len(cntr_specs) + len(ctl_specs)
                          + branch_test_count)
     # Conversion and branch instructions are all testable (tested via .ll).
     total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())

@@ -891,8 +891,10 @@ crUnpackSign` after the `vldb.unpack.d*` and `vunpack.d*` it controls (one bundl
 the first of an iteration's pair, in the same bundle for the standalone form), and silicon
 used the written sign in all 1,536 vectors (6 sign patterns x 64 blocks x 4 vectors). The
 emulator samples the sign with the source at issue+6 (`PendingUnpack`), for the fused load as
-well as the standalone form. Not pinned: how late the write can be before it misses the read
-(only Chess's own schedules, writes up to five bundles after the issue, were observed).
+well as the standalone form. Pinned 2026-11-10 with raw asm (ISA suite `ControlTimingStrategy`,
+`vunpack.d16.d8`, one `movx crUnpackSign` 8 bundles before to 8 after the op): every write
+before the op and up to five bundles after it is used, a write six or more bundles after is
+not. EMU identical to silicon on every point.
 
 **Fused-load pointer behavior** (`vec_unpack_addr`: 1,888 accesses, 4 forms x 2 sign values):
 
@@ -957,7 +959,7 @@ spills) exposed:
 |---|---|---|------|
 | unaligned fused loads | silicon rounds the address down to 32 bytes (`vlda.ups`, `vlda.conv`, `vldb.unpack`, 328-case probe); the emulator does the same | resolved: [`addressing.md`](addressing.md), "Unaligned accesses" | confirmed |
 | `crUnpackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | **settled 2026-11-10** by the register itself: on silicon `crUnpackSign` keeps one bit (`movx` of `0x66666666` reads back 0, `0xFFFFFFFF` reads 1; register-width table in `core-compute-timing.md`), so no higher bit is ever stored for the unit to see | confirmed (register state) |
-| how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
+| how late a `crUnpackSign` write can be | writes up to five bundles after the issue are honored | **pinned 2026-11-10**: raw-asm sweep, +5 used, +6 not; EMU == HW | confirmed |
 | descriptors other than `d0` / `d0_3d` | register mapping `d<k>` = `m<k>, dn<k>, dj<k>, dc<k>` taken from TableGen; `d0`..`d3` and `d0_3d`..`d3_3d` exercised by the `vec_agu_*` captures | resolved for `d0`..`d3`, see [addressing.md](addressing.md) | confirmed |
 | negative or very large counts and sizes | compared unsigned | open; only 0..7 observed | confirmable: counts above 7 / negative via asm |
 | cross-tile fused unpack loads | go through the shared vector read, not captured | open | confirmable: cross-tile fused unpack capture |
@@ -1015,8 +1017,11 @@ loops; Chess writes `crPackSign` in the same bundle as the `d` form (`vst.pack.d
 movx crPackSign, r0` in the fused loop, `vpack.d4.d8 ...; movx crPackSign, r24` in the
 standalone loop), and silicon used the value written before that bundle in all 1,536 vectors
 (6 sign patterns x 64 blocks x 4 vectors). So a pack sees a control register as of the start of
-its own bundle. Not pinned: how early a write must precede a pack to be seen (only Chess's own
-schedules were observed).
+its own bundle. Pinned 2026-11-10 with raw asm (ISA suite `ControlTimingStrategy`,
+`vpack.d8.d16`, one `movx` of `crPackSign` or `crSat` 8 bundles before to 8 after the op, the
+other register held): a write in any earlier bundle, the one just before included, is used; a
+write after the op is not. With `crPackSign` 0 the 16-bit source is read unsigned (negative
+inputs saturate to 255 under `crSat` 1). EMU identical to silicon on every point.
 
 **Fused-store addressing** (`vec_pack_addr`: 2,048 stores, 4 forms x 8 register passes x 32
 blocks x 2 groups): the data lands where the index offset (`[p, dj]` with dj = -64, -32, 0,
@@ -1071,7 +1076,7 @@ are deleted; a non-wide pack now logs an error and does nothing.
 |---|---|---|------|
 | `crPackSign` values other than 0 and 1 | bit 0 decides; higher bits ignored | **settled 2026-11-10** by the register itself: `crPackSign` keeps one bit on silicon (register-width table in `core-compute-timing.md`), so no higher bit is stored | confirmed (register state) |
 | `crSat` values above 3 | only the low two bits are used | **settled 2026-11-10** by the register itself: `crSat` keeps two bits on silicon (`0xFFFFFFFF` reads back 3; register-width table in `core-compute-timing.md`) | confirmed (register state) |
-| how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | open; only Chess's own schedules observed | confirmable: asm sweeping write-to-use distance |
+| how early a `crPackSign` / `crSat` write must precede a pack | a write in the same bundle is not seen, an earlier one is | **pinned 2026-11-10**: raw-asm sweep, a write one bundle before is used, one after is not; EMU == HW | confirmed |
 | unsigned crSat 2 saturating | observed, no explanation in the sources we may read | the table is the observation | confirmed |
 | 2D / 3D `vst.pack` data | go through the same lane map; addressing pinned by `vec_agu_pack` | the lane captures use linear addressing only | confirmable: 2D/3D vst.pack capture |
 | AIE2P | `vpack` there has `packSign0` / `packSign1` and a `crPackSize` register, a different layout; the AIE2 table does not describe it | deferred | confirmable: Strix capture (halo) |
