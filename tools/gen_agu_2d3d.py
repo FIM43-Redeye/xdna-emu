@@ -250,10 +250,10 @@ UPS_FAMILIES.append(load_family(
 SRS_FAMILIES = []
 for sign in ("s", "d"):
     for acc, lanes, src_t, src_bytes, out_t, out_bits in (
-            # The d8 form widens a byte vector: with 16-bit sources Chess spills an accumulator to
-            # [sp, #0], an encoding the LLVM decoder (and so the emulator) cannot decode.
+            # With 16-bit sources Chess spills an accumulator around the d8 form and adjusts the
+            # stack with `padds [sp], #imm` (decodable since llvm-aie PADDS_sp_imm, Xilinx/llvm-aie#1456).
             ("acc32", 16, "int16_t", 32, "int16", 16),
-            ("acc32", 32, "int8_t" if sign == "d" else "int16_t", 32 if sign == "d" else 64, "int8", 8),
+            ("acc32", 32, "int16_t", 64, "int8", 8),
             ("acc64", 16, "int16_t", 32, "int16", 16), ("acc64", 8, "int32_t", 32, "int32", 32)):
         acc_bits = acc[3:]
         otype = ("u" if sign == "d" else "") + out_t
