@@ -2238,9 +2238,11 @@ impl DmaEngine {
                 || !self.channels[transfer.channel as usize].egress_staging.is_empty()
             {
                 // Behind the words still staged (a previous BD's, or this one's).
-                self.channels[transfer.channel as usize]
-                    .egress_staging
-                    .push_back(StagedWord { data: header, ends_bd: false });
+                self.channels[transfer.channel as usize].egress_staging.push_back(StagedWord {
+                    data: header,
+                    ends_bd: false,
+                    ready_at: self.read_clock,
+                });
             } else {
                 self.push_stream_out(header);
             }
@@ -2526,7 +2528,10 @@ impl DmaEngine {
                     };
                     let ends_bd = transfer.remaining_bytes() <= 4;
                     let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
-                    self.channels[ch_idx].egress_staging.push_back(StagedWord { data, ends_bd });
+                    let ready_at = self.read_clock + self.staged_word_latency();
+                    self.channels[ch_idx]
+                        .egress_staging
+                        .push_back(StagedWord { data, ends_bd, ready_at });
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                 }
@@ -3917,6 +3922,57 @@ mod bank_demand_tests {
             vec![23, 22, 25, 24],
             "staged words at stall for BD starts 0/1/2/3 words into a granule"
         );
+    }
+
+    /// A memtile MM2S stages 29 words, 4 more than a compute tile's: silicon's
+    /// memtile -> own S2MM race reads 52/51/54/53 for BD starts 0..3 words into a
+    /// granule where the compute tile reads 48/47/50/49
+    /// (build/experiments/path-capacity/race-phase, two runs identical). Only
+    /// depth 29 gives that pattern under the fetch rule; 28 and 30 each break a
+    /// phase. The backpressure onset (path-capacity/onset) puts the 4 words
+    /// upstream of the stream port, not in the switch.
+    #[test]
+    fn memtile_mm2s_staging_holds_four_words_more_than_a_compute_tile() {
+        let depth = DmaEngine::new_mem_tile(1, 1).egress_staging_capacity();
+        assert_eq!(depth, 29);
+        let mut staged_by_phase = Vec::new();
+        for phase in 0..4u64 {
+            let mut eng = DmaEngine::new_mem_tile(1, 1);
+            let mut tile = Tile::mem_tile(1, 1);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400 + 4 * phase, 512)).unwrap();
+            eng.start_channel(6, 0).unwrap();
+            for _ in 0..400 {
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                assert!(eng.staged_words(6) <= depth, "staging overran its depth at phase {phase}");
+            }
+            staged_by_phase.push(eng.staged_words(6));
+        }
+        assert_eq!(staged_by_phase, vec![27, 26, 29, 28]);
+    }
+
+    /// A memtile MM2S word reaches the stream one cycle later than a compute
+    /// tile's: on silicon every backpressure edge of a memtile-sourced path
+    /// (the first-granule pulse, the held onset, own tile and one hop away)
+    /// comes exactly one cycle after the compute-sourced one's
+    /// (build/experiments/path-capacity/onset, two runs identical).
+    #[test]
+    fn a_memtile_mm2s_word_reaches_the_stream_one_cycle_after_a_compute_tiles() {
+        fn first_word_step(mut eng: DmaEngine, mut tile: Tile, mm2s: u8) -> usize {
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 64)).unwrap();
+            eng.start_channel(mm2s, 0).unwrap();
+            for step in 0..100 {
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                if eng.pop_stream_out_for_channel(mm2s).is_some() {
+                    return step;
+                }
+            }
+            panic!("no word left the MM2S");
+        }
+        let compute = first_word_step(DmaEngine::new_compute_tile(1, 2), Tile::compute(1, 2), 2);
+        let memtile = first_word_step(DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 6);
+        assert_eq!(memtile, compute + 1);
     }
 
     /// An MM2S BD finishes once its last word is FETCHED into the egress

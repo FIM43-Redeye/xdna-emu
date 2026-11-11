@@ -151,8 +151,15 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "A running (unparked) shim S2MM is not separated from a parked one; length 75 is a silicon oddity \
             not modelled."),
         measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
-            (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles; a memtile-sourced path holds 4 words more (pipeline-fill race probe), not modelled. \
+            (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles (memtile: memtile_mm2s_egress_fifo_depth). \
             Assumes a stalled core holds one word (+/-1)."),
+        measured("dma.memtile_mm2s_egress_fifo_depth", "NPU1 memtile start-phase data race 2026-11-10 \
+            (tools/gen_pipeline_fill_probe.py race *_loop_pK): 52/51/54/53 vs compute 48/47/50/49, two runs identical",
+            "Upstream of the stream port (backpressure onset, gen_path_onset_probe.py); deeper staging vs a granule \
+            in flight not separated."),
+        measured("dma.memtile_mm2s_fetch_latency_cycles", "NPU1 backpressure onset 2026-11-10 \
+            (tools/gen_path_onset_probe.py): every memtile-sourced edge one cycle after the compute-sourced one, two runs identical",
+            "Seen at task start; a fetch after a mid-transfer stall is assumed to pay it too."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),

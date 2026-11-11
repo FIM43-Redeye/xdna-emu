@@ -1391,18 +1391,39 @@ pub struct DmaTiming {
     /// except 3 on the switch-FIFO route at phase 0.
     ///
     /// Caveats: `c` is assumed to be 1 (if the core stream port holds a second
-    /// word the value is 26); measured on a compute tile. Mem tiles use it
-    /// too, though every memtile-sourced path holds 4 words more on silicon
-    /// (data race, 2026-11-10, `tools/gen_pipeline_fill_probe.py` `race`:
-    /// memtile -> own S2MM 52 vs compute 48, memtile -> compute 60 vs 56); the
-    /// staging and the memtile switch's DMA slave port are not separated, so
-    /// the 4 are not modelled. This is the DMA-side staging only: the
+    /// word the value is 26); measured on a compute tile. A memtile MM2S
+    /// stages more (`memtile_mm2s_egress_fifo_depth`). This is the DMA-side staging only: the
     /// downstream local-slave port FIFO is modelled separately
     /// (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`). Rig and evidence:
     /// `tools/experiments/r4d3_*.py`. The earlier trace-event experiment
     /// (xdna-emu-priv: research/findings/2026-07-15-mm2s-egress-fifo-depth.md)
     /// could only bound the whole source-to-shim pipeline at 48 words.
     pub mm2s_egress_fifo_depth: u8,
+
+    /// Words a **memtile** MM2S channel holds in its egress staging: 29, four
+    /// more than a compute tile's (`mm2s_egress_fifo_depth`), counting the words
+    /// whose memory read has not yet returned (`memtile_mm2s_fetch_latency_cycles`).
+    ///
+    /// Measured (NPU1, 2026-11-10, two runs identical): the memtile -> own S2MM
+    /// data race (`tools/gen_pipeline_fill_probe.py` `race`, start-phase cases
+    /// `_p1`..`_p3`) reads 52/51/54/53 for BD starts 0..3 words into a granule,
+    /// the compute-tile loop 48/47/50/49. Under the fetch rule ("a granule only
+    /// if staged + granule <= depth") only 29 gives that pattern; 28 and 30 each
+    /// break one phase. The 4 words sit upstream of the stream port, not in the
+    /// switch: the STREAM_BACKPRESSURE onset (`tools/gen_path_onset_probe.py`)
+    /// of a memtile-sourced path is the compute-sourced one's plus one cycle at
+    /// every edge, own tile and one hop away, where 4 more words downstream
+    /// would move the held onset 4 cycles. Which structure in the memtile MM2S
+    /// holds them (a deeper staging or a granule in flight) is not separated.
+    pub memtile_mm2s_egress_fifo_depth: u8,
+
+    /// Cycles from a memtile MM2S granule fetch until its words can leave for
+    /// the stream; 0 on a compute tile, whose fetched word can leave in the
+    /// cycle it is fetched. Measured (NPU1, 2026-11-10, two runs identical,
+    /// `tools/gen_path_onset_probe.py`): every STREAM_BACKPRESSURE edge of a
+    /// memtile-sourced path -- the first-granule pulse, the held onset, own
+    /// tile and one hop away -- is one cycle after the compute-sourced path's.
+    pub memtile_mm2s_fetch_latency_cycles: u8,
 
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself

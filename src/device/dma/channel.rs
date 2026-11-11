@@ -75,6 +75,9 @@ pub struct StagedWord {
     /// The last word of its BD: the port idles `bd_switch_bubble_cycles` after
     /// it (`drain_egress_staging`).
     pub ends_bd: bool,
+    /// Engine step (`DmaEngine::read_clock`) from which the word can leave the
+    /// staging (`DmaEngine::staged_word_latency` after its fetch).
+    pub ready_at: u64,
 }
 
 /// A shim MM2S BD whose reads have all been issued, waiting for its last read

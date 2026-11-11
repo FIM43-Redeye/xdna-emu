@@ -160,7 +160,9 @@ impl DmaEngine {
         if self.channels[ch_idx].egress_gap > 0 {
             self.channels[ch_idx].egress_gap -= 1;
         } else if !blocked {
-            if let Some(word) = self.channels[ch_idx].egress_staging.pop_front() {
+            let now = self.read_clock;
+            let ready = self.channels[ch_idx].egress_staging.front().is_some_and(|w| w.ready_at <= now);
+            if let Some(word) = ready.then(|| self.channels[ch_idx].egress_staging.pop_front()).flatten() {
                 self.push_stream_out(word.data);
                 if word.ends_bd {
                     self.channels[ch_idx].egress_gap = self.timing_config.bd_switch_bubble_cycles;
@@ -561,8 +563,27 @@ impl DmaEngine {
     ///
     /// Shim MM2S reads host DDR, not banked tile memory, and is governed by the
     /// separately calibrated DDR cold-start model -- it does not stage.
+    ///
+    /// A memtile MM2S holds 4 words more (`DMA_MEMTILE_MM2S_EGRESS_FIFO_DEPTH`),
+    /// counting the words of a fetch still in flight (`staged_word_latency`).
     pub fn egress_staging_capacity(&self) -> usize {
-        xdna_archspec::aie2::timing::DMA_MM2S_EGRESS_FIFO_DEPTH as usize
+        use xdna_archspec::aie2::timing::{DMA_MEMTILE_MM2S_EGRESS_FIFO_DEPTH, DMA_MM2S_EGRESS_FIFO_DEPTH};
+        if self.tile_kind.is_mem() {
+            DMA_MEMTILE_MM2S_EGRESS_FIFO_DEPTH as usize
+        } else {
+            DMA_MM2S_EGRESS_FIFO_DEPTH as usize
+        }
+    }
+
+    /// Cycles from a granule fetch until its words can leave the staging: one
+    /// on a memtile (`DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES`), none on a compute
+    /// tile, whose fetched word leaves in the cycle it is fetched.
+    pub(super) fn staged_word_latency(&self) -> u64 {
+        if self.tile_kind.is_mem() {
+            xdna_archspec::aie2::timing::DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES as u64
+        } else {
+            0
+        }
     }
 
     /// Egress-FIFO occupancy at/below which an MM2S channel's granule fetch is

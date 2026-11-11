@@ -239,6 +239,11 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // a compute-tile MM2S ahead of a stalled consumer, upstream of the
             // switch's local-slave port. See the DmaTiming field doc.
             mm2s_egress_fifo_depth: 25,
+            // Pinned by silicon (2026-11-10): memtile start-phase races 52/51/54/53
+            // and the backpressure onset one cycle behind a compute source. See the
+            // DmaTiming field docs.
+            memtile_mm2s_egress_fifo_depth: 29,
+            memtile_mm2s_fetch_latency_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 65 in the emulator's accounting, whose shim
             // path is one word longer and whose task-holding S2MM takes two more. See the

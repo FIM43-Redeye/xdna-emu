@@ -505,6 +505,18 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             .unwrap();
         writeln!(out, "    pub const DMA_MM2S_EGRESS_FIFO_DEPTH: u8 = {};", t.dma.mm2s_egress_fifo_depth)
             .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_MEMTILE_MM2S_EGRESS_FIFO_DEPTH: u8 = {};",
+            t.dma.memtile_mm2s_egress_fifo_depth
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES: u8 = {};",
+            t.dma.memtile_mm2s_fetch_latency_cycles
+        )
+        .unwrap();
         writeln!(out, "    pub const DMA_SHIM_S2MM_INGRESS_DEPTH: u8 = {};", t.dma.shim_s2mm_ingress_depth)
             .unwrap();
         writeln!(out).unwrap();
