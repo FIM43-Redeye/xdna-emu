@@ -527,46 +527,105 @@ for _loop in ("race_mem_loop", "race_prod_loop"):
         RACE_CASES[f"{_loop}_p{_p}"] = RACE_CASES[_loop]
 
 
+# Shim-end cases. `_turn`: the stream goes down into the shim switch and straight back north
+# (shim North slave -> North master) to a held memtile S2MM, so it crosses the memtile -> shim
+# hop without the shim DMA. `_shimq`: the shim S2MM holds a task parked on a shim lock instead of
+# no task. Together they say whether the shim-north +4 lives in the hop or at the shim DMA.
+RACE_CASES.update({
+    "race_prod_turn": ("prod", "mem"), "race_mem_turn": ("mem", "mem"),
+    "race_prod_shimq": ("prod", "shim"), "race_mem_shimq": ("mem", "shim"),
+    # the same, channel swapped: the turnaround on channel 3 (the router's pick for the shim
+    # cases) and the idle-shim case hand routed on channel 0 (the turnaround's)
+    "race_prod_turn3": ("prod", "mem"), "race_prod_shim0": ("prod", "shim"),
+})
+SHIM_GATE, SHIM_DONE = 4, 5        # shim locks of the parked S2MM task
+
+
+def race_turn_switchboxes(src: str, ch: int = 0, into_shim: bool = False) -> list[str]:
+    """Circuit src DMA 0 -> ... -> shim North `ch`, hand routed on stream channel `ch` at every hop:
+    back north to memtile DMA 0 (a `_turn` case), or into the shim S2MM 1 (South 3, `into_shim`)."""
+    mem, shim = VAR["mem"], VAR["shim"]
+    back = [] if into_shim else [f"aie.connect<South : {ch}, DMA : 0>"]
+    if src == "mem":
+        mem_conns = [f"aie.connect<DMA : 0, South : {ch}>", *back]
+        out = []
+    else:
+        mem_conns = [f"aie.connect<North : {ch}, South : {ch}>", *back]
+        out = [f"    %sb_src = aie.switchbox({VAR[src]}) {{", f"      aie.connect<DMA : 0, South : {ch}>", "    }"]
+    shim_conn = f"aie.connect<North : {ch}, South : 3>" if into_shim else f"aie.connect<North : {ch}, North : {ch}>"
+    out += [f"    %sb_mem = aie.switchbox({mem}) {{", *(f"      {c}" for c in mem_conns), "    }",
+            f"    %sb_shim = aie.switchbox({shim}) {{", f"      {shim_conn}", "    }"]
+    if into_shim:
+        out += [f"    %mux_shim = aie.shim_mux({shim}) {{", "      aie.connect<North : 3, DMA : 1>", "    }"]
+    return out
+
+
+def race_route_channel(name: str) -> int | None:
+    """Stream channel of a hand-routed case (`_turn` 0, `_turn3` 3, `_shim0` 0), None if auto-routed."""
+    m = re.search(r"_(turn|shim)(\d?)$", name)
+    if not m or (m.group(1) == "shim" and not m.group(2)):
+        return None
+    return int(m.group(2) or 0)
+
+
+def race_words(name: str) -> int:
+    """BD length: a parked shim S2MM holds more than RACE_WORDS on its own."""
+    return 2 * RACE_WORDS if name.endswith("_shimq") else RACE_WORDS
+
+
 def race_phase(name: str) -> int:
     m = re.search(r"_p(\d)$", name)
     return int(m.group(1)) if m else 0
 
 
-def race_steps(src: str, dst: str, phase: int = 0) -> list:
+def race_steps(src: str, dst: str, phase: int = 0, armed: bool = False, n: int = RACE_WORDS) -> list:
     import gen_dma_queue_probe as q
     mm2s = cp.TileRegs(src).regs["DMA_MM2S_Status_0"]
     at = RACE_SRC + 4 * phase
-    out: list = [cp.Write(at + 4 * j, q.SRC_MARK + j, f"src {j}", src) for j in range(RACE_WORDS)]
+    out: list = [cp.Write(at + 4 * j, q.SRC_MARK + j, f"src {j}", src) for j in range(n)]
+    if armed:
+        out.append(cp.Raw(("%tq = aiex.dma_configure_task_for @sink {",
+                           "  %c_tq = arith.constant 1 : i32", "  aie.use_lock(%lSG, AcquireGreaterEqual, %c_tq)",
+                           f"  aie.dma_bd(%data : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 2 : i32}}",
+                           "  aie.use_lock(%lSD, Release, %c_tq)", "  aie.end", "} {issue_token = true}",
+                           "aiex.dma_start_task(%tq)")))
     if dst != "shim":
         out.append(cp.Raw((f"%tr = aiex.dma_configure_task({VAR[dst]}, S2MM, 0) {{",
                            "  %c_tr = arith.constant 1 : i32", "  aie.use_lock(%lG, AcquireGreaterEqual, %c_tr)",
-                           f"  aie.dma_bd(%dst : memref<{RACE_WORDS}xi32> offset = 0 len = {RACE_WORDS}) {{bd_id = 0 : i32}}",
+                           f"  aie.dma_bd(%dst : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 0 : i32}}",
                            "  aie.use_lock(%lD, Release, %c_tr)", "  aie.end", "}", "aiex.dma_start_task(%tr)")))
     out.append(cp.Raw((f"%ts = aiex.dma_configure_task({VAR[src]}, MM2S, 0) {{",
-                       f"  aie.dma_bd(%src : memref<{RACE_WORDS + 4}xi32> offset = {phase} len = {RACE_WORDS}) {{bd_id = 1 : i32}}",
+                       f"  aie.dma_bd(%src : memref<{n + 4}xi32> offset = {phase} len = {n}) {{bd_id = 1 : i32}}",
                        "  aie.end", "}", "aiex.dma_start_task(%ts)")))
     out += [cp.Read(mm2s, f"a{i + 1} mm2s", src) for i in range(CHAIN_SNAPS)]
-    out += [cp.Write(at + 4 * j, RACE_MARK_B + j, f"over {j}", src) for j in range(RACE_WORDS)]
+    out += [cp.Write(at + 4 * j, RACE_MARK_B + j, f"over {j}", src) for j in range(n)]
     out.append(cp.Read(mm2s, "o mm2s", src))
-    if dst == "shim":
-        out.append(cp.Raw((f"aiex.npu.dma_memcpy_nd(%data[0, 0, 0, 0][1, 1, 1, {RACE_WORDS}][0, 0, 0, 1]) "
-                           f"{{id = 4 : i64, issue_token = true, metadata = @sink}} : memref<{RACE_WORDS}xi32>",)))
+    if armed:
+        out.append(cp.Raw(("%c_open = arith.constant 1 : i32", "aiex.set_lock(%lSG, %c_open)",
+                           "aiex.dma_await_task(%tq)")))
+    elif dst == "shim":
+        out.append(cp.Raw((f"aiex.npu.dma_memcpy_nd(%data[0, 0, 0, 0][1, 1, 1, {n}][0, 0, 0, 1]) "
+                           f"{{id = 4 : i64, issue_token = true, metadata = @sink}} : memref<{n}xi32>",)))
         out.append(cp.Wait("sink"))
     else:
         k = cp.TileRegs(dst)
         out.append(cp.Write(k.value(GATE[TILES[dst][1]][0]), 1, "open the gate", dst))
         out += [cp.Read(mm2s, "b0 mm2s", src)] * 2
-        out += [cp.Read(RACE_DST + 4 * j, f"dst {j}", dst) for j in range(RACE_WORDS)]
+        out += [cp.Read(RACE_DST + 4 * j, f"dst {j}", dst) for j in range(n)]
     out.append(cp.Read(mm2s, "b1 mm2s", src))
     return out
 
 
 def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
     src, dst = RACE_CASES[name]
-    st = race_steps(src, dst, race_phase(name))
+    armed = name.endswith("_shimq")
+    n = race_words(name)
+    st = race_steps(src, dst, race_phase(name), armed, n)
     layout = cp.encode(st)
     shim = VAR["shim"]
     tiles = ["shim", src] + ([dst] if dst not in ("shim", src) else [])
+    if race_route_channel(name) is not None and "mem" not in tiles:
+        tiles.append("mem")                    # a hand-routed circuit names the memtile's switchbox
     lines = ["module {", "  aie.device(npu1_1col) {"]
     for t in tiles:
         (c, r), _m, pkt, _resp = TILES[t]
@@ -579,18 +638,24 @@ def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
                   f"      aie.packet_dest<{shim}, DMA : 0>", "    }"]
     lines += [f"    aie.shim_dma_allocation @ctrlin0 ({shim}, MM2S, 0)",
               f"    aie.shim_dma_allocation @ctrl0 ({shim}, S2MM, 0)",
-              f'    %src = aie.buffer({VAR[src]}) {{address = {RACE_SRC} : i32, sym_name = "src"}} : memref<{RACE_WORDS + 4}xi32>']
+              f'    %src = aie.buffer({VAR[src]}) {{address = {RACE_SRC} : i32, sym_name = "src"}} : memref<{n + 4}xi32>']
     if dst == "shim":
-        lines += [f"    aie.flow({VAR[src]}, DMA : 0, {shim}, DMA : 1)",
+        ch = race_route_channel(name)
+        lines += [*([f"    aie.flow({VAR[src]}, DMA : 0, {shim}, DMA : 1)"] if ch is None
+                    else race_turn_switchboxes(src, ch, into_shim=True)),
                   f"    aie.shim_dma_allocation @sink ({shim}, S2MM, 1)"]
+        if armed:
+            lines += [f'    %lSG = aie.lock({shim}, {SHIM_GATE}) {{init = 0 : i32, sym_name = "lSG"}}',
+                      f'    %lSD = aie.lock({shim}, {SHIM_DONE}) {{init = 0 : i32, sym_name = "lSD"}}']
     else:
         gate, spare = GATE[TILES[dst][1]]
         lines += [f'    %lG = aie.lock({VAR[dst]}, {gate}) {{init = 0 : i32, sym_name = "lG"}}',
                   f'    %lD = aie.lock({VAR[dst]}, {spare}) {{init = 0 : i32, sym_name = "lD"}}',
-                  f'    %dst = aie.buffer({VAR[dst]}) {{address = {RACE_DST} : i32, sym_name = "dst"}} : memref<{RACE_WORDS}xi32>',
-                  f"    aie.flow({VAR[src]}, DMA : 0, {VAR[dst]}, DMA : 0)"]
+                  f'    %dst = aie.buffer({VAR[dst]}) {{address = {RACE_DST} : i32, sym_name = "dst"}} : memref<{n}xi32>',
+                  *(race_turn_switchboxes(src, race_route_channel(name)) if race_route_channel(name) is not None
+                    else [f"    aie.flow({VAR[src]}, DMA : 0, {VAR[dst]}, DMA : 0)"])]
     lines += [f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
-              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{RACE_WORDS}xi32>) {{",
+              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{n}xi32>) {{",
               *cp.sequence_lines(st, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
     return "\n".join(lines), st, layout
 
@@ -603,8 +668,9 @@ def race_generate(out_dir: Path, names) -> None:
         (d / "aie.mlir").write_text(text)
         (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
         src, dst = RACE_CASES[name]
+        n = race_words(name)
         meta = {"case": name, "family": "race", "src": src, "dst": dst, "phase": race_phase(name),
-                "labels": list(layout.labels), "n_words": len(layout.words), "n_data": RACE_WORDS, "host_args": []}
+                "labels": list(layout.labels), "n_words": len(layout.words), "n_data": n, "host_args": []}
         (d / "case.json").write_text(json.dumps(meta, indent=1) + "\n")
 
 
@@ -612,14 +678,14 @@ def race_report(d: Path, tag: str) -> str:
     import gen_dma_queue_probe as q
     meta = json.loads((d / "case.json").read_text())
     r = parse(d, tag)
-    src, dst = meta["src"], meta["dst"]
-    landed = r["data"] if dst == "shim" else [r[f"dst {j}"] for j in range(RACE_WORDS)]
-    old = sum(1 for j in range(RACE_WORDS) if landed[j] == q.SRC_MARK + j)
-    new = sum(1 for j in range(RACE_WORDS) if landed[j] == RACE_MARK_B + j)
-    prefix = next((j for j in range(RACE_WORDS) if landed[j] != q.SRC_MARK + j), RACE_WORDS)
+    src, dst, n = meta["src"], meta["dst"], meta["n_data"]
+    landed = r["data"] if dst == "shim" else [r[f"dst {j}"] for j in range(n)]
+    old = sum(1 for j in range(n) if landed[j] == q.SRC_MARK + j)
+    new = sum(1 for j in range(n) if landed[j] == RACE_MARK_B + j)
+    prefix = next((j for j in range(n) if landed[j] != q.SRC_MARK + j), n)
     kind = "mem" if src == "mem" else "core"
     return (f"{d.name}: {src} MM2S 0 -> {dst} ({'idle shim S2MM 1' if dst == 'shim' else 'S2MM 0 held'}): "
-            f"read before the overwrite {old} (prefix {prefix}), after {new}, other {RACE_WORDS - old - new}; "
+            f"read before the overwrite {old} (prefix {prefix}), after {new}, other {n - old - new}; "
             f"held mm2s {q.status_text(r['a3 mm2s'], kind)}")
 
 def main(argv=None) -> int:

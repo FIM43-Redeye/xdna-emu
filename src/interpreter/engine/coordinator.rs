@@ -1675,18 +1675,24 @@ impl InterpreterEngine {
             let mt_m = ports(1, true);
             let c2_s = ports(2, false);
             let c2_m = ports(2, true);
+            let sh_s = ports(0, false);
+            let sh_m = ports(0, true);
+            let sh_in = self.device.array.dma_engine(col, 0).map_or(0, |e| e.stream_in_len());
             let active = mt_out > 0
                 || infl > 0
                 || c2_in > 0
                 || !mt_s.is_empty()
                 || !mt_m.is_empty()
                 || !c2_s.is_empty()
-                || !c2_m.is_empty();
+                || !c2_m.is_empty()
+                || !sh_s.is_empty()
+                || !sh_m.is_empty();
             if active {
                 eprintln!(
                     "[STAGE] cyc={cyc} col={col} | mt_out={mt_out} mtS[{mt_s}] mtM[{mt_m}] s4b={s4b} s4st={s4s} \
                      -> xtile(inflight={infl},transit={infl_transit}) -> c2S[{c2_s}] c2M[{c2_m}] \
-                     c2_in={c2_in}(ch0={c2_in0}) c2phase={c2_phase} c2lk={c2_locks:?}"
+                     c2_in={c2_in}(ch0={c2_in0}) c2phase={c2_phase} c2lk={c2_locks:?} \
+                     | shimS[{sh_s}] shimM[{sh_m}] shim_in={sh_in}"
                 );
             }
         }
