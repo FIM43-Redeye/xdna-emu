@@ -272,14 +272,15 @@ def build_case(case: Case, out: Path, events: str = TRACE_EVENTS) -> None:
         "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"], cwd=d, log=d / "aiecc.log")
 
 
-def run_case_raw(out: Path, name: str, tag: str, backend: str) -> bool:
-    """Run one built case to `TAG.BACKEND/trace_raw.bin`; no decoding."""
+def run_case_raw(out: Path, name: str, tag: str, backend: str, output: bool = True) -> bool:
+    """Run one built case to `TAG.BACKEND/trace_raw.bin`; no decoding. `output` passes the
+    design's output buffer (designs whose runtime sequence has none pass False)."""
     d = out / name
     r = d / f"{tag}.{backend}"
     r.mkdir(parents=True, exist_ok=True)
     cmd = [str(RUNNER), "--xclbin", str(d / "aie.xclbin"), "--instr", str(d / "insts.bin"),
            "--trace-out", str(r / "trace_raw.bin"), "--trace-size", "65536",
-           "--output", str(r / "out.bin")]
+           *(["--output", str(r / "out.bin")] if output else [])]
     env = dict(os.environ)
     if backend == "hw":
         env.pop("XDNA_EMU", None)
@@ -306,8 +307,8 @@ def run_case_raw(out: Path, name: str, tag: str, backend: str) -> bool:
     return True
 
 
-def run_case(out: Path, name: str, tag: str, backend: str) -> bool:
-    if not run_case_raw(out, name, tag, backend):
+def run_case(out: Path, name: str, tag: str, backend: str, output: bool = True) -> bool:
+    if not run_case_raw(out, name, tag, backend, output):
         return False
     r = out / name / f"{tag}.{backend}"
     d = out / name

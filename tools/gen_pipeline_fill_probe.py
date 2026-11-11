@@ -518,22 +518,35 @@ RACE_CASES = {                                        # name -> (source tile, co
     "race_prod_mem": ("prod", "mem"),
     "race_mem_prod": ("mem", "prod"),
 }
+# Start-phase variants of the loops: the BD starts PHASE words into a 128-bit granule. The
+# staging fills to the largest count <= its depth congruent to -(phase + 1) mod 4 (R4-D3's
+# signature), so the four phases pin the depth, not just its granule.
+RACE_PHASES = (1, 2, 3)
+for _loop in ("race_mem_loop", "race_prod_loop"):
+    for _p in RACE_PHASES:
+        RACE_CASES[f"{_loop}_p{_p}"] = RACE_CASES[_loop]
 
 
-def race_steps(src: str, dst: str) -> list:
+def race_phase(name: str) -> int:
+    m = re.search(r"_p(\d)$", name)
+    return int(m.group(1)) if m else 0
+
+
+def race_steps(src: str, dst: str, phase: int = 0) -> list:
     import gen_dma_queue_probe as q
     mm2s = cp.TileRegs(src).regs["DMA_MM2S_Status_0"]
-    out: list = [cp.Write(RACE_SRC + 4 * j, q.SRC_MARK + j, f"src {j}", src) for j in range(RACE_WORDS)]
+    at = RACE_SRC + 4 * phase
+    out: list = [cp.Write(at + 4 * j, q.SRC_MARK + j, f"src {j}", src) for j in range(RACE_WORDS)]
     if dst != "shim":
         out.append(cp.Raw((f"%tr = aiex.dma_configure_task({VAR[dst]}, S2MM, 0) {{",
                            "  %c_tr = arith.constant 1 : i32", "  aie.use_lock(%lG, AcquireGreaterEqual, %c_tr)",
                            f"  aie.dma_bd(%dst : memref<{RACE_WORDS}xi32> offset = 0 len = {RACE_WORDS}) {{bd_id = 0 : i32}}",
                            "  aie.use_lock(%lD, Release, %c_tr)", "  aie.end", "}", "aiex.dma_start_task(%tr)")))
     out.append(cp.Raw((f"%ts = aiex.dma_configure_task({VAR[src]}, MM2S, 0) {{",
-                       f"  aie.dma_bd(%src : memref<{RACE_WORDS}xi32> offset = 0 len = {RACE_WORDS}) {{bd_id = 1 : i32}}",
+                       f"  aie.dma_bd(%src : memref<{RACE_WORDS + 4}xi32> offset = {phase} len = {RACE_WORDS}) {{bd_id = 1 : i32}}",
                        "  aie.end", "}", "aiex.dma_start_task(%ts)")))
     out += [cp.Read(mm2s, f"a{i + 1} mm2s", src) for i in range(CHAIN_SNAPS)]
-    out += [cp.Write(RACE_SRC + 4 * j, RACE_MARK_B + j, f"over {j}", src) for j in range(RACE_WORDS)]
+    out += [cp.Write(at + 4 * j, RACE_MARK_B + j, f"over {j}", src) for j in range(RACE_WORDS)]
     out.append(cp.Read(mm2s, "o mm2s", src))
     if dst == "shim":
         out.append(cp.Raw((f"aiex.npu.dma_memcpy_nd(%data[0, 0, 0, 0][1, 1, 1, {RACE_WORDS}][0, 0, 0, 1]) "
@@ -550,7 +563,7 @@ def race_steps(src: str, dst: str) -> list:
 
 def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
     src, dst = RACE_CASES[name]
-    st = race_steps(src, dst)
+    st = race_steps(src, dst, race_phase(name))
     layout = cp.encode(st)
     shim = VAR["shim"]
     tiles = ["shim", src] + ([dst] if dst not in ("shim", src) else [])
@@ -566,7 +579,7 @@ def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
                   f"      aie.packet_dest<{shim}, DMA : 0>", "    }"]
     lines += [f"    aie.shim_dma_allocation @ctrlin0 ({shim}, MM2S, 0)",
               f"    aie.shim_dma_allocation @ctrl0 ({shim}, S2MM, 0)",
-              f'    %src = aie.buffer({VAR[src]}) {{address = {RACE_SRC} : i32, sym_name = "src"}} : memref<{RACE_WORDS}xi32>']
+              f'    %src = aie.buffer({VAR[src]}) {{address = {RACE_SRC} : i32, sym_name = "src"}} : memref<{RACE_WORDS + 4}xi32>']
     if dst == "shim":
         lines += [f"    aie.flow({VAR[src]}, DMA : 0, {shim}, DMA : 1)",
                   f"    aie.shim_dma_allocation @sink ({shim}, S2MM, 1)"]
@@ -590,7 +603,7 @@ def race_generate(out_dir: Path, names) -> None:
         (d / "aie.mlir").write_text(text)
         (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
         src, dst = RACE_CASES[name]
-        meta = {"case": name, "family": "race", "src": src, "dst": dst,
+        meta = {"case": name, "family": "race", "src": src, "dst": dst, "phase": race_phase(name),
                 "labels": list(layout.labels), "n_words": len(layout.words), "n_data": RACE_WORDS, "host_args": []}
         (d / "case.json").write_text(json.dumps(meta, indent=1) + "\n")
 
