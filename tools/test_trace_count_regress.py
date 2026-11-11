@@ -93,6 +93,31 @@ def test_range_distance():
     assert tcr.range_distance(0, [0]) == 0
 
 
+def test_silicon_band_widens_a_jittery_range_by_its_spread():
+    # Two samples underestimate silicon's spread: [39, 41] (spread 2) becomes [37, 43].
+    assert tcr.silicon_band([39, 41]) == (37, 43)
+    assert tcr.band_distance(38, [39, 41]) == 0
+    assert tcr.band_distance(45, [39, 41]) == 2
+
+
+def test_silicon_band_keeps_a_repeatable_count_exact():
+    assert tcr.silicon_band([36, 36]) == (36, 36)
+    assert tcr.band_distance(35, [36, 36]) == 1
+    assert tcr.band_distance(0, [0, 0]) == 0
+    assert tcr.silicon_band([17]) == (17, 17)
+
+
+def test_one_event_wiggle_inside_silicon_jitter_does_not_gate(tmp_path):
+    # objectfifo_channel_turns shape: silicon 39 and 41, EMU 41 -> 38, cadence a hair farther.
+    b = write_run(tmp_path, "base", {K: {"hw": edge("X", periodic(39, 50)),
+                                         "emu": edge("X", periodic(41, 50))}})
+    c = write_run(tmp_path, "cand", {K: {"hw": edge("X", periodic(41, 50)),
+                                         "emu": edge("X", periodic(38, 51))}})
+    rep = tcr.compare_runs(b, c)
+    assert not any(r.gate_fail for r in rep.rows)
+    assert rep.exit_code == 0
+
+
 def test_level_series_collapses_runs_to_interval_starts():
     ev = level("LOCK_STALL", [100, 200, 300], dur=3)
     got = tcr.series_from_events(ev, "LOCK_STALL")
@@ -199,12 +224,12 @@ def test_count_drift_with_unimproved_pattern_is_regression(tmp_path):
 
 
 def test_count_worse_pattern_unchanged_inexact_is_soft(tmp_path):
-    # HW varies (30 vs 36): EMU 38 -> 39 is outside both times, no exact match
-    # to break, cadence identical -> regressed but does not fail the gate.
+    # HW varies (30 vs 36, band [24, 42]): EMU 44 -> 45 is outside both times, no exact
+    # match to break, cadence identical -> regressed but does not fail the gate.
     b = write_run(tmp_path, "base", {K: {"hw": level("LOCK_STALL", periodic(30, 140)),
-                                         "emu": level("LOCK_STALL", periodic(38, 140))}})
+                                         "emu": level("LOCK_STALL", periodic(44, 140))}})
     c = write_run(tmp_path, "cand", {K: {"hw": level("LOCK_STALL", periodic(36, 140)),
-                                         "emu": level("LOCK_STALL", periodic(39, 140))}})
+                                         "emu": level("LOCK_STALL", periodic(45, 140))}})
     rep = tcr.compare_runs(b, c)
     r = only_row(rep, "LOCK_STALL")
     assert r.verdict == "regressed" and not r.gate_fail and rep.exit_code == 0

@@ -24,11 +24,13 @@ row has count 0, so a phantom row (EMU fires, silicon does not) is a plain
 
 Scores (both are distances to silicon, lower is better)
 -------------------------------------------------------
-* Count score: distance of the EMU count from the closed range
-  [min, max] of the HW counts over the (up to) two HW samples, 0 inside.
-  Silicon is a range, not a point, because it is not run-to-run repeatable on
-  every row; the HW range is the same for baseline and candidate scoring, so
-  only the EMU change moves the score.  ``hw_repeatable`` is True when both
+* Count score: distance of the EMU count from the silicon band, 0 inside: the
+  closed range [min, max] of the HW counts over the (up to) two HW samples,
+  widened on each side by its own spread (``silicon_band``), since two samples
+  underestimate silicon's run-to-run spread and a 1-event EMU move inside it is
+  not a regression. A repeatable row (both samples equal) stays exact. The band
+  is the same for baseline and candidate scoring, so only the EMU change moves
+  the score.  ``hw_repeatable`` is True when both
   HW samples have the same count.
 * Pattern score: 1-Wasserstein distance (cycles) between the EMU's and HW's
   inter-event gap distributions.  Gaps are shift invariant (no anchoring),
@@ -142,6 +144,24 @@ def wasserstein1(a: list[float], b: list[float]) -> float:
 
 def range_distance(count: int, counts: list[int]) -> int:
     lo, hi = min(counts), max(counts)
+    return lo - count if count < lo else count - hi if count > hi else 0
+
+
+def silicon_band(counts: list[int]) -> tuple[int, int]:
+    """The count band silicon is taken to cover: [min, max] widened by its own spread.
+
+    Two samples underestimate how far silicon wanders, so a row whose samples disagree by d is
+    given d of slack on each side (a crude prediction interval: the next sample is about as
+    likely to land a spread beyond the observed range as inside it). A repeatable row (spread 0)
+    stays exact, so a phantom row on a quiet channel or a broken exact match still scores.
+    """
+    lo, hi = min(counts), max(counts)
+    d = hi - lo
+    return lo - d, hi + d
+
+
+def band_distance(count: int, counts: list[int]) -> int:
+    lo, hi = silicon_band(counts)
     return lo - count if count < lo else count - hi if count > hi else 0
 
 
@@ -313,8 +333,8 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None)
             eb, ec = b["emu"].get(k, []), c["emu"].get(k, [])
             hw_counts = [len(s) for s in hw]
             rep.rows_compared += 1
-            cb = range_distance(len(eb), hw_counts)
-            ca = range_distance(len(ec), hw_counts)
+            cb = band_distance(len(eb), hw_counts)
+            ca = band_distance(len(ec), hw_counts)
             pb, pa = pattern_distance(eb, hw), pattern_distance(ec, hw)
             moved = (len(eb) != len(ec)
                      or (pb is not None and pa is not None and abs(pa - pb) > PATTERN_EPS))

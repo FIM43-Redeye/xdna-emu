@@ -279,9 +279,10 @@ MLIR does not), `HW_ONLY` / `EMU_ONLY` (one side produced no capture), and
 CLEAN/DIVERGE and pass counts do not see an EMU change that adds phantom
 intervals (shim S2MM STREAM_STARVATION 32 -> 62 against silicon's 32). This
 tool reads the two days' `events.json` and scores every (test, compiler, tile,
-event) row twice against the HW range of both days: the count distance to
-that range, and the 1-Wasserstein distance between inter-event gap
-distributions (cycles). A count that leaves an exact repeatable-HW match while
+event) row twice against silicon: the count distance to the band the two HW
+days span (their range, widened by its own spread so a 1-event move inside
+silicon's jitter does not gate; a repeatable row stays exact), and the
+1-Wasserstein distance between inter-event gap distributions (cycles). A count that leaves an exact repeatable-HW match while
 the gap pattern gets closer is a "phase shift", not a regression
 (objectfifo_turns_walkers LOCK_STALL). Exit 1 on a row regressing on both
 scores or a broken exact match; rules are in the module docstring. Flags:
