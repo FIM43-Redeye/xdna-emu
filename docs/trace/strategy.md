@@ -275,6 +275,18 @@ MLIR does not), `HW_ONLY` / `EMU_ONLY` (one side produced no capture), and
 `route-infeasible`, `cpp-patch`, `lowering`, `injection`, `placement`,
 `no-single-source`, `python-host`, `no-prepare`, `prep-ok-no-buffer`.
 
+**Regression gate across runs: `tools/trace_count_regress.py BASELINE CANDIDATE`.**
+CLEAN/DIVERGE and pass counts do not see an EMU change that adds phantom
+intervals (shim S2MM STREAM_STARVATION 32 -> 62 against silicon's 32). This
+tool reads the two days' `events.json` and scores every (test, compiler, tile,
+event) row twice against the HW range of both days: the count distance to
+that range, and the 1-Wasserstein distance between inter-event gap
+distributions (cycles). A count that leaves an exact repeatable-HW match while
+the gap pattern gets closer is a "phase shift", not a regression
+(objectfifo_turns_walkers LOCK_STALL). Exit 1 on a row regressing on both
+scores or a broken exact match; rules are in the module docstring. Flags:
+`--only TEST ...`, `--json`.
+
 Known limits (genuine, not harness bugs):
 
 - **Hardware trace budget**: packet ids are 5 bits, so at most 31 trace sources
