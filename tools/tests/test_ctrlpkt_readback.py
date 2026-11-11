@@ -55,7 +55,8 @@ def test_register_offsets_come_from_the_am025_database():
 
 
 def test_each_target_tile_has_its_own_packet_and_response_ids():
-    ids = [(t.pkt_id, t.response_id) for t in cp.TARGETS.values()]
+    # Distinct pairs: probe generators register aliases of a base tile (pipeline-fill "prod" is "core").
+    ids = list({(t.pkt_id, t.response_id) for t in cp.TARGETS.values()})
     assert len({p for p, _ in ids}) == len(ids) and len({r for _, r in ids}) == len(ids)
     steps = [cp.Read(0x14120, "shim", tile="shim"), cp.Read(0xC0420, "mem", tile="mem")]
     lay = cp.encode(steps)

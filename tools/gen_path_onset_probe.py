@@ -18,6 +18,10 @@ Cases (src -> dst; mem = memtile (0,1), prod = compute (0,2)): mem_own, prod_own
 prod_mem. Each traced tile's DMA events go through the injector (memtile trace unit, or the
 compute tile's memory-module trace unit), event-time mode.
 
+A case name may carry a length, `prod_own_n23`: the BD then moves 23 words, so a sweep over N reads
+where the MM2S port boundary sits (sustained backpressure until the gate opens from the first N
+that does not fit downstream of the staging).
+
     python3 tools/gen_path_onset_probe.py build OUT_DIR [--cases NAME ...]
     python3 tools/gen_path_onset_probe.py run OUT_DIR TAG --backend hw|emu [--only NAME ...]
     python3 tools/gen_path_onset_probe.py show OUT_DIR TAG [TAG ...] [--only NAME ...]
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -54,18 +59,25 @@ MEMMOD_EVENTS = ("DMA_MM2S_0_START_TASK,DMA_MM2S_0_STREAM_BACKPRESSURE,DMA_MM2S_
                  "DMA_S2MM_0_FINISHED_BD,DMA_S2MM_0_STREAM_STARVATION")
 
 
-def design_mlir(src: str, dst: str) -> str:
+def case_spec(name: str) -> tuple[str, str, int]:
+    """(source, destination, words) of a case name, `BASE` or `BASE_nN`."""
+    m = re.fullmatch(r"(.+?)(?:_n(\d+))?", name)
+    src, dst = CASES[m.group(1)]
+    return src, dst, int(m.group(2)) if m.group(2) else N_WORDS
+
+
+def design_mlir(src: str, dst: str, n: int = N_WORDS) -> str:
     tiles = [src] + ([dst] if dst != src else [])
     decls = "\n".join(f"    {VAR[t]} = aie.tile({TILES[t][0]}, {TILES[t][1]})" for t in tiles)
-    data = ", ".join(str(0x0A000000 | j) for j in range(N_WORDS))
+    data = ", ".join(str(0x0A000000 | j) for j in range(n))
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
                     for _ in range(SETTLE_WRITES))
     return f"""module {{
   aie.device(npu1_1col) {{
     %t_shim = aie.tile(0, 0)
 {decls}
-    %src = aie.buffer({VAR[src]}) {{address = {SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{data}]> : tensor<{N_WORDS}xi32>}} : memref<{N_WORDS}xi32>
-    %dst = aie.buffer({VAR[dst]}) {{address = {DST_ADDR} : i32, sym_name = "dst"}} : memref<{N_WORDS}xi32>
+    %src = aie.buffer({VAR[src]}) {{address = {SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{data}]> : tensor<{n}xi32>}} : memref<{n}xi32>
+    %dst = aie.buffer({VAR[dst]}) {{address = {DST_ADDR} : i32, sym_name = "dst"}} : memref<{n}xi32>
     %scratch = aie.buffer({VAR[src]}) {{address = {SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
     %lG = aie.lock({VAR[dst]}, {GATE_LOCK}) {{init = 0 : i32, sym_name = "lG"}}
     %lD = aie.lock({VAR[dst]}, {DONE_LOCK}) {{init = 0 : i32, sym_name = "lD"}}
@@ -76,14 +88,14 @@ def design_mlir(src: str, dst: str) -> str:
       %tr = aiex.dma_configure_task({VAR[dst]}, S2MM, 0) {{
         %c_a = arith.constant 1 : i32
         aie.use_lock(%lG, AcquireGreaterEqual, %c_a)
-        aie.dma_bd(%dst : memref<{N_WORDS}xi32> offset = 0 len = {N_WORDS}) {{bd_id = 0 : i32}}
+        aie.dma_bd(%dst : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 0 : i32}}
         %c_r = arith.constant 1 : i32
         aie.use_lock(%lD, Release, %c_r)
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%tr)
       %ts = aiex.dma_configure_task({VAR[src]}, MM2S, 0) {{
-        aie.dma_bd(%src : memref<{N_WORDS}xi32> offset = 0 len = {N_WORDS}) {{bd_id = 1 : i32}}
+        aie.dma_bd(%src : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 1 : i32}}
         aie.end
       }} {{issue_token = true}}
       aiex.dma_start_task(%ts)
@@ -98,10 +110,10 @@ def design_mlir(src: str, dst: str) -> str:
 
 
 def build_case(name: str, out: Path) -> None:
-    src, dst = CASES[name]
+    src, dst, n = case_spec(name)
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "base.mlir").write_text(design_mlir(src, dst))
+    (d / "base.mlir").write_text(design_mlir(src, dst, n))
     traced = {src, dst}
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
            "--out", "aie.mlir", "--trace-mode", "event_time",
@@ -113,7 +125,7 @@ def build_case(name: str, out: Path) -> None:
     lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
-    (d / "case.json").write_text(json.dumps({"case": name, "src": src, "dst": dst, "n_words": N_WORDS}) + "\n")
+    (d / "case.json").write_text(json.dumps({"case": name, "src": src, "dst": dst, "n_words": n}) + "\n")
 
 
 def tile_frames(path: Path, row: int) -> list[tuple[int, frozenset[str]]]:
@@ -190,7 +202,7 @@ def main(argv=None) -> int:
             ok &= lp.run_case(out, n, a.tag, a.backend, output=False)
         return 0 if ok else 1
     for n in a.only:
-        src, dst = CASES[n]
+        src, dst, _ = case_spec(n)
         for tag in a.tags:
             p = out / n / tag / "events.json"
             if not p.exists():

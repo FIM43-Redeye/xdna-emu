@@ -291,7 +291,13 @@ def run_case_raw(out: Path, name: str, tag: str, backend: str, output: bool = Tr
     lockfile = None
     if backend == "hw":
         lockfile = open(HW_LOCK, "w")
-        fcntl.flock(lockfile, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Say so: a caller wrapping this in `flock` on the same file deadlocks here silently.
+            print(f"{name}: waiting for {HW_LOCK} (do not wrap this tool in flock)",
+                  file=sys.stderr, flush=True)
+            fcntl.flock(lockfile, fcntl.LOCK_EX)
     try:
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
