@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from dataclasses import dataclass
 import sys
 from pathlib import Path
 
@@ -86,18 +87,49 @@ MEMMOD_EVENTS = ("DMA_MM2S_0_START_TASK,DMA_MM2S_0_STREAM_BACKPRESSURE,DMA_MM2S_
                  "DMA_S2MM_0_FINISHED_BD,DMA_S2MM_0_STREAM_STARVATION")
 
 
-def case_spec(name: str) -> tuple[str, str, int]:
-    """(source, destination, words) of a case name, `BASE` or `BASE_nN`."""
-    m = re.fullmatch(r"(.+?)(?:_n(\d+))?", name)
+CASE_NAME = re.compile(r"(.+?)(?:_n(\d+)|_([ct])(\d+)x(\d+))?")
+
+
+@dataclass(frozen=True)
+class Shape:
+    """A case's route and BD layout: `count` BDs of `length` words, chained in one task
+    (`chain`, suffix `_cLxK`) or as back-to-back tasks (`tasks`, `_tLxK`); `single` is one BD
+    (`BASE` or `BASE_nN`). The S2MM always takes the whole stream in one BD."""
+    src: str
+    dst: str
+    length: int
+    count: int
+    mode: str
+
+    @property
+    def total(self) -> int:
+        return self.length * self.count
+
+    def design_args(self) -> tuple:
+        return (self.src, self.dst, self.total, self.length, self.mode)
+
+
+def case_shape(name: str) -> Shape:
+    m = CASE_NAME.fullmatch(name)
     src, dst = CASES[m.group(1)]
-    return src, dst, int(m.group(2)) if m.group(2) else N_WORDS
+    if m.group(3):
+        mode = "chain" if m.group(3) == "c" else "tasks"
+        return Shape(src, dst, int(m.group(4)), int(m.group(5)), mode)
+    return Shape(src, dst, int(m.group(2)) if m.group(2) else N_WORDS, 1, "single")
+
+
+def case_spec(name: str) -> tuple[str, str, int]:
+    """(source, destination, total words) of a case name (see `case_shape`)."""
+    s = case_shape(name)
+    return s.src, s.dst, s.total
 
 
 def is_ports_case(name: str) -> bool:
-    return re.fullmatch(r"(.+?)(?:_n\d+)?", name).group(1).endswith("_ports")
+    return CASE_NAME.fullmatch(name).group(1).endswith("_ports")
 
 
-def design_mlir(src: str, dst: str, n: int = N_WORDS) -> str:
+def design_mlir(src: str, dst: str, n: int = N_WORDS, bd_len: int | None = None,
+               mode: str = "single") -> str:
     core_src = src == "core"
     srct = TILE_OF[src]
     tiles = list(dict.fromkeys((srct, dst)))
@@ -126,12 +158,7 @@ def design_mlir(src: str, dst: str, n: int = N_WORDS) -> str:
         src_decl = (f"    %src = aie.buffer({sv}) {{address = {SRC_ADDR} : i32, sym_name = \"src\", "
                     f"initial_value = dense<[{data}]> : tensor<{n}xi32>}} : memref<{n}xi32>")
         flow = f"aie.flow({sv}, DMA : 0, {dv}, DMA : 0)"
-        start_src = f"""      %ts = aiex.dma_configure_task({sv}, MM2S, 0) {{
-        aie.dma_bd(%src : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 1 : i32}}
-        aie.end
-      }} {{issue_token = true}}
-      aiex.dma_start_task(%ts)"""
-        await_src = "      aiex.dma_await_task(%ts)\n"
+        start_src, await_src = mm2s_tasks(sv, n, bd_len or n, mode)
     return f"""module {{
   aie.device(npu1_1col) {{
     %t_shim = aie.tile(0, 0)
@@ -164,6 +191,33 @@ def design_mlir(src: str, dst: str, n: int = N_WORDS) -> str:
 """
 
 
+def mm2s_tasks(sv: str, n: int, bd_len: int, mode: str) -> tuple[str, str]:
+    """Runtime-sequence text starting the MM2S side and awaiting it: one task of one BD, one task
+    of chained BDs, or back-to-back single-BD tasks, each BD `bd_len` words of `src` in order."""
+    k = n // bd_len
+
+    def bd(j: int) -> str:
+        return (f"        aie.dma_bd(%src : memref<{n}xi32> offset = {j * bd_len} len = {bd_len}) "
+                f"{{bd_id = {1 + j} : i32}}")
+
+    if mode == "tasks":
+        start = "\n".join(f"""      %ts{j} = aiex.dma_configure_task({sv}, MM2S, 0) {{
+{bd(j)}
+        aie.end
+      }} {{issue_token = true}}""" for j in range(k))
+        start += "\n" + "\n".join(f"      aiex.dma_start_task(%ts{j})" for j in range(k))
+        return start, "".join(f"      aiex.dma_await_task(%ts{j})\n" for j in range(k))
+    body = []
+    for j in range(k):
+        if j:
+            body.append(f"      ^bd{j}:")
+        body.append(bd(j))
+        body.append(f"        aie.next_bd ^bd{j + 1}" if j + 1 < k else "        aie.end")
+    start = (f"      %ts = aiex.dma_configure_task({sv}, MM2S, 0) {{\n" + "\n".join(body)
+             + "\n      } {issue_token = true}\n      aiex.dma_start_task(%ts)")
+    return start, "      aiex.dma_await_task(%ts)\n"
+
+
 def inject_args(name: str) -> list[str]:
     """The trace injector's event arguments for a case."""
     src, dst, _ = case_spec(name)
@@ -182,10 +236,11 @@ def inject_args(name: str) -> list[str]:
 
 
 def build_case(name: str, out: Path) -> None:
-    src, dst, n = case_spec(name)
+    shape = case_shape(name)
+    src, dst, n = shape.src, shape.dst, shape.total
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "base.mlir").write_text(design_mlir(src, dst, n))
+    (d / "base.mlir").write_text(design_mlir(*shape.design_args()))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
            "--out", "aie.mlir", "--trace-mode", "event_time",
            *inject_args(name),

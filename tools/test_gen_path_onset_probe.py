@@ -1,3 +1,4 @@
+import pytest
 import re
 import gen_path_onset_probe as g
 
@@ -89,3 +90,37 @@ def test_port_report_without_a_stall_counts_everything():
 def test_port_report_of_an_event_that_never_fires():
     r = g.port_report(_frames([], [], 5), "PORT_RUNNING_0", "PORT_STALLED_0")
     assert r["running_before_stall"] == 0 and r["running"] == []
+
+
+def test_a_chain_suffix_is_k_chained_bds_of_l_words_in_one_task():
+    assert g.case_shape("prod_own_c4x3") == g.Shape("prod", "prod", 4, 3, "chain")
+    assert g.case_spec("prod_own_c4x3") == ("prod", "prod", 12)
+    text = g.design_mlir(*g.case_shape("prod_own_c4x3").design_args())
+    assert text.count("MM2S, 0)") == 1
+    assert text.count("aie.next_bd") == 2
+    for j in range(3):
+        assert f"offset = {4 * j} len = 4" in text
+    assert "len = 12" in text  # the S2MM takes the whole stream in one BD
+
+
+def test_a_task_suffix_is_k_back_to_back_tasks_of_l_words():
+    s = g.case_shape("mem_own_t8x2")
+    assert s == g.Shape("mem", "mem", 8, 2, "tasks")
+    text = g.design_mlir(*s.design_args())
+    assert text.count("MM2S, 0)") == 2 and "aie.next_bd" not in text
+    assert text.count("aiex.dma_start_task(%ts") == 2
+    assert "offset = 8 len = 8" in text and "len = 16" in text
+
+
+def test_a_plain_or_length_name_is_one_bd_one_task():
+    assert g.case_shape("prod_own_n23") == g.Shape("prod", "prod", 23, 1, "single")
+    assert g.case_shape("prod_own") == g.Shape("prod", "prod", g.N_WORDS, 1, "single")
+    # unchanged text for single-BD cases
+    assert g.design_mlir(*g.case_shape("prod_own_n23").design_args()) == g.design_mlir("prod", "prod", 23)
+
+
+@pytest.mark.parametrize("name", ["prod_own", "prod_own_n23", "prod_own_c4x3", "mem_own_t8x2",
+                                  "core_own_ports_n20"])
+def test_every_design_has_balanced_braces(name):
+    text = g.design_mlir(*g.case_shape(name).design_args())
+    assert text.count("{") == text.count("}")
