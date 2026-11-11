@@ -1620,10 +1620,9 @@ impl InterpreterEngine {
             let cyc = self.total_cycles;
             let col = (self.tile_col_start as u8..self.cols as u8)
                 .find(|&c| {
-                    self.device
-                        .array
-                        .dma_engine(c, 1)
-                        .map_or(false, |e| (0u8..12).any(|ch| e.get_transfer(ch).is_some()))
+                    self.device.array.dma_engine(c, 1).map_or(false, |e| {
+                        (0u8..12).any(|ch| e.get_transfer(ch).is_some() || e.staged_words(ch) > 0)
+                    })
                 })
                 .unwrap_or(self.tile_col_start as u8);
             // Non-empty port FIFOs as "i:depth" for a tile's switch side.
@@ -1678,6 +1677,12 @@ impl InterpreterEngine {
             let sh_s = ports(0, false);
             let sh_m = ports(0, true);
             let sh_in = self.device.array.dma_engine(col, 0).map_or(0, |e| e.stream_in_len());
+            let mt_in = self.device.array.dma_engine(col, 1).map_or(0, |e| e.stream_in_len());
+            let mt_stg: usize = self
+                .device
+                .array
+                .dma_engine(col, 1)
+                .map_or(0, |e| (0u8..12).map(|ch| e.staged_words(ch)).sum());
             let active = mt_out > 0
                 || infl > 0
                 || c2_in > 0
@@ -1689,7 +1694,7 @@ impl InterpreterEngine {
                 || !sh_m.is_empty();
             if active {
                 eprintln!(
-                    "[STAGE] cyc={cyc} col={col} | mt_out={mt_out} mtS[{mt_s}] mtM[{mt_m}] s4b={s4b} s4st={s4s} \
+                    "[STAGE] cyc={cyc} col={col} | mt_stg={mt_stg} mt_out={mt_out} mt_in={mt_in} mtS[{mt_s}] mtM[{mt_m}] s4b={s4b} s4st={s4s} \
                      -> xtile(inflight={infl},transit={infl_transit}) -> c2S[{c2_s}] c2M[{c2_m}] \
                      c2_in={c2_in}(ch0={c2_in0}) c2phase={c2_phase} c2lk={c2_locks:?} \
                      | shimS[{sh_s}] shimM[{sh_m}] shim_in={sh_in}"
