@@ -1624,9 +1624,18 @@ impl InterpreterEngine {
                         (0u8..12).any(|ch| e.get_transfer(ch).is_some() || e.staged_words(ch) > 0)
                     })
                 })
+                // Before any DMA runs: the first column with a memtile (column 0
+                // has none on Phoenix's full-array view).
+                .or_else(|| {
+                    (self.tile_col_start as u8..self.cols as u8)
+                        .find(|&c| self.device.array.arch().is_valid_tile(c, 1))
+                })
                 .unwrap_or(self.tile_col_start as u8);
             // Non-empty port FIFOs as "i:depth" for a tile's switch side.
             let ports = |row: u8, master: bool| -> String {
+                if !self.device.array.arch().is_valid_tile(col, row) {
+                    return "-".to_string();
+                }
                 let t = self.device.array.tile(col, row);
                 let v = if master {
                     &t.stream_switch.masters
