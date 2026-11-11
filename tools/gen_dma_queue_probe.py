@@ -19,6 +19,8 @@ sends WORDS words through the switch to its own S2MM 1, whose one task is parked
 no task at all, `idle`). The status of both channels is read after the sender has had time to run: an
 MM2S that reads idle absorbed the whole transfer; one that reads Running with Stalled_Stream_Backpressure
 did not. Sweeping the length finds the capacity.
+The `absorb_mem` variants send the same stream north to the memtile's S2MM 0 instead (parked on a memtile
+lock, or idle), so the shim's north-entry path and its local loop can be told apart.
 
 Registers come from the AM025 database (ctrlpkt_readback.TileRegs); the BDs are written by the
 runtime sequence (aiex.dma_configure_task), so a push is exactly what aie-rt's queue code does:
@@ -259,10 +261,11 @@ ABSORB_SNAPS = 3                           # status reads after the sender start
 class AbsorbCase:
     words: int
     parked: bool = True                    # False: the S2MM channel gets no task at all
+    dest: str = "shim"                     # "mem": the stream goes north to the memtile's S2MM 0
 
     @property
     def name(self) -> str:
-        return f"absorb{'' if self.parked else '_idle'}_{self.words}"
+        return f"absorb{'' if self.dest == 'shim' else '_' + self.dest}{'' if self.parked else '_idle'}_{self.words}"
 
     @property
     def data_words(self) -> int:
@@ -270,17 +273,20 @@ class AbsorbCase:
 
 
 def absorb_cases(lengths=ABSORB_LENGTHS) -> dict[str, AbsorbCase]:
-    return {c.name: c for c in (AbsorbCase(n, p) for p in (True, False) for n in lengths)}
+    return {c.name: c for c in (AbsorbCase(n, p, d) for d in ("shim", "mem") for p in (True, False)
+                                for n in lengths)}
 
 
 def absorb_steps(case: AbsorbCase) -> list:
     k = cp.TileRegs("shim")
-    s2mm, mm2s = k.regs["DMA_S2MM_Status_1"], k.regs["DMA_MM2S_Status_1"]
-    gate, count = k.value(GATE_LOCK["shim"]), k.value(COUNT_LOCK["shim"])
+    d = cp.TileRegs(case.dest)
+    mm2s = k.regs["DMA_MM2S_Status_1"]
+    s2mm = d.regs[f"DMA_S2MM_Status_{CHANNEL[case.dest]}"]
+    gate, count = d.value(GATE_LOCK[case.dest]), d.value(COUNT_LOCK[case.dest])
 
     def snap(tag: str) -> list:
-        return [cp.Read(mm2s, f"{tag} mm2s", "shim"), cp.Read(s2mm, f"{tag} s2mm", "shim"),
-                cp.Read(count, f"{tag} C", "shim")]
+        return [cp.Read(mm2s, f"{tag} mm2s", "shim"), cp.Read(s2mm, f"{tag} s2mm", case.dest),
+                cp.Read(count, f"{tag} C", case.dest)]
 
     out = snap("s0")
     if case.parked:
@@ -289,16 +295,23 @@ def absorb_steps(case: AbsorbCase) -> list:
     for i in range(ABSORB_SNAPS):
         out += snap(f"a{i + 1}")
     if case.parked:
-        out += [cp.Write(gate, GATE_OPEN, "open the gate", "shim"), *snap("b1"), *snap("b2")]
+        out += [cp.Write(gate, GATE_OPEN, "open the gate", case.dest), *snap("b1"), *snap("b2")]
     return out
 
 
 def _absorb_task_lines(case: AbsorbCase, var: str, direction: str, gated: bool) -> tuple[str, ...]:
+    """The shim's MM2S 1 task (a slice of the host buffer) or the receiving S2MM task: the second
+    half of the host buffer on the shim, a tile buffer on the memtile."""
     n = case.words
-    offset = n if direction == "s2mm" else 0
-    bd = (f"aie.dma_bd(%data : memref<{case.data_words}xi32> offset = {offset} len = {n}) "
-          f"{{bd_id = {FIRST_BD['shim'] if gated else PARTNER_BD['shim']} : i32}}")
-    out = [f"%{var} = aiex.dma_configure_task(%t00, {direction.upper()}, 1) {{"]
+    on_shim = direction == "mm2s" or case.dest == "shim"
+    kind = "shim" if on_shim else case.dest
+    if on_shim:
+        offset = n if direction == "s2mm" else 0
+        bd = (f"aie.dma_bd(%data : memref<{case.data_words}xi32> offset = {offset} len = {n}) "
+              f"{{bd_id = {FIRST_BD['shim'] if gated else PARTNER_BD['shim']} : i32}}")
+    else:
+        bd = f"aie.dma_bd(%dst : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = {FIRST_BD[kind]} : i32}}"
+    out = [f"%{var} = aiex.dma_configure_task({TILES[kind]}, {direction.upper()}, {CHANNEL[kind]}) {{"]
     if gated:
         out += [f"  %c_{var}_a = arith.constant 1 : i32",
                 f"  aie.use_lock(%lG, AcquireGreaterEqual, %c_{var}_a)"]
@@ -312,28 +325,40 @@ def _absorb_task_lines(case: AbsorbCase, var: str, direction: str, gated: bool) 
 def absorb_design(case: AbsorbCase) -> tuple[str, list, "cp.Layout"]:
     st = absorb_steps(case)
     layout = cp.encode(st)
+    dest = TILES[case.dest]
     lines = ["module {", "  aie.device(npu1_1col) {",
-             "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
-             *cp.packet_flows("%t00", "%t00", "shim"), *cp.shim_allocations("%t00")]
-    for sym, lid in (("lG", GATE_LOCK["shim"]), ("lC", COUNT_LOCK["shim"])):
-        lines.append(f'    %{sym} = aie.lock(%t00, {lid}) {{init = 0 : i32, sym_name = "{sym}"}}')
-    lines += ["    aie.flow(%t00, DMA : 1, %t00, DMA : 1)",
-              "    aie.shim_dma_allocation @dout (%t00, MM2S, 1)",
-              "    aie.shim_dma_allocation @din (%t00, S2MM, 1)",
-              f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+             "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}"]
+    if case.dest != "shim":
+        lines.append(f"    {dest} = aie.tile{TILE_COORDS[case.dest]} "
+                     f"{{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {PKT_IDS[case.dest]}>}}")
+    lines += cp.packet_flows("%t00", "%t00", "shim")
+    if case.dest != "shim":
+        lines += cp.packet_flows(dest, "%t00", case.dest)
+        lines.append(f'    %dst = aie.buffer({dest}) {{address = {DST_ADDR} : i32, sym_name = "dst"}} '
+                     f": memref<{case.words}xi32>")
+    lines += cp.shim_allocations("%t00")
+    for sym, lid in (("lG", GATE_LOCK[case.dest]), ("lC", COUNT_LOCK[case.dest])):
+        lines.append(f'    %{sym} = aie.lock({dest}, {lid}) {{init = 0 : i32, sym_name = "{sym}"}}')
+    lines += [f"    aie.flow(%t00, DMA : 1, {dest}, DMA : {CHANNEL[case.dest]})",
+              "    aie.shim_dma_allocation @dout (%t00, MM2S, 1)"]
+    if case.dest == "shim":
+        lines.append("    aie.shim_dma_allocation @din (%t00, S2MM, 1)")
+    lines += [f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
               f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{case.data_words}xi32>) {{",
               *cp.sequence_lines(st, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
     return "\n".join(lines), st, layout
 
 
 def absorb_report(case: AbsorbCase, ctrl: dict[str, int], data: list[int]) -> str:
-    lines = [f"{case.name}: MM2S 1 -> S2MM 1 on the shim, {case.words} words, "
+    where = "S2MM 1 on the shim" if case.dest == "shim" else f"the {case.dest} tile's S2MM {CHANNEL[case.dest]}"
+    lines = [f"{case.name}: shim MM2S 1 -> {where}, {case.words} words, "
              f"S2MM {'parked on a lock' if case.parked else 'without a task'}"]
     for tag in [f"a{i + 1}" for i in range(ABSORB_SNAPS)] + (["b1", "b2"] if case.parked else []):
         lines.append(f"  {tag}: mm2s {status_text(ctrl[f'{tag} mm2s'], 'shim')}")
-        lines.append(f"      s2mm {status_text(ctrl[f'{tag} s2mm'], 'shim')}  C={ctrl[f'{tag} C']}")
-    got = sum(1 for i in range(case.words) if data[case.words + i] == SRC_MARK + i)
-    lines.append(f"  words landed in the destination: {got} of {case.words}")
+        lines.append(f"      s2mm {status_text(ctrl[f'{tag} s2mm'], case.dest)}  C={ctrl[f'{tag} C']}")
+    if case.dest == "shim":
+        got = sum(1 for i in range(case.words) if data[case.words + i] == SRC_MARK + i)
+        lines.append(f"  words landed in the destination: {got} of {case.words}")
     return "\n".join(lines)
 
 
@@ -395,7 +420,7 @@ def cmd_generate(args) -> int:
         meta = {"case": name, "labels": list(layout.labels), "n_words": len(layout.words),
                 "n_data": case.data_words, "host_args": ["seq"]}
         if isinstance(case, AbsorbCase):
-            meta |= {"family": "absorb", "words": case.words, "parked": case.parked}
+            meta |= {"family": "absorb", "words": case.words, "parked": case.parked, "dest": case.dest}
         else:
             meta |= {"family": "queue", "kind": case.kind, "direction": case.direction,
                      "pushes": case.pushes, "gated": case.gated, "words": case.words,
@@ -417,7 +442,7 @@ def cmd_analyze(args) -> int:
             continue
         ctrl, data = parse_output(out.read_bytes(), meta["labels"], meta["n_data"])
         if meta["family"] == "absorb":
-            print(absorb_report(AbsorbCase(meta["words"], meta["parked"]), ctrl, data))
+            print(absorb_report(AbsorbCase(meta["words"], meta["parked"], meta.get("dest", "shim")), ctrl, data))
             continue
         case = QueueCase(meta["kind"], meta["direction"], meta["pushes"], meta.get("gated", True),
                          meta.get("words", WORDS), meta.get("chain", 1), meta.get("closed", 0),

@@ -37,6 +37,17 @@ def test_the_status_decoder_reads_the_fields_the_probe_reports():
 
 def test_absorb_cases_cover_both_modes_and_name_their_length():
     table = g.absorb_cases((16, 80))
-    assert set(table) == {"absorb_16", "absorb_80", "absorb_idle_16", "absorb_idle_80"}
+    assert set(table) == {"absorb_16", "absorb_80", "absorb_idle_16", "absorb_idle_80",
+                          "absorb_mem_16", "absorb_mem_80", "absorb_mem_idle_16", "absorb_mem_idle_80"}
     text, _, _ = g.absorb_design(table["absorb_80"])
     assert "len = 80" in text
+
+
+def test_absorb_mem_sends_the_shim_stream_north_to_a_memtile_s2mm_parked_on_a_memtile_lock():
+    text, st, _ = g.absorb_design(g.AbsorbCase(72, True, "mem"))
+    assert "aie.flow(%t00, DMA : 1, %t01, DMA : 0)" in text
+    assert "aiex.dma_configure_task(%t01, S2MM, 0)" in text
+    assert f"aie.lock(%t01, {g.GATE_LOCK['mem']})" in text
+    assert "@din" not in text                      # the shim S2MM 1 is not used
+    reads = {s.label: s.tile for s in st if isinstance(s, g.cp.Read)}
+    assert reads["a1 mm2s"] == "shim" and reads["a1 s2mm"] == "mem" and reads["a1 C"] == "mem"
