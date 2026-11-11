@@ -21,7 +21,8 @@ MM2S that reads idle absorbed the whole transfer; one that reads Running with St
 did not. Sweeping the length finds the capacity.
 The `absorb_mem` variants send the same stream north to the memtile's S2MM 0 instead (parked on a memtile
 lock, or idle), so the shim's north-entry path and its local loop can be told apart; `absorb_memloop`
-is the memtile's own MM2S 0 -> S2MM 0 loop, the same receiver without the shim.
+is the memtile's own MM2S 0 -> S2MM 0 loop, the same receiver without the shim, and `absorb_coreloop`
+the compute tile's.
 
 Registers come from the AM025 database (ctrlpkt_readback.TileRegs); the BDs are written by the
 runtime sequence (aiex.dma_configure_task), so a push is exactly what aie-rt's queue code does:
@@ -263,11 +264,11 @@ class AbsorbCase:
     words: int
     parked: bool = True                    # False: the S2MM channel gets no task at all
     dest: str = "shim"                     # "mem": the stream goes north to the memtile's S2MM 0
-    src: str = "shim"                      # "mem" (with dest "mem"): the memtile's own MM2S 0 loop
+    src: str = "shim"                      # == dest ("mem", "core"): that tile's own MM2S 0 -> S2MM 0 loop
 
     @property
     def name(self) -> str:
-        route = "" if self.dest == "shim" else "_memloop" if self.src == "mem" else "_" + self.dest
+        route = "" if self.dest == "shim" else f"_{self.src}loop" if self.src == self.dest else "_" + self.dest
         return f"absorb{route}{'' if self.parked else '_idle'}_{self.words}"
 
     @property
@@ -276,7 +277,7 @@ class AbsorbCase:
 
 
 def absorb_cases(lengths=ABSORB_LENGTHS) -> dict[str, AbsorbCase]:
-    routes = (("shim", "shim"), ("shim", "mem"), ("mem", "mem"))
+    routes = (("shim", "shim"), ("shim", "mem"), ("mem", "mem"), ("core", "core"))
     return {c.name: c for c in (AbsorbCase(n, p, d, s) for s, d in routes for p in (True, False)
                                 for n in lengths)}
 

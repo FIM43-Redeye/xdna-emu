@@ -40,7 +40,8 @@ def test_absorb_cases_cover_both_modes_and_name_their_length():
     assert set(table) == {"absorb_16", "absorb_80", "absorb_idle_16", "absorb_idle_80",
                           "absorb_mem_16", "absorb_mem_80", "absorb_mem_idle_16", "absorb_mem_idle_80",
                           "absorb_memloop_16", "absorb_memloop_80", "absorb_memloop_idle_16",
-                          "absorb_memloop_idle_80"}
+                          "absorb_memloop_idle_80", "absorb_coreloop_16", "absorb_coreloop_80",
+                          "absorb_coreloop_idle_16", "absorb_coreloop_idle_80"}
     text, _, _ = g.absorb_design(table["absorb_80"])
     assert "len = 80" in text
 
@@ -60,3 +61,10 @@ def test_absorb_memloop_loops_the_memtile_mm2s_into_its_own_s2mm_without_the_shi
     assert "aie.flow(%t01, DMA : 0, %t01, DMA : 0)" in text
     assert "aiex.dma_configure_task(%t01, MM2S, 0)" in text and "@dout" not in text
     assert {s.tile for s in st if isinstance(s, g.cp.Read)} == {"mem"}
+
+
+def test_absorb_coreloop_loops_the_compute_tile_mm2s_into_its_own_s2mm():
+    text, st, _ = g.absorb_design(g.AbsorbCase(40, False, "core", "core"))
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" in text
+    assert g.AbsorbCase(40, False, "core", "core").name == "absorb_coreloop_idle_40"
+    assert {s.tile for s in st if isinstance(s, g.cp.Read)} == {"core"}

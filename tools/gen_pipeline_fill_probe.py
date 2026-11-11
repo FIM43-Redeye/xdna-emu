@@ -538,7 +538,17 @@ RACE_CASES.update({
     # cases) and the idle-shim case hand routed on channel 0 (the turnaround's)
     "race_prod_turn3": ("prod", "mem"), "race_prod_shim0": ("prod", "shim"),
 })
+# Start-phase variants of the shim-entry cases: phase 0 alone only brackets a path's size to its
+# granule, the four phases pin it.
+for _case in ("race_prod_shim0", "race_prod_shimq"):
+    for _p in RACE_PHASES:
+        RACE_CASES[f"{_case}_p{_p}"] = RACE_CASES[_case]
 SHIM_GATE, SHIM_DONE = 4, 5        # shim locks of the parked S2MM task
+
+
+def race_base(name: str) -> str:
+    """The case name without its start-phase suffix."""
+    return re.sub(r"_p\d$", "", name)
 
 
 def race_turn_switchboxes(src: str, ch: int = 0, into_shim: bool = False) -> list[str]:
@@ -562,7 +572,7 @@ def race_turn_switchboxes(src: str, ch: int = 0, into_shim: bool = False) -> lis
 
 def race_route_channel(name: str) -> int | None:
     """Stream channel of a hand-routed case (`_turn` 0, `_turn3` 3, `_shim0` 0), None if auto-routed."""
-    m = re.search(r"_(turn|shim)(\d?)$", name)
+    m = re.search(r"_(turn|shim)(\d?)$", race_base(name))
     if not m or (m.group(1) == "shim" and not m.group(2)):
         return None
     return int(m.group(2) or 0)
@@ -570,7 +580,7 @@ def race_route_channel(name: str) -> int | None:
 
 def race_words(name: str) -> int:
     """BD length: a parked shim S2MM holds more than RACE_WORDS on its own."""
-    return 2 * RACE_WORDS if name.endswith("_shimq") else RACE_WORDS
+    return 2 * RACE_WORDS if race_base(name).endswith("_shimq") else RACE_WORDS
 
 
 def race_phase(name: str) -> int:
@@ -618,7 +628,7 @@ def race_steps(src: str, dst: str, phase: int = 0, armed: bool = False, n: int =
 
 def race_design(name: str) -> tuple[str, list, "cp.Layout"]:
     src, dst = RACE_CASES[name]
-    armed = name.endswith("_shimq")
+    armed = race_base(name).endswith("_shimq")
     n = race_words(name)
     st = race_steps(src, dst, race_phase(name), armed, n)
     layout = cp.encode(st)
