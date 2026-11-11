@@ -1162,3 +1162,147 @@ fn test_ctrl_packet_read_of_a_dma_status_register_returns_the_channel_status() {
         assert_eq!(data, live, "row {row}");
     }
 }
+
+// === Path capacity: where a stalled stream stops (silicon, NPU1, 2026-11-11) ===
+//
+// The MM2S hand-off word belongs to the MM2S: the channel is Running while it holds one and
+// reads Stalled_Stream_Backpressure while the switch's slave port refuses it. Measured by the
+// onset probes (`tools/gen_path_onset_probe.py`, data `build/experiments/path-capacity/onset-len`
+// and `onset-ports`) and the R4-D3 data race.
+
+mod path_capacity {
+    use super::*;
+    use crate::device::dma::BdConfig;
+    use xdna_archspec::aie2::stream_switch::compute;
+
+    /// A compute tile whose MM2S ch0 streams `words` words through the tile's own switch into its
+    /// S2MM ch0. `held` parks that S2MM on a lock nobody releases; otherwise it has no task.
+    fn own_loop(words: u32, held: bool) -> (TileArray, usize, HostMemory) {
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let idx = array.tile_index(1, 2);
+        array.tiles[idx]
+            .stream_switch
+            .configure_local_route(compute::DMA_SLAVE_START as usize, compute::DMA_MASTER_START as usize);
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(1, BdConfig::simple_1d(0x400, words * 4)).unwrap();
+        if held {
+            dma.configure_bd(0, BdConfig::simple_1d(0x4000, 4096).with_acquire(5, 1))
+                .unwrap();
+            dma.start_channel(0, 0).unwrap();
+        }
+        dma.start_channel(2, 1).unwrap(); // combined channel 2 = MM2S ch0
+        (array, idx, HostMemory::new())
+    }
+
+    /// The MM2S ch0 status after the route has settled: (Channel_Running, Stalled_Stream_Backpressure).
+    fn mm2s_settled(words: u32, held: bool) -> (bool, bool) {
+        let (mut array, idx, mut host) = own_loop(words, held);
+        for _ in 0..600 {
+            array.step_data_movement(&mut host);
+        }
+        let layout = &crate::device::regdb::device_reg_layout().memory_status;
+        let status = array.dma_engines[idx].get_channel_status(2);
+        (layout.channel_running.extract_bool(status), layout.stalled_stream_backpressure.extract_bool(status))
+    }
+
+    fn first_stalled(held: bool) -> u32 {
+        (1..=40).find(|&n| mm2s_settled(n, held).1).expect("some length must stall")
+    }
+
+    /// MM2S into its own held S2MM: 22 words fit past the stall point and the channel finishes
+    /// clean; the 23rd stays in the hand-off word, which reads as a sustained backpressure (the
+    /// staging is empty by then). Silicon first stalls at N=23 (onset-len); the emulator used to
+    /// first stall at 26 because the hand-off word sat outside the MM2S.
+    #[test]
+    fn mm2s_into_a_held_s2mm_stalls_at_23_words_and_is_clean_at_22() {
+        assert_eq!(mm2s_settled(22, true), (false, false), "22 words finish clean");
+        assert_eq!(
+            mm2s_settled(23, true),
+            (true, true),
+            "the 23rd word waits in the hand-off: Running + backpressure"
+        );
+        assert_eq!(first_stalled(true), 23);
+    }
+
+    /// An S2MM with no task takes 6 words past the MM2S's stall point (slave 4 + local master 2,
+    /// AM020 ch.2): 7 stalls. Silicon absorb threshold 6 (memloop/coreloop-fine idle); the
+    /// emulator absorbed 7 because it counted the hand-off word as part of the path.
+    #[test]
+    fn mm2s_into_an_idle_s2mm_stalls_at_7_words() {
+        assert_eq!(mm2s_settled(6, false), (false, false));
+        assert_eq!(first_stalled(false), 7);
+    }
+
+    /// The DMA:0 master passes 16 words into a held S2MM (PORT_RUNNING count, onset-ports): the
+    /// 15-deep ingress FIFO plus a 1-word skid. The stream switch's slave side holds 6 more.
+    #[test]
+    fn the_dma_master_passes_16_words_into_a_held_s2mm() {
+        let (mut array, idx, mut host) = own_loop(40, true);
+        for _ in 0..600 {
+            array.step_data_movement(&mut host);
+        }
+        assert_eq!(array.dma_engines[idx].stream_in_len(), 16, "parked tile intake");
+        assert_eq!(array.dma_engines[idx].input_fifo_capacity(), 16);
+    }
+
+    /// A core writing into a held DMA on its own tile: 25 words leave the core's `ms` write
+    /// (3 in its output buffer + 22 through the Core:0 slave port); with the word still in `r0`
+    /// that is the 26 of the R4-D3 core row (silicon 26/34/42/50 for 0..3 hops).
+    #[test]
+    fn a_core_into_a_held_own_tile_dma_writes_25_words_then_stalls_with_a_3_word_output_buffer() {
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let mut host = HostMemory::new();
+        let idx = array.tile_index(1, 2);
+        array.tiles[idx]
+            .stream_switch
+            .configure_local_route(0, compute::DMA_MASTER_START as usize);
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(0, BdConfig::simple_1d(0x4000, 4096).with_acquire(5, 1))
+            .unwrap();
+        dma.start_channel(0, 0).unwrap();
+        let mut written = 0u32;
+        for _ in 0..600 {
+            // the core's blocking `ms` write: only when its output buffer has room
+            if array.tiles[idx].stream_output_len(0) < crate::interpreter::execute::stream::STREAM_FIFO_DEPTH
+            {
+                array.tiles[idx].push_stream_output_beat(0, 0xC000 + written, false);
+                written += 1;
+            }
+            array.step_data_movement(&mut host);
+        }
+        assert_eq!(crate::interpreter::execute::stream::STREAM_FIFO_DEPTH, 3);
+        assert_eq!(array.tiles[idx].stream_output_len(0), 3);
+        assert_eq!(written, 25);
+    }
+
+    /// Core to core one tile east, consumer not reading: 18 words in all (silicon,
+    /// gen_stream_absorb_probe `direct`): output buffer 3, Core slave 4, one external hop 8,
+    /// Core master 2, and a 1-word input buffer.
+    #[test]
+    fn core_to_core_one_hop_holds_18_words() {
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let mut host = HostMemory::new();
+        let src = array.tile_index(1, 2);
+        let dst = array.tile_index(2, 2);
+        array.tiles[src]
+            .stream_switch
+            .configure_local_route(0, compute::EAST_MASTER_START as usize);
+        array.tiles[dst]
+            .stream_switch
+            .configure_local_route(compute::WEST_SLAVE_START as usize, 0);
+        let mut written = 0u32;
+        for _ in 0..600 {
+            if array.tiles[src].stream_output_len(0) < crate::interpreter::execute::stream::STREAM_FIFO_DEPTH
+            {
+                array.tiles[src].push_stream_output_beat(0, 0xD000 + written, false);
+                written += 1;
+            }
+            array.step_data_movement(&mut host);
+        }
+        assert_eq!(written, 18);
+        assert_eq!(array.tiles[dst].stream_input_len(0), 1);
+    }
+}

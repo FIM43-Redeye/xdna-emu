@@ -142,19 +142,23 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.s2mm_ingress_fifo_depth", "NPU1 S2MM_0_MEMORY_BACKPRESSURE opens 15 cycles into every steady \
             lock-stall window (39 windows, zero variance, xdna-emu-priv: research/findings/2026-07-14-dma-memory-pressure-\
             event-semantics.md; 15 again on the 2026-11-04 rebuild, EMU == HW)", "The FIFO the event watches; the ingress \
-            total (18) is this plus the skid stage."),
-        measured("dma.s2mm_ingress_skid_depth", HOP_SLOPE, "18 in all after the switch crossings and the sources' 1-word \
-            registers (core: 1 + 1 + 6 + 18 = 26), less the 15 the backpressure onset pins; which structure holds the 3 \
-            words is not separated."),
+            total (16, DMA:0 master port count) is this plus the skid stage."),
+        measured("dma.s2mm_ingress_skid_depth", "NPU1 port probe 2026-11-11 (tools/gen_path_onset_probe.py ports, data \
+            build/experiments/path-capacity/onset-ports): the DMA:0 master passes 16 words into a held S2MM (EMU was 18) \
+            and the source's slave port 22, so the switch holds 6 (AM020)", "16 in all less the 15 the backpressure \
+            onset pins; which structure holds the word is not separated."),
         measured("dma.shim_s2mm_ingress_depth", "NPU1 shim absorb sweep (tools/gen_dma_queue_probe.py, absorb family): \
             MM2S 1 -> S2MM 1 on the shim, S2MM parked on a lock 76 words absorbed, 8 with no task, 3 runs identical",
             "A running (unparked) shim S2MM is not separated from a parked one; length 75 is a silicon oddity \
             not modelled."),
-        measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race, 20 route x phase points, zero spread \
-            (tools/experiments/r4d3_egress_race.py; DmaTiming field doc)", "Compute tiles (memtile: memtile_mm2s_egress_fifo_depth). \
-            Assumes a stalled core holds one word (+/-1)."),
+        measured("dma.mm2s_egress_fifo_depth", "NPU1 R4-D3 egress race (20 route x phase points, zero \
+            spread, tools/experiments/r4d3_egress_race.py) pins the route capacity; the onset length sweep 2026-11-11 \
+            (gen_path_onset_probe.py prod_own_nN, data path-capacity/onset-len) puts the MM2S stall boundary at 23 words \
+            with the hand-off word inside the MM2S; DmaTiming field doc", "Compute tiles (memtile: \
+            memtile_mm2s_egress_fifo_depth). The races pin staging + hand-off + downstream, the boundary pins the split."),
         measured("dma.memtile_mm2s_egress_fifo_depth", "NPU1 memtile start-phase data race 2026-11-10 \
-            (tools/gen_pipeline_fill_probe.py race *_loop_pK): 52/51/54/53 vs compute 48/47/50/49, two runs identical",
+            (tools/gen_pipeline_fill_probe.py race *_loop_pK): 52/51/54/53 vs compute 48/47/50/49, two runs identical; \
+            31 with the hand-off word inside the MM2S since 2026-11-11 (onset-len)",
             "Upstream of the stream port (backpressure onset, gen_path_onset_probe.py); deeper staging vs a granule \
             in flight not separated."),
         measured("dma.memtile_mm2s_fetch_latency_cycles", "NPU1 backpressure onset 2026-11-10 \

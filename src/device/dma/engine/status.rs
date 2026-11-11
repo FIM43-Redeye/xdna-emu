@@ -106,7 +106,9 @@ impl DmaEngine {
         // mem_s2mm_rel), a compute tile's or memtile's egress staging (silicon, pipeline-fill
         // chain_mem_L4: Running + Stalled_Stream_Backpressure with every BD finished).
         if matches!(self.channel_type(channel), ChannelType::MM2S)
-            && (!ch.read_ahead.is_empty() || !ch.egress_staging.is_empty())
+            && (!ch.read_ahead.is_empty()
+                || !ch.egress_staging.is_empty()
+                || self.stream_out_len_for_channel(channel) > 0)
         {
             status = layout.channel_running.set_bit(status);
             if !self.can_push_stream_out_for_channel(channel) {

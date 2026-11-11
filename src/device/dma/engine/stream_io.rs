@@ -8,12 +8,16 @@ use crate::device::dma::channel::ReturningRead;
 pub(super) const BYTES_PER_STREAM_WORD: u32 = 4;
 
 /// Words an MM2S channel holds between its egress staging FIFO and its stream-switch slave port:
-/// 1, the hand-off register (the core's stream output has the same single register,
-/// `interpreter::execute::stream`). Pinned by the R4-D3 data race on NPU1 (`r4d3_egress_race.py`):
-/// with the switch crossings at their AM020 depths (slave 4 + local master 2, ch.2:86) a DMA
-/// source holds staging + 25 words and a core source 1 + 1 + 24, and the four BD start phases
-/// match the staging's granule rule only with 25 downstream of the staging -- a 4-word buffer
-/// here made it 28 and shifted the phase pattern by one.
+/// 1, the hand-off word. It belongs to the MM2S: the channel is Running while it holds the word
+/// and reads Stalled_Stream_Backpressure (and asserts the DMA_MM2S_n_STREAM_BACKPRESSURE level)
+/// while the slave port refuses it, even with the staging behind it empty. Measured on NPU1
+/// (2026-11-11): the MM2S first sustains that backpressure at N = 23 words into its own held S2MM
+/// (`gen_path_onset_probe.py prod_own_nN`, data `path-capacity/onset-len`), 22 words past the stall
+/// point, which is the number of words that enter the source's slave port (`onset-ports`), so the
+/// boundary sits at the slave port and this word is on the MM2S's side of it. The R4-D3 race
+/// (`r4d3_egress_race.py`) pins staging + this word + downstream together (switch crossings at
+/// their AM020 depths, slave 4 + local master 2, ch.2:86); the staging depth takes the
+/// remainder (`mm2s_egress_fifo_depth` 27). It keeps its 1-cycle hand-off timing role.
 pub const MM2S_OUTPUT_REGISTER_DEPTH: usize = 1;
 
 impl DmaEngine {
@@ -33,8 +37,9 @@ impl DmaEngine {
     /// pre-fix 2-deep model split every reused BD (`[16,16,2,14,16]` /
     /// `[8,8,2,6,...]`). EMU counts the master-port beat at the DMA-accept
     /// point, so this capacity stands in for the combined ingress: the skid
-    /// stage plus the ingress FIFO (`DMA_S2MM_INGRESS_SKID_DEPTH` 3 +
-    /// `DMA_S2MM_INGRESS_FIFO_DEPTH` 15 = 18, pinned by silicon). The
+    /// stage plus the ingress FIFO (`DMA_S2MM_INGRESS_SKID_DEPTH` 1 +
+    /// `DMA_S2MM_INGRESS_FIFO_DEPTH` 15 = 16: the DMA:0 master port passes 16 words into a held
+    /// S2MM, silicon port probe 2026-11-11, `path-capacity/onset-ports`). The
     /// **shim** s2mm recv is governed by the separately calibrated DDR
     /// cold-start model, so it keeps the shallow master-port depth.
     ///
@@ -142,7 +147,9 @@ impl DmaEngine {
             let read = self.channels[ch_idx].read_ahead.pop_front().expect("front checked");
             self.push_stream_out(read.data);
         }
-        let held = returned && blocked;
+        // The hand-off word belongs to the MM2S: the level is asserted while the switch's slave
+        // port refuses it, whether or not another read has returned behind it.
+        let held = blocked;
         if held != self.channels[ch_idx].read_backpressure {
             self.channels[ch_idx].read_backpressure = held;
             self.trace(EventType::DmaStreamStarvation { channel, active: held });
@@ -169,9 +176,10 @@ impl DmaEngine {
                 }
             }
         }
-        let fetching = matches!(&self.channels[ch_idx].fsm, ChannelFsm::Transferring { transfer }
-            if self.uses_egress_staging(transfer));
-        let held = blocked && (!self.channels[ch_idx].egress_staging.is_empty() || fetching);
+        // The hand-off word belongs to the MM2S: the level is asserted while the switch's slave
+        // port refuses it, including when the staging behind it is already empty (the last word
+        // of a transfer stuck in the hand-off reads as a sustained backpressure).
+        let held = blocked;
         if held != self.channels[ch_idx].egress_backpressure {
             self.channels[ch_idx].egress_backpressure = held;
             self.trace(EventType::DmaStreamStarvation { channel, active: held });

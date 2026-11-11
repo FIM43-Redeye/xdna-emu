@@ -564,7 +564,10 @@ impl DmaEngine {
 
             // Shim MM2S read-ahead: returned reads enter the stream before this
             // cycle's issue decision, whatever the FSM is doing.
-            if !self.channels[ch_idx].read_ahead.is_empty() || self.channels[ch_idx].read_backpressure {
+            if !self.channels[ch_idx].read_ahead.is_empty()
+                || self.channels[ch_idx].read_backpressure
+                || self.stream_out_len_for_channel(ch_idx as u8) > 0
+            {
                 self.drain_read_ahead(ch_idx);
                 any_active = true;
             }
@@ -657,7 +660,11 @@ impl DmaEngine {
             // in it, and whatever the FSM is doing, so the words of a finished
             // BD keep flowing while the next one starts.
             let ch = &self.channels[ch_idx];
-            if !ch.egress_staging.is_empty() || ch.egress_backpressure || ch.egress_gap > 0 {
+            if !ch.egress_staging.is_empty()
+                || ch.egress_backpressure
+                || ch.egress_gap > 0
+                || self.stream_out_len_for_channel(ch_idx as u8) > 0
+            {
                 self.drain_egress_staging(ch_idx);
                 any_active = true;
             }
@@ -3876,11 +3883,11 @@ mod bank_demand_tests {
         assert_eq!(cleared_at.map(|c| c + 1), first_accept_at, "the cycle before the next accept");
     }
 
-    /// The egress staging depth is pinned by silicon at 25 words (R4-D3,
-    /// 2026-10-28; see `DmaTiming::mm2s_egress_fifo_depth`), and an MM2S held
+    /// The egress staging depth is 27 words (R4-D3 race pins the route capacity, the
+    /// 2026-11-11 onset sweep the split; see `DmaTiming::mm2s_egress_fifo_depth`), and an MM2S held
     /// by a consumer that never takes a word must fill to exactly the depth
     /// the fetch rule "a granule is fetched only if staged + granule <= depth"
-    /// allows. Which of 22..=25 it reaches depends on where the BD starts in
+    /// allows. Which of 24..=27 it reaches depends on where the BD starts in
     /// its 128-bit granule: the phase pattern on silicon (stale-word counts
     /// 0/-1/+2/+1 for starts 0/1/2/3 words into a granule) is this rule's
     /// signature and is what excludes depths 24 and 26.
@@ -3888,18 +3895,19 @@ mod bank_demand_tests {
     fn stalled_mm2s_fills_staging_to_the_silicon_pinned_depth() {
         assert_eq!(
             xdna_archspec::aie2::timing::DMA_MM2S_EGRESS_FIFO_DEPTH,
-            25,
-            "R4-D3 measured the compute-tile MM2S staging depth at 25 words"
+            27,
+            "route capacity (R4-D3 races) less the hand-off word and the downstream 22 (onset sweep)"
         );
         let depth = DmaEngine::new_compute_tile(1, 2).egress_staging_capacity();
-        assert_eq!(depth, 25);
+        assert_eq!(depth, 27);
 
-        // The hand-off register in front of the (never-popping) stream router
-        // takes `output_fifo_capacity()` (1) word; the rest stay staged. A
-        // granule is 4 words, so the staged count settles on the largest value
-        // <= depth congruent to -(start_phase + 1) modulo 4. These are the
-        // silicon stale counts 48/47/50/49 less the 25 words downstream of the
-        // staging (hand-off 1 + local slave 4 + local master 2 + ingress 18).
+        // The hand-off word in front of the (never-popping) stream router takes
+        // `output_fifo_capacity()` (1) word; the rest stay staged. A granule is 4
+        // words, so the staged count settles on the largest value <= depth with
+        // staged + 1 congruent to -start_phase modulo 4. (On a full route the bound
+        // is the route capacity instead of the depth, which is how the silicon race
+        // counts 48/47/50/49 come out of the same rule: the congruence class is the
+        // same, only the cap differs.)
         let mut staged_by_phase = Vec::new();
         for phase in 0..4u64 {
             let mut eng = DmaEngine::new_compute_tile(1, 2);
@@ -3919,22 +3927,22 @@ mod bank_demand_tests {
         }
         assert_eq!(
             staged_by_phase,
-            vec![23, 22, 25, 24],
+            vec![27, 26, 25, 24],
             "staged words at stall for BD starts 0/1/2/3 words into a granule"
         );
     }
 
-    /// A memtile MM2S stages 29 words, 4 more than a compute tile's: silicon's
+    /// A memtile MM2S stages 31 words, 4 more than a compute tile's: silicon's
     /// memtile -> own S2MM race reads 52/51/54/53 for BD starts 0..3 words into a
     /// granule where the compute tile reads 48/47/50/49
     /// (build/experiments/path-capacity/race-phase, two runs identical). Only
-    /// depth 29 gives that pattern under the fetch rule; 28 and 30 each break a
-    /// phase. The backpressure onset (path-capacity/onset) puts the 4 words
+    /// depth 31 gives that pattern under the fetch rule with the downstream 23 of the
+    /// compute loop; 30 and 32 each break a phase. The backpressure onset (path-capacity/onset) puts the 4 words
     /// upstream of the stream port, not in the switch.
     #[test]
     fn memtile_mm2s_staging_holds_four_words_more_than_a_compute_tile() {
         let depth = DmaEngine::new_mem_tile(1, 1).egress_staging_capacity();
-        assert_eq!(depth, 29);
+        assert_eq!(depth, 31);
         let mut staged_by_phase = Vec::new();
         for phase in 0..4u64 {
             let mut eng = DmaEngine::new_mem_tile(1, 1);
@@ -3948,7 +3956,7 @@ mod bank_demand_tests {
             }
             staged_by_phase.push(eng.staged_words(6));
         }
-        assert_eq!(staged_by_phase, vec![27, 26, 29, 28]);
+        assert_eq!(staged_by_phase, vec![31, 30, 29, 28]);
     }
 
     /// A memtile MM2S word reaches the stream one cycle later than a compute
@@ -4010,7 +4018,9 @@ mod bank_demand_tests {
             tile.locks[5].value, 3,
             "BDs finished with the port held: those whose words are all staged"
         );
-        assert_eq!(eng.staged_words(2) + eng.output_fifo_capacity(), 24);
+        // 27 staged + the hand-off word: three whole BDs (24) plus the first granule of the
+        // fourth, whose BD has not finished (its last word is not staged).
+        assert_eq!(eng.staged_words(2) + eng.output_fifo_capacity(), 28);
 
         let mut out = Vec::new();
         for _ in 0..400 {

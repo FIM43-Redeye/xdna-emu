@@ -1320,30 +1320,31 @@ pub struct DmaTiming {
     /// EMU counts the master-port beat at the DMA-accept point (pop to
     /// `stream_in`), so this single depth stands in for the combined ingress.
     ///
-    /// **Pinned by silicon at 15 here plus `s2mm_ingress_skid_depth` 3 in
-    /// front of it (NPU1, modelled 2026-11-04).** The whole ingress holds 18:
-    /// a core streaming into an S2MM whose lock is withheld gets 26 words out
-    /// before it stalls on the same tile, 34/42/50 one to three tiles away,
-    /// and a DMA source 48/56/64/72 plus its staging phase pattern (R4-D3 data
-    /// race); with the switch at its AM020 depths (local slave 4 + local
-    /// master 2 on the tile, 8 more per external hop, confirmed by the
-    /// 8-per-hop slope) and the 1-word hand-off registers of the two sources,
-    /// all 25 counts leave exactly 18 (core: 1 held + 1 hand-off + 6 + 18).
-    /// `DMA_S2MM_n_MEMORY_BACKPRESSURE`, which watches this FIFO, opens 15
-    /// cycles into a lock stall (39 windows, zero variance; 15 again on a
-    /// 2026-11-04 rebuild), so the FIFO is 15 and the other 3 are a skid
-    /// stage that takes beats once it is full. The co-captures above only
-    /// lower-bound the total (16). Shim s2mm recv is governed by the separately
-    /// calibrated DDR cold-start model, so shim keeps the shallow master-port
-    /// depth. Far below the 256-word buffer that caused the 2026-06-13 warmup
-    /// transient (~1 BD of warmup slack at depth 16).
+    /// **Pinned by silicon at 15 here plus `s2mm_ingress_skid_depth` 1 in
+    /// front of it (NPU1, 2026-11-11).** A held tile S2MM takes 16 words from
+    /// the DMA:0 master port: the port probe (`tools/gen_path_onset_probe.py`
+    /// `ports`, data `build/experiments/path-capacity/onset-ports`) counts 16
+    /// PORT_RUNNING words on the DMA:0 master against a stalled-free source, and
+    /// 22 on the source's slave port, so the switch (local slave 4 + local master
+    /// 2, AM020 ch.2) holds the other 6. `DMA_S2MM_n_MEMORY_BACKPRESSURE`, which
+    /// watches this FIFO, opens 15 cycles into a lock stall (39 windows, zero
+    /// variance; 15 again on a 2026-11-04 rebuild), so the FIFO is 15 and the
+    /// remaining word is a skid stage that takes a beat once it is full. (The
+    /// earlier model, 15 + 3 = 18, came from counting the sources' hand-off words
+    /// outside the MM2S and assuming a 1-word core register; the port probe
+    /// measured 16.) The co-captures of 2026-06-27 (memtile recv [16,16,16,16],
+    /// compute [8,...]) only lower-bound the total. Shim s2mm recv is governed by
+    /// the separately calibrated DDR cold-start model, so shim keeps the shallow
+    /// master-port depth. Far below the 256-word buffer that caused the 2026-06-13
+    /// warmup transient (~1 BD of warmup slack at depth 16).
     pub s2mm_ingress_fifo_depth: u8,
 
     /// S2MM skid stage (32-bit words) between the local master port and the
-    /// ingress FIFO (`s2mm_ingress_fifo_depth`), compute and mem tiles: 3.
-    /// It takes beats only once the FIFO is full, so it adds to what a held
-    /// S2MM absorbs (18 in all, R4-D3) but not to the backpressure event's
-    /// onset (15). Which physical structure holds these 3 words is not separated.
+    /// ingress FIFO (`s2mm_ingress_fifo_depth`), compute and mem tiles: 1
+    /// (was 3 until 2026-11-11, see that field). It takes a beat only once the
+    /// FIFO is full, so it adds to what a held S2MM absorbs (16 in all, port
+    /// probe `onset-ports`) but not to the backpressure event's onset (15).
+    /// Which physical structure holds the word is not separated.
     pub s2mm_ingress_skid_depth: u8,
 
     /// MM2S DMA egress staging depth (32-bit words) for compute and mem tiles
@@ -1360,61 +1361,62 @@ pub struct DmaTiming {
     /// for them and reported `MM2S_MEMORY_STARVATION` = 0
     /// (xdna-emu-priv: research/findings/2026-07-14-dma-bank-access-width.md).
     ///
-    /// **Measured on silicon (R4-D3, Phoenix NPU1, fw 1.5.5.391, 2026-10-28):
-    /// 25 words** for a compute-tile MM2S channel. Replaces the former
-    /// placeholder of 12, which had no silicon or toolchain source. (The
-    /// starvation = 0 observation above only needs a depth of ~5 or more.)
+    /// **Measured on silicon (Phoenix NPU1): 27 words** for a compute-tile MM2S
+    /// channel (25 from R4-D3, 2026-10-28; moved to 27 on 2026-11-11 when the
+    /// hand-off word and the onset probes were placed, see below).
     ///
-    /// Method (data race, no trace events): an MM2S streams a 128-word buffer
-    /// toward an S2MM channel whose BD lock is withheld, so the pipeline fills
-    /// and the MM2S stalls on the stream. The host (NPU instruction stream)
-    /// then overwrites the source buffer and releases the consumer; the words
-    /// that still carry the OLD pattern were fetched before the overwrite. The
-    /// count is exact and identical across every repetition, and independent
-    /// of the dwell before the overwrite (0 to ~180 ms). On a route it is
-    /// `A + S` (rounded down to the fetch-granule phase), where `A` is the
-    /// downstream capacity and `S` the staging depth.
+    /// Method (data race, no trace events, R4-D3): an MM2S streams a 128-word
+    /// buffer toward an S2MM channel whose BD lock is withheld, so the pipeline
+    /// fills and the MM2S stalls on the stream. The host then overwrites the
+    /// source buffer and releases the consumer; the words that still carry the
+    /// OLD pattern were fetched before the overwrite. The count is exact and
+    /// identical across every repetition, and independent of the dwell. On a
+    /// route it is `C` (rounded down to the fetch-granule phase), the route
+    /// capacity: staging + hand-off + everything downstream.
     ///
-    /// `A` is measured separately by replacing the DMA source with a core
-    /// streaming the same buffer (a core has no staging FIFO, and AM020
-    /// ch.2:143 gives its stream port none): on all five routes (same tile,
-    /// 1/2/3 tiles north, via the 16-deep switch FIFO) the maximum DMA stale
-    /// count minus the core stale count is 24, i.e. `S = 24 + c` with `c` the
-    /// one word a stalled core holds in its own register. That gives `S = 25`.
+    /// What pins the split. The BD start phase inside a 128-bit granule moves the
+    /// race count in the pattern "fetch a granule only if staged + granule <= S"
+    /// (`next_granule_fetch`); a race value is `T == -phase (mod 4)` with
+    /// `T <= C`, so the races pin only `C`, not how it divides. The division comes
+    /// from the stall boundary: the onset length sweep (`gen_path_onset_probe.py`
+    /// `prod_own_nN`, data `path-capacity/onset-len`, 2026-11-11) shows the MM2S
+    /// first sustains STREAM_BACKPRESSURE at N = 23 words into its own held S2MM,
+    /// i.e. 22 words past the stall point, which equals the words that enter the
+    /// source's slave port (`onset-ports`: 22 on DMA:0 and on Core:0). So the
+    /// 1-word hand-off belongs to the MM2S (it is Running, and backpressured,
+    /// while the slave port refuses that word; see `MM2S_OUTPUT_REGISTER_DEPTH`)
+    /// and the boundary sits at the slave port: 22 = slave 4 + local master 2 + S2MM
+    /// intake 16. With the hand-off inside the channel, staging = C - hand-off -
+    /// downstream = 27 reproduces every race row (compute own loop 48/47/50/49,
+    /// R4-D3 DMA rows 48/56/64/72, 8 per external hop). The earlier value 25 came
+    /// from `S = 24 + c` with the core's output assumed to hold one word; the core
+    /// holds three (`STREAM_FIFO_DEPTH`).
     ///
-    /// The BD start phase inside a 128-bit granule pins it exactly rather than
-    /// to within a granule: starting the BD 0/1/2/3 words into a granule moves
-    /// the stale count in exactly the pattern of "fetch a granule only if
-    /// staged + granule <= S" with `S = 25` (the rule `next_granule_fetch`
-    /// implements), on all five routes; 24 and 26 are each contradicted by
-    /// one phase. 20 route/phase points, zero spread: 5 or 6 repetitions each,
-    /// except 3 on the switch-FIFO route at phase 0.
-    ///
-    /// Caveats: `c` is assumed to be 1 (if the core stream port holds a second
-    /// word the value is 26); measured on a compute tile. A memtile MM2S
-    /// stages more (`memtile_mm2s_egress_fifo_depth`). This is the DMA-side staging only: the
+    /// Measured on a compute tile; a memtile MM2S stages more
+    /// (`memtile_mm2s_egress_fifo_depth`). This is the DMA-side staging only: the
     /// downstream local-slave port FIFO is modelled separately
     /// (`STREAM_LOCAL_SLAVE_FIFO_DEPTH`). Rig and evidence:
-    /// `tools/experiments/r4d3_*.py`. The earlier trace-event experiment
-    /// (xdna-emu-priv: research/findings/2026-07-15-mm2s-egress-fifo-depth.md)
-    /// could only bound the whole source-to-shim pipeline at 48 words.
+    /// `tools/experiments/r4d3_*.py`, `build/experiments/path-capacity/PLAN.md`.
     pub mm2s_egress_fifo_depth: u8,
 
-    /// Words a **memtile** MM2S channel holds in its egress staging: 29, four
+    /// Words a **memtile** MM2S channel holds in its egress staging: 31, four
     /// more than a compute tile's (`mm2s_egress_fifo_depth`), counting the words
     /// whose memory read has not yet returned (`memtile_mm2s_fetch_latency_cycles`).
     ///
     /// Measured (NPU1, 2026-11-10, two runs identical): the memtile -> own S2MM
     /// data race (`tools/gen_pipeline_fill_probe.py` `race`, start-phase cases
     /// `_p1`..`_p3`) reads 52/51/54/53 for BD starts 0..3 words into a granule,
-    /// the compute-tile loop 48/47/50/49. Under the fetch rule ("a granule only
-    /// if staged + granule <= depth") only 29 gives that pattern; 28 and 30 each
-    /// break one phase. The 4 words sit upstream of the stream port, not in the
-    /// switch: the STREAM_BACKPRESSURE onset (`tools/gen_path_onset_probe.py`)
-    /// of a memtile-sourced path is the compute-sourced one's plus one cycle at
-    /// every edge, own tile and one hop away, where 4 more words downstream
-    /// would move the held onset 4 cycles. Which structure in the memtile MM2S
-    /// holds them (a deeper staging or a granule in flight) is not separated.
+    /// the compute-tile loop 48/47/50/49: a memtile source holds 4 more than a
+    /// compute one. The value moved from 29 to 31 on 2026-11-11 together with the
+    /// compute tile's 25 -> 27, when the hand-off word became part of the MM2S
+    /// (see `mm2s_egress_fifo_depth`; the onset sweep `onset-len` puts the memtile
+    /// stall boundary at 23 words as well). The 4 words sit upstream of the stream
+    /// port, not in the switch: the STREAM_BACKPRESSURE onset
+    /// (`tools/gen_path_onset_probe.py`) of a memtile-sourced path is the
+    /// compute-sourced one's plus one cycle at every edge, own tile and one hop
+    /// away, where 4 more words downstream would move the held onset 4 cycles.
+    /// Which structure in the memtile MM2S holds them (a deeper staging or a
+    /// granule in flight) is not separated.
     pub memtile_mm2s_egress_fifo_depth: u8,
 
     /// Cycles from a memtile MM2S granule fetch until its words can leave for
@@ -1430,9 +1432,11 @@ pub struct DmaTiming {
     /// holds (local slave 4 + master 4).
     ///
     /// The value is in the emulator's accounting, calibrated so that a parked shim S2MM absorbs
-    /// 76 words in all, as silicon does (68 beyond the path): 65. The emulator's shim path holds
-    /// 9 words with no task where silicon holds 8, and a channel that holds a task takes 2 more
-    /// than the 2-deep master-port FIFO alone gives; those 3 are not separated here.
+    /// 76 words in all, as silicon does (68 beyond the path): 66 (65 until 2026-11-11). With
+    /// the MM2S hand-off word counted inside the MM2S (`mm2s_egress_fifo_depth`), the shim
+    /// MM2S's stall boundary moved out one word and the emulator's no-task shim loop holds 8
+    /// as silicon does; a task-holding channel takes 2 more than the 2-deep master-port FIFO
+    /// alone gives, and the last lump of 1 is a calibration residual, not separated here.
     ///
     /// **Measured on silicon (Phoenix NPU1, 2026-11-09, shim-queue absorb probes,
     /// stable over three runs):** a shim MM2S 1 streaming into its own S2MM 1 through the

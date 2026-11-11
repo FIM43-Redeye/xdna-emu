@@ -25,17 +25,18 @@ pub const CASCADE_TOTAL_DEPTH: usize = 2;
 /// timer). The link routing realizes it as two end-of-cycle moves: MCD -> transit -> SCD.
 pub const CASCADE_TRANSIT_CYCLES: usize = 2;
 
-/// Words the core's stream input holds before the Core master port is backpressured: 3.
+/// Words the core's stream input holds before the Core master port is backpressured: 1.
 ///
-/// Pinned by silicon (NPU1, `tools/gen_stream_absorb_probe.py`, r1 == r2, 2026-11-04): a producer
-/// core one tile away writes 18 words into a consumer that is not reading before it stalls (39
-/// through the producer's switch FIFO). The producer's side of that path is pinned separately by
-/// the R4-D3 data race into a DMA sink (1-word output register; switch crossings at their AM020
-/// depths, 8 per external hop), which leaves 18 - 1 - 4 - 8 = 5 for the consumer's side: the Core
-/// master port's 2-deep FIFO (AM020 ch.2:82) and 3 here. AM020 ch.2:143 gives the core's stream
-/// interface no FIFO; where in the core's read path these 3 words sit is not separated. Without a
-/// bound the buffer absorbed any number of words and a held consumer never backpressured.
-pub const CORE_STREAM_INPUT_DEPTH: usize = 3;
+/// Derived, not measured directly. Silicon (NPU1, `tools/gen_stream_absorb_probe.py`, r1 == r2,
+/// 2026-11-04) lets a producer core one tile away write 18 words into a consumer that is not
+/// reading before it stalls (39 through the producer's switch FIFO). With the producer's output
+/// buffer at 3 words (`interpreter::execute::stream::STREAM_FIFO_DEPTH`, measured 2026-11-11 by
+/// the port probe: the core's extra words sit upstream of its slave port), Core slave 4, one
+/// external hop 8 and the Core master's 2-deep FIFO (AM020 ch.2:82), 18 - 3 - 4 - 8 - 2 leaves 1
+/// for the consumer's input. (Until 2026-11-11 this was 3 against a producer output of 1; the
+/// producer split was an assumption.) Without a bound the buffer absorbed any number of words
+/// and a held consumer never backpressured.
+pub const CORE_STREAM_INPUT_DEPTH: usize = 1;
 
 impl Tile {
     // === Stream Port Access (for core direct stream reads/writes) ===

@@ -323,6 +323,9 @@ fn stream_backpressure_outlives_finished() {
         .iter()
         .filter(|(c, e)| *c > fin && matches!(e, EventType::DmaStreamStarvation { active: true, .. }));
     assert!(bp_after_fin.count() > 0, "backpressure keeps tracing after FINISHED");
+    // The level follows the hand-off word: it reads the refusal of the cycle before, so the
+    // step after the last word is taken is the one that closes it.
+    rig.step(true);
     let last_level = rig
         .events
         .iter()
@@ -337,7 +340,7 @@ fn stream_backpressure_outlives_finished() {
 }
 
 /// (d) A compute-tile MM2S (banked tile memory, egress staging) is untouched:
-/// it holds its 25-word staging and does not finish until its last word has
+/// it holds its 27-word staging and does not finish until its last word has
 /// entered the stream.
 #[test]
 fn compute_tile_mm2s_still_finishes_only_when_its_data_is_in_the_stream() {

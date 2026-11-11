@@ -231,24 +231,26 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // lands.  Memtile and compute calibrate independently.
             memtile_first_bd_startup_cycles: 0,
             compute_first_bd_startup_cycles: 0,
-            // Pinned by silicon: 18 in all (R4-D3 data race), of which the
-            // backpressure event watches 15 (onset +15). See the field docs.
+            // Pinned by silicon: a held tile S2MM takes 16 words from the DMA:0 master
+            // port (2026-11-11 port probe), of which the backpressure event watches 15
+            // (onset +15). See the field docs.
             s2mm_ingress_fifo_depth: 15,
-            s2mm_ingress_skid_depth: 3,
-            // Pinned by silicon (R4-D3, Phoenix, 2026-10-28): 25 words held by
-            // a compute-tile MM2S ahead of a stalled consumer, upstream of the
-            // switch's local-slave port. See the DmaTiming field doc.
-            mm2s_egress_fifo_depth: 25,
-            // Pinned by silicon (2026-11-10): memtile start-phase races 52/51/54/53
-            // and the backpressure onset one cycle behind a compute source. See the
-            // DmaTiming field docs.
-            memtile_mm2s_egress_fifo_depth: 29,
+            s2mm_ingress_skid_depth: 1,
+            // Pinned by silicon (2026-11-11): the MM2S stall boundary (onset-len, 22 words
+            // past the stall point) with the hand-off word inside the MM2S, and the
+            // start-phase races, which pin only staging + hand-off + downstream. See the
+            // DmaTiming field doc.
+            mm2s_egress_fifo_depth: 27,
+            // Pinned the same way for a memtile source (races 52/51/54/53, onset one
+            // cycle behind a compute source). See the DmaTiming field docs.
+            memtile_mm2s_egress_fifo_depth: 31,
             memtile_mm2s_fetch_latency_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
-            // words, 68 beyond the stream path. 65 in the emulator's accounting, whose shim
-            // path is one word longer and whose task-holding S2MM takes two more. See the
-            // field doc.
-            shim_s2mm_ingress_depth: 65,
+            // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
+            // task-holding S2MM takes two more than the master-port FIFO alone and whose
+            // MM2S stall boundary moved out one word with the hand-off (2026-11-11). See
+            // the field doc.
+            shim_s2mm_ingress_depth: 66,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

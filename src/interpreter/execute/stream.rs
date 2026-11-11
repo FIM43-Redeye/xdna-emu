@@ -93,12 +93,16 @@ pub fn write_would_stall(tile: &Tile) -> bool {
 }
 
 /// Words the core's output buffer holds before a blocking write stalls (a non-blocking write is
-/// refused instead): 1. AM020 ch.2:143 gives the core's AXI4-Stream interface no FIFO, so this is
-/// the hand-off register to the Core slave port, whose own 4-deep FIFO is the buffering. Pinned by
-/// silicon: a core streaming into a held DMA on its own tile writes 26 words before it stalls
-/// (EMU 27 at depth 1, 30 at the former depth 4), `tools/experiments/r4d3_egress_race.py --source
-/// core`. The per-hop growth (EMU 14 words, silicon 8) is the separate stream-switch residual.
-const STREAM_FIFO_DEPTH: usize = 1;
+/// refused instead): 3. Pinned by silicon (NPU1, 2026-11-11): a core streaming into a held DMA on
+/// its own tile writes 26 words before it stalls (R4-D3, `tools/experiments/r4d3_egress_race.py
+/// --source core`; 34/42/50 one to three hops away), of which 1 is the word still in `r0` and 22
+/// pass the Core:0 slave port, exactly as for a DMA source (port probe, `gen_path_onset_probe.py
+/// ports`, data `build/experiments/path-capacity/onset-ports`: Core:0 and DMA:0 slave 22). The
+/// other 3 are therefore upstream of the slave port, in the core's own output path. (The R4-D3
+/// reading of 1 assumed a 1-word hand-off register and AM020 ch.2:143 gives the core stream
+/// interface no FIFO; the measured counts say otherwise.) The per-hop growth (silicon 8) is the
+/// stream switch's. Paired with `CORE_STREAM_INPUT_DEPTH`: core -> core stays 18.
+pub(crate) const STREAM_FIFO_DEPTH: usize = 3;
 
 /// Cycles from a `mov r, SS` issue to its destination register (II_MOV_SS, operand 0 in
 /// AIE2Schedule.td).
