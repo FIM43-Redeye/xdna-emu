@@ -87,7 +87,9 @@ impl DmaEngine {
     /// panic, which is what we want (impossible-on-HW invariant).
     #[inline]
     fn stream_out_idx(&self, channel: u8) -> usize {
-        (channel as usize).saturating_sub(self.s2mm_count)
+        // Not `saturating_sub`: that mapped every S2MM onto MM2S 0's slot, so a per-channel
+        // query from the step loop read an S2MM as holding MM2S 0's hand-off word.
+        (channel as usize).checked_sub(self.s2mm_count).unwrap_or(usize::MAX)
     }
 
     /// Push a word to the MM2S channel's stream output buffer.  The caller is

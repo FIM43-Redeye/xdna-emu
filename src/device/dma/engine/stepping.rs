@@ -3932,6 +3932,28 @@ mod bank_demand_tests {
         );
     }
 
+    /// A compute-tile MM2S whose hand-off word the switch never takes traces its backpressure on
+    /// its own channel only: the S2MM channels have no output register (see the shim twin in
+    /// `readahead_tests`).
+    #[test]
+    fn a_held_staged_mm2s_drives_no_s2mm_stream_event() {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 512)).unwrap();
+        eng.start_channel(2, 0).unwrap();
+        let mut channels = Vec::new();
+        for _ in 0..400 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            channels.extend(eng.drain_trace_events().into_iter().filter_map(|(_, e)| match e {
+                EventType::DmaStreamStarvation { channel, .. } => Some(channel),
+                _ => None,
+            }));
+        }
+        assert!(!channels.is_empty(), "the held MM2S asserts its backpressure");
+        assert!(channels.iter().all(|&c| c == 2), "stream events on channels {channels:?}");
+    }
+
     /// A memtile MM2S stages 31 words, 4 more than a compute tile's: silicon's
     /// memtile -> own S2MM race reads 52/51/54/53 for BD starts 0..3 words into a
     /// granule where the compute tile reads 48/47/50/49

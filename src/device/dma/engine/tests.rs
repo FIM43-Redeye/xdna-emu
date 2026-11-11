@@ -4219,7 +4219,8 @@ fn test_memtile_dma_west_window_mm2s_fires_west_neighbor_watchpoint() {
         .write_control_start_stop(memtile_events::WATCHPOINT_2 as u32, 0, 1, 7);
 
     let mut neighbors = NeighborTiles { west: Some(&mut west), east: None };
-    let ok = engine.transfer_mm2s(0x100, 4, 0, true, false, &mut tile, &mut neighbors);
+    // Memtile MM2S 0 is flat channel 6 (its six S2MM channels come first).
+    let ok = engine.transfer_mm2s(0x100, 4, 6, true, false, &mut tile, &mut neighbors);
     assert!(ok);
 
     assert!(

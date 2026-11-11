@@ -470,3 +470,28 @@ fn a_shim_mm2s_with_an_undelivered_window_reads_running_and_back_pressured() {
     }
     assert_eq!(rig.engine.get_channel_status(rig.ch) & ((1 << 19) | (1 << 4)), 0, "idle once drained");
 }
+
+/// The hand-off word is the MM2S's own: a held MM2S port drives the MM2S's STREAM_BACKPRESSURE
+/// and nothing on the S2MM channels. An S2MM shares no output register with an MM2S, so an idle
+/// S2MM next to a back-pressured MM2S traces no STREAM_STARVATION (silicon: shim S2MM_1 traces
+/// none in dma_task_large_linear, whose shim MM2S 0 is held for most of the run).
+#[test]
+fn a_held_mm2s_hand_off_drives_no_s2mm_stream_event() {
+    let words = 256;
+    let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
+    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
+    for _ in 0..2_000 {
+        rig.step(false);
+    }
+    let channels: Vec<u8> = rig
+        .events
+        .iter()
+        .filter_map(|(_, e)| match e {
+            EventType::DmaStreamStarvation { channel, .. } => Some(*channel),
+            _ => None,
+        })
+        .collect();
+    assert!(!channels.is_empty(), "the held MM2S asserts its backpressure");
+    assert!(channels.iter().all(|&c| c == rig.ch), "stream events on channels {channels:?}");
+}
