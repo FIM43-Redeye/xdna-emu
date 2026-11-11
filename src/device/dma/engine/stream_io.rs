@@ -131,7 +131,7 @@ impl DmaEngine {
 
     /// Move returned reads into the stream output register, one per cycle (the
     /// register holds one word), and drive the stream-side STREAM_BACKPRESSURE
-    /// level: a returned word is waiting and the register is still occupied.
+    /// level: the register is still occupied (the slave port refused its word).
     /// Runs every step regardless of the FSM, so a window keeps draining after
     /// its BDs have finished.
     pub(super) fn drain_read_ahead(&mut self, ch_idx: usize) {
@@ -139,9 +139,9 @@ impl DmaEngine {
         let channel = ch_idx as u8;
         let returned = self.channels[ch_idx].read_ahead.front().is_some_and(|r| r.ready_at <= now);
         // The register still holds a word exactly when the routing pass refused
-        // it last cycle: that, with a returned word waiting behind it, is
-        // backpressure. A word moved this step is handed downstream later in
-        // the same cycle, and an empty-handed port is not backpressured.
+        // it last cycle: that is backpressure. A word moved this step is handed
+        // downstream later in the same cycle, and an empty-handed port is not
+        // backpressured.
         let blocked = !self.can_push_stream_out_for_channel(channel);
         if returned && !blocked {
             let read = self.channels[ch_idx].read_ahead.pop_front().expect("front checked");
@@ -158,8 +158,8 @@ impl DmaEngine {
 
     /// Move one staged word of a compute / memtile MM2S into its stream output
     /// register, and drive the stream-side STREAM_BACKPRESSURE level: the
-    /// register is still occupied while a staged word (or a BD still being
-    /// fetched) waits behind it. Runs every step whatever the FSM is doing,
+    /// register is still occupied (the slave port refused its word), whether
+    /// or not anything waits behind it. Runs every step whatever the FSM is doing,
     /// so the words of a finished BD keep draining (`staged_mm2s_cycle`).
     pub(super) fn drain_egress_staging(&mut self, ch_idx: usize) {
         let channel = ch_idx as u8;
