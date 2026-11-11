@@ -1001,3 +1001,60 @@ class TestTraceSourceBudget:
 
     def test_memmod_off_is_not_charged(self):
         assert _mti_mod._trace_source_budget(16, 4, 4, False) == (16, 0)
+
+
+# ---------------------------------------------------------------------------
+# PORT_{IDLE,RUNNING,STALLED,TLAST}_<slot> and --port-slots
+# ---------------------------------------------------------------------------
+
+class TestPortEvents:
+    @pytest.mark.parametrize("kind", ["IDLE", "RUNNING", "STALLED", "TLAST"])
+    def test_every_variant_of_a_slot_gets_the_same_binding(self, kind):
+        assert _mti_mod._memtile_default_port_config(f"PORT_{kind}_0") == (0, True)
+        assert _mti_mod._memtile_default_port_config(f"PORT_{kind}_4") == (0, False)
+        assert _mti_mod._core_default_port_config(f"PORT_{kind}_0") == (0, True)
+        assert _mti_mod._core_default_port_config(f"PORT_{kind}_1") == (0, False)
+
+    def test_non_port_events_stay_unbound(self):
+        assert _mti_mod._memtile_default_port_config("DMA_MM2S_SEL0_START_TASK") is None
+        assert _mti_mod._core_default_port_config("PORT_RUNNING_4") is None
+
+    def test_port_slots_parse(self):
+        got = _mti_mod._parse_port_slots("1=Core:0:slave, 4=DMA:2:master")
+        assert got == {1: ("Core", 0, False), 4: ("DMA", 2, True)}
+        assert _mti_mod._parse_port_slots(None) == {}
+
+    @pytest.mark.parametrize("bad", ["1=Core:0", "8=DMA:0:slave", "x=DMA:0:slave", "1=DMA:0:both"])
+    def test_port_slots_reject_malformed(self, bad):
+        with pytest.raises(ValueError):
+            _mti_mod._parse_port_slots(bad)
+
+    def test_override_beats_default_and_binds_slots_without_one(self):
+        ov = _mti_mod._parse_port_slots("1=Core:0:slave,6=North:1:master")
+        f = _mti_mod._core_default_port_config
+        assert _mti_mod._port_binding("PORT_STALLED_1", f, ov) == ("Core", 0, False)
+        assert _mti_mod._port_binding("PORT_RUNNING_6", f, ov) == ("North", 1, True)
+        assert _mti_mod._port_binding("PORT_RUNNING_0", f, ov) == ("DMA", 0, True)
+        assert _mti_mod._port_binding("INSTR_EVENT_0", f, ov) is None
+
+    def test_injected_core_trace_binds_the_overridden_port(self, tmp_path, simple_design_mlir):
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        out = tmp_path / "out.mlir"
+        rc = run_inject(["--input", str(inp), "--out", str(out), "--trace-mode", "event_time",
+                         "--core-grounding", "",
+                         "--core-sweep-events",
+                         "PORT_RUNNING_0,PORT_STALLED_0,PORT_RUNNING_1,PORT_STALLED_1",
+                         "--port-slots", "1=Core:0:slave"])
+        assert rc == 0
+        text = out.read_text()
+        assert "PORT_STALLED_1" in text
+        ports = re.findall(r"aie\.trace\.port<(\d)> port = (\w+) channel = (\d+) direction = (\w+)", text)
+        assert ports == [("0", "DMA", "0", "S2MM"), ("1", "Core", "0", "MM2S")], text
+
+    def test_injector_rejects_a_bad_port_slots_spec(self, tmp_path, simple_design_mlir):
+        inp = tmp_path / "in.mlir"
+        inp.write_text(simple_design_mlir)
+        rc = run_inject(["--input", str(inp), "--out", str(tmp_path / "o.mlir"),
+                         "--port-slots", "nonsense"])
+        assert rc != 0

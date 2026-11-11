@@ -61,6 +61,7 @@ Exit codes:
 """
 import argparse
 import io
+import re
 import sys
 from pathlib import Path
 
@@ -253,8 +254,53 @@ def _parse_memtile_sel_channels(spec: str | None) -> int | None:
     return packed
 
 
+_PORT_EVENT_RE = re.compile(r"PORT_(?:IDLE|RUNNING|STALLED|TLAST)_(\d+)")
+
+
+def _port_slot(event_name: str):
+    """Monitor slot N of a PORT_{IDLE,RUNNING,STALLED,TLAST}_<N> event, else None.
+
+    All four variants of one slot watch the same stream-switch port, so they share a binding.
+    """
+    m = _PORT_EVENT_RE.fullmatch(event_name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_port_slots(spec: str | None) -> dict:
+    """Parse --port-slots 'SLOT=BUNDLE:CHANNEL:master|slave,...' into
+    {slot: (bundle, channel, master)}.
+
+    'master' is the switch's master port (data leaving the switch toward the tile: S2MM for
+    the DMA bundle), 'slave' the slave port (data entering the switch: MM2S for DMA, the
+    core's put_stream for Core). BUNDLE is a WireBundle name (DMA, Core, North, ...).
+    """
+    out: dict = {}
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        m = re.fullmatch(r"(\d+)=([A-Za-z0-9]+):(\d+):(master|slave)", tok)
+        if not m or not 0 <= int(m.group(1)) < 8:
+            raise ValueError(
+                f"bad --port-slots entry {tok!r} (want SLOT=BUNDLE:CHANNEL:master|slave, slot 0-7)")
+        out[int(m.group(1))] = (m.group(2), int(m.group(3)), m.group(4) == "master")
+    return out
+
+
+def _port_binding(event_name: str, default_fn, overrides: dict):
+    """(bundle, channel, master) for a PORT_* event: an explicit --port-slots override of its
+    slot, else the tile type's default DMA binding, else None (a plain GenericEvent)."""
+    slot = _port_slot(event_name)
+    if slot is None:
+        return None
+    if slot in overrides:
+        return overrides[slot]
+    cfg = default_fn(event_name)
+    return None if cfg is None else ("DMA", cfg[0], cfg[1])
+
+
 def _memtile_default_port_config(event_name: str):
-    """Return (channel, master) for a memtile PORT_RUNNING_<N> event, else None.
+    """Return (channel, master) for a memtile PORT_*_<N> event, else None.
 
     Mirrors the default MemTilePortEvent layout used by mlir-aie's
     setup.py::_get_default_events_for_tile for memtile:
@@ -265,19 +311,14 @@ def _memtile_default_port_config(event_name: str):
     a future caller wants to monitor non-DMA bundles, that needs a
     richer override path than --memtile-sweep-events alone.
     """
-    if not event_name.startswith("PORT_RUNNING_"):
-        return None
-    try:
-        slot = int(event_name.rsplit("_", 1)[1])
-    except ValueError:
-        return None
-    if not (0 <= slot < 8):
+    slot = _port_slot(event_name)
+    if slot is None or not (0 <= slot < 8):
         return None
     return slot % 4, slot < 4
 
 
 def _core_default_port_config(event_name: str):
-    """Return (channel, master) for a core-tile PORT_RUNNING_<N> event, else None.
+    """Return (channel, master) for a core-tile PORT_*_<N> event, else None.
 
     Mirrors the default PortEvent layout in mlir-aie's
     setup.py::_get_default_events_for_tile (core branch):
@@ -298,13 +339,8 @@ def _core_default_port_config(event_name: str):
     upstream; monitoring a core's south/north/etc. switch ports needs a
     richer override than --core-sweep-events alone.
     """
-    if not event_name.startswith("PORT_RUNNING_"):
-        return None
-    try:
-        slot = int(event_name.rsplit("_", 1)[1])
-    except ValueError:
-        return None
-    if not (0 <= slot < 4):
+    slot = _port_slot(event_name)
+    if slot is None or not (0 <= slot < 4):
         return None
     return slot // 2, slot % 2 == 0
 
@@ -403,6 +439,13 @@ def parse_args():
                    help="comma-separated event names to sweep on memtile. "
                         "Default: don't inject memtile trace. 'all' is reserved "
                         "for future use; currently behaves the same as the default.")
+    p.add_argument("--port-slots", default=None,
+                   help="override the stream-switch port a PORT_*_<slot> monitor watches "
+                        "(core and memtile trace units), as 'SLOT=BUNDLE:CHANNEL:master|slave,...'. "
+                        "Without an override a slot watches its DMA channel (see "
+                        "_core_default_port_config / _memtile_default_port_config). "
+                        "Example: '1=Core:0:slave' makes PORT_*_1 on a compute tile watch "
+                        "the core's put_stream port.")
     p.add_argument("--memtile-sel-channels", default=None,
                    help="memtile DMA Event Channel Selection register (0xA06A0) "
                         "programming. Memtiles broadcast only 4 DMA event lines "
@@ -860,11 +903,16 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
     # the per-tile closure reference it. Non-PORT_RUNNING events return None
     # and stay plain GenericEvents (no slot binding). Mirrors the memtile
     # port-config precompute below.
-    core_port_cfgs: dict[int, tuple[int, bool]] = {}
+    try:
+        port_overrides = _parse_port_slots(args.port_slots)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    core_port_cfgs: dict[int, tuple[str, int, bool]] = {}
     for ev_name in core_events:
-        cfg = _core_default_port_config(ev_name)
+        cfg = _port_binding(ev_name, _core_default_port_config, port_overrides)
         if cfg is not None:
-            core_port_cfgs[int(ev_name.rsplit("_", 1)[1])] = cfg
+            core_port_cfgs[_port_slot(ev_name)] = cfg
     # Determine trace mode attribute for core tiles.
     mode_attr = {
         "event_pc": aied.TraceMode.EventPC,
@@ -1075,13 +1123,13 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     # mirroring the memtile path. Without this the event fires
                     # against an unconfigured slot and monitors nothing.
                     # master=True -> S2MM (into the core), False -> MM2S (out).
-                    for slot, (channel, master) in core_port_cfgs.items():
+                    for slot, (bundle, channel, master) in core_port_cfgs.items():
                         direction = (
                             aied.DMAChannelDir.S2MM if master
                             else aied.DMAChannelDir.MM2S
                         )
                         aied.trace_port(
-                            slot, aied.WireBundle.DMA, channel, direction,
+                            slot, getattr(aied.WireBundle, bundle), channel, direction,
                         )
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
@@ -1146,12 +1194,11 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 # We just build the dict here -- _memtile_default_port_config
                 # returns the same answer for every PORT_*_X variant of the
                 # same X, so no per-tile validation is needed today.
-                memtile_port_cfgs: dict[int, tuple[int, bool]] = {}
+                memtile_port_cfgs: dict[int, tuple[str, int, bool]] = {}
                 for ev_name in memtile_events:
-                    cfg = _memtile_default_port_config(ev_name)
+                    cfg = _port_binding(ev_name, _memtile_default_port_config, port_overrides)
                     if cfg is not None:
-                        slot = int(ev_name.rsplit("_", 1)[1])
-                        memtile_port_cfgs[slot] = cfg
+                        memtile_port_cfgs[_port_slot(ev_name)] = cfg
 
                 pkt_id = packet_id_counter
                 packet_id_counter += 1
@@ -1165,13 +1212,13 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     # setup.py loop (line 499-502): "for slot, (config, _) in
                     # port_configs.items(): trace_port(slot, port, channel,
                     # direction)". master=True maps to S2MM, False to MM2S.
-                    for slot, (channel, master) in memtile_port_cfgs.items():
+                    for slot, (bundle, channel, master) in memtile_port_cfgs.items():
                         direction = (
                             aied.DMAChannelDir.S2MM if master
                             else aied.DMAChannelDir.MM2S
                         )
                         aied.trace_port(
-                            slot, aied.WireBundle.DMA, channel, direction,
+                            slot, getattr(aied.WireBundle, bundle), channel, direction,
                         )
                     aied.trace_start(broadcast=_TRACE_BROADCAST_START)
                     aied.trace_stop(broadcast=_TRACE_BROADCAST_STOP)
