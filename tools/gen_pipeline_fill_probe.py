@@ -502,7 +502,7 @@ def sink_report(d: Path, tag: str) -> str:
 # that holds no task, or an S2MM whose one BD is parked on a gate lock. Once the sender has
 # settled, the host overwrites the source with pattern B and only then lets the consumer run:
 # every word that lands as A had been read from memory before the overwrite, so the A count
-# is exactly the words the path holds (the R4-D3 method, which pinned the 25-word egress
+# is exactly the words the path holds (the R4-D3 method, which located the egress
 # staging). Tiles are named as in TILES (prod = (0,2), consA = (0,3)).
 
 RACE_WORDS = 96

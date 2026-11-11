@@ -4340,7 +4340,7 @@ fn phase_ordering_blocks_routing_when_ingress_was_full() {
     // available to the producer in Phase 4 of the same cycle.
     //
     // Test parameters (scaled from add_one_using_dma memtile-to-compute path):
-    //   consumer_buffer = input_fifo_capacity() (ingress FIFO 15 + skid 3)
+    //   consumer_buffer = input_fifo_capacity() (ingress FIFO 15 + skid 1)
     //   crossing_depth  = 0 (same-tile; inter-tile crossing is a separate bound)
     //   drain_per_step  = 1 (simulated Phase 3 drains 1 word)
     //   Expected head run before first stall: consumer_buffer + crossing_depth = 16

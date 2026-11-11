@@ -3838,7 +3838,7 @@ mod bank_demand_tests {
         assert_eq!(accepted, cap, "the ingress must swallow exactly its own depth in beats");
         // Silicon: backpressure opens 15 cycles into the lock stall (39 windows, zero variance,
         // 2026-07-14 capture; 15 again on the 2026-11-04 rebuild), while the whole ingress
-        // swallows 18 beats (R4-D3): the event watches the 15-deep FIFO, the skid takes 3 more.
+        // swallows 16 beats (port probe 2026-11-11): the event watches the 15-deep FIFO, the skid takes 1 more.
         assert_eq!(
             first_backpressure_at,
             Some(watched),

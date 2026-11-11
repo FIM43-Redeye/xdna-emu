@@ -48,7 +48,7 @@ impl DmaEngine {
     /// extra fast iterations during double-buffer warmup, defeating the
     /// otherwise HW-faithful master-port backpressure and producing a warmup
     /// transient much longer than silicon (root-caused 2026-06-13 via the
-    /// dma_passthrough buffer-size sweep). The depth-18 ingress is far shallower
+    /// dma_passthrough buffer-size sweep). The depth-16 ingress is far shallower
     /// (~1 BD of warmup slack). Phase 4's `can_accept_stream_in_for_routing`
     /// enforces the registered-FIFO ordering invariant: it checks
     /// `current + drained_this_cycle < capacity` rather than `current < capacity`,
@@ -513,7 +513,7 @@ impl DmaEngine {
     /// if -- a beat is on offer and the ingress FIFO is FULL: its 15 slots are taken, whether or
     /// not the skid stage still has room for the beat. That is the whole semantics of the event
     /// on silicon (xdna-emu-priv: research/findings/2026-07-14-dma-memory-pressure-event-semantics.md):
-    /// it opens 15 cycles into a lock stall while the ingress goes on to swallow 18 beats. With
+    /// it opens 15 cycles into a lock stall while the ingress goes on to swallow 16 beats (port probe 2026-11-11; 18 before). With
     /// nothing on offer it deasserts however full the ingress is. The *cause* of the channel not
     /// draining (a held lock, in practice) is not tested for here and must not be; control-path
     /// refusals (the BD-switch TREADY gap, the one-BD-lookahead gate) are not occupancy and do
