@@ -27,7 +27,19 @@ Lock-to-fetch probe (`fetch-build`, `fetch-run`, `fetch-table`; a separate desig
 case per k = 0..15). How many cycles pass between a core releasing a lock and the first
 memory fetch of an MM2S buffer descriptor that was waiting on it, where the fetches of the
 following granules fall, and where the core's own next accesses fall against them? The
-emulator says release at cycle N, first fetch at N + 1; no silicon run has pinned it.
+emulator's value comes from one of two paths and no silicon run has pinned either.
+
+Two variants (case names lfkNN and lfcNN):
+  first-BD (default, lfk): the waiting BD is the first BD of MM2S 0's task, parked on its lock
+    from boot. The emulator pays its first-BD start-up after the lock grant: first fetch 9 cycles
+    after the release took effect, then granules g0..g5 one per cycle (banks 0,1,0,1,0,1), g6 two
+    cycles later, then one per 4 cycles.
+  chained (`--chained`, lfc): the task starts at boot with a short lock-free BD (4 words from
+    `pre`, 0x4000, logical bank 1, which neither `src` nor the loads use) chained to the BD that
+    waits on lock A, so the waiting BD is reached through next-BD chaining. The emulator charges
+    a chained BD no start-up: the cycle count between the release and the first fetch is
+    reported by the table (see the hardware notes).
+The S2MM takes both BDs' words in one lock-free BD (68 words in the chained variant).
 
   tile (0,2): MM2S 0 bd (started at boot, so it is parked on its lock): acquire A (lock 0,
     init 0), send `src` (64 words, 0x400, data-memory bank 0, so granule g sits in physical
@@ -54,7 +66,7 @@ fills the last core packet, see gen_lock_pulse_probe). The memory-module lock ev
 selector events (LOCK_n_REL follows Locks_Event_Selection_n), but selector 0 resets to
 lock 0, so lock A is lock 0 and nothing is programmed.
 
-    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7]
+    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...]
 """
@@ -309,6 +321,8 @@ FETCH_WORDS = 64
 FETCH_SRC_ADDR = 0x0400            # logical bank 0; granule g (16 bytes) in physical bank g & 1
 FETCH_LD_ADDR = 0x0800             # logical bank 0; the core's two loads, offsets 0 and 16
 FETCH_DST_ADDR = 0x8000            # logical bank 2: the loopback S2MM never meets banks 0 and 1
+FETCH_PRE_ADDR = 0x4000            # chained variant: the lock-free first BD's 4 words, logical bank 1
+FETCH_PRE_WORDS = 4
 FETCH_SCRATCH_ADDR = 0xC000        # target of the sequence's pad writes, banks 6/7
 FETCH_SETTLE_ITERS = 40            # about 10 cycles each; the DMA has been parked since boot
 FETCH_TAIL_ITERS = 100             # keeps the core running so PERF_CNT_2 fills its last packet
@@ -322,8 +336,8 @@ FETCH_CORE_GROUNDING = "PERF_CNT_2"
 FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
 
 
-def fetch_case_name(k: int) -> str:
-    return f"lfk{k:02d}"
+def fetch_case_name(k: int, chained: bool = False) -> str:
+    return f"{'lfc' if chained else 'lfk'}{k:02d}"
 
 
 def fetch_core_asm(k: int) -> str:
@@ -343,9 +357,18 @@ def fetch_core_asm(k: int) -> str:
     return lp.frame(body)
 
 
-def fetch_design_mlir() -> str:
-    """Case-independent design: the k lives in the core program only."""
+def fetch_design_mlir(chained: bool = False) -> str:
+    """Case-independent design: the k lives in the core program only.
+
+    chained: MM2S 0's task starts with a lock-free BD of `pre` that chains to the lock-waiting BD."""
     w = FETCH_WORDS
+    dw = w + (FETCH_PRE_WORDS if chained else 0)
+    p = FETCH_PRE_WORDS
+    pre_buf = (f"    %pre = aie.buffer(%t02) {{address = {FETCH_PRE_ADDR} : i32, sym_name = \"pre\", "
+               f"initial_value = dense<[{', '.join(str(0x0C000000 | j) for j in range(p))}]> : tensor<{p}xi32>}} "
+               f": memref<{p}xi32>\n") if chained else ""
+    first = "^pre" if chained else "^send"
+    pre_bd = (f"    ^pre:\n      aie.dma_bd(%pre : memref<{p}xi32>)\n      aie.next_bd ^send\n") if chained else ""
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
@@ -356,7 +379,7 @@ def fetch_design_mlir() -> str:
     %t02 = aie.tile(0, 2)
     %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
     %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
-    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{w}xi32>
+{pre_buf}    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{dw}xi32>
     %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
     %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
     %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
@@ -368,8 +391,8 @@ def fetch_design_mlir() -> str:
       aie.end
     }}
     %mem = aie.mem(%t02) {{
-      %s0 = aie.dma_start(MM2S, 0, ^send, ^recv_start)
-    ^send:
+      %s0 = aie.dma_start(MM2S, 0, {first}, ^recv_start)
+{pre_bd}    ^send:
       %ca = arith.constant 1 : i32
       aie.use_lock(%lA, AcquireGreaterEqual, %ca)
       aie.dma_bd(%src : memref<{w}xi32>)
@@ -379,7 +402,7 @@ def fetch_design_mlir() -> str:
     ^recv_start:
       %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
     ^recv:
-      aie.dma_bd(%dst : memref<{w}xi32>)
+      aie.dma_bd(%dst : memref<{dw}xi32>)
       aie.next_bd ^end
     ^end:
       aie.end
@@ -499,41 +522,42 @@ def load_level_events(run_dir: Path):
 
 # -- lock-to-fetch: build / run / table ---------------------------------------------
 
-def fetch_build_case(k: int, out: Path) -> None:
-    d = out / fetch_case_name(k)
+def fetch_build_case(k: int, out: Path, chained: bool = False) -> None:
+    d = out / fetch_case_name(k, chained)
     d.mkdir(parents=True, exist_ok=True)
     lp.assemble(fetch_core_asm(k), d / "core.o", "k_core")
-    (d / "base.mlir").write_text(fetch_design_mlir())
+    (d / "base.mlir").write_text(fetch_design_mlir(chained))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
            "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(),
-           "--trace-config-out", "trace_config.json", "--config-test-name", fetch_case_name(k),
+           "--trace-config-out", "trace_config.json", "--config-test-name", fetch_case_name(k, chained),
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
     lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
-    (d / "case.json").write_text(json.dumps({"case": fetch_case_name(k), "k": k}) + "\n")
+    (d / "case.json").write_text(json.dumps({"case": fetch_case_name(k, chained), "k": k, "chained": chained}) + "\n")
 
 
-def fetch_cases_in(out: Path, ks) -> list[int]:
-    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k)).is_dir()]
+def fetch_cases_in(out: Path, ks, chained: bool = False) -> list[int]:
+    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k, chained)).is_dir()]
 
 
 def cmd_fetch_build(args) -> int:
     out = Path(args.out_dir).resolve()
     for k in args.ks or FETCH_KS:
-        fetch_build_case(k, out)
-        print("built", fetch_case_name(k))
+        fetch_build_case(k, out, args.chained)
+        print("built", fetch_case_name(k, args.chained))
     return 0
 
 
 def cmd_fetch_run(args) -> int:
     out = Path(args.out_dir).resolve()
     ok = True
-    for k in fetch_cases_in(out, args.ks):
-        ok = lp.run_case(out, fetch_case_name(k), args.tag, args.backend, output=False) and ok
+    for k in fetch_cases_in(out, args.ks, args.chained):
+        name = fetch_case_name(k, args.chained)
+        ok = lp.run_case(out, name, args.tag, args.backend, output=False) and ok
         if not ok:
-            print(f"{fetch_case_name(k)}: run did not complete; stop")
+            print(f"{name}: run did not complete; stop")
             return 1
     return 0
 
@@ -541,9 +565,9 @@ def cmd_fetch_run(args) -> int:
 def cmd_fetch_table(args) -> int:
     out = Path(args.out_dir).resolve()
     rows = []
-    for k in fetch_cases_in(out, args.ks):
+    for k in fetch_cases_in(out, args.ks, args.chained):
         for run in args.runs:
-            run_dir = out / fetch_case_name(k) / run
+            run_dir = out / fetch_case_name(k, args.chained) / run
             if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
                 rows.append((k, run, {"release": None}))
                 continue
@@ -571,15 +595,18 @@ def main(argv=None) -> int:
     fb = sub.add_parser("fetch-build", help="lock-to-fetch probe: build the cases (default k = 0..15)")
     fb.add_argument("out_dir")
     fb.add_argument("--ks", nargs="*", type=int, default=[])
+    fb.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
     fr.add_argument("out_dir")
     fr.add_argument("tag")
     fr.add_argument("--backend", choices=("hw", "emu"), required=True)
     fr.add_argument("--ks", nargs="*", type=int, default=[])
+    fr.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
     ft = sub.add_parser("fetch-table", help="lock-to-fetch probe: per k and run, events relative to the release")
     ft.add_argument("out_dir")
     ft.add_argument("runs", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
     ft.add_argument("--ks", nargs="*", type=int, default=[])
+    ft.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
     args = ap.parse_args(argv)
     return {"generate": cmd_generate, "build": cmd_build, "run": cmd_run, "analyze": cmd_analyze,
             "fetch-build": cmd_fetch_build, "fetch-run": cmd_fetch_run,

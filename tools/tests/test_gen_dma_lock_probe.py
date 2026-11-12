@@ -224,3 +224,43 @@ def test_levels_from_commands_expands_a_held_level():
     events = g.level_events(cmds, names)
     ts = sorted(e.ts for e in events if e.name == "DMA_MM2S_0_STALLED_LOCK")
     assert ts == list(range(ts[0], ts[0] + 10))
+
+
+# -- chained variant ----------------------------------------------------------------
+
+def test_chained_case_names():
+    assert g.fetch_case_name(3, chained=True) == "lfc03" and g.fetch_case_name(3) == "lfk03"
+
+
+def test_chained_design_bd_order_chain_and_sizes():
+    t = g.fetch_design_mlir(chained=True)
+    assert "aie.dma_start(MM2S, 0, ^pre, ^recv_start)" in t               # the task starts on the short BD
+    pre = t.split("^pre:")[1].split("^send:")[0]
+    assert "use_lock" not in pre                                          # lock-free
+    assert "dma_bd(%pre : memref<4xi32>)" in pre and "aie.next_bd ^send" in pre
+    send = t.split("^send:")[1].split("^recv_start:")[0]
+    assert send.index("use_lock(%lA, AcquireGreaterEqual") < send.index("dma_bd(%src") < send.index("use_lock(%lB, Release")
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert "use_lock" not in recv and "dma_bd(%dst : memref<68xi32>)" in recv   # room for both BDs, no lock
+    assert "memref<68xi32>" in t.split("%dst = ")[1].split("\n")[0]
+
+
+def test_chained_pre_buffer_is_clear_of_the_measured_banks():
+    assert g.FETCH_PRE_ADDR >> 14 == 1                                    # logical bank 1: not src's, not the loads'
+    assert g.FETCH_PRE_ADDR >> 14 not in (g.FETCH_SRC_ADDR >> 14, g.FETCH_LD_ADDR >> 14, g.FETCH_DST_ADDR >> 14)
+    assert 'sym_name = "pre"' in g.fetch_design_mlir(chained=True)
+
+
+def test_first_bd_design_is_unchanged_by_the_chained_option():
+    t = g.fetch_design_mlir()
+    assert "^pre" not in t and "memref<64xi32>" in t.split("^recv:")[1] and "%pre" not in t
+    assert g.fetch_design_mlir(chained=False) == t
+
+
+def test_chained_design_keeps_the_safety_properties():
+    t = g.fetch_design_mlir(chained=True)
+    seq = t.split("aie.runtime_sequence")[1]
+    assert "aiex.set_lock(%lGo" in seq
+    for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync"):
+        assert forbidden not in seq
+    assert "aie.shim_dma_allocation" not in t
