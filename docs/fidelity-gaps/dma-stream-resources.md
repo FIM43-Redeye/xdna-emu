@@ -413,9 +413,12 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   - *Short chained locked BDs.* Chained locked BDs of 1 to 3 words with the lock already free finish once every
     4 cycles in the emulator (a lock-free chain of the same BDs: every N cycles); silicon is unmeasured for
     them. The emulator requests the next BD's lock one cycle after the previous BD's finish (grant at the
-    finish + 1, first access two cycles later); silicon raises STALLED_LOCK of the waiting BD one cycle before
-    the previous finish (259 of 259 rows), so it probably pre-acquires and a small locked objectfifo would run
-    faster there. Also unmeasured: whether the lock-released-by-the-previous-finish 2-word BD's port gap of 2 is
+    finish + 1, first access two cycles later). On silicon the waiting BD's STALLED_LOCK rises relative to the
+    previous BD's finish at a point that depends on the chain before it: one cycle after the finish when the
+    previous BD is 16 words or longer, two cycles before it when the previous BD is 8 words or shorter (every
+    waiting row of a sweep over the previous BD's length; 9 to 15 words not measured). The rule behind that is
+    not known yet, so whether silicon requests the lock ahead of the finish for short BDs, and whether a small
+    locked objectfifo runs faster there, is open. Also unmeasured: whether the lock-released-by-the-previous-finish 2-word BD's port gap of 2 is
     right.
   - *Packet header.* The header of a lock-started compute MM2S's packet BD leaves at the grant, 6 cycles ahead of
     its payload (4 words: g + 0, then g + 6..9); on silicon header and payload are contiguous.
