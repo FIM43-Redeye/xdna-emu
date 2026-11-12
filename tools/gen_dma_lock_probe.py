@@ -72,6 +72,19 @@ fills the last core packet, see gen_lock_pulse_probe). The memory-module lock ev
 selector events (LOCK_n_REL follows Locks_Event_Selection_n), but selector 0 resets to
 lock 0, so lock A is lock 0 and nothing is programmed.
 
+Lock-synchronised variant (`--sync`, cases lsDD / lsfree / lsaDDkKK / lsbDDkKK). The chained task's pre BD
+waits for a start lock that the runtime sequence sets after the trace is armed, and releases a sync lock
+when it finishes; the core blocks on the sync lock, runs `event #0`, d nops, then releases lock A, on which
+the 64-word BD is already (or is about to be) parked. So the release comes a controlled number of cycles after
+the channel left the pre BD: d sweeps from "lock free when the BD asks" up to a long-parked channel. The table
+prints per case and run: d (measured: release minus the pre BD's FINISHED_BD), the channel's STALLED_LOCK rise
+after that finish, grant minus release, MM2S and S2MM finish minus grant, and conflicts relative to the grant.
+`--free` adds lsfree (lock A starts at 1). Bank cases (lsa/lsb) add one core load k nops after the release.
+
+    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR --sync [--ds 0 4 8] [--banks none|0|1] [--ks ..] [--free]
+    python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu --sync [same selection]
+    python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] --sync [same selection]
+
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained] [--banks both 0 1]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...] [--chained] [--banks ...]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...] [--chained] [--banks ...]
@@ -752,6 +765,321 @@ def cmd_fetch_table(args) -> int:
     return 0
 
 
+# -- lock-synchronised variant (--sync): the release comes a controlled d cycles after the pre BD ------
+
+SYNC_LOCK_A, SYNC_LOCK_SYNC, SYNC_LOCK_START, SYNC_LOCK_END = 0, 1, 2, 3   # A: the lock the 64-word BD waits on (LOCK_0_REL)
+SYNC_PRE2_ADDR = 0x4040            # the second pre BD's words (--pre2), logical bank 1 like `pre`
+SYNC_DEFAULT_DS = tuple(range(25)) + tuple(range(26, 41, 2))
+SYNC_MAX_D = 40
+FREE_D = 20                        # the lock-free-on-request case's core delay (lock A starts at 1)
+SYNC_MAIN_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD"]
+SYNC_CONFLICT_EVENTS = ["CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
+SYNC_BANK_LETTER = {"0": "a", "1": "b"}
+
+
+@dataclass(frozen=True)
+class SyncCase:
+    d: int                         # nops between the core's marker and its release of lock A
+    bank: str = "none"             # "none": no core memory access; "0"/"1": one load k nops after the release
+    k: int = 0
+    free: bool = False             # lock A starts at 1: the BD finds it free when it asks
+    pre2: int = 0                  # words of a second lock-free pre BD between the sync pre BD and the waiting
+                                   # BD (0: none). It delays the moment the channel asks for lock A, which
+                                   # moves the core's release from "long after" to "before" the request.
+
+    @property
+    def label(self):
+        """Row label in the tables: the nominal d, or "free"."""
+        return "free" if self.free else self.d
+
+    @property
+    def name(self) -> str:
+        stem = "lt" if self.pre2 else "ls"
+        if self.free:
+            return f"{stem}free"
+        if self.bank == "none":
+            return f"{stem}{self.d:02d}"
+        return f"{stem}{SYNC_BANK_LETTER[self.bank]}{self.d:02d}k{self.k:02d}"
+
+
+def sync_specs(ds, ks, banks, free: bool, pre2: int = 0) -> list[SyncCase]:
+    """The cases of a --sync selection: every d for bank none; every (bank, d, k) for a load bank."""
+    out = []
+    for bank in banks:
+        for d in ds:
+            for k in ([0] if bank == "none" else ks or FETCH_DEFAULT_KS):
+                c = SyncCase(d, bank, k, pre2=pre2)
+                sync_validate(c)
+                out.append(c)
+    if free:
+        out.append(SyncCase(FREE_D, free=True, pre2=pre2))
+    return out
+
+
+def sync_validate(c: SyncCase) -> None:
+    if not 0 <= c.d <= SYNC_MAX_D:
+        raise ValueError(f"d must be 0..{SYNC_MAX_D}")
+    if not 0 <= c.pre2 <= 32:
+        raise ValueError("pre2 must be 0..32 words")
+    if c.bank not in ("none", "0", "1"):
+        raise ValueError("bank must be none, 0 or 1")
+    if c.bank != "none" and c.k not in FETCH_KS:
+        raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+
+
+def sync_core_asm(c: SyncCase) -> str:
+    """Block on the SYNC lock (released by the pre BD when it finishes), `event #0`, d nops, release A,
+    then optionally one load k nops later. r2 = +1 releases, r3 = -1 acquires. p0 = `ldbuf`.
+    The core waits on nothing else, so it cannot hang unless the pre BD never finishes."""
+    sync_validate(c)
+    n = lp.nops
+    loads = [*n(c.k), *FETCH_LOADS[c.bank]] if c.bank != "none" else []
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + SYNC_LOCK_SYNC}, r3", *n(LOCK_SETTLE_BUNDLES),
+            "  event #0", *n(c.d), f"  rel #{OWN + SYNC_LOCK_A}, r2", *loads, *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def sync_design_mlir(c: SyncCase) -> str:
+    """MM2S 0: pre BD (acquire START, 4 words of `pre`, release SYNC) chained to the BD that waits on A.
+
+    The runtime sequence's only action is setting START, after the trace is armed, so the pre BD runs
+    (and releases SYNC for the core) inside the trace window. The S2MM takes both BDs' words."""
+    w, p = FETCH_WORDS, FETCH_PRE_WORDS
+    q = c.pre2
+    dw = w + p + q
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pre_init = ", ".join(str(0x0C000000 | j) for j in range(p))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    pre2_init = ", ".join(str(0x0D000000 | j) for j in range(q))
+    pre2_buf = (f"    %pre2 = aie.buffer(%t02) {{address = {SYNC_PRE2_ADDR} : i32, sym_name = \"pre2\", "
+                f"initial_value = dense<[{pre2_init}]> : tensor<{q}xi32>}} : memref<{q}xi32>\n") if q else ""
+    pre2_bd = (f"    ^pre2:\n      aie.dma_bd(%pre2 : memref<{q}xi32>)\n      aie.next_bd ^send\n") if q else ""
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+    %pre = aie.buffer(%t02) {{address = {FETCH_PRE_ADDR} : i32, sym_name = "pre", initial_value = dense<[{pre_init}]> : tensor<{p}xi32>}} : memref<{p}xi32>
+{pre2_buf}    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{dw}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lA = aie.lock(%t02, {SYNC_LOCK_A}) {{init = {1 if c.free else 0} : i32, sym_name = "lA"}}
+    %lSync = aie.lock(%t02, {SYNC_LOCK_SYNC}) {{init = 0 : i32, sym_name = "lSync"}}
+    %lStart = aie.lock(%t02, {SYNC_LOCK_START}) {{init = 0 : i32, sym_name = "lStart"}}
+    %lEnd = aie.lock(%t02, {SYNC_LOCK_END}) {{init = 0 : i32, sym_name = "lEnd"}}
+    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(MM2S, 0, ^pre, ^recv_start)
+    ^pre:
+      %cs = arith.constant 1 : i32
+      aie.use_lock(%lStart, AcquireGreaterEqual, %cs)
+      aie.dma_bd(%pre : memref<{p}xi32>)
+      %cy = arith.constant 1 : i32
+      aie.use_lock(%lSync, Release, %cy)
+      aie.next_bd {"^pre2" if q else "^send"}
+{pre2_bd}    ^send:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%src : memref<{w}xi32>)
+      %ce = arith.constant 1 : i32
+      aie.use_lock(%lEnd, Release, %ce)
+      aie.next_bd ^end
+    ^recv_start:
+      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
+    ^recv:
+      aie.dma_bd(%dst : memref<{dw}xi32>)
+      aie.next_bd ^end
+    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lStart, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def sync_inject_args(bank: str) -> list[str]:
+    events = SYNC_MAIN_EVENTS + (SYNC_CONFLICT_EVENTS if bank != "none" else [])
+    return ["--memmod-sweep-events", ",".join(events),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
+
+
+def sync_row(events) -> dict:
+    """One run as numbers around the lock-A release and the lock grant (memory-module timer).
+
+    The MM2S FINISHED_BD events are the pre BDs' and the 64-word BD's (last); "pre_fin" is the one just
+    before it (the last pre BD, whose finish is when the channel moves to the waiting BD) and d is
+    measured from it; d1 is measured from the first (the sync BD, which released the core). The channel's
+    STALLED_LOCK interval of the waiting BD is the one that holds the release (it may rise a cycle
+    before the pre BD's finish stamp, so park can be -1; the earlier interval is the pre BD's wait for
+    the start lock). grant = the cycle after it falls; no interval holding the release means the lock
+    was free when the BD asked."""
+    mem = {}
+    core = {}
+    for e in events:
+        if e.row == FETCH_ROW:
+            (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+    rels = sorted(mem.get("LOCK_0_REL", []))
+    if not rels:
+        return {"release": None}
+    rel = rels[0]
+    fins = sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", [])))
+    r: dict = {"release": rel, "pre_fin": None, "d": None, "park": None, "grant": None,
+               "mm2s_after_grant": None, "s2mm_after_grant": None, "fin_after_pre": None,
+               "fin_after_release": None, "d1": None, "conflicts": [], "core_event0": None}
+    if len(fins) < 2:
+        return r
+    big = fins[-1]
+    pre = fins[-2]
+    r["pre_fin"], r["d"], r["d1"] = pre, rel - pre, rel - fins[0]
+    r["fin_after_pre"] = big - pre
+    stalls = [run for run in _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", [])) if run[0] <= rel <= run[1] + 1]
+    anchor = rel
+    if stalls:
+        first, last = stalls[0]
+        r["park"] = first - pre
+        r["grant"] = last + 1 - rel
+        anchor = last + 1
+        r["mm2s_after_grant"] = big - anchor
+    r["fin_after_release"] = big - rel
+    s2 = [t for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t > pre]
+    if s2 and stalls:
+        r["s2mm_after_grant"] = s2[-1] - anchor
+    conflicts = []
+    for bank in ("CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"):
+        conflicts += [(bank, t - anchor) for t in sorted(set(mem.get(bank, []))) if t >= rel]
+    r["conflicts"] = sorted(conflicts, key=lambda c: (c[1], c[0]))
+    ev0 = sorted(core.get("INSTR_EVENT_0", []))
+    r["core_event0"] = ev0[0] - rel if ev0 else None
+    return r
+
+
+def _label_key(label) -> tuple:
+    """Sort key of a row label: a nominal d (int) first, then names such as "free"."""
+    return (0, label, "") if isinstance(label, int) else (1, 0, label)
+
+
+def _num(v, fmt="+d") -> str:
+    return "?" if v is None else format(v, fmt)
+
+
+def format_sync_table(rows) -> str:
+    """rows: (nominal d, run, sync_row dict), sorted by d then run. Cycle columns: d_meas = release minus
+    the last pre BD's finish (d1: the first pre BD's); park = STALLED_LOCK rise after the pre finish; grant = after the release;
+    mm2s-g / s2mm-g = finish after the grant; fin-pre = the 64-word BD's finish after the pre finish;
+    conflicts are cycles after the grant."""
+    lines = [f"{'d':>4} {'run':<8} {'d_meas':>6} {'d1':>4}  park  grant  mm2s-g  s2mm-g  fin-pre  conflicts"]
+    for d, run, r in sorted(rows, key=lambda x: (_label_key(x[0]), x[1])):
+        d = f"{d:>4}"
+        if r["release"] is None:
+            lines.append(f"{d} {run:<8} no LOCK_0_REL event")
+            continue
+        if r["pre_fin"] is None:
+            lines.append(f"{d} {run:<8} release seen, fewer than two MM2S FINISHED_BD events")
+            continue
+        if r["grant"] is None:
+            wait = f"park n/a (lock free on request)  fin-release +{r['fin_after_release']}"
+            grant = ""
+        else:
+            wait = f"park {r['park']:>3}  grant {r['grant']:+d}  mm2s-g {_num(r['mm2s_after_grant'])}  " \
+                   f"s2mm-g {_num(r['s2mm_after_grant'])}"
+        conf = " ".join(f"{b.replace('CONFLICT_DM_', '')}@+{t}" for b, t in r["conflicts"]) or "-"
+        lines.append(f"{d} {run:<8} {r['d']:>6} {r['d1']:>4}  {wait}  fin-pre {r['fin_after_pre']}  conflicts {conf}")
+    return "\n".join(lines)
+
+
+def format_sync_summary(rows) -> str:
+    """One line per d: every run's grant-minus-release and finish-minus-grant side by side."""
+    by_d: dict = {}
+    for d, run, r in rows:
+        by_d.setdefault(d, []).append((run, r))
+    lines = ["side by side per d (run g+<grant minus release>/f<MM2S finish minus grant>; d_meas in brackets):"]
+    for d in sorted(by_d, key=_label_key):
+        cells = []
+        for run, r in sorted(by_d[d], key=lambda x: x[0]):
+            if r.get("grant") is None:
+                cells.append(f"{run} nowait" if r.get("pre_fin") is not None else f"{run} n/a")
+            else:
+                cells.append(f"{run} g+{r['grant']}/f{r['mm2s_after_grant']}[{r['d']}]")
+        lines.append(f"d={d}  " + "  ".join(cells))
+    return "\n".join(lines)
+
+
+def sync_build_case(c: SyncCase, out: Path) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(sync_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(sync_design_mlir(c))
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *sync_inject_args(c.bank),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "d": c.d, "bank": c.bank, "k": c.k,
+                                             "free": c.free, "pre2": c.pre2, "sync": True}) + "\n")
+
+
+def sync_selection(args) -> list[SyncCase]:
+    if args.free_only:
+        return [SyncCase(FREE_D, free=True, pre2=args.pre2)]
+    return sync_specs(args.ds or SYNC_DEFAULT_DS, args.ks, args.banks or ["none"], args.free, args.pre2)
+
+
+def cmd_sync_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sync_selection(args):
+        sync_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_sync_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sync_selection(args):
+        if not (out / c.name).is_dir():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_sync_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in sync_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c.label, run, {"release": None}))
+                continue
+            rows.append((c.label, run, sync_row(load_level_events(run_dir))))
+    print(format_sync_table(rows))
+    print()
+    print(format_sync_summary(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -772,7 +1100,7 @@ def main(argv=None) -> int:
     fb.add_argument("out_dir")
     fb.add_argument("--ks", nargs="*", type=int, default=[])
     fb.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
-    fb.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"],
+    fb.add_argument("--banks", nargs="+", choices=FETCH_BANKS + ("none",), default=None,
                     help="both = two loads (lfk/lfc); 0 or 1 = one load on that bank (lfa/lfb chained, lfd/lfe first-BD)")
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
     fr.add_argument("out_dir")
@@ -780,14 +1108,28 @@ def main(argv=None) -> int:
     fr.add_argument("--backend", choices=("hw", "emu"), required=True)
     fr.add_argument("--ks", nargs="*", type=int, default=[])
     fr.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
-    fr.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"], help="as for fetch-build")
+    fr.add_argument("--banks", nargs="+", choices=FETCH_BANKS + ("none",), default=None, help="as for fetch-build")
     ft = sub.add_parser("fetch-table", help="lock-to-fetch probe: per k and run, events relative to the release")
     ft.add_argument("out_dir")
     ft.add_argument("runs", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
     ft.add_argument("--ks", nargs="*", type=int, default=[])
     ft.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
-    ft.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"], help="as for fetch-build")
+    ft.add_argument("--banks", nargs="+", choices=FETCH_BANKS + ("none",), default=None, help="as for fetch-build")
+    for sp in (fb, fr, ft):
+        sp.add_argument("--sync", action="store_true",
+                        help="the lock-synchronised variant (cases lsDD, lsfree, lsaDDkKK/lsbDDkKK): --ds are core delays, "
+                             "--banks none|0|1 (default none), --ks the load offsets of the bank cases")
+        sp.add_argument("--ds", nargs="*", type=int, default=[], help="--sync: core delays d (default 0..24, 26..40 by 2)")
+        sp.add_argument("--free", action="store_true", help="--sync: also the lock-free-on-request case (lsfree)")
+        sp.add_argument("--pre2", type=int, default=0, help="--sync: words of a second lock-free pre BD (cases ltDD...)")
+        sp.add_argument("--free-only", action="store_true", help="--sync: only lsfree")
     args = ap.parse_args(argv)
+    if args.cmd.startswith("fetch-"):
+        if args.sync:
+            return {"fetch-build": cmd_sync_build, "fetch-run": cmd_sync_run, "fetch-table": cmd_sync_table}[args.cmd](args)
+        args.banks = args.banks or ["both"]
+        if any(b == "none" for b in args.banks):
+            ap.error("--banks none needs --sync")
     return {"generate": cmd_generate, "build": cmd_build, "run": cmd_run, "analyze": cmd_analyze,
             "fetch-build": cmd_fetch_build, "fetch-run": cmd_fetch_run,
             "fetch-table": cmd_fetch_table}[args.cmd](args)
