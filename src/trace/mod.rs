@@ -367,7 +367,10 @@ pub const SHIM_LOCK_EVENT_IDS: LockEventIds = LockEventIds { acq_ge: 40, rel: 41
 ///
 /// Reset behaviour (all selectors on lock 0) is silicon-confirmed for the
 /// memtile: an unprogrammed trace of a design using locks 0 and 1 shows
-/// LOCK_SEL1_* timestamped identically to LOCK_SEL0_*.
+/// LOCK_SEL1_* timestamped identically to LOCK_SEL0_*. For the compute
+/// memory module and the shim it is database-derived, silicon check pending
+/// (the smallest probe: trace LOCK_SEL1_ACQ_GE / LOCK_1_ACQ_GE on a design
+/// that alternates locks 0 and 1 without programming the selectors).
 pub fn lock_event_hw_ids(
     event: &EventType,
     ids: LockEventIds,
