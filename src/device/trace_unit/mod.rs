@@ -252,6 +252,15 @@ const REPEAT1_MAX: u64 = (1 << 10) - 1;
 /// written one cycle after its frame.
 const FRAME_TOKEN_LAG: u64 = 1;
 
+/// Cycles the Skip fill in front of a multi-byte token that would straddle a payload word is
+/// written before the token itself. Silicon (shim trace packets, three captures of every traced
+/// bridge test): a packet finished by such a fill reaches the shim S2MM one cycle sooner than
+/// one finished by the token's own last byte would, 10 cycles after the cycle the token covers up
+/// to against 11 (Multiple0 frames, saturated Repeat1(1023), run-ending Repeat1 alike; about 400
+/// packets per capture). Structural, not tunable; why the fill leads (the token's size known a
+/// cycle before its bytes are written) is INFERRED.
+const PAD_LEAD: u64 = 1;
+
 /// Cycles a completed packet waits in the output stage (`xdna-archspec`, measured on the shim).
 const PACKET_EMIT_CYCLES: u64 = xdna_archspec::aie2::timing::STREAM_TRACE_PACKET_EMIT_CYCLES as u64;
 
@@ -1028,10 +1037,17 @@ impl TraceUnit {
     /// Append one mode-0 opcode. Silicon never lets a multi-byte opcode straddle a 32-bit
     /// word of the packet payload: it fills the rest of the word with Skip (0xFE) and starts
     /// the opcode in the next one (all 12.8k fills in the silicon corpus are of this kind).
+    ///
+    /// The fill goes in one cycle before the opcode (`PAD_LEAD`): a packet the fill completes
+    /// is timed from `token_cycle - 1`.
     fn push_op(&mut self, op: &[u8]) {
         let used = self.byte_buffer.len() % 4;
         if op.len() > 1 && used + op.len() > 4 {
             self.byte_buffer.extend(std::iter::repeat(0xFE).take(4 - used));
+            let token_cycle = self.token_cycle;
+            self.token_cycle = token_cycle.saturating_sub(PAD_LEAD);
+            self.try_emit_packet();
+            self.token_cycle = token_cycle;
         }
         self.byte_buffer.extend_from_slice(op);
         self.try_emit_packet();

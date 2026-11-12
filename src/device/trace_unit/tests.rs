@@ -1820,3 +1820,64 @@ fn hand_off_does_not_depend_on_what_else_happens_in_the_ready_cycle() {
         assert_eq!(first_handoff(&mut tu, 5..=ready + 20), Some(ready), "dirty = {dirty}");
     }
 }
+
+// -- Packets finished by Skip padding ---------------------------------------------------------
+//
+// A multi-byte token that would straddle a payload word is preceded by Skip bytes; when those
+// bytes are the last of a packet, the packet is finished by the padding and the token starts the
+// next one. Silicon (shim trace packets, three captures, every traced bridge test): such a packet
+// reaches the shim S2MM 10 cycles after the cycle the token that did not fit covers up to, for a
+// Multiple0 frame (16 + 52, 12 + 37, 12 + 37 packets), a saturated Repeat1(1023) (36, 45, 29) and
+// a Repeat1 ending a run with the next frame in the following cycle (49, 57, 60), and 18 for one
+// with 8 idle cycles before the next frame (12, 13, 14): one cycle sooner than a packet whose last
+// byte is that token's own (11, and gap + 10). The padding is written one cycle before the token.
+
+/// Test: a Multiple0 frame of cycle `t_f` that does not fit: the padded packet is handed over at
+/// `t_f + EMIT`, one cycle before a packet the frame itself would have completed.
+#[test]
+fn a_packet_finished_by_padding_before_a_frame_is_handed_over_at_t_f_plus_emit() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(27, 0xFE); // one byte left in the last word: a 2-byte frame straddles it
+    tu.notify_event(37, 5, None);
+    tu.notify_event(38, 5, None); // slots 0 and 1: Multiple0 (2 bytes)
+    assert_eq!(first_handoff(&mut tu, 5..=200), Some(5 + EMIT));
+    assert_eq!(tu.byte_buffer.len(), 2, "the frame starts the next packet");
+}
+
+/// Test: a saturated Repeat1(1023) that does not fit: written one cycle after the 1023rd repeat,
+/// the padded packet before it handed over at the 1023rd repeat + `EMIT`.
+#[test]
+fn a_packet_finished_by_padding_before_a_saturated_repeat_leaves_at_the_1023rd_repeat_plus_emit() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(26, 0xFE); // the level's Single0 makes 27: the Repeat1 straddles
+    tu.set_event_level(26, 1, true); // frame in cycle 1, repeats in 2..=1024
+    let t_s = 1024;
+    assert_eq!(first_handoff(&mut tu, 1..=t_s + 100), Some(t_s + EMIT));
+    assert_eq!(tu.byte_buffer, vec![0xDB, 0xFF], "the Repeat1(1023) starts the next packet");
+}
+
+/// Test: a Repeat1 ending a run, written when the next different frame is sampled in `t_n`, that
+/// does not fit: the padded packet is handed over at `t_n - 1 + EMIT`, for the next frame in the
+/// cycle right after the run and 8 idle cycles later.
+#[test]
+fn a_packet_finished_by_padding_before_a_run_ending_repeat_leaves_a_cycle_before_the_next_frame() {
+    for gap in [1u64, 9] {
+        let (mut tu, _) = held_run_unit();
+        tu.byte_buffer.clear();
+        tu.byte_buffer.resize(26, 0xFE);
+        tu.set_event_level(26, 1, true); // frame in 1 (27 bytes), Repeat1(20) for 2..=21
+        let last_covered = 21;
+        commit_each(&mut tu, 1..=last_covered);
+        tu.set_event_level(26, last_covered + 1, false);
+        let t_n = last_covered + gap;
+        commit_each(&mut tu, last_covered + 1..=t_n - 1);
+        tu.notify_event(37, t_n, None);
+        assert_eq!(
+            first_handoff(&mut tu, t_n..=t_n + 100),
+            Some(t_n - 1 + EMIT),
+            "gap {gap}: the padding goes in one cycle before the Repeat"
+        );
+    }
+}
