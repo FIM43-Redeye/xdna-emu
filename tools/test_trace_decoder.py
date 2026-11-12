@@ -660,3 +660,102 @@ def test_a_sync_is_one_wrap_of_the_cycles_field_and_a_repeat_repeats_it():
     ts = [e.ts for e in events]
     assert ts == [100 + 3 * (1 << 18) + 213569, 100 + 2 * (3 * (1 << 18) + 213569)]
     assert ts[1] - ts[0] == 1_000_001
+
+
+# ---------------------------------------------------------------------------
+# held levels: true assertion intervals
+# ---------------------------------------------------------------------------
+#
+# A level that stays high is written as an open frame, one (mask, 0) frame and a Repeat, and the
+# mlir-aie rebuild emits no event for the Repeat's cycles.  rebuild_timeline_mode0_levels adds
+# them; assertion_intervals turns the per-cycle events into (first, last) runs.
+
+_L = 0b001      # level slot 0
+_L2 = 0b010     # level slot 1
+_P = 0b100      # foreign pulse / edge slot 2
+_TILE = (0, 2, 1)
+_NAMES = {0: {"2,1": ["LEVEL", "LEVEL2", "PULSE"] + [""] * 5}}
+
+
+def _levels(cmds):
+    from trace_decoder import assertion_intervals, rebuild_timeline_mode0_levels
+    events = rebuild_timeline_mode0_levels({_TILE: [StartCmd(0)] + cmds}, _NAMES)
+    return events, assertion_intervals(events)
+
+
+def _runs(intervals, slot):
+    return intervals.get((0, 2, 1, slot), [])
+
+
+def test_a_held_level_alone_is_one_interval():
+    # open frame at ts 3 (2 idle cycles), (mask,0) at 4, Repeat(5): asserted 3..9.
+    events, iv = _levels([EventCmd(_L, 2), EventCmd(_L, 0), RepeatCmd(5)])
+    assert _runs(iv, 0) == [(3, 9)]
+    assert [e.ts for e in events] == list(range(3, 10))
+
+
+def test_a_foreign_pulse_inside_a_held_level_leaves_it_one_interval():
+    cmds = [EventCmd(_L, 0), EventCmd(_L, 0), RepeatCmd(3),   # level 1..5
+            EventCmd(_L | _P, 0),                             # pulse in cycle 6
+            EventCmd(_L, 0), RepeatCmd(2)]                    # level 7..9
+    _, iv = _levels(cmds)
+    assert _runs(iv, 0) == [(1, 9)]
+    assert _runs(iv, 2) == [(6, 6)]
+
+
+@pytest.mark.parametrize("repeat", [
+    [RepeatCmd(15)],                    # Repeat0 limit
+    [RepeatCmd(16)],                    # first Repeat1 count
+    [RepeatCmd(1023)],                  # Repeat1 limit
+    [RepeatCmd(1023), RepeatCmd(1023), RepeatCmd(7)],   # chained 1023-chunks
+])
+def test_a_held_level_across_repeat_boundaries_is_one_interval(repeat):
+    total = sum(r.count for r in repeat)
+    _, iv = _levels([EventCmd(_L, 0), EventCmd(_L, 0)] + repeat)
+    assert _runs(iv, 0) == [(1, 2 + total)]
+
+
+def test_a_level_dropped_for_exactly_one_cycle_is_two_intervals():
+    cmds = [EventCmd(_L, 0), EventCmd(_L, 0), RepeatCmd(2),   # 1..4
+            EventCmd(_L, 1), EventCmd(_L, 0), RepeatCmd(2)]           # 6..9
+    _, iv = _levels(cmds)
+    assert _runs(iv, 0) == [(1, 4), (6, 9)]
+
+
+def test_two_overlapping_levels_keep_their_own_extents():
+    cmds = [EventCmd(_L, 0), EventCmd(_L, 0), RepeatCmd(3),           # L 1..5
+            EventCmd(_L | _L2, 0), EventCmd(_L | _L2, 0), RepeatCmd(2),   # both 6..9
+            EventCmd(_L2, 0), EventCmd(_L2, 0), RepeatCmd(1)]         # L2 only 10..12
+    _, iv = _levels(cmds)
+    assert _runs(iv, 0) == [(1, 9)]
+    assert _runs(iv, 1) == [(6, 12)]
+
+
+def test_an_edge_event_repeated_across_idle_cycles_is_not_turned_into_a_level():
+    # Repeat after a cycles>0 frame replays the frame (idle + event) each time: pulses 4 apart.
+    events, iv = _levels([EventCmd(_P, 3), RepeatCmd(4)])
+    assert [e.ts for e in events] == [4, 8, 12, 16, 20]
+    assert _runs(iv, 2) == [(t, t) for t in (4, 8, 12, 16, 20)]
+
+
+def test_a_repeat_after_a_sync_is_not_a_hold():
+    from trace_decoder.decode import _SYNC_CYCLE_ADVANCE
+    _, iv = _levels([EventCmd(_L, 0), SyncCmd(), RepeatCmd(2), EventCmd(_L, 0)])
+    # The Repeat repeats the Sync (two more wraps), it does not hold the level.
+    assert _runs(iv, 0) == [(1, 1), (2 + 3 * _SYNC_CYCLE_ADVANCE, 2 + 3 * _SYNC_CYCLE_ADVANCE)]
+
+
+@pytest.mark.parametrize("cmds", [
+    [EventCmd(_L, 2), EventCmd(_L, 0), RepeatCmd(5)],
+    [EventCmd(_L, 0), EventCmd(_L, 0), RepeatCmd(3), EventCmd(_L | _P, 0), EventCmd(_L, 0),
+     RepeatCmd(2)],
+    [EventCmd(_P, 3), RepeatCmd(4)],
+    [EventCmd(_L, 1), EventCmd(_L, 0), RepeatCmd(1023), RepeatCmd(5), EventCmd(_P, 9)],
+])
+def test_levels_rebuild_extends_the_plain_rebuild_without_changing_it(cmds):
+    from trace_decoder import rebuild_timeline_mode0, rebuild_timeline_mode0_levels
+    full = [StartCmd(0)] + cmds
+    plain = rebuild_timeline_mode0({_TILE: full}, _NAMES)
+    levels = rebuild_timeline_mode0_levels({_TILE: full}, _NAMES)
+    assert set(plain) <= set(levels)
+    assert len(levels) >= len(plain)

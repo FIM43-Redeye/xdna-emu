@@ -56,6 +56,8 @@ from .decode import (
     parse_trace,
     parse_trace_auto,
     rebuild_timeline_mode0,
+    rebuild_timeline_mode0_levels,
+    assertion_intervals,
     rebuild_timeline_mode1,
     rebuild_perfetto_mode0,
 )
@@ -78,6 +80,8 @@ __all__ = [
     "parse_trace",
     "parse_trace_auto",
     "rebuild_timeline_mode0",
+    "rebuild_timeline_mode0_levels",
+    "assertion_intervals",
     "rebuild_timeline_mode1",
     "rebuild_perfetto_mode0",
 ]

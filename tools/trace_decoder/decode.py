@@ -34,7 +34,8 @@ authoritative -- do not "fix" the emitter to satisfy this module.
 from __future__ import annotations
 
 import logging
-from typing import Iterable
+from dataclasses import dataclass
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -186,6 +187,122 @@ def _emit_event(
     )
 
 
+@dataclass(frozen=True)
+class _Mode0Step:
+    """One decoded stretch of a mode-0 tile stream, as the timeline walk sees it.
+
+    A frame (and each iteration of a Repeat that follows a cycles>0 frame) is one cycle:
+    ``count == 1``, ``held`` False.  A Repeat that follows a cycles==0 frame is a *hold*: the
+    previous frame's mask stays asserted for ``count`` further consecutive cycles
+    (``ts .. ts + count - 1``).  The mlir-aie convention emits no event for those cycles, it only
+    advances the timer, so ``rebuild_timeline_mode0`` skips held steps; a held level (STALL,
+    STARVATION, PORT_RUNNING ...) is written exactly this way, which makes its cycles visible
+    only to a consumer that walks the holds too.
+    """
+
+    ts: int
+    cmd_index: int
+    bits: int
+    count: int = 1
+    held: bool = False
+
+
+def _walk_mode0(cmds: list[TraceCommand]) -> Iterator[_Mode0Step]:
+    """The mode-0 timeline walk of one tile, shared by every mode-0 rebuild.
+
+    The timer increments by 1 cycle implicitly per Event frame, then by the frame's ``cycles``
+    value (matches mlir-aie's convert_commands_to_json so cycle counts agree exactly).
+    ``cmd_index`` counts EventCmds (and cycles>0 Repeat iterations) since the most recent Start;
+    soc = ts - cmd_index strips the +1-per-cmd implicit increment that the mlir-aie convention
+    bakes into ts.  Reset on every Start (mid-stream re-anchor in modes 1/2).
+    """
+    timer = 0
+    cmd_index = 0
+    after_sync = False
+    prev_event: EventCmd | None = None
+    for cmd in cmds:
+        if isinstance(cmd, StartCmd):
+            timer = cmd.timer_value
+            cmd_index = 0
+            prev_event = None
+            continue
+        if isinstance(cmd, SyncCmd):
+            timer += _SYNC_CYCLE_ADVANCE
+            after_sync = True
+            continue
+        if isinstance(cmd, RepeatCmd) and after_sync:
+            timer += cmd.count * _SYNC_CYCLE_ADVANCE
+            continue
+        after_sync = False
+        if isinstance(cmd, StopCmd):
+            # No timeline contribution; mode 0 doesn't actually emit
+            # a Stop opcode in the byte stream (it terminates with
+            # padding / end-of-buffer).
+            continue
+        if isinstance(cmd, EventCmd):
+            timer += 1  # implicit per-command increment
+            timer += cmd.cycles
+            cmd_index += 1
+            yield _Mode0Step(timer, cmd_index, cmd.event_bits)
+            prev_event = cmd
+            continue
+        if isinstance(cmd, RepeatCmd):
+            if prev_event is None:
+                # Repeat with no preceding event is malformed; skip
+                # rather than crash.
+                continue
+            cycles = prev_event.cycles
+            if cycles == 0:
+                # Zero-cycle repeats just extend the timer linearly:
+                # the decoder advances timer by `count` without firing
+                # the implicit per-EventCmd +1, so cmd_index must not
+                # advance either -- the timer increase in this region
+                # represents real SoC cycles passing with no events,
+                # which is exactly the case where ts == SoC.
+                yield _Mode0Step(timer + 1, cmd_index, prev_event.event_bits,
+                                 count=cmd.count, held=True)
+                timer += cmd.count
+            else:
+                for _ in range(cmd.count):
+                    timer += 1
+                    timer += cycles
+                    cmd_index += 1
+                    yield _Mode0Step(timer, cmd_index, prev_event.event_bits)
+
+
+def _rebuild_mode0(
+    commands_per_tile: dict[tuple[int, int, int], list[TraceCommand]],
+    slot_names: dict[int, dict[str, list[str]]],
+    *,
+    include_held: bool,
+) -> list[Event]:
+    events: list[Event] = []
+    for (pkt_type, row, col), cmds in commands_per_tile.items():
+        # Keys are stringified row,col (matching mlir-aie's convention)
+        names_for_pt = slot_names.get(pkt_type, {})
+        slot_table = names_for_pt.get(f"{row},{col}", [""] * 8)
+        for step in _walk_mode0(cmds):
+            if step.held and not include_held:
+                continue
+            for k in range(step.count):
+                ts = step.ts + k
+                for slot in range(8):
+                    if step.bits & (1 << slot):
+                        name = slot_table[slot] if slot < len(slot_table) else ""
+                        _emit_event(
+                            events,
+                            col=col,
+                            row=row,
+                            pkt_type=pkt_type,
+                            slot=slot,
+                            name=name,
+                            ts=ts,
+                            soc=ts - step.cmd_index,
+                        )
+    events.sort(key=lambda e: (e.col, e.row, e.pkt_type, e.ts))
+    return events
+
+
 def rebuild_timeline_mode0(
     commands_per_tile: dict[tuple[int, int, int], list[TraceCommand]],
     slot_names: dict[int, dict[str, list[str]]],
@@ -196,104 +313,49 @@ def rebuild_timeline_mode0(
     strings (or empty strings when a slot is unused), keyed the same way
     mlir-aie's parse_mlir_trace_events emits them.
 
-    The timer increments by 1 cycle implicitly per non-Start command,
-    then by the command's ``cycles`` value (matches mlir-aie's
-    convert_commands_to_json so cycle counts agree exactly).
+    A Repeat that follows a cycles==0 frame (a held level) emits no events, per the mlir-aie
+    convention; use ``rebuild_timeline_mode0_levels`` when the held cycles matter.
     """
-    events: list[Event] = []
-    for (pkt_type, row, col), cmds in commands_per_tile.items():
-        timer = 0
-        # cmd_index counts EventCmds (and Repeat iterations) since the
-        # most recent Start; soc = ts - cmd_index strips the +1-per-cmd
-        # implicit increment that the mlir-aie convention bakes into ts.
-        # Reset on every Start (mid-stream re-anchor in modes 1/2).
-        cmd_index = 0
-        after_sync = False
-        prev_event: EventCmd | None = None
-        # Keys are stringified row,col (matching mlir-aie's convention)
-        names_for_pt = slot_names.get(pkt_type, {})
-        slot_table = names_for_pt.get(f"{row},{col}", [""] * 8)
+    return _rebuild_mode0(commands_per_tile, slot_names, include_held=False)
 
-        for cmd in cmds:
-            if isinstance(cmd, StartCmd):
-                timer = cmd.timer_value
-                cmd_index = 0
-                prev_event = None
-                continue
-            if isinstance(cmd, SyncCmd):
-                timer += _SYNC_CYCLE_ADVANCE
-                after_sync = True
-                continue
-            if isinstance(cmd, RepeatCmd) and after_sync:
-                timer += cmd.count * _SYNC_CYCLE_ADVANCE
-                continue
-            after_sync = False
-            if isinstance(cmd, StopCmd):
-                # No timeline contribution; mode 0 doesn't actually emit
-                # a Stop opcode in the byte stream (it terminates with
-                # padding / end-of-buffer).
-                continue
-            if isinstance(cmd, EventCmd):
-                timer += 1  # implicit per-command increment
-                timer += cmd.cycles
-                cmd_index += 1
-                soc = timer - cmd_index
-                for slot in range(8):
-                    if cmd.event_bits & (1 << slot):
-                        name = slot_table[slot] if slot < len(slot_table) else ""
-                        _emit_event(
-                            events,
-                            col=col,
-                            row=row,
-                            pkt_type=pkt_type,
-                            slot=slot,
-                            name=name,
-                            ts=timer,
-                            soc=soc,
-                        )
-                prev_event = cmd
-                continue
-            if isinstance(cmd, RepeatCmd):
-                if prev_event is None:
-                    # Repeat with no preceding event is malformed; skip
-                    # rather than crash.
-                    continue
-                cycles = prev_event.cycles
-                if cycles == 0:
-                    # Zero-cycle repeats just extend the timer linearly:
-                    # the decoder advances timer by `count` without firing
-                    # the implicit per-EventCmd +1, so cmd_index must not
-                    # advance either -- the timer increase in this region
-                    # represents real SoC cycles passing with no events,
-                    # which is exactly the case where ts == SoC.
-                    timer += cmd.count
-                else:
-                    for _ in range(cmd.count):
-                        timer += 1
-                        timer += cycles
-                        cmd_index += 1
-                        soc = timer - cmd_index
-                        for slot in range(8):
-                            if prev_event.event_bits & (1 << slot):
-                                name = (
-                                    slot_table[slot]
-                                    if slot < len(slot_table)
-                                    else ""
-                                )
-                                _emit_event(
-                                    events,
-                                    col=col,
-                                    row=row,
-                                    pkt_type=pkt_type,
-                                    slot=slot,
-                                    name=name,
-                                    ts=timer,
-                                    soc=soc,
-                                )
-                continue
 
-    events.sort(key=lambda e: (e.col, e.row, e.pkt_type, e.ts))
-    return events
+def rebuild_timeline_mode0_levels(
+    commands_per_tile: dict[tuple[int, int, int], list[TraceCommand]],
+    slot_names: dict[int, dict[str, list[str]]],
+) -> list[Event]:
+    """``rebuild_timeline_mode0`` plus one event per held cycle.
+
+    Silicon and the emulator write a level that stays high as an open frame, one ``(mask, 0)``
+    frame and a Repeat; the plain rebuild shows such a level only at the frames where the 8-bit
+    mask changes, so counting its events counts mask changes caused by *other* events.  This
+    rebuild also emits the mask's events for every cycle a zero-cycle Repeat holds, so a level
+    has an event on each cycle it is asserted and ``assertion_intervals`` gives its true
+    intervals.  Every event of the plain rebuild is still present, unchanged.
+    """
+    return _rebuild_mode0(commands_per_tile, slot_names, include_held=True)
+
+
+def assertion_intervals(
+    events: Iterable[Event],
+) -> dict[tuple[int, int, int, int], list[tuple[int, int]]]:
+    """``{(pkt_type, row, col, slot): [(first_ts, last_ts), ...]}`` of consecutive-cycle runs.
+
+    Meant for the output of ``rebuild_timeline_mode0_levels``: a run of events on adjacent
+    cycles is one assertion interval, and a gap of even one cycle ends it.
+    """
+    by_slot: dict[tuple[int, int, int, int], list[int]] = {}
+    for e in events:
+        by_slot.setdefault((e.pkt_type, e.row, e.col, e.slot), []).append(e.ts)
+    out: dict[tuple[int, int, int, int], list[tuple[int, int]]] = {}
+    for key, stamps in by_slot.items():
+        runs: list[tuple[int, int]] = []
+        for ts in sorted(set(stamps)):
+            if runs and ts == runs[-1][1] + 1:
+                runs[-1] = (runs[-1][0], ts)
+            else:
+                runs.append((ts, ts))
+        out[key] = runs
+    return out
 
 
 _PT_CODE_TO_NAME = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
@@ -596,6 +658,8 @@ def parse_trace_auto(
 __all__ = [
     "decode_words",
     "rebuild_timeline_mode0",
+    "rebuild_timeline_mode0_levels",
+    "assertion_intervals",
     "rebuild_timeline_mode1",
     "parse_trace",
     "parse_trace_auto",
