@@ -599,7 +599,17 @@ def test_pre2_names_design_and_specs():
     assert g.SYNC_PRE2_ADDR >> 14 == 1 and phys_bank(g.SYNC_PRE2_ADDR) == 2
     assert "^pre2" not in g.sync_design_mlir(g.SyncCase(d=5))              # the single-pre design is unchanged
     with pytest.raises(ValueError):
-        g.sync_validate(g.SyncCase(d=1, pre2=33))
+        g.sync_validate(g.SyncCase(d=1, pre2=g.SYNC_MAX_PRE2 + 1))
+
+
+@pytest.mark.parametrize("q", [1, 5, 33, 40])
+def test_pre2_lengths_beyond_32_and_off_the_granule_are_accepted(q):
+    c = g.SyncCase(d=5, pre2=q)
+    g.sync_validate(c)
+    t = g.sync_design_mlir(c)
+    assert f"dma_bd(%pre2 : memref<{q}xi32>)" in t and f"memref<{68 + q}xi32>" in t.split("^recv:")[1]
+    # the longest pre2 stays inside its logical bank, clear of the 0x8000 destination
+    assert g.SYNC_PRE2_ADDR + 4 * g.SYNC_MAX_PRE2 < g.FETCH_DST_ADDR
 
 
 def test_sync_row_with_two_pre_bds_measures_d_from_the_last_one():

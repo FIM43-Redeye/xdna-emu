@@ -771,6 +771,7 @@ SYNC_LOCK_A, SYNC_LOCK_SYNC, SYNC_LOCK_START, SYNC_LOCK_END = 0, 1, 2, 3   # A: 
 SYNC_PRE2_ADDR = 0x4040            # the second pre BD's words (--pre2), logical bank 1 like `pre`
 SYNC_DEFAULT_DS = tuple(range(25)) + tuple(range(26, 41, 2))
 SYNC_MAX_D = 40
+SYNC_MAX_PRE2 = 40                 # words; the buffer (0x4040 + 4 * words) must stay in its logical bank
 FREE_D = 20                        # the lock-free-on-request case's core delay (lock A starts at 1)
 SYNC_MAIN_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD"]
 SYNC_CONFLICT_EVENTS = ["CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
@@ -821,8 +822,8 @@ def sync_specs(ds, ks, banks, free: bool, pre2: int = 0) -> list[SyncCase]:
 def sync_validate(c: SyncCase) -> None:
     if not 0 <= c.d <= SYNC_MAX_D:
         raise ValueError(f"d must be 0..{SYNC_MAX_D}")
-    if not 0 <= c.pre2 <= 32:
-        raise ValueError("pre2 must be 0..32 words")
+    if not 0 <= c.pre2 <= SYNC_MAX_PRE2:
+        raise ValueError(f"pre2 must be 0..{SYNC_MAX_PRE2} words")
     if c.bank not in ("none", "0", "1"):
         raise ValueError("bank must be none, 0 or 1")
     if c.bank != "none" and c.k not in FETCH_KS:
