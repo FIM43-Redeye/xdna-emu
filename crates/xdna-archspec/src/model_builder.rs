@@ -260,6 +260,10 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // MM2S stall boundary moved out one word with the hand-off (2026-11-11). See
             // the field doc.
             shim_s2mm_ingress_depth: 66,
+            // Compute-tile bank arbitration (silicon arb/ring probes, 2026-11). See the
+            // DmaTiming field docs.
+            bank_arbiter_period: 5,
+            bank_arbiter_dma_residue: 2,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

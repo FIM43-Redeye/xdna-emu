@@ -192,6 +192,17 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "Fitted with the lead: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 \
             (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, granule 5 at + 11, unchanged (with FINISHED_BD + \
             52) when a core access wins the bank at + 2."),
+        measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
+            every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
+            5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \
+            fit at period 5 and at no other",
+            "Compute tiles, one core port against DMA channels. Why 5 is not known; neighbour cores, wide accesses and \
+            memtile banks are unmeasured."),
+        unit("dma.bank_arbiter_dma_residue", HardwareObserved, Verification::Unverified,
+            "Fitted: only the bank's served count at a probe's window minus the residue is observable. NPU1 2026-11 \
+            (tools/gen_dma_lock_probe.py): with the count from reset (configuration-written 16-byte lines plus the core \
+            prologue's stores) banks 0 and 1 of one design, whose histories differ by two stores, need the same value, \
+            and all four DMA channels share it; the image-line unit is measured by adding initialised words."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),

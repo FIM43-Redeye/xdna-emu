@@ -530,6 +530,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
             ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),
             ("DMA_MM2S_WORD_CLOCK_RESUME_CYCLES", t.dma.mm2s_word_clock_resume_cycles),
+            ("BANK_ARBITER_PERIOD", t.dma.bank_arbiter_period),
+            ("BANK_ARBITER_DMA_RESIDUE", t.dma.bank_arbiter_dma_residue),
         ] {
             writeln!(out, "    pub const {name}: u8 = {value};").unwrap();
         }

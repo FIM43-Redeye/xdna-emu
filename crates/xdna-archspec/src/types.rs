@@ -1518,6 +1518,26 @@ pub struct DmaTiming {
     /// structure (a 64-word write buffer plus a 4-word stage, or one FIFO) is not separated,
     /// and neither is whether a running (not parked) shim S2MM uses the same depth.
     pub shim_s2mm_ingress_depth: u8,
+
+    /// Period of a **compute-tile** data-memory bank's core-versus-DMA turn: 5. Each physical
+    /// bank counts the accesses it has served since reset (core loads and stores, every DMA
+    /// channel's accesses, configuration writes once per 16-byte line); when the core and a
+    /// DMA channel want the bank in the same cycle, the DMA is served if that count is at
+    /// `bank_arbiter_dma_residue` modulo this period, otherwise the core is. Measured (NPU1,
+    /// 2026-11, `tools/gen_dma_lock_probe.py` arb and ring cases, 222 rows, every row as the
+    /// rule predicts; the producer probe's dense-store captures fit only at period 5): a core
+    /// camping on a bank lets a waiting DMA in exactly once in every 5 served cycles, and a
+    /// DMA is never refused more than 4 cycles in a row. Why 5 is not known.
+    pub bank_arbiter_period: u8,
+
+    /// The served-count residue (modulo `bank_arbiter_period`) at which a contended
+    /// compute-tile bank serves the DMA instead of the core: 2. Fitted, one constant for every
+    /// bank and channel: only the count at a probe's window minus this residue is observable,
+    /// so the value holds together with the emulator counting the same history from reset
+    /// (configuration-written lines, the core prologue's stores). Silicon (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py`): banks 0 and 1 of one design, whose histories differ by
+    /// two stores, both need the same residue, and all four DMA channels share it.
+    pub bank_arbiter_dma_residue: u8,
 }
 
 /// Stream switch timing and physical constants.
