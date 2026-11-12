@@ -742,3 +742,10 @@ def test_arb_row_reads_the_core_window_and_memory_stalls():
     assert g.arb_start(c, 2) == 15 and g.arb_start(c, 3) == 14
     text = g.format_arb_table([(c, "a1.hw", r)])
     assert "ar0l1k16m0" in text and "b0@14" in text and "(+1)" in text
+
+
+def test_arb_matches_compares_contended_cycles_and_core_stall_count():
+    r = {"grant": 2, "conflicts": [("CONFLICT_DM_BANK_0", 9)], "memory_stalls": [15]}
+    assert g.arb_matches(r, {"contended": [7], "core_lost": [7]})
+    assert not g.arb_matches(r, {"contended": [7], "core_lost": []})
+    assert not g.arb_matches(r, {"contended": [7, 8], "core_lost": [7]})

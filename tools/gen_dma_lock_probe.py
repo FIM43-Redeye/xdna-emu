@@ -1270,11 +1270,21 @@ def format_arb_table(rows) -> str:
         mstall = ",".join(str(t) for t in r.get("memory_stalls", [])) or "-"
         start = arb_start(c, g)
         p = rotation_prediction(c, start)
+        verdict = "MATCH" if arb_matches(r, p) else "DIFFER"
         lines.append(f"{c.name:<13} {run:<8} +{g}     {conf:<34} {mstall:<10} {extra:<15} "
                      f"{','.join(f'+{t - g}' for t in r['mm2s_finished']):<8} "
                      f"{','.join(f'+{t - g}' for t in r['s2mm_finished']):<8} | "
-                     f"g+{start} {','.join(map(str, p['contended'])) or '-'} {','.join(map(str, p['core_lost'])) or '-'}")
+                     f"g+{start} {','.join(map(str, p['contended'])) or '-'} {','.join(map(str, p['core_lost'])) or '-'} "
+                     f"{verdict}")
     return "\n".join(lines)
+
+
+def arb_matches(r: dict, p: dict) -> bool:
+    """The measured row agrees with a prediction: the same contended cycles (conflict events, grant-
+    relative, the probed bank) and as many core stalls (MEMORY_STALL events) as predicted core losses."""
+    g = r["grant"]
+    seen = sorted(t - g for _b, t in r["conflicts"])
+    return seen == p["contended"] and len(r.get("memory_stalls", [])) == len(p["core_lost"])
 
 
 def arb_selection(args) -> list[ArbCase]:
