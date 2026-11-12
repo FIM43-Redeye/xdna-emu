@@ -202,11 +202,152 @@ def test_ready_offset_uses_the_solo_latency():
     assert g.b_ready(ab, None) is None
 
 
-def test_format_table_has_a_row_per_case_and_marks_missing_runs():
-    solo = g.gap_row(run_events(0, 85), g.Case("solo"))
-    text = g.format_table([(g.Case("ab", 12), "e1.emu", g.gap_row(run_events(2, 95), g.Case("ab", 12))),
-                           (g.Case("solo"), "e1.emu", solo), (g.Case("far"), "e1.emu", {"first_word": None})],
-                          g.solo_latency(solo))
-    lines = text.splitlines()
-    assert len(lines) == 4 and "no S2MM starvation event" in lines[3]
-    assert lines[1].split()[:5] == ["ab12", "e1.emu", "-5", "2", "2"]
+PEv = namedtuple("PEv", "ts row pkt_type name")
+
+
+def core(name, stamps, row=2):
+    return [PEv(t, row, g.PT_CORE, name) for t in stamps]
+
+
+def mem(name, stamps, row=2):
+    return [PEv(t, row, g.PT_MEM, name) for t in stamps]
+
+
+def silicon_ab(a_start=100, gap=3, b_lock_end=95, b_slave_start=105):
+    """Source-tile events shaped like silicon: A's 17 words with a bubble every fourth, then B's 5 words after
+    `gap` idle cycles, a PORT_TLAST_0 on each packet's last word, no event from the destination tile."""
+    a = [t for t in range(a_start, a_start + 18) if t != a_start + 4]          # 17 words, one bubble
+    a_last = a[-1]
+    b_first = a_last + 1 + gap
+    b = [b_first + i for i in range(5)]
+    idle = list(range(a_last + 1, b_first))
+    return (core("PORT_RUNNING_0", a + b) + core("PORT_TLAST_0", [a_last, b[-1]])
+            + core("PORT_IDLE_0", idle) + core("PORT_RUNNING_2", range(b_slave_start, b_slave_start + 4))
+            + mem("DMA_MM2S_0_STALLED_LOCK", range(10, 80)) + mem("DMA_MM2S_1_STALLED_LOCK", range(10, b_lock_end))
+            ), a_last
+
+
+def test_gap_is_the_idle_cycles_between_the_17th_and_18th_port_word():
+    events, a_last = silicon_ab(gap=3)
+    row = g.port_row(events, g.Case("ab", 20))
+    assert row["missing"] == []
+    assert row["gap"] == 3 and row["gap_data"] == 3 and row["hd"] == 0
+    assert row["a_last"] == a_last
+
+
+def test_back_to_back_packets_have_gap_zero():
+    events, _ = silicon_ab(gap=0)
+    row = g.port_row(events, g.Case("ab", 8))
+    assert row["gap"] == 0 and row["gap_data"] == 0
+
+
+def test_an_early_header_word_does_not_hide_the_idle_before_the_data():
+    # emulator shape: A's header 13 cycles before its data; B's header right behind A, B's data later
+    a = [50] + list(range(63, 79))                  # 17 words, the last at 78
+    b = [79] + list(range(85, 89))                  # header back to back, data after 5 idle cycles
+    events = core("PORT_RUNNING_0", a + b)
+    row = g.port_row(events, g.Case("ab", 20))
+    assert row["a_last"] == 78
+    assert row["gap"] == 0 and row["hd"] == 5 and row["gap_data"] == 5
+
+
+def test_the_destination_starvation_event_is_not_needed():
+    events, _ = silicon_ab(gap=2)
+    assert not any(e.row == g.DST_ROW for e in events)
+    row = g.port_row(events, g.Case("ab", 20))
+    assert row["old"] is None
+    text = g.format_table([(g.Case("ab", 20), "h2.hw", row)])
+    assert "no S2MM starvation event" not in text
+    assert "ab20" in text and "h2.hw" in text
+
+
+def test_the_old_starvation_columns_stay_when_the_destination_event_exists():
+    events, _ = silicon_ab(gap=0)
+    events = events + mem("DMA_S2MM_0_STREAM_STARVATION", list(range(0, 40)) + list(range(60, 62)), row=g.DST_ROW)
+    row = g.port_row(events, g.Case("ab", 8))
+    assert row["old"] is not None and row["old"]["first_word"] == 40
+
+
+def test_idle_cycles_between_the_words_are_cross_checked_against_port_idle():
+    events, _ = silicon_ab(gap=3)
+    assert g.port_row(events, g.Case("ab", 20))["idle_ok"] is True
+    no_idle = [e for e in events if e.name != "PORT_IDLE_0"]
+    row = g.port_row(no_idle, g.Case("ab", 20))
+    assert row["idle_ok"] is None and "PORT_IDLE_0" in " ".join(row["notes"])
+    wrong = [e for e in events if not (e.name == "PORT_IDLE_0" and e.ts == 120)] + [PEv(500, 2, g.PT_CORE, "PORT_IDLE_0")]
+    assert g.port_row(wrong, g.Case("ab", 20))["idle_ok"] is False
+
+
+def test_tlast_on_the_17th_word_is_reported_as_agreeing():
+    events, _ = silicon_ab(gap=3)
+    assert g.port_row(events, g.Case("ab", 20))["tlast_ok"] is True
+    moved = [e for e in events if e.name != "PORT_TLAST_0"] + core("PORT_TLAST_0", [10_000])
+    assert g.port_row(moved, g.Case("ab", 20))["tlast_ok"] is False
+
+
+def test_b_lock_grant_is_the_cycle_after_its_last_stalled_cycle_relative_to_a_last_word():
+    events, a_last = silicon_ab(gap=3, b_lock_end=95)
+    row = g.port_row(events, g.Case("ab", 20))
+    assert row["grant_b"] == 95 - a_last              # stalled cycles end at 94, grant at 95
+    assert row["b_slave"] == 105 - a_last             # first PORT_RUNNING_2 cycle
+
+
+def test_a_missing_event_is_named_not_blanketed():
+    events, _ = silicon_ab(gap=3)
+    row = g.port_row([e for e in events if e.name != "PORT_RUNNING_0"], g.Case("ab", 20))
+    assert row["gap"] is None
+    assert any("PORT_RUNNING_0" in m for m in row["missing"])
+    row = g.port_row([e for e in events if e.name != "DMA_MM2S_1_STALLED_LOCK"], g.Case("ab", 20))
+    assert row["gap"] == 3 and row["grant_b"] is None
+    assert any("DMA_MM2S_1_STALLED_LOCK" in m for m in row["missing"])
+    text = g.format_table([(g.Case("ab", 20), "h2.hw", row)])
+    assert "DMA_MM2S_1_STALLED_LOCK" in text
+
+
+def test_a_wrong_word_count_is_reported_with_the_counts():
+    events, _ = silicon_ab(gap=3)
+    short = [e for e in events if not (e.name == "PORT_RUNNING_0" and e.ts == events[-1].ts)]
+    short = [e for e in short if e.name != "PORT_RUNNING_0"] + core("PORT_RUNNING_0", range(100, 110))
+    row = g.port_row(short, g.Case("ab", 20))
+    assert row["gap"] is None
+    assert any("10" in m and "22" in m for m in row["missing"])
+
+
+def test_same_source_b_grant_needs_a_second_stalled_interval():
+    a = list(range(100, 117)) + list(range(119, 124))
+    ev = core("PORT_RUNNING_0", a) + mem("DMA_MM2S_0_STALLED_LOCK", range(10, 80))
+    row = g.port_row(ev, g.Case("same", 8))
+    assert row["gap"] == 2 and row["grant_b"] is None
+    assert any("second" in m for m in row["missing"])
+    ev += mem("DMA_MM2S_0_STALLED_LOCK", range(90, 110))
+    assert g.port_row(ev, g.Case("same", 8))["grant_b"] == 110 - 116
+
+
+def test_solo_has_five_words_no_gap_and_reports_grant_to_first_and_last_word():
+    ev = core("PORT_RUNNING_0", [70, 71, 72, 73, 75]) + mem("DMA_MM2S_1_STALLED_LOCK", range(10, 60))
+    row = g.port_row(ev, g.Case("solo"))
+    assert row["missing"] == [] and row["gap"] is None
+    assert row["grant_to_first"] == 10 and row["grant_to_last"] == 15
+
+
+def test_a_grant_to_first_word_is_reported_for_every_two_packet_case():
+    events, _ = silicon_ab(a_start=100)
+    assert g.port_row(events, g.Case("ab", 20))["a_grant_to_first"] == 100 - 80
+
+
+def test_table_lists_cases_a_run_did_not_capture_once_instead_of_a_row_each(tmp_path, monkeypatch, capsys):
+    out = tmp_path
+    for name in ("ab12", "ab13", "ab14"):
+        (out / name).mkdir()
+    for name in ("ab12", "ab13"):
+        run = out / name / "h1.hw"
+        run.mkdir()
+        (run / "trace_raw.bin").write_bytes(b"")
+        (run / "events.json").write_text("{}")
+    events, _ = silicon_ab(gap=0)
+    monkeypatch.setattr(g.dl, "load_level_events", lambda run_dir: events)
+    g.main(["table", str(out), "h1.hw", "--cases", "ab12", "ab13", "ab14"])
+    text = capsys.readouterr().out
+    assert text.count("ab12") == 1 and text.count("ab13") == 1
+    assert "ab14" in text and text.count("ab14") == 1
+    assert "not in h1.hw" in text

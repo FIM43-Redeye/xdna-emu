@@ -20,7 +20,10 @@ Design (source tile (0,2), destination tile (0,3); only the trace goes to the sh
   of cycles after A. k is swept one cycle per case; `table` converts k to "B ready relative
   to A's TLAST" from the trace itself, so the sweep only has to cover the window.
 
-Measured, in the memory-module timers: S2MM 0 STREAM_STARVATION of the destination tile (the
+The table reads the source tile's port events (PORT_RUNNING_0 words at the shared master port,
+PORT_IDLE_0, PORT_TLAST_0, PORT_RUNNING_2, the MM2S STALLED_LOCK intervals), which both silicon
+and the emulator record; the destination-starvation numbers are extra columns where that event
+was captured. Measured, in the memory-module timers: S2MM 0 STREAM_STARVATION of the destination tile (the
 words reaching it), MM2S 0/1 STREAM_BACKPRESSURE, FINISHED_BD and STALLED_LOCK of the source
 tile. The two tiles' timers are two clocks: the gap is read from the destination clock alone,
 and the B-ready offset uses the solo control's grant-to-first-word latency, which absorbs
@@ -332,23 +335,136 @@ def b_ready(row: dict, latency: int | None) -> int | None:
     return row["b_grant"] + latency - row["a_last"]
 
 
-def format_table(rows, latency: int | None) -> str:
-    """rows: (case, run name, gap_row dict)."""
-    head = (f"{'case':<8} {'run':<8} {'B_ready':>7} {'gap':>4} {'port_gap':>8}  details  "
-            f"(B_ready: B's first word could arrive this many cycles after A's last word, from "
-            f"B's lock grant + the solo latency {latency}; gap: idle cycles between them at the "
-            f"destination, less B's header word; all relative to the first word)")
+def expected_port_words(case: Case) -> int:
+    """Words that cross the shared master port: each packet's header plus its payload."""
+    if case.mode == "solo":
+        return WORDS_B + HEADER_WORDS
+    return WORDS_A + WORDS_B + 2 * HEADER_WORDS
+
+
+def _grant(events, channel: int, which: str) -> int | None:
+    """Cycle after the first or last STALLED_LOCK interval of an MM2S channel (memory-module timer)."""
+    runs = dl._runs(_stamps(events, PT_MEM, f"DMA_MM2S_{channel}_STALLED_LOCK"))
+    if not runs:
+        return None
+    return (runs[0] if which == "first" else runs[-1])[1] + 1
+
+
+def port_row(events, case: Case) -> dict:
+    """One run as numbers read only from the source tile (0,2), whose events exist on silicon and in the emulator.
+
+    The shared master port's PORT_RUNNING_0 cycles are the words, in time order: the first
+    WORDS_A + 1 are A (header and payload), the next ones B. All times are core-timer cycles
+    unless noted; the destination tile's events are not needed.
+
+    gap       idle cycles between A's last word and the next word at the port (B's first).
+    hd        idle cycles between B's first and second word (the emulator sends a packet's header
+              ahead of its payload; silicon sends them back to back).
+    gap_data  gap + hd: idle cycles between A's last word and B's second word, so B's header word
+              is not counted: what the destination sees (the destination drops the header).
+    idle_ok   PORT_IDLE_0 cycles between the two words equal gap (None: no PORT_IDLE_0 events).
+    tlast_ok  a PORT_TLAST_0 sits on A's last word (None: no PORT_TLAST_0 events).
+    grant_b   B's lock grant (the cycle after the last STALLED_LOCK interval of B's channel; memory
+              timer) minus A's last word (core timer): a raw cross-module interval, whose constant
+              module-clock offset is not known. For `same`, B's grant is the second interval.
+    b_slave   first PORT_RUNNING_2 cycle (B's source slave port) minus A's last word, same timer.
+    a_grant_to_first  A's lock grant to the first word at the port (also cross-module).
+    grant_to_first / grant_to_last   the same for solo's only packet, to its first and last word.
+    old       the destination-starvation numbers of `gap_row`, or None when that event is absent."""
+    row = {"missing": [], "notes": [], "gap": None, "gap_data": None, "hd": None, "idle_ok": None,
+           "tlast_ok": None, "grant_b": None, "b_slave": None, "a_grant_to_first": None,
+           "grant_to_first": None, "grant_to_last": None, "a_last": None, "end": None, "old": None}
+    if any(e.row == DST_ROW and e.pkt_type == PT_MEM and e.name == "DMA_S2MM_0_STREAM_STARVATION"
+           for e in events):
+        row["old"] = gap_row(events, case)
+    words = _stamps(events, PT_CORE, "PORT_RUNNING_0")
+    want = expected_port_words(case)
+    row["words"] = len(words)
+    if not words:
+        row["missing"].append("PORT_RUNNING_0 (source tile)")
+        return row
+    if len(words) != want:
+        row["missing"].append(f"PORT_RUNNING_0 has {len(words)} cycles, expected {want}")
+        return row
+    if case.mode == "solo":
+        grant = _grant(events, 1, "last")
+        if grant is None:
+            row["missing"].append("DMA_MM2S_1_STALLED_LOCK (source tile)")
+        else:
+            row["grant_to_first"], row["grant_to_last"] = words[0] - grant, words[-1] - grant
+        return row
+    n_a = WORDS_A + HEADER_WORDS
+    a_last = words[n_a - 1]
+    row["a_last"] = a_last
+    row["gap"] = words[n_a] - a_last - 1
+    row["hd"] = words[n_a + 1] - words[n_a] - 1
+    row["gap_data"] = row["gap"] + row["hd"]
+    row["end"] = words[-1] - a_last
+    idle = _stamps(events, PT_CORE, "PORT_IDLE_0")
+    if idle:
+        row["idle_ok"] = sum(1 for t in idle if a_last < t < words[n_a]) == row["gap"]
+    else:
+        row["notes"].append("PORT_IDLE_0 absent, idle cross-check skipped")
+    tlast = _stamps(events, PT_CORE, "PORT_TLAST_0")
+    if tlast:
+        row["tlast_ok"] = a_last in tlast
+    first_a = _grant(events, 0, "first")
+    if first_a is None:
+        row["missing"].append("DMA_MM2S_0_STALLED_LOCK (source tile)")
+    else:
+        row["a_grant_to_first"] = words[0] - first_a
+    b_ch = case.b_channel
+    if case.mode == "same":
+        runs = dl._runs(_stamps(events, PT_MEM, "DMA_MM2S_0_STALLED_LOCK"))
+        if len(runs) < 2:
+            row["missing"].append("second DMA_MM2S_0_STALLED_LOCK interval (B's BD never waited for its lock)")
+        else:
+            row["grant_b"] = runs[-1][1] + 1 - a_last
+    else:
+        grant = _grant(events, b_ch, "last")
+        if grant is None:
+            row["missing"].append(f"DMA_MM2S_{b_ch}_STALLED_LOCK (source tile)")
+        else:
+            row["grant_b"] = grant - a_last
+        slave = _stamps(events, PT_CORE, "PORT_RUNNING_2")
+        if slave:
+            row["b_slave"] = slave[0] - a_last
+        else:
+            row["missing"].append("PORT_RUNNING_2 (source tile)")
+    return row
+
+
+def _fmt(v, signed=False) -> str:
+    if v is None:
+        return "-"
+    return f"{v:+d}" if signed else str(v)
+
+
+def format_table(rows) -> str:
+    """rows: (case, run name, port_row dict). All times are core-timer cycles of the source tile
+    except grant columns, which subtract a memory-timer cycle from a core-timer cycle."""
+    head = (f"{'case':<8} {'run':<8} {'gap':>4} {'gap_data':>8} {'hd':>3} {'grantB':>7} {'Bslave':>7} "
+            f"{'Agr>w1':>6} {'idle':>5} {'tlast':>5} {'old_gap':>7} {'old_Brdy':>8}  notes\n"
+            "  gap: idle cycles at the shared master port between A's last word and B's first; hd: B's first to "
+            "second word;\n  gap_data = gap + hd (B's header not counted). grantB / Bslave: B's lock grant / first "
+            "slave-port word minus A's last word\n  (grantB mixes the memory and core timers: raw, offset not "
+            "known). Agr>w1: A's grant to first word. old_*: destination\n  starvation anchoring, only where "
+            "that event was captured.")
     lines = [head]
+    flag = {True: "ok", False: "BAD", None: "-"}
     for case, run, r in rows:
-        if r.get("first_word") is None:
-            lines.append(f"{case.name:<8} {run:<8} no S2MM starvation event")
-            continue
-        ready = b_ready(r, latency)
-        rd = "?" if ready is None else f"{ready:+d}"
-        pg = "?" if r["port_gap"] is None else str(r["port_gap"])
-        lines.append(f"{case.name:<8} {run:<8} {rd:>7} {r['gap']:>4} {pg:>8}  grantB {r['b_grant']}  "
-                     f"a_last +{r['a_last']}  internal {r['internal']}  backpressure {r['backpressure']}  "
-                     f"fin0 {r['finished'][0]} fin1 {r['finished'][1]}")
+        notes = list(r["notes"])
+        if r["missing"]:
+            notes.insert(0, "missing: " + "; ".join(r["missing"]))
+        if case.mode == "solo" and r["grant_to_first"] is not None:
+            notes.append(f"solo: grant->first word +{r['grant_to_first']}, grant->last word +{r['grant_to_last']}")
+        old = r.get("old")
+        og = "-" if old is None else str(old["gap"])
+        ob = _fmt(r.get("old_b_ready"), True)
+        lines.append(f"{case.name:<8} {run:<8} {_fmt(r['gap']):>4} {_fmt(r['gap_data']):>8} {_fmt(r['hd']):>3} "
+                     f"{_fmt(r['grant_b'], True):>7} {_fmt(r['b_slave'], True):>7} "
+                     f"{_fmt(r['a_grant_to_first']):>6} {flag[r['idle_ok']]:>5} {flag[r['tlast_ok']]:>5} "
+                     f"{og:>7} {ob:>8}  " + "; ".join(notes))
     return "\n".join(lines)
 
 
@@ -401,18 +517,25 @@ def cmd_run(args) -> int:
 
 def cmd_table(args) -> int:
     out = Path(args.out_dir).resolve()
-    rows, latency = [], None
+    rows, latency, absent = [], {}, {}
     for case in select(out, args.cases):
         for run in args.runs:
             run_dir = out / case.name / run
             if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
-                rows.append((case, run, {"first_word": None}))
+                absent.setdefault(run, []).append(case.name)
                 continue
-            row = gap_row(dl.load_level_events(run_dir), case)
+            events = dl.load_level_events(run_dir)
+            row = port_row(events, case)
+            if row["old"] is not None:
+                if case.mode == "solo" and run not in latency:
+                    latency[run] = solo_latency(row["old"])
             rows.append((case, run, row))
-            if case.mode == "solo" and latency is None:
-                latency = solo_latency(row)
-    print(format_table(rows, latency))
+    for _, run, row in rows:       # the solo control may come after the rows that need its latency
+        if row["old"] is not None:
+            row["old_b_ready"] = b_ready(row["old"], latency.get(run))
+    print(format_table(rows))
+    for run, names in absent.items():
+        print(f"not in {run}: {' '.join(names)}")
     return 0
 
 
