@@ -76,8 +76,9 @@ pub struct StagedWord {
     /// it (`drain_egress_staging`).
     pub ends_bd: bool,
     /// Engine step (`DmaEngine::read_clock`) from which the word can leave the
-    /// staging: the read of its granule's last word (one word per cycle behind every earlier fetch,
-    /// `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
+    /// staging. Memtile: the read of its granule's last word (one word per cycle behind every
+    /// earlier fetch, `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
+    /// Compute: the granule's bank access plus `mm2s_access_to_offer_cycles`.
     pub ready_at: u64,
 }
 
@@ -571,9 +572,9 @@ pub struct ChannelContext {
     /// Compute / memtile MM2S egress staging FIFO: words read from tile memory
     /// (a 16-byte granule per bank access), in order, not yet handed to the
     /// stream output register, each already carrying its TLAST. It belongs to
-    /// the channel, not to a BD: a BD finishes once its last word has been READ
-    /// into it (one word per cycle, `read_tail`), and the next BD fetches in behind
-    /// words still waiting here.
+    /// the channel, not to a BD: a memtile BD finishes once its last word has been READ
+    /// into it (one word per cycle, `read_tail`), a compute BD one cycle after its last
+    /// bank access, and the next BD fetches in behind words still waiting here.
     /// Silicon: an MM2S chain into a held consumer finishes exactly as many BDs
     /// as fit the path's whole absorb (48 words at 0 hops on a compute tile and
     /// a memtile, BDs of 2..24 words), not the absorb less this FIFO
@@ -615,12 +616,6 @@ pub struct ChannelContext {
 }
 
 impl ChannelContext {
-    /// Cycles of reading still queued at engine step `at` (before that step's own fetch): the
-    /// words fetched but not yet read, at one per cycle. 0 when the read port is idle.
-    pub fn read_backlog(&self, at: u64) -> usize {
-        (self.read_tail + 1).saturating_sub(at) as usize
-    }
-
     pub fn new(index: u8) -> Self {
         Self {
             fsm: ChannelFsm::Idle,

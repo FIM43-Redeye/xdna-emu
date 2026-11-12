@@ -43,8 +43,8 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
     }
 }
 
-/// Is a staged MM2S near underflow: its `slack` (`DmaEngine::mm2s_is_urgent`: staged words on a
-/// compute tile, cycles of reading queued on a memtile) is at/below
+/// Is a staged MM2S near underflow: its `slack` (`DmaEngine::mm2s_is_urgent`: the words staged on
+/// a compute tile) is at/below
 /// `DmaEngine::URGENT_WATERMARK` (so its stream is about to run dry), while `transfer` still has
 /// words to fetch?
 ///
@@ -155,8 +155,7 @@ impl DmaEngine {
             let ChannelFsm::Transferring { transfer } = &ch.fsm else {
                 continue;
             };
-            // `peek_bank_demand`'s caller runs before this cycle's step, which advances `read_clock`.
-            if self.uses_egress_staging(transfer) && self.mm2s_is_urgent(transfer, self.read_clock + 1) {
+            if self.uses_egress_staging(transfer) && self.mm2s_is_urgent(transfer) {
                 urgent.push(self.channel_requester(ch_idx as u8));
             }
         }
@@ -473,18 +472,11 @@ impl DmaEngine {
         GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words, addrs }
     }
 
-    /// Whether a staged MM2S's memory side is `urgent` at engine step `at` (before that step's
-    /// own fetch): its stream is about to run dry with words still to fetch. A compute MM2S
-    /// (word clock) judges it on its staging occupancy -- the words already accessed and not
-    /// yet handed to the stream; a memtile MM2S on its read backlog
-    /// (`ChannelContext::read_backlog`, its words are read one per cycle after the access).
-    fn mm2s_is_urgent(&self, transfer: &Transfer, at: u64) -> bool {
-        let ch = &self.channels[transfer.channel as usize];
-        let slack = if self.uses_word_clock(transfer) {
-            ch.egress_staging.len()
-        } else {
-            ch.read_backlog(at)
-        };
+    /// Whether a compute MM2S's memory side is `urgent`: its stream is about to run dry with
+    /// words still to fetch, judged on its staging occupancy -- the words already accessed and
+    /// not yet handed to the stream. Only compute tiles arbitrate (`urgent_channels`).
+    fn mm2s_is_urgent(&self, transfer: &Transfer) -> bool {
+        let slack = self.channels[transfer.channel as usize].egress_staging.len();
         transfer_is_urgent(transfer, slack)
     }
 
@@ -875,12 +867,13 @@ impl DmaEngine {
     ///
     /// - `channel_start_cycles`: generic "start trigger to first data" cost.
     ///   Fires on every task (every Idle->BdSetup), tile-agnostic, when
-    ///   `pays_channel_start`. The one exemption is a staged compute / memtile
-    ///   MM2S started from idle without a lock, whose first read lands at
-    ///   START_TASK + 9 on silicon (bd_setup 4 + memory_latency 5, FINISHED_BD =
-    ///   N + 8): that offset is measured, while `channel_start_cycles` itself is
-    ///   an unsourced estimate, so the caller passes `false` there rather than
-    ///   subtracting it afterwards.
+    ///   `pays_channel_start`. The one exemption is a staged memtile MM2S started
+    ///   from idle without a lock, whose first read lands at START_TASK + 9 on
+    ///   silicon (bd_setup 4 + memory_latency 5, FINISHED_BD = N + 8): that offset
+    ///   is measured, while `channel_start_cycles` itself is an unsourced estimate,
+    ///   so the caller passes `false` there rather than subtracting it afterwards.
+    ///   A compute MM2S does not come through MemoryLatency (word clock) and pays
+    ///   no bonus.
     /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
     ///   shim DMA touching host memory.  Fires on every task.  0 for MM2S:
     ///   its calibrated 325 is the read latency, charged per read between
@@ -1582,10 +1575,10 @@ impl DmaEngine {
     /// Gate `begin_completion` on the channel's egress stream having drained,
     /// for an MM2S that does not stage (zero padding, compression).
     ///
-    /// A staged compute / memtile MM2S finishes its BD once the last word is
-    /// fetched into the channel's egress staging (silicon,
-    /// build/experiments/pipeline-fill/chain): its words drain from there after
-    /// the BD, so it completes at once. Any other MM2S writes straight into the
+    /// A staged memtile MM2S finishes its BD once the last word is read into the
+    /// channel's egress staging (silicon, pipeline-fill chain probe): its words
+    /// drain from there after the BD, so it completes at once. (A compute MM2S
+    /// finishes one cycle after its last bank access instead, `word_clock_mm2s_cycle`.) Any other MM2S writes straight into the
     /// output register and keeps the older rule: it has not finished its BD
     /// until the last word has handshaked downstream (TVALID&&TREADY). If the
     /// sink is BEHIND -- the egress FIFO still held words from previous cycles
@@ -4509,8 +4502,7 @@ mod bank_demand_tests {
     /// Silicon (lock-fetch probe, 2026-11): a core access that wins the bank at the DMA's LAST
     /// access delays FINISHED_BD by one cycle; one at the FIRST access delays only the stream.
     /// The finish follows the last memory access, not a read cursor. Host-path form: the
-    /// denied access is retried the next cycle (the staging is nearly empty, so the channel
-    /// is urgent and does not back off).
+    /// denied access is retried the next cycle (a denial never backs the channel off).
     #[test]
     fn a_denied_last_access_delays_the_finish_and_a_denied_first_access_only_the_stream() {
         let (_, base_first, base_finished) = run_compute_bd_accesses(16, &[]);

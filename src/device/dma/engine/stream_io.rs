@@ -599,8 +599,7 @@ impl DmaEngine {
         (DMA_MM2S_READ_TO_OFFER_CYCLES + memtile) as u64
     }
 
-    /// Slack (`DmaEngine::mm2s_is_urgent`: staged words on a compute tile, cycles of reading
-    /// still queued on a memtile) at/below which an MM2S channel's granule fetch is `urgent` --
+    /// Slack (`DmaEngine::mm2s_is_urgent`: the words staged on a compute tile) at/below which an MM2S channel's granule fetch is `urgent` --
     /// its stream port is about to run dry with stream still to feed (`transfer_is_urgent`,
     /// `stepping.rs`), so the bank arbiter serves it over the core. One granule (4 words): the
     /// minimum that still leaves a whole fetch's worth of slack, not a fitted number.
