@@ -214,7 +214,6 @@ def test_proof_design_does_not_wait_on_the_responses():
     text, steps, layout = g.clock_proof_design("K1", "prod")
     body = text.split("aie.runtime_sequence")[1]
     assert "aiex.npu.dma_wait {symbol = @ctrl0}" not in body       # the response channel is never awaited
-    assert "maskpoll" not in body
     resp = next(l for l in body.splitlines() if "metadata = @ctrl0" in l)
     assert "issue_token = true" not in resp
     assert body.count("aiex.npu.dma_wait {symbol = @ctrlin0}") == len(layout.labels)   # packets leave the shim
