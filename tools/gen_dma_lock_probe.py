@@ -1111,7 +1111,9 @@ ARB_EVENT1_NOPS = 4
 # Same-physical-bank offsets in `ldbuf` (0x800, 64 bytes): bit 4 of the address picks the bank.
 ARB_OFFSETS = {0: (0, 4, 8, 12, 32, 36), 1: (16, 20, 24, 28, 48, 52)}
 ARB_LOAD_REGS = ("r26", "r27", "r28", "r29", "r30", "r31")
-ARB_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "MEMORY_STALL", "LOCK_STALL"]
+# No LOCK_STALL: its four edges overflow the core's first trace packet, which then pushes the
+# memory-module packet out of the capture (silicon, first arb run). The window replaces it.
+ARB_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "MEMORY_STALL"]
 
 
 @dataclass(frozen=True)
@@ -1242,9 +1244,10 @@ def arb_row(events) -> dict:
 
 
 def arb_clean_window(c: ArbCase) -> int:
-    """event #1 minus event #0 with no core stall: the release, k nops, n accesses and the nops between,
-    one bundle per cycle."""
-    return 1 + c.k + c.n + ARB_EVENT1_NOPS
+    """Bundles from `event #0` to `event #1`: the release, k nops, n accesses, ARB_EVENT1_NOPS nops, then
+    the marker. Silicon adds a constant to this (calibrated from conflict-free rows), plus one per core
+    stall."""
+    return c.k + c.n + ARB_EVENT1_NOPS + 2
 
 
 def arb_start(c: ArbCase, grant: int) -> int:

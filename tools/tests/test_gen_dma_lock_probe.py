@@ -689,7 +689,7 @@ def test_arb_plan_names_are_distinct_valid_and_clear_of_other_variants():
 
 def test_arb_inject_args_trace_both_core_markers_and_memory_stall():
     args = g.arb_inject_args()
-    assert args[args.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,MEMORY_STALL,LOCK_STALL"
+    assert args[args.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,MEMORY_STALL"
     assert args[args.index("--memmod-sweep-events") + 1] == ",".join(g.FETCH_MEMMOD_EVENTS)
 
 
@@ -733,11 +733,12 @@ def test_rotation_rule_uncontended_core_accesses_count():
 
 def test_arb_row_reads_the_core_window_and_memory_stalls():
     e = synthetic(rel=1000, grant_after=2, conflict_bank="CONFLICT_DM_BANK_0", conflict_at=16)
-    e += [ev("INSTR_EVENT_1", 1000 + 4 + 23, pkt=0), ev("MEMORY_STALL", 1000 + 4 + 17, pkt=0)]
+    e += [ev("INSTR_EVENT_1", 1000 + 4 + 24, pkt=0), ev("MEMORY_STALL", 1000 + 4 + 17, pkt=0)]
     r = g.arb_row(e)
-    assert r["grant"] == 2 and r["window"] == 23 and r["memory_stalls"] == [17]
+    assert r["grant"] == 2 and r["window"] == 24 and r["memory_stalls"] == [17]
     c = arb(n=1, k=16)
-    assert g.arb_clean_window(c) == 1 + 16 + 1 + g.ARB_EVENT1_NOPS
+    body = bundles_of(g.arb_core_asm(c))
+    assert g.arb_clean_window(c) == body.index("event #1") - body.index("event #0")
     assert g.arb_start(c, 2) == 15 and g.arb_start(c, 3) == 14
     text = g.format_arb_table([(c, "a1.hw", r)])
     assert "ar0l1k16m0" in text and "b0@14" in text and "(+1)" in text
