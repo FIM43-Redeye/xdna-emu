@@ -340,7 +340,8 @@ row is identical over two silicon runs.
   (compute) / 52 (memtile); 49, 50 and 53..55 never finish until the S2MM is released. Admission reserves
   `granule_words` (4) of staging for every fetch, a BD's short tail included (the emulator admitted the tail into
   the space it needed and finished 50 / 54).
-- **Emulator.** The bank access and the admission decision stay per granule, as before (one `next_granule_fetch`
+- **Emulator (2026-11-11; since 2026-11-12 the memtile MM2S only, the compute MM2S runs the word clock of the next
+  section).** The bank access and the admission decision stay per granule, as before (one `next_granule_fetch`
   per granule, bank demand unchanged, so the start-phase congruence and every race row are unchanged). What
   changed is when the words become available: a fetched granule's words enter `egress_staging` at once (they
   count against the staging and its admission from the fetch on) but carry `ready_at` = the cycle their last word
@@ -348,20 +349,62 @@ row is identical over two silicon runs.
   `staged_mm2s_cycle` holds the BD open (`TransferCycleResult::ReadInProgress`) until its last word has been read,
   which then releases the lock, raises FINISHED_BD and chains the next BD. A staged MM2S's chained BDs take no FSM
   bubble (`enter_chained_transfer`): the boundary idle cycle is `egress_gap` on the port side only.
-- **Start and offer latencies (modelled 2026-11-11, second step).** Two silicon-pinned offsets were leftovers of
+- **Start and offer latencies (modelled 2026-11-11, second step; memtile only since 2026-11-12).** Two silicon-pinned offsets were leftovers of
   the older granule-at-fetch calibration. (1) First read at START_TASK + 9: a compute / memtile MM2S started from
   idle pays `bd_setup_cycles` 4 + `memory_latency_cycles` 5 and not the `channel_start_cycles` 2 term every other
   channel (S2MM, shim, locked first BD) keeps; those three constants were never isolated on silicon. (2) A granule
   is offered `mm2s_read_to_offer_cycles` (3) after its last word is read (first offer 11 + min(N, 4) against a
-  last read at N + 8), plus the memtile's 1. Urgency (the fetch backoff override) is now judged on the read
-  backlog (`ChannelContext::read_backlog`) rather than the staging occupancy, which the 3 in-flight words would
-  otherwise inflate; without it the bank-denial absorption test (`HW T_collide/T_apart` = 1) fails.
+  last read at N + 8), plus the memtile's 1. Urgency was judged on the read backlog
+  (`ChannelContext::read_backlog`); a compute MM2S now judges it on its staging occupancy, and the fetch
+  backoff it overrode is gone (next section).
 - **Result.** FINISHED_BD = N + 8 for every N tested, compute and memtile; `c4x4` 12 / 16 / 20 / 24, `c8x2` 16 / 24;
   `t4x4` 12 for the first task and START + 12 for each later one; the longest finishing BD is 48 / 52; sustained
   STREAM_BACKPRESSURE at 38 (compute) / 39 (memtile) for every N >= 23 and clean at N = 21, 22; races, R4-D3 and the
   chain table unchanged. **Still different:** silicon's 1-cycle first-offer refusal (not deterministic: present in
   some tasks of a chain and not in others) and the S2MM starvation until the first word arrives
   have no emulator counterpart; both are rows in "Open timing rows" below.
+
+## Compute MM2S word clock and lock-path start (modelled 2026-11-12, NPU1 silicon)
+
+Probes: `tools/gen_dma_lock_probe.py` fetch cases (a 64-word compute MM2S BD parked on a lock that a core releases,
+own-tile loopback, core loads swept across the grant to map the DMA's bank accesses; first-BD and chained),
+`tools/gen_path_onset_probe.py` `prewake-run` (a 1-word dummy BD, then a 16-word BD) and the onset probes above.
+Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
+
+- **Silicon.** Bank accesses at g + 2, 3, 4, 5, 7, 11, 15, ..., 51 (banks alternating from bank 0), first-BD and
+  chained alike; FINISHED_BD at g + 52, one cycle after the last access; a 1-word and a 4-word BD finish at g + 3.
+  A core access that wins the bank at the first access (g + 2) delays the stream by one cycle and not FINISHED_BD;
+  one at the last access (g + 51) delays FINISHED_BD by one cycle. The host-path numbers of the previous section
+  (FINISHED_BD = N + 8, first offer 11 + min(N, 4)) hold as well.
+- **Model.** A compute MM2S sequences its words (address generation) one per cycle from START_TASK + 7
+  (`mm2s_word_clock_start_cycles` 3 after BD setup), lock or no lock, and on into a chained next BD. While a BD
+  waits for its lock the clock runs up to 16 words ahead in all, a chained next BD's words included
+  (`mm2s_word_clock_lead_words`), and resumes at grant + 3
+  (`mm2s_word_clock_resume_cycles`); 16 resuming at + 3 and 14 resuming at + 1 give the same cells and are not
+  separated. A granule is accessed the cycle after its last word was sequenced, from grant + 2
+  (`mm2s_lock_to_access_cycles`), one access per cycle, when the staging has room; it is offered 4 cycles after
+  the access (`mm2s_access_to_offer_cycles`); FINISHED_BD is the last access + 1 (`mm2s_access_to_finish_cycles`).
+  A lock-started BD pays no memory latency, channel start or post-grant countdown. A denied access is retried
+  the next cycle: the 2-cycle fetch backoff of 2026-07 is removed (silicon: against a dense same-bank core every
+  lost granule shows as two conflicts on consecutive cycles on the same bank, 532-535 pairs per run, producer
+  probe; with the backoff the emulator gave single conflicts and half the count). A BD that has not accessed
+  memory yet raises no MEMORY_STARVATION.
+- **Result (emulator).** The grant-relative access map, FINISHED_BD g + 52 (was g + 64 chained, g + 72 first-BD),
+  the conflict side effects at g + 2 and g + 51, and the dummy BD's start-to-finish of 3 (was 9) match silicon;
+  every host-path guard of the previous section is unchanged; producer probe `collide`: conflicts in same-bank
+  pairs, 116 per colliding transfer (silicon 115-116; before 58). Lock-synchronised variant (`fetch --sync --pre2
+  32`, 34 cases): FINISHED_BD minus the previous BD's = max(64, grant - previous finish + 52) on every row, as on
+  silicon (291 rows; the emulator was flat grant + 64), and a parked 4-word BD's lock-free next BD of 32 words
+  finishes 21 after it (silicon 21, emulator was 32).
+- **Still different.** The grant itself is at release + 0 (silicon + 2 or + 3, + 3 exactly when the release lands
+  2 mod 3 cycles after the channel reached the BD). A core access colliding with the first access (g + 2) wins on
+  silicon (the stream slips one cycle) and loses in the emulator, whose empty-staging urgency gives the DMA the
+  bank. The first word reaches the own-tile
+  S2MM at g + 10 (silicon g + 9; the offer / route split is not separated). The S2MM finishes at g + 74 against
+  g + 78. The producer probe's core stall count stays below silicon (0 against 18-20), the `bankdisc` probe's
+  conflict count above it (15 per transfer against 6-13). Not measured, so not changed: the memtile MM2S (keeps
+  the read-cursor rule), the shim MM2S, every S2MM lock path, the host-path access position inside a granule, and
+  a chained BD shorter than the lock hand-off (a 2-word BD's port gap is now 2).
 
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
