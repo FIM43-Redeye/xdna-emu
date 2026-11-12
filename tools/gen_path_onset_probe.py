@@ -920,14 +920,36 @@ def prewake_threshold(rows, key: str = "blip"):
     return (max(no) if no else None, min(yes) if yes else None)
 
 
+def prewake_flip(points, key: str):
+    """Where `key` flips with D over pooled rows. points: (d_start, row, label). Returns
+    (largest D without, smallest D with, offending labels); the labels are empty unless the rows
+    interleave (a row with the feature at a D no larger than a row without it)."""
+    no = [(d, lab) for d, r, lab in points if not r[key]]
+    yes = [(d, lab) for d, r, lab in points if r[key]]
+    no_max = max((d for d, _ in no), default=None)
+    yes_min = min((d for d, _ in yes), default=None)
+    if no_max is None or yes_min is None or no_max < yes_min:
+        return no_max, yes_min, []
+    bad = [f"{lab} D={d}" for d, lab in sorted(yes) if d <= no_max]
+    bad += [f"{lab} D={d}" for d, lab in sorted(no) if d >= yes_min]
+    return no_max, yes_min, bad
+
+
+def _platform(run: str) -> str:
+    """The backend suffix of a run tag (`h1.hw` -> `hw`); a tag without one is its own platform."""
+    return run.rsplit(".", 1)[1] if "." in run else run
+
+
 def format_prewake_table(rows) -> str:
-    """rows: (case, run, prewake_row dict)."""
+    """rows: (case, run, prewake_row dict). Cases a run did not capture are listed once per run;
+    the flip summaries pool all runs of a platform."""
     lines = [f"{'case':<8} {'run':<8} {'D(start)':>8} {'D(fin)':>7} {'blip':>5} {'blip@':>6} {'1st word':>8} "
              f"{'frames':>6}  note"]
-    ok = []
+    ok: dict[str, list] = {}
+    absent: dict[str, list[str]] = {}
     for case, run, r in sorted(rows, key=lambda x: (x[1], prewake_case_d(x[0]) if x[0] != "pw_ctl" else -1)):
         if r["start0"] is None:
-            lines.append(f"{case:<8} {run:<8} no MM2S 0 grant (STALLED_LOCK end) in the trace")
+            absent.setdefault(run, []).append(case)
             continue
         fmt = lambda v: "-" if v is None else str(v)
         note = "PACKET? do not read" if r["packet_risk"] else ""
@@ -935,14 +957,23 @@ def format_prewake_table(rows) -> str:
                      f"{'yes' if r['blip'] else 'no':>5} {fmt(r['blip_at']):>6} {fmt(r['latency']):>8} "
                      f"{r['frames']:>6}  {note}")
         if not r["packet_risk"] and r["d_start"] is not None:
-            ok.append(r)
-    lats = [r["latency"] for r in ok if r["latency"] is not None]
-    for r in ok:
-        r["late"] = bool(lats) and r["latency"] is not None and r["latency"] > min(lats)
-    for key, what in (("blip", "the BACKPRESSURE blip"), ("late", "a first word one cycle late")):
-        t = prewake_threshold(ok, key)
-        lines.append(f"{what} flips between D(start) = "
-                     + (f"{t[0]} (absent) and {t[1]} (present)" if t else "NOT MONOTONE in D"))
+            ok.setdefault(_platform(run), []).append((case, run, r))
+    for run, cases in absent.items():
+        lines.append(f"not in this run ({run}, no MM2S 0 grant captured): {' '.join(cases)}")
+    for platform, items in ok.items():
+        lats = [r["latency"] for _, _, r in items if r["latency"] is not None]
+        for _, _, r in items:
+            r["late"] = bool(lats) and r["latency"] is not None and r["latency"] > min(lats)
+        points = [(r["d_start"], r, f"{run} {case}") for case, run, r in items]
+        for key, what in (("blip", "the BACKPRESSURE blip"), ("late", "a first word one cycle late")):
+            no, yes, bad = prewake_flip(points, key)
+            if bad:
+                verdict = f"overlap, rows interleave: {'; '.join(bad)}"
+            elif yes is None:
+                verdict = f"{no} (absent), none present"
+            else:
+                verdict = f"{no} (absent) and {yes} (present)"
+            lines.append(f"{platform}: {what} flips between D(start) = {verdict}")
     return "\n".join(lines)
 
 

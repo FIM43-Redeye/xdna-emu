@@ -439,3 +439,48 @@ def test_prewake_threshold_works_on_the_late_first_word_too():
     text = g.format_prewake_table([("pw_d020", "r", g.prewake_row(window(None, 20, 19))),
                                    ("pw_d200", "r", g.prewake_row(window(None, 200, 20)))])
     assert "first word one cycle late flips between D(start) = 20 (absent) and 200 (present)" in text
+
+
+def _rows(run, spec):
+    """(case, run, row) per (d, blip): a window whose MM2S 0 starts d after MM2S 1."""
+    return [(f"pw_d{d:03d}", run, g.prewake_row(window(blip_at=15 if blip else None, d=d, latency=19)))
+            for d, blip in spec]
+
+
+def test_a_case_a_run_did_not_capture_is_listed_once_not_as_a_row():
+    rows = _rows("h1.hw", [(20, False), (200, True)])
+    rows += [("pw_d050", "h1.hw", {"start0": None}), ("pw_d100", "h1.hw", {"start0": None})]
+    text = g.format_prewake_table(rows)
+    assert "no MM2S 0 grant" not in text.split("not in this run")[0]
+    assert text.count("not in this run") == 1
+    assert "pw_d050" in text and "pw_d100" in text
+    assert text.count("pw_d050") == 1 and text.count("pw_d100") == 1
+
+
+def test_the_flip_is_pooled_over_the_runs_of_one_platform_so_a_partial_run_is_not_non_monotone():
+    # h1 ran only the low and high D, h2 the middle ones: each alone is fine, pooled is still monotone
+    rows = (_rows("h1.hw", [(20, False), (200, True)]) + _rows("h2.hw", [(100, False), (126, False), (128, True)])
+            + _rows("e3.emu", [(20, False), (140, True)]))
+    text = g.format_prewake_table(rows)
+    assert "NOT MONOTONE" not in text
+    assert "hw: the BACKPRESSURE blip flips between D(start) = 126 (absent) and 128 (present)" in text
+    assert "emu: the BACKPRESSURE blip flips between D(start) = 20 (absent) and 140 (present)" in text
+
+
+def test_interleaved_runs_of_one_platform_say_overlap_and_name_the_rows():
+    rows = (_rows("h1.hw", [(20, False), (128, True), (200, True)])
+            + _rows("h2.hw", [(128, False), (130, True)]))
+    text = g.format_prewake_table(rows)
+    line = next(ln for ln in text.splitlines() if ln.startswith("hw: the BACKPRESSURE"))
+    assert "overlap" in line and "NOT MONOTONE" not in line
+    assert "h1.hw pw_d128" in line and "h2.hw pw_d128" in line
+
+
+def test_flip_per_platform_uses_a_late_threshold_from_that_platforms_own_fastest_first_word():
+    rows = (_rows("h1.hw", [(20, False)]) + _rows("h2.hw", [(200, False)])
+            + [("pw_d020", "e3.emu", g.prewake_row(window(None, 20, 30))),
+               ("pw_d200", "e3.emu", g.prewake_row(window(None, 200, 30)))])
+    text = g.format_prewake_table(rows)
+    # the emulator's 30-cycle first words are its own minimum, so nothing there is "late"
+    line = next(ln for ln in text.splitlines() if ln.startswith("emu: a first word"))
+    assert "200 (absent), none present" in line
