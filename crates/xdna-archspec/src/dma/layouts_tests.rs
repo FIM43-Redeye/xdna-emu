@@ -756,6 +756,59 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_value_lookup_per_tile_kind() {
+        use crate::types::TileKind;
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        // Module_Clock_Control: compute (core section) 0x37, memtile 0x33, shim MCC_0 0x3B.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x60000), Some(0x37));
+        assert_eq!(layout.reset_value(TileKind::Mem, 0xFFF00), Some(0x33));
+        assert_eq!(layout.reset_value(TileKind::ShimNoc, 0xFFF00), Some(0x3B));
+        assert_eq!(layout.reset_value(TileKind::ShimPl, 0xFFF00), Some(0x3B));
+        // Compute-tile registers come from both the core and memory sections.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x32000), Some(0x02));
+        // A register whose reset is zero, and an offset with no register, have no entry.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x3FF34), None);
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x0F_FFFC), None);
+    }
+
+    #[test]
+    fn test_clock_control_layout_from_database() {
+        use crate::types::TileKind;
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        let compute = layout.clock_control(TileKind::Compute);
+        assert_eq!(compute.module_clock_control, 0x60000);
+        assert_eq!(
+            compute.stream_switch_adaptive_enable.mask << compute.stream_switch_adaptive_enable.shift,
+            1 << 4
+        );
+        assert_eq!(compute.dma_adaptive_enable.mask << compute.dma_adaptive_enable.shift, 1 << 5);
+        assert_eq!(compute.abort_period_register, 0x3FF38);
+        assert_eq!((compute.abort_period.shift, compute.abort_period.mask), (0, 0xF));
+        assert_eq!(compute.abort_period_reset, 7);
+        assert_eq!(compute.status_register, 0x3FF34);
+
+        let memtile = layout.clock_control(TileKind::Mem);
+        assert_eq!(memtile.module_clock_control, 0xFFF00);
+        assert_eq!(memtile.abort_period_register, 0xB0F38);
+        assert_eq!(memtile.status_register, 0xB0F34);
+
+        let shim = layout.clock_control(TileKind::ShimNoc);
+        assert_eq!(shim.module_clock_control, 0xFFF00);
+        assert_eq!(shim.abort_period_register, 0x3FF38);
+        assert_eq!(layout.clock_control(TileKind::ShimPl).module_clock_control, 0xFFF00);
+    }
+
+    #[test]
     fn test_non_zero_reset_values_iterator() {
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database JSON not found");
