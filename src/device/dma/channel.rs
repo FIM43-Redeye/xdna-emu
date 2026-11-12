@@ -446,6 +446,15 @@ pub struct ChannelContext {
     /// pending.
     pub prev_lock_stalled: bool,
 
+    /// STREAM_STARVATION held level of a tile S2MM waiting on the lock of its task's first BD
+    /// (`DmaEngine::settle_stream_starvation`). Separate from `prev_starving`, which belongs to
+    /// the running transfer and gates the swap-enable release watch.
+    pub lock_wait_starving: bool,
+
+    /// First cycle at which that level may rise: the cycle `start_channel` ran plus the arming
+    /// delay (`DMA_S2MM_STARVATION_ARM_CYCLES`).
+    pub lock_wait_starve_from: u64,
+
     /// Deferred cross-lock release, held until the next chained BD's acquire
     /// is granted (the buffer swap).  `(lock_id, release_value)`.
     ///
@@ -645,6 +654,8 @@ impl ChannelContext {
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
+            lock_wait_starving: false,
+            lock_wait_starve_from: 0,
             pending_releases: Vec::new(),
             parked_releases: std::collections::VecDeque::new(),
             swap_free_watch: None,
@@ -798,6 +809,8 @@ impl ChannelContext {
         self.stats = ChannelStats::default();
         self.pending_releases.clear();
         self.swap_free_watch = None;
+        self.lock_wait_starving = false;
+        self.lock_wait_starve_from = 0;
         self.startup_hold_cycles = 0;
         self.bubble_spent = false;
         self.bd_switch_accept_block = 0;

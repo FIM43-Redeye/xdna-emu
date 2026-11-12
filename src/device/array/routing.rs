@@ -197,6 +197,12 @@ impl TileArray {
         // Phase 4: Stream Routing
         // Route all stream data through the stream switch network.
         let words_routed = self.route_streams();
+        // The beats offered this cycle are known: settle the S2MM starvation levels.
+        for (dma, &present) in self.dma_engines.iter_mut().zip(&self.tile_present) {
+            if present {
+                dma.settle_stream_starvation();
+            }
+        }
 
         // Phase 4.5: Cascade Propagation
         // Dedicated point-to-point 512-bit links between compute tiles.
@@ -1204,6 +1210,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     if !dma.channel_is_started(ch) {
                         continue;
                     }
+                    // A beat held at the master port is on offer whether or not the channel takes it
+                    // (STREAM_STARVATION is low while one is).
+                    dma.note_stream_offer(ch, fifo_len > 0);
                     // Combinational cold-terminal hold (#140 SP-4a campaign): an
                     // interior armed S2MM that transitively feeds a cold terminal
                     // presents TREADY-low this cycle, so its master FIFO retains

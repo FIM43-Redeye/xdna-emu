@@ -497,6 +497,9 @@ impl DmaEngine {
         for f in &mut self.s2mm_ingress_full_offered {
             *f = false;
         }
+        for f in &mut self.s2mm_beat_offered {
+            *f = false;
+        }
         for f in &mut self.mm2s_egress_empty_wanted {
             *f = false;
         }
@@ -533,6 +536,51 @@ impl DmaEngine {
                 *f = true;
             }
         }
+    }
+
+    /// The routing pass's view of S2MM channel `ch` this cycle: its master port holds a beat
+    /// (TVALID), whether or not the channel takes it. Feeds `settle_stream_starvation`.
+    pub fn note_stream_offer(&mut self, ch: u8, offered: bool) {
+        if let Some(f) = self.s2mm_beat_offered.get_mut(ch as usize) {
+            *f |= offered;
+        }
+    }
+
+    /// End of the routing pass: drive the STREAM_STARVATION held level of every S2MM channel
+    /// that is waiting on the lock of its task's first BD.
+    ///
+    /// Silicon (NPU1 onset probes): the level rises `DMA_S2MM_STARVATION_ARM_CYCLES` after the
+    /// task starts and is high in every cycle in which no beat is on offer at the master port,
+    /// as long as the BD still wants words. A beat on offer that a full ingress refuses keeps it
+    /// low, and so does a BD whose words have all arrived. It ends with the lock grant, after
+    /// which the transfer's own starvation (`prev_starving`) takes over unchanged.
+    ///
+    /// Not measured, so not asserted: shim channels (bridge-calibrated separately), a BD
+    /// reached after the first of a task, a BD with no lock, an idle channel.
+    pub fn settle_stream_starvation(&mut self) {
+        if self.tile_kind.is_shim() {
+            return;
+        }
+        for ch in 0..self.s2mm_count {
+            let high = self.lock_wait_wants_beat(ch) && !self.s2mm_beat_offered[ch];
+            if high != self.channels[ch].lock_wait_starving {
+                self.channels[ch].lock_wait_starving = high;
+                self.trace(EventType::DmaStreamStarvation { channel: ch as u8, active: high });
+            }
+        }
+    }
+
+    /// S2MM channel `ch` is armed, waiting on the lock of its task's first BD, and that BD has
+    /// not yet received all its words.
+    fn lock_wait_wants_beat(&self, ch: usize) -> bool {
+        let c = &self.channels[ch];
+        let ChannelFsm::AcquiringLock { acquired: false, transfer, .. } = &c.fsm else {
+            return false;
+        };
+        c.is_first_bd
+            && self.current_cycle >= c.lock_wait_starve_from
+            && c.accept_bd == Some(transfer.bd_index)
+            && c.accept_words_remaining > 0
     }
 
     /// Is `DMA_S2MM_n_MEMORY_BACKPRESSURE` asserted for S2MM channel `ch` this
