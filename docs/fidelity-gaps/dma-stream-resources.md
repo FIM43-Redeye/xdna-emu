@@ -390,9 +390,11 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   probe; with the backoff the emulator gave single conflicts and half the count). A BD that has not accessed
   memory yet raises no MEMORY_STARVATION.
 - **Result (emulator).** The grant-relative access map, FINISHED_BD g + 52 (was g + 64 chained, g + 72 first-BD),
-  the conflict side effects at g + 2 and g + 51, and the dummy BD's start-to-finish of 3 (was 9) match silicon;
+  the conflict at g + 51 (FINISHED_BD g + 53), and the dummy BD's start-to-finish of 3 (was 9) match silicon; a
+  denied access at g + 2 delays only the stream (unit test), but in the probe the DMA wins that conflict (below);
   every host-path guard of the previous section is unchanged; producer probe `collide`: conflicts in same-bank
-  pairs, 116 per colliding transfer (silicon 115-116; before 58). Lock-synchronised variant (`fetch --sync --pre2
+  pairs, 116 per colliding transfer (silicon 115-116; before 58), but every transfer collides (silicon: about 9 of
+  15, the others 4-6), so the run total is 1740 against 1069-1074 (870 before). Lock-synchronised variant (`fetch --sync --pre2
   32`, 34 cases): FINISHED_BD minus the previous BD's = max(64, grant - previous finish + 52) on every row, as on
   silicon (291 rows; the emulator was flat grant + 64), and a parked 4-word BD's lock-free next BD of 32 words
   finishes 21 after it (silicon 21, emulator was 32).

@@ -4727,10 +4727,24 @@ mod bank_demand_tests {
             }
             let (g, f1) = (grant.expect("granted") - f0, f1.expect("BD1 finished") - f0);
             assert_eq!(f1, 64.max(g + 52), "d = {d}: grant at previous finish + {g}");
-            let lattice: Vec<i64> = (0..16).map(|n| 3 + 4 * n).collect();
-            if g <= 1 {
-                assert_eq!(accesses, lattice, "d = {d}: the word clock alone paces the accesses");
+            // Word i is sequenced at i - 1, except that words 16.. wait for the clock to resume at
+            // grant + 3; granule n is accessed the cycle after its last word, not before grant + 2,
+            // one access per cycle. Unsaturated (grant before + 12) this is the lattice 3 + 4n with
+            // a burst of the granules ready by grant + 2 (silicon: 2 / 3 / 4 granules at d_meas
+            // 1 / 5 / 10); saturated it is grant + 2..5, + 7, + 11, ... (the long-parked map).
+            let word = |i: i64| {
+                if i < 16 {
+                    i - 1
+                } else {
+                    (i - 1).max(g + 3 + i - 16)
+                }
+            };
+            let mut expected: Vec<i64> = Vec::new();
+            for n in 0..16i64 {
+                let prev = expected.last().map_or(i64::MIN, |p| p + 1);
+                expected.push((word(4 * n + 3) + 1).max(g + 2).max(prev));
             }
+            assert_eq!(accesses, expected, "d = {d}: grant at previous finish + {g}");
         }
     }
 
