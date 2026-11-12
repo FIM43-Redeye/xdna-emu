@@ -46,9 +46,13 @@ Proof that a clock write lands (`proof-build`, `proof-run`, `proof-show`): the t
 a control-packet readback cannot share one design (the trace injector owns the shim S2MM and the
 runtime-sequence arguments the bridge runner binds; the readback needs shim MM2S 0 / S2MM 0 for its
 packets and its own host with three buffers), so the proof is a separate, trace-free design on the
-same tile: read Module_Clock_Control, the stream-switch Abort_Period and the gate Status register
-over control packets, do the config's masked writes, read all three again. `proof-show` compares
-the two reads with what the AM025 database says a landed write must give.
+same tile: read lock 0 (seeded to a known value, the control read), Module_Clock_Control, the
+stream-switch Abort_Period and the gate Status register over control packets, do the config's
+masked writes, read the three again, read lock 0 again, then the control-packet handler status.
+The sequence does not wait on the replies: the host collects them after a fixed pause, and a read
+that was never answered shows as "no reply". `proof-show` compares the clock reads with what the
+AM025 database says a landed write must give: LANDED, DROPPED, NO-REPLY (clock reads unanswered,
+control reads answered), BROKEN (control reads unanswered), and prints the handler status bits.
 
 `run --backend hw` takes the NPU lock (`build/experiments/.npu-hw.lock`).
 """
@@ -168,19 +172,33 @@ PROOF_TARGET = {"prod": "core", "mem": "mem"}      # ctrlpkt_readback target of 
 PROOF_VAR = {"prod": "%t_core", "mem": "%t_mem"}
 PROOF_PKT_ID = {"core": 5, "mem": 6}
 PROOF_READS = ("Module_Clock_Control", ABORT_PERIOD_REG, "Stream_Switch_Adaptive_Clock_Gate_Status")
+# AM025 module holding each tile's lock registers (the control read's register) and its handler status
+PROOF_LOCK_MODULE = {"prod": "memory", "mem": "memory_tile"}
+HANDLER_STATUS_REG = "Tile_Control_Packet_Handler_Status"
+SLVERR_FIELD = "SLVERR_On_Access"
+PROOF_LOCK_VALUE = 42               # lock 0's initial value: a reply that cannot be mistaken for a clock word
 PROOF_DATA_WORDS = 4                # the sequence's unused third buffer
+PROOF_SETTLE_MS = 500               # the host waits this long after the run before collecting replies
+NO_REPLY = 0xEEEEEEEE               # what the host leaves in a reply slot that was never written
 
 
 def _register(module: str, name: str) -> dict:
     return next(r for r in _regdb_modules()[module]["registers"] if r["name"] == name)
 
 
+def _offset(module: str, name: str) -> int:
+    return int(_register(module, name)["offset"], 16)
+
+
 def clock_proof_steps(config: str, tile: str) -> list:
-    """ctrlpkt_readback steps: three reads, the config's masked writes, the same three reads."""
+    """ctrlpkt_readback steps: a control read (lock 0), the three clock reads, the config's masked
+    writes, the three clock reads again, the control read again, then the handler status."""
     import ctrlpkt_readback as cp
     module, target = REGDB_MODULE[tile], PROOF_TARGET[tile]
-    reads = [(name, int(_register(module, name)["offset"], 16)) for name in PROOF_READS]
-    steps: list = [cp.Read(off, f"pre {name}", target) for name, off in reads]
+    control = _offset(PROOF_LOCK_MODULE[tile], "Lock0_value")
+    reads = [(name, _offset(module, name)) for name in PROOF_READS]
+    steps: list = [cp.Read(control, "pre control Lock0_value", target)]
+    steps += [cp.Read(off, f"pre {name}", target) for name, off in reads]
     lines = []
     for i, (offset, value, mask) in enumerate(clock_writes(config, tile)):
         lines += [f"%pf_a{i} = arith.constant {offset} : i32", f"%pf_v{i} = arith.constant {value} : i32",
@@ -190,7 +208,34 @@ def clock_proof_steps(config: str, tile: str) -> list:
     if lines:
         steps.append(cp.Raw(tuple(lines)))
     steps += [cp.Read(off, f"post {name}", target) for name, off in reads]
+    steps += [cp.Read(control, "post control Lock0_value", target),
+              cp.Read(_offset(module, HANDLER_STATUS_REG), f"handler {HANDLER_STATUS_REG}", target)]
     return steps
+
+
+def proof_sequence_lines(steps: list, layout, ctrlout: str, ctrlin: str) -> list[str]:
+    """ctrlpkt_readback.sequence_lines without the waits on the responses: the reply buffer is armed
+    without a completion token and the sequence ends after the last packet has left the shim; the
+    host collects the replies after PROOF_SETTLE_MS. A read that is never answered leaves its slot
+    at NO_REPLY."""
+    import ctrlpkt_readback as cp
+    n_out, n_in = len(layout.labels), len(layout.words)
+    out = [f"      aiex.npu.dma_memcpy_nd(%{ctrlout}[0, 0, 0, 0][1, 1, 1, {n_out}][0, 0, 0, 1]) "
+           f"{{id = 15 : i64, issue_token = false, metadata = @ctrl0}} : memref<{n_out}xi32>"]
+    by_step = {i: (off, n) for i, off, n in layout.packets}
+    sent = 0
+    for i, s in enumerate(steps):
+        if isinstance(s, cp.Raw):
+            out += [f"      {line}" for line in s.lines]
+            continue
+        off, n = by_step[i]
+        out.append(f"      aiex.npu.dma_memcpy_nd(%{ctrlin}[0, 0, 0, {off}][1, 1, 1, {n}][0, 0, 0, 1], "
+                   f"packet = <pkt_id = {cp.TARGETS[s.tile].pkt_id}, pkt_type = 0>) "
+                   f"{{id = {sent % cp.BD_IDS} : i64, issue_token = true, metadata = @ctrlin0}} "
+                   f": memref<{n_in}xi32>")
+        out.append("      aiex.npu.dma_wait {symbol = @ctrlin0}")
+        sent += 1
+    return out
 
 
 def clock_proof_design(config: str, tile: str) -> tuple[str, list, object]:
@@ -203,36 +248,64 @@ def clock_proof_design(config: str, tile: str) -> tuple[str, list, object]:
              "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
              f"    {var} = aie.tile({col}, {row}) "
              f"{{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {PROOF_PKT_ID[target]}>}}",
+             f'    %l_ctl = aie.lock({var}, 0) {{init = {PROOF_LOCK_VALUE} : i32, sym_name = "l_ctl"}}',
              *cp.packet_flows(var, "%t00", target), *cp.shim_allocations("%t00"),
              f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
              f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{PROOF_DATA_WORDS}xi32>) {{",
-             *cp.sequence_lines(steps, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
+             *proof_sequence_lines(steps, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
     return "\n".join(lines), steps, layout
 
 
 def proof_expectation(config: str, tile: str) -> dict[str, int]:
-    """What a landed write leaves in each read register: reset value with the written fields applied
-    (pre reads are the reset values; the Status register is only reported, not predicted)."""
+    """What a landed write leaves in each clock register: the reset value with the written fields
+    applied (pre reads are the reset values). The gate Status register is only reported."""
     module = REGDB_MODULE[tile]
     reset = {n: int(_register(module, n)["reset"], 16) for n in PROOF_READS[:2]}
     post = dict(reset)
     for offset, value, mask in clock_writes(config, tile):
         for n in PROOF_READS[:2]:
-            if int(_register(module, n)["offset"], 16) == offset:
+            if _offset(module, n) == offset:
                 post[n] = (reset[n] & ~mask) | (value & mask)
     return {**{f"pre {n}": v for n, v in reset.items()}, **{f"post {n}": v for n, v in post.items()}}
 
 
-def proof_verdict(config: str, tile: str, readback: dict[str, int]) -> str:
-    """LANDED when pre and post equal the prediction, DROPPED when post still equals pre while the
-    prediction differs, else UNEXPECTED (the words are in the report)."""
+def proof_decode(labels: list[str], words: list[int]) -> dict[str, int | None]:
+    """Reply words (NO_REPLY where nothing arrived) -> {label: value or None}.
+
+    Replies fill the buffer in arrival order, so a read that is never answered lets the next reply
+    slide into its slot. The control reads return PROOF_LOCK_VALUE, which no clock word equals: a
+    clock or status read that finds that value next while a control read is still to come was not
+    answered."""
+    out: dict[str, int | None] = {}
+    p = 0
+    for i, label in enumerate(labels):
+        control = "control" in label
+        control_ahead = any("control" in l for l in labels[i + 1:])
+        w = words[p] if p < len(words) else NO_REPLY
+        if w == NO_REPLY or (not control and w == PROOF_LOCK_VALUE and control_ahead):
+            out[label] = None
+            continue
+        out[label] = w
+        p += 1
+    return out
+
+
+def proof_verdict(config: str, tile: str, readback: dict[str, int | None]) -> str:
+    """BROKEN: a control read got no (or the wrong) reply, so control packets are not working.
+    NO-REPLY: the clock registers did not answer while control did. LANDED / DROPPED: the post
+    read has / has not changed as written. NO-WRITE: K0. UNEXPECTED: any other values."""
+    ctl = [readback.get(f"{w} control Lock0_value") for w in ("pre", "post")]
+    if any(v != PROOF_LOCK_VALUE for v in ctl):
+        return "BROKEN"
     want = proof_expectation(config, tile)
-    if all(readback.get(k) == v for k, v in want.items()):
-        return "LANDED" if any(want[f"post {n}"] != want[f"pre {n}"] for n in PROOF_READS[:2]) else "NO-WRITE (reads match)"
-    names = PROOF_READS[:2]
-    if all(readback.get(f"post {n}") == readback.get(f"pre {n}") for n in names) and any(
-            want[f"post {n}"] != want[f"pre {n}"] for n in names):
-        return "DROPPED (post == pre)"
+    keys = [f"{w} {n}" for w in ("pre", "post") for n in PROOF_READS[:2]]
+    if any(readback.get(k) is None for k in keys):
+        return "NO-REPLY"
+    changed = [n for n in PROOF_READS[:2] if want[f"post {n}"] != want[f"pre {n}"]]
+    if all(readback[k] == want[k] for k in keys):
+        return "LANDED" if changed else "NO-WRITE"
+    if changed and all(readback[f"post {n}"] == readback[f"pre {n}"] for n in PROOF_READS[:2]):
+        return "DROPPED"
     return "UNEXPECTED"
 
 
@@ -505,6 +578,34 @@ def summarize(path: Path, src: str, dst: str) -> str:
     return "\n".join(lines)
 
 
+def build_proof_host(dest: Path) -> Path:
+    """The ctrlpkt_readback host with a PROOF_SETTLE_MS pause between the end of the run and the
+    collection of the replies (replies are not awaited by the sequence)."""
+    import ctrlpkt_readback as cp
+    src = cp.HOST_CPP
+    src = src.replace("#include <vector>", "#include <vector>\n#include <chrono>\n#include <thread>")
+    src = src.replace("  bo_ctrl.sync(XCL_BO_SYNC_BO_FROM_DEVICE);",
+                      f"  std::this_thread::sleep_for(std::chrono::milliseconds({PROOF_SETTLE_MS}));\n"
+                      "  bo_ctrl.sync(XCL_BO_SYNC_BO_FROM_DEVICE);", 1)
+    assert "sleep_for" in src
+    exe = dest / "proof_host"
+    cpp = dest / "proof_host.cpp"
+    dest.mkdir(parents=True, exist_ok=True)
+    if not cpp.is_file() or cpp.read_text() != src:
+        cpp.write_text(src)
+        exe.unlink(missing_ok=True)
+    if not exe.exists():
+        # reuse the ctrlpkt host build (same flags) on this source
+        saved = cp.HOST_CPP
+        cp.HOST_CPP = src
+        try:
+            built = cp.build_host(dest)
+        finally:
+            cp.HOST_CPP = saved
+        built.replace(exe)
+    return exe
+
+
 def proof_build(out: Path, config: str, tile: str) -> Path:
     import ctrlpkt_readback as cp
     from harness.build import aiecc_command, aiecc_path
@@ -524,9 +625,8 @@ def proof_run(out: Path, tag: str, backend: str, only: list[str]) -> bool:
     """Run the built proof designs; `hw` takes the NPU lock itself (do not wrap it in flock)."""
     import fcntl
     import subprocess
-    import ctrlpkt_readback as cp
     from harness.run import _env, build_ffi
-    host = cp.build_host(out)
+    host = build_proof_host(out)
     if backend == "emu":
         build_ffi("debug")
     env = _env(backend, "debug")
@@ -566,11 +666,19 @@ def proof_show(out: Path, tag: str, only: list[str]) -> str:
         if (only and d.name not in only) or not f.exists():
             continue
         n = len(meta["labels"])
-        rb = dict(zip(meta["labels"], struct.unpack(f"<{n}I", f.read_bytes()[:4 * n])))
+        words = list(struct.unpack(f"<{n}I", f.read_bytes()[:4 * n]))
+        rb = proof_decode(meta["labels"], words)
         want = proof_expectation(meta["config"], meta["tile"])
         lines.append(f"{d.name} {tag}: {proof_verdict(meta['config'], meta['tile'], rb)}")
         for k, v in rb.items():
-            lines.append(f"   {k:48s} {v:#010x}" + (f"   (landed-write prediction {want[k]:#x})" if k in want else ""))
+            shown = "no reply" if v is None else f"{v:#010x}"
+            lines.append(f"   {k:56s} {shown}" + (f"   (landed-write prediction {want[k]:#x})" if k in want else ""))
+        h = rb.get(f"handler {HANDLER_STATUS_REG}")
+        if h is not None:
+            module = REGDB_MODULE[meta["tile"]]
+            bits = {f["name"]: (h >> f["bit_range"][0]) & 1 for f in _register(module, HANDLER_STATUS_REG)["bit_fields"]}
+            lines.append(f"   handler status {h:#x}: " + " ".join(f"{k}={v}" for k, v in bits.items())
+                         + (f"   <- {SLVERR_FIELD} set" if bits.get(SLVERR_FIELD) else ""))
     return "\n".join(lines)
 
 

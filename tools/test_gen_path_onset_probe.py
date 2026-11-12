@@ -177,16 +177,27 @@ needs_mlir_aie = pytest.mark.skipif(g.toolchain_paths.try_resolve_mlir_aie(g.REP
 
 
 @needs_mlir_aie
-def test_proof_steps_read_three_registers_around_the_masked_write():
+def test_proof_steps_order_control_reads_around_the_clock_reads():
     import ctrlpkt_readback as cp
     steps = g.clock_proof_steps("K3", "prod")
     reads = [s for s in steps if isinstance(s, cp.Read)]
-    assert [r.label for r in reads] == [f"{w} {n}" for w in ("pre", "post") for n in g.PROOF_READS]
-    assert [r.addr for r in reads[:3]] == [0x60000, 0x3FF38, 0x3FF34]
+    clock = list(g.PROOF_READS)
+    assert [r.label for r in reads] == (
+        ["pre control Lock0_value"] + [f"pre {n}" for n in clock] + [f"post {n}" for n in clock]
+        + ["post control Lock0_value", "handler Tile_Control_Packet_Handler_Status"])
+    assert [r.addr for r in reads] == [0x1F000, 0x60000, 0x3FF38, 0x3FF34, 0x60000, 0x3FF38, 0x3FF34,
+                                       0x1F000, 0x3FF30]
     raw = [i for i, s in enumerate(steps) if isinstance(s, cp.Raw)]
-    assert len(raw) == 1 and raw[0] == 3                    # after the 3 pre reads, before the post reads
-    assert any("maskwrite32" in line and "row = 2" in line for line in steps[3].lines)
-    assert not any("maskpoll" in line for line in steps[3].lines)
+    assert raw == [4]                                       # after the 4 pre reads, before the post reads
+    assert any("maskwrite32" in line and "row = 2" in line for line in steps[4].lines)
+
+
+@needs_mlir_aie
+def test_proof_memtile_reads_its_own_registers():
+    import ctrlpkt_readback as cp
+    reads = [s for s in g.clock_proof_steps("K1", "mem") if isinstance(s, cp.Read)]
+    assert reads[0].addr == 0xC0000 and reads[1].addr == 0xFFF00 and reads[-1].addr == 0xB0F30
+    assert all(r.tile == "mem" for r in reads)
 
 
 @needs_mlir_aie
@@ -194,38 +205,81 @@ def test_proof_k0_has_no_write_and_k4_writes_the_abort_period():
     import ctrlpkt_readback as cp
     assert not any(isinstance(s, cp.Raw) for s in g.clock_proof_steps("K0", "prod"))
     raw = next(s for s in g.clock_proof_steps("K4", "mem") if isinstance(s, cp.Raw))
-    assert f"arith.constant {0xB0F38} : i32" in raw.lines[0]    # 0xB0F38, the memtile Abort_Period
+    assert f"arith.constant {0xB0F38} : i32" in raw.lines[0]
     assert any("row = 1" in line for line in raw.lines)
 
 
 @needs_mlir_aie
-def test_proof_design_routes_control_packets_to_the_data_tile():
+def test_proof_design_does_not_wait_on_the_responses():
     text, steps, layout = g.clock_proof_design("K1", "prod")
+    body = text.split("aie.runtime_sequence")[1]
+    assert "aiex.npu.dma_wait {symbol = @ctrl0}" not in body       # the response channel is never awaited
+    assert "maskpoll" not in body
+    resp = next(l for l in body.splitlines() if "metadata = @ctrl0" in l)
+    assert "issue_token = true" not in resp
+    assert body.count("aiex.npu.dma_wait {symbol = @ctrlin0}") == len(layout.labels)   # packets leave the shim
+    assert f"memref<{len(layout.labels)}xi32>" in text
+
+
+@needs_mlir_aie
+def test_proof_design_routes_control_packets_and_seeds_the_control_lock():
+    text, _, _ = g.clock_proof_design("K1", "prod")
     assert "aie.packet_dest<%t_core, TileControl : 0>" in text and "pkt_id = 5" in text
-    assert text.count("aiex.npu.dma_memcpy_nd") == 1 + 6       # response buffer + 6 read packets
-    assert "memref<6xi32>" in text and f"memref<{g.PROOF_DATA_WORDS}xi32>" in text
+    assert f"aie.lock(%t_core, 0) {{init = {g.PROOF_LOCK_VALUE}" in text
     mem, _, _ = g.clock_proof_design("K2", "mem")
     assert "aie.packet_dest<%t_mem, TileControl : 0>" in mem and "pkt_id = 6" in mem
+    assert f"aie.lock(%t_mem, 0) {{init = {g.PROOF_LOCK_VALUE}" in mem
 
 
 @needs_mlir_aie
-def test_proof_writes_come_between_the_read_packets():
+def test_proof_write_comes_between_the_read_packets():
     text, _, _ = g.clock_proof_design("K1", "prod")
     body = text.split("aie.runtime_sequence")[1]
-    first_read, write, last_read = (body.index("dma_memcpy_nd(%ctrlin[0, 0, 0, 0]"), body.index("maskwrite32"),
-                                    body.rindex("dma_memcpy_nd(%ctrlin"))
-    assert first_read < write < last_read
+    assert body.index("dma_memcpy_nd(%ctrlin[0, 0, 0, 0]") < body.index("maskwrite32") < body.rindex("dma_memcpy_nd(%ctrlin")
 
 
 @needs_mlir_aie
-def test_proof_expectation_and_verdict():
+def test_proof_expectation_names_the_written_values():
     want = g.proof_expectation("K3", "prod")
     assert want["pre Module_Clock_Control"] == 0x37 and want["post Module_Clock_Control"] == 0x07
     assert want["pre Stream_Switch_Adaptive_Clock_Gate_Abort_Period"] == 7
     assert g.proof_expectation("K4", "mem")["post Stream_Switch_Adaptive_Clock_Gate_Abort_Period"] == 3
-    got = {k: v for k, v in want.items()}
-    assert g.proof_verdict("K3", "prod", got) == "LANDED"
-    dropped = dict(got, **{"post Module_Clock_Control": 0x37})
-    assert g.proof_verdict("K3", "prod", dropped).startswith("DROPPED")
-    assert g.proof_verdict("K3", "prod", dict(got, **{"pre Module_Clock_Control": 0})) == "UNEXPECTED"
-    assert g.proof_verdict("K0", "prod", g.proof_expectation("K0", "prod")).startswith("NO-WRITE")
+
+
+def _words(config="K3", tile="prod", **over):
+    want = g.proof_expectation(config, tile)
+    w = {"pre control Lock0_value": g.PROOF_LOCK_VALUE, "post control Lock0_value": g.PROOF_LOCK_VALUE,
+         "pre Stream_Switch_Adaptive_Clock_Gate_Status": 0, "post Stream_Switch_Adaptive_Clock_Gate_Status": 0,
+         "handler Tile_Control_Packet_Handler_Status": 0, **want}
+    w.update(over)
+    return w
+
+
+@needs_mlir_aie
+def test_verdicts():
+    assert g.proof_verdict("K3", "prod", _words()) == "LANDED"
+    assert g.proof_verdict("K3", "prod", _words(**{"post Module_Clock_Control": 0x37})) == "DROPPED"
+    nr = _words(**{"pre Module_Clock_Control": None, "post Module_Clock_Control": None})
+    assert g.proof_verdict("K3", "prod", nr) == "NO-REPLY"
+    assert g.proof_verdict("K3", "prod", _words(**{"post control Lock0_value": None})) == "BROKEN"
+    assert g.proof_verdict("K3", "prod", _words(**{"pre control Lock0_value": None})) == "BROKEN"
+    assert g.proof_verdict("K3", "prod", _words(**{"post Module_Clock_Control": 0x11})) == "UNEXPECTED"
+    assert g.proof_verdict("K0", "prod", _words("K0")) == "NO-WRITE"
+
+
+@needs_mlir_aie
+def test_decode_assigns_replies_in_order_and_marks_missing_ones():
+    import ctrlpkt_readback as cp
+    labels = list(cp.encode(g.clock_proof_steps("K3", "prod")).labels)
+    EE, L = 0xEEEEEEEE, g.PROOF_LOCK_VALUE
+    # every reply present
+    full = [L, 0x37, 7, 0, 0x07, 7, 0, L, 0]
+    assert list(g.proof_decode(labels, full).values()) == full
+    # the clock registers never answer: the later control reply must not slide into their slots
+    silent = [L, L, 0, EE, EE, EE, EE, EE, EE]
+    d = g.proof_decode(labels, silent)
+    assert d["pre control Lock0_value"] == L and d["post control Lock0_value"] == L
+    assert d["pre Module_Clock_Control"] is None and d["post Module_Clock_Control"] is None
+    assert d["handler Tile_Control_Packet_Handler_Status"] == 0
+    # nothing at all answers
+    assert all(v is None for v in g.proof_decode(labels, [EE] * 9).values())
