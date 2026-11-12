@@ -610,3 +610,10 @@ def test_sync_row_with_two_pre_bds_measures_d_from_the_last_one():
     e = sync_synthetic(rel=1000, pre=1010, waits=False) + [ev("DMA_MM2S_0_FINISHED_BD", 975)]
     r = g.sync_row(e)
     assert r["d"] == -10 and r["grant"] is None                            # released before the channel asked
+
+
+def test_load_case_labels_distinguish_k_and_bank():
+    assert sync_case(11, "0", 5).label == "a11k05" and g.SyncCase(11, "1", 12, pre2=32).label == "b11k12"
+    rows = [(sync_case(11, "1", 2).label, "s1.hw", g.sync_row(sync_synthetic())),
+            (sync_case(11, "0", 10).label, "s1.hw", g.sync_row(sync_synthetic()))]
+    assert [ln.split()[0] for ln in g.format_sync_table(rows).splitlines()[1:]] == ["a11k10", "b11k02"]

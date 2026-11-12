@@ -789,8 +789,10 @@ class SyncCase:
 
     @property
     def label(self):
-        """Row label in the tables: the nominal d, or "free"."""
-        return "free" if self.free else self.d
+        """Row label in the tables: the nominal d; "free"; or "a11k05" (bank letter, d, k) for a load case."""
+        if self.free:
+            return "free"
+        return self.d if self.bank == "none" else self.name[2:]
 
     @property
     def name(self) -> str:
