@@ -599,25 +599,12 @@ impl DmaEngine {
         (DMA_MM2S_READ_TO_OFFER_CYCLES + memtile) as u64
     }
 
-    /// Read backlog (cycles of reading still queued, `ChannelContext::read_backlog`) at/below
-    /// which an MM2S channel's granule fetch is `urgent` -- the read port is about to idle, so
-    /// the stream port would run dry, with stream still to feed (`transfer_is_urgent`,
-    /// `stepping.rs`). One granule (4 words): the minimum that still leaves a whole fetch's worth
-    /// of slack before the read port could idle, not a fitted number. (It used to be the staging
-    /// occupancy, which equals the read backlog while a fetched word is readable at once; the
-    /// read-to-offer latency keeps words in the staging that are no longer queued to read.) Also the threshold
-    /// that overrides `BACKOFF` -- a starving DMA must never stall itself out
-    /// via its own backoff.
+    /// Slack (`DmaEngine::mm2s_is_urgent`: staged words on a compute tile, cycles of reading
+    /// still queued on a memtile) at/below which an MM2S channel's granule fetch is `urgent` --
+    /// its stream port is about to run dry with stream still to feed (`transfer_is_urgent`,
+    /// `stepping.rs`), so the bank arbiter serves it over the core. One granule (4 words): the
+    /// minimum that still leaves a whole fetch's worth of slack, not a fitted number.
     pub(super) const URGENT_WATERMARK: usize = 4;
-
-    /// Cycles an MM2S channel withholds its granule-fetch demand after losing
-    /// a bank arbitration, before re-presenting (unless urgent, which always
-    /// overrides). The physical minimum that moves the next fetch attempt off
-    /// the exact cycle offset that just lost -- long enough to land on a
-    /// different point in the core's period-8 march, short enough that the
-    /// staging FIFO's slack (`egress_staging_capacity`) absorbs it without
-    /// ever draining to genuine underflow. See `stepping.rs::next_granule_fetch`.
-    pub(super) const BACKOFF: u8 = 2;
 
     /// Check if a specific S2MM channel can accept a word from the routing phase.
     ///
