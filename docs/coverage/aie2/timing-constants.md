@@ -6,7 +6,7 @@ Every `TimingModel` field with its provenance and verification verdict
 (`coverage/constants.rs`). The backlog lists what silicon contradicts or
 nothing has verified yet; settled values are toolchain-derived or measured.
 
-## Backlog (21)
+## Backlog (25)
 
 | Constant | Value | Provenance | Verification | Note |
 |----------|-------|------------|--------------|------|
@@ -22,6 +22,10 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `dma.host_memory_latency_cycles` | 0 | unspecified | unverified | Placeholder 0: folded into the per-direction shim cold-start values. |
 | `dma.memtile_first_bd_startup_cycles` | 0 | unspecified | unverified | Placeholder 0 (inert). The cold-start gap it was meant for was later root-caused to the CORE_CONTROL reset, so it may never be needed. |
 | `dma.compute_first_bd_startup_cycles` | 0 | unspecified | unverified | Placeholder 0 (inert), as memtile_first_bd_startup_cycles. |
+| `dma.mm2s_word_clock_start_cycles` | 3 | hardware-observed | unverified | Fitted. NPU1 2026-11 (tools/gen_path_onset_probe.py prod_own_nN, two runs identical): FINISHED_BD = START_TASK + N + 8; word 0 at + 7 follows from placing the access after the last word and the finish one cycle later, a placement that is not measured on the host path. Compute tiles, one value for every N. |
+| `dma.mm2s_word_clock_lead_words` | 16 | hardware-observed | unverified | Fitted: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 (tools/gen_dma_lock_probe.py, 64-word lock-started BD): granules 0..3 at grant + 2..5, granule 4 at + 7, then every 4 from + 11; both pairs give that map. |
+| `dma.mm2s_access_to_offer_cycles` | 4 | hardware-observed | unverified | Inferred. Neither side is a direct observation: the host-path access (7 + min(N, 4)) is the model's placement, and the lock-path offer (grant + 6) is the first word at the receiving DMA (grant + 9, NPU1 2026-11, tools/gen_dma_lock_probe.py) less a route of 3 that is not separated. The host first offer 11 + min(N, 4) (tools/gen_path_onset_probe.py) is measured. Compute tiles. |
+| `dma.mm2s_word_clock_resume_cycles` | 3 | hardware-observed | unverified | Fitted with the lead: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, granule 5 at + 11, unchanged (with FINISHED_BD + 52) when a core access wins the bank at + 2. |
 | `stream_switch.local_master_fifo_depth` | 2 | doc-specified | unverified | AM020 ch.2 'local master ports ... 2-deep FIFO'. |
 | `stream_switch.switch_fifo_depth` | 16 | doc-specified | unverified | AM020 ch.2:74 'the switch has one FIFO that is 16-deep'. A route through FIFO:0 absorbs +21 words on silicon (core and DMA sources, r4d3 rig and gen_stream_absorb_probe.py): this 16, the FIFO slave port's 4 and the 1-word FIFO output register; modelled, EMU == HW. |
 | `stream_switch.slave_port_latency` | 2 | doc-specified | unverified | AM020 ch.2:78/80 'slave ports are 2-cycle latency'. Splits a crossing's latency between its slave and master slots; only the sums are observed. |
@@ -32,7 +36,7 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `instruction.data_memory_latency` | 5 | doc-specified | unverified | AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie AIE2Schedule.td LoadLatency 5 (marked FIXME there). |
 | `instruction.branch_penalty` | 3 | unspecified | unverified | Original estimate (~3 fetch stages); llvm-aie MispredictPenalty is 4 (FIXME). The executor deliberately adds no branch penalty (the delay slots are the flush), so its live effect is unclear. |
 
-## Settled (27)
+## Settled (29)
 
 | Constant | Value | Provenance | Verification | Evidence and note |
 |----------|-------|------------|--------------|-------------------|
@@ -54,6 +58,8 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `dma.memtile_mm2s_egress_fifo_depth` | 31 | hardware-observed | silicon-verified | NPU1 memtile start-phase data race 2026-11-10 (tools/gen_pipeline_fill_probe.py race *_loop_pK): 52/51/54/53 vs compute 48/47/50/49, two runs identical; 31 with the hand-off word inside the MM2S since 2026-11-11 (onset-len) -- Upstream of the stream port (backpressure onset, gen_path_onset_probe.py); deeper staging vs a granule in flight not separated. |
 | `dma.memtile_mm2s_fetch_latency_cycles` | 1 | hardware-observed | silicon-verified | NPU1 backpressure onset 2026-11-10 (tools/gen_path_onset_probe.py): every memtile-sourced edge one cycle after the compute-sourced one, two runs identical -- Seen at task start; a fetch after a mid-transfer stall is assumed to pay it too. |
 | `dma.mm2s_read_to_offer_cycles` | 3 | hardware-observed | silicon-verified | NPU1 2026-11-11 (tools/gen_path_onset_probe.py prod_own_nN / mem_own_nN, path-capacity/onset-len + onset-long, two runs identical): first word offered at 11 + min(N, 4) while the BD's last read lands at N + 8 -- Compute value; the memtile pays memtile_mm2s_fetch_latency_cycles on top. |
+| `dma.mm2s_access_to_finish_cycles` | 1 | hardware-observed | silicon-verified | NPU1 2026-11 (tools/gen_dma_lock_probe.py): last access grant + 51, FINISHED_BD + 52, + 53 when a core access wins the bank at + 51 -- Paired with the lock-to-access latency through the conflict-stamp-equals-access assumption. |
+| `dma.mm2s_lock_to_access_cycles` | 2 | hardware-observed | silicon-verified | NPU1 2026-11 (tools/gen_dma_lock_probe.py, first-BD and chained): first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3 -- Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency. Assumes a conflict event is stamped on the access cycle. |
 | `stream_switch.local_slave_fifo_depth` | 4 | doc-specified | silicon-verified | NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase points exactly (docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field). |
 | `stream_switch.external_master_fifo_depth` | 4 | doc-specified | silicon-verified | NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase points exactly (docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 'external ports ... 4-deep FIFO'; with the slave's 4, the 8 words silicon adds per hop. |
 | `stream_switch.external_to_external_latency` | 4 | doc-specified | silicon-verified | NPU1 core-to-core round trip 32/40/48 cycles at 1/2/3 hops, r1 == r2 (tools/gen_stream_rtt_probe.py): +4 cycles one way per hop = one ext->ext crossing, nothing for the wire; the emulator's slope matches (its intercept is 8 cycles high, docs/fidelity-gaps/dma-stream-resources.md) -- AM020 ch.2 '4-cycle, 8-deep'. Latency is time inside the two FIFOs, not storage on top of them. |

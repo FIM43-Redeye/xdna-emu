@@ -168,23 +168,30 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             path-capacity/onset-len + onset-long, two runs identical): first word offered at 11 + min(N, 4) while the BD's \
             last read lands at N + 8",
             "Compute value; the memtile pays memtile_mm2s_fetch_latency_cycles on top."),
-        measured("dma.mm2s_word_clock_start_cycles", "NPU1 2026-11 (tools/gen_path_onset_probe.py prod_own_nN, two runs \
-            identical): FINISHED_BD = START_TASK + N + 8 = word 0 at + 7, access after the last word, finish + 1",
-            "Compute tiles; fitted under the word-clock model, one value for every N."),
-        measured("dma.mm2s_word_clock_lead_words", "NPU1 2026-11 (tools/gen_dma_lock_probe.py, 64-word lock-started BD): \
-            granules 0..3 at grant + 2..5, granule 4 at + 7, then every 4 from + 11",
-            "16 or 14 (resume at grant + 3 or + 1) give the same map; not yet separated."),
-        measured("dma.mm2s_access_to_offer_cycles", "NPU1 2026-11: host first offer 11 + min(N, 4) against access \
-            7 + min(N, 4) (gen_path_onset_probe.py); lock path offer grant + 6 against access grant + 2", "Compute tiles."),
+        unit("dma.mm2s_word_clock_start_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (tools/gen_path_onset_probe.py prod_own_nN, two runs identical): FINISHED_BD = \
+            START_TASK + N + 8; word 0 at + 7 follows from placing the access after the last word and the finish \
+            one cycle later, a placement that is not measured on the host path. Compute tiles, one value for every N."),
+        unit("dma.mm2s_word_clock_lead_words", HardwareObserved, Verification::Unverified,
+            "Fitted: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 \
+            (tools/gen_dma_lock_probe.py, 64-word lock-started BD): granules 0..3 at grant + 2..5, granule 4 at + 7, \
+            then every 4 from + 11; both pairs give that map."),
+        unit("dma.mm2s_access_to_offer_cycles", HardwareObserved, Verification::Unverified,
+            "Inferred. Neither side is a direct observation: the host-path access (7 + min(N, 4)) is the model's \
+            placement, and the lock-path offer (grant + 6) is the first word at the receiving DMA (grant + 9, \
+            NPU1 2026-11, tools/gen_dma_lock_probe.py) less a route of 3 that is not separated. The host first \
+            offer 11 + min(N, 4) (tools/gen_path_onset_probe.py) is measured. Compute tiles."),
         measured("dma.mm2s_access_to_finish_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py): last access grant + 51, \
             FINISHED_BD + 52, + 53 when a core access wins the bank at + 51",
             "Paired with the lock-to-access latency through the conflict-stamp-equals-access assumption."),
         measured("dma.mm2s_lock_to_access_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py, first-BD and chained): \
             first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3",
-            "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency."),
-        measured("dma.mm2s_word_clock_resume_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, \
-            granule 5 at + 11, unchanged (with FINISHED_BD + 52) when a core access wins the bank at + 2",
-            "Fitted with the lead: 16 resuming at + 3 or 14 at + 1, not separated."),
+            "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency. Assumes a conflict \
+            event is stamped on the access cycle."),
+        unit("dma.mm2s_word_clock_resume_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted with the lead: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 \
+            (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, granule 5 at + 11, unchanged (with FINISHED_BD + \
+            52) when a core access wins the bank at + 2."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),
