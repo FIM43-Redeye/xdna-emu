@@ -2,7 +2,7 @@
 class: trace-encoding
 subsystem: trace unit frame encoding (held-level spans, cycles field, Repeat / Sync tokens)
 posture: encoding-artifact -- the underlying mechanism (cycle_beat, level rising/falling) is faithful; the disagreement is in how spans are *encoded* into trace frames
-status: encoding layer CLOSED (2026-06-27); one residual falling-edge case documented-and-bounded
+status: encoding layer CLOSED (2026-06-27); one residual falling-edge case documented-and-bounded; packet hand-off timing, end of stream and first frame OPEN (2026-11-12)
 ---
 
 # Trace Held-Level Encoding Gaps
@@ -100,3 +100,36 @@ acquire (hold duration is the DMA / producer timing gap) or the phase of the PER
 | Hardware zero-overhead loop in the probe | the hand-written loops ran **once** on silicon: the loop registers are read at fetch, four lines ahead of issue, so LE must be a line start and LE written at least five lines before the loop end (rule table in `core-compute-timing.md` "Zero-overhead loop set-up") | iterates only when the set-up is in time (`src/interpreter/state/fetch.rs`) | **FIXED 2026-11-09**; loop PCs (mode 1) are still the sequential walk, see the branch row |
 | LOCK_STALL pulse of a request window | one 1-cycle pulse at c+4 | FIXED 2026-11-09 | closed |
 | Held level at the start of the trace | first frame, one cycle after the start event | FIXED 2026-11-09 (`level_signals`) | closed |
+
+## Packet hand-off, end of stream, first frame (silicon vs emulator, 2026-11-12)
+
+The token stream of a tile (frames, Repeats, Skip padding) now matches silicon packet for packet in a quiet
+stretch of `objectfifo_repeat_init_values_repeat` (28 bytes: `Repeat0(10)`, a frame, `Repeat0(7)`, `Skip`, a
+multiple-cycle frame and eleven saturated `Repeat1(1023)`). What differs is when the bytes are written, when
+the packet leaves the trace unit, and how a stream begins and ends.
+
+Method: packets of the shim that carries the trace (shim S2MM channel 1), six tests (`repeat_init_values_repeat`,
+`add_one_objFifo_elf`, `add_one_two_txn`, `add_one_ctrl_packet_4_cores`, `objectfifo_channel_turns`,
+`objectfifo_turns_walkers`), three silicon captures, one emulator run. The k-th packet in buffer order is
+matched to the k-th 8-cycle non-starved slot of that channel's `STREAM_STARVATION` level (this assumes buffer
+order is arrival order); delay = arrival cycle minus the last cycle the packet's own tokens cover, on the
+shim's timer. Only the shim's own packets are tabulated, because tile timers are not synchronised.
+
+| Last token of the packet | Silicon (cycles, 3 captures pooled) | Emulator |
+|---|---|---|
+| Single-cycle frame | 11 in 48 of 48 | 2 in 17 of 17 |
+| Multiple-cycle frame | 11 in 25 of 26 (one 17) | 2 in 5 of 5 |
+| Saturated `Repeat1(1023)` | 11 in 149 of 149 | 3 in 51 of 51 |
+| `Repeat0` or unsaturated `Repeat1`, a frame in the next cycle | 11 in 47 of 48 (one 18) | `Repeat0` 3 in 6 of 6; `Repeat1` 9 in 8 of 9 (one 3) |
+| `Repeat0` or unsaturated `Repeat1`, idle after it | 8 cases: gap + 10 in 7 (gap 5: 15; gap 9: 19, six cases), one case at gap 5 is 20 | 3 cases, gap 9: 11 (gap + 2) |
+| Single-cycle frame, idle after it | 1 case, gap 9: 11 | none |
+| `Skip` padding (end of trace) | 12 packets, 11 to 1033 | 8 packets, 3 to 633 |
+
+"Gap" is the distance in cycles from the last covered cycle to the tile's next frame.
+
+| Gap | Silicon | Emulator | Status | Obs. |
+|-----|---------|----------|--------|------|
+| Packet hand-off timing | A packet's first word reaches the shim S2MM 10 cycles after the byte that completes it is written. Event frames therefore reach it 11 cycles after their own cycle, so the frame token is written one cycle after the frame's cycle (inferred from the arrival time). A Repeat that ends a run is written when the next frame arrives, so its delay is the idle gap + 10, and 11 when a frame follows at once. A saturated `Repeat1(1023)` is written in the cycle it completes (11, as above). | 2 to 3 cycles after the completing token for frames and saturated Repeats, 9 for most unsaturated Repeats followed by a frame, gap + 2 when idle follows. The trace unit hands a packet to the switch one step after it completes in every case measured; the extra step of saturated packets (3 against 2) is the stream-switch idle gate, see [`dma-stream-resources.md`](dma-stream-resources.md) "Open timing rows". Visible as starved stretches of `repeat_init_values_repeat`: 42 of 11256 cycles (1 + 11 * 1023 + 2) in the emulator against 39 of 11264 (1 + 11 * 1023 + 10) in each silicon capture. | **OPEN.** Not modelled. The missing hold is about 8 cycles on the shim (measured there, not on other trace units); how much of the difference is the idle gate is not settled. Two silicon packets do not fit the table (a multiple-cycle frame at 17, an unsaturated Repeat at 18, both with a frame next) and one idle-after Repeat is gap + 15. | confirmed (shim), inferred elsewhere |
+| End of stream | Each tile's stream ends with a 4-byte end token; a quiet tail also writes Syncs (above). Padding packets at the end of the trace arrive 11 to 1033 cycles after the last covered cycle (12 packets). | No end token; the last packet is padded with Skip. Padding packets arrive 3 to 633 cycles after (8 packets). | **OPEN.** The cycle the end token lands in and what the late arrivals depend on are not pinned. | confirmed |
+| First frame of a stream | The shim's first frame is the starved level at once: `Single(mask 128, cycles 0)` on `repeat_init_values_repeat` (3 captures). | The same frame carries a cycles field of 218: the starved level begins 218 idle cycles after the start. | **OPEN.** Cause not investigated. | confirmed |
+| Trace carrier residuals (shim S2MM channel 1 `STREAM_STARVATION` interval counts) | `add_one_ctrl_packet_4_cores` shim (2,0): Chess 50 / 52 / 52, Peano 52 / 52 / 52. `dynamic_object_fifo_two_core_sliding_window` shim (0,0): 12 / 11 / 12. | After the saturated-Repeat fix (`f3813fc`): 60 (Chess), 59 (Peano); 14. Other carriers are below silicon: `add_one_objFifo_elf` 8 against 11 / 13 / 11, `add_one_two_txn` 8 against 9 / 10 / 11, `objectfifo_channel_turns` 30 against 34 / 33 / 32. | **OPEN.** Probably downstream of the hand-off timing above, since each arriving packet ends a starved stretch (untested); rescore once that row is modelled. | confirmed |
