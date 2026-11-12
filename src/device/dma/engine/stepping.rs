@@ -1043,6 +1043,10 @@ impl DmaEngine {
                         let ch = &mut self.channels[ch_idx];
                         ch.words_sequenced = 0;
                         ch.word_clock_resume_at = u64::MAX;
+                        // No access yet, so nothing to settle: a BD with no words (silicon: not
+                        // measured; this is the emulator's own timing, the end of BD setup) must
+                        // finish on its own state, not on an earlier BD's.
+                        ch.access_settles_at = 0;
                         ch.word_clock_from = self.read_clock
                             + 1
                             + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
@@ -1464,6 +1468,8 @@ impl DmaEngine {
         let ch = &mut self.channels[ch_idx];
         ch.words_sequenced = ch.words_sequenced.min(words);
         ch.word_clock_resume_at = u64::MAX;
+        // As at the end of BD setup: this BD has not accessed memory, so nothing is settling.
+        ch.access_settles_at = 0;
 
         // (Recv-side BD-switch accept deassert is driven by the *accept* cursor
         // in `push_stream_in`/`note_stream_accepted`, NOT here: the memory-write
@@ -4482,6 +4488,29 @@ mod bank_demand_tests {
             }
         }
         (accesses, first.expect("a word left"), finished.expect("the BD finished"))
+    }
+
+    /// A zero-length compute MM2S BD has no access to settle, so its finish must not depend on
+    /// what an earlier BD left in `access_settles_at`. Run it with the stale value at 0 and at a
+    /// step far in the future: FINISHED_BD must land on the same step. Silicon has not measured a
+    /// zero-length BD; the step asserted here is the emulator's own (the end of BD setup).
+    #[test]
+    fn a_zero_length_mm2s_bd_does_not_depend_on_a_stale_access_settle_time() {
+        let finish_step = |stale: u64| {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 0).with_release(5, 1)).unwrap();
+            eng.channels[2].access_settles_at = stale;
+            eng.start_channel(2, 0).unwrap();
+            (0..100usize).find(|_| {
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                tile.locks[5].value >= 1
+            })
+        };
+        let fresh = finish_step(0);
+        assert!(fresh.is_some(), "a zero-length BD finishes");
+        assert_eq!(finish_step(60), fresh);
     }
 
     /// A compute MM2S sequences its words one per cycle (the word clock) and accesses a granule
