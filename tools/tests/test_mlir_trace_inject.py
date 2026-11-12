@@ -338,68 +338,123 @@ def test_core_port_running_emits_trace_port(tmp_path):
     assert "MM2S" in result, "MM2S direction missing on core port config"
 
 
+def _inject_memtile(tmp_path, *extra):
+    """Inject memtile tracing into the memtile fixture; return (mlir, config)."""
+    import json
+
+    fixture = _write_memtile_fixture(tmp_path)
+    out = tmp_path / "out.mlir"
+    cfg_path = tmp_path / "trace_config.json"
+    r = _run(["--input", str(fixture), "--out", str(out),
+              "--trace-config-out", str(cfg_path),
+              "--memtile-sweep-events", "all", *extra])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    return out.read_text(), json.loads(cfg_path.read_text())
+
+
+def _lower_selection_writes(mlir_text):
+    """Run the trace lowering passes aiecc runs and return the npu.write32
+    ops as (offset, value, col, row), in program order. Skips without aie-opt."""
+    import re
+
+    aie_opt = shutil.which("aie-opt")
+    if aie_opt is None:
+        pytest.skip("aie-opt not on PATH")
+    r = subprocess.run(
+        [aie_opt, "--aie-trace-to-config", "--aie-insert-trace-flows",
+         "--aie-trace-pack-reg-writes", "--aie-inline-trace-config", "-"],
+        input=mlir_text, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    consts = dict(re.findall(r"(%c\S+) = arith.constant (-?\d+) : i32", r.stdout))
+    out = []
+    for m in re.finditer(
+            r"aiex.npu.write32\((%c\S+?), (%c\S+?)\) \{column = (\d+) : i32, row = (\d+) : i32\}",
+            r.stdout):
+        addr, val, col, row = m.groups()
+        out.append((int(consts[addr]), int(consts[val]) & 0xFFFFFFFF, int(col), int(row)))
+    return out
+
+
 def test_memtile_sel_channels_default_off(tmp_path):
-    """Without --memtile-sel-channels, the runtime sequence must NOT emit
-    a write to the DMA_Event_Channel_Selection register (0xA06A0).
+    """Without --memtile-sel-channels nothing touches the selection registers
+    (DMA_Event_Channel_Selection, Locks_Event_Selection_<n>): the reset values
+    stay, and the trace config carries no selection record."""
+    text, cfg = _inject_memtile(tmp_path)
+    assert "sel_memtile" not in text
+    assert "Event_Channel_Selection" not in text
+    assert "Locks_Event_Selection" not in text
+    assert all("selection" not in t for t in cfg["tiles_traced"])
+    # After lowering there is no write to either register (0xA06A0, 0xC0400+).
+    offsets = {o for o, _, _, _ in _lower_selection_writes(text)}
+    assert 0xA06A0 not in offsets
+    assert not any(0xC0400 <= o <= 0xC041C for o in offsets)
 
-    Leaving the register at its reset value is the safe default -- we don't
-    want to clobber it for tests that aren't asking for memtile DMA SEL
-    events. The reset value (all SEL slots at channel 0) matches what
-    chaining_channels and similar examples assume.
-    """
+
+def test_memtile_sel_channels_uses_upstream_trace_reg(tmp_path):
+    """The selection is an aie.trace.config of aie.trace.reg field writes,
+    started ahead of the trace units: mlir-aie resolves the offsets from the
+    register database, so the tool carries no address."""
+    text, _ = _inject_memtile(tmp_path, "--memtile-sel-channels",
+                              "S2MM_SEL1:1,MM2S_SEL1:1")
+    assert "aie.trace.config @sel_memtile_0_1" in text
+    assert 'register = "DMA_Event_Channel_Selection" field = "S2MM_Sel1_Channel" value = 1' in text
+    assert 'register = "DMA_Event_Channel_Selection" field = "MM2S_Sel1_Channel" value = 1' in text
+    starts = [l.strip() for l in text.splitlines() if "aie.trace.start_config" in l]
+    assert starts[0] == "aie.trace.start_config @sel_memtile_0_1", starts
+    assert "arith.constant 657056" not in text  # no literal address written by us
+
+
+def test_memtile_sel_channels_lowers_to_the_register_offsets(tmp_path):
+    """'S2MM_SEL1:1,MM2S_SEL1:1' -> 0xA06A0 = (1<<8)|(1<<24) = 0x01000100;
+    each lock selector is its own register at 0xC0400 + 4n with
+    Lock_Select in bits 21:16 and Lock_Value in 5:0 (reset 0x3F)."""
+    text, _ = _inject_memtile(
+        tmp_path, "--memtile-sel-channels",
+        "S2MM_SEL1:1,MM2S_SEL1:1,LOCK_SEL0:33,LOCK_SEL3:40@2")
+    writes = _lower_selection_writes(text)
+    assert writes[:3] == [
+        (0xA06A0, 0x01000100, 0, 1),
+        (0xC0400, (33 << 16) | 0x3F, 0, 1),
+        (0xC040C, (40 << 16) | 2, 0, 1),
+    ], writes[:4]
+    # The selection lands before the first trace-unit write of any tile.
+    assert all(w[0] not in (0xA06A0, 0xC0400, 0xC040C) for w in writes[3:])
+
+
+def test_memtile_selection_recorded_in_trace_config(tmp_path):
+    """A reader of trace_config.json can tell what SEL0 meant in the run, and
+    the file still validates against the schema."""
+    import trace_config
+
+    text, cfg = _inject_memtile(
+        tmp_path, "--memtile-sel-channels", "S2MM_SEL0:1,LOCK_SEL0:4,LOCK_SEL1:5@1")
+    trace_config.validate(cfg)
+    (mem,) = [t for t in cfg["tiles_traced"] if t["kind"] == "memtile"]
+    assert mem["selection"] == {
+        "dma_channels": {"S2MM_SEL0": 1, "S2MM_SEL1": 0, "MM2S_SEL0": 0, "MM2S_SEL1": 0},
+        "locks": {"LOCK_SEL0": {"lock": 4, "value": 63},
+                  "LOCK_SEL1": {"lock": 5, "value": 1}},
+    }
+    assert all("selection" not in t for t in cfg["tiles_traced"] if t["kind"] != "memtile")
+
+
+def test_memtile_selection_without_memtile_trace_is_ignored_with_warning(tmp_path):
     fixture = _write_memtile_fixture(tmp_path)
     out = tmp_path / "out.mlir"
-    r = _run([
-        "--input", str(fixture),
-        "--out", str(out),
-        "--memtile-sweep-events", "all",
-    ])
-    assert r.returncode == 0, f"stderr={r.stderr}"
-    result = out.read_text()
-    # Current mlir-aie renders npu.write32 operands as arith constants;
-    # older printers used an address attribute. Reject either form.
-    lower = result.lower()
-    assert not any(
-        rendering in lower
-        for rendering in ("address = 0xa06a0", "address = 657056", "arith.constant 657056")
-    ), (
-        f"unexpected DMA_Event_Channel_Selection write without --memtile-sel-channels:\n{result}"
-    )
+    r = _run(["--input", str(fixture), "--out", str(out),
+              "--memtile-sel-channels", "S2MM_SEL0:1"])
+    assert r.returncode == 0
+    assert "ignored" in r.stderr
+    assert "sel_memtile" not in out.read_text()
 
 
-def test_memtile_sel_channels_emits_npu_write32(tmp_path):
-    """With --memtile-sel-channels, the runtime sequence must emit one
-    npu_write32 per memtile to program 0xA06A0 with the packed value.
-
-    Spec: 'S2MM_SEL1:1,MM2S_SEL1:1' -> S2MM_SEL0=0 (default), S2MM_SEL1=1,
-    MM2S_SEL0=0 (default), MM2S_SEL1=1.
-    Packed value: (0)<<0 | (1)<<8 | (0)<<16 | (1)<<24 = 0x01000100.
-    """
+def test_memtile_lock_selector_out_of_range_rejected(tmp_path):
     fixture = _write_memtile_fixture(tmp_path)
-    out = tmp_path / "out.mlir"
-    r = _run([
-        "--input", str(fixture),
-        "--out", str(out),
-        "--memtile-sweep-events", "all",
-        "--memtile-sel-channels", "S2MM_SEL1:1,MM2S_SEL1:1",
-    ])
-    assert r.returncode == 0, f"stderr={r.stderr}"
-    result = out.read_text()
-    # Accept both the older attribute form and current SSA-operand form.
-    lower = result.lower()
-    assert "aiex.npu.write32" in lower
-    assert (
-        "0xa06a0" in lower
-        or "0x000a06a0" in lower
-        or "address = 657056" in lower
-        or "arith.constant 657056" in lower
-    ), f"expected DMA_Event_Channel_Selection write at 0xA06A0:\n{result}"
-    assert (
-        "0x1000100" in lower
-        or "0x01000100" in lower
-        or "value = 16777472" in lower
-        or "arith.constant 16777472" in lower
-    ), f"expected packed SEL value 0x01000100:\n{result}"
+    r = _run(["--input", str(fixture), "--out", str(tmp_path / "o.mlir"),
+              "--memtile-sweep-events", "all",
+              "--memtile-sel-channels", "LOCK_SEL0:64"], check=False)
+    assert r.returncode != 0
+    assert "out of range" in r.stderr.lower()
 
 
 def test_memtile_sel_channels_invalid_slot_rejected(tmp_path):

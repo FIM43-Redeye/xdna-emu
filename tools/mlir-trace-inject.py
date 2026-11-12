@@ -69,6 +69,7 @@ from pathlib import Path
 # so trace-sweep.py and the Rust trace-compare can reference the same value.
 sys.path.insert(0, str(Path(__file__).parent))
 from perfcnt_defaults import DEFAULT_PERFCNT_PERIOD  # noqa: E402
+import trace_selectors  # noqa: E402
 from trace_config import dump as trace_config_dump  # noqa: E402
 
 # MLIR op name used by mlir-aie for the declarative trace op. If the
@@ -194,64 +195,6 @@ _TRACE_DEFAULT_MEMMOD_EVENTS = (
     "EDGE_DETECTION_EVENT_0",
     "EDGE_DETECTION_EVENT_1",
 )
-
-
-# MemTile DMA_Event_Channel_Selection register offset (per AM020 /
-# aie-rt xaiemlgbl_params.h XAIEMLGBL_MEM_TILE_MODULE_DMA_EVENT_CHANNEL_SELECTION).
-_MEMTILE_DMA_EVENT_SEL_OFFSET = 0xA06A0
-_MEMTILE_SEL_FIELD_SHIFTS = {
-    "S2MM_SEL0": 0,
-    "S2MM_SEL1": 8,
-    "MM2S_SEL0": 16,
-    "MM2S_SEL1": 24,
-}
-
-
-def _parse_memtile_sel_channels(spec: str | None) -> int | None:
-    """Decode --memtile-sel-channels into the packed 32-bit register value.
-
-    Format: comma-separated `SLOT:CHANNEL` pairs where SLOT is one of
-    {S2MM_SEL0, S2MM_SEL1, MM2S_SEL0, MM2S_SEL1} and CHANNEL is 0-5
-    (3-bit field, memtile has 6 channels per direction). Unspecified
-    slots default to channel 0, matching the register's reset value.
-
-    Returns None when no override is requested (so the caller can skip
-    emitting an npu_write32 entirely and let the register stay at reset).
-    """
-    if not spec:
-        return None
-    packed = 0
-    for tok in spec.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        if ":" not in tok:
-            raise ValueError(
-                f"--memtile-sel-channels: missing ':' in '{tok}' "
-                f"(expected 'SLOT:CHANNEL')"
-            )
-        slot, channel_str = tok.split(":", 1)
-        slot = slot.strip().upper()
-        if slot not in _MEMTILE_SEL_FIELD_SHIFTS:
-            raise ValueError(
-                f"--memtile-sel-channels: unknown slot '{slot}' "
-                f"(expected one of {sorted(_MEMTILE_SEL_FIELD_SHIFTS)})"
-            )
-        try:
-            channel = int(channel_str.strip(), 0)
-        except ValueError:
-            raise ValueError(
-                f"--memtile-sel-channels: invalid channel '{channel_str}' "
-                f"for slot {slot}"
-            ) from None
-        if not (0 <= channel <= 5):
-            raise ValueError(
-                f"--memtile-sel-channels: channel {channel} out of range "
-                f"for slot {slot} (memtile has 6 channels per direction, "
-                f"valid 0-5)"
-            )
-        packed |= (channel & 0x7) << _MEMTILE_SEL_FIELD_SHIFTS[slot]
-    return packed
 
 
 _PORT_EVENT_RE = re.compile(r"PORT_(?:IDLE|RUNNING|STALLED|TLAST)_(\d+)")
@@ -447,21 +390,23 @@ def parse_args():
                         "Example: '1=Core:0:slave' makes PORT_*_1 on a compute tile watch "
                         "the core's put_stream port.")
     p.add_argument("--memtile-sel-channels", default=None,
-                   help="memtile DMA Event Channel Selection register (0xA06A0) "
-                        "programming. Memtiles broadcast only 4 DMA event lines "
-                        "(S2MM_SEL0/SEL1, MM2S_SEL0/SEL1) regardless of how "
-                        "many physical channels are active; this register "
-                        "selects which physical channel feeds each SEL slot. "
-                        "Default register value is 0 (every SEL slot points "
-                        "at channel 0), so by default channel 0 fires both "
-                        "SEL0 and SEL1 events for its direction and channels "
-                        "1..5 fire nothing -- pass an explicit mapping to "
-                        "redirect SEL slots at higher channels. Format: "
-                        "'S2MM_SEL0:N,S2MM_SEL1:N,MM2S_SEL0:N,MM2S_SEL1:N' "
-                        "where any subset of the four SEL slots may be "
-                        "specified; unset slots default to 0. Example: "
-                        "'S2MM_SEL1:1,MM2S_SEL1:1' redirects the SEL1 slots "
-                        "at channel 1 while leaving SEL0 at channel 0.")
+                   help="memtile event selection: what the DMA_*_SELn and "
+                        "LOCK_SELn events watch. Memtiles raise only four DMA "
+                        "event lines (S2MM_SEL0/SEL1, MM2S_SEL0/SEL1) and eight "
+                        "lock event groups (LOCK_SEL0..7); the registers "
+                        "DMA_Event_Channel_Selection and "
+                        "Locks_Event_Selection_<n> pick the physical channel "
+                        "and the lock behind each. At reset every selector "
+                        "points at channel 0 / lock 0. Format: comma-separated "
+                        "'SLOT:CHANNEL' for the DMA slots and "
+                        "'LOCK_SEL<n>:LOCK[@VALUE]' for the lock selectors "
+                        "(VALUE is the Lock_Value trigger, default its reset "
+                        "value). DMA slots left out go out at channel 0 "
+                        "because the register is written whole. Example: "
+                        "'S2MM_SEL0:1,MM2S_SEL0:0,LOCK_SEL0:4,LOCK_SEL1:5'. "
+                        "Register names and widths come from the AM025 "
+                        "database; the choice is recorded in trace_config.json "
+                        "(tiles_traced[].selection).")
     p.add_argument("--shim-sweep-events", default=None,
                    help="comma-separated event names to sweep on shim. "
                         "Default (None): don't inject shim trace at all. "
@@ -651,6 +596,7 @@ def _build_trace_config(
     memmod_grounding: list[str],
     memmod_sweep: list[str],
     tiles: list[tuple[int, int, list[str], str | None]],
+    memtile_selection: dict | None = None,
 ) -> dict:
     """Construct the trace_config.json payload for the schema.
 
@@ -706,6 +652,10 @@ def _build_trace_config(
         # tiles. Shim and memtile entries omit the field per schema.
         if kind == "core":
             entry["module"] = module if module is not None else "core"
+        # What the memtile's SELn events watch in this run. Absent when no
+        # selection was programmed, i.e. every selector at its reset value.
+        if kind == "memtile" and memtile_selection:
+            entry["selection"] = memtile_selection
         tiles_traced.append(entry)
 
     # MLIR-declared placement origin -- the smallest (col, row) corner of
@@ -756,6 +706,27 @@ def _build_trace_config(
             "expected_runtime_sequence_memref_count": memref_arg_count,
         },
     }
+
+
+def _emit_selection_config(aied, tile_val, selection, col: int, row: int) -> str:
+    """Emit an aie.trace.config that programs the memtile event selectors.
+
+    Uses mlir-aie's own register mechanism (aie.trace.reg with a register and
+    field name): aie-trace-pack-reg-writes folds the fields of one register
+    into a single value and aie-inline-trace-config looks the register offset
+    up in the AM025 database, so no address appears here.
+    """
+    from aie.ir import InsertionPoint, IntegerAttr, IntegerType
+
+    sym = f"sel_memtile_{col}_{row}"
+    i32 = IntegerType.get_signless(32)
+    cfg = aied.trace_config(tile_val, sym)
+    block = cfg.operation.regions[0].blocks.append()
+    with InsertionPoint.at_block_begin(block):
+        for w in selection.writes:
+            aied.trace_reg(w.register, IntegerAttr.get(i32, w.value), field=w.field)
+        aied.end()
+    return sym
 
 
 def _inject_trace_ops(module, input_path: str, aied, args) -> int:
@@ -954,15 +925,20 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         _TRACE_DEFAULT_MEMTILE_EVENTS,
     ) if inject_memtile else []
 
-    # Parse the memtile DMA SEL channel mapping once. None means leave the
-    # register at its reset value (every SEL slot at channel 0). Anything
-    # non-None becomes a single 32-bit npu_write32 emitted into each
-    # traced memtile's runtime sequence below.
+    # Parse the memtile DMA-channel / lock selection once. None means leave
+    # the selection registers at their reset values (every selector at
+    # channel 0 / lock 0). Anything else becomes one aie.trace.config per
+    # traced memtile, started ahead of the trace units (see below).
     try:
-        memtile_sel_value = _parse_memtile_sel_channels(args.memtile_sel_channels)
+        memtile_selection = trace_selectors.parse_selection(
+            args.memtile_sel_channels, trace_selectors.load_memtile_registers())
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    if memtile_selection is not None and not inject_memtile:
+        print("warning: --memtile-sel-channels given without --memtile-sweep-events; "
+              "no memtile is traced, so the selection is ignored", file=sys.stderr)
+        memtile_selection = None
 
     # Memmod (compute mem-module) trace injection is opt-in. Stage 3 of #374.
     # The memmod trace unit lives on the SAME compute tile as the core trace
@@ -1071,6 +1047,7 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
 
         # Track perfcnt config symbols so we can add trace_start_config for them.
         perf_syms: list[str] = []
+        selection_syms: list[str] = []
 
         # Per-source trace packet ID. Every trace flow multiplexed onto the
         # shim's packet-switched S2MM channel must carry a UNIQUE packet id:
@@ -1202,6 +1179,10 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                     if cfg is not None:
                         memtile_port_cfgs[_port_slot(ev_name)] = cfg
 
+                if memtile_selection is not None:
+                    selection_syms.append(
+                        _emit_selection_config(aied, tile_val, memtile_selection, col, row))
+
                 pkt_id = packet_id_counter
                 packet_id_counter += 1
 
@@ -1274,6 +1255,11 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             # only matters for human-readable diffs; aiecc's trace
             # lowering passes don't care about emission order.
             # Mirror of mlir-aie python/utils/trace/setup.py line 542.
+            # Selectors first: a SELn event means nothing until the selection
+            # registers say what it watches, so program them before any trace
+            # unit starts.
+            for sym in selection_syms:
+                aied.trace_start_config(sym)
             for col, row, _ in compute_tiles:
                 aied.trace_start_config(_trace_sym(col, row, "core"))
             if inject_memmod:
@@ -1285,27 +1271,6 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 aied.trace_start_config(_trace_sym(col, row, "shim"))
             for sym in perf_syms:
                 aied.trace_start_config(sym)
-
-            # Program memtile DMA_Event_Channel_Selection (offset 0xA06A0) when
-            # the user has requested a non-default mapping. Without this write,
-            # all four SEL slots default to channel 0 -- so kernels that drive
-            # multiple memtile channels would only see channel-0 activity in
-            # the SEL events. Emitted via aiex.npu_write32 so aiecc lowers it
-            # alongside the rest of the runtime sequence config writes.
-            #
-            # Skipped when the spec is None: we don't need to clobber the
-            # register with its reset value, and emitting an unconditional
-            # write would change the runtime trace for tests that don't ask
-            # for memtile SEL events.
-            if memtile_sel_value is not None and memtile_tiles:
-                from aie.dialects.aiex import npu_write32
-                for col, row, _ in memtile_tiles:
-                    npu_write32(
-                        column=int(col),
-                        row=int(row),
-                        address=_MEMTILE_DMA_EVENT_SEL_OFFSET,
-                        value=memtile_sel_value,
-                    )
 
     # Write trace_config.json -- the single source of truth consumed by
     # cpp_trace_patch, parse-trace, trace_compare, and the bridge script.
@@ -1345,6 +1310,8 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         memmod_grounding=_split(args.memmod_grounding),
         memmod_sweep=_split(args.memmod_sweep_events),
         tiles=all_traced_tiles,
+        memtile_selection=(memtile_selection.as_json()
+                           if memtile_selection is not None else None),
     )
     trace_config_dump(cfg, args.trace_config_out)
 

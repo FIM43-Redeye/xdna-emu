@@ -198,6 +198,38 @@
           "module": {
             "enum": ["core", "mem"],
             "description": "Which module's trace_unit (only meaningful for core tiles, which have both)."
+          },
+          "selection": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Memtile only, present only when the selector registers were programmed: what the SELn events watched in this run. Without it every selector sat at its reset value (DMA channel 0, lock 0). A DMA_S2MM_SEL0_* event means channel dma_channels.S2MM_SEL0; a LOCK_SEL0_* event means lock locks.LOCK_SEL0.lock.",
+            "properties": {
+              "dma_channels": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Physical DMA channel behind each DMA event selector (DMA_Event_Channel_Selection). All four are listed because the register is written whole.",
+                "properties": {
+                  "S2MM_SEL0": {"type": "integer", "minimum": 0},
+                  "S2MM_SEL1": {"type": "integer", "minimum": 0},
+                  "MM2S_SEL0": {"type": "integer", "minimum": 0},
+                  "MM2S_SEL1": {"type": "integer", "minimum": 0}
+                }
+              },
+              "locks": {
+                "type": "object",
+                "description": "Lock behind each programmed lock selector (Locks_Event_Selection_<n>); selectors not listed stayed at reset. Keys are LOCK_SEL0..LOCK_SEL7.",
+                "propertyNames": {"pattern": "^LOCK_SEL[0-7]$"},
+                "additionalProperties": {
+                  "type": "object",
+                  "required": ["lock", "value"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "lock": {"type": "integer", "minimum": 0, "description": "Lock id watched."},
+                    "value": {"type": "integer", "minimum": 0, "description": "Lock_Value: the value LOCK_SELn_EQUAL_TO_VALUE compares against."}
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -171,10 +171,9 @@ def inject_trace_declarative(
         # pattern as shim above: None leaves row-1 tiles untraced.
         if memtile_sweep_events is not None:
             cmd += ["--memtile-sweep-events", memtile_sweep_events]
-        # Opt-in memtile DMA Event Channel Selection register override.
-        # None leaves register 0xA06A0 at its reset value (every SEL slot
-        # at channel 0). Used by #355a multi-channel memtile attribution
-        # to redirect SEL slots at non-zero physical channels.
+        # Opt-in memtile event selection (DMA channel and lock behind each
+        # SELn event). None leaves the selection registers at reset (every
+        # selector at channel 0 / lock 0). See tools/trace_selectors.py.
         if memtile_sel_channels is not None:
             cmd += ["--memtile-sel-channels", memtile_sel_channels]
         # Opt-in memmod trace injection (stage 3 / #374). Same pattern: None
@@ -577,10 +576,12 @@ def main():
         "--memtile-sel-channels",
         default=None,
         help="forward through to mlir-trace-inject's --memtile-sel-channels. "
-             "Default (None) leaves the DMA_Event_Channel_Selection register "
-             "(0xA06A0) at its reset value (every SEL slot at channel 0). "
-             "Pass 'SLOT:CHANNEL' pairs (e.g. 'S2MM_SEL1:1,MM2S_SEL1:1') to "
-             "redirect SEL slots at non-zero physical channels.",
+             "Default (None) leaves the memtile event selectors at reset "
+             "(every DMA_*_SELn at channel 0, every LOCK_SELn at lock 0). "
+             "Pass 'SLOT:CHANNEL' pairs for the DMA selectors (e.g. "
+             "'S2MM_SEL1:1,MM2S_SEL1:1') and 'LOCK_SEL<n>:LOCK[@VALUE]' for "
+             "the lock selectors (e.g. 'LOCK_SEL0:4'). The choice is recorded "
+             "in trace_config.json.",
     )
     parser.add_argument(
         "--memmod-sweep-events",
