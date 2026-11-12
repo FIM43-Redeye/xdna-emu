@@ -2775,13 +2775,15 @@ impl DmaEngine {
 
     /// Whether a compute MM2S's word clock sequences a word this cycle: it has started
     /// (`ChannelContext::word_clock_from`) and a word is left to sequence in the current BD or
-    /// its chained next BD. Words of a BD whose lock is not held -- the current BD before its
-    /// clock resumes (`ChannelContext::word_clock_resume_at`, grant +
-    /// `mm2s_word_clock_resume_cycles`), or a chained next BD with an acquire -- are sequenced
-    /// only up to `mm2s_word_clock_lead_words` (start-of-cycle count). The clock resumes on the
+    /// its chained next BD. While the current BD waits for its lock -- until its clock resumes
+    /// (`ChannelContext::word_clock_resume_at`, grant + `mm2s_word_clock_resume_cycles`) -- the
+    /// clock holds at `mm2s_word_clock_lead_words` sequenced words in all, the chained next
+    /// BD's included (start-of-cycle count; silicon: a parked 4-word BD's lead takes 12 words of
+    /// its lock-free next BD, `a_parked_bds_lead_carries_into_its_lock_free_next_bd`). Words of
+    /// a chained next BD that acquires a lock are held at the same lead. The clock resumes on the
     /// grant's timing, not on the first access: on silicon a core access that wins the bank at
     /// grant + 2 delays granules 0..3 and leaves granule 4 at + 7 and FINISHED_BD at + 52
-    /// (lock-fetch probe). Past the resume nothing bounds the lead but the BD itself.
+    /// (lock-fetch probe). Past the resume nothing bounds the lead but the BDs themselves.
     fn word_clock_sequences(&self, ch_idx: usize, transfer: &Transfer) -> bool {
         use xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_LEAD_WORDS;
         let lead = DMA_MM2S_WORD_CLOCK_LEAD_WORDS as usize;
@@ -2790,10 +2792,13 @@ impl DmaEngine {
             return false;
         }
         let ahead = ch.words_sequenced;
+        let parked = transfer.acquire_lock.is_some() && self.read_clock < ch.word_clock_resume_at;
+        if parked && ahead >= lead {
+            return false;
+        }
         let current = (transfer.remaining_bytes() as usize).div_ceil(4);
         if ahead < current {
-            let parked = transfer.acquire_lock.is_some() && self.read_clock < ch.word_clock_resume_at;
-            return !(parked && ahead >= lead);
+            return true;
         }
         let Some(next) = transfer.next_bd.and_then(|n| self.bd_configs.get(n as usize)) else {
             return false;
@@ -4626,6 +4631,107 @@ mod bank_demand_tests {
         let (accesses, _, finished) = run_lock_started_bd(64, true, &[51]);
         assert_eq!(accesses.last(), Some(&(52, 0b10)));
         assert_eq!(finished, 53);
+    }
+
+    /// The lead of a BD waiting for its lock counts every word the word clock has sequenced, the
+    /// chained next BD's included. Silicon (`tools/gen_dma_lock_probe.py` fetch `--sync --pre2`,
+    /// 2026-11): a 4-word BD parked on its lock, chained to a lock-free BD of N words, finishes
+    /// that BD N - 11 cycles after its own (21 for N = 32 in 102 rows, 5 for N = 16): the 16-word
+    /// lead holds the parked BD's 4 words and the next BD's first 12, which go out in the burst,
+    /// and the next BD's remaining words follow the clock from grant + 3.
+    #[test]
+    fn a_parked_bds_lead_carries_into_its_lock_free_next_bd() {
+        for (n, gap) in [(32u32, 21usize), (16, 5)] {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(
+                0,
+                BdConfig::simple_1d(0x2000, 16)
+                    .with_acquire(5, 1)
+                    .with_release(6, 1)
+                    .with_next(1),
+            )
+            .unwrap();
+            eng.configure_bd(1, BdConfig::simple_1d(0x400, n * 4).with_release(7, 1))
+                .unwrap();
+            eng.start_channel(2, 0).unwrap();
+            let (mut f0, mut f1) = (None, None);
+            for step in 0..400usize {
+                if step == 100 {
+                    tile.locks[5].value = 1;
+                }
+                eng.reset_cycle_drain_counters();
+                eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                tile.resolve_lock_requests(0);
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while eng.pop_stream_out_for_channel(2).is_some() {}
+                if f0.is_none() && tile.locks[6].value >= 1 {
+                    f0 = Some(step);
+                }
+                if f1.is_none() && tile.locks[7].value >= 1 {
+                    f1 = Some(step);
+                }
+            }
+            assert_eq!(f1.unwrap() - f0.unwrap(), gap, "N = {n}");
+        }
+    }
+
+    /// A chained 64-word BD whose lock arrives d cycles after the channel reached it finishes at
+    /// the later of its word clock and its grant: FINISHED_BD - the previous BD's FINISHED_BD =
+    /// max(64, grant - previous finish + 52). Silicon (`tools/gen_dma_lock_probe.py` fetch
+    /// `--sync --pre2 32`, 2026-11, 291 rows, no exception): exactly 64 when the lock is free on
+    /// request or granted up to 12 cycles after the previous finish, grant + 52 from there on.
+    /// The word clock runs from the channel's arrival (word i at previous finish + i - 1), so
+    /// granule n is accessed at previous finish + 3 + 4n unless the grant holds it.
+    #[test]
+    fn a_chained_lock_bd_finishes_at_the_later_of_its_word_clock_and_its_grant() {
+        for d in -8i64..=24 {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x2000, 128).with_release(6, 1).with_next(1))
+                .unwrap();
+            eng.configure_bd(1, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(7, 1))
+                .unwrap();
+            eng.start_channel(2, 0).unwrap();
+            // BD0 (32 words, host-started) finishes at step 40 (N + 8).
+            let f0 = 40i64;
+            let (mut grant, mut f1, mut accesses) = (None, None, Vec::new());
+            for step in 0..400i64 {
+                if step == f0 + d {
+                    tile.locks[5].value = 1;
+                }
+                let phase_before = eng.channel_phase(2);
+                eng.cycle_dma_banks = 0;
+                eng.reset_cycle_drain_counters();
+                eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                tile.resolve_lock_requests(0);
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while eng.pop_stream_out_for_channel(2).is_some() {}
+                if step == f0 {
+                    assert_eq!(tile.locks[6].value, 1, "BD0 finished at {f0}");
+                }
+                if grant.is_none()
+                    && phase_before == "AcquiringLock"
+                    && eng.channel_phase(2) != "AcquiringLock"
+                {
+                    grant = Some(step);
+                }
+                if step > f0 && eng.cycle_dma_banks != 0 {
+                    accesses.push(step - f0);
+                }
+                if f1.is_none() && tile.locks[7].value >= 1 {
+                    f1 = Some(step);
+                }
+            }
+            let (g, f1) = (grant.expect("granted") - f0, f1.expect("BD1 finished") - f0);
+            assert_eq!(f1, 64.max(g + 52), "d = {d}: grant at previous finish + {g}");
+            let lattice: Vec<i64> = (0..16).map(|n| 3 + 4 * n).collect();
+            if g <= 1 {
+                assert_eq!(accesses, lattice, "d = {d}: the word clock alone paces the accesses");
+            }
+        }
     }
 
     /// An MM2S into a consumer that takes nothing finishes a BD only if every fetch, the BD's
