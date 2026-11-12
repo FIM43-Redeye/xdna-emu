@@ -1477,13 +1477,17 @@ def ring_design_mlir(c: RingCase) -> str:
                 f"    ^recv2:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
     else:
         recv = f"    ^recv:\n      aie.dma_bd(%dst : memref<{w + p}xi32> offset = 0 len = {w + p})\n      aie.next_bd ^end\n"
-    second_flow, second_task = "", ""
+    second_flow, second_task, second_lock = "", "", ""
     if c.variant == "ms":
+        # a BD carries both lock fields or neither: MM2S 1's releases an otherwise unused END lock
+        second_lock = f"\n    %lEnd = aie.lock(%t02, {SYNC_LOCK_END}) {{init = 0 : i32, sym_name = \"lEnd\"}}"
         # MM2S 1: one lock-A BD (no pre BD) reading `feed` into S2MM 1, which writes all 64 words to `sdst`
         second_flow = "\n    aie.flow(%t02, DMA : 1, %t02, DMA : 1)"
         second_task = (f"    ^m1_start:\n      %s2 = aie.dma_start(MM2S, 1, ^send1, ^s1_start)\n"
                        f"    ^send1:\n      %ca1 = arith.constant 1 : i32\n      aie.use_lock(%lA, AcquireGreaterEqual, %ca1)\n"
-                       f"      aie.dma_bd(%feed : memref<{w}xi32>)\n      aie.next_bd ^end\n"
+                       f"      aie.dma_bd(%feed : memref<{w}xi32>)\n"
+                       f"      %ce1 = arith.constant 1 : i32\n      aie.use_lock(%lEnd, Release, %ce1)\n"
+                       f"      aie.next_bd ^end\n"
                        f"    ^s1_start:\n      %s3 = aie.dma_start(S2MM, 1, ^recv1, ^end)\n"
                        f"    ^recv1:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
     return f"""module {{
@@ -1499,7 +1503,7 @@ def ring_design_mlir(c: RingCase) -> str:
     %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
     %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
     %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
-    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}{second_lock}
     aie.flow(%t02, DMA : {c.mm2s}, %t02, DMA : {c.s2mm}){second_flow}
     func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
     aie.core(%t02) {{
