@@ -54,6 +54,41 @@ that was never answered shows as "no reply". `proof-show` compares the clock rea
 AM025 database says a landed write must give: LANDED, DROPPED, NO-REPLY (clock reads unanswered,
 control reads answered), BROKEN (control reads unanswered), and prints the handler status bits.
 
+Gate pre-wake probe (`prewake-build`, `prewake-run`, `prewake-table`). A tile's stream switch is
+adaptively clock-gated once it has been idle for 2^Abort_Period = 128 cycles, and a word offered to
+a gated switch is refused for one cycle: a one-cycle DMA MM2S STREAM_BACKPRESSURE "blip" on the
+first word of a transfer, which then arrives one cycle later. If that is the mechanism, a dummy
+word that crossed the same switch D cycles before the measured transfer's first word hides the
+blip exactly when D is below the idle threshold. One compute tile, two loopbacks through its
+switch:
+  MM2S 1 -> S2MM 1: a repeating one-word BD behind lock Dm (the dummy word, and later the filler).
+  MM2S 0 -> S2MM 0: N_WORDS = 16 words behind lock M (the measured transfer).
+  core: wait for the go lock (set by the runtime sequence once the trace is armed), settle (the
+    switch has seen no traffic since boot), release Dm, D nops, release M; then, long after the
+    measured transfer, PW_FILLERS more releases of Dm. Case `pw_dNNN` puts NNN nops between the
+    two releases (the table reports the D the trace measured: MM2S 1 grant to MM2S 0 grant, and
+    MM2S 1 FINISHED_BD to MM2S 0 grant); `pw_ctl` skips the first release.
+Trace: the memory module only (no core-module trace unit, so no core packet ever leaves the tile),
+five events: MM2S 0 STALLED_LOCK (its fall is the start: the BDs are started at boot) and
+STREAM_BACKPRESSURE, MM2S 1 STALLED_LOCK and FINISHED_BD, S2MM 0
+STREAM_STARVATION (it falls when the measured first word arrives).
+The confound: a trace packet leaving this tile crosses its switch and wakes it. A packet leaves
+when it is full, and the unit's last, partly filled packet never leaves without a stop event, so
+the design inverts the usual problem: the window's few frames (about ten edges, well under one
+packet) sit in the first packet, which is completed by the filler's MM2S 1 events AFTER the
+measured transfer, and the filler also leaves the last packet full. The table counts the trace
+edges up to the measured first word (`frames`) and marks `PACKET?` when that reaches PW_FRAME_GUARD
+(a packet could have left inside the window); a case so marked must not be read.
+Why it always completes. Nothing waits on a host buffer, host DMA or host signal. The runtime sequence
+holds only plain writes: one lock set (the go lock) and padding writes to a scratch word; it waits
+on nothing. The core waits on one thing, the go lock, which that sequence always sets.
+Both S2MMs run from boot on a plain BD and take any word offered; the MM2S BDs wait on locks
+that only the core releases, and it always reaches those releases after the go lock.
+
+    python3 tools/gen_path_onset_probe.py prewake-build OUT_DIR [--ds 20 50 ...] [--no-control]
+    python3 tools/gen_path_onset_probe.py prewake-run OUT_DIR TAG --backend hw|emu [--ds ...]
+    python3 tools/gen_path_onset_probe.py prewake-table OUT_DIR TAG [TAG ...] [--ds ...]
+
 `run --backend hw` takes the NPU lock (`build/experiments/.npu-hw.lock`).
 """
 from __future__ import annotations
@@ -682,6 +717,235 @@ def proof_show(out: Path, tag: str, only: list[str]) -> str:
     return "\n".join(lines)
 
 
+# -- gate pre-wake probe (see the module doc) ------------------------------------------------------
+
+# D is the number of nops between the dummy's and the measured release; the D the trace measures
+# (see prewake_row) is a few cycles more. The short cases come first: the idle threshold is unknown
+# (128 is the register-database guess), so it is searched from the bottom too. At D = 1..2 the
+# dummy word can still be in the switch when the measured word is offered ("switch busy").
+PREWAKE_SHORT_DS = (1, 2, 3, 4, 6, 8, 10, 12, 16, 24, 32, 64)
+PREWAKE_DS = PREWAKE_SHORT_DS + (20, 50, 100, 120, 126, 127, 128, 129, 130, 140, 200)
+PW_WORDS = 16                      # the measured transfer: the row where silicon shows the blip
+PW_LOCK_DUMMY, PW_LOCK_MEAS, PW_LOCK_GO = 1, 2, 3
+PW_LOCK_DUMMY_DONE, PW_LOCK_MEAS_DONE = 4, 5   # a BD with an acquire also carries a release
+OWN_LOCKS = 48                     # raw lock id base of the compute tile's own memory module
+PW_SETTLE_ITERS = 60               # about 10 cycles each: the switch idles long before the window
+PW_AFTER_MEASURED_NOPS = 150       # the measured transfer is long over before the first filler
+PW_FILLERS = 16                    # filler words: their MM2S 1 events complete the trace packet
+PW_FILLER_SPACING = 24
+PW_FILL_WORDS = 32                 # S2MM 1 BD length: the dummy word plus every filler
+PW_SRC, PW_DUMMY_SRC, PW_DST, PW_DUMMY_DST, PW_SCRATCH = 0x0400, 0x0800, 0x8000, 0x8400, 0xC000
+PW_PAD_WRITES = 600
+PW_BLIP_WINDOW = 40                # BACKPRESSURE this soon after the MM2S 0 start is the onset blip
+PW_FRAME_GUARD = 14                # trace edges before the first word at which a packet may have left
+# The BDs are started at boot, so START_TASK never fires; the grant (end of STALLED_LOCK) dates a start.
+# The trace config needs one core event: one the core program never raises (no `event #1`), so the
+# core-module unit records nothing and no core packet ever leaves the tile.
+PW_CORE_NEVER = "INSTR_EVENT_1"
+PW_EVENTS = ["DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_STREAM_BACKPRESSURE", "DMA_MM2S_1_STALLED_LOCK",
+             "DMA_MM2S_1_FINISHED_BD", "DMA_S2MM_0_STREAM_STARVATION"]
+
+
+def prewake_case_name(d: int | None) -> str:
+    return "pw_ctl" if d is None else f"pw_d{d:03d}"
+
+
+def prewake_case_d(name: str) -> int | None:
+    return None if name == "pw_ctl" else int(name[len("pw_d"):])
+
+
+def prewake_core_asm(d: int | None) -> str:
+    """go, settle, [release Dm, d nops,] release M, the filler's releases of Dm."""
+    n = lp.nops
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN_LOCKS + PW_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(PW_SETTLE_ITERS, ".Lsettle"), *n(8)]
+    if d is None:
+        body += n(8)
+    else:
+        body += [f"  rel #{OWN_LOCKS + PW_LOCK_DUMMY}, r2", *n(d)]
+    body += [f"  rel #{OWN_LOCKS + PW_LOCK_MEAS}, r2", *n(PW_AFTER_MEASURED_NOPS)]
+    for _ in range(PW_FILLERS):
+        body += [f"  rel #{OWN_LOCKS + PW_LOCK_DUMMY}, r2", *n(PW_FILLER_SPACING)]
+    body += n(8)
+    return lp.frame(body)
+
+
+def prewake_design_mlir() -> str:
+    w, f = PW_WORDS, PW_FILL_WORDS
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    one = str(0x0D000000)
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(PW_PAD_WRITES))
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t_shim = aie.tile(0, 0)
+    %t_prod = aie.tile(0, 2)
+    %src = aie.buffer(%t_prod) {{address = {PW_SRC} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %dsrc = aie.buffer(%t_prod) {{address = {PW_DUMMY_SRC} : i32, sym_name = "dsrc", initial_value = dense<[{one}]> : tensor<1xi32>}} : memref<1xi32>
+    %dst = aie.buffer(%t_prod) {{address = {PW_DST} : i32, sym_name = "dst"}} : memref<{w}xi32>
+    %ddst = aie.buffer(%t_prod) {{address = {PW_DUMMY_DST} : i32, sym_name = "ddst"}} : memref<{f}xi32>
+    %scratch = aie.buffer(%t_prod) {{address = {PW_SCRATCH} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lDm = aie.lock(%t_prod, {PW_LOCK_DUMMY}) {{init = 0 : i32, sym_name = "lDm"}}
+    %lM = aie.lock(%t_prod, {PW_LOCK_MEAS}) {{init = 0 : i32, sym_name = "lM"}}
+    %lGo = aie.lock(%t_prod, {PW_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    %lDd = aie.lock(%t_prod, {PW_LOCK_DUMMY_DONE}) {{init = 0 : i32, sym_name = "lDd"}}
+    %lMd = aie.lock(%t_prod, {PW_LOCK_MEAS_DONE}) {{init = 0 : i32, sym_name = "lMd"}}
+    aie.flow(%t_prod, DMA : 0, %t_prod, DMA : 0)
+    aie.flow(%t_prod, DMA : 1, %t_prod, DMA : 1)
+    func.func private @k_core(memref<4xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t_prod) {{
+      func.call @k_core(%scratch) : (memref<4xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t_prod) {{
+      %s0 = aie.dma_start(MM2S, 0, ^send0, ^start1)
+    ^send0:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lM, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%src : memref<{w}xi32>)
+      %cr0 = arith.constant 1 : i32
+      aie.use_lock(%lMd, Release, %cr0)
+      aie.next_bd ^end
+    ^start1:
+      %s1 = aie.dma_start(MM2S, 1, ^send1, ^start2)
+    ^send1:
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lDm, AcquireGreaterEqual, %cb)
+      aie.dma_bd(%dsrc : memref<1xi32>)
+      %cr1 = arith.constant 1 : i32
+      aie.use_lock(%lDd, Release, %cr1)
+      aie.next_bd ^send1
+    ^start2:
+      %s2 = aie.dma_start(S2MM, 0, ^recv0, ^start3)
+    ^recv0:
+      aie.dma_bd(%dst : memref<{w}xi32>)
+      aie.next_bd ^end
+    ^start3:
+      %s3 = aie.dma_start(S2MM, 1, ^recv1, ^end)
+    ^recv1:
+      aie.dma_bd(%ddst : memref<{f}xi32>)
+      aie.next_bd ^end
+    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lGo, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def prewake_inject_args() -> list[str]:
+    return ["--memmod-sweep-events", ",".join(PW_EVENTS), "--core-grounding", PW_CORE_NEVER, "--core-sweep-events", ""]
+
+
+def prewake_build_case(d: int | None, out: Path) -> None:
+    name = prewake_case_name(d)
+    dd = out / name
+    dd.mkdir(parents=True, exist_ok=True)
+    lp.assemble(prewake_core_asm(d), dd / "core.o", "k_core")
+    (dd / "base.mlir").write_text(prewake_design_mlir())
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *prewake_inject_args(),
+           "--trace-config-out", "trace_config.json", "--config-test-name", name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=dd, log=dd / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=dd, log=dd / "aiecc.log")
+    (dd / "case.json").write_text(json.dumps({"case": name, "d": d}) + "\n")
+
+
+def prewake_row(events) -> dict:
+    """One run of the tile's memory module as numbers. `events` are level-expanded (an event on
+    every asserted cycle) objects with name, ts, row, pkt_type.
+
+    d_start = MM2S 0 start minus MM2S 1 start (a start is the grant: the cycle after the end of its
+    STALLED_LOCK level); d_fin the same against MM2S 1 FINISHED_BD
+    (the dummy word has left the DMA by then). blip = STREAM_BACKPRESSURE within PW_BLIP_WINDOW
+    cycles of the MM2S 0 start, at blip_at. latency = cycles from the MM2S 0 start to the first
+    word at S2MM 0 (the end of its STREAM_STARVATION level that spans the start). frames = trace
+    edges up to the first word; packet_risk when a trace packet could have left in the window."""
+    stamps: dict[str, list[int]] = {}
+    core_seen = sum(1 for e in events if e.row == 2 and e.pkt_type == 0)
+    for e in events:
+        if e.row == 2 and e.pkt_type == 1:
+            stamps.setdefault(e.name, []).append(e.ts)
+    grant = lambda name: next(iter(b + 1 for _, b in _level_runs(stamps.get(name, []))), None)
+    s0 = grant("DMA_MM2S_0_STALLED_LOCK")
+    if s0 is None:
+        return {"start0": None}
+    start1 = grant("DMA_MM2S_1_STALLED_LOCK")
+    fin1 = min(stamps.get("DMA_MM2S_1_FINISHED_BD", [None]), default=None)
+    if start1 is not None and start1 > s0 + PW_BLIP_WINDOW:
+        start1 = fin1 = None           # the control: MM2S 1 only starts later, as the filler
+    row = {"start0": s0, "d_start": None if start1 is None else s0 - start1,
+           "d_fin": None if fin1 is None else s0 - fin1}
+    bp = [t - s0 for t in stamps.get("DMA_MM2S_0_STREAM_BACKPRESSURE", []) if 0 <= t - s0 <= PW_BLIP_WINDOW]
+    row["blip"], row["blip_at"], row["blip_cycles"] = bool(bp), (min(bp) if bp else None), len(bp)
+    run = next(((a, b) for a, b in _level_runs(stamps.get("DMA_S2MM_0_STREAM_STARVATION", []))
+                if a <= s0 <= b), None)
+    row["latency"] = None if run is None else run[1] + 1 - s0
+    arrival = s0 + row["latency"] if row["latency"] is not None else s0 + PW_BLIP_WINDOW
+    row["frames"] = sum((a <= arrival) + (b + 1 <= arrival)
+                        for ts in stamps.values() for a, b in _level_runs(ts))
+    row["core_events"] = core_seen        # any core-module event means core packets left the tile
+    row["packet_risk"] = row["frames"] >= PW_FRAME_GUARD or core_seen > 0
+    return row
+
+
+def _level_runs(ts) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for t in sorted(set(ts)):
+        if out and t == out[-1][1] + 1:
+            out[-1] = (out[-1][0], t)
+        else:
+            out.append((t, t))
+    return out
+
+
+def prewake_threshold(rows, key: str = "blip"):
+    """(largest D without `key`, smallest D with it) over rows that have a d_start; None when
+    `key` is not a monotone function of D. The upper is None if no row has it."""
+    pts = sorted((r["d_start"], r[key]) for r in rows if r.get("d_start") is not None)
+    if any(a and not b for (_, a), (_, b) in zip(pts, pts[1:])):
+        return None
+    no = [d for d, b in pts if not b]
+    yes = [d for d, b in pts if b]
+    return (max(no) if no else None, min(yes) if yes else None)
+
+
+def format_prewake_table(rows) -> str:
+    """rows: (case, run, prewake_row dict)."""
+    lines = [f"{'case':<8} {'run':<8} {'D(start)':>8} {'D(fin)':>7} {'blip':>5} {'blip@':>6} {'1st word':>8} "
+             f"{'frames':>6}  note"]
+    ok = []
+    for case, run, r in sorted(rows, key=lambda x: (x[1], prewake_case_d(x[0]) if x[0] != "pw_ctl" else -1)):
+        if r["start0"] is None:
+            lines.append(f"{case:<8} {run:<8} no MM2S 0 grant (STALLED_LOCK end) in the trace")
+            continue
+        fmt = lambda v: "-" if v is None else str(v)
+        note = "PACKET? do not read" if r["packet_risk"] else ""
+        lines.append(f"{case:<8} {run:<8} {fmt(r['d_start']):>8} {fmt(r['d_fin']):>7} "
+                     f"{'yes' if r['blip'] else 'no':>5} {fmt(r['blip_at']):>6} {fmt(r['latency']):>8} "
+                     f"{r['frames']:>6}  {note}")
+        if not r["packet_risk"] and r["d_start"] is not None:
+            ok.append(r)
+    lats = [r["latency"] for r in ok if r["latency"] is not None]
+    for r in ok:
+        r["late"] = bool(lats) and r["latency"] is not None and r["latency"] > min(lats)
+    for key, what in (("blip", "the BACKPRESSURE blip"), ("late", "a first word one cycle late")):
+        t = prewake_threshold(ok, key)
+        lines.append(f"{what} flips between D(start) = "
+                     + (f"{t[0]} (absent) and {t[1]} (present)" if t else "NOT MONOTONE in D"))
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -716,8 +980,47 @@ def main(argv=None) -> int:
     ps.add_argument("out_dir")
     ps.add_argument("tag")
     ps.add_argument("--only", nargs="*", default=[])
+    wb = sub.add_parser("prewake-build", help="gate pre-wake probe: build the D cases and the control")
+    wb.add_argument("out_dir")
+    wb.add_argument("--ds", nargs="*", type=int, default=list(PREWAKE_DS))
+    wb.add_argument("--no-control", action="store_true")
+    wr = sub.add_parser("prewake-run", help="gate pre-wake probe: run the built cases to TAG.BACKEND/")
+    wr.add_argument("out_dir")
+    wr.add_argument("tag")
+    wr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    wr.add_argument("--ds", nargs="*", type=int, default=list(PREWAKE_DS))
+    wr.add_argument("--no-control", action="store_true")
+    wt = sub.add_parser("prewake-table", help="gate pre-wake probe: D, blip and first-word latency per case")
+    wt.add_argument("out_dir")
+    wt.add_argument("tags", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
+    wt.add_argument("--ds", nargs="*", type=int, default=list(PREWAKE_DS))
+    wt.add_argument("--no-control", action="store_true")
     a = ap.parse_args(argv)
     out = Path(a.out_dir)
+    if a.cmd.startswith("prewake-"):
+        cases = ([] if a.no_control else [None]) + list(a.ds)
+        if a.cmd == "prewake-build":
+            for d in cases:
+                prewake_build_case(d, out)
+                print("built", prewake_case_name(d))
+            return 0
+        if a.cmd == "prewake-run":
+            for d in [c for c in cases if (out / prewake_case_name(c)).is_dir()]:
+                if not lp.run_case(out, prewake_case_name(d), a.tag, a.backend, output=False):
+                    print(f"{prewake_case_name(d)}: run did not complete; stop")
+                    return 1
+            return 0
+        import gen_dma_lock_probe as dl
+        rows = []
+        for d in cases:
+            for tag in a.tags:
+                run_dir = out / prewake_case_name(d) / tag
+                if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                    rows.append((prewake_case_name(d), tag, {"start0": None}))
+                    continue
+                rows.append((prewake_case_name(d), tag, prewake_row(dl.load_level_events(run_dir))))
+        print(format_prewake_table(rows))
+        return 0
     if a.cmd == "proof-build":
         for c in a.clock:
             for t in a.tile:

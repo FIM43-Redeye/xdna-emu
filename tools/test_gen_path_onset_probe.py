@@ -282,3 +282,160 @@ def test_decode_assigns_replies_in_order_and_marks_missing_ones():
     assert d["handler Tile_Control_Packet_Handler_Status"] == 0
     # nothing at all answers
     assert all(v is None for v in g.proof_decode(labels, [EE] * 9).values())
+
+
+# -- prewake probe: does a word crossing the switch shortly before a transfer hide the gate's blip? --
+
+from collections import namedtuple
+
+Ev = namedtuple("Ev", "name ts row pkt_type")
+
+
+def bundles(text):
+    lines = [ln.strip() for ln in text.splitlines()]
+    start = max(i for i, ln in enumerate(lines) if ln.startswith("st r31,")) + 1
+    end = min(i for i, ln in enumerate(lines) if ln.startswith("lda r16,"))
+    return [ln for ln in lines[start:end] if ln and not ln.startswith((".", "#")) and not ln.endswith(":")]
+
+
+def test_prewake_case_names_round_trip():
+    assert g.prewake_case_name(None) == "pw_ctl" and g.prewake_case_name(126) == "pw_d126"
+    assert g.prewake_case_d("pw_ctl") is None and g.prewake_case_d("pw_d020") == 20
+    assert g.PREWAKE_DS[:12] == (1, 2, 3, 4, 6, 8, 10, 12, 16, 24, 32, 64)   # the short cases first
+    assert g.PREWAKE_DS[12:] == (20, 50, 100, 120, 126, 127, 128, 129, 130, 140, 200)
+
+
+@pytest.mark.parametrize("d", [0, 20, 128, 200])
+def test_prewake_core_spaces_the_two_releases_by_d_nops(d):
+    body = bundles(g.prewake_core_asm(d))
+    rels = [i for i, b in enumerate(body) if b.startswith("rel ")]
+    assert body[rels[0]] == f"rel #{g.OWN_LOCKS + g.PW_LOCK_DUMMY}, r2"
+    assert body[rels[1]] == f"rel #{g.OWN_LOCKS + g.PW_LOCK_MEAS}, r2"
+    assert body[rels[0] + 1:rels[1]] == ["nop"] * d
+    # the filler releases come after the measured release, on the dummy lock only
+    assert len(rels) == 2 + g.PW_FILLERS
+    assert all(body[i] == f"rel #{g.OWN_LOCKS + g.PW_LOCK_DUMMY}, r2" for i in rels[2:])
+    assert rels[2] - rels[1] > g.PW_AFTER_MEASURED_NOPS - 1
+
+
+def test_prewake_control_core_has_no_dummy_release_before_the_measured_one():
+    body = bundles(g.prewake_core_asm(None))
+    rels = [b for b in body if b.startswith("rel ")]
+    assert rels[0] == f"rel #{g.OWN_LOCKS + g.PW_LOCK_MEAS}, r2"
+    assert len(rels) == 1 + g.PW_FILLERS
+
+
+def test_prewake_core_waits_only_on_the_go_lock():
+    body = bundles(g.prewake_core_asm(50))
+    acqs = [b for b in body if b.startswith("acq ")]
+    assert acqs == [f"acq #{g.OWN_LOCKS + g.PW_LOCK_GO}, r3"]
+    assert body.index(acqs[0]) < body.index(next(b for b in body if b.startswith("rel ")))
+
+
+def test_prewake_design_is_two_loopbacks_and_a_blind_sequence():
+    t = g.prewake_design_mlir()
+    assert "aie.flow(%t_prod, DMA : 0, %t_prod, DMA : 0)" in t
+    assert "aie.flow(%t_prod, DMA : 1, %t_prod, DMA : 1)" in t
+    assert f"aie.dma_bd(%src : memref<{g.PW_WORDS}xi32>)" in t and g.PW_WORDS == 16
+    send0 = t.split("^send0:")[1].split("^start1:")[0]
+    assert "use_lock(%lM, AcquireGreaterEqual" in send0 and "next_bd" in send0
+    send1 = t.split("^send1:")[1].split("^start2:")[0]
+    assert "use_lock(%lDm, AcquireGreaterEqual" in send1 and "aie.next_bd ^send1" in send1   # a repeating 1-word BD
+    for recv, nxt in (("^recv0:", "^start3:"), ("^recv1:", "^end:")):
+        assert "use_lock" not in t.split(recv)[1].split(nxt)[0]          # the S2MMs wait on nothing
+    seq = t.split("aie.runtime_sequence")[1]
+    assert "aiex.set_lock(%lGo" in seq
+    for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync",
+                      "blockwrite"):
+        assert forbidden not in seq.lower()
+    assert "aie.shim_dma_allocation" not in t
+
+
+def test_prewake_traces_only_the_memory_module_and_few_events():
+    a = g.prewake_inject_args()
+    assert a[a.index("--memmod-sweep-events") + 1].split(",") == g.PW_EVENTS
+    assert len(g.PW_EVENTS) <= 6
+    assert a[a.index("--core-grounding") + 1] == "INSTR_EVENT_1"   # an event the core never raises
+    assert "event #1" not in g.prewake_core_asm(50)              # so no core packet ever leaves
+    assert a[a.index("--core-sweep-events") + 1] == ""
+
+
+def ev(name, *ts):
+    return [Ev(name, t, 2, 1) for t in ts]
+
+
+def window(blip_at=None, d=50, latency=19, fillers=0):
+    """Events of one run: MM2S 1 start/finish at 1000, MM2S 0 start at 1000 + d."""
+    s0 = 1000 + d
+    out = ev("DMA_MM2S_1_STALLED_LOCK", *range(900, 1000)) + ev("DMA_MM2S_1_FINISHED_BD", 1006)
+    out += ev("DMA_MM2S_0_STALLED_LOCK", *range(900, s0))
+    out += ev("DMA_S2MM_0_STREAM_STARVATION", *range(900, s0 + latency))
+    if blip_at is not None:
+        out += ev("DMA_MM2S_0_STREAM_BACKPRESSURE", s0 + blip_at)
+    return out
+
+
+def test_prewake_row_reads_d_blip_and_latency():
+    r = g.prewake_row(window(blip_at=15, d=50, latency=19))
+    assert (r["d_start"], r["d_fin"], r["blip"], r["blip_at"], r["latency"]) == (50, 44, True, 15, 19)
+    r = g.prewake_row(window(blip_at=None, d=20, latency=18))
+    assert (r["d_start"], r["blip"], r["blip_at"], r["latency"]) == (20, False, None, 18)
+
+
+def test_prewake_row_ignores_backpressure_outside_the_onset_window():
+    r = g.prewake_row(window(blip_at=g.PW_BLIP_WINDOW + 5))
+    assert r["blip"] is False
+
+
+def test_prewake_row_without_a_dummy_is_the_control():
+    evs = [e for e in window(blip_at=15) if "MM2S_1" not in e.name]
+    r = g.prewake_row(evs)
+    assert r["d_start"] is None and r["blip"] is True
+
+
+def test_prewake_row_flags_a_possible_trace_packet_in_the_window():
+    quiet = g.prewake_row(window(blip_at=15))
+    assert quiet["frames"] < g.PW_FRAME_GUARD and not quiet["packet_risk"]
+    noisy = window(blip_at=15) + ev("DMA_MM2S_0_STREAM_BACKPRESSURE", *range(1060, 1060 + 40, 2))
+    assert g.prewake_row(noisy)["packet_risk"]
+
+
+def test_prewake_row_with_no_events_is_empty():
+    assert g.prewake_row([])["start0"] is None
+    assert g.prewake_row(ev("DMA_MM2S_0_STALLED_LOCK", *range(5)))["start0"] == 5
+
+
+def test_prewake_threshold_brackets_the_flip_and_rejects_a_non_monotone_set():
+    rows = [{"d_start": d, "blip": d >= 128} for d in (20, 100, 126, 128, 130, 200)]
+    assert g.prewake_threshold(rows) == (126, 128)
+    rows[1]["blip"] = True
+    assert g.prewake_threshold(rows) is None
+    assert g.prewake_threshold([{"d_start": 20, "blip": False}]) == (20, None)
+
+
+def test_prewake_table_prints_one_line_per_case_and_the_bracket():
+    rows = [("pw_ctl", "e1.emu", g.prewake_row(window(blip_at=15))),
+            ("pw_d020", "e1.emu", g.prewake_row(window(blip_at=None, d=20, latency=18)))]
+    text = g.format_prewake_table(rows)
+    assert text.count("\n") >= 3 and "pw_ctl" in text and "pw_d020" in text and "blip" in text
+
+
+def test_prewake_row_flags_any_core_module_event_as_a_packet_risk():
+    evs = window(blip_at=15) + [Ev("LOCK_STALL", 1010, 2, 0)]
+    r = g.prewake_row(evs)
+    assert r["core_events"] == 1 and r["packet_risk"]
+
+
+def test_prewake_control_ignores_the_fillers_that_start_mm2s_1_later():
+    evs = [e for e in window(blip_at=15) if "MM2S_1" not in e.name]
+    evs += ev("DMA_MM2S_1_STALLED_LOCK", *range(900, 1400)) + ev("DMA_MM2S_1_FINISHED_BD", 1406)
+    r = g.prewake_row(evs)
+    assert r["d_start"] is None and r["d_fin"] is None
+
+
+def test_prewake_threshold_works_on_the_late_first_word_too():
+    rows = [{"d_start": d, "late": d >= 130} for d in (20, 128, 130, 200)]
+    assert g.prewake_threshold(rows, "late") == (128, 130)
+    text = g.format_prewake_table([("pw_d020", "r", g.prewake_row(window(None, 20, 19))),
+                                   ("pw_d200", "r", g.prewake_row(window(None, 200, 20)))])
+    assert "first word one cycle late flips between D(start) = 20 (absent) and 200 (present)" in text
