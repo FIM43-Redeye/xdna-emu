@@ -235,9 +235,8 @@ def _walk_mode0(cmds: list[TraceCommand]) -> Iterator[_Mode0Step]:
             continue
         after_sync = False
         if isinstance(cmd, StopCmd):
-            # No timeline contribution; mode 0 doesn't actually emit
-            # a Stop opcode in the byte stream (it terminates with
-            # padding / end-of-buffer).
+            # The end token marks the stop: no timeline contribution (its
+            # idle_cycles count is the distance from the last frame to the stop).
             continue
         if isinstance(cmd, EventCmd):
             timer += 1  # implicit per-command increment

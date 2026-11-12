@@ -12,7 +12,7 @@ Bit-level encoding (MSB-first within each byte):
   | Opcode    | Pattern                | Meaning                     |
   +-----------+------------------------+-----------------------------+
   | Start     | 1111 0X00 + 7B timer   | Segment-start anchor        |
-  | DC        | 1101 11XX + 3B padding | Don't-care, advance 4 bytes |
+  | End       | 1101 11XX + 3B count   | End of stream, 18-bit idle  |
   | Single0   | 0xxxxxxx               | 1 event, 4-bit cycle delta  |
   | Single1   | 100xxxxx + 1B          | 1 event, 10-bit cycle delta |
   | Single2   | 101xxxxx + 2B          | 1 event, 18-bit cycle delta |
@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import Generator
 
-from ..frame import EventCmd, RepeatCmd, StartCmd, SyncCmd, TraceCommand
+from ..frame import EventCmd, RepeatCmd, StartCmd, StopCmd, SyncCmd, TraceCommand
 
 
 def decode(byte_stream: list[int]) -> Generator[TraceCommand, None, None]:
@@ -77,8 +77,16 @@ def decode(byte_stream: list[int]) -> Generator[TraceCommand, None, None]:
             cursor += 1
             continue
 
-        # --- DC (don't-care padding): 1101 11XX + 3B -------------------
+        # --- End token: 1101 11XX + 3B (18-bit idle-cycle count) -------
         if (b & 0b11111100) == 0b11011100:
+            if cursor + 3 >= n:
+                return
+            idle_cycles = (
+                ((byte_stream[cursor + 1] & 0b11) << 16)
+                | (byte_stream[cursor + 2] << 8)
+                | byte_stream[cursor + 3]
+            )
+            yield StopCmd(idle_cycles=idle_cycles)
             cursor += 4
             continue
 
