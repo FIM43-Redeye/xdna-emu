@@ -22,6 +22,41 @@ Design (tile (0,2) holds every lock and buffer):
 
 Output (16 words): 0.. = counter stamps (start, before each ladder step, after the
 loopback, after the probe), 15 = the marker.
+
+Lock-to-fetch probe (`fetch-build`, `fetch-run`, `fetch-table`; a separate design, one
+case per k = 0..15). How many cycles pass between a core releasing a lock and the first
+memory fetch of an MM2S buffer descriptor that was waiting on it, where the fetches of the
+following granules fall, and where the core's own next accesses fall against them? The
+emulator says release at cycle N, first fetch at N + 1; no silicon run has pinned it.
+
+  tile (0,2): MM2S 0 bd (started at boot, so it is parked on its lock): acquire A (lock 0,
+    init 0), send `src` (64 words, 0x400, data-memory bank 0, so granule g sits in physical
+    bank g & 1), release B. The stream switch loops it back to S2MM 0 of the same tile,
+    which writes `dst` (0x8000, bank 2): the S2MM never touches banks 0 and 1.
+  core: wait on a go lock, settle, `event #0`, release A, k nops, then two adjacent loads
+    from `ldbuf` (0x800, bank 0): offset 0 is physical bank 0, offset 16 is bank 1. For
+    some k the core's load meets a DMA fetch of the same physical bank and CONFLICT_DM_BANK_0
+    or _1 rises. Then it waits for B and ends.
+
+Why it cannot hang. The cores start when the array is configured, before the trace unit is
+armed, so the core first waits on a go lock that the runtime sequence sets (`aiex.set_lock`,
+a command-processor write) after the trace is armed. Nothing in the design waits on a host
+buffer, a host DMA or any host signal: the only things the core waits on are that sequence
+write, which the sequence always reaches, and lock B, released by MM2S 0 after it moved its
+64 words into an S2MM that has no lock and runs from boot. The sequence waits on nothing in
+the tile: it writes the go lock, pads with command-processor writes to a scratch word in
+bank 6/7 (clear of the measured banks), and ends.
+
+Trace slots, memory module: LOCK_0_REL, DMA_MM2S_0_STALLED_LOCK, DMA_MM2S_0_FINISHED_BD,
+DMA_MM2S_0_MEMORY_STARVATION, CONFLICT_DM_BANK_0, CONFLICT_DM_BANK_1, DMA_S2MM_0_FINISHED_BD;
+core module: INSTR_EVENT_0, LOCK_STALL and, grounded, PERF_CNT_2 (the periodic event that
+fills the last core packet, see gen_lock_pulse_probe). The memory-module lock events are
+selector events (LOCK_n_REL follows Locks_Event_Selection_n), but selector 0 resets to
+lock 0, so lock A is lock 0 and nothing is programmed.
+
+    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7]
+    python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...]
+    python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...]
 """
 from __future__ import annotations
 
@@ -37,6 +72,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import gen_cascade_probe as base                                    # noqa: E402
+import gen_lock_pulse_probe as lp                                   # noqa: E402
 from gen_lock_stall_probe import LOCK_SETTLE_BUNDLES, TS_PAIRS, _frame, _ts  # noqa: E402
 
 LOCK_A, LOCK_F, LOCK_C, LOCK_D, LOCK_E = 14, 13, 12, 11, 10
@@ -265,6 +301,257 @@ def cmd_analyze(args) -> int:
     return 0
 
 
+# -- lock-to-fetch probe ------------------------------------------------------------
+
+FETCH_LOCK_A, FETCH_LOCK_B, FETCH_LOCK_GO = 0, 1, 2   # A is lock 0: LOCK_0_REL follows it at reset
+FETCH_KS = tuple(range(16))
+FETCH_WORDS = 64
+FETCH_SRC_ADDR = 0x0400            # logical bank 0; granule g (16 bytes) in physical bank g & 1
+FETCH_LD_ADDR = 0x0800             # logical bank 0; the core's two loads, offsets 0 and 16
+FETCH_DST_ADDR = 0x8000            # logical bank 2: the loopback S2MM never meets banks 0 and 1
+FETCH_SCRATCH_ADDR = 0xC000        # target of the sequence's pad writes, banks 6/7
+FETCH_SETTLE_ITERS = 40            # about 10 cycles each; the DMA has been parked since boot
+FETCH_TAIL_ITERS = 100             # keeps the core running so PERF_CNT_2 fills its last packet
+FETCH_PAD_WRITES = 600             # command-processor writes after the go lock: outlast the window
+FETCH_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD",
+                       "DMA_MM2S_0_MEMORY_STARVATION", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                       "DMA_S2MM_0_FINISHED_BD"]
+FETCH_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
+FETCH_CORE_GROUNDING = "PERF_CNT_2"
+# tile (0,2) is physical column 1; trace pkt_type 0 = core module, 1 = memory module
+FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
+
+
+def fetch_case_name(k: int) -> str:
+    return f"lfk{k:02d}"
+
+
+def fetch_core_asm(k: int) -> str:
+    """The core of case k: go, settle, `event #0`, release A, k nops, a bank-0 load, a bank-1 load.
+
+    r2 = +1 releases, r3 = -1 acquires (as gen_lock_pulse_probe). p0 = `ldbuf`."""
+    if k not in FETCH_KS:
+        raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+    n = lp.nops
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
+            "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(k),
+            "  lda r26, [p0, #0]", "  lda r28, [p0, #16]", *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def fetch_design_mlir() -> str:
+    """Case-independent design: the k lives in the core program only."""
+    w = FETCH_WORDS
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{w}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
+    %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
+    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(MM2S, 0, ^send, ^recv_start)
+    ^send:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%src : memref<{w}xi32>)
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lB, Release, %cb)
+      aie.next_bd ^end
+    ^recv_start:
+      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
+    ^recv:
+      aie.dma_bd(%dst : memref<{w}xi32>)
+      aie.next_bd ^end
+    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lGo, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def fetch_inject_args() -> list[str]:
+    return ["--memmod-sweep-events", ",".join(FETCH_MEMMOD_EVENTS),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
+
+
+# -- lock-to-fetch: the table -------------------------------------------------------
+
+def _runs(stamps) -> list[tuple[int, int]]:
+    """(first, last) of each run of consecutive cycles."""
+    out: list[tuple[int, int]] = []
+    for t in sorted(set(stamps)):
+        if out and t == out[-1][1] + 1:
+            out[-1] = (out[-1][0], t)
+        else:
+            out.append((t, t))
+    return out
+
+
+def fetch_row(events) -> dict:
+    """One run of tile (0,2) as numbers relative to the lock A release (memory-module timer).
+
+    `events` are level-expanded (`level_events`): a level has an event on every cycle it is
+    asserted. grant = the cycle after the last asserted cycle of the MM2S STALLED_LOCK interval
+    that holds the release. core_event0 is the core's INSTR_EVENT_0 minus the release: two
+    different trace timers, so only good to the cross-domain skew; core_stalls are relative to
+    the core's own INSTR_EVENT_0."""
+    tile = [e for e in events if e.row == FETCH_ROW]
+    mem = {}
+    core = {}
+    for e in tile:
+        (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+    rel_stamps = sorted(mem.get("LOCK_0_REL", []))
+    if not rel_stamps:
+        return {"release": None}
+    rel = rel_stamps[0]
+    row: dict = {"release": rel, "grant": None}
+    for first, last in _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", [])):
+        if first <= rel <= last + 1:
+            row["grant"] = last + 1 - rel
+    row["starvation"] = [(a - rel, b - rel) for a, b in _runs(mem.get("DMA_MM2S_0_MEMORY_STARVATION", []))
+                         if b >= rel]
+    conflicts = []
+    for bank in ("CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"):
+        conflicts += [(bank, t - rel) for t in sorted(set(mem.get(bank, [])))]
+    row["conflicts"] = sorted(conflicts, key=lambda c: (c[1], c[0]))
+    row["mm2s_finished"] = [t - rel for t in sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", []))) if t >= rel]
+    row["s2mm_finished"] = [t - rel for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t >= rel]
+    ev0 = sorted(core.get("INSTR_EVENT_0", []))
+    row["core_event0"] = ev0[0] - rel if ev0 else None
+    row["core_stalls"] = ([(a - ev0[0], b - ev0[0]) for a, b in _runs(core.get("LOCK_STALL", []))
+                           if a >= ev0[0] - 2 and a - ev0[0] <= 64] if ev0 else [])
+    return row
+
+
+def _interval(a: int, b: int) -> str:
+    return f"+{a}" if a == b else f"+{a}..+{b}"
+
+
+def format_fetch_table(rows) -> str:
+    """rows: (k, run name, fetch_row dict). Sorted by k, then run."""
+    lines = [f"{'k':>2} {'run':<8} {'release':>9}  (release: memory-module timer; every other number is cycles "
+             "after it; core columns are another timer, marked core)"]
+    for k, run, r in sorted(rows, key=lambda x: (x[0], x[1])):
+        if r["release"] is None:
+            lines.append(f"{k:>2} {run:<8} no LOCK_0_REL event")
+            continue
+        grant = "grant ?" if r["grant"] is None else f"grant +{r['grant']}"
+        starv = "starv [" + ", ".join(_interval(a, b) for a, b in r["starvation"][:6]) + "]"
+        conf = ("conflict " + " ".join(f"{b}@+{t}" for b, t in r["conflicts"])) if r["conflicts"] else "no conflict"
+        ev0 = "core(xtimer) ev0 n/a" if r["core_event0"] is None else f"core(xtimer) ev0 {r['core_event0']:+d}"
+        stalls = "core stall(from ev0) [" + ", ".join(_interval(a, b) for a, b in r["core_stalls"][:6]) + "]"
+        fin = (f"mm2s_fin [{', '.join(f'+{t}' for t in r['mm2s_finished'])}] "
+               f"s2mm_fin [{', '.join(f'+{t}' for t in r['s2mm_finished'])}]")
+        lines.append(f"{k:>2} {run:<8} {r['release']:>9}  {grant}  {starv}  {conf}  {fin}  {ev0}  {stalls}")
+    return "\n".join(lines)
+
+
+def level_events(commands, slot_names):
+    """Level-expanded events of per-tile decoded commands (a held level has an event per cycle)."""
+    from trace_decoder.decode import rebuild_timeline_mode0_levels
+    return rebuild_timeline_mode0_levels(commands, slot_names)
+
+
+def load_level_events(run_dir: Path):
+    """Level-expanded events of a run directory (trace_raw.bin; events.json supplies the slot names)."""
+    import trace_decoder as td
+    doc = json.loads((run_dir / "events.json").read_text())
+    raw = (run_dir / "trace_raw.bin").read_bytes()
+    commands = td.decode_words(list(struct.unpack(f"<{len(raw) // 4}I", raw)), mode=None)
+    kind = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
+    names: dict = {}
+    for e in doc["events"]:
+        names.setdefault(e["pkt_type"], {}).setdefault(f"{e['row']},{e['col']}", [""] * 8)[e["slot"]] = e["name"]
+    for pkt, row, col in commands:
+        table = names.setdefault(pkt, {}).setdefault(f"{row},{col}", [""] * 8)
+        defaults = doc.get("slot_names", {}).get(kind[pkt], [""] * 8)
+        for slot in range(8):
+            table[slot] = table[slot] or defaults[slot]
+    return level_events(commands, names)
+
+
+# -- lock-to-fetch: build / run / table ---------------------------------------------
+
+def fetch_build_case(k: int, out: Path) -> None:
+    d = out / fetch_case_name(k)
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(fetch_core_asm(k), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(fetch_design_mlir())
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(),
+           "--trace-config-out", "trace_config.json", "--config-test-name", fetch_case_name(k),
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": fetch_case_name(k), "k": k}) + "\n")
+
+
+def fetch_cases_in(out: Path, ks) -> list[int]:
+    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k)).is_dir()]
+
+
+def cmd_fetch_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for k in args.ks or FETCH_KS:
+        fetch_build_case(k, out)
+        print("built", fetch_case_name(k))
+    return 0
+
+
+def cmd_fetch_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    ok = True
+    for k in fetch_cases_in(out, args.ks):
+        ok = lp.run_case(out, fetch_case_name(k), args.tag, args.backend, output=False) and ok
+        if not ok:
+            print(f"{fetch_case_name(k)}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_fetch_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for k in fetch_cases_in(out, args.ks):
+        for run in args.runs:
+            run_dir = out / fetch_case_name(k) / run
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((k, run, {"release": None}))
+                continue
+            rows.append((k, run, fetch_row(load_level_events(run_dir))))
+    print(format_fetch_table(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -281,8 +568,22 @@ def main(argv=None) -> int:
     a = sub.add_parser("analyze")
     a.add_argument("out_dir")
     a.add_argument("tag")
+    fb = sub.add_parser("fetch-build", help="lock-to-fetch probe: build the cases (default k = 0..15)")
+    fb.add_argument("out_dir")
+    fb.add_argument("--ks", nargs="*", type=int, default=[])
+    fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
+    fr.add_argument("out_dir")
+    fr.add_argument("tag")
+    fr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    fr.add_argument("--ks", nargs="*", type=int, default=[])
+    ft = sub.add_parser("fetch-table", help="lock-to-fetch probe: per k and run, events relative to the release")
+    ft.add_argument("out_dir")
+    ft.add_argument("runs", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
+    ft.add_argument("--ks", nargs="*", type=int, default=[])
     args = ap.parse_args(argv)
-    return {"generate": cmd_generate, "build": cmd_build, "run": cmd_run, "analyze": cmd_analyze}[args.cmd](args)
+    return {"generate": cmd_generate, "build": cmd_build, "run": cmd_run, "analyze": cmd_analyze,
+            "fetch-build": cmd_fetch_build, "fetch-run": cmd_fetch_run,
+            "fetch-table": cmd_fetch_table}[args.cmd](args)
 
 
 if __name__ == "__main__":
