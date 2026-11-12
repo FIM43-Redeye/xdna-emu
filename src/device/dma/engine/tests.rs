@@ -802,7 +802,7 @@ fn test_shim_mm2s_warmup_transient_decays_geometrically() {
     let mut seq = Vec::new();
     for _ in 0..6 {
         engine.channels[0].is_first_bd = true;
-        seq.push(engine.consume_first_bd_bonus(0, &transfer));
+        seq.push(engine.consume_first_bd_bonus(0, &transfer, true));
     }
 
     // channel_start(2) + per_task_mm2s(0; its 325 is now the read latency
@@ -825,7 +825,7 @@ fn test_shim_s2mm_warmup_has_no_tail() {
     let mut seq = Vec::new();
     for _ in 0..3 {
         engine.channels[0].is_first_bd = true;
-        seq.push(engine.consume_first_bd_bonus(0, &transfer));
+        seq.push(engine.consume_first_bd_bonus(0, &transfer, true));
     }
 
     // channel_start(2) + per_task_s2mm(179) + cold_start(341) only on task 0.
@@ -855,14 +855,14 @@ fn test_memtile_first_bd_startup_latches_post_transfer_hold_once() {
     // First task: MemoryLatency bonus is channel_start only; the startup is
     // latched as a post-transfer hold instead.
     engine.channels[0].is_first_bd = true;
-    assert_eq!(engine.consume_first_bd_bonus(0, &transfer), 2, "bonus stays channel_start only");
+    assert_eq!(engine.consume_first_bd_bonus(0, &transfer, true), 2, "bonus stays channel_start only");
     assert_eq!(engine.channels[0].startup_hold_cycles, 100, "startup latched as post-transfer hold");
 
     // The hold fires once (begin_completion clears it); emulate that, then a
     // second task -- warm_task_index>0, so no re-latch (one-time per session).
     engine.channels[0].startup_hold_cycles = 0;
     engine.channels[0].is_first_bd = true;
-    assert_eq!(engine.consume_first_bd_bonus(0, &transfer), 2);
+    assert_eq!(engine.consume_first_bd_bonus(0, &transfer, true), 2);
     assert_eq!(engine.channels[0].startup_hold_cycles, 0, "startup is one-time per session");
 }
 
@@ -881,7 +881,7 @@ fn test_non_shim_first_bd_startup_defaults_zero_and_is_tile_scoped() {
     let bd = BdConfig::simple_1d(0x1000, 16);
     let t = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 0, 1, mem.tile_kind).unwrap();
     mem.channels[0].is_first_bd = true;
-    assert_eq!(mem.consume_first_bd_bonus(0, &t), 2);
+    assert_eq!(mem.consume_first_bd_bonus(0, &t, true), 2);
     assert_eq!(mem.channels[0].startup_hold_cycles, 0, "compute knob must not latch on a memtile");
 }
 

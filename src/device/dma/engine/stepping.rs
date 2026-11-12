@@ -872,7 +872,13 @@ impl DmaEngine {
     /// MemoryLatency for the first BD of a task.  Combines three terms:
     ///
     /// - `channel_start_cycles`: generic "start trigger to first data" cost.
-    ///   Fires on every task (every Idle->BdSetup), tile-agnostic.
+    ///   Fires on every task (every Idle->BdSetup), tile-agnostic, when
+    ///   `pays_channel_start`. The one exemption is a staged compute / memtile
+    ///   MM2S started from idle without a lock, whose first read lands at
+    ///   START_TASK + 9 on silicon (bd_setup 4 + memory_latency 5, FINISHED_BD =
+    ///   N + 8): that offset is measured, while `channel_start_cycles` itself is
+    ///   an unsourced estimate, so the caller passes `false` there rather than
+    ///   subtracting it afterwards.
     /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
     ///   shim DMA touching host memory.  Fires on every task.  0 for MM2S:
     ///   its calibrated 325 is the read latency, charged per read between
@@ -888,12 +894,21 @@ impl DmaEngine {
     /// `is_first_bd` is reset to true by `after_transfer_done` (Idle re-entry)
     /// and by `stop_channel`; `warm_task_index` increments per task and is
     /// reset to 0 only by `stop_channel`.
-    pub(crate) fn consume_first_bd_bonus(&mut self, ch_idx: usize, transfer: &Transfer) -> u16 {
+    pub(crate) fn consume_first_bd_bonus(
+        &mut self,
+        ch_idx: usize,
+        transfer: &Transfer,
+        pays_channel_start: bool,
+    ) -> u16 {
         if !self.channels[ch_idx].is_first_bd {
             return 0;
         }
         self.channels[ch_idx].is_first_bd = false;
-        let mut bonus = self.timing_config.channel_start_cycles as u16;
+        let mut bonus = if pays_channel_start {
+            self.timing_config.channel_start_cycles as u16
+        } else {
+            0
+        };
         if self.tile_kind.is_shim() && transfer.involves_host_memory() {
             // SP-4a (#140): when the shim S2MM cold-start drain THROTTLE is
             // enabled, the FIRST host-memory S2MM task charges its ENTIRE
@@ -1045,17 +1060,15 @@ impl DmaEngine {
                     } else {
                         // No lock needed -- insert header now, go to MemoryLatency.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                        let mut bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
-                        if self.uses_egress_staging(&transfer) {
-                            // A compute / memtile MM2S started from idle reads its first word at
-                            // START_TASK + 9 = bd_setup 4 + memory_latency 5 (silicon FINISHED_BD
-                            // = N + 8, `onset-len` / `onset-long` / `onset-chain` t4x4: first task
-                            // 12 for 4 words, every later task L + 8 after its START). The
-                            // `channel_start_cycles` term (2, an unsourced estimate from the
-                            // granule-at-fetch calibration) is not paid on this path; the lock path
-                            // and every other channel kind keep it.
-                            bonus = bonus.saturating_sub(self.timing_config.channel_start_cycles as u16);
-                        }
+                        // A compute / memtile MM2S started from idle reads its first word at
+                        // START_TASK + 9 = bd_setup 4 + memory_latency 5 (silicon FINISHED_BD
+                        // = N + 8, `onset-len` / `onset-long` / `onset-chain` t4x4: first task
+                        // 12 for 4 words, every later task L + 8 after its START). The
+                        // `channel_start_cycles` term (2, an unsourced estimate from the
+                        // granule-at-fetch calibration) is not paid on this path; the lock path
+                        // and every other channel kind keep it.
+                        let pays_channel_start = !self.uses_egress_staging(&transfer);
+                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, pays_channel_start);
                         ChannelFsm::MemoryLatency {
                             cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
                             transfer,
@@ -1079,7 +1092,7 @@ impl DmaEngine {
                         // memory pipeline during the prior BD's transferring
                         // tail. See enter_chained_bd / the BD-chain finding.
                         if self.channels[ch_idx].is_first_bd {
-                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, true);
                             ChannelFsm::MemoryLatency {
                                 cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
                                 transfer,
