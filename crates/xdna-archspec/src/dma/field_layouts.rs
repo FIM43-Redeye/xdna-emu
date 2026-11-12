@@ -719,3 +719,70 @@ pub struct ModuleEventLayout {
     /// Stream_Switch_Event_Port_Selection_0 and _1 offsets
     pub event_port_select: Option<[u32; 2]>,
 }
+
+// ============================================================================
+// Lock event selection registers
+// ============================================================================
+
+/// The `Locks_Event_Selection_<n>` register bank of one module.
+///
+/// Lock trace events (`LOCK_SEL<n>_ACQ_GE`, `_REL`, ...) are selector events:
+/// register `n` picks which lock selector `n` watches. The bank size, the
+/// width of the lock-select field and the reset value all differ per module
+/// (compute memory: 8 selectors over 16 locks; memtile: 8 over 64; shim: 6
+/// over 16), so everything is read from the register database.
+#[derive(Debug, Clone)]
+pub struct LockEventSelectionLayout {
+    /// Offset of `Locks_Event_Selection_0`.
+    pub base: u32,
+    /// Byte distance between consecutive selector registers.
+    pub stride: u32,
+    /// Number of selector registers the module has.
+    pub count: usize,
+    /// `Lock_Select`: which lock the selector watches.
+    pub lock_select: BitField,
+    /// `Lock_Value`: trigger value of the `EQUAL_TO_VALUE` event.
+    pub lock_value: BitField,
+    /// Reset value of every selector register.
+    pub reset: u32,
+}
+
+impl LockEventSelectionLayout {
+    pub fn from_regdb(db: &RegisterDb, module: &str) -> Result<Self, String> {
+        let m = db
+            .module(module)
+            .ok_or_else(|| format!("module '{module}' not in register database"))?;
+        let name = |n: usize| format!("Locks_Event_Selection_{n}");
+        let reg0 = m.register(&name(0)).ok_or_else(|| format!("{module}: {} missing", name(0)))?;
+        let count = (0..).take_while(|n| m.register(&name(*n)).is_some()).count();
+        let stride = m
+            .register(&name(1))
+            .map(|r| r.offset - reg0.offset)
+            .ok_or_else(|| format!("{module}: {} missing", name(1)))?;
+        let field = |f: &str| {
+            reg0.field(f)
+                .cloned()
+                .ok_or_else(|| format!("{module}: {} has no field {f}", name(0)))
+        };
+        Ok(Self {
+            base: reg0.offset,
+            stride,
+            count,
+            lock_select: field("Lock_Select")?,
+            lock_value: field("Lock_Value")?,
+            reset: reg0.reset_value,
+        })
+    }
+
+    /// Which selector register lives at this tile-local offset, if any.
+    pub fn selector_at(&self, offset: u32) -> Option<usize> {
+        let rel = offset.checked_sub(self.base)?;
+        let n = (rel / self.stride) as usize;
+        (rel % self.stride == 0 && n < self.count).then_some(n)
+    }
+
+    /// The lock a selector register word points at.
+    pub fn selected_lock(&self, word: u32) -> u8 {
+        self.lock_select.extract(word) as u8
+    }
+}

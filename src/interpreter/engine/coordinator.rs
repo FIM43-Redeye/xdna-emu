@@ -1354,7 +1354,22 @@ impl InterpreterEngine {
                 // start/finished events are one-cycle pulses. `dma_level_active`
                 // returns the edge polarity for the former, None for the latter.
                 let level = crate::trace::dma_level_active(&event);
-                if tile.is_shim() {
+                // Lock acquire/release are selector events: one event per
+                // selector watching the lock (shim lock events live in the PL
+                // module trace unit, the others in the memory module's).
+                if matches!(
+                    event,
+                    crate::interpreter::state::EventType::LockAcquire { .. }
+                        | crate::interpreter::state::EventType::LockRelease { .. }
+                ) {
+                    for id in tile.lock_event_hw_ids(&event).into_iter().flatten() {
+                        if tile.is_shim() {
+                            tile.notify_core_trace_event(id, cycle, None);
+                        } else {
+                            tile.notify_mem_trace_event(id, cycle, None);
+                        }
+                    }
+                } else if tile.is_shim() {
                     if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {
                         // Shim DMA/lock events have no program counter.
                         match level {

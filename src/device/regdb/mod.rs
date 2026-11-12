@@ -15,7 +15,7 @@ pub use xdna_archspec::regdb::*;
 pub use xdna_archspec::dma::DeviceRegLayout;
 pub use xdna_archspec::dma::field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
+    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout, LockEventSelectionLayout,
 };
 
 use std::path::Path;

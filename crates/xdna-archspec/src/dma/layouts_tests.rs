@@ -277,6 +277,45 @@ mod tests {
     }
 
     #[test]
+    fn lock_event_selection_layouts_come_from_the_register_database() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        // Compute tile memory module: 8 selectors, 4-bit lock select.
+        let mem = &layout.memory_lock_selection;
+        assert_eq!((mem.base, mem.stride, mem.count), (0x1F100, 4, 8));
+        assert_eq!((mem.lock_select.lsb, mem.lock_select.width), (16, 4));
+        assert_eq!((mem.lock_value.lsb, mem.lock_value.width), (0, 6));
+        assert_eq!(mem.reset, 0x3F);
+
+        // MemTile: 8 selectors, 6-bit lock select.
+        let mt = &layout.memtile_lock_selection;
+        assert_eq!((mt.base, mt.stride, mt.count), (0xC0400, 4, 8));
+        assert_eq!((mt.lock_select.lsb, mt.lock_select.width), (16, 6));
+
+        // Shim: only 6 selectors.
+        let shim = &layout.shim_lock_selection;
+        assert_eq!((shim.base, shim.stride, shim.count), (0x14100, 4, 6));
+        assert_eq!(shim.lock_select.width, 4);
+
+        // Offset decoding: registers map to their selector index, nothing else does.
+        assert_eq!(mt.selector_at(0xC0400), Some(0));
+        assert_eq!(mt.selector_at(0xC041C), Some(7));
+        assert_eq!(mt.selector_at(0xC0420), None);
+        assert_eq!(mt.selector_at(0xC0402), None, "unaligned offsets are not registers");
+        assert_eq!(shim.selector_at(0x14114), Some(5));
+        assert_eq!(shim.selector_at(0x14118), None);
+
+        // The reset word selects lock 0 and carries the all-ones trigger value.
+        assert_eq!(mt.selected_lock(mt.reset), 0);
+        assert_eq!(mt.selected_lock((37 << 16) | 0x3F), 37);
+        assert_eq!(mem.selected_lock((9 << 16) | 0x3F), 9);
+    }
+
+    #[test]
     fn validate_status_field_layout() {
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database JSON not found");
