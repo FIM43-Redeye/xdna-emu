@@ -406,3 +406,64 @@ class TestPlaceLogicalTiles:
         mod = _load_prepare_module()
         text = "module {\n  aie.device(npu1_1col) {\n    %t = aie.tile(0, 2)\n  }\n}\n"
         assert mod.place_logical_tiles(text) == text
+
+
+# ---------------------------------------------------------------------------
+# Trace egress read back from the lowered MLIR
+# ---------------------------------------------------------------------------
+
+def _lowered(*flows):
+    """Lowered-MLIR fixture: each flow is (source_text, dest_text)."""
+    body = "".join(
+        f"    aie.packet_flow({i}) {{\n"
+        f"      aie.packet_source<{src}>\n"
+        f"      aie.packet_dest<{dst}>\n"
+        f"    }}  {{keep_pkt_header = true}}\n"
+        for i, (src, dst) in enumerate(flows, start=1)
+    )
+    return "module {\n  aie.device(npu1) {\n" + body + "  }\n}\n"
+
+
+# The design's own (non-trace) flows must never count as trace egress.
+_DATA_FLOW = ("%tile_0_2, DMA : 0", "%shim_noc_tile_0_0, DMA : 0")
+
+
+class TestTraceEgress:
+    def test_column_1_egress_walkers_case(self):
+        mod = _load_prepare_module()
+        text = _lowered(
+            ("%tile_0_2, Trace : 0", "%shim_noc_tile_1_0, DMA : 1"),
+            ("%shim_noc_tile_0_0, Trace : 0", "%shim_noc_tile_1_0, DMA : 1"),
+            _DATA_FLOW,
+        )
+        assert mod.read_trace_egress(text) == (1, 1)
+
+    def test_column_0_egress(self):
+        mod = _load_prepare_module()
+        text = _lowered(
+            ("%tile_0_2, Trace : 0", "%shim_noc_tile_0_0, DMA : 1"),
+            _DATA_FLOW,
+        )
+        assert mod.read_trace_egress(text) == (0, 1)
+
+    def test_no_trace_flow_fails_loudly(self):
+        mod = _load_prepare_module()
+        with pytest.raises(ValueError, match="no trace packet_flow"):
+            mod.read_trace_egress(_lowered(_DATA_FLOW))
+
+    def test_distinct_egresses_fail_loudly(self):
+        mod = _load_prepare_module()
+        text = _lowered(
+            ("%tile_0_2, Trace : 0", "%shim_noc_tile_0_0, DMA : 1"),
+            ("%tile_1_2, Trace : 0", "%shim_noc_tile_1_0, DMA : 1"),
+        )
+        with pytest.raises(ValueError, match="more than one"):
+            mod.read_trace_egress(text)
+
+    def test_apply_fills_routing_and_keeps_other_fields(self):
+        mod = _load_prepare_module()
+        cfg = {"routing": {"shim_bd_id": 15}}
+        text = _lowered(("%tile_0_2, Trace : 0", "%shim_noc_tile_1_0, DMA : 1"))
+        out = mod.apply_trace_egress(cfg, text)
+        assert out["routing"] == {"shim_bd_id": 15, "shim_col": 1,
+                                  "shim_dma_channel": 1}

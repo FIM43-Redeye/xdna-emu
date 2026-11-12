@@ -205,19 +205,19 @@
 
     "routing": {
       "type": "object",
-      "required": ["shim_col", "shim_dma_channel", "trace_done"],
+      "required": ["trace_done"],
       "additionalProperties": false,
       "properties": {
         "shim_col": {
           "type": "integer",
           "minimum": 0,
-          "description": "Column of the shim tile that drains all trace packets."
+          "description": "Column of the shim tile that drains all trace packets. Absent until trace-prepare reads it back from the lowered MLIR (the injector does not choose it)."
         },
         "shim_dma_channel": {
           "type": "integer",
           "minimum": 0,
           "maximum": 1,
-          "description": "Shim DMA S2MM channel (0 or 1). Channel 1 is the conventional trace channel."
+          "description": "Shim DMA S2MM channel (0 or 1). Channel 1 is the conventional trace channel. Absent until trace-prepare reads it back from the lowered MLIR."
         },
         "shim_bd_id": {
           "type": "integer",

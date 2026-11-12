@@ -707,3 +707,18 @@ def test_compiled_traced_xclbin_has_trace_buffer_slot(tmp_path):
         "either AIEInsertTraceFlows did not run or arg numbering changed.\n"
         f"Metadata:\n{metadata_xml}"
     )
+
+
+def test_routing_omits_egress_until_trace_prepare_reads_it_back(tmp_path):
+    """The injector does not choose the trace shim (aie-insert-trace-flows
+    does, later), so it must not publish a guess for it."""
+    import json
+
+    out = tmp_path / "out.mlir"
+    cfg_path = tmp_path / "trace_config.json"
+    r = _run(["--input", str(UNTRACED), "--out", str(out),
+              "--trace-config-out", str(cfg_path)])
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    routing = json.loads(cfg_path.read_text())["routing"]
+    assert "shim_col" not in routing
+    assert "shim_dma_channel" not in routing

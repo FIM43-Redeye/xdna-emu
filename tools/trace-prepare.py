@@ -30,12 +30,14 @@ Usage:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from trace_config import dump as trace_config_dump  # noqa: E402
 from trace_config import load as trace_config_load  # noqa: E402
 
 
@@ -268,6 +270,51 @@ def lower_trace_ops_with_lateral_routing(mlir_text: str) -> str:
     return proc.stdout
 
 
+_PACKET_FLOW_RE = re.compile(
+    r"aie\.packet_flow\s*\([^)]*\)\s*\{(?P<body>.*?)\n\s*\}", re.DOTALL)
+_TRACE_SOURCE_RE = re.compile(r"aie\.packet_source<[^>]*\bTrace\s*:\s*\d+\s*>")
+_PACKET_DEST_RE = re.compile(
+    r"aie\.packet_dest<%\w*?_(?P<col>\d+)_(?P<row>\d+)\s*,\s*DMA\s*:\s*"
+    r"(?P<ch>\d+)\s*>")
+
+
+def read_trace_egress(lowered_mlir: str) -> tuple[int, int]:
+    """Return (shim column, S2MM channel) that drains the trace packets.
+
+    aie-insert-trace-flows picks the egress (it can move it off column 0 when
+    the design saturates that shim), so the only truthful source is the
+    lowered MLIR: the destination of every packet_flow whose source is a
+    Trace port. Raises ValueError when there is none or they disagree.
+    """
+    egresses = set()
+    for m in _PACKET_FLOW_RE.finditer(lowered_mlir):
+        body = m.group("body")
+        if not _TRACE_SOURCE_RE.search(body):
+            continue
+        for d in _PACKET_DEST_RE.finditer(body):
+            if int(d.group("row")) != 0:
+                raise ValueError(
+                    f"trace packet_flow ends at non-shim tile row {d.group('row')}")
+            egresses.add((int(d.group("col")), int(d.group("ch"))))
+    if not egresses:
+        raise ValueError("no trace packet_flow with a shim DMA packet_dest "
+                         "in the lowered MLIR")
+    if len(egresses) > 1:
+        raise ValueError(
+            "trace packet_flows reach more than one egress: "
+            f"{sorted(egresses)}")
+    return next(iter(egresses))
+
+
+def apply_trace_egress(cfg: dict, lowered_mlir: str) -> dict:
+    """Return cfg with routing.shim_col / shim_dma_channel read from the MLIR."""
+    col, channel = read_trace_egress(lowered_mlir)
+    out = dict(cfg)
+    out["routing"] = {**cfg["routing"], "shim_col": col,
+                      "shim_dma_channel": channel}
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
@@ -404,8 +451,18 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
-        # Write traced MLIR. (trace_config.json was already written by the
-        # injector via --trace-config-out above.)
+        # The injector cannot know which shim the pass chose; read it back.
+        try:
+            trace_config = apply_trace_egress(trace_config, traced_mlir)
+            trace_config_dump(trace_config, trace_config_path)
+        except Exception as e:
+            msg = f"FAIL trace egress: {e}"
+            write_status(output_dir, msg)
+            print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+            return 1
+
+        # Write traced MLIR. (trace_config.json was written by the injector
+        # and completed with the egress just above.)
         (output_dir / "aie_traced.mlir").write_text(traced_mlir)
 
     # -- C++ patching -------------------------------------------------------

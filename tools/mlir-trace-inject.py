@@ -741,8 +741,10 @@ def _build_trace_config(
         },
         "tiles_traced": tiles_traced,
         "routing": {
-            "shim_col": 0,
-            "shim_dma_channel": 1,
+            # shim_col / shim_dma_channel are deliberately absent: the egress
+            # shim is chosen by aie-insert-trace-flows (which may move it to
+            # a spare column), so trace-prepare reads it back from the
+            # lowered MLIR and fills both in.
             "shim_bd_id": 15,
             "trace_done": {
                 "broadcast": _TRACE_BROADCAST_STOP,
