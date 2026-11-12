@@ -42,6 +42,14 @@ stream-switch Abort_Period to its minimum (the gate engages after the shortest i
 offsets, fields and the supported period range are read from the AM025 database (mlir-aie), not
 written here. Use one OUT_DIR per configuration.
 
+Proof that a clock write lands (`proof-build`, `proof-run`, `proof-show`): the trace routing and
+a control-packet readback cannot share one design (the trace injector owns the shim S2MM and the
+runtime-sequence arguments the bridge runner binds; the readback needs shim MM2S 0 / S2MM 0 for its
+packets and its own host with three buffers), so the proof is a separate, trace-free design on the
+same tile: read Module_Clock_Control, the stream-switch Abort_Period and the gate Status register
+over control packets, do the config's masked writes, read all three again. `proof-show` compares
+the two reads with what the AM025 database says a landed write must give.
+
 `run --backend hw` takes the NPU lock (`build/experiments/.npu-hw.lock`).
 """
 from __future__ import annotations
@@ -152,6 +160,80 @@ def clock_sequence(config: str, tiles: list[str]) -> str:
                          f"      aiex.npu.maskwrite32(%clk_a_{n}, %clk_v_{n}, %clk_m_{n}) "
                          f"{{column = {TILES[t][0]} : i32, row = {TILES[t][1]} : i32}} : i32, i32, i32")
     return "".join(line + "\n" for line in lines)
+
+
+# -- clock-write proof: the same masked writes, read back over control packets --------------------
+
+PROOF_TARGET = {"prod": "core", "mem": "mem"}      # ctrlpkt_readback target of each data tile
+PROOF_VAR = {"prod": "%t_core", "mem": "%t_mem"}
+PROOF_PKT_ID = {"core": 5, "mem": 6}
+PROOF_READS = ("Module_Clock_Control", ABORT_PERIOD_REG, "Stream_Switch_Adaptive_Clock_Gate_Status")
+PROOF_DATA_WORDS = 4                # the sequence's unused third buffer
+
+
+def _register(module: str, name: str) -> dict:
+    return next(r for r in _regdb_modules()[module]["registers"] if r["name"] == name)
+
+
+def clock_proof_steps(config: str, tile: str) -> list:
+    """ctrlpkt_readback steps: three reads, the config's masked writes, the same three reads."""
+    import ctrlpkt_readback as cp
+    module, target = REGDB_MODULE[tile], PROOF_TARGET[tile]
+    reads = [(name, int(_register(module, name)["offset"], 16)) for name in PROOF_READS]
+    steps: list = [cp.Read(off, f"pre {name}", target) for name, off in reads]
+    lines = []
+    for i, (offset, value, mask) in enumerate(clock_writes(config, tile)):
+        lines += [f"%pf_a{i} = arith.constant {offset} : i32", f"%pf_v{i} = arith.constant {value} : i32",
+                  f"%pf_m{i} = arith.constant {mask} : i32",
+                  f"aiex.npu.maskwrite32(%pf_a{i}, %pf_v{i}, %pf_m{i}) "
+                  f"{{column = {TILES[tile][0]} : i32, row = {TILES[tile][1]} : i32}} : i32, i32, i32"]
+    if lines:
+        steps.append(cp.Raw(tuple(lines)))
+    steps += [cp.Read(off, f"post {name}", target) for name, off in reads]
+    return steps
+
+
+def clock_proof_design(config: str, tile: str) -> tuple[str, list, object]:
+    import ctrlpkt_readback as cp
+    steps = clock_proof_steps(config, tile)
+    layout = cp.encode(steps)
+    target, var = PROOF_TARGET[tile], PROOF_VAR[tile]
+    col, row = TILES[tile]
+    lines = ["module {", "  aie.device(npu1_1col) {",
+             "    %t00 = aie.tile(0, 0) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 4>}",
+             f"    {var} = aie.tile({col}, {row}) "
+             f"{{controller_id = #aie.packet_info<pkt_type = 0, pkt_id = {PROOF_PKT_ID[target]}>}}",
+             *cp.packet_flows(var, "%t00", target), *cp.shim_allocations("%t00"),
+             f"    aie.runtime_sequence @seq(%ctrlout: memref<{len(layout.labels)}xi32>, "
+             f"%ctrlin: memref<{len(layout.words)}xi32>, %data: memref<{PROOF_DATA_WORDS}xi32>) {{",
+             *cp.sequence_lines(steps, layout, "ctrlout", "ctrlin"), "    }", "  }", "}", ""]
+    return "\n".join(lines), steps, layout
+
+
+def proof_expectation(config: str, tile: str) -> dict[str, int]:
+    """What a landed write leaves in each read register: reset value with the written fields applied
+    (pre reads are the reset values; the Status register is only reported, not predicted)."""
+    module = REGDB_MODULE[tile]
+    reset = {n: int(_register(module, n)["reset"], 16) for n in PROOF_READS[:2]}
+    post = dict(reset)
+    for offset, value, mask in clock_writes(config, tile):
+        for n in PROOF_READS[:2]:
+            if int(_register(module, n)["offset"], 16) == offset:
+                post[n] = (reset[n] & ~mask) | (value & mask)
+    return {**{f"pre {n}": v for n, v in reset.items()}, **{f"post {n}": v for n, v in post.items()}}
+
+
+def proof_verdict(config: str, tile: str, readback: dict[str, int]) -> str:
+    """LANDED when pre and post equal the prediction, DROPPED when post still equals pre while the
+    prediction differs, else UNEXPECTED (the words are in the report)."""
+    want = proof_expectation(config, tile)
+    if all(readback.get(k) == v for k, v in want.items()):
+        return "LANDED" if any(want[f"post {n}"] != want[f"pre {n}"] for n in PROOF_READS[:2]) else "NO-WRITE (reads match)"
+    names = PROOF_READS[:2]
+    if all(readback.get(f"post {n}") == readback.get(f"pre {n}") for n in names) and any(
+            want[f"post {n}"] != want[f"pre {n}"] for n in names):
+        return "DROPPED (post == pre)"
+    return "UNEXPECTED"
 
 
 CASE_NAME = re.compile(r"(.+?)(?:_n(\d+)|_([ct])(\d+)x(\d+))?")
@@ -423,6 +505,75 @@ def summarize(path: Path, src: str, dst: str) -> str:
     return "\n".join(lines)
 
 
+def proof_build(out: Path, config: str, tile: str) -> Path:
+    import ctrlpkt_readback as cp
+    from harness.build import aiecc_command, aiecc_path
+    text, _, layout = clock_proof_design(config, tile)
+    d = out / f"proof_{tile}_{config}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "aie.mlir").write_text(text)
+    (d / "pkts.bin").write_bytes(cp.pack_words(layout.words))
+    (d / "case.json").write_text(json.dumps({"case": d.name, "config": config, "tile": tile,
+                                             "labels": list(layout.labels), "n_words": len(layout.words),
+                                             "n_data": PROOF_DATA_WORDS}, indent=1) + "\n")
+    lp.sh(aiecc_command("peano", aiecc_path()), cwd=d, log=d / "aiecc.log")
+    return d
+
+
+def proof_run(out: Path, tag: str, backend: str, only: list[str]) -> bool:
+    """Run the built proof designs; `hw` takes the NPU lock itself (do not wrap it in flock)."""
+    import fcntl
+    import subprocess
+    import ctrlpkt_readback as cp
+    from harness.run import _env, build_ffi
+    host = cp.build_host(out)
+    if backend == "emu":
+        build_ffi("debug")
+    env = _env(backend, "debug")
+    ok = True
+    for d in sorted(p for p in out.iterdir() if (p / "aie.xclbin").exists() and (p / "case.json").exists()):
+        if only and d.name not in only:
+            continue
+        meta = json.loads((d / "case.json").read_text())
+        rd = d / "runs" / tag
+        rd.mkdir(parents=True, exist_ok=False)
+        cmd = [str(host), str(d / "aie.xclbin"), str(d / "insts.bin"), str(d / "pkts.bin"),
+               str(len(meta["labels"])), str(meta["n_data"]), str(rd / "out.bin")]
+        lock = None
+        if backend == "hw":
+            lock = open(lp.HW_LOCK, "w")
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60 if backend == "hw" else 1800)
+            rc, text = r.returncode, r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            rc, text = -1, "TIMEOUT"
+        finally:
+            if lock:
+                lock.close()
+        (rd / "log.txt").write_text(text)
+        print(f"{d.name} {tag}.{backend}: rc {rc}", flush=True)
+        ok &= rc == 0
+    return ok
+
+
+def proof_show(out: Path, tag: str, only: list[str]) -> str:
+    import struct
+    lines = []
+    for d in sorted(p for p in out.iterdir() if (p / "case.json").exists()):
+        meta = json.loads((d / "case.json").read_text())
+        f = d / "runs" / tag / "out.bin"
+        if (only and d.name not in only) or not f.exists():
+            continue
+        n = len(meta["labels"])
+        rb = dict(zip(meta["labels"], struct.unpack(f"<{n}I", f.read_bytes()[:4 * n])))
+        want = proof_expectation(meta["config"], meta["tile"])
+        lines.append(f"{d.name} {tag}: {proof_verdict(meta['config'], meta['tile'], rb)}")
+        for k, v in rb.items():
+            lines.append(f"   {k:48s} {v:#010x}" + (f"   (landed-write prediction {want[k]:#x})" if k in want else ""))
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -444,8 +595,31 @@ def main(argv=None) -> int:
     po.add_argument("out_dir")
     po.add_argument("tags", nargs="+")
     po.add_argument("--only", nargs="*", default=[c for c in CASES if c.endswith("_ports")])
+    pb = sub.add_parser("proof-build", help="trace-free design: read, masked write, read back (control packets)")
+    pb.add_argument("out_dir")
+    pb.add_argument("--clock", nargs="+", choices=sorted(CLOCK_CONFIGS), default=["K1"])
+    pb.add_argument("--tile", nargs="+", choices=sorted(PROOF_TARGET), default=["prod"])
+    pr = sub.add_parser("proof-run")
+    pr.add_argument("out_dir")
+    pr.add_argument("tag")
+    pr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    pr.add_argument("--only", nargs="*", default=[])
+    ps = sub.add_parser("proof-show")
+    ps.add_argument("out_dir")
+    ps.add_argument("tag")
+    ps.add_argument("--only", nargs="*", default=[])
     a = ap.parse_args(argv)
     out = Path(a.out_dir)
+    if a.cmd == "proof-build":
+        for c in a.clock:
+            for t in a.tile:
+                print(f"built {proof_build(out, c, t)}")
+        return 0
+    if a.cmd == "proof-run":
+        return 0 if proof_run(out, a.tag, a.backend, a.only) else 1
+    if a.cmd == "proof-show":
+        print(proof_show(out, a.tag, a.only))
+        return 0
     if a.cmd == "build":
         for n in a.cases:
             build_case(n, out, a.clock)
