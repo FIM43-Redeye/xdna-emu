@@ -1482,3 +1482,188 @@ fn idle_longer_than_the_cycles_field_is_sync_tokens() {
     let body: Vec<u8> = tu.byte_buffer[start_len..].iter().copied().filter(|&b| b != 0xFE).collect();
     assert_eq!(body, expected);
 }
+
+// -- Saturated Repeat1 tokens are written when they complete -------------------------------
+//
+// Silicon writes each Repeat1(1023) in the cycle its 1023rd repeat happens, not when the run
+// ends: in the quiet stretches of objectfifo_repeat_init_values_repeat every shim trace packet
+// is the same 28 bytes (`Rep0(10) Sng0(64,0) Rep0(7) Skip Mul0(192,0)` and 11 x Rep1(1023))
+// and is handed to the stream in the cycle the 11th chunk completes. The byte stream is the
+// same as when the run is written at its end; only the cycle bytes enter the buffer moves.
+
+/// A started unit with slot 3 (hw event 26, a level) and slots 5..=7 (24, 35, 36) mapped.
+/// Returns the unit and the length of the Start marker already in the buffer.
+fn held_run_unit() -> (TraceUnit, usize) {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    tu.write_register(0x14, 23 | (24 << 8) | (35 << 16) | (36 << 24));
+    tu.notify_event(28, 0, None);
+    let start_len = tu.byte_buffer.len();
+    (tu, start_len)
+}
+
+/// Drive the coordinator's per-cycle commit pass over `cycles` (inclusive).
+fn commit_each(tu: &mut TraceUnit, cycles: std::ops::RangeInclusive<u64>) {
+    for c in cycles {
+        tu.commit_cycle(c);
+    }
+}
+
+/// Test 1: a level held alone writes its first Repeat1(1023) in the cycle of the 1023rd repeat.
+#[test]
+fn a_lone_held_level_writes_its_saturated_repeat_at_the_1023rd_repeat() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true); // the frame in cycle 1, repeats in 2..=1024
+    commit_each(&mut tu, 1..=1023);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30], "1022 repeats: nothing written yet");
+
+    commit_each(&mut tu, 1024..=1024);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+    assert_ne!(tu.held_mask, 0, "the level is still held");
+}
+
+/// Test 2: three saturations at their own cycles (with the word-straddle Skip fill between
+/// them), the remainder at the drop. The literal bytes are what the end-flushed code wrote
+/// for this run before the change; `the_same_run_written_at_its_end_is_the_same_bytes`
+/// feeds the run with no intermediate commits.
+#[test]
+fn a_long_hold_writes_each_saturation_at_its_cycle() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=1023);
+    commit_each(&mut tu, 1024..=1024);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+    commit_each(&mut tu, 1025..=2046);
+    assert_eq!(tu.byte_buffer.len(), start_len + 3);
+    commit_each(&mut tu, 2047..=2047);
+    // the second chunk would straddle the word: Skip fill first
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF]);
+    commit_each(&mut tu, 2048..=3069);
+    assert_eq!(tu.byte_buffer.len(), start_len + 6);
+    commit_each(&mut tu, 3070..=3070);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF, 0xDB, 0xFF]);
+    commit_each(&mut tu, 3071..=3075); // five more held cycles
+    assert_eq!(tu.byte_buffer.len(), start_len + 8);
+
+    tu.set_event_level(26, 3076, false);
+    commit_each(&mut tu, 3076..=3076);
+    tu.flush_repeats();
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF, 0xDB, 0xFF, 0xE5]);
+}
+
+/// The same hold with no commit in between (the whole run written when it ends, as before the
+/// change) gives the same bytes: pre-change literal, recorded by running this test unchanged
+/// against the old code.
+#[test]
+fn the_same_run_written_at_its_end_is_the_same_bytes() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true);
+    tu.commit_cycle(1);
+    tu.set_event_level(26, 3076, false);
+    tu.commit_cycle(3076);
+    tu.flush_repeats();
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF, 0xDB, 0xFF, 0xE5]);
+}
+
+/// Test 3: the silicon packet. A 28-byte payload of `Rep0(10) Sng0 Rep0(7) Mul0(192,0)` and
+/// 11 x Rep1(1023) is handed over in the cycle of the 11th saturation, level still held.
+/// (The lead is built from events: a 11-cycle hold of slot 5 handing over to slot 6 held for
+/// 8 cycles, then slot 7 joining; that is 6 lead bytes as on silicon, but with no Skip fill
+/// since the buffer is aligned differently.)
+#[test]
+fn the_silicon_packet_is_handed_over_at_the_11th_saturation() {
+    let (mut tu, _) = held_run_unit();
+    tu.set_event_level(24, 1, true); // slot 5: cycles 1..=11 (Single + Repeat0(10))
+    tu.commit_cycle(1);
+    tu.set_event_level(24, 12, false); // hands over to slot 6 in cycle 12
+    tu.set_event_level(35, 12, true); // slot 6: 12..=19 (Single0(64,0) + Repeat0(7))
+    commit_each(&mut tu, 2..=19);
+    tu.set_event_level(36, 20, true); // slot 7 joins: Multiple0(192,0) from cycle 20
+    commit_each(&mut tu, 20..=20);
+    // the Start marker is the 8 bytes before; drop them to start a fresh 28-byte packet
+    tu.byte_buffer.drain(..8);
+    assert_eq!(tu.byte_buffer, vec![0x50, 0xEA, 0x60, 0xE7, 0xCC, 0x00]);
+
+    let last = 20 + 11 * 1023; // cycle of the 11th chunk's 1023rd repeat
+    commit_each(&mut tu, 21..=last - 1);
+    assert!(!tu.has_pending_packets(), "10 chunks: packet not complete");
+    commit_each(&mut tu, last..=last);
+    assert!(tu.has_pending_packets(), "packet handed over in the cycle of the 11th saturation");
+    assert_eq!(tu.held_mask & 0xC0, 0xC0, "both levels still held");
+
+    let packet = tu.pop_packet().unwrap();
+    let payload: Vec<u8> = packet[1..].iter().flat_map(|w| w.to_be_bytes()).collect();
+    let mut expected = vec![0x50, 0xEA, 0x60, 0xE7, 0xCC, 0x00];
+    for _ in 0..11 {
+        expected.extend_from_slice(&[0xDB, 0xFF]);
+    }
+    assert_eq!(payload, expected);
+}
+
+/// Test 4: a foreign pulse in a long hold below the saturation count behaves as before:
+/// repeats flush before the pulse frame, the held-only frame follows it.
+#[test]
+fn a_pulse_in_a_hold_below_saturation_is_unchanged() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=499);
+    tu.notify_event(37, 500, None);
+    commit_each(&mut tu, 500..=599);
+    tu.set_event_level(26, 600, false);
+    commit_each(&mut tu, 600..=600);
+    tu.flush_repeats();
+    // 1: frame; 2..=499: 498 repeats; 500: Multiple0(slot0|slot3); 501..=599: frame + 98
+    let body: Vec<u8> = tu.byte_buffer[start_len..].iter().copied().filter(|&b| b != 0xFE).collect();
+    assert_eq!(body, [0x30, 0xD9, 0xF2, 0xC0, 0x90, 0x30, 0xD8, 98]);
+}
+
+/// Test 5a: a Sync right after a run that saturated exactly: the Repeat1 is written at its
+/// cycle, then the Sync (idle >= 2^18 before the next frame), then the frame.
+#[test]
+fn saturation_then_a_sync_is_the_same_bytes() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=1024);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+    tu.set_event_level(26, 1025, false);
+    tu.commit_cycle(1025);
+    let again = 1025 + (1 << 18) + 5; // idle = 2^18 + 5: one Sync, field 5
+    tu.set_event_level(26, again, true);
+    tu.commit_cycle(again);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFF, 0x35]);
+}
+
+/// Test 5b: saturation landing where the chunk would straddle a word writes the Skip fill in
+/// that cycle, and the whole stream equals the run written at its end.
+#[test]
+fn saturation_with_a_word_straddle_fill_is_the_same_bytes() {
+    let (mut eager, start_len) = held_run_unit();
+    eager.set_event_level(26, 1, true);
+    commit_each(&mut eager, 1..=2047);
+    assert_eq!(eager.byte_buffer.len(), start_len + 6, "second chunk and its fill are in");
+    commit_each(&mut eager, 2048..=2100);
+    eager.set_event_level(26, 2101, false);
+    commit_each(&mut eager, 2101..=2101);
+    eager.flush_repeats();
+
+    let (mut late, _) = held_run_unit();
+    late.set_event_level(26, 1, true);
+    late.commit_cycle(1);
+    late.set_event_level(26, 2101, false);
+    late.commit_cycle(2101);
+    late.flush_repeats();
+    assert_eq!(eager.byte_buffer, late.byte_buffer);
+}
+
+/// Test 6: a run that ends exactly at 1023 repeats is one Repeat1(1023) and no empty Repeat.
+#[test]
+fn a_run_ending_at_exactly_1023_repeats_has_no_trailing_repeat() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=1024);
+    tu.set_event_level(26, 1025, false);
+    commit_each(&mut tu, 1025..=1025);
+    tu.flush_repeats();
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+}

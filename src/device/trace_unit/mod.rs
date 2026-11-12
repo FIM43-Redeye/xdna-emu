@@ -231,6 +231,9 @@ pub struct TraceUnit {
     armed_start_cycle: Option<u64>,
 }
 
+/// Largest count one Repeat1 token holds (10-bit field); a run longer than this is chunks of it.
+const REPEAT1_MAX: u64 = (1 << 10) - 1;
+
 /// Idle cycles in a mode-0 frame's cycles field: 18 bits.
 const CYCLES_FIELD_RANGE: u64 = 1 << 18;
 
@@ -737,12 +740,31 @@ impl TraceUnit {
         // Commit when a pulse fired OR a level edge changed `held_mask` this
         // cycle (deferred for one-frame-per-cycle coalescing).
         if self.pending_slot_mask == 0 && !self.level_dirty {
+            // Nothing new this cycle, but a held level is still asserted in it: account the
+            // cycle now so a Repeat1 that saturates is written in its own cycle, not when the
+            // hold ends.
+            self.extend_held_run(cycle);
             return;
         }
         if self.pending_cycle > cycle {
             return;
         }
         self.commit_pending_frame();
+    }
+
+    /// Account the cycles after the last commit, up to and including `cycle`, to the held
+    /// snapshot of that commit (silicon writes a frame in every cycle a level is asserted).
+    /// The level is unchanged in them: a change would have marked the cycle dirty and been
+    /// committed instead. Writing them as they pass is the same run `commit_pending_frame`
+    /// writes for the cycles between two commits, so the byte stream is unchanged.
+    fn extend_held_run(&mut self, cycle: u64) {
+        if self.frame_held == 0 || cycle <= self.last_event_cycle {
+            return;
+        }
+        let held_cycles = cycle - self.last_event_cycle;
+        self.push_frame_run(self.frame_held, 0, held_cycles);
+        self.last_event_cycle = cycle;
+        self.try_emit_packet();
     }
 
     /// Advance the timer. Called each cycle to keep the internal clock in sync.
@@ -978,12 +1000,23 @@ impl TraceUnit {
         }
         if self.last_frame == Some((mask, cycles)) {
             self.repeat_pending += count;
-            return;
+        } else {
+            self.flush_repeats();
+            self.emit_event_frame(mask, cycles);
+            self.last_frame = Some((mask, cycles));
+            self.repeat_pending = count - 1;
         }
-        self.flush_repeats();
-        self.emit_event_frame(mask, cycles);
-        self.last_frame = Some((mask, cycles));
-        self.repeat_pending = count - 1;
+        self.write_saturated_repeats();
+    }
+
+    /// Silicon writes a Repeat1 as soon as it is full, in the cycle of its last repeat, and
+    /// counts again from zero. `flush_repeats` chunks the same way (full chunks first), so
+    /// only the cycle the bytes are written in differs from writing the run at its end.
+    fn write_saturated_repeats(&mut self) {
+        while self.repeat_pending >= REPEAT1_MAX {
+            self.encode_mode0_repeat1(REPEAT1_MAX as u16);
+            self.repeat_pending -= REPEAT1_MAX;
+        }
     }
 
     /// Write `n` Sync tokens (one 0xFF and a Repeat for the rest, like any other run). They
@@ -1002,9 +1035,9 @@ impl TraceUnit {
     /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15).
     fn flush_repeats(&mut self) {
         let mut n = std::mem::take(&mut self.repeat_pending);
-        while n > 1023 {
-            self.encode_mode0_repeat1(1023);
-            n -= 1023;
+        while n > REPEAT1_MAX {
+            self.encode_mode0_repeat1(REPEAT1_MAX as u16);
+            n -= REPEAT1_MAX;
         }
         match n {
             0 => {}
@@ -1118,7 +1151,7 @@ impl TraceUnit {
     /// Mode-0 Repeat1 frame: `0b110110_RR RRRRRRRR` (2 bytes), 10-bit count
     /// (0..1023).
     fn encode_mode0_repeat1(&mut self, n: u16) {
-        debug_assert!(n < 1024, "Repeat1 count {} exceeds 10 bits", n);
+        debug_assert!(u64::from(n) <= REPEAT1_MAX, "Repeat1 count {} exceeds 10 bits", n);
         self.push_op(&[0xD8 | ((n >> 8) as u8 & 0x03), (n & 0xFF) as u8]);
     }
 
