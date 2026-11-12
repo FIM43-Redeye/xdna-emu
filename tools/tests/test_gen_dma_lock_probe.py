@@ -872,7 +872,7 @@ def test_ring_row_and_residues():
 
 def test_ring_plan():
     names = [c.name for c in g.ring_plan()]
-    assert len(names) == len(set(names)) == 12 and all(n.startswith("rg") for n in names)
+    assert len(names) == len(set(names)) == 14 and all(n.startswith("rg") for n in names)
 
 
 def test_ring_two_channel_variant():
@@ -896,3 +896,14 @@ def test_ring_pad_one_buffer_spans_banks():
     assert c.name.endswith("p12o")
     with pytest.raises(ValueError):
         g.ring_validate(ring(pad=13, pad_one=True))
+
+
+def test_ring_two_mm2s_on_one_schedule():
+    t = g.ring_design_mlir(ring("mm", n=120))
+    assert "aie.dma_start(MM2S, 1, ^pre1" in t and t.count("aie.dma_bd(%src : memref<64xi32>)") == 2
+    assert t.count("aie.dma_bd(%pre : memref<4xi32>)") == 2                     # same chained path for both
+    assert "dma_bd(%dst2 : memref<68xi32> offset = 0 len = 68)" in t           # S2MM 1 takes all 68 words
+    assert phys_bank(g.RING_DST2_ADDR) in (6, 7) and g.RING_DST2_ADDR > g.FETCH_SCRATCH_ADDR
+    assert "mov r4, #2" in bundles_of(g.ring_core_asm(ring("mm", n=120)))
+    ev = g.ring_memmod_events(ring("mm"))
+    assert len(ev) == 8 and "DMA_MM2S_1_MEMORY_STARVATION" in ev
