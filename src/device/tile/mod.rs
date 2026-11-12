@@ -402,6 +402,13 @@ pub struct Tile {
     /// for the field layout.
     pub memtile_dma_event_chan_sel: u32,
 
+    /// Lock watched by each lock event selector: the `Lock_Select` field of
+    /// `Locks_Event_Selection_<n>` (memory module, memtile or shim; compute
+    /// core modules have none). Slots beyond the module's selector count are
+    /// unused. Starts at the register-database reset (every selector on
+    /// lock 0); see `crate::trace::lock_event_hw_ids`.
+    pub lock_event_selected: [u8; crate::trace::MAX_LOCK_SELECTORS],
+
     /// Control_Packet_Handler_Status sticky bits (offset 0x3FF30
     /// compute, 0xB0F30 memtile).
     ///
@@ -574,6 +581,10 @@ impl Tile {
             pending_ctrl_response: std::collections::VecDeque::new(),
             lock_release_count: 0,
             memtile_dma_event_chan_sel: 0,
+            lock_event_selected: {
+                let sel = Self::lock_selection_layout(tile_kind);
+                [sel.selected_lock(sel.reset); crate::trace::MAX_LOCK_SELECTORS]
+            },
             pkt_handler_status: 0,
             lock_error_latch: 0,
             isolation: 0,
@@ -604,6 +615,34 @@ impl Tile {
         *self = Tile::new(self.tile_kind, self.col, self.row, params);
         self.data_memory = saved_data;
         self.program_memory = saved_program;
+    }
+
+    /// The lock event selection register bank of this kind of tile.
+    pub(crate) fn lock_selection_layout(
+        tile_kind: TileKind,
+    ) -> &'static super::regdb::LockEventSelectionLayout {
+        let layout = super::regdb::device_reg_layout();
+        match tile_kind {
+            TileKind::Compute => &layout.memory_lock_selection,
+            TileKind::Mem => &layout.memtile_lock_selection,
+            TileKind::ShimNoc | TileKind::ShimPl => &layout.shim_lock_selection,
+        }
+    }
+
+    /// Hardware event IDs a lock acquire/release raises in this tile's
+    /// memory-module (or shim PL) trace namespace, one per selector watching
+    /// the lock. Empty for non-lock events.
+    pub fn lock_event_hw_ids(
+        &self,
+        event: &crate::interpreter::state::EventType,
+    ) -> [Option<u8>; crate::trace::MAX_LOCK_SELECTORS] {
+        let ids = match self.tile_kind {
+            TileKind::Compute => crate::trace::COMPUTE_LOCK_EVENT_IDS,
+            TileKind::Mem => crate::trace::MEMTILE_LOCK_EVENT_IDS,
+            TileKind::ShimNoc | TileKind::ShimPl => crate::trace::SHIM_LOCK_EVENT_IDS,
+        };
+        let count = Self::lock_selection_layout(self.tile_kind).count;
+        crate::trace::lock_event_hw_ids(event, ids, &self.lock_event_selected[..count])
     }
 
     /// Create a compute tile with NPU1/AIE2 default parameters.

@@ -234,7 +234,8 @@ pub(crate) fn event_pc(event: &EventType) -> Option<u32> {
 /// DMA events are per-channel. The channel field encodes:
 /// - 0 = S2MM ch0, 1 = S2MM ch1, 2 = MM2S ch0, 3 = MM2S ch1
 ///
-/// Lock events are per-lock (lock IDs 0-7 have dedicated event IDs).
+/// Lock events are not mapped here: they follow the Locks_Event_Selection
+/// registers (see `lock_event_hw_ids`).
 ///
 /// Event IDs from mlir-aie `python/utils/trace/events/aie2.py` MemEvent.
 pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
@@ -279,24 +280,7 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
             3 => Some(38),
             _ => None,
         },
-        // Lock acquire: LOCK_SEL0_ACQ_GE=45, stride 4 per lock
-        // Lock 0 acq_ge=45, Lock 1 acq_ge=49, ..., Lock 7 acq_ge=73
-        EventType::LockAcquire { lock_id } => {
-            if *lock_id <= 7 {
-                Some(45 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
-        // Lock release: LOCK_0_REL=46, stride 4 per lock
-        // Lock 0 rel=46, Lock 1 rel=50, ..., Lock 7 rel=74
-        EventType::LockRelease { lock_id } => {
-            if *lock_id <= 7 {
-                Some(46 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
+        // Lock events are selector events: see `lock_event_hw_ids`.
         // Core events don't have memory module IDs
         _ => None,
     }
@@ -346,6 +330,63 @@ impl MemtileDmaEventSel {
     }
 }
 
+/// Largest lock selector bank of any module (compute memory and memtile: 8).
+pub const MAX_LOCK_SELECTORS: usize = 8;
+
+/// Event IDs of selector 0's lock events in one module's event namespace.
+///
+/// Lock events are selector events: `Locks_Event_Selection_<n>` chooses the
+/// lock that selector `n` watches, and selector `n`'s events sit `4 * n`
+/// above selector 0's (each selector owns ACQ_EQ, ACQ_GE, REL and
+/// EQUAL_TO_VALUE). Only the ACQ_GE and REL families are raised.
+///
+/// Bases from mlir-aie `python/utils/trace/events/aie2.py`
+/// (MemEvent / MemTileEvent / ShimTileEvent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockEventIds {
+    pub acq_ge: u8,
+    pub rel: u8,
+}
+
+/// Compute tile memory module: LOCK_SEL0_ACQ_GE = 45, LOCK_SEL0_REL = 46.
+pub const COMPUTE_LOCK_EVENT_IDS: LockEventIds = LockEventIds { acq_ge: 45, rel: 46 };
+/// MemTile: LOCK_SEL0_ACQ_GE = 47, LOCK_SEL0_REL = 48.
+pub const MEMTILE_LOCK_EVENT_IDS: LockEventIds = LockEventIds { acq_ge: 47, rel: 48 };
+/// Shim: LOCK_0_ACQ_GE = 40, LOCK_0_REL = 41 (the shim names its selectors
+/// LOCK_<n>, but they are the same selector scheme).
+pub const SHIM_LOCK_EVENT_IDS: LockEventIds = LockEventIds { acq_ge: 40, rel: 41 };
+
+/// Hardware event IDs raised by a lock acquire/release under the tile's
+/// lock selection.
+///
+/// `selected[n]` is the lock that selector `n` watches (its `Lock_Select`
+/// field); its length is the module's selector count. Every selector that
+/// watches the event's lock fires its own event, so at reset (all selectors
+/// on lock 0) one lock-0 operation fires every selector's event, and a lock
+/// nobody selects raises nothing. Non-lock events return all `None`.
+///
+/// Reset behaviour (all selectors on lock 0) is silicon-confirmed for the
+/// memtile: an unprogrammed trace of a design using locks 0 and 1 shows
+/// LOCK_SEL1_* timestamped identically to LOCK_SEL0_*.
+pub fn lock_event_hw_ids(
+    event: &EventType,
+    ids: LockEventIds,
+    selected: &[u8],
+) -> [Option<u8>; MAX_LOCK_SELECTORS] {
+    let (lock_id, base) = match event {
+        EventType::LockAcquire { lock_id } => (*lock_id, ids.acq_ge),
+        EventType::LockRelease { lock_id } => (*lock_id, ids.rel),
+        _ => return [None; MAX_LOCK_SELECTORS],
+    };
+    let mut out = [None; MAX_LOCK_SELECTORS];
+    for (n, watched) in selected.iter().take(MAX_LOCK_SELECTORS).enumerate() {
+        if *watched == lock_id {
+            out[n] = Some(base + 4 * n as u8);
+        }
+    }
+    out
+}
+
 /// Number of S2MM channels on a MemTile (per AM020 / mlir-aie device model).
 /// Used to decode the EMU's flat channel index (0..5 = S2MM, 6..11 = MM2S).
 const MEMTILE_S2MM_CHANNELS: u8 = 6;
@@ -363,8 +404,9 @@ const MEMTILE_S2MM_CHANNELS: u8 = 6;
 /// `[None, None]`). Both SEL slots can be aimed at the same channel
 /// (e.g., both default to 0) -- in that case both event IDs fire.
 ///
-/// Returns up to two HW event IDs in a fixed-size array. Non-DMA events
-/// (locks, etc.) always produce at most one entry. Unused slots are `None`.
+/// Returns up to two HW event IDs in a fixed-size array. Lock events are not
+/// handled here: they follow the lock selection registers (`lock_event_hw_ids`).
+/// Unused slots are `None`.
 ///
 /// Event IDs from mlir-aie `python/utils/trace/events/aie2.py` MemTileEvent.
 pub fn memtile_event_to_hw_ids(event: &EventType, sel: MemtileDmaEventSel) -> [Option<u8>; 2] {
@@ -390,11 +432,7 @@ pub fn memtile_event_to_hw_ids(event: &EventType, sel: MemtileDmaEventSel) -> [O
         EventType::DmaStalledLock { channel, .. } => dma_ids(*channel, 33, 35),
         // DMA stream starvation: S2MM_SEL0=37, S2MM_SEL1=38, MM2S_SEL0=39(bp), MM2S_SEL1=40
         EventType::DmaStreamStarvation { channel, .. } => dma_ids(*channel, 37, 39),
-        // Lock acquire: LOCK_SEL0_ACQ_GE=47, stride 4 per lock.
-        // Lock events are not gated by the DMA SEL register.
-        EventType::LockAcquire { lock_id } if *lock_id <= 7 => [Some(47 + (*lock_id as u8) * 4), None],
-        // Lock release: LOCK_SEL0_REL=48, stride 4 per lock.
-        EventType::LockRelease { lock_id } if *lock_id <= 7 => [Some(48 + (*lock_id as u8) * 4), None],
+        // Lock events are selector events: see `lock_event_hw_ids`.
         _ => [None, None],
     }
 }
@@ -448,22 +486,7 @@ pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
             3 => Some(33),
             _ => None,
         },
-        // Lock acquire: LOCK_0_ACQ_GE=40, stride 4 per lock (6 locks max)
-        EventType::LockAcquire { lock_id } => {
-            if *lock_id <= 5 {
-                Some(40 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
-        // Lock release: LOCK_0_REL=41, stride 4 per lock
-        EventType::LockRelease { lock_id } => {
-            if *lock_id <= 5 {
-                Some(41 + (*lock_id as u8) * 4)
-            } else {
-                None
-            }
-        }
+        // Lock events are selector events: see `lock_event_hw_ids`.
         _ => None,
     }
 }
@@ -692,21 +715,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_event_lock_ids() {
-        // Lock 0: acq_ge=45, rel=46
-        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(45));
-        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(46));
-
-        // Lock 3: acq_ge=45+12=57, rel=46+12=58
-        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 3 }), Some(57));
-        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 3 }), Some(58));
-
-        // Lock 7: acq_ge=45+28=73, rel=46+28=74
-        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 7 }), Some(73));
-        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 7 }), Some(74));
-
-        // Lock 8+: out of range
-        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 8 }), None);
+    fn test_mem_event_has_no_fixed_lock_ids() {
+        // Lock events depend on the selection registers, never on the lock id alone.
+        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), None);
+        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 3 }), None);
     }
 
     #[test]
@@ -796,15 +808,80 @@ mod tests {
     }
 
     #[test]
-    fn test_memtile_lock_ids_offset_from_compute() {
-        // Lock events are not gated by the DMA SEL register.
+    fn test_memtile_event_has_no_fixed_lock_ids() {
         let sel = MemtileDmaEventSel::default();
-        // Compute: LOCK_SEL0_ACQ_GE=45, MemTile: LOCK_SEL0_ACQ_GE=47
-        assert_eq!(memtile_event_to_hw_ids(&EventType::LockAcquire { lock_id: 0 }, sel), [Some(47), None]);
-        assert_eq!(memtile_event_to_hw_ids(&EventType::LockRelease { lock_id: 0 }, sel), [Some(48), None]);
-        // Lock 7: 47 + 28 = 75
-        assert_eq!(memtile_event_to_hw_ids(&EventType::LockAcquire { lock_id: 7 }, sel), [Some(75), None]);
-        assert_eq!(memtile_event_to_hw_ids(&EventType::LockRelease { lock_id: 7 }, sel), [Some(76), None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockAcquire { lock_id: 0 }, sel), [None, None]);
+        assert_eq!(memtile_event_to_hw_ids(&EventType::LockRelease { lock_id: 7 }, sel), [None, None]);
+    }
+
+    // --- lock selector events -------------------------------------------
+
+    const RESET: [u8; 8] = [0; 8];
+
+    fn fired(event: &EventType, ids: LockEventIds, selected: &[u8]) -> Vec<u8> {
+        lock_event_hw_ids(event, ids, selected).into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn lock_selector_n_follows_its_programmed_lock() {
+        // LOCK_SEL0 -> lock 2, LOCK_SEL1 -> lock 3, the rest stay on lock 0.
+        let sel = [2, 3, 0, 0, 0, 0, 0, 0];
+        let rel = |l| fired(&EventType::LockRelease { lock_id: l }, MEMTILE_LOCK_EVENT_IDS, &sel);
+        let acq = |l| fired(&EventType::LockAcquire { lock_id: l }, MEMTILE_LOCK_EVENT_IDS, &sel);
+        // LOCK_SEL0_REL = 48, LOCK_SEL1_REL = 52.
+        assert_eq!(rel(2), vec![48]);
+        assert_eq!(rel(3), vec![52]);
+        // LOCK_SEL0_ACQ_GE = 47, LOCK_SEL1_ACQ_GE = 51.
+        assert_eq!(acq(2), vec![47]);
+        assert_eq!(acq(3), vec![51]);
+        // Lock 1 is watched by nobody now.
+        assert!(rel(1).is_empty());
+    }
+
+    #[test]
+    fn lock_ids_above_seven_are_reachable() {
+        let mut sel = RESET;
+        sel[4] = 40; // memtile locks go to 63
+        assert_eq!(
+            fired(&EventType::LockRelease { lock_id: 40 }, MEMTILE_LOCK_EVENT_IDS, &sel),
+            vec![48 + 16]
+        );
+        let mut sel = RESET;
+        sel[1] = 15; // compute tile memory module has 16 locks
+        assert_eq!(
+            fired(&EventType::LockAcquire { lock_id: 15 }, COMPUTE_LOCK_EVENT_IDS, &sel),
+            vec![45 + 4]
+        );
+    }
+
+    #[test]
+    fn reset_selection_watches_lock_zero_on_every_selector() {
+        // Database reset, confirmed on silicon: all selectors on lock 0.
+        let all_ids: Vec<u8> = (0..8).map(|n| 48 + 4 * n).collect();
+        assert_eq!(fired(&EventType::LockRelease { lock_id: 0 }, MEMTILE_LOCK_EVENT_IDS, &RESET), all_ids);
+        assert!(fired(&EventType::LockRelease { lock_id: 1 }, MEMTILE_LOCK_EVENT_IDS, &RESET).is_empty());
+    }
+
+    #[test]
+    fn selectors_sharing_a_lock_all_fire() {
+        let sel = [5, 5, 0, 0, 0, 0, 0, 0];
+        assert_eq!(fired(&EventType::LockAcquire { lock_id: 5 }, MEMTILE_LOCK_EVENT_IDS, &sel), vec![47, 51]);
+    }
+
+    #[test]
+    fn selector_count_is_the_module_bank_size() {
+        // The shim has 6 selectors: LOCK_0..LOCK_5 with ACQ_GE at 40 + 4n.
+        let sel = [0, 0, 0, 0, 0, 7];
+        assert_eq!(
+            fired(&EventType::LockAcquire { lock_id: 0 }, SHIM_LOCK_EVENT_IDS, &sel),
+            vec![40, 44, 48, 52, 56]
+        );
+        assert_eq!(fired(&EventType::LockRelease { lock_id: 7 }, SHIM_LOCK_EVENT_IDS, &sel), vec![41 + 20]);
+    }
+
+    #[test]
+    fn non_lock_events_raise_no_lock_selector_events() {
+        assert!(fired(&EventType::DmaStartTask { channel: 0 }, MEMTILE_LOCK_EVENT_IDS, &RESET).is_empty());
     }
 
     #[test]
@@ -977,12 +1054,8 @@ mod tests {
             Some(33)
         );
 
-        // Lock events: 6 locks, stride 4, ACQ_GE base=40, REL base=41
-        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(40));
-        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 5 }), Some(60));
-        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 6 }), None); // Only 6 locks
-        assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(41));
-        assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 5 }), Some(61));
+        // Lock events follow the selection registers: `lock_event_hw_ids`.
+        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), None);
     }
 
     #[test]

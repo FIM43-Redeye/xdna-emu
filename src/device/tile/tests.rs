@@ -689,7 +689,7 @@ fn test_lock_event_reaches_trace_unit() {
     //
     // This tests the full pipeline that sweep batch 3 exercises:
     // 1. Lock acquire resolves -> pushes EventType::LockAcquire{lock_id:0}
-    // 2. mem_event_to_hw_id maps to 45 (LOCK_SEL0_ACQ_GE)
+    // 2. the tile's lock selection (reset: every selector on lock 0) maps it to 45 (LOCK_SEL0_ACQ_GE)
     // 3. Trace unit with slot configured to 45 captures the event
     let mut tile = Tile::compute(0, 2);
 
@@ -733,9 +733,10 @@ fn test_lock_event_reaches_trace_unit() {
         event
     );
 
-    // Map through mem_event_to_hw_id -- should return 45
-    let hw_id = crate::trace::mem_event_to_hw_id(event);
-    assert_eq!(hw_id, Some(45), "LOCK_SEL0_ACQ_GE should be event ID 45");
+    // At reset every selector watches lock 0, so selector 0's ACQ_GE (45)
+    // fires, and so does every other selector's (49, 53, ..., 73).
+    let hw_ids: Vec<u8> = tile.lock_event_hw_ids(event).into_iter().flatten().collect();
+    assert_eq!(hw_ids, vec![45, 49, 53, 57, 61, 65, 69, 73]);
 
     // Notify the trace unit and flush to check capture.
     // Flush drains any pending per-cycle mask before padding the final packet.
@@ -774,13 +775,41 @@ fn test_lock_release_event_reaches_trace_unit() {
 
     // Check pending event
     assert_eq!(tile.mem_trace_pending.len(), 1);
-    let hw_id = crate::trace::mem_event_to_hw_id(&tile.mem_trace_pending[0].1);
-    assert_eq!(hw_id, Some(46), "LOCK_0_REL should be event ID 46");
+    let hw_ids: Vec<u8> = tile
+        .lock_event_hw_ids(&tile.mem_trace_pending[0].1)
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(hw_ids.first(), Some(&46), "LOCK_SEL0_REL should be event ID 46");
 
     // Notify, flush, and verify capture
     tile.mem_trace.notify_event(46, 50, None);
     tile.mem_trace.flush();
     assert!(tile.mem_trace.has_pending_packets(), "Trace unit should have recorded the lock release event");
+}
+
+#[test]
+fn lock_event_selection_starts_at_the_register_reset() {
+    // Locks_Event_Selection_<n> resets to 0x3F: Lock_Select = lock 0 for every selector.
+    for tile in [Tile::compute(0, 2), Tile::mem_tile(0, 1), Tile::shim(0, 0)] {
+        assert_eq!(tile.lock_event_selected, [0; 8], "{:?}", tile.tile_kind);
+    }
+}
+
+#[test]
+fn unprogrammed_memtile_lock_events_fire_every_selector_for_lock_zero_only() {
+    use crate::interpreter::state::EventType;
+    let tile = Tile::mem_tile(0, 1);
+    let rel0: Vec<u8> = tile
+        .lock_event_hw_ids(&EventType::LockRelease { lock_id: 0 })
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(rel0, vec![48, 52, 56, 60, 64, 68, 72, 76]);
+    assert!(tile
+        .lock_event_hw_ids(&EventType::LockRelease { lock_id: 1 })
+        .iter()
+        .all(Option::is_none));
 }
 
 // === Performance Counter Integration Tests ===
