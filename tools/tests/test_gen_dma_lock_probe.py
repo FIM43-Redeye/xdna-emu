@@ -627,3 +627,117 @@ def test_load_case_labels_distinguish_k_and_bank():
     rows = [(sync_case(11, "1", 2).label, "s1.hw", g.sync_row(sync_synthetic())),
             (sync_case(11, "0", 10).label, "s1.hw", g.sync_row(sync_synthetic()))]
     assert [ln.split()[0] for ln in g.format_sync_table(rows).splitlines()[1:]] == ["a11k10", "b11k02"]
+
+
+# -- bank arbitration probe (arb-*) ---------------------------------------------------
+
+def arb(bank=0, op="l", n=1, k=16, m=0):
+    return g.ArbCase(bank, op, n, k, m)
+
+
+@pytest.mark.parametrize("bank,op,n,k,m", [(0, "l", 1, 8, 0), (0, "l", 4, 16, 2), (1, "s", 6, 28, 0),
+                                           (0, "s", 3, 0, 4)])
+def test_arb_core_order_settle_loads_marker_release_nops_accesses_marker(bank, op, n, k, m):
+    body = bundles_of(g.arb_core_asm(arb(bank, op, n, k, m)))
+    i = body.index("event #0")
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    assert body[i + 2:i + 2 + k] == ["nop"] * k
+    acc = body[i + 2 + k:i + 2 + k + n]
+    verb = "lda" if op == "l" else "st r2,"
+    assert all(a.startswith(verb) for a in acc) and len(acc) == n
+    offs = [int(a.split("#")[1].rstrip("]")) for a in acc]
+    assert [phys_bank(g.FETCH_LD_ADDR + o) for o in offs] == [bank] * n      # all on the one physical bank
+    j = i + 2 + k + n
+    assert body[j:j + g.ARB_EVENT1_NOPS] == ["nop"] * g.ARB_EVENT1_NOPS and body[j + g.ARB_EVENT1_NOPS] == "event #1"
+    settle = [b for b in body[:i] if b.startswith("lda r25,")]
+    assert len(settle) == m
+    assert all(phys_bank(g.FETCH_LD_ADDR + int(s.split("#")[1].rstrip("]"))) == bank for s in settle)
+    assert body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3") < i                # settle loads after the go lock
+    assert sum(b.startswith("acq ") for b in body) == 2                         # go and B only
+    assert sum(b.startswith("rel ") for b in body) == 1
+    # nothing else touches data memory between the go lock and the wait for B
+    go, done = body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3"), body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    mem = [b for b in body[go:done] if b.startswith(("lda", "st "))]
+    assert len(mem) == m + n
+
+
+def test_arb_rejects_out_of_range():
+    for c in (arb(bank=2), arb(op="x"), arb(n=0), arb(n=g.ARB_MAX_N + 1), arb(k=65), arb(m=g.ARB_MAX_M + 1)):
+        with pytest.raises(ValueError):
+            g.arb_core_asm(c)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [arb(0, "l", 6, 16, 4), arb(1, "s", 6, 28, 0)])
+def test_arb_core_assembles(c, tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.arb_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_arb_plan_names_are_distinct_valid_and_clear_of_other_variants():
+    plan = g.arb_plan()
+    names = [c.name for c in plan]
+    assert len(names) == len(set(names)) == 50
+    for c in plan:
+        g.arb_validate(c)
+    assert all(n.startswith("ar") and not n.startswith(("lf", "ls", "lt")) for n in names)
+    assert arb(1, "s", 3, 28, 2).name == "ar1s3k28m2"
+
+
+def test_arb_inject_args_trace_both_core_markers_and_memory_stall():
+    args = g.arb_inject_args()
+    assert args[args.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,MEMORY_STALL,LOCK_STALL"
+    assert args[args.index("--memmod-sweep-events") + 1] == ",".join(g.FETCH_MEMMOD_EVENTS)
+
+
+# The rotation rule against the silicon rows it was read from (lock-fetch, single core loads).
+@pytest.mark.parametrize("bank,cell,lost", [
+    (0, 2, False), (0, 4, False), (0, 7, True), (0, 15, False), (0, 23, False), (0, 31, False), (0, 39, False),
+    (1, 3, False), (1, 5, False), (1, 11, False), (1, 19, False), (1, 27, True), (1, 35, False), (1, 43, False),
+    (1, 51, False)])
+def test_rotation_rule_reproduces_the_lock_fetch_rows(bank, cell, lost):
+    p = g.rotation_prediction(arb(bank=bank), cell)
+    assert p["contended"] == [cell]
+    assert p["core_lost"] == ([cell] if lost else [])
+
+
+def test_rotation_rule_predicts_a_bank0_loss_at_g47():
+    assert g.rotation_prediction(arb(bank=0), 47)["core_lost"] == [47]
+
+
+def test_rotation_rule_bursts_against_g15_the_dma_waits_at_most_four_cycles():
+    for n in range(1, 5):
+        p = g.rotation_prediction(arb(n=n), 15)
+        assert p["contended"] == list(range(15, 15 + n)) and p["core_lost"] == []
+        assert (15, 15 + n) in p["served"]                       # the DMA gets the bank when the core is done
+    p = g.rotation_prediction(arb(n=5), 15)
+    assert p["contended"] == [15, 16, 17, 18, 19] and p["core_lost"] == [19]
+    p = g.rotation_prediction(arb(n=6), 15)
+    assert p["core_lost"] == [19] and p["contended"] == [15, 16, 17, 18, 19]   # sixth access runs alone at 20
+
+
+def test_rotation_rule_history_moves_the_losing_access():
+    assert g.rotation_prediction(arb(m=4), 15)["core_lost"] == [15]
+    assert all(g.rotation_prediction(arb(m=m), 15)["core_lost"] == [] for m in range(4))
+    assert all(g.rotation_prediction(arb(m=m), 7)["core_lost"] == [] for m in range(1, 5))
+
+
+def test_rotation_rule_uncontended_core_accesses_count():
+    # starting one cycle before the DMA's g+15 access: the first load runs alone and advances the count
+    p = g.rotation_prediction(arb(n=5), 14)
+    assert p["contended"] == [15, 16, 17, 18] and p["core_lost"] == [18]
+
+
+def test_arb_row_reads_the_core_window_and_memory_stalls():
+    e = synthetic(rel=1000, grant_after=2, conflict_bank="CONFLICT_DM_BANK_0", conflict_at=16)
+    e += [ev("INSTR_EVENT_1", 1000 + 4 + 23, pkt=0), ev("MEMORY_STALL", 1000 + 4 + 17, pkt=0)]
+    r = g.arb_row(e)
+    assert r["grant"] == 2 and r["window"] == 23 and r["memory_stalls"] == [17]
+    c = arb(n=1, k=16)
+    assert g.arb_clean_window(c) == 1 + 16 + 1 + g.ARB_EVENT1_NOPS
+    assert g.arb_start(c, 2) == 15 and g.arb_start(c, 3) == 14
+    text = g.format_arb_table([(c, "a1.hw", r)])
+    assert "ar0l1k16m0" in text and "b0@14" in text and "(+1)" in text

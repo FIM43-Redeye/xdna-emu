@@ -1083,6 +1083,260 @@ def cmd_sync_table(args) -> int:
     return 0
 
 
+# -- bank arbitration probe (arb-*): who wins a core-vs-DMA bank conflict --------------------------
+#
+# The chained lock-fetch design, with a core program that makes n consecutive same-bank accesses (loads
+# or stores) k nops after releasing lock A, optionally after m extra same-bank loads in the settle phase
+# (before the release, while the MM2S is parked and the bank is otherwise idle). The core marks the
+# window with `event #0` (just before the release) and `event #1` (ARB_EVENT1_NOPS bundles after the
+# accesses), so a lost core access shows as one extra cycle between the two core events and as a
+# MEMORY_STALL event, independently of the lock-B stall (which is blind once B is released first).
+#
+# Candidate rule under test (the "rotation" rule): each physical bank keeps a count of the cycles in
+# which it served an access (any requester); in a cycle where the core and the DMA both want the bank,
+# the DMA wins when that count is at one residue modulo ARB_PERIOD and the core wins otherwise.
+# `rotation_prediction` simulates it for one case so the table can print the prediction next to the
+# measurement; the residue is fixed per bank by ARB_DMA_WIN_ORDINAL (the ordinal, counted from 0, of
+# the MM2S access on that bank at which a lone core access loses when nothing else touched the bank).
+
+ARB_PERIOD = 5
+ARB_DMA_WIN_ORDINAL = {0: 2, 1: 4}       # bank 0: the 3rd access (g+7); bank 1: the 5th (g+27)
+# MM2S accesses of the 64-word lock-started BD per physical bank, cycles after the lock grant
+# (silicon map of the chained lock-fetch probe; bank = granule parity).
+ARB_DMA_ACCESSES = {0: (2, 4, 7, 15, 23, 31, 39, 47), 1: (3, 5, 11, 19, 27, 35, 43, 51)}
+ARB_OPS = ("l", "s")                     # load, store
+ARB_MAX_N = 6
+ARB_MAX_M = 4
+ARB_EVENT1_NOPS = 4
+# Same-physical-bank offsets in `ldbuf` (0x800, 64 bytes): bit 4 of the address picks the bank.
+ARB_OFFSETS = {0: (0, 4, 8, 12, 32, 36), 1: (16, 20, 24, 28, 48, 52)}
+ARB_LOAD_REGS = ("r26", "r27", "r28", "r29", "r30", "r31")
+ARB_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "MEMORY_STALL", "LOCK_STALL"]
+
+
+@dataclass(frozen=True)
+class ArbCase:
+    bank: int                      # physical bank 0 or 1
+    op: str                        # "l" load, "s" store
+    n: int                         # consecutive same-bank accesses after the release
+    k: int                         # nops between the release and the first access
+    m: int = 0                     # extra same-bank loads in the settle phase
+
+    @property
+    def name(self) -> str:
+        return f"ar{self.bank}{self.op}{self.n}k{self.k:02d}m{self.m}"
+
+
+def arb_validate(c: ArbCase) -> None:
+    if c.bank not in (0, 1):
+        raise ValueError("bank must be 0 or 1")
+    if c.op not in ARB_OPS:
+        raise ValueError(f"op must be one of {ARB_OPS}")
+    if not 1 <= c.n <= ARB_MAX_N:
+        raise ValueError(f"n must be 1..{ARB_MAX_N}")
+    if c.k not in FETCH_KS:
+        raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+    if not 0 <= c.m <= ARB_MAX_M:
+        raise ValueError(f"m must be 0..{ARB_MAX_M}")
+
+
+def arb_accesses(c: ArbCase) -> list[str]:
+    """The n same-bank accesses, one bundle each."""
+    offs = ARB_OFFSETS[c.bank]
+    if c.op == "l":
+        return [f"  lda {ARB_LOAD_REGS[i]}, [p0, #{offs[i]}]" for i in range(c.n)]
+    return [f"  st r2, [p0, #{offs[i]}]" for i in range(c.n)]
+
+
+def arb_core_asm(c: ArbCase) -> str:
+    """go, settle, m same-bank loads, `event #0`, release A, k nops, n accesses, `event #1`, wait B.
+
+    Waits only on the go lock (set by the runtime sequence) and on B (released by the MM2S), as the
+    lock-fetch core. r2 = +1 releases (and is the stored value), r3 = -1 acquires. p0 = `ldbuf`."""
+    arb_validate(c)
+    n = lp.nops
+    settle_loads = [f"  lda r25, [p0, #{ARB_OFFSETS[c.bank][0]}]"] * c.m
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *settle_loads, *n(8),
+            "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(c.k),
+            *arb_accesses(c), *n(ARB_EVENT1_NOPS), "  event #1", *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def arb_plan() -> list[ArbCase]:
+    """The probe grid. k = cell + 1 puts the first access on `cell` after a grant of release + 2 and
+    one cycle before it after release + 3 (the two grant phases silicon shows)."""
+    cases = []
+    # repeat the two measured core losses and the cell the rotation rule says loses next on bank 0
+    for bank, cell in ((0, 7), (1, 27), (0, 47)):
+        for k in (cell + 1, cell + 2):
+            cases.append(ArbCase(bank, "l", 1, k))
+    # bursts of 1..6 against bank-0 accesses at different rotation phases, loads and stores
+    for op in ARB_OPS:
+        for cell in (15, 23, 31):
+            for n in range(1, ARB_MAX_N + 1):
+                cases.append(ArbCase(0, op, n, cell + 1))
+    # history: m extra bank-0 loads before the release move the losing access
+    for cell in (7, 15):
+        for m in range(1, ARB_MAX_M + 1):
+            cases.append(ArbCase(0, "l", 1, cell + 1, m))
+    return cases
+
+
+def rotation_prediction(c: ArbCase, start: int, period: int = ARB_PERIOD,
+                        win_ordinal: dict | None = None) -> dict:
+    """The rotation rule's outcome for case c when its first access lands `start` cycles after the grant.
+
+    The bank's served-access count starts (at the grant) at m - win_ordinal: the DMA wins a contended
+    cycle when the count is 0 modulo `period`. A denied DMA access retries every cycle; a denied core
+    access stalls the core one cycle and is repeated. Returns the contended cycles, the cycles the core
+    lost (each one core stall), and when the DMA's accesses on this bank were served."""
+    win = (win_ordinal or ARB_DMA_WIN_ORDINAL)[c.bank]
+    count = c.m - win
+    dma = list(ARB_DMA_ACCESSES[c.bank])
+    core_left, t_core = c.n, start
+    pending = []                   # DMA accesses requested and not yet served
+    contended, core_lost, served = [], [], []
+    t = min(dma[0], start)
+    while dma or pending or core_left:
+        while dma and dma[0] <= t:
+            pending.append(dma.pop(0))
+        core_wants = core_left > 0 and t >= t_core
+        if pending and core_wants:
+            contended.append(t)
+            if count % period == 0:
+                core_lost.append(t)
+                served.append((pending.pop(0), t))
+            else:
+                core_left -= 1
+            count += 1
+        elif pending:
+            served.append((pending.pop(0), t))
+            count += 1
+        elif core_wants:
+            core_left -= 1
+            count += 1
+        t += 1
+    return {"contended": contended, "core_lost": core_lost, "served": served}
+
+
+def arb_row(events) -> dict:
+    """fetch_row plus the core window: event #1 minus event #0 (core timer) and the MEMORY_STALL cycles
+    relative to event #0."""
+    r = fetch_row(events)
+    if r.get("release") is None:
+        return r
+    core: dict = {}
+    for e in events:
+        if e.row == FETCH_ROW and e.pkt_type == PT_CORE:
+            core.setdefault(e.name, []).append(e.ts)
+    ev0 = sorted(core.get("INSTR_EVENT_0", []))
+    ev1 = sorted(core.get("INSTR_EVENT_1", []))
+    r["window"] = ev1[0] - ev0[0] if ev0 and ev1 else None
+    r["memory_stalls"] = ([t - ev0[0] for t in sorted(set(core.get("MEMORY_STALL", []))) if t >= ev0[0]]
+                          if ev0 else [])
+    return r
+
+
+def arb_clean_window(c: ArbCase) -> int:
+    """event #1 minus event #0 with no core stall: the release, k nops, n accesses and the nops between,
+    one bundle per cycle."""
+    return 1 + c.k + c.n + ARB_EVENT1_NOPS
+
+
+def arb_start(c: ArbCase, grant: int) -> int:
+    """Grant-relative cycle of the case's first access: release + k + 1 on silicon (lock-fetch fit)."""
+    return c.k + 1 - grant
+
+
+def format_arb_table(rows) -> str:
+    """rows: (ArbCase, run, arb_row dict)."""
+    lines = ["case          run      grant  conflicts(g+)                      core_lost  window(+stall)  "
+             "mm2s_fin s2mm_fin | rotation rule: start contended core_lost"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r.get("release") is None or r.get("grant") is None:
+            lines.append(f"{c.name:<13} {run:<8} no release or grant")
+            continue
+        g = r["grant"]
+        conf = " ".join(f"b{b[-1]}@{t - g}" for b, t in r["conflicts"]) or "-"
+        win = r.get("window")
+        extra = "?" if win is None else f"{win}({win - arb_clean_window(c):+d})"
+        mstall = ",".join(str(t) for t in r.get("memory_stalls", [])) or "-"
+        start = arb_start(c, g)
+        p = rotation_prediction(c, start)
+        lines.append(f"{c.name:<13} {run:<8} +{g}     {conf:<34} {mstall:<10} {extra:<15} "
+                     f"{','.join(f'+{t - g}' for t in r['mm2s_finished']):<8} "
+                     f"{','.join(f'+{t - g}' for t in r['s2mm_finished']):<8} | "
+                     f"g+{start} {','.join(map(str, p['contended'])) or '-'} {','.join(map(str, p['core_lost'])) or '-'}")
+    return "\n".join(lines)
+
+
+def arb_selection(args) -> list[ArbCase]:
+    plan = arb_plan()
+    return [c for c in plan if not args.names or c.name in args.names]
+
+
+def arb_build_case(c: ArbCase, out: Path) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(arb_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(fetch_design_mlir(chained=True))
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *arb_inject_args(),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "bank": c.bank, "op": c.op, "n": c.n,
+                                             "k": c.k, "m": c.m, "arb": True}) + "\n")
+
+
+def arb_inject_args() -> list[str]:
+    return ["--memmod-sweep-events", ",".join(FETCH_MEMMOD_EVENTS),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(ARB_CORE_EVENTS)]
+
+
+def cmd_arb_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in arb_selection(args):
+        arb_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_arb_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in arb_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_arb_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in arb_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"release": None}))
+                continue
+            rows.append((c, run, arb_row(load_level_events(run_dir))))
+    print(format_arb_table(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1126,7 +1380,20 @@ def main(argv=None) -> int:
         sp.add_argument("--free", action="store_true", help="--sync: also the lock-free-on-request case (lsfree)")
         sp.add_argument("--pre2", type=int, default=0, help="--sync: words of a second lock-free pre BD (cases ltDD...)")
         sp.add_argument("--free-only", action="store_true", help="--sync: only lsfree")
+    ab = sub.add_parser("arb-build", help="bank arbitration probe: build the plan's cases (or --names)")
+    ab.add_argument("out_dir")
+    ar = sub.add_parser("arb-run", help="bank arbitration probe: run the built cases to TAG.BACKEND/")
+    ar.add_argument("out_dir")
+    ar.add_argument("tag")
+    ar.add_argument("--backend", choices=("hw", "emu"), required=True)
+    at = sub.add_parser("arb-table", help="bank arbitration probe: measurement next to the rotation rule")
+    at.add_argument("out_dir")
+    at.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at):
+        sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     args = ap.parse_args(argv)
+    if args.cmd.startswith("arb-"):
+        return {"arb-build": cmd_arb_build, "arb-run": cmd_arb_run, "arb-table": cmd_arb_table}[args.cmd](args)
     if args.cmd.startswith("fetch-"):
         if args.sync:
             return {"fetch-build": cmd_sync_build, "fetch-run": cmd_sync_run, "fetch-table": cmd_sync_table}[args.cmd](args)
