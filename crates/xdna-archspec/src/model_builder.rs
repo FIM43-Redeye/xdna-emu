@@ -236,6 +236,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // (onset +15). See the field docs.
             s2mm_ingress_fifo_depth: 15,
             s2mm_ingress_skid_depth: 1,
+            s2mm_starvation_arm_cycles: 6,
             // Pinned by silicon (2026-11-11): the MM2S stall boundary (onset-len, 22 words
             // past the stall point) with the hand-off word inside the MM2S, and the
             // start-phase races, which pin only staging + hand-off + downstream. See the
