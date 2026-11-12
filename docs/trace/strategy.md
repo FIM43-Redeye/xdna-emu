@@ -278,15 +278,17 @@ MLIR does not), `HW_ONLY` / `EMU_ONLY` (one side produced no capture), and
 **Regression gate across runs: `tools/trace_count_regress.py BASELINE CANDIDATE`.**
 CLEAN/DIVERGE and pass counts do not see an EMU change that adds phantom
 intervals (shim S2MM STREAM_STARVATION 32 -> 62 against silicon's 32). This
-tool reads the two days' `events.json` and scores every (test, compiler, tile,
-event) row twice against silicon: the count distance to the band the two HW
-days span (their range, widened by its own spread so a 1-event move inside
+tool scores every (test, compiler, tile,
+event) row twice against silicon (edge rows from `events.json`, level rows from
+true assertion intervals rebuilt from `trace_raw.bin`; see
+[`tooling.md`](tooling.md)): the count distance to the band the HW samples
+span (the distinct samples of both days plus any `--hw-samples`; their range, widened by its own spread so a 1-event move inside
 silicon's jitter does not gate; a repeatable row stays exact), and the
 1-Wasserstein distance between inter-event gap distributions (cycles). A count that leaves an exact repeatable-HW match while
 the gap pattern gets closer is a "phase shift", not a regression
 (objectfifo_turns_walkers LOCK_STALL). Exit 1 on a row regressing on both
 scores or a broken exact match; rules are in the module docstring. Flags:
-`--only TEST ...`, `--json`.
+`--only TEST ...`, `--hw-samples DIR ...`, `--json`.
 
 Known limits (genuine, not harness bugs):
 

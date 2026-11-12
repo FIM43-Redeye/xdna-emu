@@ -2,36 +2,61 @@
 # SPDX-License-Identifier: MIT
 """Bridge-suite regression gate: compare two result dirs on trace counts AND timing.
 
-``scripts/emu-bridge-test.sh`` writes ``<test>.<compiler>.{hw,emu}/events.json``
+``scripts/emu-bridge-test.sh`` writes ``<test>.<compiler>.{hw,emu}/{events.json,trace_raw.bin}``
 into ``build/bridge-test-results/YYYYMMDD/``.  Its CLEAN/DIVERGE verdict
 anchors each tile on one event and compares pairs, so it misses a change that
 adds phantom intervals on an otherwise quiet row (EMU STREAM_STARVATION went
 32 -> 62 against silicon's 32).  This tool scores every (test, compiler, tile,
 event) row of a baseline run against a candidate run, always measured against
-the silicon samples of both days.
+the silicon samples of both days (plus any given with ``--hw-samples``).
 
 Rows
 ----
 A row is (test, compiler, tile col/row, tile module, event name); columns are
 shifted by the file's placement origin so HW and EMU line up.  Its *series* is
-the list of event timestamps; for level events (stalls, starvation, port
-running ... one event per cycle while the level is high) consecutive cycles
-collapse into an interval and the series is the interval start times, the same
-convention as trace-compare's ``events_to_intervals``.  A row's count is the
-length of its series (intervals for level rows).  A side that never fires a
-row has count 0, so a phantom row (EMU fires, silicon does not) is a plain
-0 -> N count move.
+the list of event timestamps; a row's count is the length of its series.  A
+side that never fires a row has count 0, so a phantom row (EMU fires, silicon
+does not) is a plain 0 -> N count move.
+
+Level rows are scored on true assertion intervals, not on events.json
+-------------------------------------------------------------------
+Level events (stalls, starvation, backpressure, port running, bank conflicts: high for as
+many cycles as the condition holds) are scored as intervals, the series being the interval
+start times.  events.json cannot give those: the decoder follows the mlir-aie convention, in
+which a Repeat after a zero-cycle frame only advances the timer and emits no event, and that
+is exactly how silicon and the emulator write a held level (open frame, one (mask, 0) frame,
+Repeat).  A held level therefore appears in events.json only at the frames where the tile's
+8-bit event mask changes, so the "interval count" read from it is the number of mask
+changes caused by *other* traced events while the level was high: it moves when an unrelated
+event shifts by a cycle, and not at all when the level itself does.  So the level rows are
+rebuilt from ``trace_raw.bin`` (``trace_decoder.rebuild_timeline_mode0_levels``, the same
+walk as the events.json rebuild plus one event per held cycle) and consecutive cycles
+collapse into one interval; a one-cycle drop makes two.  Edge rows (one event per
+occurrence) keep reading events.json, and tiles in EVENT_PC mode keep their events.json
+events (their timestamps are program counters; there is no held level to expand).  A level
+row whose side lacks a usable ``trace_raw.bin`` (missing, or one that does not reproduce
+that side's events.json) is *not scored*: it is listed as unscored with the reason, never
+counted from events.json.
+
+Silicon samples
+---------------
+The silicon of a (test, compiler) is every HW sample of the baseline dir, the candidate dir
+and each ``--hw-samples`` dir.  Samples with identical content (same ``trace_raw.bin``, or
+same events.json when there is none) are one sample: a result dir that was copied forward
+must not count twice.  A sample counts for a row only when its traced event set for the row's
+tile module (events.json ``slot_names``) equals the candidate EMU's: a different event set
+is a different measurement.  Dropped samples are listed with the reason.
 
 Scores (both are distances to silicon, lower is better)
 -------------------------------------------------------
 * Count score: distance of the EMU count from the silicon band, 0 inside: the
-  closed range [min, max] of the HW counts over the (up to) two HW samples,
-  widened on each side by its own spread (``silicon_band``), since two samples
+  closed range [min, max] of the HW counts over the usable HW samples,
+  widened on each side by its own spread (``silicon_band``), since a few samples
   underestimate silicon's run-to-run spread and a 1-event EMU move inside it is
-  not a regression. A repeatable row (both samples equal) stays exact. The band
+  not a regression. A repeatable row (all samples equal) stays exact. The band
   is the same for baseline and candidate scoring, so only the EMU change moves
-  the score.  ``hw_repeatable`` is True when both
-  HW samples have the same count.
+  the score.  ``hw_repeatable`` is True when two or more HW samples have the
+  same count.
 * Pattern score: 1-Wasserstein distance (cycles) between the EMU's and HW's
   inter-event gap distributions.  Gaps are shift invariant (no anchoring),
   and W1 is in cycles, so "gap 128 vs silicon 140" scores 12 and "131" scores
@@ -40,7 +65,7 @@ Scores (both are distances to silicon, lower is better)
   length are compared as quantile functions (exact integral of
   |Q_emu - Q_hw| over [0, 1]), which is the textbook W1 and needs no
   resampling.  Ordering of gaps is deliberately ignored: a systematic shift of
-  the cadence is what we care about.  With two HW samples the score is the
+  the cadence is what we care about.  With several HW samples the score is the
   minimum over them (consistent with the range distance: "close to any
   silicon observation").  Undefined (None) when either side has no gap, i.e.
   fewer than two events.
@@ -71,25 +96,39 @@ Exit status: 1 when any row is a gate failure: a row regressing on both
 scores (an undefined pattern counts as not improving, so phantom rows on
 quiet channels fail), or a repeatable-HW exact count match breaking without
 the pattern improving by enough to be a phase shift.  Otherwise 0; 2 for
-usage errors.  A "repeatable" match needs two HW samples that agree.  Tests present in only one run, or lacking either side's
-events.json, are listed but not scored.
+usage errors.  A "repeatable" match needs two HW samples that agree.  Unscored rows never
+fail the gate, but are counted in the summary.  Tests present in only one run, or lacking
+either side's events.json, are listed but not scored.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
+import hashlib
 import json
 import math
 import re
+import struct
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from trace_decoder import (  # noqa: E402
+    TraceMode,
+    decode_words,
+    detect_per_tile_modes,
+    rebuild_timeline_mode0,
+    rebuild_timeline_mode0_levels,
+)
+from trace_decoder.decode import _PT_CODE_TO_NAME  # noqa: E402
 
 PATTERN_EPS = 0.5      # cycles of W1 movement below which the pattern is "unchanged"
 PHASE_FRAC = 0.10      # phase shift allowed to move the count by this fraction of HW max
 PHASE_MIN_COUNT = 2    # ... but at least this many events/intervals
 
-# Level events: held while true, one trace event per cycle.  This mirrors
+# Level events: high for as many cycles as the condition holds.  This mirrors
 # crates/xdna-archspec trace_events::is_level_event by name family; validated
 # against the [level]/[edge] tags of every trace.log in the real results.
 _LEVEL_RE = re.compile(
@@ -103,9 +142,12 @@ def is_level_name(name: str) -> bool:
 
 # --- series and distances -----------------------------------------------
 
-def series_from_events(events: list[dict], name: str) -> list[int]:
-    """Sorted timestamps; level events collapse to interval start times."""
-    ts = sorted(e["ts"] for e in events)
+def series_from_stamps(stamps: list[int], name: str) -> list[int]:
+    """Sorted timestamps; level events collapse to interval start times.
+
+    For a level the stamps must be one per asserted cycle (see the module docstring), or the
+    "intervals" are not intervals."""
+    ts = sorted(stamps)
     if not is_level_name(name) or not ts:
         return ts
     starts = [ts[0]]
@@ -113,6 +155,10 @@ def series_from_events(events: list[dict], name: str) -> list[int]:
         if cur - prev > 1:
             starts.append(cur)
     return starts
+
+
+def series_from_events(events: list[dict], name: str) -> list[int]:
+    return series_from_stamps([e["ts"] for e in events], name)
 
 
 def gaps(series: list[int]) -> list[int]:
@@ -188,19 +234,94 @@ class RowKey:
         return f"({self.col},{self.row})/m{self.module}"
 
 
-def _load_side(path: Path) -> dict[tuple, list[int]]:
-    doc = json.loads(path.read_text())
-    pl = doc.get("placement") or {}
-    oc, orow = pl.get("origin_col", 0), pl.get("origin_row", 0)
-    groups: dict[tuple, list[dict]] = {}
-    for e in doc["events"]:
-        k = (max(e["col"] - oc, 0), max(e["row"] - orow, 0), e["pkt_type"], e["name"])
-        groups.setdefault(k, []).append(e)
-    return {k: series_from_events(v, k[3]) for k, v in groups.items()}
+class Side:
+    """One ``<test>.<compiler>.<hw|emu>`` result dir, decoded on first use.
+
+    ``series``: {(col, row, pkt_type, event): [timestamps]} with level rows rebuilt from
+    ``trace_raw.bin`` into one event per asserted cycle (so the series of a level is its interval
+    start times).  ``level_problem`` is None when that worked, else why level rows of this side
+    cannot be scored.  ``event_sets``: {pkt_type: slot names} as traced.  ``digest`` identifies
+    the capture by content.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._loaded = False
+
+    @property
+    def digest(self) -> str:
+        raw = self.path / "trace_raw.bin"
+        f = raw if raw.exists() else self.path / "events.json"
+        return hashlib.sha256(f.read_bytes()).hexdigest()
+
+    def _load(self):
+        if self._loaded:
+            return
+        doc = json.loads((self.path / "events.json").read_text())
+        pl = doc.get("placement") or {}
+        self._origin = (pl.get("origin_col", 0), pl.get("origin_row", 0))
+        sn = doc.get("slot_names") or {}
+        self._event_sets = {pt: tuple(sn[kind]) for pt, kind in _PT_CODE_TO_NAME.items()
+                            if kind in sn}
+        # (col, row, pkt_type, name, ts) of every event, level rows expanded where possible.
+        rows, self._level_problem = _event_rows(self.path, doc)
+        groups: dict[tuple, list[int]] = {}
+        oc, orow = self._origin
+        for col, row, pt, name, ts in rows:
+            groups.setdefault((max(col - oc, 0), max(row - orow, 0), pt, name), []).append(ts)
+        self._series = {k: series_from_stamps(v, k[3]) for k, v in groups.items()}
+        self._loaded = True
+
+    @property
+    def series(self) -> dict[tuple, list[int]]:
+        self._load()
+        return self._series
+
+    @property
+    def level_problem(self) -> str | None:
+        self._load()
+        return self._level_problem
+
+    @property
+    def event_sets(self) -> dict[int, tuple]:
+        self._load()
+        return self._event_sets
 
 
-def load_run(root: Path) -> dict[tuple[str, str], dict[str, dict[tuple, list[int]]]]:
-    """{(test, compiler): {"hw": {rowkey: series}, "emu": {...}}} (sides may be absent)."""
+def _event_rows(path: Path, doc: dict):
+    """-> ([(col, row, pkt_type, name, ts)], level_problem) for one side.
+
+    Mode-0 tiles come from ``trace_raw.bin`` with held levels expanded; every other tile (and
+    every tile, when the raw trace cannot be used) comes from events.json.
+    """
+    original = [(e["col"], e["row"], e["pkt_type"], e["name"], e["ts"]) for e in doc["events"]]
+    raw = path / "trace_raw.bin"
+    if not raw.exists():
+        return original, "no trace_raw.bin"
+    data = raw.read_bytes()
+    words = list(struct.unpack(f"<{len(data) // 4}I", data[: len(data) // 4 * 4]))
+    modes = detect_per_tile_modes(words)
+    cmds = {k: v for k, v in decode_words(words, mode=None).items()
+            if modes.get(k) == TraceMode.EVENT_TIME}
+    sn = doc.get("slot_names") or {}
+    names = {pt: {f"{r},{c}": sn.get(_PT_CODE_TO_NAME[pt], [""] * 8) for (p, r, c) in cmds
+                  if p == pt} for pt in _PT_CODE_TO_NAME}
+    # The raw trace must reproduce this side's events.json, or it is a different capture.
+    plain = collections.Counter((e.col, e.row, e.pkt_type, e.slot, e.ts)
+                                for e in rebuild_timeline_mode0(cmds, names))
+    want = collections.Counter((e["col"], e["row"], e["pkt_type"], e["slot"], e["ts"])
+                               for e in doc["events"]
+                               if (e["pkt_type"], e["row"], e["col"]) in cmds)
+    if plain != want:
+        return original, "trace_raw.bin does not reproduce events.json"
+    expanded = [(e.col, e.row, e.pkt_type, e.name, e.ts)
+                for e in rebuild_timeline_mode0_levels(cmds, names)]
+    rest = [r for r in original if (r[2], r[1], r[0]) not in cmds]
+    return expanded + rest, None
+
+
+def load_run(root: Path) -> dict[tuple[str, str], dict[str, Side]]:
+    """{(test, compiler): {"hw": Side, "emu": Side}} (sides may be absent)."""
     out: dict = {}
     for ev in sorted(Path(root).glob("*.*.*/events.json")):
         d = ev.parent.name
@@ -210,7 +331,7 @@ def load_run(root: Path) -> dict[tuple[str, str], dict[str, dict[tuple, list[int
         test, _, comp = stem.rpartition(".")
         if not test:
             continue
-        out.setdefault((test, comp), {})[side] = _load_side(ev)
+        out.setdefault((test, comp), {})[side] = Side(ev.parent)
     return out
 
 
@@ -246,6 +367,10 @@ class Report:
     only_in_baseline: list[tuple] = field(default_factory=list)
     only_in_candidate: list[tuple] = field(default_factory=list)
     skipped: list[tuple] = field(default_factory=list)
+    # (RowKey, reason): level rows that could not be scored.
+    unscored: list[tuple] = field(default_factory=list)
+    # (test, compiler, sample label, reason): silicon samples not used.
+    dropped_samples: list[tuple] = field(default_factory=list)
 
     @property
     def changed(self):
@@ -267,6 +392,7 @@ class Report:
         return {
             "rows_compared": self.rows_compared,
             "rows_changed": len(self.rows),
+            "rows_unscored": len(self.unscored),
             "improved": len(self.of("improved")),
             "regressed": len(self.of("regressed")),
             "neutral": len(self.of("neutral")),
@@ -311,8 +437,26 @@ def _classify(cb, ca, pb, pa, hw_max, exact_broken):
     return "neutral", "no score change", False
 
 
-def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None) -> Report:
+def _usable_hw_samples(tc, b, c, extra, rep):
+    """The distinct HW samples of one (test, compiler): [(label, Side)] in day order."""
+    cands = [(str(d), r[tc]["hw"]) for d, r in extra if tc in r and "hw" in r[tc]]
+    cands = [(lbl, r["hw"]) for lbl, r in (("baseline", b), ("candidate", c)) if "hw" in r] + cands
+    seen: dict[str, str] = {}
+    out = []
+    for label, side in cands:
+        dig = side.digest
+        if dig in seen:
+            rep.dropped_samples.append((*tc, label, f"identical to {seen[dig]}"))
+            continue
+        seen[dig] = label
+        out.append((label, side))
+    return out
+
+
+def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
+                 hw_samples: list[Path] | None = None) -> Report:
     base, cand = load_run(baseline), load_run(candidate)
+    extra = [(d, load_run(d)) for d in (hw_samples or [])]
     rep = Report()
     keep = (lambda t: True) if not only else (lambda t: t in only)
     rep.only_in_baseline = sorted(k for k in base.keys() - cand.keys() if keep(k[0]))
@@ -321,16 +465,42 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None)
         if not keep(tc[0]):
             continue
         b, c = base[tc], cand[tc]
-        hw_runs = [r["hw"] for r in (b, c) if "hw" in r]
-        if "emu" not in b or "emu" not in c or not hw_runs:
+        samples = _usable_hw_samples(tc, b, c, extra, rep)
+        if "emu" not in b or "emu" not in c or not samples:
             rep.skipped.append(tc)
             continue
-        keys = set(b["emu"]) | set(c["emu"])
-        for r in hw_runs:
-            keys |= set(r)
+        eb_side, ec_side = b["emu"], c["emu"]
+        # A sample measures a tile module only with the event set the candidate EMU traced.
+        usable = {pt: [] for pt in _PT_CODE_TO_NAME}
+        for label, side in samples:
+            for pt in usable:
+                if side.event_sets.get(pt) == ec_side.event_sets.get(pt):
+                    usable[pt].append((label, side))
+                elif pt in side.event_sets or pt in ec_side.event_sets:
+                    rep.dropped_samples.append(
+                        (*tc, label, f"event set of module {pt} differs from the candidate EMU's"))
+        keys = set(eb_side.series) | set(ec_side.series)
+        for pt, lst in usable.items():
+            for _, side in lst:
+                keys |= {k for k in side.series if k[2] == pt}
         for k in sorted(keys):
-            hw = [r.get(k, []) for r in hw_runs]
-            eb, ec = b["emu"].get(k, []), c["emu"].get(k, [])
+            rk = RowKey(tc[0], tc[1], k[0], k[1], k[2], k[3])
+            hw_sides = usable[k[2]]
+            if not hw_sides:
+                rep.unscored.append((rk, "no silicon sample with the candidate EMU's event set"))
+                continue
+            if eb_side.event_sets.get(k[2]) != ec_side.event_sets.get(k[2]):
+                rep.unscored.append((rk, "baseline and candidate EMU traced different event sets"))
+                continue
+            if is_level_name(k[3]):
+                bad = [f"{lbl}: {side.level_problem}"
+                       for lbl, side in [("baseline emu", eb_side), ("candidate emu", ec_side)]
+                       + hw_sides if side.level_problem]
+                if bad:
+                    rep.unscored.append((rk, "level not reconstructable (" + "; ".join(bad) + ")"))
+                    continue
+            hw = [side.series.get(k, []) for _, side in hw_sides]
+            eb, ec = eb_side.series.get(k, []), ec_side.series.get(k, [])
             hw_counts = [len(s) for s in hw]
             rep.rows_compared += 1
             cb = band_distance(len(eb), hw_counts)
@@ -343,7 +513,7 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None)
             exact = len(set(hw_counts)) == 1 and len(hw_counts) > 1 and cb == 0 and ca > 0
             verdict, label, gate = _classify(cb, ca, pb, pa, max(hw_counts), exact)
             rep.rows.append(RowResult(
-                key=RowKey(tc[0], tc[1], k[0], k[1], k[2], k[3]),
+                key=rk,
                 hw_counts=hw_counts,
                 hw_repeatable=len(set(hw_counts)) == 1 and len(hw_counts) > 1,
                 emu_count_before=len(eb), emu_count_after=len(ec),
@@ -361,7 +531,9 @@ def _fmt_p(p):
 
 
 def _line(r: RowResult) -> str:
-    rep = "repeatable" if r.hw_repeatable else "HW varies" if len(r.hw_counts) > 1 else "1 HW sample"
+    n = len(r.hw_counts)
+    rep = (f"{n} HW samples, repeatable" if r.hw_repeatable
+           else f"{n} HW samples, HW varies" if n > 1 else "1 HW sample")
     return (f"  {r.key.test}.{r.key.compiler} {r.key.tile()} {r.key.event}: "
             f"EMU {r.emu_count_before}->{r.emu_count_after} vs HW {r.hw_counts} ({rep}); "
             f"count dist {r.count_before}->{r.count_after}, "
@@ -375,6 +547,7 @@ def format_text(rep: Report) -> str:
         f"rows compared: {s['rows_compared']}",
         f"rows changed: {s['rows_changed']}  improved: {s['improved']}  "
         f"regressed: {s['regressed']}  neutral: {s['neutral']}  gate failures: {s['gate_failures']}",
+        f"unscored rows: {s['rows_unscored']}",
         f"count distance (sum):   {s['count_distance_before']} -> {s['count_distance_after']}",
         f"pattern distance (sum, {s['pattern_rows']} rows, cycles): "
         f"{s['pattern_distance_before']} -> {s['pattern_distance_after']}",
@@ -389,6 +562,12 @@ def format_text(rep: Report) -> str:
         rows = rep.of(verdict)
         if rows:
             out += ["", f"{title} ({len(rows)}):"] + [_line(r) for r in rows]
+    if rep.dropped_samples:
+        out += ["", f"Silicon samples not used ({len(rep.dropped_samples)}):"] + [
+            f"  {t}.{c} {lbl}: {why}" for t, c, lbl, why in rep.dropped_samples]
+    if rep.unscored:
+        out += ["", f"Unscored rows ({len(rep.unscored)}):"] + [
+            f"  {k.test}.{k.compiler} {k.tile()} {k.event}: {why}" for k, why in rep.unscored]
     out.append("")
     out.append("RESULT: " + ("FAIL" if rep.exit_code else "ok"))
     return "\n".join(out)
@@ -408,6 +587,8 @@ def to_json(rep: Report) -> dict:
         "only_in_baseline": [list(t) for t in rep.only_in_baseline],
         "only_in_candidate": [list(t) for t in rep.only_in_candidate],
         "skipped": [list(t) for t in rep.skipped],
+        "unscored": [{"key": asdict(k), "reason": why} for k, why in rep.unscored],
+        "dropped_samples": [list(t) for t in rep.dropped_samples],
     }
 
 
@@ -416,13 +597,17 @@ def main(argv=None) -> int:
     ap.add_argument("baseline")
     ap.add_argument("candidate")
     ap.add_argument("--only", nargs="+", metavar="TEST", help="restrict to these tests")
+    ap.add_argument("--hw-samples", nargs="+", metavar="DIR", default=[],
+                    help="further result dirs whose HW samples count as silicon samples "
+                         "(identical captures and other event sets are dropped)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    for d in (args.baseline, args.candidate):
+    for d in (args.baseline, args.candidate, *args.hw_samples):
         if not Path(d).is_dir():
             print(f"error: not a directory: {d}", file=sys.stderr)
             return 2
-    rep = compare_runs(Path(args.baseline), Path(args.candidate), only=args.only)
+    rep = compare_runs(Path(args.baseline), Path(args.candidate), only=args.only,
+                       hw_samples=[Path(d) for d in args.hw_samples])
     print(json.dumps(to_json(rep), indent=1) if args.json else format_text(rep))
     return rep.exit_code
 

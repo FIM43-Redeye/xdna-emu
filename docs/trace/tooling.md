@@ -50,6 +50,18 @@ the per-tool inventory of the active pipeline.
    | `scripts/emu-bridge-test.sh` | End-to-end bridge driver (`--sweep`, `--trace=pc-anchored`, etc.). |
    | `src/device/trace_unit/` | Emulator-side trace unit -- writes the same packet-stream format HW does. |
 
+**Regression gate and level events.** `tools/trace_count_regress.py` scores level rows
+(STALL, STARVATION, BACKPRESSURE, PORT_RUNNING, CONFLICT_DM_BANK) on true assertion intervals,
+not on `events.json`. Silicon and the emulator write a held level as an open frame, one
+`(mask, 0)` frame and a Repeat, and the mlir-aie rebuild emits no event for a Repeat after a
+zero-cycle frame, so `events.json` shows a held level only where the tile's 8-bit mask changes:
+its "interval count" is the number of mask changes caused by other traced events while the level
+was high. The gate re-walks `trace_raw.bin` with `rebuild_timeline_mode0_levels` (same walk as
+the plain rebuild, plus one event per held cycle) and a one-cycle drop makes two intervals. A
+level row whose side has no usable `trace_raw.bin` is listed as unscored, never counted from
+`events.json`. Silicon samples are the distinct HW captures of both days plus `--hw-samples`
+dirs: identical captures count once and a sample traced with another event set is dropped.
+
 Build the Rust comparator: `cargo build --release --bin trace-compare`.
 
 ## Deprecated tools

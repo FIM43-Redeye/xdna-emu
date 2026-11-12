@@ -7,6 +7,7 @@ writes.
 """
 
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -17,10 +18,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 import trace_count_regress as tcr
 
 
+# The traced event set, the same on every side of every test unless a test says otherwise.
+_EVENT_SET = ["INSTR_VECTOR", "X", "LOCK_STALL", "DMA_S2MM_0_STREAM_STARVATION",
+              "DMA_S2MM_1_STREAM_STARVATION", "EXTRA_EVT", "", ""]
+_KINDS = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
+
+
+def _slot(name):
+    return _EVENT_SET.index(name)
+
+
 def level(name, starts, dur=2, col=1, row=2, pkt=0):
     """A level event: one event per cycle while high, so dur events per interval."""
     return [
-        dict(col=col, row=row, pkt_type=pkt, name=name, ts=s + k, slot=0, soc=0, mode=0)
+        dict(col=col, row=row, pkt_type=pkt, name=name, ts=s + k, slot=_slot(name), soc=0, mode=0)
         for s in starts
         for k in range(dur)
     ]
@@ -28,7 +39,7 @@ def level(name, starts, dur=2, col=1, row=2, pkt=0):
 
 def edge(name, stamps, col=1, row=2, pkt=0):
     return [
-        dict(col=col, row=row, pkt_type=pkt, name=name, ts=t, slot=0, soc=0, mode=0)
+        dict(col=col, row=row, pkt_type=pkt, name=name, ts=t, slot=_slot(name), soc=0, mode=0)
         for t in stamps
     ]
 
@@ -37,8 +48,84 @@ def periodic(n, gap, t0=1000):
     return [t0 + i * gap for i in range(n)]
 
 
-def write_run(root: Path, day: str, tests: dict) -> Path:
-    """tests: {(test, compiler): {"hw": [events] | None, "emu": [events] | None}}"""
+# --- a mode-0 trace_raw.bin encoder for the tests ---------------------------
+
+def _frame_commands(events):
+    """Per-cycle events of one tile -> the frames silicon writes: an open frame carrying the idle
+    cycles, then for a run of identical masks on consecutive cycles one (mask, 0) frame and a
+    Repeat for the rest."""
+    masks: dict[int, int] = {}
+    for e in events:
+        masks[e["ts"]] = masks.get(e["ts"], 0) | (1 << e["slot"])
+    out, prev, ts_list = [], 0, sorted(masks)
+    i = 0
+    while i < len(ts_list):
+        ts, m = ts_list[i], masks[ts_list[i]]
+        run = 1
+        while (i + run < len(ts_list) and ts_list[i + run] == ts + run
+               and masks[ts_list[i + run]] == m):
+            run += 1
+        out.append((m, ts - prev - 1, 0))
+        if run >= 2:
+            out.append((m, 0, 0))
+        if run >= 3:
+            out.append((None, None, run - 2))
+        prev = ts + run - 1
+        i += run
+    return out
+
+
+def _tile_bytes(events):
+    b = bytearray([0xF0]) + bytearray(7)          # Start, timer 0
+    for m, cycles, rep in _frame_commands(events):
+        if m is None:
+            n = rep
+            while n:
+                c = min(n, 1023)
+                b += bytes([0xD8 | (c >> 8), c & 0xFF])
+                n -= c
+        else:
+            b += bytes([0xD4 | (m >> 6), ((m & 0x3F) << 2) | (cycles >> 16),
+                        (cycles >> 8) & 0xFF, cycles & 0xFF])
+    return b
+
+
+def _raw_trace(events):
+    """events (per-cycle, absolute cols) -> trace_raw.bin bytes, one packet stream per tile."""
+    words = []
+    tiles = sorted({(e["col"], e["row"], e["pkt_type"]) for e in events})
+    for col, row, pt in tiles:
+        b = _tile_bytes([e for e in events if (e["col"], e["row"], e["pkt_type"]) == (col, row, pt)])
+        b += bytes([0xFE]) * (-len(b) % 28)
+        hdr = (col << 21) | (row << 16) | (pt << 12) | 1
+        if bin(hdr).count("1") % 2 == 0:
+            hdr |= 1 << 31
+        for off in range(0, len(b), 28):
+            words.append(hdr)
+            words += [int.from_bytes(b[off + j:off + j + 4], "big") for j in range(0, 28, 4)]
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def _events_json(events):
+    """What the in-tree rebuild writes for the raw trace: no events for held cycles."""
+    import trace_decoder as td
+    words = list(struct.unpack(f"<{len(_raw_trace(events)) // 4}I", _raw_trace(events)))
+    cmds = td.decode_words(words, mode=None)
+    plain = td.rebuild_timeline_mode0(cmds, {})
+    return [dict(col=e.col, row=e.row, pkt_type=e.pkt_type, slot=e.slot,
+                 name=_EVENT_SET[e.slot], ts=e.ts, soc=e.soc, mode=0)
+            for e in plain]
+
+
+def write_run(root: Path, day: str, tests: dict, raw=True, stamp=True) -> Path:
+    """tests: {(test, compiler): {"hw": [events] | None, "emu": [events] | None}}
+
+    Level events are given one per asserted cycle.  With ``raw`` each side gets the trace_raw.bin
+    that encodes them and an events.json as the decoder writes it (held cycles absent); without,
+    only an events.json holding the given events.  ``stamp`` marks each capture with its day so
+    sides given the same events are still distinct captures (a copied-forward dir is the
+    ``stamp=False`` case).
+    """
     d = root / day
     d.mkdir(parents=True)
     for (test, comp), sides in tests.items():
@@ -47,10 +134,16 @@ def write_run(root: Path, day: str, tests: dict) -> Path:
                 continue
             sd = d / f"{test}.{comp}.{side}"
             sd.mkdir()
-            (sd / "events.json").write_text(
-                json.dumps({"schema_version": 1, "events": events,
-                            "placement": {"origin_col": 1, "origin_row": 0}})
-            )
+            if stamp:
+                shift = {"base": 0, "cand": 1}.get(day, 2 + len(day))
+                events = [dict(e, ts=e["ts"] + shift) for e in events]
+            slot_names = {k: list(_EVENT_SET) for k in _KINDS.values()}
+            doc = {"schema_version": 1, "events": events, "slot_names": slot_names,
+                   "placement": {"origin_col": 1, "origin_row": 0}}
+            if raw and events:
+                (sd / "trace_raw.bin").write_bytes(_raw_trace(events))
+                doc["events"] = _events_json(events)
+            (sd / "events.json").write_text(json.dumps(doc))
     return d
 
 
@@ -322,7 +415,7 @@ def test_tile_columns_are_shifted_by_placement(tmp_path):
         (sd / "events.json").write_text(json.dumps(
             {"events": ev, "placement": {"origin_col": oc, "origin_row": 0}}))
     run_data = tcr.load_run(d)
-    assert set(run_data[K]["hw"]) == set(run_data[K]["emu"])
+    assert set(run_data[K]["hw"].series) == set(run_data[K]["emu"].series)
 
 
 def test_only_filter(tmp_path):
@@ -332,6 +425,91 @@ def test_only_filter(tmp_path):
             ("u", "peano"): {"hw": hw, "emu": edge("X", periodic(30, 10))}}
     rep = run(tmp_path, base, cand, only=["u"])
     assert {r.key.test for r in rep.rows} == {"u"}
+
+
+# --- level rows are scored on true assertion intervals ---------------------------
+
+def test_a_held_level_with_foreign_pulses_inside_is_one_interval(tmp_path):
+    # events.json shows the level only at frames where the tile's mask changes (the pulses);
+    # the true series is one interval starting at its first asserted cycle.
+    held = level("LOCK_STALL", [1000], dur=100)
+    pulses = edge("INSTR_VECTOR", [1010, 1030, 1050])
+    d = write_run(tmp_path, "r", {K: {"hw": held + pulses}}, stamp=False)
+    doc = json.loads((d / "t.peano.hw" / "events.json").read_text())
+    shown = [e for e in doc["events"] if e["name"] == "LOCK_STALL"]
+    assert 1 < len(shown) < 100                       # events.json: mask changes only
+    side = tcr.load_run(d)[K]["hw"]
+    assert side.series[(0, 2, 0, "LOCK_STALL")] == [1000]
+
+
+def test_a_level_dropped_for_one_cycle_is_two_intervals(tmp_path):
+    ev = level("LOCK_STALL", [1000, 1011], dur=10)    # asserted 1000..1009, then 1011..1020
+    d = write_run(tmp_path, "r", {K: {"hw": ev}}, stamp=False)
+    assert tcr.load_run(d)[K]["hw"].series[(0, 2, 0, "LOCK_STALL")] == [1000, 1011]
+
+
+def test_level_rows_without_a_raw_trace_are_unscored_not_counted(tmp_path):
+    hw = level("LOCK_STALL", periodic(20, 140)) + edge("INSTR_VECTOR", periodic(10, 50))
+    emu_b = level("LOCK_STALL", periodic(20, 140)) + edge("INSTR_VECTOR", periodic(10, 50))
+    emu_c = level("LOCK_STALL", periodic(30, 140)) + edge("INSTR_VECTOR", periodic(25, 50))
+    b = write_run(tmp_path, "base", {K: {"hw": hw, "emu": emu_b}}, raw=False)
+    c = write_run(tmp_path, "cand", {K: {"hw": hw, "emu": emu_c}}, raw=False)
+    rep = tcr.compare_runs(b, c)
+    assert [r.key.event for r in rep.rows] == ["INSTR_VECTOR"]       # edge rows still scored
+    assert [(k.event, "no trace_raw.bin" in why) for k, why in rep.unscored] == [("LOCK_STALL", True)]
+    text = tcr.format_text(rep)
+    assert "unscored rows: 1" in text and "no trace_raw.bin" in text
+
+
+def test_a_raw_trace_that_does_not_reproduce_events_json_leaves_levels_unscored(tmp_path):
+    ev = level("LOCK_STALL", periodic(5, 100))
+    d = write_run(tmp_path, "r", {K: {"hw": ev}})
+    other = write_run(tmp_path, "o", {K: {"hw": level("LOCK_STALL", periodic(9, 70))}})
+    (d / "t.peano.hw" / "trace_raw.bin").write_bytes((other / "t.peano.hw" / "trace_raw.bin").read_bytes())
+    side = tcr.load_run(d)[K]["hw"]
+    assert "does not reproduce" in side.level_problem
+
+
+# --- silicon samples --------------------------------------------------------
+
+def test_extra_hw_samples_widen_the_silicon_band(tmp_path):
+    # Two samples (10, 12) leave EMU 11 -> 12 inside; one sample (10) would call it a regression.
+    emu = lambda n: edge("X", periodic(n, 50))
+    b = write_run(tmp_path, "base", {K: {"hw": edge("X", periodic(10, 50)), "emu": emu(10)}})
+    c = write_run(tmp_path, "cand", {K: {"hw": edge("X", periodic(10, 50)), "emu": emu(12)}})
+    extra = write_run(tmp_path, "extra", {K: {"hw": edge("X", periodic(12, 50))}})
+    one = only_row(tcr.compare_runs(b, c), "X")
+    assert one.hw_counts == [10, 10] and one.count_after == 2     # base and cand differ by shift only
+    rep = tcr.compare_runs(b, c, hw_samples=[extra])
+    assert rep.rows == [] or only_row(rep, "X").count_after == 0
+    assert all(sorted(r.hw_counts) == [10, 10, 12] for r in rep.rows)
+
+
+def test_identical_hw_captures_count_once(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    t = {K: {"hw": hw, "emu": edge("X", periodic(14, 50))}}
+    b = write_run(tmp_path, "base", t, stamp=False)
+    c = write_run(tmp_path, "cand", {K: {"hw": hw, "emu": edge("X", periodic(10, 50))}}, stamp=False)
+    r = only_row(tcr.compare_runs(b, c), "X")
+    assert r.hw_counts == [10] and not r.hw_repeatable
+    rep = tcr.compare_runs(b, c, hw_samples=[b])
+    assert only_row(rep, "X").hw_counts == [10]
+    assert any("identical" in why for *_, why in rep.dropped_samples)
+
+
+def test_a_sample_with_another_event_set_is_not_used(tmp_path):
+    t = {K: {"hw": edge("X", periodic(10, 50)), "emu": edge("X", periodic(14, 50))}}
+    b = write_run(tmp_path, "base", t)
+    c = write_run(tmp_path, "cand", {K: {"hw": edge("X", periodic(10, 50)),
+                                         "emu": edge("X", periodic(10, 50))}})
+    extra = write_run(tmp_path, "extra", {K: {"hw": edge("X", periodic(40, 50))}})
+    doc_path = extra / "t.peano.hw" / "events.json"
+    doc = json.loads(doc_path.read_text())
+    doc["slot_names"]["core"] = ["Y"] + doc["slot_names"]["core"][1:]
+    doc_path.write_text(json.dumps(doc))
+    rep = tcr.compare_runs(b, c, hw_samples=[extra])
+    assert only_row(rep, "X").hw_counts == [10, 10]
+    assert any("event set" in why for *_, why in rep.dropped_samples)
 
 
 # --- CLI ------------------------------------------------------------------
@@ -354,6 +532,17 @@ def test_cli_text_summary(tmp_path, capsys):
     rc = tcr.main([str(b), str(c)])
     assert rc == 0
     assert "rows changed: 0" in capsys.readouterr().out
+
+
+def test_cli_hw_samples_option(tmp_path, capsys):
+    hw = edge("INSTR_VECTOR", periodic(10, 50))
+    b = write_run(tmp_path, "base", {K: {"hw": hw, "emu": hw}})
+    c = write_run(tmp_path, "cand", {K: {"hw": hw, "emu": edge("INSTR_VECTOR", periodic(25, 50))}})
+    x = write_run(tmp_path, "extra", {K: {"hw": edge("INSTR_VECTOR", periodic(11, 50))}})
+    assert tcr.main([str(b), str(c), "--hw-samples", str(x), "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert len(out["regressed"][0]["hw_counts"]) == 3
+    assert tcr.main([str(b), str(c), "--hw-samples", str(tmp_path / "nope")]) == 2
 
 
 def test_cli_missing_dir_is_error(tmp_path):
