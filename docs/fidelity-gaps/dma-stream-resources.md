@@ -398,15 +398,38 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   32`, 34 cases): FINISHED_BD minus the previous BD's = max(64, grant - previous finish + 52) on every row, as on
   silicon (291 rows; the emulator was flat grant + 64), and a parked 4-word BD's lock-free next BD of 32 words
   finishes 21 after it (silicon 21, emulator was 32).
-- **Still different.** The grant itself is at release + 0 (silicon + 2 or + 3, + 3 exactly when the release lands
-  2 mod 3 cycles after the channel reached the BD). A core access colliding with the first access (g + 2) wins on
-  silicon (the stream slips one cycle) and loses in the emulator, whose empty-staging urgency gives the DMA the
-  bank. The first word reaches the own-tile
-  S2MM at g + 10 (silicon g + 9; the offer / route split is not separated). The S2MM finishes at g + 74 against
-  g + 78. The producer probe's core stall count stays below silicon (0 against 18-20), the `bankdisc` probe's
-  conflict count above it (15 per transfer against 6-13). Not measured, so not changed: the memtile MM2S (keeps
-  the read-cursor rule), the shim MM2S, every S2MM lock path, the host-path access position inside a granule, and
-  a chained BD shorter than the lock hand-off (a 2-word BD's port gap is now 2).
+- **Still different (open gaps).**
+  - *Bank arbitration.* The emulator gives the bank to a compute MM2S whose staging holds 4 words or fewer
+    (`URGENT_WATERMARK`) ahead of the core. Words enter the staging at their access, so the staging is 0 at
+    g + 2 and holds the first granule's 4 words at g + 3: the DMA wins at g + 2 and g + 3 on the lock path, and at
+    every access of a free-running host-started BD (each access finds exactly the previous granule's 4 words).
+    On silicon the core won in all but 2 of about 40 measured conflicts (a core access at g + 2 delayed the
+    stream by one cycle and the DMA lost; the core itself was delayed only at g + 7 and g + 27) and in about 98%
+    of the producer probe's conflicts. Consequences: the producer probe's core stall count stays below silicon
+    (0 against 18-20), the `bankdisc` probe's conflict count above it (15 per transfer against 6-13), and the
+    unit test that denies the g + 2 access by hand passes while the integrated emulator cannot produce that
+    case. The urgent-DMA-wins case (the 18-20 core stalls) must stay reachable, so this needs a model decision
+    and a silicon measurement, not a threshold change.
+  - *Short chained locked BDs.* Chained locked BDs of 1 to 3 words with the lock already free finish once every
+    4 cycles in the emulator (a lock-free chain of the same BDs: every N cycles); silicon is unmeasured for
+    them. The emulator requests the next BD's lock one cycle after the previous BD's finish (grant at the
+    finish + 1, first access two cycles later); silicon raises STALLED_LOCK of the waiting BD one cycle before
+    the previous finish (259 of 259 rows), so it probably pre-acquires and a small locked objectfifo would run
+    faster there. Also unmeasured: whether the lock-released-by-the-previous-finish 2-word BD's port gap of 2 is
+    right.
+  - *Packet header.* The header of a lock-started compute MM2S's packet BD leaves at the grant, 6 cycles ahead of
+    its payload (4 words: g + 0, then g + 6..9); on silicon header and payload are contiguous.
+  - *Grant.* The grant is at release + 0 (silicon + 2 or + 3, + 3 exactly when the release lands 2 mod 3 cycles
+    after the channel reached the BD).
+  - *First word at the receiving DMA.* The first word reaches the own-tile S2MM at g + 10 (silicon g + 9; the
+    offer / route split is not separated), one cycle late.
+  - *S2MM finish.* The S2MM finishes at g + 74 against silicon's g + 78, 4 cycles early.
+  - *Choice, not measurement.* Outside a lock wait nothing bounds the word clock's lead but the BDs
+    themselves; silicon was not probed for a bound there. The same holds for the 16-word cap on words carried
+    into a locked next BD while the current one streams, and for a lock-started first BD's clock starting at
+    START_TASK + 7.
+  - Not measured, so not changed: the memtile MM2S (keeps the read-cursor rule), the shim MM2S, every S2MM lock
+    path, and the host-path access position inside a granule.
 
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
