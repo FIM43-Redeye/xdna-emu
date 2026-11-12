@@ -246,6 +246,12 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             memtile_mm2s_egress_fifo_depth: 31,
             memtile_mm2s_fetch_latency_cycles: 1,
             mm2s_read_to_offer_cycles: 3,
+            // Compute MM2S word clock (silicon onset + lock-fetch probes, 2026-11). See the
+            // DmaTiming field docs.
+            mm2s_word_clock_start_cycles: 3,
+            mm2s_word_clock_lead_words: 16,
+            mm2s_access_to_offer_cycles: 4,
+            mm2s_access_to_finish_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
             // task-holding S2MM takes two more than the master-port FIFO alone and whose

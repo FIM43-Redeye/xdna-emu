@@ -53,8 +53,12 @@ fn dma_read_only_stall_reason_reports_live_channel_conditions() {
         guard += 1;
         assert!(guard < 50, "active fixture never reached Transferring");
     }
-    active_engine.step(&mut active_tile, &mut NeighborTiles::empty(), &mut host_mem);
-    assert!(active_engine.get_transfer(2).unwrap().bytes_transferred > 0);
+    // A compute MM2S's first access waits for its word clock to sequence a granule.
+    while active_engine.get_transfer(2).unwrap().bytes_transferred == 0 {
+        active_engine.step(&mut active_tile, &mut NeighborTiles::empty(), &mut host_mem);
+        guard += 1;
+        assert!(guard < 50, "active fixture never accessed memory");
+    }
     assert_eq!(active_engine.channel_stall_reason(2), None);
 }
 
@@ -125,6 +129,12 @@ fn dma_read_only_stall_reason_prioritizes_mm2s_memory_starvation() {
         assert!(guard < 100, "MM2S fixture never reached backpressure");
     }
     assert!(engine.channels[2].egress_backpressure);
+    // Held long enough for the staging to fill and the word clock to run ahead of the
+    // accesses: the next granule is sequenced, so an empty staging is the memory side's fault.
+    for _ in 0..40 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+    assert!(engine.channels[2].words_sequenced >= 4, "the next granule is sequenced");
     while engine.pop_stream_out_for_channel(2).is_some() {}
     engine.channels[2].egress_staging.clear();
     engine.reset_cycle_drain_counters();
@@ -694,31 +704,46 @@ fn test_first_bd_bonus_applies_channel_start_cycles() {
     }
 }
 
-/// A compute / memtile MM2S started from idle reads its first word at START_TASK + 9 (silicon
-/// FINISHED_BD = N + 8; `build/experiments/path-capacity/onset-len`, `onset-long`, `onset-chain`):
-/// BdSetup 4 + MemoryLatency 5, without the `channel_start_cycles` term every other channel pays.
+/// A staged MM2S started from idle pays no `channel_start_cycles` (silicon FINISHED_BD = N + 8;
+/// `tools/gen_path_onset_probe.py`, onset-len / onset-long / onset-chain). A memtile reads its
+/// first word at START_TASK + 9: BdSetup 4 + MemoryLatency 5. A compute tile goes from BdSetup
+/// straight to its data phase, its word clock sequencing word 0 at START_TASK + 7 (BdSetup 4 +
+/// `mm2s_word_clock_start_cycles` 3).
 #[test]
 fn test_staged_mm2s_idle_start_skips_channel_start() {
-    for (mut engine, ch) in [(DmaEngine::new_compute_tile(1, 2), 2u8), (DmaEngine::new_mem_tile(1, 1), 6u8)] {
-        let mut tile = if ch == 2 {
-            make_tile()
-        } else {
-            Tile::mem_tile(1, 1)
-        };
-        let mut host_mem = make_host_memory();
-        let base = if ch == 2 { 0x100 } else { 0x80100 };
-        engine.configure_bd(0, BdConfig::simple_1d(base, 16)).unwrap();
-        engine.start_channel(ch, 0).unwrap();
-        for _ in 0..4 {
-            engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    let mut engine = DmaEngine::new_mem_tile(1, 1);
+    let mut tile = Tile::mem_tile(1, 1);
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x80100, 16)).unwrap();
+    engine.start_channel(6, 0).unwrap();
+    for _ in 0..4 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+    match &engine.channels[6].fsm {
+        crate::device::dma::channel::ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+            assert_eq!(*cycles_remaining, 5, "memory_latency only");
         }
-        match &engine.channels[ch as usize].fsm {
-            crate::device::dma::channel::ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
-                assert_eq!(*cycles_remaining, 5, "memory_latency only, ch{ch}");
-            }
-            other => panic!("expected MemoryLatency after BdSetup, got {:?}", other.phase_name()),
+        other => panic!("expected MemoryLatency after BdSetup, got {:?}", other.phase_name()),
+    }
+
+    let mut engine = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = make_tile();
+    engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+    engine.start_channel(2, 0).unwrap();
+    for _ in 0..4 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+    }
+    assert_eq!(engine.channel_phase(2), "Transferring", "no MemoryLatency on a compute MM2S");
+    assert!(!engine.channels[2].is_first_bd, "the first-BD bookkeeping still ran");
+    // Steps 0..3 were BdSetup; word 0 is sequenced at step 7 (START_TASK + 7).
+    let mut sequenced_at = None;
+    for step in 4..20 {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        if sequenced_at.is_none() && engine.channels[2].words_sequenced > 0 {
+            sequenced_at = Some(step);
         }
     }
+    assert_eq!(sequenced_at, Some(7));
 }
 
 /// First-BD bonus re-arms after the channel returns to Idle.

@@ -523,6 +523,14 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.mm2s_read_to_offer_cycles
         )
         .unwrap();
+        for (name, value) in [
+            ("DMA_MM2S_WORD_CLOCK_START_CYCLES", t.dma.mm2s_word_clock_start_cycles),
+            ("DMA_MM2S_WORD_CLOCK_LEAD_WORDS", t.dma.mm2s_word_clock_lead_words),
+            ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
+            ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
+        ] {
+            writeln!(out, "    pub const {name}: u8 = {value};").unwrap();
+        }
         writeln!(out, "    pub const DMA_SHIM_S2MM_INGRESS_DEPTH: u8 = {};", t.dma.shim_s2mm_ingress_depth)
             .unwrap();
         writeln!(out).unwrap();
