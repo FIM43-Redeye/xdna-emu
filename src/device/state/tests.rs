@@ -1274,3 +1274,83 @@ fn memtile_lock_written_above_31_is_acquirable_by_dma() {
     );
     assert_eq!(tile.locks[0].value, 39);
 }
+
+// --- Module_Clock_Control and the adaptive clock-gate registers ------------
+
+/// Tiles with their Module_Clock_Control offset and AM025 reset value.
+const CLOCK_TILES: [(u8, u8, u32, u32); 3] = [
+    (2, 3, 0x60000, 0x37), // compute
+    (2, 1, 0xFFF00, 0x33), // memtile
+    (2, 0, 0xFFF00, 0x3B), // shim (Module_Clock_Control_0)
+];
+
+/// Stream_Switch_Adaptive_Clock_Gate (bit 4) and DMA_Adaptive_Clock_Gate (bit 5).
+const SS_ADAPTIVE: u32 = 1 << 4;
+const DMA_ADAPTIVE: u32 = 1 << 5;
+
+#[test]
+fn module_clock_control_reads_its_reset_value_before_any_write() {
+    let mut state = DeviceState::new_npu1();
+    for (col, row, offset, reset) in CLOCK_TILES {
+        assert_eq!(state.read_tile_register(col, row, offset), reset, "tile ({col},{row})");
+    }
+}
+
+#[test]
+fn an_unwritten_register_with_a_nonzero_reset_reads_that_reset() {
+    // Not clock control: the reset fallback is general. Abort_Period resets to 7.
+    let mut state = DeviceState::new_npu1();
+    assert_eq!(state.read_tile_register(2, 3, 0x3FF38), 7);
+    assert_eq!(state.read_tile_register(2, 1, 0xB0F38), 7);
+    assert_eq!(state.read_tile_register(2, 0, 0x3FF38), 7);
+}
+
+#[test]
+fn cdo_masked_write_clearing_bit4_keeps_the_reset_bits_and_reaches_the_clock_controller() {
+    for (col, row, offset, reset) in CLOCK_TILES {
+        let mut state = DeviceState::new_npu1();
+        state.write_tile_register(col, 0, 0xFFF20, 1); // ungate the column
+        state
+            .mask_write_register(TileAddress::encode(col, row, offset), SS_ADAPTIVE, 0)
+            .unwrap();
+        assert_eq!(state.read_tile_register(col, row, offset), reset & !SS_ADAPTIVE, "tile ({col},{row})");
+        assert!(state.array.clock().is_module_active(
+            col,
+            row,
+            crate::device::clock_control::ModuleKind::StreamSwitch
+        ));
+        assert!(!state.array.clock().is_adaptive_ss_enabled(col, row), "tile ({col},{row})");
+        assert!(state.array.clock().is_adaptive_dma_enabled(col, row), "tile ({col},{row})");
+    }
+}
+
+#[test]
+fn abort_period_write_reaches_the_clock_controller_for_each_tile_kind() {
+    for (col, row, offset) in [(2, 3, 0x3FF38), (2, 1, 0xB0F38), (2, 0, 0x3FF38)] {
+        let mut state = DeviceState::new_npu1();
+        state.write_tile_register(col, 0, 0xFFF20, 1);
+        state.write_tile_register(col, row, offset, 3);
+        assert_eq!(state.read_tile_register(col, row, offset), 3);
+        for _ in 0..7 {
+            state.array.clock_mut().tick_adaptive_ss(col, row, false);
+        }
+        assert!(!state.array.clock().is_adaptive_ss_engaged(col, row), "7 idle cycles, threshold 8");
+        state.array.clock_mut().tick_adaptive_ss(col, row, false);
+        assert!(state.array.clock().is_adaptive_ss_engaged(col, row), "8 idle cycles, threshold 8");
+    }
+}
+
+#[test]
+fn status_register_reads_back_the_stream_switch_gate() {
+    for (col, row, offset) in [(2, 3, 0x3FF34), (2, 1, 0xB0F34), (2, 0, 0x3FF34)] {
+        let mut state = DeviceState::new_npu1();
+        state.write_tile_register(col, 0, 0xFFF20, 1);
+        assert_eq!(state.read_tile_register(col, row, offset), 0, "idle for no time yet");
+        for _ in 0..128 {
+            state.array.clock_mut().tick_adaptive_ss(col, row, false);
+        }
+        assert_eq!(state.read_tile_register(col, row, offset), 1, "tile ({col},{row}) engaged");
+        state.array.clock_mut().wake_adaptive_ss(col, row);
+        assert_eq!(state.read_tile_register(col, row, offset), 0, "woken");
+    }
+}

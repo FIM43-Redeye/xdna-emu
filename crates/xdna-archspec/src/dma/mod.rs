@@ -26,6 +26,7 @@
 //! at DmaEngine construction and at the ~5 call-site boundaries where AIE2
 //! features are disabled for other archs.
 
+pub mod clock_layout;
 pub mod field_layouts;
 pub mod layouts;
 #[cfg(test)]
@@ -36,6 +37,7 @@ pub use field_layouts::{
     ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout, LockEventSelectionLayout,
 };
 
+pub use clock_layout::ClockControlLayout;
 pub use layouts::DeviceRegLayout;
 
 use crate::types::TileKind;
