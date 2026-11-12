@@ -737,6 +737,8 @@ def cmd_fetch_table(args) -> int:
             name = fetch_case_name(k, args.chained, bank)
             for run in args.runs:
                 run_dir = out / name / run
+                if not run_dir.is_dir():
+                    continue                    # this case was not run under this tag
                 if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
                     rows.append((k, run, {"release": None}))
                     continue
