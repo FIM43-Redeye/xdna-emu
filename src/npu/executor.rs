@@ -1663,6 +1663,23 @@ mod tests {
         assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
     }
 
+    /// The NPU MaskWrite reads the register before it writes. A register no one has
+    /// written must read its AM025 reset value, so clearing one field leaves the rest.
+    #[test]
+    fn maskwrite_of_one_clock_control_bit_starts_from_the_reset_value() {
+        for (row, offset, reset) in [(2u32, 0x60000u32, 0x37u32), (1, 0xFFF00, 0x33), (0, 0xFFF00, 0x3B)] {
+            let mut executor = NpuExecutor::new();
+            let mut device = DeviceState::new_npu1();
+            let mut host_mem = HostMemory::new();
+            device.set_start_col(1);
+            let reg_off = (row << 20) | offset;
+            executor.load_instructions(vec![NpuInstruction::MaskWrite { reg_off, value: 0, mask: 1 << 4 }]);
+            assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
+            assert_eq!(device.read_tile_register(1, row as u8, offset), reset & !(1 << 4), "row {row}");
+            assert!(device.array.clock().is_adaptive_dma_enabled(1, row as u8), "row {row}");
+        }
+    }
+
     #[test]
     fn test_try_advance_processes_write32() {
         let mut executor = NpuExecutor::new();

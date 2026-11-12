@@ -118,6 +118,19 @@ impl TileArray {
         Some(dma.get_channel_status(channel as u8))
     }
 
+    /// The stream-switch adaptive clock gate's Status register, which reads the live
+    /// gate state rather than a stored value.  `None` when `offset` is not that
+    /// register.  Both the register bus and control-packet reads answer it from the
+    /// clock controller.
+    pub fn adaptive_gate_status(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
+        self.get(col, row)?;
+        let layout = crate::device::regdb::device_reg_layout();
+        let status = layout.clock_control(self.arch().tile_kind(col, row)).status_register;
+        (offset == status)
+            .then(|| self.clock().read_register(col, row, offset))
+            .flatten()
+    }
+
     pub fn handle_read_registers(
         &mut self,
         col: u8,
@@ -129,7 +142,11 @@ impl TileArray {
         use crate::device::stream_switch::{PacketHeader, PacketType};
 
         let statuses: Vec<Option<u32>> = (0..count as u32)
-            .map(|i| self.dma_channel_status(col, row, offset + i * 4))
+            .map(|i| {
+                let address = offset + i * 4;
+                self.dma_channel_status(col, row, address)
+                    .or_else(|| self.adaptive_gate_status(col, row, address))
+            })
             .collect();
         let tile = match self.get_mut(col, row) {
             Some(t) => t,
