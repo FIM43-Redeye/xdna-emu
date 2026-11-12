@@ -517,6 +517,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.memtile_mm2s_fetch_latency_cycles
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_MM2S_READ_TO_OFFER_CYCLES: u8 = {};",
+            t.dma.mm2s_read_to_offer_cycles
+        )
+        .unwrap();
         writeln!(out, "    pub const DMA_SHIM_S2MM_INGRESS_DEPTH: u8 = {};", t.dma.shim_s2mm_ingress_depth)
             .unwrap();
         writeln!(out).unwrap();

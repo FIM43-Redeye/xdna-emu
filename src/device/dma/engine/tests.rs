@@ -656,13 +656,16 @@ fn test_default_cycle_accurate_timing() {
     assert_eq!(engine.timing_config().words_per_cycle, 4);
 }
 
-/// First-BD-of-task bonus: channel_start_cycles applies to every tile kind.
+/// First-BD-of-task bonus: channel_start_cycles applies to every channel kind
+/// except a staged compute / memtile MM2S started from idle.
 ///
-/// On a fresh compute MM2S channel the FSM transitions
+/// On a fresh compute S2MM channel the FSM transitions
 /// Idle -> BdSetup -> MemoryLatency -> Transferring. Without the bonus,
 /// MemoryLatency budget is `memory_latency_cycles` (5). With the bonus,
 /// it is `memory_latency_cycles + channel_start_cycles` (5 + 2 = 7) on
-/// the first BD only. Subsequent chained BDs don't pay it.
+/// the first BD only. Subsequent chained BDs don't pay it. A staged MM2S
+/// from idle does not pay it either (silicon: first read at START_TASK + 9,
+/// FINISHED_BD = N + 8): see `test_staged_mm2s_idle_start_skips_channel_start`.
 #[test]
 fn test_first_bd_bonus_applies_channel_start_cycles() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
@@ -670,9 +673,9 @@ fn test_first_bd_bonus_applies_channel_start_cycles() {
     let mut host_mem = make_host_memory();
     engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
 
-    assert!(engine.channels[2].is_first_bd, "fresh channel should start with is_first_bd=true");
-    engine.start_channel(2, 0).unwrap();
-    assert!(engine.channels[2].is_first_bd, "is_first_bd shouldn't clear before MemoryLatency entry");
+    assert!(engine.channels[0].is_first_bd, "fresh channel should start with is_first_bd=true");
+    engine.start_channel(0, 0).unwrap();
+    assert!(engine.channels[0].is_first_bd, "is_first_bd shouldn't clear before MemoryLatency entry");
 
     // Step through BdSetup (4 cycles: cycles_remaining counts down 4->1).
     for _ in 0..4 {
@@ -682,12 +685,39 @@ fn test_first_bd_bonus_applies_channel_start_cycles() {
 
     // Now in MemoryLatency. Bonus should be consumed and budget should be
     // memory_latency + channel_start = 5 + 2 = 7 (not just 5).
-    assert!(!engine.channels[2].is_first_bd, "is_first_bd cleared on MemoryLatency entry");
-    match &engine.channels[2].fsm {
+    assert!(!engine.channels[0].is_first_bd, "is_first_bd cleared on MemoryLatency entry");
+    match &engine.channels[0].fsm {
         crate::device::dma::channel::ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
             assert_eq!(*cycles_remaining, 7, "first-BD bonus folds channel_start into MemoryLatency");
         }
         other => panic!("expected MemoryLatency after BdSetup, got {:?}", other.phase_name()),
+    }
+}
+
+/// A compute / memtile MM2S started from idle reads its first word at START_TASK + 9 (silicon
+/// FINISHED_BD = N + 8; `build/experiments/path-capacity/onset-len`, `onset-long`, `onset-chain`):
+/// BdSetup 4 + MemoryLatency 5, without the `channel_start_cycles` term every other channel pays.
+#[test]
+fn test_staged_mm2s_idle_start_skips_channel_start() {
+    for (mut engine, ch) in [(DmaEngine::new_compute_tile(1, 2), 2u8), (DmaEngine::new_mem_tile(1, 1), 6u8)] {
+        let mut tile = if ch == 2 {
+            make_tile()
+        } else {
+            Tile::mem_tile(1, 1)
+        };
+        let mut host_mem = make_host_memory();
+        let base = if ch == 2 { 0x100 } else { 0x80100 };
+        engine.configure_bd(0, BdConfig::simple_1d(base, 16)).unwrap();
+        engine.start_channel(ch, 0).unwrap();
+        for _ in 0..4 {
+            engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        match &engine.channels[ch as usize].fsm {
+            crate::device::dma::channel::ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+                assert_eq!(*cycles_remaining, 5, "memory_latency only, ch{ch}");
+            }
+            other => panic!("expected MemoryLatency after BdSetup, got {:?}", other.phase_name()),
+        }
     }
 }
 

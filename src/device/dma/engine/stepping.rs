@@ -43,8 +43,8 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
     }
 }
 
-/// Is a staged MM2S near underflow: its channel's egress staging holds
-/// `staged` words, at/below `DmaEngine::URGENT_WATERMARK`, while `transfer`
+/// Is a staged MM2S near underflow: its read port has `read_backlog` cycles of reading queued,
+/// at/below `DmaEngine::URGENT_WATERMARK` (so it is about to idle), while `transfer`
 /// still has words to fetch?
 ///
 /// Defined once so `next_granule_fetch` (the backoff override -- an urgent
@@ -55,8 +55,8 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
 /// staging occupancy is only meaningful for a channel that actually stages.
 /// Every word a transfer still has to move is unfetched: a fetched word
 /// leaves the transfer for the channel's staging (`egress_staging`).
-fn transfer_is_urgent(transfer: &Transfer, staged: usize) -> bool {
-    transfer.remaining_bytes() > 0 && staged <= DmaEngine::URGENT_WATERMARK
+fn transfer_is_urgent(transfer: &Transfer, read_backlog: usize) -> bool {
+    transfer.remaining_bytes() > 0 && read_backlog <= DmaEngine::URGENT_WATERMARK
 }
 
 /// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
@@ -159,7 +159,10 @@ impl DmaEngine {
             let ChannelFsm::Transferring { transfer } = &ch.fsm else {
                 continue;
             };
-            if self.uses_egress_staging(transfer) && transfer_is_urgent(transfer, ch.egress_staging.len()) {
+            // `peek_bank_demand`'s caller runs before this cycle's step, which advances `read_clock`.
+            if self.uses_egress_staging(transfer)
+                && transfer_is_urgent(transfer, ch.read_backlog(self.read_clock + 1))
+            {
                 urgent.push(self.channel_requester(ch_idx as u8));
             }
         }
@@ -228,7 +231,9 @@ impl DmaEngine {
         // `next_granule_fetch`). The two are decoupled by the FIFO, which is
         // the whole point of the staging model.
         if self.uses_egress_staging(transfer) {
-            return self.next_granule_fetch(transfer, layout).map_or(0, |f| f.bank_mask);
+            return self
+                .next_granule_fetch(transfer, layout, self.read_clock + 1)
+                .map_or(0, |f| f.bank_mask);
         }
 
         let bytes_remaining = transfer.remaining_bytes() as usize;
@@ -410,6 +415,7 @@ impl DmaEngine {
         &self,
         transfer: &Transfer,
         layout: crate::device::banking::BankLayout,
+        at: u64,
     ) -> Option<GranuleFetch> {
         use crate::device::banking::banks_for_access;
 
@@ -420,7 +426,7 @@ impl DmaEngine {
         let ch = &self.channels[transfer.channel as usize];
         let staged = ch.egress_staging.len();
 
-        if ch.backoff_left > 0 && !transfer_is_urgent(transfer, staged) {
+        if ch.backoff_left > 0 && !transfer_is_urgent(transfer, ch.read_backlog(at)) {
             return None;
         }
 
@@ -1039,7 +1045,17 @@ impl DmaEngine {
                     } else {
                         // No lock needed -- insert header now, go to MemoryLatency.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
+                        let mut bonus = self.consume_first_bd_bonus(ch_idx, &transfer);
+                        if self.uses_egress_staging(&transfer) {
+                            // A compute / memtile MM2S started from idle reads its first word at
+                            // START_TASK + 9 = bd_setup 4 + memory_latency 5 (silicon FINISHED_BD
+                            // = N + 8, `onset-len` / `onset-long` / `onset-chain` t4x4: first task
+                            // 12 for 4 words, every later task L + 8 after its START). The
+                            // `channel_start_cycles` term (2, an unsourced estimate from the
+                            // granule-at-fetch calibration) is not paid on this path; the lock path
+                            // and every other channel kind keep it.
+                            bonus = bonus.saturating_sub(self.timing_config.channel_start_cycles as u16);
+                        }
                         ChannelFsm::MemoryLatency {
                             cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
                             transfer,
@@ -2539,7 +2555,7 @@ impl DmaEngine {
     ) -> TransferCycleResult {
         if !mem_denied {
             let layout = self.bank_layout();
-            if let Some(fetch) = self.next_granule_fetch(transfer, layout) {
+            if let Some(fetch) = self.next_granule_fetch(transfer, layout, self.read_clock) {
                 self.cycle_dma_banks |= fetch.bank_mask;
                 let channel = transfer.channel;
                 let tlast_suppress = transfer.effective_tlast_suppress();
@@ -4149,9 +4165,8 @@ mod bank_demand_tests {
                     .1
                     .unwrap_or_else(|| panic!("{name} N={n} never finished"))
             };
-            let base = finish(1);
-            for n in [2u32, 4, 8, 23, 46] {
-                assert_eq!(finish(n), base + n as usize - 1, "{name}: FINISHED_BD at N={n}");
+            for n in [1u32, 2, 4, 8, 23, 46] {
+                assert_eq!(finish(n), n as usize + 8, "{name}: FINISHED_BD at N={n}");
             }
         }
     }
@@ -4159,8 +4174,8 @@ mod bank_demand_tests {
     /// The first word reaches the switch side once the first granule's last word has been read
     /// (or the BD's last word, for a BD shorter than a granule): 11 + min(N, 4) cycles after
     /// START_TASK on silicon (compute; the memtile one cycle later, which
-    /// `memtile_mm2s_fetch_latency_cycles` models). The N-dependence is what is asserted here; the
-    /// absolute offset is the port side's business.
+    /// `memtile_mm2s_fetch_latency_cycles` models): the first granule's last word is read at
+    /// 8 + min(N, 4) and offered `mm2s_read_to_offer_cycles` (3) later.
     #[test]
     fn mm2s_first_word_is_offered_when_its_granule_has_been_read() {
         type Make = fn() -> (DmaEngine, Tile, u8);
@@ -4175,9 +4190,10 @@ mod bank_demand_tests {
                     .0
                     .unwrap_or_else(|| panic!("{name} N={n}: no word"))
             };
-            let base = first(1);
-            for n in [2u32, 3, 4, 8, 23] {
-                assert_eq!(first(n), base + (n.min(4) as usize - 1), "{name}: first offer at N={n}");
+            // 11 + min(N, 4) after START_TASK on a compute tile, one more on a memtile.
+            let extra = usize::from(name == "memtile");
+            for n in [1u32, 2, 3, 4, 8, 23] {
+                assert_eq!(first(n), 11 + n.min(4) as usize + extra, "{name}: first offer at N={n}");
             }
         }
     }
@@ -4214,9 +4230,7 @@ mod bank_demand_tests {
             }
         }
         assert_eq!(finished.len(), K as usize);
-        for w in finished.windows(2) {
-            assert_eq!(w[1] - w[0], L as usize, "FINISHED_BD spacing: {finished:?}");
-        }
+        assert_eq!(finished, vec![12, 16, 20, 24], "silicon c4x4 FINISHED_BD: first read at START + 9");
         let firsts: Vec<usize> = (0..K as usize).map(|j| offered[j * L as usize]).collect();
         for w in firsts.windows(2) {
             assert_eq!(

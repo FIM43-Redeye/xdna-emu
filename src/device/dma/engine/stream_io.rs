@@ -586,21 +586,26 @@ impl DmaEngine {
     }
 
     /// Cycles from the read of a granule's last word until its words can leave the
-    /// staging: one on a memtile (`DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES`), none on a
-    /// compute tile, whose granule leaves in the cycle its last word is read.
+    /// staging: `DMA_MM2S_READ_TO_OFFER_CYCLES` (3, silicon: first offer at 11 + min(N, 4)
+    /// against a last read at N + 8), plus on a memtile
+    /// `DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES` (1).
     pub(super) fn staged_word_latency(&self) -> u64 {
-        if self.tile_kind.is_mem() {
-            xdna_archspec::aie2::timing::DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES as u64
+        use xdna_archspec::aie2::timing::{DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES, DMA_MM2S_READ_TO_OFFER_CYCLES};
+        let memtile = if self.tile_kind.is_mem() {
+            DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES
         } else {
             0
-        }
+        };
+        (DMA_MM2S_READ_TO_OFFER_CYCLES + memtile) as u64
     }
 
-    /// Egress-FIFO occupancy at/below which an MM2S channel's granule fetch is
-    /// `urgent` -- near underflow, with stream still to feed
-    /// (`transfer_is_urgent`, `stepping.rs`). One granule (4 words): the
-    /// minimum that still leaves a whole fetch's worth of slack before the
-    /// stream port could run dry, not a fitted number. Also the threshold
+    /// Read backlog (cycles of reading still queued, `ChannelContext::read_backlog`) at/below
+    /// which an MM2S channel's granule fetch is `urgent` -- the read port is about to idle, so
+    /// the stream port would run dry, with stream still to feed (`transfer_is_urgent`,
+    /// `stepping.rs`). One granule (4 words): the minimum that still leaves a whole fetch's worth
+    /// of slack before the read port could idle, not a fitted number. (It used to be the staging
+    /// occupancy, which equals the read backlog while a fetched word is readable at once; the
+    /// read-to-offer latency keeps words in the staging that are no longer queued to read.) Also the threshold
     /// that overrides `BACKOFF` -- a starving DMA must never stall itself out
     /// via its own backoff.
     pub(super) const URGENT_WATERMARK: usize = 4;

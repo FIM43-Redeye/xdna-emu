@@ -245,6 +245,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // cycle behind a compute source). See the DmaTiming field docs.
             memtile_mm2s_egress_fifo_depth: 31,
             memtile_mm2s_fetch_latency_cycles: 1,
+            mm2s_read_to_offer_cycles: 3,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
             // task-holding S2MM takes two more than the master-port FIFO alone and whose

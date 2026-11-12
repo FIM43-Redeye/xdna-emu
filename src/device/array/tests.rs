@@ -1332,15 +1332,17 @@ mod path_capacity {
 
     /// Silicon: FINISHED_BD = N + 8 (one word read per cycle), and the first word reaches the
     /// switch at 11 + min(N, 4) (the first granule is visible once its last word, or the BD's, has
-    /// been read), compute and memtile alike (onset-len, onset-long). Only the N-dependence is
-    /// asserted: the absolute offsets are port-side calibration.
+    /// been read, plus `mm2s_read_to_offer_cycles`), compute and memtile alike (onset-len,
+    /// onset-long). FINISHED is asserted absolutely; the offer is measured at the S2MM's intake,
+    /// a fixed distance past the switch, so only its N-dependence is asserted.
     #[test]
     fn the_own_loop_finishes_one_cycle_per_word_and_offers_after_the_first_granule() {
         for memtile in [false, true] {
             let (f1, o1) = finished_and_first_offer(1, memtile);
+            assert_eq!(f1, 9, "FINISHED_BD at N=1 (memtile={memtile})");
             for n in [2u32, 4, 8, 23, 46] {
                 let (f, o) = finished_and_first_offer(n, memtile);
-                assert_eq!(f, f1 + n as usize - 1, "FINISHED_BD at N={n} (memtile={memtile})");
+                assert_eq!(f, n as usize + 8, "FINISHED_BD at N={n} (memtile={memtile})");
                 assert_eq!(o, o1 + n.min(4) as usize - 1, "first offer at N={n} (memtile={memtile})");
             }
         }

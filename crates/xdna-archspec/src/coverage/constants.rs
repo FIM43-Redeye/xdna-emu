@@ -164,6 +164,10 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.memtile_mm2s_fetch_latency_cycles", "NPU1 backpressure onset 2026-11-10 \
             (tools/gen_path_onset_probe.py): every memtile-sourced edge one cycle after the compute-sourced one, two runs identical",
             "Seen at task start; a fetch after a mid-transfer stall is assumed to pay it too."),
+        measured("dma.mm2s_read_to_offer_cycles", "NPU1 2026-11-11 (tools/gen_path_onset_probe.py prod_own_nN / mem_own_nN, \
+            path-capacity/onset-len + onset-long, two runs identical): first word offered at 11 + min(N, 4) while the BD's \
+            last read lands at N + 8",
+            "Compute value; the memtile pays memtile_mm2s_fetch_latency_cycles on top."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),

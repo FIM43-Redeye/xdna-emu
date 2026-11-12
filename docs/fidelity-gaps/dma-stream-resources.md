@@ -348,13 +348,20 @@ row is identical over two silicon runs.
   `staged_mm2s_cycle` holds the BD open (`TransferCycleResult::ReadInProgress`) until its last word has been read,
   which then releases the lock, raises FINISHED_BD and chains the next BD. A staged MM2S's chained BDs take no FSM
   bubble (`enter_chained_transfer`): the boundary idle cycle is `egress_gap` on the port side only.
-- **Result.** FINISHED_BD spacing exact (one cycle per word, chained BDs L apart); the longest finishing BD is 48 /
-  52; races, absorbs and the onset-len boundary (23) unchanged. **Still different (port-side calibration, a later
-  step):** the absolute FINISHED_BD is two cycles late (N + 10 against N + 8, the BD-start overhead before the
-  first read; the same +2 on every row, chained and task variants alike); the sustained STREAM_BACKPRESSURE onset is
-  37 / 38 against silicon 38 / 39; silicon's 1-cycle first-offer blip (not deterministic: present in some tasks
-  of a chain and not in others) and the S2MM starvation until the first word arrives (a known gap) have no
-  emulator counterpart.
+- **Start and offer latencies (modelled 2026-11-11, second step).** Two silicon-pinned offsets were leftovers of
+  the older granule-at-fetch calibration. (1) First read at START_TASK + 9: a compute / memtile MM2S started from
+  idle pays `bd_setup_cycles` 4 + `memory_latency_cycles` 5 and not the `channel_start_cycles` 2 term every other
+  channel (S2MM, shim, locked first BD) keeps; those three constants were never isolated on silicon. (2) A granule
+  is offered `mm2s_read_to_offer_cycles` (3) after its last word is read (first offer 11 + min(N, 4) against a
+  last read at N + 8), plus the memtile's 1. Urgency (the fetch backoff override) is now judged on the read
+  backlog (`ChannelContext::read_backlog`) rather than the staging occupancy, which the 3 in-flight words would
+  otherwise inflate; without it the bank-denial absorption test (`HW T_collide/T_apart` = 1) fails.
+- **Result.** FINISHED_BD = N + 8 for every N tested, compute and memtile; `c4x4` 12 / 16 / 20 / 24, `c8x2` 16 / 24;
+  `t4x4` 12 for the first task and START + 12 for each later one; the longest finishing BD is 48 / 52; sustained
+  STREAM_BACKPRESSURE at 38 (compute) / 39 (memtile) for every N >= 23 and clean at N = 21, 22; races, R4-D3 and the
+  chain table unchanged. **Still different:** silicon's 1-cycle first-offer blip (not deterministic: present in
+  some tasks of a chain and not in others) and the S2MM starvation until the first word arrives (a known gap)
+  have no emulator counterpart.
 
 ## Stream buffering and latency (modelled 2026-11-04, NPU1 silicon)
 

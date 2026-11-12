@@ -619,6 +619,12 @@ pub struct ChannelContext {
 }
 
 impl ChannelContext {
+    /// Cycles of reading still queued at engine step `at` (before that step's own fetch): the
+    /// words fetched but not yet read, at one per cycle. 0 when the read port is idle.
+    pub fn read_backlog(&self, at: u64) -> usize {
+        (self.read_tail + 1).saturating_sub(at) as usize
+    }
+
     pub fn new(index: u8) -> Self {
         Self {
             fsm: ChannelFsm::Idle,

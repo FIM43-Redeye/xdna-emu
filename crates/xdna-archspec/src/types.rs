@@ -1156,7 +1156,9 @@ pub struct LockTiming {
 pub struct DmaTiming {
     /// Cycles to parse and configure a buffer descriptor.
     pub bd_setup_cycles: u8,
-    /// Cycles from start trigger to first data.
+    /// Cycles from start trigger to first data. Not paid by a compute / memtile MM2S started
+    /// from idle, whose first read is at START_TASK + 9 = `bd_setup_cycles` +
+    /// `memory_latency_cycles` (silicon FINISHED_BD = N + 8, `path-capacity/onset-len`).
     pub channel_start_cycles: u8,
     /// Throughput: words (32-bit) per cycle per channel for non-host
     /// (tile-local / memtile / compute) DMA transfers.  Derived from the
@@ -1434,6 +1436,16 @@ pub struct DmaTiming {
     /// memtile-sourced path -- the first-granule pulse, the held onset, own
     /// tile and one hop away -- is one cycle after the compute-sourced path's.
     pub memtile_mm2s_fetch_latency_cycles: u8,
+
+    /// Cycles from the read of a compute / memtile MM2S granule's last word until its words can
+    /// be offered to the stream: 3. Measured (NPU1, 2026-11-11, two runs identical,
+    /// `tools/gen_path_onset_probe.py` `prod_own_nN` / `mem_own_nN`, data
+    /// `path-capacity/onset-len` and `onset-long`): the first word reaches the switch at
+    /// 11 + min(N, 4) cycles after START_TASK, while FINISHED_BD (the BD's last read) lands at
+    /// N + 8, so for N = 4 the offer is 3 cycles behind the last read of the first granule. The
+    /// memtile adds `memtile_mm2s_fetch_latency_cycles` on top. Residue of the older
+    /// granule-at-fetch calibration, where this delay was folded into the start latency.
+    pub mm2s_read_to_offer_cycles: u8,
 
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
