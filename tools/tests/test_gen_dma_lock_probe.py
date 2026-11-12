@@ -872,7 +872,7 @@ def test_ring_row_and_residues():
 
 def test_ring_plan():
     names = [c.name for c in g.ring_plan()]
-    assert len(names) == len(set(names)) == 14 and all(n.startswith("rg") for n in names)
+    assert len(names) == len(set(names)) == 15 and all(n.startswith("rg") for n in names)
 
 
 def test_ring_two_channel_variant():
@@ -907,3 +907,13 @@ def test_ring_two_mm2s_on_one_schedule():
     assert "mov r4, #2" in bundles_of(g.ring_core_asm(ring("mm", n=120)))
     ev = g.ring_memmod_events(ring("mm"))
     assert len(ev) == 8 and "DMA_MM2S_1_MEMORY_STARVATION" in ev
+
+
+def test_ring_opposite_parity_variant():
+    t = g.ring_design_mlir(ring("mx", n=1))
+    send1 = t.split("^send1:")[1].split("^s1_start")[0]
+    assert "aie.dma_bd(%src : memref<64xi32> offset = 4 len = 60)" in send1
+    assert "dma_bd(%dst2 : memref<68xi32> offset = 0 len = 64)" in t          # 4 pre words + 60
+    assert phys_bank(g.FETCH_SRC_ADDR + 16) == 1                               # MM2S 1 starts on bank 1
+    ev = g.ring_memmod_events(ring("mx"))
+    assert len(ev) == 8 and "DMA_MM2S_1_STALLED_LOCK" in ev and "DMA_MM2S_0_STALLED_LOCK" in ev

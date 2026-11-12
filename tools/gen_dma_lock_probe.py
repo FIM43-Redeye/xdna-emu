@@ -1379,7 +1379,9 @@ def cmd_arb_table(args) -> int:
 # two channels on banks 0/1 at once, both lock-started on lock A (the core releases it by 2).
 # mm: MM2S 0 and MM2S 1 run the same chained task on `src` (same schedule, so they ask for the same bank in
 # the same cycles) into S2MM 0 (`dst`) and S2MM 1 (`dst2`, banks 6/7).
-RING_VARIANTS = ("m0", "m1", "s0", "s1", "ms", "mm")
+# mx: as mm, but MM2S 1 reads `src` from its second 16-byte line (60 words), so its granule parity is the
+# opposite of MM2S 0's: a one-cycle grant offset then puts both on the same bank in the same cycles.
+RING_VARIANTS = ("m0", "m1", "s0", "s1", "ms", "mm", "mx")
 RING_DST2_ADDR = 0xC100
 RING_FEED_ADDR = 0x4100             # banks 2/3: the s-variants' MM2S source
 RING_SDST_ADDR = 0x1000             # banks 0/1: the s-variants' S2MM destination (granule g in bank g & 1)
@@ -1438,7 +1440,7 @@ def ring_core_asm(c: RingCase) -> str:
     fill = []
     for i in range(RING_FILL_RELEASES):
         fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
-    grants = 2 if c.variant in ("ms", "mm") else 1          # lock-A BDs waiting for the release
+    grants = 2 if c.variant in ("ms", "mm", "mx") else 1          # lock-A BDs waiting for the release
     body = ["  mov r2, #1", "  mov r3, #-1", f"  mov r4, #{grants}", *n(2),
             f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
             *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
@@ -1494,7 +1496,9 @@ def ring_design_mlir(c: RingCase) -> str:
                        f"    ^s1_start:\n      %s3 = aie.dma_start(S2MM, 1, ^recv1, ^end)\n"
                        f"    ^recv1:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
     dst2 = ""
-    if c.variant == "mm":
+    if c.variant in ("mm", "mx"):
+        m1_bd = f"%src : memref<{w}xi32>" if c.variant == "mm" else f"%src : memref<{w}xi32> offset = 4 len = {w - 4}"
+        s1_len = w + p if c.variant == "mm" else w
         second_lock = f"\n    %lEnd = aie.lock(%t02, {SYNC_LOCK_END}) {{init = 0 : i32, sym_name = \"lEnd\"}}"
         second_flow = "\n    aie.flow(%t02, DMA : 1, %t02, DMA : 1)"
         dst2 = (f"\n    %dst2 = aie.buffer(%t02) {{address = {RING_DST2_ADDR} : i32, sym_name = \"dst2\"}} "
@@ -1502,11 +1506,11 @@ def ring_design_mlir(c: RingCase) -> str:
         second_task = (f"    ^m1_start:\n      %s2 = aie.dma_start(MM2S, 1, ^pre1, ^s1_start)\n"
                        f"    ^pre1:\n      aie.dma_bd(%pre : memref<{p}xi32>)\n      aie.next_bd ^send1\n"
                        f"    ^send1:\n      %ca1 = arith.constant 1 : i32\n      aie.use_lock(%lA, AcquireGreaterEqual, %ca1)\n"
-                       f"      aie.dma_bd(%src : memref<{w}xi32>)\n"
+                       f"      aie.dma_bd({m1_bd})\n"
                        f"      %ce1 = arith.constant 1 : i32\n      aie.use_lock(%lEnd, Release, %ce1)\n"
                        f"      aie.next_bd ^end\n"
                        f"    ^s1_start:\n      %s3 = aie.dma_start(S2MM, 1, ^recv1, ^end)\n"
-                       f"    ^recv1:\n      aie.dma_bd(%dst2 : memref<{w + p}xi32> offset = 0 len = {w + p})\n"
+                       f"    ^recv1:\n      aie.dma_bd(%dst2 : memref<{w + p}xi32> offset = 0 len = {s1_len})\n"
                        f"      aie.next_bd ^end\n")
     return f"""module {{
   aie.device(npu1_1col) {{
@@ -1541,7 +1545,7 @@ def ring_design_mlir(c: RingCase) -> str:
       aie.use_lock(%lB, Release, %cb)
       aie.next_bd ^end
     ^recv_start:
-      %s1 = aie.dma_start(S2MM, {c.s2mm}, ^recv, {"^m1_start" if c.variant in ("ms", "mm") else "^end"})
+      %s1 = aie.dma_start(S2MM, {c.s2mm}, ^recv, {"^m1_start" if c.variant in ("ms", "mm", "mx") else "^end"})
 {recv}{second_task}    ^end:
       aie.end
     }}
@@ -1557,6 +1561,9 @@ def ring_design_mlir(c: RingCase) -> str:
 
 
 def ring_memmod_events(c: RingCase) -> list[str]:
+    if c.variant == "mx":
+        return ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD",
+                "DMA_MM2S_1_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD", "DMA_S2MM_1_FINISHED_BD", "CONFLICT_DM_BANK_0"]
     if c.variant == "mm":
         return ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_MM2S_1_FINISHED_BD",
                 "DMA_MM2S_0_MEMORY_STARVATION", "DMA_MM2S_1_MEMORY_STARVATION", "CONFLICT_DM_BANK_0",
@@ -1637,8 +1644,11 @@ def ring_plan() -> list[RingCase]:
     # second batch: image-write unit (one buffer over two bank-0 granules), two channels with and without
     # the core camping
     cases += [RingCase("m0", pad=12, pad_one=True), RingCase("ms"), RingCase("ms", n=1)]
-    # third batch: two MM2S channels on one schedule (they meet at every access), core camping and silent
+    # third batch: two MM2S channels on one schedule, core camping and silent
     cases += [RingCase("mm", n=120), RingCase("mm", n=1)]
+    # fourth batch: two MM2S channels on opposite granule parity, core silent (forces a same-bank meeting
+    # when the two grants are one cycle apart)
+    cases += [RingCase("mx", n=1)]
     return cases
 
 
@@ -1677,7 +1687,7 @@ def format_ring_table(rows) -> str:
         lines.append(f"{c.name:<18} {run:<6} +{r['grant']}    {','.join(map(str, r['lost'])) or '-':<33} "
                      f"{runs:<44} {res['dma_wins']} / {res['dma_refused']}  {res['withdrew'] or '-'}  "
                      f"{r['mm2s_fin']} {r['s2mm_fin']} {bp or '-'}"
-                     + (f" fins {r['finished']}" if c.variant in ("ms", "mm") else ""))
+                     + (f" fins {r['finished']}" if c.variant in ("ms", "mm", "mx") else ""))
     return "\n".join(lines)
 
 
