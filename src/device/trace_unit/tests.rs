@@ -476,6 +476,8 @@ fn test_packet_formation() {
     for i in 1..=20 {
         notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
     }
+    // the output stage hands the packet over once its emit latency has passed
+    commit_each(&mut tu, 21..=40);
 
     // Should have exactly one packet now (28 bytes consumed)
     assert!(tu.has_pending_packets());
@@ -580,6 +582,8 @@ fn test_packet_header_parity() {
     for i in 1..=20 {
         notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
     }
+    // the output stage hands the packet over once its emit latency has passed
+    commit_each(&mut tu, 21..=40);
 
     let packet = tu.pop_packet().unwrap();
     let header = packet[0];
@@ -795,6 +799,7 @@ fn test_packet_header_matches_mlir_aie_decoder() {
         for i in 1..=20 {
             notify_commit(&mut tu, if i % 2 == 0 { 37 } else { 38 }, i as u64);
         }
+        commit_each(&mut tu, 21..=40);
 
         let packet = tu.pop_packet().unwrap();
         let header = packet[0];
@@ -1027,7 +1032,8 @@ fn test_per_cycle_coalesce_bounds_byte_rate() {
         tu.commit_cycle(cycle);
     }
 
-    let bytes_emitted = tu.byte_buffer.len() + tu.pending_words.len() * 4 - start_len;
+    let staged_words: usize = tu.staged.iter().map(|(_, w)| w.len()).sum();
+    let bytes_emitted = tu.byte_buffer.len() + (tu.pending_words.len() + staged_words) * 4 - start_len;
     // Worst-case with delta=1: each cycle emits one Multiple0 = 2 bytes.
     // Upper bound: CYCLES * 2 (plus some rounding from packetization).
     // Legacy Single0-per-event encoding would emit CYCLES * 8 = 800 bytes;
@@ -1488,8 +1494,9 @@ fn idle_longer_than_the_cycles_field_is_sync_tokens() {
 // Silicon writes each Repeat1(1023) in the cycle its 1023rd repeat happens, not when the run
 // ends: in the quiet stretches of objectfifo_repeat_init_values_repeat every shim trace packet
 // is the same 28 bytes (`Rep0(10) Sng0(64,0) Rep0(7) Skip Mul0(192,0)` and 11 x Rep1(1023))
-// and is handed to the stream in the cycle the 11th chunk completes. The byte stream is the
-// same as when the run is written at its end; only the cycle bytes enter the buffer moves.
+// and reaches the S2MM 11 cycles after the 11th chunk's last repeat. A chunk is written in
+// the cycle of the next identical frame; the byte stream is the same as when the run is
+// written at its end, only the cycle bytes enter the buffer moves.
 
 /// A started unit with slot 3 (hw event 26, a level) and slots 5..=7 (24, 35, 36) mapped.
 /// Returns the unit and the length of the Start marker already in the buffer.
@@ -1510,15 +1517,16 @@ fn commit_each(tu: &mut TraceUnit, cycles: std::ops::RangeInclusive<u64>) {
     }
 }
 
-/// Test 1: a level held alone writes its first Repeat1(1023) in the cycle of the 1023rd repeat.
+/// Test 1: a level held alone writes its first Repeat1(1023) in the cycle after the 1023rd
+/// repeat: the frame of that cycle cannot extend the run.
 #[test]
-fn a_lone_held_level_writes_its_saturated_repeat_at_the_1023rd_repeat() {
+fn a_lone_held_level_writes_its_saturated_repeat_one_cycle_after_the_1023rd_repeat() {
     let (mut tu, start_len) = held_run_unit();
     tu.set_event_level(26, 1, true); // the frame in cycle 1, repeats in 2..=1024
-    commit_each(&mut tu, 1..=1023);
-    assert_eq!(&tu.byte_buffer[start_len..], &[0x30], "1022 repeats: nothing written yet");
+    commit_each(&mut tu, 1..=1024);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30], "1023 repeats: still counting");
 
-    commit_each(&mut tu, 1024..=1024);
+    commit_each(&mut tu, 1025..=1025);
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
     assert_ne!(tu.held_mask, 0, "the level is still held");
 }
@@ -1531,19 +1539,19 @@ fn a_lone_held_level_writes_its_saturated_repeat_at_the_1023rd_repeat() {
 fn a_long_hold_writes_each_saturation_at_its_cycle() {
     let (mut tu, start_len) = held_run_unit();
     tu.set_event_level(26, 1, true);
-    commit_each(&mut tu, 1..=1023);
-    commit_each(&mut tu, 1024..=1024);
+    commit_each(&mut tu, 1..=1024);
+    commit_each(&mut tu, 1025..=1025);
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
-    commit_each(&mut tu, 1025..=2046);
+    commit_each(&mut tu, 1026..=2047);
     assert_eq!(tu.byte_buffer.len(), start_len + 3);
-    commit_each(&mut tu, 2047..=2047);
+    commit_each(&mut tu, 2048..=2048);
     // the second chunk would straddle the word: Skip fill first
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF]);
-    commit_each(&mut tu, 2048..=3069);
+    commit_each(&mut tu, 2049..=3070);
     assert_eq!(tu.byte_buffer.len(), start_len + 6);
-    commit_each(&mut tu, 3070..=3070);
+    commit_each(&mut tu, 3071..=3071);
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF, 0xFE, 0xDB, 0xFF, 0xDB, 0xFF]);
-    commit_each(&mut tu, 3071..=3075); // five more held cycles
+    commit_each(&mut tu, 3072..=3075); // four more held cycles, five repeats with 3071
     assert_eq!(tu.byte_buffer.len(), start_len + 8);
 
     tu.set_event_level(26, 3076, false);
@@ -1567,12 +1575,13 @@ fn the_same_run_written_at_its_end_is_the_same_bytes() {
 }
 
 /// Test 3: the silicon packet. A 28-byte payload of `Rep0(10) Sng0 Rep0(7) Mul0(192,0)` and
-/// 11 x Rep1(1023) is handed over in the cycle of the 11th saturation, level still held.
+/// 11 x Rep1(1023): the 11th chunk is written one cycle after its 1023rd repeat and the packet
+/// is handed over `EMIT` cycles later, level still held.
 /// (The lead is built from events: a 11-cycle hold of slot 5 handing over to slot 6 held for
 /// 8 cycles, then slot 7 joining; that is 6 lead bytes as on silicon, but with no Skip fill
 /// since the buffer is aligned differently.)
 #[test]
-fn the_silicon_packet_is_handed_over_at_the_11th_saturation() {
+fn the_silicon_packet_is_handed_over_emit_cycles_after_the_11th_saturation_is_written() {
     let (mut tu, _) = held_run_unit();
     tu.set_event_level(24, 1, true); // slot 5: cycles 1..=11 (Single + Repeat0(10))
     tu.commit_cycle(1);
@@ -1586,10 +1595,11 @@ fn the_silicon_packet_is_handed_over_at_the_11th_saturation() {
     assert_eq!(tu.byte_buffer, vec![0x50, 0xEA, 0x60, 0xE7, 0xCC, 0x00]);
 
     let last = 20 + 11 * 1023; // cycle of the 11th chunk's 1023rd repeat
-    commit_each(&mut tu, 21..=last - 1);
-    assert!(!tu.has_pending_packets(), "10 chunks: packet not complete");
-    commit_each(&mut tu, last..=last);
-    assert!(tu.has_pending_packets(), "packet handed over in the cycle of the 11th saturation");
+    let written = last + 1; // the cycle of the next identical frame
+    commit_each(&mut tu, 21..=written + EMIT - 1);
+    assert!(!tu.has_pending_packets(), "packet not handed over before written + EMIT");
+    commit_each(&mut tu, written + EMIT..=written + EMIT);
+    assert!(tu.has_pending_packets(), "packet handed over EMIT cycles after the 11th chunk is written");
     assert_eq!(tu.held_mask & 0xC0, 0xC0, "both levels still held");
 
     let packet = tu.pop_packet().unwrap();
@@ -1618,14 +1628,14 @@ fn a_pulse_in_a_hold_below_saturation_is_unchanged() {
     assert_eq!(body, [0x30, 0xD9, 0xF2, 0xC0, 0x90, 0x30, 0xD8, 98]);
 }
 
-/// Test 5a: a Sync right after a run that saturated exactly: the Repeat1 is written at its
-/// cycle, then the Sync (idle >= 2^18 before the next frame), then the frame.
+/// Test 5a: a Sync right after a run that saturated exactly: the Repeat1 is written with the
+/// Sync (the next frame's turn, INFERRED), then the Sync (idle >= 2^18 before the next frame), then the frame.
 #[test]
 fn saturation_then_a_sync_is_the_same_bytes() {
     let (mut tu, start_len) = held_run_unit();
     tu.set_event_level(26, 1, true);
     commit_each(&mut tu, 1..=1024);
-    assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+    assert_eq!(&tu.byte_buffer[start_len..], &[0x30], "a run of exactly 1023 repeats waits for a frame");
     tu.set_event_level(26, 1025, false);
     tu.commit_cycle(1025);
     let again = 1025 + (1 << 18) + 5; // idle = 2^18 + 5: one Sync, field 5
@@ -1640,9 +1650,9 @@ fn saturation_then_a_sync_is_the_same_bytes() {
 fn saturation_with_a_word_straddle_fill_is_the_same_bytes() {
     let (mut eager, start_len) = held_run_unit();
     eager.set_event_level(26, 1, true);
-    commit_each(&mut eager, 1..=2047);
+    commit_each(&mut eager, 1..=2048);
     assert_eq!(eager.byte_buffer.len(), start_len + 6, "second chunk and its fill are in");
-    commit_each(&mut eager, 2048..=2100);
+    commit_each(&mut eager, 2049..=2100);
     eager.set_event_level(26, 2101, false);
     commit_each(&mut eager, 2101..=2101);
     eager.flush_repeats();
@@ -1666,4 +1676,147 @@ fn a_run_ending_at_exactly_1023_repeats_has_no_trailing_repeat() {
     commit_each(&mut tu, 1025..=1025);
     tu.flush_repeats();
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
+}
+
+// -- Hand-off timing of completed packets ---------------------------------------------------
+//
+// Silicon (shim trace packets, three captures of six tests): a packet's first word reaches the
+// shim S2MM 11 cycles after the last cycle its tokens cover when its last token is a single or
+// multiple frame, a saturated Repeat1(1023), or a Repeat followed at once by a frame; g + 10
+// when a Repeat is followed by g - 1 idle cycles. That is a Repeat written in the cycle a frame
+// that cannot extend the run is sampled (R1), a frame's own token one cycle after its cycle
+// (R2), and a packet handed to the stream `STREAM_TRACE_PACKET_EMIT_CYCLES` after its last byte
+// is written (R3), on top of the 2 cycles the stream path takes. Hand-off cycles below are the
+// cycles at whose `commit_cycle` the packet first shows in `has_pending_packets`.
+
+const EMIT: u64 = xdna_archspec::aie2::timing::STREAM_TRACE_PACKET_EMIT_CYCLES as u64;
+
+/// The first cycle in `cycles` at whose commit the unit has a packet to hand over, with the
+/// byte stream untouched by the choice.
+fn first_handoff(tu: &mut TraceUnit, cycles: std::ops::RangeInclusive<u64>) -> Option<u64> {
+    cycles.into_iter().find(|&c| {
+        tu.commit_cycle(c);
+        tu.has_pending_packets()
+    })
+}
+
+/// Test: a packet completed by a single frame sampled in cycle `t_f` is handed over at
+/// `t_f + 1 + EMIT`, not at `t_f + EMIT` (R2, R3).
+#[test]
+fn a_packet_completed_by_a_single_frame_is_handed_over_at_t_f_plus_1_plus_emit() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(27, 0xFE);
+    tu.notify_event(37, 5, None); // slot 0, one pulse: Single0
+    assert_eq!(first_handoff(&mut tu, 5..=200), Some(5 + 1 + EMIT));
+    assert_eq!(tu.byte_buffer.len(), 0, "the 28 bytes went into the packet");
+}
+
+/// Test: the same for a frame of several events (Multiple0).
+#[test]
+fn a_packet_completed_by_a_multiple_frame_is_handed_over_at_t_f_plus_1_plus_emit() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(26, 0xFE);
+    tu.notify_event(37, 5, None);
+    tu.notify_event(38, 5, None); // slots 0 and 1: Multiple0 (2 bytes)
+    assert_eq!(first_handoff(&mut tu, 5..=200), Some(5 + 1 + EMIT));
+}
+
+/// Test: a saturated Repeat1(1023) is written in the cycle of the next identical frame, one
+/// after the 1023rd repeat, and the packet it completes is handed over `EMIT` later (R1, R3).
+#[test]
+fn a_packet_completed_by_a_saturated_repeat_is_handed_over_one_cycle_after_the_1023rd_repeat_plus_emit() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(25, 0xFE);
+    tu.set_event_level(26, 1, true); // frame in cycle 1, repeats in 2..=1024
+    let t_s = 1024;
+    assert_eq!(first_handoff(&mut tu, 1..=t_s + 100), Some(t_s + 1 + EMIT));
+    assert_ne!(tu.held_mask, 0, "the level is still held");
+}
+
+/// Test: a Repeat0 ending a run is written when the next frame arrives. With that frame in the
+/// very next cycle (gap 1) and 8 idle cycles later (gap 9) the hand-off is `EMIT` after the
+/// next frame's cycle either way, so the delay from the last covered cycle is gap + 10.
+#[test]
+fn a_run_ending_repeat_is_handed_over_emit_cycles_after_the_next_frame() {
+    for gap in [1u64, 9] {
+        let (mut tu, _) = held_run_unit();
+        tu.byte_buffer.clear();
+        tu.byte_buffer.resize(26, 0xFE);
+        tu.set_event_level(26, 1, true); // frame in 1, Repeat0(10) for 2..=11
+        let last_covered = 11;
+        commit_each(&mut tu, 1..=last_covered);
+        tu.set_event_level(26, last_covered + 1, false);
+        let t_n = last_covered + gap;
+        tu.notify_event(37, t_n, None); // the different frame
+        assert_eq!(
+            first_handoff(&mut tu, last_covered + 1..=t_n + 100),
+            Some(t_n + EMIT),
+            "gap {gap}: the Repeat is written in the cycle of the next frame"
+        );
+        assert_eq!(tu.byte_buffer.len(), 1, "the frame's own token is the next packet's");
+    }
+}
+
+/// Test: exactly 1023 repeats and then nothing (INFERRED corner: no silicon sample) writes no
+/// token until the next frame arrives, like any run-ending Repeat.
+#[test]
+fn a_run_of_exactly_1023_repeats_then_idle_waits_for_the_next_frame() {
+    let (mut tu, start_len) = held_run_unit();
+    tu.byte_buffer.truncate(start_len);
+    tu.byte_buffer.resize(25, 0xFE);
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=1024);
+    tu.set_event_level(26, 1025, false);
+    commit_each(&mut tu, 1025..=1999);
+    assert!(!tu.has_pending_packets());
+    assert_eq!(tu.byte_buffer.len(), 26, "frame written, the Repeat1(1023) still pending");
+    tu.notify_event(37, 2000, None);
+    assert_eq!(first_handoff(&mut tu, 2000..=2100), Some(2000 + EMIT));
+}
+
+/// Test: two packets completing within `EMIT` cycles of each other leave in order, each no
+/// earlier than its own completion + `EMIT`, the second only after the first.
+#[test]
+fn two_packets_completing_close_together_leave_in_order() {
+    let (mut tu, _) = held_run_unit();
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(27, 0xFE);
+    tu.notify_event(37, 5, None);
+    commit_each(&mut tu, 5..=7);
+    tu.byte_buffer.resize(27, 0xFE); // a second packet completes with the frame of cycle 8
+    tu.notify_event(38, 8, None);
+    let mut words_at = Vec::new();
+    for c in 8..=40 {
+        tu.commit_cycle(c);
+        words_at.push((c, tu.pending_words.len()));
+    }
+    let first = words_at.iter().find(|(_, n)| *n == 8).map(|(c, _)| *c);
+    let second = words_at.iter().find(|(_, n)| *n == 16).map(|(c, _)| *c);
+    assert_eq!(first, Some(5 + 1 + EMIT));
+    assert_eq!(second, Some(8 + 1 + EMIT));
+    let a = tu.pop_packet().unwrap();
+    let b = tu.pop_packet().unwrap();
+    assert_eq!(a[7] & 0xFF, 0x04, "first packet ends in slot 0's Single0 (4 idle cycles)");
+    assert_eq!(b[7] & 0xFF, 0x12, "second packet ends in slot 1's Single0 (2 idle cycles)");
+}
+
+/// Test: a packet is handed over at exactly its ready cycle whether that cycle is quiet or
+/// carries a frame of its own.
+#[test]
+fn hand_off_does_not_depend_on_what_else_happens_in_the_ready_cycle() {
+    for dirty in [false, true] {
+        let (mut tu, _) = held_run_unit();
+        tu.byte_buffer.clear();
+        tu.byte_buffer.resize(27, 0xFE);
+        tu.notify_event(37, 5, None);
+        let ready = 5 + 1 + EMIT;
+        if dirty {
+            commit_each(&mut tu, 5..=ready - 1);
+            tu.notify_event(38, ready, None);
+        }
+        assert_eq!(first_handoff(&mut tu, 5..=ready + 20), Some(ready), "dirty = {dirty}");
+    }
 }

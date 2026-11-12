@@ -57,7 +57,7 @@ What silicon does, and the encoder now follows (`commit_pending_frame`, `push_fr
   the true cycle on silicon, and since the emulator writes the same, on both; `soc` (= `ts` minus
   frames) drifts one cycle per frame on both.
 - **Identical consecutive frames are one frame plus Repeats** (0 of 44k silicon frames repeat
-  without one; Repeat0 up to 15, Repeat1 16..1023, 1023-chunks beyond, each Repeat1(1023) written in the cycle of its 1023rd repeat, not when the run ends: every shim packet in a quiet stretch of `objectfifo_repeat_init_values_repeat` ends in 11 of them). A held level is such a
+  without one; Repeat0 up to 15, Repeat1 16..1023, 1023-chunks beyond, each Repeat1(1023) written in the cycle of the next identical frame (one after its 1023rd repeat), not when the run ends: every shim packet in a quiet stretch of `objectfifo_repeat_init_values_repeat` ends in 11 of them; a run-ending Repeat is written in the cycle of the next different frame, an event frame's token one cycle after its own cycle, and a completed packet's first word reaches the shim S2MM 10 cycles after its last byte is written, 8 of them the trace unit's output stage, `stream_switch.trace_packet_emit_cycles`). A held level is such a
   run: its open frame carries the idle cycles before it, the rest are `(mask, 0)` frames, a pulse
   inside it is its own frame and the cycle after it a held-only frame again. This replaces the
   skip-token / skew-debt bookkeeping, which approximated it.

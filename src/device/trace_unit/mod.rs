@@ -203,6 +203,15 @@ pub struct TraceUnit {
     no_pc_warnings: u32,
     /// Accumulated encoded bytes waiting to be packed into packets.
     pub(super) byte_buffer: Vec<u8>,
+    /// Cycle of the token being written: the cycle in which silicon writes it, which a packet
+    /// completed by that token is timed from. Set by every writer before it pushes bytes.
+    token_cycle: u64,
+    /// Latest cycle the unit has been told about (`commit_cycle`), for writes made outside a
+    /// commit (`flush`).
+    now: u64,
+    /// Completed packets held in the output stage: `(cycle the first word may be handed to the
+    /// stream, the 8 words)`. Packets leave in order, so the ready cycles never decrease.
+    staged: VecDeque<(u64, Vec<(u32, bool)>)>,
     /// Individual words ready for emission to the stream switch.
     /// Each entry is (word, tlast). Words are pushed in order: header first,
     /// then 7 data words, with TLAST=true on the last word. This allows the
@@ -233,6 +242,18 @@ pub struct TraceUnit {
 
 /// Largest count one Repeat1 token holds (10-bit field); a run longer than this is chunks of it.
 const REPEAT1_MAX: u64 = (1 << 10) - 1;
+
+/// Cycles between the cycle an event frame is sampled and the cycle its token is written: the
+/// trace unit's frame register. Structural, not tunable. Silicon: a shim trace packet completed
+/// by a single or multiple frame reaches the shim S2MM 11 cycles after the frame's cycle (48 of
+/// 48), the same as a packet completed by a saturated Repeat1 after the 1023rd repeat (149 of
+/// 149), which is written in the cycle of the next identical frame (R1 below); with the packet
+/// emit latency and the 2-cycle stream path that is only consistent if the frame token is
+/// written one cycle after its frame.
+const FRAME_TOKEN_LAG: u64 = 1;
+
+/// Cycles a completed packet waits in the output stage (`xdna-archspec`, measured on the shim).
+const PACKET_EMIT_CYCLES: u64 = xdna_archspec::aie2::timing::STREAM_TRACE_PACKET_EMIT_CYCLES as u64;
 
 /// Idle cycles in a mode-0 frame's cycles field: 18 bits.
 const CYCLES_FIELD_RANGE: u64 = 1 << 18;
@@ -272,6 +293,9 @@ impl TraceUnit {
             pc_truncate_warnings: 0,
             no_pc_warnings: 0,
             byte_buffer: Vec::with_capacity(64),
+            token_cycle: 0,
+            now: 0,
+            staged: VecDeque::new(),
             pending_words: VecDeque::new(),
             col,
             row,
@@ -734,6 +758,8 @@ impl TraceUnit {
     /// or Multiple encoding) to the byte buffer for each cycle that had
     /// any pending events, matching the HW "one frame per cycle" rule.
     pub fn commit_cycle(&mut self, cycle: u64) {
+        self.now = self.now.max(cycle);
+        self.release_staged(cycle);
         if self.state != TraceState::Running {
             return;
         }
@@ -762,9 +788,8 @@ impl TraceUnit {
             return;
         }
         let held_cycles = cycle - self.last_event_cycle;
-        self.push_frame_run(self.frame_held, 0, held_cycles);
+        self.push_frame_run(self.frame_held, 0, held_cycles, self.last_event_cycle + 1);
         self.last_event_cycle = cycle;
-        self.try_emit_packet();
     }
 
     /// Advance the timer. Called each cycle to keep the internal clock in sync.
@@ -844,9 +869,11 @@ impl TraceUnit {
             self.commit_pending_frame();
         }
         // Repeats still owed to the last frame belong before the padding.
+        self.token_cycle = self.now.max(self.last_event_cycle);
         self.flush_repeats();
 
         if self.byte_buffer.is_empty() {
+            self.release_all_staged();
             return;
         }
 
@@ -864,6 +891,23 @@ impl TraceUnit {
         }
 
         self.emit_packet_from_buffer();
+
+        self.release_all_staged();
+    }
+
+    /// The trace is over: nothing is left to wait for.
+    fn release_all_staged(&mut self) {
+        for (_, words) in self.staged.drain(..) {
+            self.pending_words.extend(words);
+        }
+    }
+
+    /// Hand the staged packets whose ready cycle has come to the stream, in order.
+    fn release_staged(&mut self, cycle: u64) {
+        while self.staged.front().is_some_and(|(ready, _)| *ready <= cycle) {
+            let (_, words) = self.staged.pop_front().expect("front checked");
+            self.pending_words.extend(words);
+        }
     }
 
     // -- Internal encoding methods --
@@ -901,14 +945,14 @@ impl TraceUnit {
                 let t = self.pending_cycle;
                 if self.frame_held != 0 {
                     let between = t.saturating_sub(self.last_event_cycle + 1);
-                    self.push_frame_run(self.frame_held, 0, between);
+                    self.push_frame_run(self.frame_held, 0, between, self.last_event_cycle + 1);
                     self.last_event_cycle = self.last_event_cycle.max(t.saturating_sub(1));
                 }
                 if active != 0 {
                     let idle = t.saturating_sub(self.last_event_cycle + 1);
                     let (syncs, field) = split_idle(idle);
-                    self.push_syncs(syncs);
-                    self.push_frame_run(active, field, 1);
+                    self.push_syncs(syncs, t);
+                    self.push_frame_run(active, field, 1, t);
                     self.last_event_cycle = t;
                 }
                 // A level that dropped with nothing else asserted writes no frame: the
@@ -933,6 +977,7 @@ impl TraceUnit {
                     );
                     self.pc_truncate_warnings += 1;
                 }
+                self.token_cycle = self.pending_cycle + FRAME_TOKEN_LAG;
                 self.encode_event_pc(active, pc14);
             }
             TraceMode::Execution => {
@@ -989,42 +1034,53 @@ impl TraceUnit {
             self.byte_buffer.extend(std::iter::repeat(0xFE).take(4 - used));
         }
         self.byte_buffer.extend_from_slice(op);
+        self.try_emit_packet();
     }
 
-    /// Write `count` consecutive identical frames: the frame itself, then Repeat tokens for
-    /// the rest, and fold the run into a previous identical frame so a periodic pulse is
-    /// one frame plus a Repeat however often it fires.
-    fn push_frame_run(&mut self, mask: u8, cycles: u64, count: u64) {
+    /// Write `count` consecutive identical frames sampled in the cycles `first_cycle..`: the
+    /// frame itself, then Repeat tokens for the rest, and fold the run into a previous
+    /// identical frame so a periodic pulse is one frame plus a Repeat however often it fires.
+    ///
+    /// When each token is written (silicon, shim trace packets, `objectfifo_repeat_init_values_repeat`
+    /// and five other tests): a pending Repeat is written in the cycle a frame is sampled that
+    /// cannot extend the run, a different frame or an identical one when the count already
+    /// stands at 1023 (so a saturated Repeat1 is written one cycle after its 1023rd repeat), and
+    /// the frame's own token one cycle after that (`FRAME_TOKEN_LAG`).
+    fn push_frame_run(&mut self, mask: u8, cycles: u64, count: u64, first_cycle: u64) {
         if count == 0 {
             return;
         }
-        if self.last_frame == Some((mask, cycles)) {
-            self.repeat_pending += count;
-        } else {
+        let (mut at, mut left) = (first_cycle, count);
+        if self.last_frame != Some((mask, cycles)) {
+            self.token_cycle = first_cycle;
             self.flush_repeats();
+            self.token_cycle = first_cycle + FRAME_TOKEN_LAG;
             self.emit_event_frame(mask, cycles);
             self.last_frame = Some((mask, cycles));
-            self.repeat_pending = count - 1;
+            self.repeat_pending = 0;
+            at += 1;
+            left -= 1;
         }
-        self.write_saturated_repeats();
-    }
-
-    /// Silicon writes a Repeat1 as soon as it is full, in the cycle of its last repeat, and
-    /// counts again from zero. `flush_repeats` chunks the same way (full chunks first), so
-    /// only the cycle the bytes are written in differs from writing the run at its end.
-    fn write_saturated_repeats(&mut self) {
-        while self.repeat_pending >= REPEAT1_MAX {
-            self.encode_mode0_repeat1(REPEAT1_MAX as u16);
-            self.repeat_pending -= REPEAT1_MAX;
+        while left > 0 {
+            if self.repeat_pending == REPEAT1_MAX {
+                self.token_cycle = at;
+                self.encode_mode0_repeat1(REPEAT1_MAX as u16);
+                self.repeat_pending = 0;
+            }
+            let take = left.min(REPEAT1_MAX - self.repeat_pending);
+            self.repeat_pending += take;
+            left -= take;
+            at += take;
         }
     }
 
     /// Write `n` Sync tokens (one 0xFF and a Repeat for the rest, like any other run). They
     /// break a run of identical frames: the frames on either side are never merged.
-    fn push_syncs(&mut self, n: u64) {
+    fn push_syncs(&mut self, n: u64, cycle: u64) {
         if n == 0 {
             return;
         }
+        self.token_cycle = cycle;
         self.flush_repeats();
         self.last_frame = None;
         self.push_op(&[0xFF]);
@@ -1032,7 +1088,10 @@ impl TraceUnit {
         self.flush_repeats();
     }
 
-    /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15).
+    /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15)
+    /// in `token_cycle`. A run of exactly 1023 repeats that stops with idle cycles after it is
+    /// written only here, when the next frame arrives (INFERRED: the one rule for a Repeat that
+    /// the run did not outgrow; silicon has no sample of this corner).
     fn flush_repeats(&mut self) {
         let mut n = std::mem::take(&mut self.repeat_pending);
         while n > REPEAT1_MAX {
@@ -1260,7 +1319,8 @@ impl TraceUnit {
         if ones % 2 == 0 {
             header |= 1 << 31; // Set parity bit to make total odd
         }
-        self.pending_words.push_back((header, false));
+        let mut words = Vec::with_capacity(8);
+        words.push((header, false));
 
         // Words 1-7: 28 bytes of trace data, packed big-endian into u32s
         for word_idx in 0..7 {
@@ -1275,8 +1335,14 @@ impl TraceUnit {
                 word = (word << 8) | (byte as u32);
             }
             let tlast = word_idx == 6; // Last data word (word 7 of 8)
-            self.pending_words.push_back((word, tlast));
+            words.push((word, tlast));
         }
+        let ready = self
+            .staged
+            .back()
+            .map_or(0, |(r, _)| *r)
+            .max(self.token_cycle + PACKET_EMIT_CYCLES);
+        self.staged.push_back((ready, words));
 
         // Remove consumed bytes (up to 28)
         let consumed = self.byte_buffer.len().min(28);
