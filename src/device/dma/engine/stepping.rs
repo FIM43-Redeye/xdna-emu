@@ -4530,6 +4530,17 @@ mod bank_demand_tests {
     /// leaves AcquiringLock) that lose their bank arbitration. Returns the parked BD's bank
     /// accesses as (step - g, bank mask), its first offered word and its FINISHED_BD, both - g.
     fn run_lock_started_bd(n: u32, chained: bool, deny: &[usize]) -> (Vec<(usize, u16)>, usize, usize) {
+        run_lock_started_bd_by(n, chained, |rel, _| deny.contains(&rel))
+    }
+
+    /// `run_lock_started_bd` with the denial chosen per presented demand: `lose(step - g,
+    /// denied_last_step)` is asked only on a step where the channel presents a bank demand after
+    /// the grant, and `denied_last_step` tells whether the previous step's demand lost.
+    fn run_lock_started_bd_by(
+        n: u32,
+        chained: bool,
+        mut lose: impl FnMut(usize, bool) -> bool,
+    ) -> (Vec<(usize, u16)>, usize, usize) {
         let mut eng = DmaEngine::new_compute_tile(1, 2);
         let mut tile = Tile::compute(1, 2);
         let mut host_mem = HostMemory::new();
@@ -4544,6 +4555,7 @@ mod bank_demand_tests {
         let mut grant = None;
         let (mut accesses, mut first, mut finished) = (Vec::new(), None, None);
         let mut released = false;
+        let mut denied_last = false;
         for step in 0..400usize {
             if step == 100 {
                 tile.locks[5].value = 1;
@@ -4552,10 +4564,15 @@ mod bank_demand_tests {
                 released = true;
             }
             let phase_before = eng.channel_phase(2);
+            let presents = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0);
             let denied: &[Requester] = match grant {
-                Some(g) if deny.contains(&(step - g)) => &[Requester::Mm2s(0)],
+                Some(g) if presents && lose(step - g, denied_last) => &[Requester::Mm2s(0)],
                 _ => &[],
             };
+            denied_last = !denied.is_empty();
             eng.cycle_dma_banks = 0;
             eng.reset_cycle_drain_counters();
             eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
@@ -4631,6 +4648,30 @@ mod bank_demand_tests {
         let (accesses, _, finished) = run_lock_started_bd(64, true, &[51]);
         assert_eq!(accesses.last(), Some(&(52, 0b10)));
         assert_eq!(finished, 53);
+    }
+
+    /// Silicon (lock-fetch probe, two passes): of the ~40 conflict rows in which a core access won
+    /// the bank at one DMA access, those at g + 3, 4, 5, 7, 11, 15, ..., 47 delayed neither
+    /// FINISHED_BD (g + 52); only the first access (g + 2, the stream) and the last (g + 51, the
+    /// finish, g + 53) moved anything. And the dedicated collision probe measured
+    /// `T_collide / T_apart = 1.0000` for a lock-started MM2S that lost 112 arbitrations in 16
+    /// transfers and paid 5 cycles in all: a lock-started BD loses its warm arbitrations at no
+    /// cost, because the staging that its parked word clock filled covers the retry. Here every
+    /// warm access loses once (each retried the next cycle) and the finish stays at g + 52.
+    #[test]
+    fn a_lock_started_mm2s_loses_its_warm_bank_arbitrations_at_no_cost() {
+        let base = run_lock_started_bd(64, true, &[]);
+        assert_eq!(base.2, 52);
+        for cell in [3usize, 4, 5, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47] {
+            let (_, _, finished) = run_lock_started_bd(64, true, &[cell]);
+            assert_eq!(finished, 52, "one denial at g + {cell}");
+        }
+        for chained in [false, true] {
+            let (accesses, _, finished) =
+                run_lock_started_bd_by(64, chained, |rel, denied_last| rel > 2 && rel < 51 && !denied_last);
+            assert_eq!(finished, 52, "every warm access lost once, chained={chained}");
+            assert_eq!(accesses.len(), 16, "all 16 granules are still accessed");
+        }
     }
 
     /// The lead of a BD waiting for its lock counts every word the word clock has sequenced, the
