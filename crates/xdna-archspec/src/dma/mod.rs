@@ -33,7 +33,7 @@ mod layouts_tests;
 
 pub use field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
+    ShimMuxField, ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout, LockEventSelectionLayout,
 };
 
 pub use layouts::DeviceRegLayout;

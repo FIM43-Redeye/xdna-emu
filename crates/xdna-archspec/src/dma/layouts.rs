@@ -12,7 +12,7 @@
 
 use crate::dma::field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
+    ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout, LockEventSelectionLayout,
 };
 use crate::regdb::{RegisterDb, RegisterDef};
 use crate::types::TileKind;
@@ -161,6 +161,14 @@ pub struct DeviceRegLayout {
     pub memory_events: ModuleEventLayout,
     /// MemTile event registers
     pub memtile_events: ModuleEventLayout,
+
+    // -- Lock event selection banks (which lock each LOCK_SEL<n> watches) --
+    /// Compute tile memory module
+    pub memory_lock_selection: LockEventSelectionLayout,
+    /// MemTile
+    pub memtile_lock_selection: LockEventSelectionLayout,
+    /// Shim
+    pub shim_lock_selection: LockEventSelectionLayout,
 
     /// Cascade configuration register (compute tiles, core module)
     pub cascade_config_offset: u32,
@@ -341,6 +349,9 @@ impl DeviceRegLayout {
         let core_events = build_event_layout("core");
         let memory_events = build_event_layout("memory");
         let memtile_events = build_event_layout("memory_tile");
+        let memory_lock_selection = LockEventSelectionLayout::from_regdb(&db, "memory")?;
+        let memtile_lock_selection = LockEventSelectionLayout::from_regdb(&db, "memory_tile")?;
+        let shim_lock_selection = LockEventSelectionLayout::from_regdb(&db, "shim")?;
 
         // Cascade/accumulator control register (core module, compute tiles).
         // AM025 names this "Accumulator_Control" -- it configures cascade
@@ -399,6 +410,9 @@ impl DeviceRegLayout {
             core_events,
             memory_events,
             memtile_events,
+            memory_lock_selection,
+            memtile_lock_selection,
+            shim_lock_selection,
             cascade_config_offset,
             db,
         })
