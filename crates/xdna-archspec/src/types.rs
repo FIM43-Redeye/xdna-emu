@@ -1349,6 +1349,12 @@ pub struct DmaTiming {
     /// Which physical structure holds the word is not separated.
     pub s2mm_ingress_skid_depth: u8,
 
+    /// Cycles from a tile S2MM's START_TASK until its STREAM_STARVATION level can rise while the
+    /// channel waits on its first BD's lock: 6 (NPU1 onset probes, 138 silicon runs, compute and
+    /// memtile, every length and source). The level is low for the first six cycles after the
+    /// task starts, and rises three cycles before STALLED_LOCK does (+9 on silicon).
+    pub s2mm_starvation_arm_cycles: u8,
+
     /// MM2S DMA egress staging depth (32-bit words) for compute and mem tiles
     /// -- how many words the channel holds between the memory read and the
     /// stream port.

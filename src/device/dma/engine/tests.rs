@@ -4697,3 +4697,243 @@ fn a_starved_s2mm_channel_reads_the_silicon_pipeline_state() {
     ];
     assert_parked_rows("shim", false, &shim_rows, || (DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 5));
 }
+
+// ---------------------------------------------------------------------------
+// S2MM STREAM_STARVATION while the channel waits on its first BD's lock.
+//
+// Silicon (NPU1 onset probes, 138 runs): a tile S2MM raises the level 6 cycles after its
+// START_TASK, three cycles before STALLED_LOCK shows, and holds it in every cycle in which no
+// beat is on offer at its master port, for as long as its BD still wants words. It falls with
+// the first beat and stays down while beats keep coming, while a full ingress refuses the beat
+// on offer, and once every word of the BD has arrived.
+// ---------------------------------------------------------------------------
+
+/// A tile S2MM (channel 0) with one BD gated on a lock nobody releases, driven in the array's
+/// per-cycle phase order, recording the STREAM_STARVATION level it asserts each cycle.
+struct StarvationRig {
+    eng: DmaEngine,
+    tile: Tile,
+    host: HostMemory,
+    lock: usize,
+    cycle: u64,
+    level: bool,
+    /// `levels[i]` is the level in cycle `first_cycle + i`.
+    levels: Vec<bool>,
+    first_cycle: u64,
+    accepted: usize,
+}
+
+impl StarvationRig {
+    fn compute() -> Self {
+        Self::with(DmaEngine::new_compute_tile(1, 2), make_tile(), 5)
+    }
+
+    fn memtile() -> Self {
+        Self::with(DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 64 + 5)
+    }
+
+    fn shim() -> Self {
+        Self::with(DmaEngine::new_shim_tile(1, 0), Tile::shim(1, 0), 5)
+    }
+
+    fn with(eng: DmaEngine, tile: Tile, lock: usize) -> Self {
+        Self {
+            eng,
+            tile,
+            host: make_host_memory(),
+            lock,
+            cycle: 100,
+            level: false,
+            levels: Vec::new(),
+            first_cycle: 100,
+            accepted: 0,
+        }
+    }
+
+    /// Configure a BD of `words` words gated on the lock and start channel 0 in the current cycle.
+    fn start(&mut self, words: u32) {
+        let bd = BdConfig::simple_1d(0x400, words * 4).with_acquire(self.lock as u8, 1);
+        self.eng.configure_bd(0, bd).unwrap();
+        self.eng.set_current_cycle(self.cycle);
+        self.eng.start_channel(0, 0).unwrap();
+        self.first_cycle = self.cycle;
+    }
+
+    /// One cycle: lock phases, DMA step, then the routing pass offering a beat (or not).
+    fn cycle(&mut self, offer: bool) {
+        let c = self.cycle;
+        self.eng.set_current_cycle(c);
+        self.eng.reset_cycle_drain_counters();
+        self.eng.submit_lock_requests(&mut self.tile, &mut NeighborTiles::empty());
+        self.tile.resolve_lock_requests(c);
+        self.eng.step(&mut self.tile, &mut NeighborTiles::empty(), &mut self.host);
+
+        self.eng.note_stream_offer(0, offer);
+        self.eng.note_ingress_offer(0, offer);
+        if offer && self.eng.can_accept_stream_in_for_routing(0) {
+            let word = StreamData { data: 0xC0DE_0000 | c as u32, tlast: false, channel: 0 };
+            assert!(self.eng.push_stream_in(word));
+            self.accepted += 1;
+        }
+        self.eng.settle_stream_starvation();
+
+        for (cycle, event) in self.eng.drain_trace_events() {
+            if let EventType::DmaStreamStarvation { channel: 0, active } = event {
+                assert_eq!(cycle, c, "the level edge must be stamped with the cycle that caused it");
+                self.level = active;
+            }
+        }
+        self.levels.push(self.level);
+        self.cycle += 1;
+    }
+
+    fn run(&mut self, cycles: u64, offer: impl Fn(u64) -> bool) {
+        for _ in 0..cycles {
+            let at = self.cycle - self.first_cycle;
+            self.cycle(offer(at));
+        }
+    }
+
+    /// The level in the cycle `at` cycles after the channel was started.
+    fn at(&self, at: u64) -> bool {
+        self.levels[at as usize]
+    }
+
+    /// The cycles (relative to the start) in which the level was high, as maximal `[from, to]` runs.
+    fn high_runs(&self) -> Vec<(u64, u64)> {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (i, &high) in self.levels.iter().enumerate() {
+            let i = i as u64;
+            match runs.last_mut() {
+                Some(r) if high && r.1 + 1 == i => r.1 = i,
+                _ if high => runs.push((i, i)),
+                _ => {}
+            }
+        }
+        runs
+    }
+}
+
+/// The arming delay of silicon: low for six cycles after START_TASK, high from the seventh.
+const ARM: u64 = 6;
+
+#[test]
+fn lock_stalled_s2mm_raises_starvation_six_cycles_after_start_and_holds_it_until_the_first_beat() {
+    for mut rig in [StarvationRig::compute(), StarvationRig::memtile()] {
+        rig.start(16);
+        // No beat for 30 cycles, then a beat every cycle.
+        rig.run(60, |at| at >= 30);
+
+        for at in 0..ARM {
+            assert!(!rig.at(at), "cycle +{at}: the level is still low while the task arms");
+        }
+        for at in ARM..30 {
+            assert!(rig.at(at), "cycle +{at}: lock-stalled, BD wants words, no beat on offer");
+        }
+        for at in 30..60 {
+            assert!(!rig.at(at), "cycle +{at}: a beat is on offer");
+        }
+        assert_eq!(rig.high_runs(), vec![(ARM, 29)]);
+        // Nothing here granted the lock: the channel really was lock-stalled throughout.
+        assert!(rig.eng.channel_lock_stalled(0));
+    }
+}
+
+#[test]
+fn lock_stalled_s2mm_pulses_starvation_in_every_cycle_without_a_beat_while_the_bd_wants_words() {
+    for mut rig in [StarvationRig::compute(), StarvationRig::memtile()] {
+        rig.start(16);
+        // Beats from cycle 20: four, a one-cycle gap, four, a one-cycle gap, then a long gap
+        // before the last eight (silicon c4x4 / t4x4: 1-cycle pulses, then a held level).
+        let beat = |at: u64| match at {
+            20..=23 | 25..=28 | 60..=67 => true,
+            _ => false,
+        };
+        rig.run(80, beat);
+
+        assert_eq!(rig.high_runs(), vec![(ARM, 19), (24, 24), (29, 59)]);
+        assert_eq!(rig.accepted, 16);
+    }
+}
+
+#[test]
+fn lock_stalled_s2mm_with_a_full_ingress_stays_low_while_a_refused_beat_is_on_offer() {
+    for mut rig in [StarvationRig::compute(), StarvationRig::memtile()] {
+        rig.start(64);
+        // A beat every cycle from +20: the ingress fills, then refuses the beat on offer.
+        rig.run(80, |at| at >= 20);
+
+        assert!(rig.accepted < 64, "the ingress must have filled and refused beats");
+        assert_eq!(rig.accepted, rig.eng.input_fifo_capacity());
+        assert_eq!(rig.high_runs(), vec![(ARM, 19)], "low from the first beat on, refused or not");
+    }
+}
+
+#[test]
+fn lock_stalled_s2mm_stays_low_once_every_word_of_its_bd_has_arrived() {
+    for mut rig in [StarvationRig::compute(), StarvationRig::memtile()] {
+        rig.start(4);
+        // Four beats, then nothing for a long time with the lock still held.
+        rig.run(60, |at| (20..24).contains(&at));
+
+        assert_eq!(rig.accepted, 4);
+        assert_eq!(rig.high_runs(), vec![(ARM, 19)], "a complete BD wants nothing more");
+    }
+}
+
+#[test]
+fn lock_wait_starvation_ends_when_the_lock_is_granted() {
+    let mut rig = StarvationRig::compute();
+    rig.start(16);
+    rig.run(30, |_| false);
+    assert!(rig.at(29), "precondition: starving while the lock is held");
+
+    rig.tile.locks[rig.lock].set(1);
+    rig.run(10, |_| false);
+    let granted_at = rig
+        .levels
+        .iter()
+        .skip(30)
+        .position(|&h| !h)
+        .expect("the level must fall at the grant");
+    assert!(granted_at < 5, "the level falls within the lock grant, not later ({granted_at})");
+    assert!(!rig.eng.channel_lock_stalled(0));
+}
+
+#[test]
+fn lock_wait_starvation_is_not_raised_where_silicon_is_unmeasured() {
+    // Shim S2MM: bridge-calibrated, not part of the tile probes.
+    let mut shim = StarvationRig::shim();
+    shim.start(16);
+    shim.run(40, |_| false);
+    assert!(shim.high_runs().is_empty(), "shim S2MM starvation is unchanged");
+
+    // A BD with no lock to wait on is the running state, not the lock-stalled one.
+    let mut rig = StarvationRig::compute();
+    rig.eng.configure_bd(0, BdConfig::simple_1d(0x400, 64)).unwrap();
+    rig.eng.set_current_cycle(rig.cycle);
+    rig.eng.start_channel(0, 0).unwrap();
+    rig.first_cycle = rig.cycle;
+    rig.run(ARM, |_| false);
+    assert!(rig.high_runs().is_empty(), "no lock wait, no lock-wait level");
+}
+
+#[test]
+fn stopping_a_lock_stalled_channel_closes_its_starvation_level() {
+    let mut rig = StarvationRig::compute();
+    rig.start(16);
+    rig.run(20, |_| false);
+    assert!(rig.at(19));
+
+    rig.eng.stop_channel(0).unwrap();
+    let closing: Vec<_> = rig
+        .eng
+        .drain_trace_events()
+        .into_iter()
+        .filter(|(_, e)| matches!(e, EventType::DmaStreamStarvation { channel: 0, active: false }))
+        .collect();
+    assert_eq!(closing.len(), 1, "the asserted level must be closed when the channel stops");
+    rig.level = false; // the rig did not see the closing edge: this test drained it
+    rig.run(10, |_| false);
+    assert!(rig.levels[20..].iter().all(|&h| !h), "and must stay down");
+}

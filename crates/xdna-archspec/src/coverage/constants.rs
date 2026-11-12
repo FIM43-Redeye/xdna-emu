@@ -147,6 +147,10 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             build/experiments/path-capacity/onset-ports): the DMA:0 master passes 16 words into a held S2MM (EMU was 18) \
             and the source's slave port 22, so the switch holds 6 (AM020)", "16 in all less the 15 the backpressure \
             onset pins; which structure holds the word is not separated."),
+        measured("dma.s2mm_starvation_arm_cycles", "NPU1 onset probes (tools/gen_path_onset_probe.py, banked h1/h2 and \
+            clock-gate h1..h3 runs, 138 in all): a held tile S2MM's STREAM_STARVATION rises 6 cycles after its START_TASK \
+            on compute and memtile, every length and source", "STALLED_LOCK rises at +9 on silicon (+6 / +7 for 1 / 2 word \
+            BDs); the emulator raises it at +0, a separate gap. Only the first BD of a lock-stalled task is measured."),
         measured("dma.shim_s2mm_ingress_depth", "NPU1 shim absorb sweep (tools/gen_dma_queue_probe.py, absorb family): \
             MM2S 1 -> S2MM 1 on the shim, S2MM parked on a lock 76 words absorbed, 8 with no task, 3 runs identical",
             "A running (unparked) shim S2MM is not separated from a parked one; length 75 is a silicon oddity \

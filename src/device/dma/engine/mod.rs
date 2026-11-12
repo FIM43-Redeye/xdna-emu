@@ -179,6 +179,11 @@ pub struct DmaEngine {
     /// unstarted channel) is not memory pressure and does not set this.
     pub(super) s2mm_ingress_full_offered: Vec<bool>,
 
+    /// Per-S2MM-channel: the master port held a beat this cycle, whether or not the channel
+    /// took it. Set by the routing pass (Phase 4) via `note_stream_offer`, cleared with the
+    /// other per-cycle signals; read by `settle_stream_starvation`.
+    pub(super) s2mm_beat_offered: Vec<bool>,
+
     /// Per-MM2S-channel: the stream port could have taken a beat this cycle and
     /// the channel's egress staging FIFO was EMPTY --
     /// `DMA_MM2S_n_MEMORY_STARVATION`. Set by the transfer pass (Phase 3),
@@ -247,6 +252,7 @@ impl DmaEngine {
             word_opens_granule: true,
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             s2mm_ingress_full_offered: vec![false; s2mm_channels],
+            s2mm_beat_offered: vec![false; s2mm_channels],
             mm2s_egress_empty_wanted: vec![false; mm2s_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
@@ -595,6 +601,8 @@ impl DmaEngine {
         // pop runs ahead of via the input FIFO + objfifo double-buffer.
         if direction == TransferDirection::S2MM {
             self.init_accept_cursor(ch_idx, bd_index);
+            self.channels[ch_idx].lock_wait_starve_from =
+                self.current_cycle + xdna_archspec::aie2::timing::DMA_S2MM_STARVATION_ARM_CYCLES as u64;
         }
 
         // Packet header insertion is deferred until after lock acquisition.
@@ -663,6 +671,7 @@ impl DmaEngine {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
         }
         if self.channels[ch_idx].prev_starving
+            || self.channels[ch_idx].lock_wait_starving
             || self.channels[ch_idx].read_backpressure
             || self.channels[ch_idx].egress_backpressure
         {
@@ -687,6 +696,7 @@ impl DmaEngine {
         ch.controller_dispatch_index = 0;
         ch.backoff_left = 0;
         ch.prev_starving = false;
+        ch.lock_wait_starving = false;
         ch.prev_lock_stalled = false;
         ch.pending_releases.clear();
         ch.parked_releases.clear();
