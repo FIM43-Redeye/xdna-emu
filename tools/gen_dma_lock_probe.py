@@ -41,6 +41,12 @@ Two variants (case names lfkNN and lfcNN):
     reported by the table (see the hardware notes).
 The S2MM takes both BDs' words in one lock-free BD (68 words in the chained variant).
 
+Single-bank cases (`--banks 0` / `--banks 1`): the core makes one load only, k nops after the release,
+so one bank is probed alone and a bank-0 conflict cannot disturb a bank-1 access. Names (chained /
+first-BD): bank 0 lfa / lfd, bank 1 lfb / lfe; the two-load cases stay lfc / lfk. k runs 0..64.
+fetch-table prints, per platform, the DMA's per-bank map relative to the lock grant pooled over every
+run given (cells: DMA access proven / proven absent / unknown) and lists contradictions.
+
   tile (0,2): MM2S 0 bd (started at boot, so it is parked on its lock): acquire A (lock 0,
     init 0), send `src` (64 words, 0x400, data-memory bank 0, so granule g sits in physical
     bank g & 1), release B. The stream switch loops it back to S2MM 0 of the same tile,
@@ -66,9 +72,9 @@ fills the last core packet, see gen_lock_pulse_probe). The memory-module lock ev
 selector events (LOCK_n_REL follows Locks_Event_Selection_n), but selector 0 resets to
 lock 0, so lock A is lock 0 and nothing is programmed.
 
-    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained]
-    python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...]
-    python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...]
+    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained] [--banks both 0 1]
+    python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...] [--chained] [--banks ...]
+    python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...] [--chained] [--banks ...]
 """
 from __future__ import annotations
 
@@ -316,7 +322,12 @@ def cmd_analyze(args) -> int:
 # -- lock-to-fetch probe ------------------------------------------------------------
 
 FETCH_LOCK_A, FETCH_LOCK_B, FETCH_LOCK_GO = 0, 1, 2   # A is lock 0: LOCK_0_REL follows it at reset
-FETCH_KS = tuple(range(16))
+FETCH_KS = tuple(range(65))        # valid k: nops between the release and the access(es)
+FETCH_DEFAULT_KS = tuple(range(16))  # what fetch-build makes when no --ks is given
+FETCH_BANKS = ("both", "0", "1")   # both = a bank-0 load then a bank-1 load one bundle later; else one load
+# case-name prefix per (chained, bank): lfk / lfc are the two-load cases; the single-bank cases get their own
+FETCH_PREFIX = {(False, "both"): "lfk", (True, "both"): "lfc", (True, "0"): "lfa", (True, "1"): "lfb",
+                (False, "0"): "lfd", (False, "1"): "lfe"}
 FETCH_WORDS = 64
 FETCH_SRC_ADDR = 0x0400            # logical bank 0; granule g (16 bytes) in physical bank g & 1
 FETCH_LD_ADDR = 0x0800             # logical bank 0; the core's two loads, offsets 0 and 16
@@ -336,22 +347,31 @@ FETCH_CORE_GROUNDING = "PERF_CNT_2"
 FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
 
 
-def fetch_case_name(k: int, chained: bool = False) -> str:
-    return f"{'lfc' if chained else 'lfk'}{k:02d}"
+def fetch_case_name(k: int, chained: bool = False, bank: str = "both") -> str:
+    return f"{FETCH_PREFIX[(chained, bank)]}{k:02d}"
 
 
-def fetch_core_asm(k: int) -> str:
-    """The core of case k: go, settle, `event #0`, release A, k nops, a bank-0 load, a bank-1 load.
+FETCH_LOADS = {"0": ["  lda r26, [p0, #0]"], "1": ["  lda r28, [p0, #16]"],
+               "both": ["  lda r26, [p0, #0]", "  lda r28, [p0, #16]"]}
 
-    r2 = +1 releases, r3 = -1 acquires (as gen_lock_pulse_probe). p0 = `ldbuf`."""
+
+def fetch_core_asm(k: int, bank: str = "both") -> str:
+    """The core of case k: go, settle, `event #0`, release A, k nops, then the load(s).
+
+    bank "both": a bank-0 load and, one bundle later, a bank-1 load. "0" / "1": that one load alone,
+    at the same place (k nops after the release), so the other bank is not touched and a bank-0
+    conflict cannot disturb a bank-1 access. r2 = +1 releases, r3 = -1 acquires (as
+    gen_lock_pulse_probe). p0 = `ldbuf`."""
     if k not in FETCH_KS:
         raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+    if bank not in FETCH_LOADS:
+        raise ValueError(f"bank must be one of {FETCH_BANKS}")
     n = lp.nops
     body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
             f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
             *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
             "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(k),
-            "  lda r26, [p0, #0]", "  lda r28, [p0, #16]", *n(8),
+            *FETCH_LOADS[bank], *n(8),
             f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8),
             *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
     return lp.frame(body)
@@ -496,6 +516,149 @@ def format_fetch_table(rows) -> str:
     return "\n".join(lines)
 
 
+# -- lock-to-fetch: the per-bank map relative to the grant ---------------------------
+
+# Core access offset from the release stamp (cycles): the first load sits at k + offset. Silicon and
+# emulator differ (see the analysis notes); the table infers it from the conflicts when any exist.
+DEFAULT_ACCESS_OFFSET = {"hw": 1, "emu": -2}
+PLATFORM_NAMES = {"hw": "silicon", "emu": "emulator"}
+
+
+def run_platform(run: str) -> str:
+    """'hw' or 'emu' from a run directory name such as h3.hw."""
+    return run.rsplit(".", 1)[-1]
+
+
+def _entry_offsets(entry) -> list[int]:
+    """Offsets implied by the conflicts of one row: the stamp of the first conflict minus where the
+    first load sits relative to k. Empty when the row has no conflict."""
+    _case, k, bank, _run, r = entry
+    if r.get("release") is None or not r["conflicts"]:
+        return []
+    out = []
+    first = {}
+    for b, t in r["conflicts"]:
+        first.setdefault(b, t)
+    for b, t in first.items():
+        second = bank == "both" and b == "CONFLICT_DM_BANK_1"
+        if second and "CONFLICT_DM_BANK_0" in first:
+            continue                    # a retried load: its stamp has moved
+        if bank in ("0", "1") and b != f"CONFLICT_DM_BANK_{bank}":
+            continue
+        out.append(t - k - (1 if second else 0))
+    return out
+
+
+def infer_access_offsets(entries) -> int:
+    """The release-to-first-load offset of one platform: the most common value implied by its
+    conflicts, else the platform default."""
+    from collections import Counter
+    seen = Counter(o for e in entries for o in _entry_offsets(e))
+    if seen:
+        return seen.most_common(1)[0][0]
+    return DEFAULT_ACCESS_OFFSET[run_platform(entries[0][3])]
+
+
+def _row_accesses(k: int, bank: str, offset: int) -> list[tuple[int, int]]:
+    """(bank, cycle after the release) of each load of a case."""
+    if bank == "both":
+        return [(0, k + offset), (1, k + offset + 1)]
+    return [(int(bank), k + offset)]
+
+
+def fetch_access_cells(entries) -> dict:
+    """Per platform {(bank, cycle after the grant): {'dma': [labels], 'none': [labels]}}.
+
+    A conflict event is a DMA access to that bank in that cycle. A load that ran without a conflict
+    event in its cycle shows the DMA absent from that bank then. The second load of a two-load row is
+    not trusted once the first conflicted (the retry moves it). Rows without a release or a grant
+    say nothing."""
+    by_platform: dict = {}
+    for e in entries:
+        by_platform.setdefault(run_platform(e[3]), []).append(e)
+    cells: dict = {}
+    for plat, ents in by_platform.items():
+        offset = infer_access_offsets(ents)
+        c = cells.setdefault(plat, {})
+        for case, k, bank, run, r in ents:
+            if r.get("release") is None or r.get("grant") is None:
+                continue
+            label = f"{case}.{run}"
+            g = r["grant"]
+            hit = {(int(b[-1]), t) for b, t in r["conflicts"]}
+            for b, t in hit:
+                c.setdefault((b, t - g), {"dma": [], "none": []})["dma"].append(label)
+            b0_hit = any(b == "CONFLICT_DM_BANK_0" for b, _ in r["conflicts"])
+            for i, (b, t) in enumerate(_row_accesses(k, bank, offset)):
+                if (b, t) in hit or (bank == "both" and i == 1 and b0_hit):
+                    continue
+                c.setdefault((b, t - g), {"dma": [], "none": []})["none"].append(label)
+    return cells
+
+
+def _spans(values) -> str:
+    """'g+2, g+4..g+6' from a set of cycles."""
+    vs = sorted(values)
+    if not vs:
+        return "none"
+    runs = []
+    for v in vs:
+        if runs and v == runs[-1][1] + 1:
+            runs[-1][1] = v
+        else:
+            runs.append([v, v])
+    return ", ".join(f"g{a:+d}" if a == b else f"g{a:+d}..g{b:+d}" for a, b in runs)
+
+
+def format_fetch_map(entries) -> str:
+    """Per platform: the DMA's per-bank access map relative to the grant, pooled over every run given,
+    and the cells where a conflict and a clean access disagree."""
+    cells = fetch_access_cells(entries)
+    by_platform: dict = {}
+    for e in entries:
+        by_platform.setdefault(run_platform(e[3]), []).append(e)
+    lines = []
+    for plat in sorted(cells):
+        c = cells[plat]
+        lines.append(f"== per-bank map relative to the grant: {PLATFORM_NAMES.get(plat, plat)} "
+                     f"(first-load offset from the release {infer_access_offsets(by_platform[plat]):+d}) ==")
+        if not c:
+            lines.append("  no data")
+            continue
+        lo, hi = min(g for _, g in c), max(g for _, g in c)
+        lines.append("cycle  bank0            bank1       (DMA(n): n rows saw a conflict; none(n): n clean "
+                     "loads; ?: no load there)")
+        for g in range(lo, hi + 1):
+            cols = []
+            for b in (0, 1):
+                cell = c.get((b, g))
+                if cell is None:
+                    cols.append("?")
+                else:
+                    cols.append(" ".join(f"{kind}({len(cell[kind])})" for kind in ("dma", "none") if cell[kind])
+                                .replace("dma", "DMA"))
+            lines.append(f"g{g:+3d}   {cols[0]:<16} {cols[1]}")
+        for b in (0, 1):
+            dma = {g for (bb, g), cell in c.items() if bb == b and cell["dma"]}
+            absent = {g for (bb, g), cell in c.items() if bb == b and cell["none"] and not cell["dma"]}
+            seen = {g for (bb, g) in c if bb == b}
+            if not seen:
+                lines.append(f"bank {b}: no data")
+                continue
+            unknown = {g for g in range(lo, hi + 1)} - seen
+            lines.append(f"bank {b} DMA access proven: {_spans(dma)}")
+            lines.append(f"bank {b} no DMA access: {_spans(absent)}")
+            lines.append(f"bank {b} unknown (no load there, within g{lo:+d}..g{hi:+d}): {_spans(unknown)}")
+        bad = [((b, g), cell) for (b, g), cell in sorted(c.items()) if cell["dma"] and cell["none"]]
+        lines.append("CONTRADICTIONS (same cycle after the grant, same bank, one row with a conflict and one without):")
+        if not bad:
+            lines.append("  contradictions: none")
+        for (b, g), cell in bad:
+            lines.append(f"  bank {b} g{g:+d}: conflict in {', '.join(cell['dma'])}; clean in {', '.join(cell['none'])}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def level_events(commands, slot_names):
     """Level-expanded events of per-tile decoded commands (a held level has an event per cycle)."""
     from trace_decoder.decode import rebuild_timeline_mode0_levels
@@ -522,57 +685,68 @@ def load_level_events(run_dir: Path):
 
 # -- lock-to-fetch: build / run / table ---------------------------------------------
 
-def fetch_build_case(k: int, out: Path, chained: bool = False) -> None:
-    d = out / fetch_case_name(k, chained)
+def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both") -> None:
+    name = fetch_case_name(k, chained, bank)
+    d = out / name
     d.mkdir(parents=True, exist_ok=True)
-    lp.assemble(fetch_core_asm(k), d / "core.o", "k_core")
+    lp.assemble(fetch_core_asm(k, bank), d / "core.o", "k_core")
     (d / "base.mlir").write_text(fetch_design_mlir(chained))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
            "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(),
-           "--trace-config-out", "trace_config.json", "--config-test-name", fetch_case_name(k, chained),
+           "--trace-config-out", "trace_config.json", "--config-test-name", name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
     lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
-    (d / "case.json").write_text(json.dumps({"case": fetch_case_name(k, chained), "k": k, "chained": chained}) + "\n")
+    (d / "case.json").write_text(json.dumps({"case": name, "k": k, "chained": chained, "bank": bank}) + "\n")
 
 
-def fetch_cases_in(out: Path, ks, chained: bool = False) -> list[int]:
-    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k, chained)).is_dir()]
+def fetch_cases_in(out: Path, ks, chained: bool = False, bank: str = "both") -> list[int]:
+    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k, chained, bank)).is_dir()]
 
 
 def cmd_fetch_build(args) -> int:
     out = Path(args.out_dir).resolve()
-    for k in args.ks or FETCH_KS:
-        fetch_build_case(k, out, args.chained)
-        print("built", fetch_case_name(k, args.chained))
+    for bank in args.banks:
+        for k in args.ks or FETCH_DEFAULT_KS:
+            fetch_build_case(k, out, args.chained, bank)
+            print("built", fetch_case_name(k, args.chained, bank))
     return 0
 
 
 def cmd_fetch_run(args) -> int:
     out = Path(args.out_dir).resolve()
     ok = True
-    for k in fetch_cases_in(out, args.ks, args.chained):
-        name = fetch_case_name(k, args.chained)
-        ok = lp.run_case(out, name, args.tag, args.backend, output=False) and ok
-        if not ok:
-            print(f"{name}: run did not complete; stop")
-            return 1
+    for bank in args.banks:
+        for k in fetch_cases_in(out, args.ks, args.chained, bank):
+            name = fetch_case_name(k, args.chained, bank)
+            ok = lp.run_case(out, name, args.tag, args.backend, output=False) and ok
+            if not ok:
+                print(f"{name}: run did not complete; stop")
+                return 1
     return 0
 
 
 def cmd_fetch_table(args) -> int:
     out = Path(args.out_dir).resolve()
-    rows = []
-    for k in fetch_cases_in(out, args.ks, args.chained):
-        for run in args.runs:
-            run_dir = out / fetch_case_name(k, args.chained) / run
-            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
-                rows.append((k, run, {"release": None}))
-                continue
-            rows.append((k, run, fetch_row(load_level_events(run_dir))))
-    print(format_fetch_table(rows))
+    entries = []
+    for bank in args.banks:
+        rows = []
+        for k in fetch_cases_in(out, args.ks, args.chained, bank):
+            name = fetch_case_name(k, args.chained, bank)
+            for run in args.runs:
+                run_dir = out / name / run
+                if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                    rows.append((k, run, {"release": None}))
+                    continue
+                r = fetch_row(load_level_events(run_dir))
+                rows.append((k, run, r))
+                entries.append((name, k, bank, run, r))
+        print(f"== bank {bank} ({FETCH_PREFIX[(args.chained, bank)]}NN) ==")
+        print(format_fetch_table(rows))
+        print()
+    print(format_fetch_map(entries))
     return 0
 
 
@@ -596,17 +770,21 @@ def main(argv=None) -> int:
     fb.add_argument("out_dir")
     fb.add_argument("--ks", nargs="*", type=int, default=[])
     fb.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
+    fb.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"],
+                    help="both = two loads (lfk/lfc); 0 or 1 = one load on that bank (lfa/lfb chained, lfd/lfe first-BD)")
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
     fr.add_argument("out_dir")
     fr.add_argument("tag")
     fr.add_argument("--backend", choices=("hw", "emu"), required=True)
     fr.add_argument("--ks", nargs="*", type=int, default=[])
     fr.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
+    fr.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"], help="as for fetch-build")
     ft = sub.add_parser("fetch-table", help="lock-to-fetch probe: per k and run, events relative to the release")
     ft.add_argument("out_dir")
     ft.add_argument("runs", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
     ft.add_argument("--ks", nargs="*", type=int, default=[])
     ft.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
+    ft.add_argument("--banks", nargs="+", choices=FETCH_BANKS, default=["both"], help="as for fetch-build")
     args = ap.parse_args(argv)
     return {"generate": cmd_generate, "build": cmd_build, "run": cmd_run, "analyze": cmd_analyze,
             "fetch-build": cmd_fetch_build, "fetch-run": cmd_fetch_run,

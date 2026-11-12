@@ -92,9 +92,10 @@ def test_fetch_core_waits_for_go_before_the_marker_and_for_b_after_the_loads():
 
 
 def test_fetch_core_rejects_k_out_of_range():
-    for k in (-1, 16):
+    for k in (-1, 65):
         with pytest.raises(ValueError):
             g.fetch_core_asm(k)
+    g.fetch_core_asm(64)                                                 # the last valid k
 
 
 @pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
@@ -108,7 +109,8 @@ def test_fetch_core_assembles(k, tmp_path):
 
 
 def test_fetch_case_names_cover_k_0_to_15():
-    assert g.FETCH_KS == tuple(range(16))
+    assert g.FETCH_KS == tuple(range(65))                                # valid k; the default build is the first 16
+    assert g.FETCH_DEFAULT_KS == tuple(range(16))
     assert [g.fetch_case_name(k) for k in (0, 3, 15)] == ["lfk00", "lfk03", "lfk15"]
 
 
@@ -264,3 +266,130 @@ def test_chained_design_keeps_the_safety_properties():
     for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync"):
         assert forbidden not in seq
     assert "aie.shim_dma_allocation" not in t
+
+
+# -- k beyond 15 and the single-bank variants -------------------------------------------
+
+@pytest.mark.parametrize("k", [16, 40, 64])
+def test_long_nop_runs_keep_the_shape(k):
+    body = bundles_of(g.fetch_core_asm(k))
+    i = body.index("event #0")
+    assert body[i + 2:i + 2 + k] == ["nop"] * k
+    assert body[i + 2 + k] == "lda r26, [p0, #0]" and body[i + 3 + k] == "lda r28, [p0, #16]"
+    assert sum(b.startswith("acq ") for b in body) == 2
+
+
+@pytest.mark.parametrize("bank,load", [("0", "lda r26, [p0, #0]"), ("1", "lda r28, [p0, #16]")])
+@pytest.mark.parametrize("k", [0, 5, 40])
+def test_single_bank_core_has_one_access_k_nops_after_the_release(bank, load, k):
+    body = bundles_of(g.fetch_core_asm(k, bank=bank))
+    i = body.index("event #0")
+    assert body[i + 2:i + 2 + k] == ["nop"] * k
+    assert body[i + 2 + k] == load                                       # the access sits where bank 0's does
+    assert sum(b.startswith("lda ") for b in body) == 1                  # and it is the only one
+    assert g.fetch_core_asm(k, bank=bank) != g.fetch_core_asm(k)
+
+
+def test_fetch_core_rejects_an_unknown_bank():
+    with pytest.raises(ValueError):
+        g.fetch_core_asm(3, bank="2")
+
+
+def test_default_core_is_the_two_load_core():
+    assert g.fetch_core_asm(3) == g.fetch_core_asm(3, bank="both")
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("bank", ["0", "1"])
+def test_single_bank_core_assembles(bank, tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.fetch_core_asm(50, bank=bank))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_case_names_are_distinct_per_variant_and_clear_of_lfc_lfk():
+    names = {(c, b): g.fetch_case_name(7, chained=c, bank=b) for c in (False, True) for b in ("both", "0", "1")}
+    assert names[(False, "both")] == "lfk07" and names[(True, "both")] == "lfc07"
+    assert len(set(names.values())) == 6
+    for key, n in names.items():
+        if key[1] != "both":
+            assert not n.startswith(("lfc", "lfk")) and n.endswith("07")
+
+
+def test_the_design_does_not_depend_on_the_bank():
+    assert g.fetch_design_mlir(chained=True) == g.fetch_design_mlir(chained=True)   # k and bank live in the core only
+
+
+# -- the per-bank map ---------------------------------------------------------------
+
+def row(rel=1000, grant=2, conflicts=()):
+    return {"release": rel, "grant": grant, "conflicts": [(b, t) for b, t in conflicts], "starvation": [],
+            "mm2s_finished": [], "s2mm_finished": [], "core_event0": None, "core_stalls": []}
+
+
+B0, B1 = "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"
+
+
+def cells_of(entries):
+    return g.fetch_access_cells(entries)
+
+
+def test_platform_comes_from_the_run_suffix():
+    assert g.run_platform("h3.hw") == "hw" and g.run_platform("e2.emu") == "emu"
+
+
+def test_single_bank_conflict_marks_dma_and_clean_rows_mark_absent_relative_to_the_grant():
+    # silicon offset 1: bank-0 access at rel + k + 1; grant 2 or 3
+    entries = [("lfa03", 3, "0", "h3.hw", row(grant=2, conflicts=[(B0, 4)])),     # access at +4, grant-relative +2
+               ("lfa04", 4, "0", "h3.hw", row(grant=3)),                           # access at +5, grant-relative +2: clean
+               ("lfa06", 6, "0", "h3.hw", row(grant=2))]                           # access at +7, grant-relative +5: clean
+    cells = cells_of(entries)["hw"]
+    assert cells[(0, 2)]["dma"] == ["lfa03.h3.hw"] and cells[(0, 2)]["none"] == ["lfa04.h3.hw"]
+    assert cells[(0, 5)] == {"dma": [], "none": ["lfa06.h3.hw"]}
+
+
+def test_both_variant_second_load_is_one_cycle_behind_and_unknown_after_a_bank0_conflict():
+    clean = ("lfc08", 8, "both", "h3.hw", row(grant=2))
+    c = cells_of([clean])["hw"]
+    assert c[(0, 7)]["none"] and c[(1, 8)]["none"]                              # b0 at +9, b1 at +10; grant 2
+    hit = ("lfc03", 3, "both", "h3.hw", row(grant=2, conflicts=[(B0, 4)]))
+    c = cells_of([hit])["hw"]
+    assert c[(0, 2)]["dma"] and (1, 3) not in c                                  # the b1 cell is not trusted
+
+
+def test_default_offsets_per_platform_and_inference_from_conflicts():
+    assert g.infer_access_offsets([("c", 3, "0", "h.hw", row(conflicts=[(B0, 4)]))]) == 1
+    assert g.infer_access_offsets([("c", 3, "0", "e.emu", row(conflicts=[(B0, 1)]))]) == -2
+    # a both-variant bank-1-only conflict is one cycle behind the first load
+    assert g.infer_access_offsets([("c", 11, "both", "h.hw", row(conflicts=[(B1, 13)]))]) == 1
+    # no conflicts: the platform default
+    assert g.infer_access_offsets([("c", 3, "0", "h.hw", row())]) == g.DEFAULT_ACCESS_OFFSET["hw"]
+    assert g.infer_access_offsets([("c", 3, "0", "e.emu", row())]) == g.DEFAULT_ACCESS_OFFSET["emu"]
+
+
+def test_contradictions_name_cell_case_and_runs():
+    entries = [("lfa03", 3, "0", "h3.hw", row(grant=2, conflicts=[(B0, 4)])),
+               ("lfa04", 4, "0", "h4.hw", row(grant=3)),
+               ("lfa07", 7, "0", "h3.hw", row(grant=2))]
+    text = g.format_fetch_map(entries)
+    assert "CONTRADICTIONS" in text and "bank 0 g+2" in text
+    assert "lfa03.h3.hw" in text.split("CONTRADICTIONS")[1] and "lfa04.h4.hw" in text.split("CONTRADICTIONS")[1]
+
+
+def test_no_contradictions_is_stated_and_platforms_are_kept_apart():
+    entries = [("lfa03", 3, "0", "h3.hw", row(grant=2, conflicts=[(B0, 4)])),
+               ("lfa03", 3, "0", "e2.emu", row(grant=0))]                          # emulator: access at +1, clean
+    text = g.format_fetch_map(entries)
+    assert "silicon" in text and "emulator" in text
+    assert "contradictions: none" in text.lower()
+
+
+def test_map_lists_dma_absent_and_unknown_cycles_per_bank():
+    entries = [("lfb03", 3, "1", "h3.hw", row(grant=2, conflicts=[(B1, 4)])),
+               ("lfb05", 5, "1", "h3.hw", row(grant=2))]
+    text = g.format_fetch_map(entries)
+    assert "bank 1 DMA access proven: g+2" in text
+    assert "bank 1 no DMA access: g+4" in text
+    assert "bank 0 unknown" in text or "bank 0: no data" in text
