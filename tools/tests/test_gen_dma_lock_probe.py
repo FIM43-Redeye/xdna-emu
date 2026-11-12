@@ -768,7 +768,7 @@ def test_ring_core_camps_on_one_bank_from_the_release_then_fills_the_trace():
     c = ring(n=10, k=0)
     body = bundles_of(g.ring_core_asm(c))
     i = body.index("event #0")
-    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r4" and "mov r4, #1" in body
     camp = body[i + 2:i + 12]
     assert all(b.startswith("lda ") for b in camp)
     assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in camp} == {0}
@@ -872,4 +872,27 @@ def test_ring_row_and_residues():
 
 def test_ring_plan():
     names = [c.name for c in g.ring_plan()]
-    assert len(names) == len(set(names)) == 9 and all(n.startswith("rg") for n in names)
+    assert len(names) == len(set(names)) == 12 and all(n.startswith("rg") for n in names)
+
+
+def test_ring_two_channel_variant():
+    c = ring("ms")
+    t = g.ring_design_mlir(c)
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" in t and "aie.flow(%t02, DMA : 1, %t02, DMA : 1)" in t
+    assert t.count("aie.use_lock(%lA, AcquireGreaterEqual") == 2                 # both MM2S wait on A
+    assert "aie.dma_start(MM2S, 1, ^send1" in t and "aie.dma_bd(%feed" in t.split("^send1:")[1].split("^s1_start")[0]
+    assert "dma_bd(%sdst" in t.split("^recv1:")[1] and "dma_bd(%sdst" not in t.split("^recv:")[1].split("^m1_start")[0]
+    body = bundles_of(g.ring_core_asm(c))
+    assert "mov r4, #2" in body                                                # A released by 2: one grant each
+    assert len(g.ring_memmod_events(c)) == 8 and "DMA_S2MM_1_FINISHED_BD" in g.ring_memmod_events(c)
+
+
+def test_ring_pad_one_buffer_spans_banks():
+    c = ring(pad=12, pad_one=True)
+    t = g.ring_design_mlir(c)
+    pads = [ln for ln in t.splitlines() if 'sym_name = "pad' in ln]
+    assert len(pads) == 1 and "memref<12xi32>" in pads[0]
+    assert [phys_bank(g.RING_PAD_ADDRS[0] + 16 * i) for i in range(3)] == [0, 1, 0]
+    assert c.name.endswith("p12o")
+    with pytest.raises(ValueError):
+        g.ring_validate(ring(pad=13, pad_one=True))

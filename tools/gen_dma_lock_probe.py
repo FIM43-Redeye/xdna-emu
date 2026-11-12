@@ -1375,11 +1375,14 @@ def cmd_arb_table(args) -> int:
 # only on go and on B, released by the lock-A BD after its 64 words; the S2MM BDs take exactly the 68 words
 # the MM2S sends (4 + 64), so the MM2S cannot be back-pressured forever.
 
-RING_VARIANTS = ("m0", "m1", "s0", "s1")
+# ms: MM2S 0 reads `src` (banks 0/1) and MM2S 1 reads `feed` into S2MM 1, which writes `sdst` (banks 0/1):
+# two channels on banks 0/1 at once, both lock-started on lock A (the core releases it by 2).
+RING_VARIANTS = ("m0", "m1", "s0", "s1", "ms")
 RING_FEED_ADDR = 0x4100             # banks 2/3: the s-variants' MM2S source
 RING_SDST_ADDR = 0x1000             # banks 0/1: the s-variants' S2MM destination (granule g in bank g & 1)
 RING_PAD_ADDRS = (0x0C00, 0x0C20)   # bank 0 granules (bit 4 clear): up to 4 + 4 initialised words
 RING_MAX_PAD = 8
+RING_MAX_PAD_ONE = 12               # one contiguous buffer at RING_PAD_ADDRS[0]: granules bank 0, 1, 0
 RING_MAX_N = 120
 RING_FILL_RELEASES = 16
 RING_TAIL_ITERS = 800
@@ -1393,10 +1396,11 @@ class RingCase:
     n: int = 90                    # camp length (consecutive same-bank loads)
     k: int = 0                     # nops between the release and the camp
     pad: int = 0                   # extra initialised words in bank 0
+    pad_one: bool = False          # the pad words as one contiguous buffer (crossing into bank 1 after 4)
 
     @property
     def name(self) -> str:
-        return f"rg{self.variant}b{self.bank}n{self.n:03d}k{self.k:02d}p{self.pad}"
+        return f"rg{self.variant}b{self.bank}n{self.n:03d}k{self.k:02d}p{self.pad}{'o' if self.pad_one else ''}"
 
     @property
     def mm2s(self) -> int:
@@ -1417,8 +1421,8 @@ def ring_validate(c: RingCase) -> None:
         raise ValueError(f"n must be 1..{RING_MAX_N}")
     if c.k not in FETCH_KS:
         raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
-    if not 0 <= c.pad <= RING_MAX_PAD:
-        raise ValueError(f"pad must be 0..{RING_MAX_PAD}")
+    if not 0 <= c.pad <= (RING_MAX_PAD_ONE if c.pad_one else RING_MAX_PAD):
+        raise ValueError(f"pad must be 0..{RING_MAX_PAD_ONE if c.pad_one else RING_MAX_PAD}")
 
 
 def ring_core_asm(c: RingCase) -> str:
@@ -1431,10 +1435,11 @@ def ring_core_asm(c: RingCase) -> str:
     fill = []
     for i in range(RING_FILL_RELEASES):
         fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
-    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+    grants = 2 if c.variant == "ms" else 1          # lock-A BDs waiting for the release
+    body = ["  mov r2, #1", "  mov r3, #-1", f"  mov r4, #{grants}", *n(2),
             f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
             *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
-            "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(c.k),
+            "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r4", *n(c.k),
             *camp, *n(ARB_EVENT1_NOPS), "  event #1", *n(8),
             f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8), *fill,
             *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
@@ -1451,6 +1456,11 @@ def ring_design_mlir(c: RingCase) -> str:
     pre_init = ", ".join(str(0x0C000000 | j) for j in range(p))
     pads = []
     left = c.pad
+    if c.pad_one and c.pad:
+        init = ", ".join(str(0x0F000000 | j) for j in range(c.pad))
+        pads.append(f"    %pad0 = aie.buffer(%t02) {{address = {RING_PAD_ADDRS[0]} : i32, sym_name = \"pad0\", "
+                    f"initial_value = dense<[{init}]> : tensor<{c.pad}xi32>}} : memref<{c.pad}xi32>\n")
+        left = 0
     for i, addr in enumerate(RING_PAD_ADDRS):
         words = min(left, 4)
         if words:
@@ -1461,12 +1471,21 @@ def ring_design_mlir(c: RingCase) -> str:
     pad_text = "".join(pads)
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
                     for _ in range(FETCH_PAD_WRITES))
-    source = "%feed" if c.variant.startswith("s") else "%src"
-    if c.variant.startswith("s"):
+    source = "%feed" if c.variant in ("s0", "s1") else "%src"
+    if c.variant in ("s0", "s1"):
         recv = (f"    ^recv:\n      aie.dma_bd(%dst : memref<{w + p}xi32> offset = 0 len = {p})\n      aie.next_bd ^recv2\n"
                 f"    ^recv2:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
     else:
         recv = f"    ^recv:\n      aie.dma_bd(%dst : memref<{w + p}xi32> offset = 0 len = {w + p})\n      aie.next_bd ^end\n"
+    second_flow, second_task = "", ""
+    if c.variant == "ms":
+        # MM2S 1: one lock-A BD (no pre BD) reading `feed` into S2MM 1, which writes all 64 words to `sdst`
+        second_flow = "\n    aie.flow(%t02, DMA : 1, %t02, DMA : 1)"
+        second_task = (f"    ^m1_start:\n      %s2 = aie.dma_start(MM2S, 1, ^send1, ^s1_start)\n"
+                       f"    ^send1:\n      %ca1 = arith.constant 1 : i32\n      aie.use_lock(%lA, AcquireGreaterEqual, %ca1)\n"
+                       f"      aie.dma_bd(%feed : memref<{w}xi32>)\n      aie.next_bd ^end\n"
+                       f"    ^s1_start:\n      %s3 = aie.dma_start(S2MM, 1, ^recv1, ^end)\n"
+                       f"    ^recv1:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
     return f"""module {{
   aie.device(npu1_1col) {{
     %t00 = aie.tile(0, 0)
@@ -1481,7 +1500,7 @@ def ring_design_mlir(c: RingCase) -> str:
     %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
     %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
     %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
-    aie.flow(%t02, DMA : {c.mm2s}, %t02, DMA : {c.s2mm})
+    aie.flow(%t02, DMA : {c.mm2s}, %t02, DMA : {c.s2mm}){second_flow}
     func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
     aie.core(%t02) {{
       func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
@@ -1500,8 +1519,8 @@ def ring_design_mlir(c: RingCase) -> str:
       aie.use_lock(%lB, Release, %cb)
       aie.next_bd ^end
     ^recv_start:
-      %s1 = aie.dma_start(S2MM, {c.s2mm}, ^recv, ^end)
-{recv}    ^end:
+      %s1 = aie.dma_start(S2MM, {c.s2mm}, ^recv, {"^m1_start" if c.variant == "ms" else "^end"})
+{recv}{second_task}    ^end:
       aie.end
     }}
     aie.runtime_sequence(%dummy: memref<4xi32>) {{
@@ -1516,10 +1535,13 @@ def ring_design_mlir(c: RingCase) -> str:
 
 
 def ring_memmod_events(c: RingCase) -> list[str]:
+    if c.variant == "ms":
+        return ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_MM2S_1_FINISHED_BD",
+                "DMA_S2MM_0_FINISHED_BD", "DMA_S2MM_1_FINISHED_BD", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
     m, s = c.mm2s, c.s2mm
     ev = ["LOCK_0_REL", f"DMA_MM2S_{m}_STALLED_LOCK", f"DMA_MM2S_{m}_FINISHED_BD", f"DMA_S2MM_{s}_FINISHED_BD",
           "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
-    if c.variant.startswith("s"):
+    if c.variant in ("s0", "s1"):
         ev += [f"DMA_S2MM_{s}_MEMORY_BACKPRESSURE", f"DMA_MM2S_{m}_STREAM_BACKPRESSURE"]
     else:
         ev += [f"DMA_MM2S_{m}_MEMORY_STARVATION"]
@@ -1554,6 +1576,8 @@ def ring_row(events, c: RingCase) -> dict:
     r["runs"] = {b: [(a - t0, z - t0) for a, z in _runs(mem.get(f"CONFLICT_DM_BANK_{b}", []))] for b in (0, 1)}
     r["mm2s_fin"] = [t - t0 for t in sorted(set(mem.get(f"DMA_MM2S_{c.mm2s}_FINISHED_BD", []))) if t > rel]
     r["s2mm_fin"] = [t - t0 for t in sorted(set(mem.get(f"DMA_S2MM_{c.s2mm}_FINISHED_BD", []))) if t > rel]
+    r["finished"] = {name.replace("DMA_", "").replace("_FINISHED_BD", ""): [t - t0 for t in sorted(set(ts)) if t > rel]
+                     for name, ts in mem.items() if name.endswith("_FINISHED_BD")}
     r["backpressure"] = {name: [(a - t0, z - t0) for a, z in _runs(mem.get(name, [])) if z >= rel]
                          for name in (f"DMA_S2MM_{c.s2mm}_MEMORY_BACKPRESSURE",
                                       f"DMA_MM2S_{c.mm2s}_STREAM_BACKPRESSURE") if name in mem}
@@ -1582,8 +1606,11 @@ def ring_residues(r: dict, c: RingCase, period: int = ARB_PERIOD) -> dict:
 
 
 def ring_plan() -> list[RingCase]:
-    cases = [RingCase(v) for v in RING_VARIANTS]
+    cases = [RingCase(v) for v in ("m0", "m1", "s0", "s1")]
     cases += [RingCase("m0", pad=p) for p in range(1, 6)]
+    # second batch: image-write unit (one buffer over two bank-0 granules), two channels with and without
+    # the core camping
+    cases += [RingCase("m0", pad=12, pad_one=True), RingCase("ms"), RingCase("ms", n=1)]
     return cases
 
 
@@ -1621,7 +1648,8 @@ def format_ring_table(rows) -> str:
                       for k, v in r["backpressure"].items() if v)
         lines.append(f"{c.name:<18} {run:<6} +{r['grant']}    {','.join(map(str, r['lost'])) or '-':<33} "
                      f"{runs:<44} {res['dma_wins']} / {res['dma_refused']}  {res['withdrew'] or '-'}  "
-                     f"{r['mm2s_fin']} {r['s2mm_fin']} {bp or '-'}")
+                     f"{r['mm2s_fin']} {r['s2mm_fin']} {bp or '-'}"
+                     + (f" fins {r['finished']}" if c.variant == "ms" else ""))
     return "\n".join(lines)
 
 
