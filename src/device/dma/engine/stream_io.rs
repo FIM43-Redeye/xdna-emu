@@ -599,12 +599,6 @@ impl DmaEngine {
         (DMA_MM2S_READ_TO_OFFER_CYCLES + memtile) as u64
     }
 
-    /// Slack (`DmaEngine::mm2s_is_urgent`: the words staged on a compute tile) at/below which an MM2S channel's granule fetch is `urgent` --
-    /// its stream port is about to run dry with stream still to feed (`transfer_is_urgent`,
-    /// `stepping.rs`), so the bank arbiter serves it over the core. One granule (4 words): the
-    /// minimum that still leaves a whole fetch's worth of slack, not a fitted number.
-    pub(super) const URGENT_WATERMARK: usize = 4;
-
     /// Check if a specific S2MM channel can accept a word from the routing phase.
     ///
     /// Like `can_accept_stream_in_for_channel` but enforces the registered-FIFO

@@ -224,6 +224,10 @@ impl DeviceState {
                 // write to data memory word-by-word; CDO uses bulk dma_write.
                 if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
                     tile.write_data_u32(tile_addr.offset as usize, value);
+                    if tile.is_compute() {
+                        // A configuration write is a served bank access (`BankAccessCounts`).
+                        tile.bank_access_counts.record_config_write(tile_addr.offset as usize, 4);
+                    }
                 }
             }
 
@@ -474,6 +478,11 @@ impl DeviceState {
                 let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
                 if tile.write_data(offset, data) {
                     self.stats.data_bytes += data.len();
+                    if tile.is_compute() {
+                        // The image load: one served bank access per initialised 16-byte
+                        // line (`BankAccessCounts::record_config_write`).
+                        tile.bank_access_counts.record_config_write(offset, data.len());
+                    }
                 }
             }
 

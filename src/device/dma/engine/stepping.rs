@@ -1,11 +1,10 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
-use crate::device::bank_arbiter::{Requester, NUM_DMA_CHANNELS};
+use crate::device::bank_arbiter::Requester;
 use crate::device::dma::channel::{PendingReadCompletion, PendingRelease};
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
-use smallvec::SmallVec;
 
 /// Map a resolved DMA target to the `AccessOrigin` the target tile's
 /// WatchPoint comparator should see.
@@ -41,20 +40,6 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
         None => true,
         Some(prev) => prev / granule != addr / granule,
     }
-}
-
-/// Is a staged MM2S near underflow: its `slack` (`DmaEngine::mm2s_is_urgent`: the words staged on
-/// a compute tile) is at/below
-/// `DmaEngine::URGENT_WATERMARK` (so its stream is about to run dry), while `transfer` still has
-/// words to fetch?
-///
-/// Read by `DmaEngine::urgent_channels` (the arbiter's urgency override) through
-/// `DmaEngine::mm2s_is_urgent`. Callers gate on `DmaEngine::uses_egress_staging` first -- the
-/// staging occupancy is only meaningful for a channel that actually stages.
-/// Every word a transfer still has to move is unfetched: a fetched word
-/// leaves the transfer for the channel's staging (`egress_staging`).
-fn transfer_is_urgent(transfer: &Transfer, slack: usize) -> bool {
-    transfer.remaining_bytes() > 0 && slack <= DmaEngine::URGENT_WATERMARK
 }
 
 /// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
@@ -125,41 +110,6 @@ impl DmaEngine {
             demand.push((self.channel_requester(ch_idx as u8), mask));
         }
         demand
-    }
-
-    /// MM2S channels whose egress staging is `urgent` (near underflow) THIS
-    /// cycle -- the arbiter must serve them over the core or the stream
-    /// stalls. A companion to `peek_bank_demand`, not a replacement: it does
-    /// not change that method's return type (other callers depend on it),
-    /// and it reads the channel's slack through `mm2s_is_urgent`
-    /// (`transfer_is_urgent`).
-    ///
-    /// `layout` mirrors `peek_bank_demand`'s signature (the coordinator calls
-    /// both together, see task-3), though urgency itself needs no bank-layout
-    /// information -- it is purely a function of FIFO occupancy, not of which
-    /// physical banks a fetch would touch.
-    ///
-    /// Scoped to compute tiles for the same reason as `peek_bank_demand`:
-    /// MemTile bank geometry is unvalidated, so a non-compute engine reports
-    /// no urgency at all.
-    pub fn urgent_channels(
-        &self,
-        _layout: crate::device::banking::BankLayout,
-    ) -> SmallVec<[Requester; NUM_DMA_CHANNELS]> {
-        let mut urgent = SmallVec::new();
-        if !self.tile_kind.is_compute() {
-            return urgent;
-        }
-
-        for (ch_idx, ch) in self.channels.iter().enumerate() {
-            let ChannelFsm::Transferring { transfer } = &ch.fsm else {
-                continue;
-            };
-            if self.uses_egress_staging(transfer) && self.mm2s_is_urgent(transfer) {
-                urgent.push(self.channel_requester(ch_idx as u8));
-            }
-        }
-        urgent
     }
 
     /// The `Requester` identity for a flat channel index, per direction.
@@ -470,14 +420,6 @@ impl DmaEngine {
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
         let offset = Self::wrap_local_offset(first, mem_size) as u32;
         GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words, addrs }
-    }
-
-    /// Whether a compute MM2S's memory side is `urgent`: its stream is about to run dry with
-    /// words still to fetch, judged on its staging occupancy -- the words already accessed and
-    /// not yet handed to the stream. Only compute tiles arbitrate (`urgent_channels`).
-    fn mm2s_is_urgent(&self, transfer: &Transfer) -> bool {
-        let slack = self.channels[transfer.channel as usize].egress_staging.len();
-        transfer_is_urgent(transfer, slack)
     }
 
     /// Whether a staged MM2S runs on the word clock (`word_clock_mm2s_cycle`): a compute
@@ -4662,13 +4604,161 @@ mod bank_demand_tests {
 
     /// Silicon (lock-fetch probe, three rows): a core access winning the bank at the last DMA
     /// access (g + 51) delays FINISHED_BD by one cycle, to g + 53: the denied access is retried
-    /// the next cycle, though about 15 words are staged by then. (The 2-cycle fetch backoff the
-    /// emulator used to apply to a denied, non-urgent MM2S put it at g + 55.)
+    /// the next cycle, though about 15 words are staged by then.
     #[test]
     fn a_denied_last_lock_path_access_delays_the_finish_one_cycle() {
         let (accesses, _, finished) = run_lock_started_bd(64, true, &[51]);
         assert_eq!(accesses.last(), Some(&(52, 0b10)));
         assert_eq!(finished, 53);
+    }
+
+    /// What a bank of the probe's tile saw, grant-relative: contended cycles, the cycles the
+    /// core lost, the MM2S's bank accesses and its FINISHED_BD.
+    #[derive(Debug, Default)]
+    struct CoreContact {
+        contended: Vec<usize>,
+        core_lost: Vec<usize>,
+        finished: usize,
+    }
+
+    /// The arb / ring probe on the emulator's own MM2S: a lock-started 64-word BD on MM2S
+    /// channel `mm2s` (0 or 1) reading 0x400 (granule g in physical bank g & 1), parked 100
+    /// steps, against a core that makes `n` consecutive accesses on physical bank `bank` from
+    /// grant + `start` (negative: before the grant), a lost access repeated the next cycle.
+    /// Both go through the real arbiter on the tile's served-access count, which starts from
+    /// the probe design's history (`lock_fetch_history`, with `m` settle loads on the bank).
+    fn run_lock_started_bd_against_core(mm2s: u8, bank: usize, n: u32, start: i64, m: usize) -> CoreContact {
+        use crate::device::bank_arbiter::test_support::lock_fetch_history;
+        use crate::device::bank_arbiter::CorePort;
+        let flat = 2 + mm2s; // MM2S channels follow the two S2MM channels
+        let settle = if bank == 0 { 0x800 } else { 0x810 };
+        // The grant step is deterministic: find it with the core silent.
+        let grant_step = {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(6, 1))
+                .unwrap();
+            eng.start_channel(flat, 0).unwrap();
+            (0..400usize)
+                .find(|&step| {
+                    if step == 100 {
+                        tile.locks[5].value = 1;
+                    }
+                    let before = eng.channel_phase(flat);
+                    eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                    tile.resolve_lock_requests(0);
+                    eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                    while eng.pop_stream_out_for_channel(flat).is_some() {}
+                    before == "AcquiringLock" && eng.channel_phase(flat) != "AcquiringLock"
+                })
+                .expect("granted")
+        };
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        let (mut arb, counts) = lock_fetch_history(Some((settle, m)));
+        tile.bank_access_counts = counts;
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(6, 1))
+            .unwrap();
+        eng.start_channel(flat, 0).unwrap();
+        let bit = 1u16 << bank;
+        let first_core = (grant_step as i64 + start) as usize;
+        let mut core_left = n;
+        let mut out = CoreContact::default();
+        let mut finished = None;
+        for step in 0..400usize {
+            if step == 100 {
+                tile.locks[5].value = 1;
+            }
+            let mut demands = eng.peek_bank_demand(BankLayout::Compute);
+            if step >= first_core && core_left > 0 {
+                demands.push((Requester::Core(CorePort::LoadA), bit));
+            }
+            let a = arb.arbitrate(&demands, &mut tile.bank_access_counts);
+            let rel = step as i64 - grant_step as i64;
+            if a.contended_banks & bit != 0 {
+                out.contended.push(rel as usize);
+            }
+            if a.core_lost() {
+                out.core_lost.push(rel as usize);
+            } else if demands.iter().any(|(r, _)| matches!(r, Requester::Core(_))) {
+                core_left -= 1;
+            }
+            let denied: Vec<Requester> =
+                a.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if finished.is_none() && tile.locks[6].value >= 1 {
+                finished = Some(rel as usize);
+            }
+            while eng.pop_stream_out_for_channel(flat).is_some() {}
+        }
+        out.finished = finished.expect("the BD finished");
+        out
+    }
+
+    /// The arb probe's single-access, history and burst rows (silicon, NPU1 2026-11,
+    /// `tools/gen_dma_lock_probe.py` arb cases; a start one cycle early is the + 3 grant
+    /// phase) on the emulator's own lock-started MM2S and its retry: the same contended
+    /// cycles, the same core losses, FINISHED_BD at g + 52 except g + 53 after a won g + 51.
+    #[test]
+    fn the_emulated_mm2s_meets_and_loses_to_the_core_where_silicon_does() {
+        #[rustfmt::skip]
+        let rows: &[(usize, u32, i64, usize, &[usize], &[usize], usize)] = &[
+            // bank, n, start, m, contended, core lost, finish
+            (0, 1, 7, 0, &[7], &[7], 52),                        // T1 ar0l1k08m0
+            (0, 1, 6, 0, &[], &[], 52),                          // ar0l1k08m1 (+3)
+            (1, 1, 27, 0, &[27], &[27], 52),                     // T2 ar1l1k28m0
+            (1, 1, 19, 0, &[19], &[], 52),                       // ar1l1k20m0
+            (1, 1, 51, 0, &[51], &[], 53),                       // lock-fetch g + 51
+            (0, 1, 47, 0, &[47], &[47], 52),                     // T3 ar0l1k48m0
+            (0, 1, 15, 0, &[15], &[], 52),                       // ar0l1k16m0
+            (0, 1, 15, 4, &[15], &[15], 52),                     // T4 ar0l1k16m4
+            (0, 1, 15, 3, &[15], &[], 52),                       // ar0l1k16m3
+            (0, 1, 7, 2, &[7], &[], 52),                         // ar0l1k08m2
+            (0, 5, 15, 0, &[15, 16, 17, 18, 19], &[19], 52),     // T5 ar0l5k16m0
+            (0, 4, 15, 0, &[15, 16, 17, 18], &[], 52),           // ar0l4k16m0
+            (0, 5, 14, 0, &[15, 16, 17, 18], &[18], 52),         // ar0l5k16m0 (+3)
+            (0, 4, 23, 0, &[23, 24, 25, 26], &[26], 52),         // ar0l4k24m0
+            (0, 3, 31, 0, &[31, 32, 33], &[33], 52),             // ar0l3k32m0
+            (0, 3, 30, 0, &[31, 32], &[32], 52),                 // ar0l3k32m0 (+3)
+            (1, 2, 19, 0, &[19, 20], &[20], 52),                 // ar1l2k20m0
+            (1, 5, 35, 0, &[35, 36, 37, 38, 39], &[39], 52),     // ar1l5k36m0
+            (1, 4, 35, 0, &[35, 36, 37, 38], &[], 52),           // ar1l4k36m0
+        ];
+        for &(bank, n, start, m, contended, lost, finish) in rows {
+            let c = run_lock_started_bd_against_core(0, bank, n, start, m);
+            assert_eq!(
+                (c.contended.as_slice(), c.core_lost.as_slice(), c.finished),
+                (contended, lost, finish),
+                "bank {bank} n {n} g + {start} m {m}"
+            );
+        }
+    }
+
+    /// Ring camp (silicon, ring probe rgm0 r1 grant + 2 / rgm1 r1 grant + 3): the core loads
+    /// bank 0 every cycle from the release + 1 (camp start) for 90 cycles against MM2S 0 or 1.
+    /// Camp-relative, the core loses at 7, 12, 17, 22, 27, 32 | 37, 42, 52, and the bank is
+    /// contended over the runs 3..7 9..12 14..17 19..22 24..27 (32 | 33..37) 40..42 48..52.
+    #[test]
+    fn the_emulated_mm2s_against_a_camping_core_matches_the_ring_camp() {
+        #[rustfmt::skip]
+        let rows: &[(u8, i64, &[usize], &[(usize, usize)])] = &[
+            (0, 1, &[7, 12, 17, 22, 27, 32, 42, 52], &[(3, 7), (9, 12), (14, 17), (19, 22), (24, 27), (32, 32), (40, 42), (48, 52)]),
+            (1, 2, &[7, 12, 17, 22, 27, 37, 42, 52], &[(4, 7), (9, 12), (14, 17), (19, 22), (25, 27), (33, 37), (41, 42), (49, 52)]),
+        ];
+        for &(mm2s, camp_before_grant, lost, runs) in rows {
+            let c = run_lock_started_bd_against_core(mm2s, 0, 90, -camp_before_grant, 0);
+            let camp =
+                |v: &[usize]| -> Vec<usize> { v.iter().map(|&t| t + camp_before_grant as usize).collect() };
+            assert_eq!(camp(&c.core_lost), lost, "MM2S {mm2s}: core losses, camp-relative");
+            let expected: Vec<usize> = runs.iter().flat_map(|&(a, b)| a..=b).collect();
+            assert_eq!(camp(&c.contended), expected, "MM2S {mm2s}: contended runs, camp-relative");
+        }
     }
 
     /// Silicon (lock-fetch probe, two passes): of the ~40 conflict rows in which a core access won
@@ -4862,93 +4952,33 @@ mod bank_demand_tests {
         assert!(words[stale..].iter().all(|w| w >> 24 == 0x0B), "the rest is the new data");
     }
 
-    /// `urgent_channels` and `peek_bank_demand` read the identical per-transfer
-    /// `staged_words` state (`transfer_is_urgent`) -- a channel just entering
-    /// `Transferring` has an empty staging FIFO with the whole BD still
-    /// unfetched, which is as near underflow as it gets, so it must report
-    /// urgent immediately. Once the front-loading fetch tops the FIFO up past
-    /// `DmaEngine::URGENT_WATERMARK`, the same channel must stop reporting
-    /// urgent even though it is still mid-transfer -- urgency is about FIFO
-    /// occupancy, not whether the channel has more work left.
-    #[test]
-    fn urgent_channels_reports_only_a_near_underflow_mm2s() {
-        let mut eng = DmaEngine::new_compute_tile(1, 2);
-        let mut tile = Tile::compute(1, 2);
-        let mut host_mem = HostMemory::new();
-
-        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
-        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
-
-        let mut guard = 0;
-        while eng.channel_phase(2) != "Transferring" {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            guard += 1;
-            assert!(guard < 50, "fixture did not reach Transferring in time");
-        }
-
-        assert_eq!(eng.staged_words(2), 0, "fixture must start with an empty staging FIFO");
-        assert!(
-            eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "an empty staging FIFO with stream still to feed must report urgent"
-        );
-
-        // Drain like the array's stream router every cycle: the cycle a granule is
-        // accessed, the one before it is still staged, so the FIFO holds more than the
-        // watermark.
-        let mut guard = 0;
-        while eng.staged_words(2) <= DmaEngine::URGENT_WATERMARK {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            while eng.pop_stream_out_for_channel(2).is_some() {}
-            guard += 1;
-            assert!(guard < 50, "the staging never rose past the watermark");
-        }
-        let staged = eng.staged_words(2);
-        assert!(
-            staged > DmaEngine::URGENT_WATERMARK,
-            "fixture must actually reach a topped-up FIFO: staged={staged}"
-        );
-        assert!(
-            !eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "a topped-up FIFO (staged={staged}) must not report urgent"
-        );
-    }
-
-    /// A denied compute MM2S re-presents the identical demand the next cycle, whether or not it
-    /// is urgent. Silicon: against a dense same-bank core every lost granule shows as two
-    /// CONFLICT_DM_BANK stamps on consecutive cycles on the same bank, the core winning both
-    /// (producer probe, 2026-07, 532-535 pairs per run, 18-20 core stalls), and a lost last
-    /// access moves FINISHED_BD by one cycle (lock-fetch probe, 2026-11).
+    /// A denied compute MM2S re-presents the identical demand the next cycle, whatever its
+    /// staging holds (the producer probe's 56 DMA wins came at the same staging as its 1557
+    /// losses). Silicon: against a dense same-bank core every lost granule shows as
+    /// CONFLICT_DM_BANK stamps on consecutive cycles on the same bank (producer probe, 2026-07),
+    /// and a lost last access moves FINISHED_BD by one cycle (lock-fetch probe, 2026-11).
     #[test]
     fn a_denied_mm2s_re_presents_its_demand_the_next_cycle() {
-        for urgent in [true, false] {
+        for warm in [false, true] {
             let mut eng = DmaEngine::new_compute_tile(1, 2);
             let mut tile = Tile::compute(1, 2);
             let mut host_mem = HostMemory::new();
             eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
-            eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
-                                              // The port is held, so the staging fills past the watermark (on a free port a
-                                              // host-started BD's staging sits at the watermark whenever it accesses).
+            // Channel 2 = MM2S ch0. The port is held, so the staging fills: the first demand
+            // finds it empty, a later one holds more than a granule.
+            eng.start_channel(2, 0).unwrap();
             let mut guard = 0;
             let demand = loop {
                 let demand = eng.peek_bank_demand(BankLayout::Compute);
                 let staged = eng.staged_words(2);
-                let wanted = if urgent {
-                    staged == 0
-                } else {
-                    staged > DmaEngine::URGENT_WATERMARK
-                };
+                let wanted = if warm { staged > 4 } else { staged == 0 };
                 if demand.iter().any(|(r, _)| *r == Requester::Mm2s(0)) && wanted {
                     break demand;
                 }
                 eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
                 guard += 1;
-                assert!(guard < 50, "the fixture never presented the wanted demand (urgent={urgent})");
+                assert!(guard < 50, "the fixture never presented the wanted demand (warm={warm})");
             };
-            assert_eq!(
-                eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-                urgent,
-                "fixture urgency"
-            );
             eng.step_with_denied(
                 &[Requester::Mm2s(0)],
                 &mut tile,
@@ -4958,7 +4988,7 @@ mod bank_demand_tests {
             assert_eq!(
                 eng.peek_bank_demand(BankLayout::Compute),
                 demand,
-                "the identical demand, the next cycle (urgent={urgent})"
+                "the identical demand, the next cycle (warm={warm})"
             );
         }
     }

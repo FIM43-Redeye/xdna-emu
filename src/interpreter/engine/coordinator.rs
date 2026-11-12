@@ -2248,18 +2248,12 @@ impl InterpreterEngine {
                 // slots cover every real case with no heap allocation.
                 let mut demands: SmallVec<[(Requester, u16); 5]> = SmallVec::new();
                 let mut dma_demand = 0u16;
-                // Egress-FIFO-urgent DMA channels (Task 2's `urgent_channels`):
-                // read alongside `peek_bank_demand` from the same `engine`/
-                // `layout` so urgency and demand agree on the same cycle's
-                // `staged_words` state.
-                let mut urgent: SmallVec<[Requester; 4]> = SmallVec::new();
                 if self.device.array.clock().is_module_active(c, r, ModuleKind::Dma)
                     && !self.device.array.clock().is_adaptive_dma_engaged(c, r)
                 {
                     if let Some(engine) = self.device.array.dma_engine(c, r) {
                         demands.extend(engine.peek_bank_demand(layout));
                         dma_demand = demands.iter().fold(0u16, |m, (_, banks)| m | banks);
-                        urgent.extend(engine.urgent_channels(layout));
                     }
                 }
 
@@ -2276,10 +2270,11 @@ impl InterpreterEngine {
                     continue;
                 }
 
-                // Phase C: arbitrate. `urgent` overrides round-robin fairness
-                // for DMA channels whose egress FIFO is near underflow, so a
-                // starving stream wins the bank over an otherwise-fair core.
-                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands, &urgent);
+                // Phase C: arbitrate. The tile's served-access count decides
+                // core versus DMA (`bank_arbiter` module docs) and advances
+                // for every access a bank serves this cycle.
+                let arb = self.bank_arbiters[tile_idx]
+                    .arbitrate(&demands, &mut self.device.array.tiles[tile_idx].bank_access_counts);
 
                 out[tile_idx].contended_banks = arb.contended_banks;
                 out[tile_idx].denied_dma =
@@ -3022,27 +3017,16 @@ mod tests {
     }
 
     /// End-to-end: a core storing into physical bank 0 every cycle while an
-    /// urgent MM2S DMA channel reads from the SAME bank must actually lose
-    /// some of those cycles to the arbiter -- and pay for them.
-    ///
-    /// The class-priority bank arbiter (c1e404a5/c01ff205/a9c2e134) makes the
-    /// core beat any non-urgent DMA on a contended bank; the only DMA that
-    /// overrides the core is an *urgent* MM2S -- one whose egress staging FIFO
-    /// is at/below `DmaEngine::URGENT_WATERMARK`
-    /// (`uses_egress_staging(transfer) && transfer_is_urgent(transfer)`,
-    /// stepping.rs). So this fixture keeps the MM2S egress drained every step
-    /// (mirroring `route_dma_to_tile_switches`) to hold it near underflow --
-    /// that is what makes it urgent often enough to actually deny the core.
-    /// This is HW-faithful, not a workaround: the producer finding measured
-    /// ~18-20 core stalls on Phoenix from exactly this shape (a dense core
-    /// losing bank arbitration to an urgent, egress-draining MM2S).
+    /// MM2S DMA channel reads from the SAME bank must actually lose some of
+    /// those cycles to the arbiter -- and pay for them. The bank's served-access
+    /// count lets the waiting DMA in once in every 5 served cycles (silicon:
+    /// the producer probe's dense march-store lost 18-20 cycles per run).
     ///
     /// This is the wiring test for the request -> arbitrate -> commit loop:
     /// the arbiter, the two peeks and `stall_for_bank` all have their own unit
     /// tests, but only the coordinator can prove that a real bundle competing
     /// with a real DMA transfer over a real bank ends up stalled, that the
-    /// stall costs a cycle, and that MEMORY_STALL is emitted for it. Under the
-    /// retroactive Phase-4 observer this charged nothing.
+    /// stall costs a cycle, and that MEMORY_STALL is emitted for it.
     #[test]
     fn core_and_dma_contending_for_one_bank_costs_the_core_cycles() {
         use crate::device::dma::BdConfig;
@@ -3083,11 +3067,7 @@ mod tests {
             tile.dma_channels[2].start_queue = 0;
         }
 
-        // Drain the MM2S egress every step so its staging FIFO stays near
-        // underflow -- urgent -- instead of topping up past the watermark and
-        // losing its override. This is exactly how
-        // `urgent_channels_reports_only_a_near_underflow_mm2s`
-        // (stepping.rs:3501) keeps a channel urgent.
+        // Drain the MM2S egress every step so the channel keeps fetching.
         for _ in 0..400 {
             engine.step();
             let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
@@ -3120,11 +3100,11 @@ mod tests {
     /// doing exactly this).
     ///
     /// Reuses `core_and_dma_contending_for_one_bank_costs_the_core_cycles`'s
-    /// contention fixture -- a core storing into bank 0 every cycle against
-    /// an urgent, egress-drained MM2S reading the same bank, whose own
-    /// `memory_stalls` assertion already proves the core loses arbitration
-    /// here -- but reads the count off a core-module perf counter configured
-    /// with start_event=MEMORY_STALL(23) instead of the timing-context stat.
+    /// contention fixture -- a core storing into bank 0 every cycle against an
+    /// MM2S reading the same bank, whose own `memory_stalls` assertion already
+    /// proves the core loses arbitration here -- but reads the count off a
+    /// core-module perf counter configured with start_event=MEMORY_STALL(23)
+    /// instead of the timing-context stat.
     #[test]
     fn core_losing_bank_arbitration_ticks_a_core_perf_counter_armed_by_memory_stall() {
         use crate::device::dma::BdConfig;
@@ -3173,10 +3153,7 @@ mod tests {
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
 
-        // Drain the MM2S egress every step so its staging FIFO stays near
-        // underflow -- urgent -- which is the one thing that overrides the
-        // core's class priority on the contended bank (see the sibling test
-        // above for the full model).
+        // Drain the MM2S egress every step so the channel keeps fetching.
         for _ in 0..400 {
             engine.step();
             let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();

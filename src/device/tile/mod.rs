@@ -330,6 +330,12 @@ pub struct Tile {
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
 
+    /// Accesses each physical data-memory bank has served since reset: the core-versus-DMA
+    /// arbitration state (`crate::device::bank_arbiter::BankAccessCounts`). On the tile, not in
+    /// the coordinator's arbiter, because the configuration path counts the lines it writes.
+    /// Compute tiles only; memtile banks are not arbitrated.
+    pub bank_access_counts: crate::device::bank_arbiter::BankAccessCounts,
+
     /// Held-level state for DMA_S2MM_n_MEMORY_BACKPRESSURE /
     /// DMA_MM2S_n_MEMORY_STARVATION (mem events 39-42, compute tiles only):
     /// true while DMA channel identity `idx` (`[S2MM ch0.., MM2S ch0..]`, see
@@ -567,6 +573,7 @@ impl Tile {
                 None
             },
             cycle_dma_banks: 0,
+            bank_access_counts: Default::default(),
             dma_mem_pressure_active: [false; DMA_PRESSURE_SIGNAL_COUNT],
             core_edge_detectors: [EdgeDetector::default(); 2],
             mem_edge_detectors: [EdgeDetector::default(); 2],

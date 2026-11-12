@@ -3689,7 +3689,8 @@ mod tests {
         assert_eq!(demand.len(), 2, "LoadA and Store are two independent ports, two demand entries");
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let arbitration = arb.arbitrate(&demand, &[]);
+        let arbitration =
+            arb.arbitrate(&demand, &mut crate::device::bank_arbiter::BankAccessCounts::default());
 
         assert_ne!(
             arbitration.contended_banks, 0,
@@ -3734,7 +3735,8 @@ mod tests {
         assert_eq!(demand.len(), 2);
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let arbitration = arb.arbitrate(&demand, &[]);
+        let arbitration =
+            arb.arbitrate(&demand, &mut crate::device::bank_arbiter::BankAccessCounts::default());
 
         assert_eq!(arbitration.contended_banks, 0, "different physical banks must not contend");
         assert!(arbitration.lost.is_empty());
@@ -3776,7 +3778,7 @@ mod tests {
         // with the accumulated served set until the bundle can issue.
         for _ in 0..8 {
             let demand = executor.peek_bank_demand(&bundle, &ctx, layout, &served);
-            let a = arb.arbitrate(&demand, &[]);
+            let a = arb.arbitrate(&demand, &mut crate::device::bank_arbiter::BankAccessCounts::default());
             if !a.core_lost() {
                 break; // every remaining port got its bank -- the bundle retires
             }
