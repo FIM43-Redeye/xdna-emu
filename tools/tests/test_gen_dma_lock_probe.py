@@ -756,3 +756,120 @@ def test_rotation_rule_bank1_phases_in_the_plan():
     assert g.rotation_prediction(arb(bank=1, n=2, k=20), 19)["core_lost"] == [20]
     assert g.rotation_prediction(arb(bank=1, n=4, k=36), 35)["core_lost"] == []
     assert g.rotation_prediction(arb(bank=1, n=5, k=36), 35)["core_lost"] == [39]
+
+
+# -- ring-order probe (ring-*) ----------------------------------------------------------
+
+def ring(variant="m0", **kw):
+    return g.RingCase(variant, **kw)
+
+
+def test_ring_core_camps_on_one_bank_from_the_release_then_fills_the_trace():
+    c = ring(n=10, k=0)
+    body = bundles_of(g.ring_core_asm(c))
+    i = body.index("event #0")
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    camp = body[i + 2:i + 12]
+    assert all(b.startswith("lda ") for b in camp)
+    assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in camp} == {0}
+    assert body[i + 12:i + 12 + g.ARB_EVENT1_NOPS] == ["nop"] * g.ARB_EVENT1_NOPS
+    done = body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    assert sum(b == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2" for b in body[done:]) == g.RING_FILL_RELEASES
+    assert sum(b.startswith("acq ") for b in body) == 2
+    go = body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3")
+    assert not [b for b in body[go:i] if b.startswith(("lda", "st "))]       # no history access before the camp
+
+
+def test_ring_bank1_camp_offsets():
+    body = bundles_of(g.ring_core_asm(ring(bank=1, n=9)))
+    loads = [b for b in body if b.startswith("lda r2") or b.startswith("lda r3")]
+    assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in loads} == {1}
+
+
+def test_ring_rejects_out_of_range():
+    for c in (ring("x"), ring(bank=2), ring(n=0), ring(n=g.RING_MAX_N + 1), ring(pad=g.RING_MAX_PAD + 1)):
+        with pytest.raises(ValueError):
+            g.ring_core_asm(c)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+def test_ring_core_assembles(tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.ring_core_asm(ring(n=g.RING_MAX_N)))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_ring_geometry():
+    assert {phys_bank(g.RING_SDST_ADDR + 16 * i) for i in range(16)} == {0, 1}      # S2MM target: banks 0/1
+    assert {phys_bank(g.RING_FEED_ADDR + 16 * i) for i in range(16)} == {2, 3}      # feed: clear of 0/1
+    assert all(phys_bank(a + 4 * j) == 0 for a in g.RING_PAD_ADDRS for j in range(4))
+    assert g.FETCH_LD_ADDR + 64 <= g.RING_PAD_ADDRS[0] and g.RING_PAD_ADDRS[1] + 16 <= g.RING_SDST_ADDR
+
+
+@pytest.mark.parametrize("variant,mm2s,s2mm,source,sdst", [("m0", 0, 0, "%src", False), ("m1", 1, 0, "%src", False),
+                                                           ("s0", 0, 0, "%feed", True), ("s1", 0, 1, "%feed", True)])
+def test_ring_design_puts_one_channel_on_banks_0_1(variant, mm2s, s2mm, source, sdst):
+    t = g.ring_design_mlir(ring(variant))
+    assert f"aie.flow(%t02, DMA : {mm2s}, %t02, DMA : {s2mm})" in t
+    assert f"aie.dma_start(MM2S, {mm2s}, ^pre" in t and f"aie.dma_start(S2MM, {s2mm}, ^recv" in t
+    send = t.split("^send:")[1].split("^recv_start:")[0]
+    assert f"aie.dma_bd({source} :" in send
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert ("dma_bd(%sdst" in recv) == sdst
+    assert "use_lock" not in recv                                               # the S2MM never waits
+    # the S2MM takes exactly what the MM2S sends: 4 + 64 words
+    import re
+    sizes = [int(x) for x in re.findall(r"dma_bd\(%\w+ : memref<\d+xi32> offset = \d+ len = (\d+)\)", recv)]
+    assert sizes
+    assert sum(sizes) == g.FETCH_PRE_WORDS + g.FETCH_WORDS
+    seq = t.split("aie.runtime_sequence")[1]
+    for forbidden in ("dma_wait", "dma_memcpy_nd", "npu.sync"):
+        assert forbidden not in seq
+
+
+def test_ring_variants_share_buffers_and_initial_data():
+    def bufs(t):
+        return [ln.strip() for ln in t.splitlines() if "aie.buffer" in ln]
+    base = bufs(g.ring_design_mlir(ring("m0")))
+    for v in ("m1", "s0", "s1"):
+        assert bufs(g.ring_design_mlir(ring(v))) == base
+    addrs = [int(ln.split("address = ")[1].split(" ")[0]) for ln in base]
+    assert addrs == sorted(addrs)                                               # ascending for the allocator
+
+
+@pytest.mark.parametrize("pad,words", [(0, []), (3, [3]), (4, [4]), (5, [4, 1]), (8, [4, 4])])
+def test_ring_pad_words_in_bank0(pad, words):
+    t = g.ring_design_mlir(ring(pad=pad))
+    found = [int(ln.split("memref<")[1].split("x")[0]) for ln in t.splitlines() if 'sym_name = "pad' in ln]
+    assert found == words
+
+
+def test_ring_event_lists():
+    assert g.ring_memmod_events(ring("m1")) == ["LOCK_0_REL", "DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_1_FINISHED_BD",
+                                                "DMA_S2MM_0_FINISHED_BD", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                                                "DMA_MM2S_1_MEMORY_STARVATION"]
+    s1 = g.ring_memmod_events(ring("s1"))
+    assert "DMA_S2MM_1_MEMORY_BACKPRESSURE" in s1 and "DMA_S2MM_1_FINISHED_BD" in s1 and len(s1) == 8
+    assert all(len(g.ring_memmod_events(ring(v))) <= 8 for v in g.RING_VARIANTS)
+
+
+def test_ring_row_and_residues():
+    rel = 1000
+    e = held("DMA_MM2S_0_STALLED_LOCK", 200, rel + 1) + [ev("LOCK_0_REL", rel), ev("LOCK_0_REL", rel + 500)]
+    # camp starts at rel + 1; runs on bank 0 at camp+3..+5 (DMA let in at +5) and +10..+11 (in at +11)
+    e += held("CONFLICT_DM_BANK_0", rel + 4, rel + 6) + held("CONFLICT_DM_BANK_0", rel + 11, rel + 12)
+    e += [ev("MEMORY_STALL", rel + 1 + 5 + 1, pkt=0), ev("MEMORY_STALL", rel + 1 + 11 + 1, pkt=0)]
+    e += [ev("INSTR_EVENT_0", rel - 1, pkt=0), ev("INSTR_EVENT_1", rel + 40, pkt=0)]
+    c = ring(n=20)
+    r = g.ring_row(e, c)
+    assert r["grant"] == 2 and r["lost"] == [5, 11] and r["runs"][0] == [(3, 5), (10, 11)]
+    res = g.ring_residues(r, c)
+    assert res["dma_wins"] == [0, 1] and res["dma_refused"] == [0, 3, 4] and res["withdrew"] == []
+    assert "rgm0b0n020k00p0" in g.format_ring_table([(c, "r1.hw", r)])
+
+
+def test_ring_plan():
+    names = [c.name for c in g.ring_plan()]
+    assert len(names) == len(set(names)) == 9 and all(n.startswith("rg") for n in names)

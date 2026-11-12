@@ -1355,6 +1355,311 @@ def cmd_arb_table(args) -> int:
     return 0
 
 
+# -- ring-order probe (ring-*): each DMA channel against the core on one bank -------------------------
+#
+# The core camps on one physical bank: n consecutive same-bank loads from the lock-A release, so every
+# cycle of the camp is exactly one served access of that bank (the core's, or a DMA's while the core is
+# refused). The bank's served-access count therefore advances one per cycle inside the camp, and the
+# cycles at which a DMA channel is let in, taken modulo 5 from the camp start, are that channel's winning
+# count residues; the cycles it is refused are the others. One DMA channel works on banks 0/1 per variant:
+#   m0 / m1  MM2S 0 / MM2S 1 runs the chained lock-fetch task (pre BD, then the lock-A BD reading `src`,
+#            banks 0/1) into S2MM 0, which writes `dst` (banks 4/5).
+#   s0 / s1  MM2S 0 runs the same task reading `feed` (banks 2/3) instead of `src`; S2MM 0 / S2MM 1 takes
+#            the pre BD's 4 words into `dst` and the 64 words into `sdst` (banks 0/1).
+# Every variant declares the same buffers with the same initial data, so the bank's history before the
+# camp is the same and the residues of different variants are on one common count. `pad` adds that many
+# initialised words to bank 0 (buffers at RING_PAD_ADDRS) to test whether image-load writes advance it.
+# After the window the core releases lock A RING_FILL_RELEASES more times (memory-module LOCK_0_REL events)
+# and runs a long tail, so both trace units fill their last packets and nothing measured is left in a
+# partial packet. Nothing waits on the host: the runtime sequence only sets the go lock; the core waits
+# only on go and on B, released by the lock-A BD after its 64 words; the S2MM BDs take exactly the 68 words
+# the MM2S sends (4 + 64), so the MM2S cannot be back-pressured forever.
+
+RING_VARIANTS = ("m0", "m1", "s0", "s1")
+RING_FEED_ADDR = 0x4100             # banks 2/3: the s-variants' MM2S source
+RING_SDST_ADDR = 0x1000             # banks 0/1: the s-variants' S2MM destination (granule g in bank g & 1)
+RING_PAD_ADDRS = (0x0C00, 0x0C20)   # bank 0 granules (bit 4 clear): up to 4 + 4 initialised words
+RING_MAX_PAD = 8
+RING_MAX_N = 120
+RING_FILL_RELEASES = 16
+RING_TAIL_ITERS = 800
+RING_CAMP_OFFSETS = {0: (0, 4, 8, 12, 32, 36, 40, 44), 1: (16, 20, 24, 28, 48, 52, 56, 60)}
+
+
+@dataclass(frozen=True)
+class RingCase:
+    variant: str                   # m0, m1, s0, s1: which channel works on banks 0/1
+    bank: int = 0                  # the camped physical bank
+    n: int = 90                    # camp length (consecutive same-bank loads)
+    k: int = 0                     # nops between the release and the camp
+    pad: int = 0                   # extra initialised words in bank 0
+
+    @property
+    def name(self) -> str:
+        return f"rg{self.variant}b{self.bank}n{self.n:03d}k{self.k:02d}p{self.pad}"
+
+    @property
+    def mm2s(self) -> int:
+        """The lock-started MM2S channel (its STALLED_LOCK gives the grant)."""
+        return 1 if self.variant == "m1" else 0
+
+    @property
+    def s2mm(self) -> int:
+        return 1 if self.variant == "s1" else 0
+
+
+def ring_validate(c: RingCase) -> None:
+    if c.variant not in RING_VARIANTS:
+        raise ValueError(f"variant must be one of {RING_VARIANTS}")
+    if c.bank not in (0, 1):
+        raise ValueError("bank must be 0 or 1")
+    if not 1 <= c.n <= RING_MAX_N:
+        raise ValueError(f"n must be 1..{RING_MAX_N}")
+    if c.k not in FETCH_KS:
+        raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+    if not 0 <= c.pad <= RING_MAX_PAD:
+        raise ValueError(f"pad must be 0..{RING_MAX_PAD}")
+
+
+def ring_core_asm(c: RingCase) -> str:
+    """go, settle, `event #0`, release A, k nops, n same-bank loads, `event #1`, wait B, then
+    RING_FILL_RELEASES spaced releases of A and a long tail (trace packet fillers)."""
+    ring_validate(c)
+    n = lp.nops
+    offs = RING_CAMP_OFFSETS[c.bank]
+    camp = [f"  lda {ARB_LOAD_REGS[i % len(ARB_LOAD_REGS)]}, [p0, #{offs[i % len(offs)]}]" for i in range(c.n)]
+    fill = []
+    for i in range(RING_FILL_RELEASES):
+        fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
+            "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(c.k),
+            *camp, *n(ARB_EVENT1_NOPS), "  event #1", *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8), *fill,
+            *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def ring_design_mlir(c: RingCase) -> str:
+    """The chained lock-fetch design with the channel of variant c on banks 0/1 (see the section note)."""
+    ring_validate(c)
+    w, p = FETCH_WORDS, FETCH_PRE_WORDS
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    feed = ", ".join(str(0x0E000000 | j) for j in range(w))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pre_init = ", ".join(str(0x0C000000 | j) for j in range(p))
+    pads = []
+    left = c.pad
+    for i, addr in enumerate(RING_PAD_ADDRS):
+        words = min(left, 4)
+        if words:
+            init = ", ".join(str(0x0F000000 | (4 * i + j)) for j in range(words))
+            pads.append(f"    %pad{i} = aie.buffer(%t02) {{address = {addr} : i32, sym_name = \"pad{i}\", "
+                        f"initial_value = dense<[{init}]> : tensor<{words}xi32>}} : memref<{words}xi32>\n")
+        left -= words
+    pad_text = "".join(pads)
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    source = "%feed" if c.variant.startswith("s") else "%src"
+    if c.variant.startswith("s"):
+        recv = (f"    ^recv:\n      aie.dma_bd(%dst : memref<{w + p}xi32> offset = 0 len = {p})\n      aie.next_bd ^recv2\n"
+                f"    ^recv2:\n      aie.dma_bd(%sdst : memref<{w}xi32> offset = 0 len = {w})\n      aie.next_bd ^end\n")
+    else:
+        recv = f"    ^recv:\n      aie.dma_bd(%dst : memref<{w + p}xi32> offset = 0 len = {w + p})\n      aie.next_bd ^end\n"
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+{pad_text}    %sdst = aie.buffer(%t02) {{address = {RING_SDST_ADDR} : i32, sym_name = "sdst"}} : memref<{w}xi32>
+    %pre = aie.buffer(%t02) {{address = {FETCH_PRE_ADDR} : i32, sym_name = "pre", initial_value = dense<[{pre_init}]> : tensor<{p}xi32>}} : memref<{p}xi32>
+    %feed = aie.buffer(%t02) {{address = {RING_FEED_ADDR} : i32, sym_name = "feed", initial_value = dense<[{feed}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{w + p}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
+    %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
+    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    aie.flow(%t02, DMA : {c.mm2s}, %t02, DMA : {c.s2mm})
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(MM2S, {c.mm2s}, ^pre, ^recv_start)
+    ^pre:
+      aie.dma_bd(%pre : memref<{p}xi32>)
+      aie.next_bd ^send
+    ^send:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd({source} : memref<{w}xi32>)
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lB, Release, %cb)
+      aie.next_bd ^end
+    ^recv_start:
+      %s1 = aie.dma_start(S2MM, {c.s2mm}, ^recv, ^end)
+{recv}    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lGo, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def ring_memmod_events(c: RingCase) -> list[str]:
+    m, s = c.mm2s, c.s2mm
+    ev = ["LOCK_0_REL", f"DMA_MM2S_{m}_STALLED_LOCK", f"DMA_MM2S_{m}_FINISHED_BD", f"DMA_S2MM_{s}_FINISHED_BD",
+          "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
+    if c.variant.startswith("s"):
+        ev += [f"DMA_S2MM_{s}_MEMORY_BACKPRESSURE", f"DMA_MM2S_{m}_STREAM_BACKPRESSURE"]
+    else:
+        ev += [f"DMA_MM2S_{m}_MEMORY_STARVATION"]
+    return ev
+
+
+def ring_inject_args(c: RingCase) -> list[str]:
+    return ["--memmod-sweep-events", ",".join(ring_memmod_events(c)),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(ARB_CORE_EVENTS)]
+
+
+def ring_row(events, c: RingCase) -> dict:
+    """One run: grant (cycles after the release), conflict runs on each bank, the cycles the core lost (from
+    MEMORY_STALL: core stamp minus 1, the offset measured in the arb probe), finishes, back-pressure runs.
+    All cycles are relative to the camp start (release + k + 1, the first load's cycle)."""
+    mem: dict = {}
+    core: dict = {}
+    for e in events:
+        if e.row == FETCH_ROW:
+            (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+    rels = sorted(mem.get("LOCK_0_REL", []))
+    if not rels:
+        return {"release": None}
+    rel = rels[0]
+    t0 = rel + c.k + 1
+    r: dict = {"release": rel, "grant": None, "camp_start": t0}
+    for first, last in _runs(mem.get(f"DMA_MM2S_{c.mm2s}_STALLED_LOCK", [])):
+        if first <= rel <= last + 1:
+            r["grant"] = last + 1 - rel
+    r["lost"] = [t - 1 - t0 for t in sorted(set(core.get("MEMORY_STALL", [])))]
+    r["runs"] = {b: [(a - t0, z - t0) for a, z in _runs(mem.get(f"CONFLICT_DM_BANK_{b}", []))] for b in (0, 1)}
+    r["mm2s_fin"] = [t - t0 for t in sorted(set(mem.get(f"DMA_MM2S_{c.mm2s}_FINISHED_BD", []))) if t > rel]
+    r["s2mm_fin"] = [t - t0 for t in sorted(set(mem.get(f"DMA_S2MM_{c.s2mm}_FINISHED_BD", []))) if t > rel]
+    r["backpressure"] = {name: [(a - t0, z - t0) for a, z in _runs(mem.get(name, [])) if z >= rel]
+                         for name in (f"DMA_S2MM_{c.s2mm}_MEMORY_BACKPRESSURE",
+                                      f"DMA_MM2S_{c.mm2s}_STREAM_BACKPRESSURE") if name in mem}
+    ev0, ev1 = sorted(core.get("INSTR_EVENT_0", [])), sorted(core.get("INSTR_EVENT_1", []))
+    r["window"] = ev1[0] - ev0[0] if ev0 and ev1 else None
+    return r
+
+
+def ring_residues(r: dict, c: RingCase, period: int = ARB_PERIOD) -> dict:
+    """Inside the camp (cycles 0..n-1 + losses from the camp start) every cycle is one served access, so the
+    count residue of cycle t is t mod period (plus a constant common to all variants). Returns, for the
+    camped bank, the residues at which the DMA was let in (a contended cycle the core lost) and at which it
+    was refused (a contended cycle the core won), and contended runs that ended without a core loss inside
+    the camp (the DMA withdrew)."""
+    end = c.n + len(r["lost"])
+    lost = set(r["lost"])
+    won, refused, withdrew = set(), set(), []
+    for a, z in r["runs"][c.bank]:
+        if a < 0 or z >= end:
+            continue
+        for t in range(a, z + 1):
+            (won if t in lost else refused).add(t % period)
+        if z not in lost:
+            withdrew.append((a, z))
+    return {"dma_wins": sorted(won), "dma_refused": sorted(refused), "withdrew": withdrew}
+
+
+def ring_plan() -> list[RingCase]:
+    cases = [RingCase(v) for v in RING_VARIANTS]
+    cases += [RingCase("m0", pad=p) for p in range(1, 6)]
+    return cases
+
+
+def ring_selection(args) -> list[RingCase]:
+    return [c for c in ring_plan() if not args.names or c.name in args.names]
+
+
+def ring_build_case(c: RingCase, out: Path) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(ring_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(ring_design_mlir(c))
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *ring_inject_args(c),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "variant": c.variant, "bank": c.bank, "n": c.n,
+                                             "k": c.k, "pad": c.pad, "ring": True}) + "\n")
+
+
+def format_ring_table(rows) -> str:
+    lines = ["case               run    grant  lost(camp+)                       runs on the camped bank (start..end)"
+             "                  residues: DMA in / refused   withdrew  mm2s_fin s2mm_fin backpressure"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r.get("release") is None or r.get("grant") is None:
+            lines.append(f"{c.name:<18} {run:<6} no release or grant")
+            continue
+        res = ring_residues(r, c)
+        runs = " ".join(f"{a}" if a == z else f"{a}..{z}" for a, z in r["runs"][c.bank])
+        bp = " ".join(f"{k.replace('DMA_', '')}:{','.join(f'{a}..{z}' for a, z in v)}"
+                      for k, v in r["backpressure"].items() if v)
+        lines.append(f"{c.name:<18} {run:<6} +{r['grant']}    {','.join(map(str, r['lost'])) or '-':<33} "
+                     f"{runs:<44} {res['dma_wins']} / {res['dma_refused']}  {res['withdrew'] or '-'}  "
+                     f"{r['mm2s_fin']} {r['s2mm_fin']} {bp or '-'}")
+    return "\n".join(lines)
+
+
+def cmd_ring_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in ring_selection(args):
+        ring_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_ring_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in ring_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_ring_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in ring_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"release": None}))
+                continue
+            rows.append((c, run, ring_row(load_level_events(run_dir), c)))
+    print(format_ring_table(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1407,9 +1712,20 @@ def main(argv=None) -> int:
     at = sub.add_parser("arb-table", help="bank arbitration probe: measurement next to the rotation rule")
     at.add_argument("out_dir")
     at.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at):
+    rb = sub.add_parser("ring-build", help="ring-order probe: build the plan's cases (or --names)")
+    rb.add_argument("out_dir")
+    rr = sub.add_parser("ring-run", help="ring-order probe: run the built cases to TAG.BACKEND/")
+    rr.add_argument("out_dir")
+    rr.add_argument("tag")
+    rr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    rt = sub.add_parser("ring-table", help="ring-order probe: per-run camp table with count residues")
+    rt.add_argument("out_dir")
+    rt.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     args = ap.parse_args(argv)
+    if args.cmd.startswith("ring-"):
+        return {"ring-build": cmd_ring_build, "ring-run": cmd_ring_run, "ring-table": cmd_ring_table}[args.cmd](args)
     if args.cmd.startswith("arb-"):
         return {"arb-build": cmd_arb_build, "arb-run": cmd_arb_run, "arb-table": cmd_arb_table}[args.cmd](args)
     if args.cmd.startswith("fetch-"):
