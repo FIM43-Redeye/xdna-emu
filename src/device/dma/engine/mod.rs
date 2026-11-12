@@ -604,8 +604,24 @@ impl DmaEngine {
         // the DMA waits for buffer locks, potentially deadlocking other
         // packets sharing the same arbiter.
 
+        // A compute MM2S's word clock starts on the BD, lock or no lock, at the same point as
+        // after BdSetup on the lock-free path (BdSetup's last step + 1 +
+        // `mm2s_word_clock_start_cycles`): a lock-started BD skips BdSetup here, but not the BD
+        // load the clock waits for. (A lock-free BD sets it again when its BdSetup ends.)
+        let word_clock_from = self.uses_word_clock(&transfer).then(|| {
+            self.read_clock
+                + self.timing_config.bd_setup_cycles as u64
+                + 1
+                + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64
+        });
+
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];
+        if let Some(from) = word_clock_from {
+            ch.words_sequenced = 0;
+            ch.word_clock_from = from;
+            ch.word_clock_resume_at = u64::MAX;
+        }
         ch.error_event_reported = false;
         ch.current_bd = Some(bd_index);
         ch.repeat_count = repeat_count as u32;
@@ -679,6 +695,8 @@ impl DmaEngine {
         ch.words_sequenced = 0;
         ch.word_clock_from = 0;
         ch.access_settles_at = 0;
+        ch.access_from = 0;
+        ch.word_clock_resume_at = 0;
         ch.egress_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;

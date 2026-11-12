@@ -179,6 +179,12 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.mm2s_access_to_finish_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py): last access grant + 51, \
             FINISHED_BD + 52, + 53 when a core access wins the bank at + 51",
             "Paired with the lock-to-access latency through the conflict-stamp-equals-access assumption."),
+        measured("dma.mm2s_lock_to_access_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py, first-BD and chained): \
+            first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3",
+            "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency."),
+        measured("dma.mm2s_word_clock_resume_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, \
+            granule 5 at + 11, unchanged (with FINISHED_BD + 52) when a core access wins the bank at + 2",
+            "Fitted with the lead: 16 resuming at + 3 or 14 at + 1, not separated."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),

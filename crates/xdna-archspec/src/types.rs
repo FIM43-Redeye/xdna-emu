@@ -1457,10 +1457,9 @@ pub struct DmaTiming {
     /// keeps the older read-cursor rule (its access position is not measured).
     pub mm2s_word_clock_start_cycles: u8,
 
-    /// Words a compute-tile MM2S word clock may have sequenced ahead of its bank accesses: 16.
-    /// While the access is withheld (the BD's lock not yet held, or no staging room) the clock
-    /// keeps sequencing up to this lead, so a lock-parked BD resumes with four granules
-    /// ready. Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`, 64-word lock-started BD):
+    /// Words a compute-tile MM2S word clock may sequence of a BD whose lock is not held: 16.
+    /// While the BD waits for its lock the clock keeps sequencing up to this lead, so it
+    /// resumes with four granules ready (`mm2s_word_clock_resume_cycles`). Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`, 64-word lock-started BD):
     /// granules 0..3 accessed back to back at grant + 2..5, granule 4 at + 7, then one per 4
     /// cycles from + 11. A lead of 16 with the clock resuming at grant + 3 and a lead of 14
     /// resuming at grant + 1 give the same map: the exact value is not yet separated by
@@ -1480,6 +1479,24 @@ pub struct DmaTiming {
     /// access won the bank at grant + 51. A constant offset between the CONFLICT_DM_BANK stamp
     /// and the access would move this and the lock-to-access latency in opposite directions.
     pub mm2s_access_to_finish_cycles: u8,
+
+    /// Cycles from the lock grant of a lock-started **compute-tile** MM2S BD (the cycle it
+    /// leaves the lock wait, STALLED_LOCK falling) until its first bank access may happen: 2.
+    /// Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`, first-BD and chained alike): first
+    /// access at grant + 2, none at + 0 or + 1 on either bank; the word clock sequenced the
+    /// BD's first granules during the wait, so nothing else is paid after the grant (no memory
+    /// latency, no channel start). The 1-word dummy BD of `tools/gen_path_onset_probe.py`
+    /// `prewake-run` finishes at grant + 3 the same way.
+    pub mm2s_lock_to_access_cycles: u8,
+
+    /// Cycles from the lock grant of a lock-started **compute-tile** MM2S BD until its word
+    /// clock, held at `mm2s_word_clock_lead_words` while the BD waited, sequences again: 3.
+    /// Fitted with the lead (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`): word i >= 16 of a
+    /// 64-word BD sequenced at grant - 13 + i puts granule 4 at grant + 7 and granule 5 at
+    /// + 11. Timed by the grant, not by the first access: a core access that wins the bank at
+    /// grant + 2 leaves granule 4 and FINISHED_BD where they were. A lead of 14 resuming at
+    /// grant + 1 gives the same cells; the pair is not yet separated by measurement.
+    pub mm2s_word_clock_resume_cycles: u8,
 
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself

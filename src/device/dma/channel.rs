@@ -623,6 +623,12 @@ pub struct ChannelContext {
     /// Engine step at which the current BD's last bank access has settled and FINISHED_BD may
     /// be stamped (last access + `mm2s_access_to_finish_cycles`).
     pub access_settles_at: u64,
+    /// Engine step from which a lock-started BD may access memory (its grant +
+    /// `mm2s_lock_to_access_cycles`); unused by a BD without an acquire.
+    pub access_from: u64,
+    /// Engine step from which the word clock of a lock-started BD sequences past the lead
+    /// (grant + `mm2s_word_clock_resume_cycles`); `u64::MAX` while the BD waits for its lock.
+    pub word_clock_resume_at: u64,
     /// Held level of the stream-side STREAM_BACKPRESSURE for a staged MM2S: a
     /// staged word is waiting on a full output register.
     pub egress_backpressure: bool,
@@ -677,6 +683,8 @@ impl ChannelContext {
             words_sequenced: 0,
             word_clock_from: 0,
             access_settles_at: 0,
+            access_from: 0,
+            word_clock_resume_at: 0,
             egress_backpressure: false,
             read_completions: VecDeque::new(),
             read_backpressure: false,
@@ -828,6 +836,8 @@ impl ChannelContext {
         self.words_sequenced = 0;
         self.word_clock_from = 0;
         self.access_settles_at = 0;
+        self.access_from = 0;
+        self.word_clock_resume_at = 0;
         self.egress_backpressure = false;
     }
 }

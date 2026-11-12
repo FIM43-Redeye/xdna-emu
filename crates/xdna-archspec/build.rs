@@ -528,6 +528,8 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             ("DMA_MM2S_WORD_CLOCK_LEAD_WORDS", t.dma.mm2s_word_clock_lead_words),
             ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
             ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
+            ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),
+            ("DMA_MM2S_WORD_CLOCK_RESUME_CYCLES", t.dma.mm2s_word_clock_resume_cycles),
         ] {
             writeln!(out, "    pub const {name}: u8 = {value};").unwrap();
         }

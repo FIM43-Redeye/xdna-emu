@@ -3020,7 +3020,12 @@ fn chained_bd_lock_interval_baseline() {
         "expected exactly 2 FINISHED_BD events, got cycles {:?}",
         finished_bd_cycles
     );
-    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, &finished_bd_cycles);
+    // A 2-word BD is shorter than the lock hand-off: BD#1's lock is released by BD#0's
+    // FINISHED_BD (last access + 1), granted the cycle after, and BD#1 may access memory only
+    // from grant + 2 (`mm2s_lock_to_access_cycles`, lock-fetch probe), i.e. 4 cycles after
+    // BD#0's last access, while BD#0's 2 words leave in 2: the port idles 2 cycles at the
+    // boundary, not the 1 of a longer BD (`on16 off1`). Unmeasured for 2-word BDs on silicon.
+    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, 2, &finished_bd_cycles);
 }
 
 /// The port side of a chained MM2S: one run of `words` beats per BD (1 word/cyc
@@ -3028,7 +3033,13 @@ fn chained_bd_lock_interval_baseline() {
 /// and each FINISHED_BD lands no later than its BD's last beat -- a staged
 /// MM2S finishes a BD when its last word is fetched, not when it leaves
 /// (silicon, pipeline-fill chain probe).
-fn assert_port_runs_with_boundary_bubbles(beats: &[usize], bds: usize, words: usize, finished: &[u64]) {
+fn assert_port_runs_with_boundary_bubbles(
+    beats: &[usize],
+    bds: usize,
+    words: usize,
+    bubble: usize,
+    finished: &[u64],
+) {
     let first = beats.iter().position(|&n| n > 0).expect("no beat left the port");
     let last = beats.iter().rposition(|&n| n > 0).unwrap();
     let mut runs = Vec::new();
@@ -3052,11 +3063,11 @@ fn assert_port_runs_with_boundary_bubbles(beats: &[usize], bds: usize, words: us
     }
     runs.push(run);
     assert_eq!(runs, vec![words; bds], "one beat run per BD: {beats:?}");
-    assert_eq!(gaps, vec![1; bds - 1], "a 1-cycle bubble at each BD boundary (HW off1): {beats:?}");
+    assert_eq!(gaps, vec![bubble; bds - 1], "a {bubble}-cycle bubble at each BD boundary: {beats:?}");
     assert_eq!(finished.len(), bds, "one FINISHED_BD per BD: {finished:?}");
     let mut end = first as u64;
     for (j, &f) in finished.iter().enumerate() {
-        end += words as u64 + if j > 0 { 1 } else { 0 };
+        end += words as u64 + if j > 0 { bubble as u64 } else { 0 };
         assert!(f < end, "BD {j} finished at {f}, after its last beat left at {}: {finished:?}", end - 1);
     }
 }
@@ -3142,7 +3153,7 @@ fn chained_bd_16w_lock_interval_diagnostic() {
             _ => None,
         })
         .collect();
-    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &finished_bd_cycles);
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, 1, &finished_bd_cycles);
 }
 
 /// Diagnostic: chained BDs *without* locks. Pure chain overhead, no
@@ -3196,7 +3207,7 @@ fn chained_bd_no_lock_interval_diagnostic() {
     // cycles, then the per-BD `off1` HW shows whether or not the BD carries
     // locks (#140 stream-rate metering); the bubble sits on the port side
     // (`ChannelContext::egress_gap`).
-    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &finished_bd_cycles);
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, 1, &finished_bd_cycles);
 }
 
 /// Cross-lock handoff: a chained BD's release is DEFERRED to the next BD's
