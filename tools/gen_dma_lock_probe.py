@@ -1185,6 +1185,11 @@ def arb_plan() -> list[ArbCase]:
     for cell in (7, 15):
         for m in range(1, ARB_MAX_M + 1):
             cases.append(ArbCase(0, "l", 1, cell + 1, m))
+    # bank 1 bursts at two other phases: g+19 (DMA due on the 2nd contended cycle), g+35 (on the 5th)
+    for n in (1, 2, 3):
+        cases.append(ArbCase(1, "l", n, 20))
+    for n in (4, 5, 6):
+        cases.append(ArbCase(1, "l", n, 36))
     return cases
 
 

@@ -680,7 +680,7 @@ def test_arb_core_assembles(c, tmp_path):
 def test_arb_plan_names_are_distinct_valid_and_clear_of_other_variants():
     plan = g.arb_plan()
     names = [c.name for c in plan]
-    assert len(names) == len(set(names)) == 50
+    assert len(names) == len(set(names)) == 56
     for c in plan:
         g.arb_validate(c)
     assert all(n.startswith("ar") and not n.startswith(("lf", "ls", "lt")) for n in names)
@@ -749,3 +749,10 @@ def test_arb_matches_compares_contended_cycles_and_core_stall_count():
     assert g.arb_matches(r, {"contended": [7], "core_lost": [7]})
     assert not g.arb_matches(r, {"contended": [7], "core_lost": []})
     assert not g.arb_matches(r, {"contended": [7, 8], "core_lost": [7]})
+
+
+def test_rotation_rule_bank1_phases_in_the_plan():
+    assert g.rotation_prediction(arb(bank=1, n=1, k=20), 19)["core_lost"] == []
+    assert g.rotation_prediction(arb(bank=1, n=2, k=20), 19)["core_lost"] == [20]
+    assert g.rotation_prediction(arb(bank=1, n=4, k=36), 35)["core_lost"] == []
+    assert g.rotation_prediction(arb(bank=1, n=5, k=36), 35)["core_lost"] == [39]
