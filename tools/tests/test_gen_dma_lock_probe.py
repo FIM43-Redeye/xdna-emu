@@ -393,3 +393,220 @@ def test_map_lists_dma_absent_and_unknown_cycles_per_bank():
     assert "bank 1 DMA access proven: g+2" in text
     assert "bank 1 no DMA access: g+4" in text
     assert "bank 0 unknown" in text or "bank 0: no data" in text
+
+
+# -- lock-synchronised variant (--sync): the core's release a controlled d cycles after the pre BD --------
+
+def sync_case(d=12, bank="none", k=0, free=False):
+    return g.SyncCase(d=d, bank=bank, k=k, free=free)
+
+
+def test_sync_case_names_are_distinct_and_clear_of_the_other_variants():
+    names = {sync_case(d).name for d in g.SYNC_DEFAULT_DS}
+    names |= {sync_case(12, b, k).name for b in "01" for k in range(16)}
+    names |= {sync_case(g.FREE_D, free=True).name}
+    assert len(names) == len(g.SYNC_DEFAULT_DS) + 32 + 1
+    other = {g.fetch_case_name(k, c, b) for k in range(65) for (c, b) in g.FETCH_PREFIX}
+    assert not names & other
+    assert sync_case(7).name == "ls07" and sync_case(12, "0", 5).name == "lsa12k05"
+    assert sync_case(12, "1", 5).name == "lsb12k05" and sync_case(g.FREE_D, free=True).name == "lsfree"
+
+
+def test_sync_default_d_sweep_is_0_to_24_then_steps_of_two_to_40():
+    assert g.SYNC_DEFAULT_DS == tuple(range(25)) + tuple(range(26, 41, 2))
+
+
+def test_sync_specs_cover_the_requested_grid():
+    main = g.sync_specs(ds=[0, 4], ks=[], banks=["none"], free=True)
+    assert [s.name for s in main] == ["ls00", "ls04", "lsfree"]
+    conf = g.sync_specs(ds=[4, 30], ks=[0, 1], banks=["0", "1"], free=False)
+    assert [s.name for s in conf] == ["lsa04k00", "lsa04k01", "lsa30k00", "lsa30k01",
+                                      "lsb04k00", "lsb04k01", "lsb30k00", "lsb30k01"]
+    with pytest.raises(ValueError):
+        g.sync_specs(ds=[41], ks=[], banks=["none"], free=False)
+
+
+def test_sync_core_acquires_sync_then_event_then_d_nops_then_release_a():
+    body = bundles_of(g.sync_core_asm(sync_case(d=9)))
+    acq = body.index(f"acq #{g.OWN + g.SYNC_LOCK_SYNC}, r3")
+    ev0 = body.index("event #0")
+    rel = body.index(f"rel #{g.OWN + g.SYNC_LOCK_A}, r2")
+    assert acq < ev0 < rel
+    assert body[ev0 + 1:rel] == ["nop"] * 9                       # exactly d nops between the marker and the release
+    assert sum(b.startswith("acq ") for b in body) == 1           # the only wait is the pre BD's release
+    assert not any(b.startswith("lda r2") for b in body)          # no core memory access in the main sweep
+
+
+@pytest.mark.parametrize("bank,load", [("0", "lda r26, [p0, #0]"), ("1", "lda r28, [p0, #16]")])
+def test_sync_core_conflict_case_loads_k_nops_after_the_release(bank, load):
+    body = bundles_of(g.sync_core_asm(sync_case(d=3, bank=bank, k=6)))
+    rel = body.index(f"rel #{g.OWN + g.SYNC_LOCK_A}, r2")
+    assert body[rel + 1:rel + 7] == ["nop"] * 6 and body[rel + 7] == load
+    assert sum(b.startswith("lda r2") for b in body) == 1
+
+
+def test_sync_core_rejects_out_of_range():
+    for bad in (sync_case(d=-1), sync_case(d=41), sync_case(bank="0", k=-1), sync_case(bank="0", k=65)):
+        with pytest.raises(ValueError):
+            g.sync_core_asm(bad)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [sync_case(0), sync_case(40), sync_case(5, "0", 3), sync_case(5, "1", 64)])
+def test_sync_core_assembles(c, tmp_path):
+    s = tmp_path / "c.s"
+    s.write_text(g.sync_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "c.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_sync_design_pre_bd_waits_on_start_releases_sync_and_chains_to_the_waiting_bd():
+    t = g.sync_design_mlir(sync_case())
+    pre = t.split("^pre:")[1].split("^send:")[0]
+    assert pre.index("use_lock(%lStart, AcquireGreaterEqual") < pre.index("dma_bd(%pre") < pre.index("use_lock(%lSync, Release")
+    assert "next_bd ^send" in pre
+    send = t.split("^send:")[1].split("^recv_start:")[0]
+    assert send.index("use_lock(%lA, AcquireGreaterEqual") < send.index("dma_bd(%src")
+    assert "use_lock(%lEnd, Release" in send and "use_lock(%lA, Release" not in send   # a BD needs both lock fields
+    assert 'aie.lock(%t02, 0) {init = 0 : i32, sym_name = "lA"}' in t          # lock id 0: LOCK_0_REL follows it
+    assert "dma_start(MM2S, 0, ^pre," in t
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert "use_lock" not in recv and "memref<68xi32>" in recv                  # both BDs' words, no lock
+
+
+def test_sync_design_sequence_only_sets_the_start_lock():
+    t = g.sync_design_mlir(sync_case())
+    seq = t.split("aie.runtime_sequence")[1]
+    assert "aiex.set_lock(%lStart" in seq and "aiex.set_lock(%lSync" not in seq and "aiex.set_lock(%lA" not in seq
+    assert seq.count("aiex.set_lock") == 1
+    for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync"):
+        assert forbidden not in seq
+    assert phys_bank(g.FETCH_PRE_ADDR) == 2 and g.FETCH_PRE_ADDR >> 14 == 1       # clear of the measured banks
+
+
+def test_sync_free_case_starts_lock_a_at_one():
+    assert 'sym_name = "lA"' in g.sync_design_mlir(sync_case())
+    assert 'aie.lock(%t02, 0) {init = 1 : i32, sym_name = "lA"}' in g.sync_design_mlir(sync_case(g.FREE_D, free=True))
+
+
+def test_sync_event_lists_per_variant():
+    main = g.sync_inject_args("none")
+    ev_main = main[main.index("--memmod-sweep-events") + 1].split(",")
+    assert ev_main == ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD"]
+    conf = g.sync_inject_args("0")
+    assert conf[conf.index("--memmod-sweep-events") + 1].split(",")[-2:] == ["CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
+    assert main[main.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,LOCK_STALL"
+
+
+def sync_synthetic(rel=1000, pre=960, park=6, grant_after=2, fin_after_grant=52, s2mm_after_grant=78,
+                   conflict_at=None, waits=True):
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, 940)                   # the pre BD's wait on the start lock
+    if waits:
+        e += held("DMA_MM2S_0_STALLED_LOCK", pre + park, rel + grant_after - 1)
+    grant = rel + grant_after
+    e += [ev("DMA_MM2S_0_FINISHED_BD", pre), ev("LOCK_0_REL", rel),
+          ev("DMA_MM2S_0_FINISHED_BD", grant + fin_after_grant), ev("DMA_S2MM_0_FINISHED_BD", grant + s2mm_after_grant),
+          ev("INSTR_EVENT_0", rel - 12, pkt=0)]
+    if conflict_at is not None:
+        e.append(ev("CONFLICT_DM_BANK_1", grant + conflict_at))
+    return e
+
+
+def test_sync_row_numbers():
+    r = g.sync_row(sync_synthetic(rel=1000, pre=960, park=6, grant_after=3))
+    assert r["pre_fin"] == 960 and r["release"] == 1000
+    assert r["d"] == 40                                             # release minus the pre BD's finish
+    assert r["park"] == 6                                           # the channel's STALLED_LOCK rise after the pre finish
+    assert r["grant"] == 3
+    assert r["mm2s_after_grant"] == 52 and r["s2mm_after_grant"] == 78
+    assert r["fin_after_pre"] == 40 + 3 + 52
+
+
+def test_sync_row_ignores_the_start_lock_interval():
+    r = g.sync_row(sync_synthetic())
+    assert r["park"] == 6 and r["grant"] == 2                       # not the interval that ended at 940
+
+
+def test_sync_row_lock_free_on_request_has_no_wait():
+    r = g.sync_row(sync_synthetic(waits=False))
+    assert r["park"] is None and r["grant"] is None
+    assert r["mm2s_after_grant"] is None and r["fin_after_release"] == 2 + 52   # falls back to the release anchor
+
+
+def test_sync_row_conflicts_relative_to_the_grant():
+    r = g.sync_row(sync_synthetic(grant_after=3, conflict_at=7))
+    assert r["conflicts"] == [("CONFLICT_DM_BANK_1", 7)]
+
+
+def test_sync_row_without_release_or_second_finish_says_so():
+    assert g.sync_row([ev("DMA_MM2S_0_FINISHED_BD", 5)])["release"] is None
+    r = g.sync_row([ev("LOCK_0_REL", 50), ev("DMA_MM2S_0_FINISHED_BD", 5)])
+    assert r["release"] == 50 and r["mm2s_after_grant"] is None and r["fin_after_pre"] is None
+
+
+def test_format_sync_table_and_summary():
+    rows = [(12, "s2.hw", g.sync_row(sync_synthetic(grant_after=3))), (4, "s1.hw", g.sync_row(sync_synthetic())),
+            (12, "s1.hw", g.sync_row(sync_synthetic(grant_after=2)))]
+    t = g.format_sync_table(rows).splitlines()
+    assert t[0].split()[:3] == ["d", "run", "d_meas"]
+    assert t[1].split()[:2] == ["4", "s1.hw"] and t[2].split()[:2] == ["12", "s1.hw"] and t[3].split()[:2] == ["12", "s2.hw"]
+    assert "grant +3" in t[3] and "mm2s-g +52" in t[3] and "s2mm-g +78" in t[3]
+    s = g.format_sync_summary(rows)
+    assert "d=12" in s and "s1.hw g+2/f52" in s and "s2.hw g+3/f52" in s
+
+
+def test_free_case_row_sorts_after_the_numbered_ds_and_does_not_clash_with_the_same_d():
+    assert sync_case(g.FREE_D, free=True).label == "free" and sync_case(7).label == 7
+    rows = [("free", "s1.hw", g.sync_row(sync_synthetic(waits=False))), (g.FREE_D, "s1.hw", g.sync_row(sync_synthetic())),
+            (3, "s1.hw", g.sync_row(sync_synthetic()))]
+    t = g.format_sync_table(rows).splitlines()
+    assert [ln.split()[0] for ln in t[1:]] == ["3", str(g.FREE_D), "free"]
+    assert "lock free on request" in t[3]
+    s = g.format_sync_summary(rows)
+    assert s.splitlines()[-1].startswith("d=free") and "s1.hw nowait" in s.splitlines()[-1]
+
+
+def test_sync_row_park_can_precede_the_pre_finish_stamp():
+    r = g.sync_row(sync_synthetic(pre=960, park=-1))
+    assert r["park"] == -1 and r["grant"] == 2
+
+
+def test_sync_row_a_stall_that_ended_before_the_release_is_not_a_wait():
+    e = sync_synthetic(waits=False) + held("DMA_MM2S_0_STALLED_LOCK", 962, 970)
+    assert g.sync_row(e)["grant"] is None
+
+
+def test_sync_selection_free_only():
+    import argparse
+    a = argparse.Namespace(free_only=True, ds=[3], ks=[], banks=None, free=False, pre2=0)
+    assert [c.name for c in g.sync_selection(a)] == ["lsfree"]
+    a = argparse.Namespace(free_only=False, ds=[3], ks=[], banks=None, free=True, pre2=0)
+    assert [c.name for c in g.sync_selection(a)] == ["ls03", "lsfree"]
+
+
+def test_pre2_names_design_and_specs():
+    c = g.SyncCase(d=5, pre2=16)
+    assert c.name == "lt05" and g.SyncCase(5, "0", 3, pre2=16).name == "lta05k03"
+    assert g.SyncCase(g.FREE_D, free=True, pre2=16).name == "ltfree"
+    assert [s.name for s in g.sync_specs([1, 2], [], ["none"], True, pre2=16)] == ["lt01", "lt02", "ltfree"]
+    t = g.sync_design_mlir(c)
+    pre = t.split("^pre:")[1].split("^pre2:")[0]
+    assert "use_lock(%lSync, Release" in pre and "next_bd ^pre2" in pre
+    pre2 = t.split("^pre2:")[1].split("^send:")[0]
+    assert "dma_bd(%pre2 : memref<16xi32>)" in pre2 and "use_lock" not in pre2 and "next_bd ^send" in pre2
+    assert "memref<84xi32>" in t.split("^recv:")[1]                        # 64 + 4 + 16 words
+    assert g.SYNC_PRE2_ADDR >> 14 == 1 and phys_bank(g.SYNC_PRE2_ADDR) == 2
+    assert "^pre2" not in g.sync_design_mlir(g.SyncCase(d=5))              # the single-pre design is unchanged
+    with pytest.raises(ValueError):
+        g.sync_validate(g.SyncCase(d=1, pre2=33))
+
+
+def test_sync_row_with_two_pre_bds_measures_d_from_the_last_one():
+    e = sync_synthetic(rel=1000, pre=990, park=2, grant_after=2) + [ev("DMA_MM2S_0_FINISHED_BD", 975)]
+    r = g.sync_row(e)
+    assert r["d"] == 10 and r["d1"] == 25 and r["pre_fin"] == 990
+    assert r["grant"] == 2 and r["mm2s_after_grant"] == 52
+    e = sync_synthetic(rel=1000, pre=1010, waits=False) + [ev("DMA_MM2S_0_FINISHED_BD", 975)]
+    r = g.sync_row(e)
+    assert r["d"] == -10 and r["grant"] is None                            # released before the channel asked
