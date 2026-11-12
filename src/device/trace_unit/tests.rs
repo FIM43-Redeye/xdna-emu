@@ -1667,3 +1667,129 @@ fn a_run_ending_at_exactly_1023_repeats_has_no_trailing_repeat() {
     tu.flush_repeats();
     assert_eq!(&tu.byte_buffer[start_len..], &[0x30, 0xDB, 0xFF]);
 }
+
+// -- End-of-stream token ---------------------------------------------------------------------
+//
+// Silicon ends each tile's stream with a 4-byte token, 0xDC and an 18-bit count of the idle
+// cycles from the last frame (Repeats included) to the stop, on a 4-byte boundary, the rest of
+// the packet 0xFE. A quiet tile's stream is `Start DC`; a long idle tail writes Syncs first;
+// when the last data fills its packet the token would need a packet of its own and is left out.
+// The tails below are copied from three silicon captures (impl notes: held level to the stop
+// ends `Rep1 DC(0)`, a periodic counter tail `Sng2(1,1024) Rep0(5) DC(422)`).
+
+/// Payload bytes of every packet queued so far, one `Vec` per packet (header dropped).
+fn payloads(tu: &mut TraceUnit) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(words) = tu.pop_packet() {
+        out.push(words[1..].iter().flat_map(|w| w.to_be_bytes()).collect());
+    }
+    out
+}
+
+/// A running unit with slots 0..=3 on hw events 37..=39 and 26 (a level), started at cycle 0.
+fn running_unit() -> TraceUnit {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (26 << 24));
+    force_start(&mut tu, 28);
+    tu
+}
+
+#[test]
+fn a_level_held_to_the_stop_ends_with_its_repeat_and_a_zero_count() {
+    let mut tu = running_unit();
+    tu.set_event_level(26, 1, true);
+    commit_each(&mut tu, 1..=9);
+    tu.notify_event(29, 10, None); // stop: the level was asserted through cycle 9
+    let p = payloads(&mut tu);
+    assert_eq!(p.len(), 1);
+    // Start (8), Single0 slot 3 cycles 0, Repeat0(8), two Skip to the word boundary, DC(0)
+    assert_eq!(&p[0][8..16], &[0x30, 0xE8, 0xFE, 0xFE, 0xDC, 0x00, 0x00, 0x00]);
+    assert!(p[0][16..].iter().all(|&b| b == 0xFE));
+}
+
+#[test]
+fn an_idle_tail_after_a_periodic_run_counts_the_idle_cycles() {
+    // Silicon core tail: `a0 04 00 | e5 | dc 00 01 a6`: Single2(slot 0, 1024), Repeat0(5), count 422.
+    let mut tu = running_unit();
+    for k in 1..=6u64 {
+        notify_commit(&mut tu, 37, 1025 * k);
+    }
+    tu.notify_event(29, 6150 + 423, None);
+    let p = payloads(&mut tu);
+    assert_eq!(p.len(), 1);
+    assert_eq!(&p[0][8..16], &[0xA0, 0x04, 0x00, 0xE5, 0xDC, 0x00, 0x01, 0xA6]);
+    assert!(p[0][16..].iter().all(|&b| b == 0xFE));
+}
+
+#[test]
+fn a_quiet_tile_is_a_start_and_the_token() {
+    let mut tu = running_unit();
+    tu.notify_event(29, 100, None);
+    let p = payloads(&mut tu);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0][0], 0xF0);
+    assert_eq!(&p[0][8..12], &[0xDC, 0x00, 0x00, 99]);
+    assert!(p[0][12..].iter().all(|&b| b == 0xFE));
+}
+
+#[test]
+fn a_long_quiet_tail_writes_syncs_before_the_count() {
+    // Silicon `Start Sync Rep0(1) DC`: two wraps of the field, the rest in the count.
+    let mut tu = running_unit();
+    let idle = 2 * (1u64 << 18) + 5;
+    tu.notify_event(29, idle + 1, None);
+    let p = payloads(&mut tu);
+    assert_eq!(&p[0][8..16], &[0xFF, 0xE1, 0xFE, 0xFE, 0xDC, 0x00, 0x00, 0x05]);
+}
+
+#[test]
+fn the_count_field_is_eighteen_bits() {
+    let mut tu = running_unit();
+    tu.notify_event(29, 0x2_ABCD + 1, None);
+    let p = payloads(&mut tu);
+    assert_eq!(&p[0][8..12], &[0xDC, 0x02, 0xAB, 0xCD]);
+}
+
+/// Alternating slots in consecutive cycles: one byte per frame, no Repeat merging.
+fn fill_with_frames(tu: &mut TraceUnit, frames: u64) {
+    for c in 1..=frames {
+        notify_commit(tu, if c % 2 == 1 { 37 } else { 38 }, c);
+    }
+}
+
+#[test]
+fn the_token_may_end_exactly_at_the_end_of_the_packet() {
+    let mut tu = running_unit();
+    fill_with_frames(&mut tu, 16); // 8 + 16 = 24 bytes
+    tu.notify_event(29, 20, None); // count 3
+    let p = payloads(&mut tu);
+    assert_eq!(p.len(), 1);
+    assert_eq!(&p[0][24..], &[0xDC, 0x00, 0x00, 0x03]);
+}
+
+#[test]
+fn data_that_fills_its_packet_gets_no_token_packet() {
+    // Measured as an absence in 75 of 226 streams that need a packet of their own.
+    for frames in [20u64, 18, 19] {
+        // 28 bytes exactly (packet already emitted), 26 and 27 used (token does not fit)
+        let mut tu = running_unit();
+        fill_with_frames(&mut tu, frames);
+        tu.notify_event(29, 100, None);
+        let p = payloads(&mut tu);
+        assert_eq!(p.len(), 1, "{frames} frames");
+        assert!(!p[0].contains(&0xDC), "{frames} frames: no token");
+    }
+}
+
+#[test]
+fn a_pending_repeat_is_written_before_the_token() {
+    let mut tu = running_unit();
+    for c in 5..=7 {
+        notify_commit(&mut tu, 37, c);
+    }
+    tu.notify_event(29, 20, None);
+    let p = payloads(&mut tu);
+    // Single0 slot 0 cycles 4, Single0 slot 0 cycles 0, Repeat0(1), count 20 - 1 - 7 = 12
+    assert_eq!(&p[0][8..16], &[0x04, 0x00, 0xE1, 0xFE, 0xDC, 0x00, 0x00, 0x0C]);
+}

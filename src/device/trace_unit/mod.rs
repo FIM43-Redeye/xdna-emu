@@ -31,6 +31,7 @@
 //! | Multiple2 | `0b110101EE EEEEEETT TTTTTTTT TTTTTTTT`     | mask(8), delta(18)                             |
 //! | Start     | `0b11110000 + 7 bytes timer`                | 56-bit timer sync                              |
 //! | Pad       | `0xFE`                                      | Fills remainder of packet                      |
+//! | End       | `0xDC` + 3 bytes (4-byte aligned)           | End of stream: idle cycles since the last frame |
 //!
 //! Discriminators and field placements match mlir-aie's
 //! `python/utils/trace/utils.py::convert_to_commands` decoder.
@@ -230,6 +231,21 @@ pub struct TraceUnit {
     /// See `xdna-emu-priv: research/coverage/trace-start-stop-latency-gap.md` (2026-05-04).
     armed_start_cycle: Option<u64>,
 }
+
+/// First byte of the end-of-stream token: the last token of every tile's stream on silicon
+/// (0xDC in 788 of 788, 785 of 785 and 784 of 784 tokens over three captures). The vendor
+/// name of the opcode is not known to us; it is called the end token here.
+pub const END_TOKEN_OPCODE: u8 = 0xDC;
+
+/// Length of the end token in bytes: the opcode and a 3-byte big-endian count field.
+pub const END_TOKEN_LEN: usize = 4;
+
+/// Width of the end token's count field in bits: the low 2 bits of byte 1 and bytes 2 and 3
+/// (byte 1 is 0..=3 in every silicon token), the same width as a frame's cycles field.
+pub const END_TOKEN_COUNT_BITS: u32 = 18;
+
+/// Bytes of trace data in one packet: seven 32-bit payload words.
+const PACKET_PAYLOAD_BYTES: usize = 28;
 
 /// Largest count one Repeat1 token holds (10-bit field); a run longer than this is chunks of it.
 const REPEAT1_MAX: u64 = (1 << 10) - 1;
@@ -602,8 +618,8 @@ impl TraceUnit {
         if self.state == TraceState::Running && hw_event_id == self.stop_event {
             self.state = TraceState::Stopped;
             log::debug!("TraceUnit ({},{}) stopped at cycle {}", self.col, self.row, cycle);
-            // Flush remaining data as a final packet
-            self.flush();
+            // Close the stream with the end token and emit the final packet
+            self.end_stream(cycle);
             return;
         }
 
@@ -832,6 +848,61 @@ impl TraceUnit {
     #[cfg(test)]
     pub(crate) fn encoded_bytes(&self) -> &[u8] {
         &self.byte_buffer
+    }
+
+    /// Close the stream at the stop event of `stop_cycle`: bring the open frame, the held
+    /// level and the pending Repeat up to the last traced cycle, write the end token, and
+    /// emit the final packet.
+    ///
+    /// The token's count is the idle cycles between the last frame (a held level counts as a
+    /// frame in every cycle it is asserted, Repeats included) and the stop, with the same
+    /// convention as a frame's cycles field: the stop is the cycle after the last traced
+    /// cycle, `stop_cycle - 1`, so a level held through that cycle gives 0, and a frame in
+    /// cycle `L` gives `stop_cycle - L - 1`. INFERRED: silicon fixes the count only up to a
+    /// common offset (the stop is the same instant on every tile, so tiles agree whatever
+    /// the offset is) and no capture pins the offset; this is the convention under which a
+    /// held level gives 0, which silicon shows (shim 166 of 216, core 80 of 264 end in 0).
+    /// Only mode 0 is measured, so only mode 0 writes the token.
+    fn end_stream(&mut self, stop_cycle: u64) {
+        if self.pending_slot_mask != 0 || self.level_dirty {
+            self.commit_pending_frame();
+        }
+        if self.mode == TraceMode::EventTime {
+            self.extend_held_run(stop_cycle.saturating_sub(1));
+            self.flush_repeats();
+            self.write_end_token(stop_cycle);
+        }
+        self.flush();
+    }
+
+    /// Append the end token for a stop in `stop_cycle`; see [`Self::end_stream`] for the count.
+    ///
+    /// Idle of 2^18 cycles or more is Sync tokens first (one per wrap, a Repeat for more,
+    /// silicon: a quiet tile's `Start Sync Rep0 DC` with the Syncs and the count adding up to
+    /// the one start-to-stop time every tile of the test shows), the count is the remainder.
+    /// The token starts on a 4-byte boundary, Skip before it.
+    ///
+    /// When it does not fit in the packet being filled it is not written. Silicon shows the
+    /// token in a packet of its own after data that fills its packet in only about two thirds
+    /// of the cases (151 of 226 over three captures) and omits it in the rest (75): measured
+    /// as an absence, mechanism inferred (the packet arriving after the host's buffer is
+    /// read). The emulator takes the omission.
+    fn write_end_token(&mut self, stop_cycle: u64) {
+        let idle = stop_cycle.saturating_sub(1).saturating_sub(self.last_event_cycle);
+        let count_range = 1u64 << END_TOKEN_COUNT_BITS;
+        self.push_syncs(idle / count_range);
+        self.try_emit_packet();
+        let count = idle % count_range;
+        // An empty buffer after the Start marker is a packet the data filled exactly.
+        let start = self.byte_buffer.len().next_multiple_of(4);
+        if self.byte_buffer.is_empty() || start + END_TOKEN_LEN > PACKET_PAYLOAD_BYTES {
+            return;
+        }
+        self.byte_buffer.resize(start, 0xFE);
+        self.byte_buffer.push(END_TOKEN_OPCODE);
+        self.byte_buffer.push((count >> 16) as u8);
+        self.byte_buffer.push(((count >> 8) & 0xFF) as u8);
+        self.byte_buffer.push((count & 0xFF) as u8);
     }
 
     /// Flush any remaining bytes as a padded final packet.
