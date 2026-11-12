@@ -34,6 +34,14 @@ high before the sustained PORT_STALLED are the words that passed that port. `cor
 sources the words from the core (put_stream into Core:0), released by a lock after the trace is
 armed. `ports` prints the per-port counts. TAG is the run directory name, e.g. `e1.emu`.
 
+Clock-gate configurations (`build --clock K1`): the runtime sequence first writes the tile clock
+controls of the case's data tiles (compute tile, memtile) with a masked write per register, so the
+same case runs with the stream-switch and DMA adaptive clock gates changed. K0 writes nothing;
+K1 clears Stream_Switch_Adaptive_Clock_Gate, K2 DMA_Adaptive_Clock_Gate, K3 both, K4 sets the
+stream-switch Abort_Period to its minimum (the gate engages after the shortest idle time). Register
+offsets, fields and the supported period range are read from the AM025 database (mlir-aie), not
+written here. Use one OUT_DIR per configuration.
+
 `run --backend hw` takes the NPU lock (`build/experiments/.npu-hw.lock`).
 """
 from __future__ import annotations
@@ -42,6 +50,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 import sys
 from pathlib import Path
 
@@ -49,6 +58,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
 import gen_lock_pulse_probe as lp  # noqa: E402  (build/run plumbing: sh, run_case)
+import toolchain_paths  # noqa: E402
 
 N_WORDS = 96
 SRC_ADDR, DST_ADDR, SCRATCH_ADDR = 0x1000, 0x2000, 0x3000
@@ -85,6 +95,63 @@ MEMTILE_EVENTS = ("DMA_MM2S_SEL0_START_TASK,DMA_MM2S_SEL0_STREAM_BACKPRESSURE,DM
 MEMMOD_EVENTS = ("DMA_MM2S_0_START_TASK,DMA_MM2S_0_STREAM_BACKPRESSURE,DMA_MM2S_0_FINISHED_BD,"
                  "DMA_MM2S_0_MEMORY_STARVATION,DMA_S2MM_0_START_TASK,DMA_S2MM_0_STALLED_LOCK,"
                  "DMA_S2MM_0_FINISHED_BD,DMA_S2MM_0_STREAM_STARVATION")
+
+
+# Clock-gate configurations: which adaptive gates a case's data tiles run with (see the module doc).
+CLOCK_CONFIGS = {"K0": (), "K1": ("ss_off",), "K2": ("dma_off",), "K3": ("ss_off", "dma_off"),
+                 "K4": ("ss_period_min",)}
+# regdb module holding each tile's clock-control registers
+REGDB_MODULE = {"mem": "memory_tile", "prod": "core"}
+ABORT_PERIOD_REG = "Stream_Switch_Adaptive_Clock_Gate_Abort_Period"
+
+
+@lru_cache(maxsize=1)
+def _regdb_modules() -> dict:
+    path = toolchain_paths.resolve_mlir_aie(start=REPO) / toolchain_paths.MLIR_AIE_SENTINEL
+    return json.loads(path.read_text())["modules"]
+
+
+def _field(module: str, register: str, field: str) -> tuple[int, int, int]:
+    """(register offset, field mask, supported-range-min) from the AM025 database."""
+    reg = next(r for r in _regdb_modules()[module]["registers"] if r["name"] == register)
+    f = next(f for f in reg["bit_fields"] if f["name"] == field)
+    lo, hi = f["bit_range"]
+    mask = ((1 << (hi - lo + 1)) - 1) << lo
+    rng = re.search(r"range for field: \[(\d+)-(\d+)\]", f["description"])
+    return int(reg["offset"], 16), mask, int(rng.group(1)) if rng else 0
+
+
+def clock_writes(config: str, tile: str) -> list[tuple[int, int, int]]:
+    """(offset, value, mask) masked writes that put `tile` ('mem' or 'prod') in clock config `config`."""
+    module = REGDB_MODULE[tile]
+    out = []
+    clears = [name for key, name in (("ss_off", "Stream_Switch_Adaptive_Clock_Gate"),
+                                     ("dma_off", "DMA_Adaptive_Clock_Gate"))
+              if key in CLOCK_CONFIGS[config]]
+    if clears:
+        offset, mask = None, 0
+        for name in clears:
+            offset, m, _ = _field(module, "Module_Clock_Control", name)
+            mask |= m
+        out.append((offset, 0, mask))
+    if "ss_period_min" in CLOCK_CONFIGS[config]:
+        offset, mask, lowest = _field(module, ABORT_PERIOD_REG, "Abort_Period")
+        out.append((offset, lowest, mask))
+    return out
+
+
+def clock_sequence(config: str, tiles: list[str]) -> str:
+    """Runtime-sequence text of the clock writes for the case's data tiles."""
+    lines = []
+    for t in tiles:
+        for i, (offset, value, mask) in enumerate(clock_writes(config, t)):
+            n = f"{t}{i}"
+            lines.append(f"      %clk_a_{n} = arith.constant {offset} : i32\n"
+                         f"      %clk_v_{n} = arith.constant {value} : i32\n"
+                         f"      %clk_m_{n} = arith.constant {mask} : i32\n"
+                         f"      aiex.npu.maskwrite32(%clk_a_{n}, %clk_v_{n}, %clk_m_{n}) "
+                         f"{{column = {TILES[t][0]} : i32, row = {TILES[t][1]} : i32}} : i32, i32, i32")
+    return "".join(line + "\n" for line in lines)
 
 
 CASE_NAME = re.compile(r"(.+?)(?:_n(\d+)|_([ct])(\d+)x(\d+))?")
@@ -129,7 +196,7 @@ def is_ports_case(name: str) -> bool:
 
 
 def design_mlir(src: str, dst: str, n: int = N_WORDS, bd_len: int | None = None,
-               mode: str = "single") -> str:
+               mode: str = "single", clock: str = "K0") -> str:
     core_src = src == "core"
     srct = TILE_OF[src]
     tiles = list(dict.fromkeys((srct, dst)))
@@ -138,6 +205,7 @@ def design_mlir(src: str, dst: str, n: int = N_WORDS, bd_len: int | None = None,
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
                     for _ in range(SETTLE_WRITES))
     sv, dv = VAR[srct], VAR[dst]
+    clock_ops = clock_sequence(clock, list(dict.fromkeys((srct, dst))))
     if core_src:
         src_decl = f"    %lGo = aie.lock({sv}, {GO_LOCK}) {{init = 0 : i32, sym_name = \"lGo\"}}"
         puts = "\n".join(f"      %w{j} = arith.constant {w} : i32\n      aie.put_stream(%ch : i32, %w{j} : i32)"
@@ -172,7 +240,7 @@ def design_mlir(src: str, dst: str, n: int = N_WORDS, bd_len: int | None = None,
     aie.runtime_sequence(%dummy: memref<4xi32>) {{
       %c_zero = arith.constant 0 : i32
       %c_one = arith.constant 1 : i32
-      %tr = aiex.dma_configure_task({dv}, S2MM, 0) {{
+{clock_ops}      %tr = aiex.dma_configure_task({dv}, S2MM, 0) {{
         %c_a = arith.constant 1 : i32
         aie.use_lock(%lG, AcquireGreaterEqual, %c_a)
         aie.dma_bd(%dst : memref<{n}xi32> offset = 0 len = {n}) {{bd_id = 0 : i32}}
@@ -235,12 +303,12 @@ def inject_args(name: str) -> list[str]:
     return a
 
 
-def build_case(name: str, out: Path) -> None:
+def build_case(name: str, out: Path, clock: str = "K0") -> None:
     shape = case_shape(name)
     src, dst, n = shape.src, shape.dst, shape.total
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "base.mlir").write_text(design_mlir(*shape.design_args()))
+    (d / "base.mlir").write_text(design_mlir(*shape.design_args(), clock=clock))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
            "--out", "aie.mlir", "--trace-mode", "event_time",
            *inject_args(name),
@@ -250,7 +318,7 @@ def build_case(name: str, out: Path) -> None:
     lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
-    (d / "case.json").write_text(json.dumps({"case": name, "src": src, "dst": dst, "n_words": n}) + "\n")
+    (d / "case.json").write_text(json.dumps({"case": name, "src": src, "dst": dst, "n_words": n, "clock": clock}) + "\n")
 
 
 def tile_frames(path: Path, row: int, pkt_type: int | None = None) -> list[tuple[int, frozenset[str]]]:
@@ -361,6 +429,8 @@ def main(argv=None) -> int:
     b = sub.add_parser("build")
     b.add_argument("out_dir")
     b.add_argument("--cases", nargs="*", default=PLAIN_CASES)
+    b.add_argument("--clock", choices=sorted(CLOCK_CONFIGS), default="K0",
+                   help="adaptive clock-gate configuration of the data tiles (see the module doc)")
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
@@ -378,7 +448,7 @@ def main(argv=None) -> int:
     out = Path(a.out_dir)
     if a.cmd == "build":
         for n in a.cases:
-            build_case(n, out)
+            build_case(n, out, a.clock)
             print(f"built {n}")
         return 0
     if a.cmd == "run":

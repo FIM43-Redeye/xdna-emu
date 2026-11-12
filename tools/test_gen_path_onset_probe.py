@@ -124,3 +124,49 @@ def test_a_plain_or_length_name_is_one_bd_one_task():
 def test_every_design_has_balanced_braces(name):
     text = g.design_mlir(*g.case_shape(name).design_args())
     assert text.count("{") == text.count("}")
+
+
+def _clock_ops(text):
+    return [l.strip() for l in text.splitlines() if "maskwrite32" in l]
+
+
+def test_k0_adds_nothing_to_a_design():
+    assert g.clock_writes("K0", "prod") == [] and g.clock_writes("K0", "mem") == []
+    assert _clock_ops(g.design_mlir("prod", "prod", 16)) == []
+    assert g.design_mlir("prod", "prod", 16, clock="K0") == g.design_mlir("prod", "prod", 16)
+
+
+@pytest.mark.skipif(g.toolchain_paths.try_resolve_mlir_aie(g.REPO) is None, reason="no mlir-aie checkout")
+def test_clock_configs_clear_the_adaptive_enables_from_the_register_database():
+    # Module_Clock_Control: compute tile 0x60000, memtile 0xFFF00; bit 4 stream switch, bit 5 DMA
+    assert g.clock_writes("K1", "prod") == [(0x60000, 0, 0x10)]
+    assert g.clock_writes("K2", "mem") == [(0xFFF00, 0, 0x20)]
+    assert g.clock_writes("K3", "prod") == [(0x60000, 0, 0x30)]
+    assert g.clock_writes("K3", "mem") == [(0xFFF00, 0, 0x30)]
+
+
+@pytest.mark.skipif(g.toolchain_paths.try_resolve_mlir_aie(g.REPO) is None, reason="no mlir-aie checkout")
+def test_k4_sets_the_stream_switch_abort_period_to_the_database_minimum():
+    # Abort_Period[3:0], supported range [3-12]: compute 0x3FF38, memtile 0xB0F38
+    assert g.clock_writes("K4", "prod") == [(0x3FF38, 3, 0xF)]
+    assert g.clock_writes("K4", "mem") == [(0xB0F38, 3, 0xF)]
+
+
+@pytest.mark.skipif(g.toolchain_paths.try_resolve_mlir_aie(g.REPO) is None, reason="no mlir-aie checkout")
+def test_clock_writes_target_the_data_tiles_and_precede_the_dmas():
+    text = g.design_mlir("prod", "prod", 16, clock="K1")
+    ops = _clock_ops(text)
+    assert len(ops) == 1 and "column = 0 : i32, row = 2 : i32" in ops[0]
+    assert "arith.constant 393216 : i32" in text           # 0x60000
+    assert text.index("maskwrite32") < text.index("aiex.dma_start_task")
+    # a memtile-sourced case into the memtile touches only the memtile
+    mem = _clock_ops(g.design_mlir("mem", "mem", 16, clock="K3"))
+    assert len(mem) == 1 and "row = 1 : i32" in mem[0]
+    # mem -> prod touches both tiles, one write each
+    both = _clock_ops(g.design_mlir("mem", "prod", 16, clock="K2"))
+    assert len(both) == 2 and any("row = 1" in o for o in both) and any("row = 2" in o for o in both)
+
+
+def test_an_unknown_clock_config_is_refused():
+    with pytest.raises(KeyError):
+        g.design_mlir("prod", "prod", 16, clock="K9")
