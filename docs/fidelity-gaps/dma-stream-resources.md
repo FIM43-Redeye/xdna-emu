@@ -167,8 +167,9 @@ whole absorb (`chain`, 0 hops, 12 BDs; BDs finished x L):
 
 48 is the R4-D3 0-hop absorb, so the whole path holds the finished BDs. The emulator's egress staging
 (`ChannelContext::egress_staging`) now belongs to the channel: a fetched word leaves the transfer with its
-TLAST, the BD completes when its last granule is fetched, the next BD fetches in behind, and the staging drains
-one word per cycle whatever the FSM is doing. The BD-boundary bubble (`off1`) is a port-side idle cycle after a
+TLAST, the BD completes when its last word has been read (one word per cycle, see "MM2S read bandwidth and tail
+reservation" below), the next BD fetches in behind, and the staging drains one word per cycle whatever the FSM
+is doing. The BD-boundary bubble (`off1`) is a port-side idle cycle after a
 BD's last word (`egress_gap`). A channel whose BDs have all finished with words still staged reads Running with
 Stalled_Stream_Backpressure (silicon `chain_mem_L4`), like the shim read-ahead window.
 
@@ -319,6 +320,41 @@ timing, which is a later step: the sustained-onset cycle is 34 / 35 in the emula
 (prod / mem, 4 early), the `DMA:0` master port's stall onset 20 / 32 against 19 / 37 (prod / mem), the memtile
 slave port's 34 against 40 (N = 40), silicon's 1-cycle STREAM_BACKPRESSURE blip at +15/16 has no emulator
 counterpart, and at N = 20 the emulator's slave port reports a PORT_STALLED onset (20 / 32) where silicon has none.
+
+## MM2S read bandwidth and tail reservation (modelled 2026-11-11, NPU1 silicon)
+
+Probes: `tools/gen_path_onset_probe.py` `prod_own_nN` / `mem_own_nN` (one MM2S BD of N words into an S2MM on the
+same tile whose BD waits on a lock; cycles from the MM2S START_TASK), data `build/experiments/path-capacity/onset-len`
+(N 21..27) and `onset-long` (N 1..55), and the chain / task variants `_cLxK` / `_tLxK`, data `onset-chain`. Every
+row is identical over two silicon runs.
+
+- **One word read per cycle.** FINISHED_BD = N + 8 for every N tested (1..48 compute, 1..52 memtile), independent
+  of the port stalling (the port stalls at 38; N = 46 still finishes at 54). The BD is done when its last word has
+  been read. Chained BDs read back to back: `c4x4` finishes at 12 / 16 / 20 / 24, `c8x2` at 16 / 24; a task started
+  from idle finishes L + 8 after its START_TASK (`t4x4`: +12 each). The port-side bubble per BD boundary is separate
+  (S2MM starvation pulses at 22, 27, 32 for `c4x4`: 5 cycles per 4-word BD, `egress_gap`).
+- **Granule-wise visibility.** The first word is offered at the switch at 11 + min(N, 4) (compute; the memtile one
+  cycle later, `memtile_mm2s_fetch_latency_cycles`): a granule enters the staging when its last word (or the BD's
+  last word) has been read, so data arrives a whole granule at a time, at most one 4-word granule per 4 cycles.
+- **A short tail reserves a whole granule.** The longest BD that finishes into a held own-tile S2MM is 48 words
+  (compute) / 52 (memtile); 49, 50 and 53..55 never finish until the S2MM is released. Admission reserves
+  `granule_words` (4) of staging for every fetch, a BD's short tail included (the emulator admitted the tail into
+  the space it needed and finished 50 / 54).
+- **Emulator.** The bank access and the admission decision stay per granule, as before (one `next_granule_fetch`
+  per granule, bank demand unchanged, so the start-phase congruence and every race row are unchanged). What
+  changed is when the words become available: a fetched granule's words enter `egress_staging` at once (they
+  count against the staging and its admission from the fetch on) but carry `ready_at` = the cycle their last word
+  is read, with reads serialised one word per cycle behind every earlier fetch (`ChannelContext::read_tail`).
+  `staged_mm2s_cycle` holds the BD open (`TransferCycleResult::ReadInProgress`) until its last word has been read,
+  which then releases the lock, raises FINISHED_BD and chains the next BD. A staged MM2S's chained BDs take no FSM
+  bubble (`enter_chained_transfer`): the boundary idle cycle is `egress_gap` on the port side only.
+- **Result.** FINISHED_BD spacing exact (one cycle per word, chained BDs L apart); the longest finishing BD is 48 /
+  52; races, absorbs and the onset-len boundary (23) unchanged. **Still different (port-side calibration, a later
+  step):** the absolute FINISHED_BD is two cycles late (N + 10 against N + 8, the BD-start overhead before the
+  first read; the same +2 on every row, chained and task variants alike); the sustained STREAM_BACKPRESSURE onset is
+  37 / 38 against silicon 38 / 39; silicon's 1-cycle first-offer blip (not deterministic: present in some tasks
+  of a chain and not in others) and the S2MM starvation until the first word arrives (a known gap) have no
+  emulator counterpart.
 
 ## Stream buffering and latency (modelled 2026-11-04, NPU1 silicon)
 

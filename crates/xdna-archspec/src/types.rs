@@ -1392,6 +1392,13 @@ pub struct DmaTiming {
     /// from `S = 24 + c` with the core's output assumed to hold one word; the core
     /// holds three (`STREAM_FIFO_DEPTH`).
     ///
+    /// Admission reserves a whole 4-word granule of this depth for every fetch, a BD's short
+    /// tail included: the longest BD that finishes into a held own-tile S2MM is 48 words
+    /// (49, 50 never finish), where admitting the tail into the space it needs finished 50
+    /// (`prod_own_nN`, `path-capacity/onset-long`, 2026-11-11). The words of a fetched granule
+    /// count against this depth from the fetch, while they are still being read (one word per
+    /// cycle: FINISHED_BD = N + 8, `onset-len` / `onset-long`).
+    ///
     /// Measured on a compute tile; a memtile MM2S stages more
     /// (`memtile_mm2s_egress_fifo_depth`). This is the DMA-side staging only: the
     /// downstream local-slave port FIFO is modelled separately
@@ -1421,7 +1428,8 @@ pub struct DmaTiming {
 
     /// Cycles from a memtile MM2S granule fetch until its words can leave for
     /// the stream; 0 on a compute tile, whose fetched word can leave in the
-    /// cycle it is fetched. Measured (NPU1, 2026-11-10, two runs identical,
+    /// cycle its granule has been read (the read is one word per cycle, so that is the
+    /// granule's last word, not its fetch). Measured (NPU1, 2026-11-10, two runs identical,
     /// `tools/gen_path_onset_probe.py`): every STREAM_BACKPRESSURE edge of a
     /// memtile-sourced path -- the first-granule pulse, the held onset, own
     /// tile and one hop away -- is one cycle after the compute-sourced path's.

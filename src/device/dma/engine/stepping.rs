@@ -448,8 +448,13 @@ impl DmaEngine {
             words += 1;
         }
 
-        if staged + words > self.egress_staging_capacity() {
-            return None; // no room for the whole granule; wait for the stream to drain one
+        // Every fetch reserves a whole granule of staging, a BD's short tail (or a strided
+        // single-word fetch) included: silicon's longest BD that finishes into a held S2MM is
+        // 48 words (compute) / 52 (memtile), where admitting the tail into the space it
+        // actually needs finished 50 / 54.
+        let reserve = (granule / 4) as usize;
+        if staged + reserve > self.egress_staging_capacity() {
+            return None; // no room for a whole granule; wait for the stream to drain one
         }
 
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
@@ -1309,6 +1314,7 @@ impl DmaEngine {
                 }
                 ChannelFsm::Transferring { transfer }
             }
+            TransferCycleResult::ReadInProgress => ChannelFsm::Transferring { transfer },
             TransferCycleResult::MemoryStarved => {
                 // The egress staging ran dry with the stream port able to take a
                 // beat: DMA_MM2S_n_MEMORY_STARVATION, raised in `do_transfer_cycle`.
@@ -1439,7 +1445,13 @@ impl DmaEngine {
     /// back-to-back behavior.
     fn enter_chained_transfer(&mut self, ch_idx: usize, transfer: Box<Transfer>) -> ChannelFsm {
         let host_lat = self.timing_config.host_memory_latency_cycles;
-        let bubble = self.take_bd_switch_bubble(ch_idx);
+        let mut bubble = self.take_bd_switch_bubble(ch_idx);
+        if self.uses_egress_staging(&transfer) {
+            // A staged MM2S reads chained BDs back to back (silicon: FINISHED_BD every L cycles
+            // for L-word BDs, no read-side gap, onset-chain `c4x4` / `c8x2`); the boundary's idle
+            // cycle is on the port side, `egress_gap` after the BD's last word.
+            bubble = 0;
+        }
         if host_lat > 0 && transfer.involves_host_memory() {
             ChannelFsm::HostPipelineLatency { cycles_remaining: host_lat, transfer }
         } else if bubble > 0 {
@@ -2500,8 +2512,10 @@ impl DmaEngine {
     /// side only. The channel fetches one 16-byte granule into its egress
     /// staging (`next_granule_fetch`, the whole of its bank demand this cycle)
     /// and the fetched words leave the transfer at once, each carrying its
-    /// TLAST, so the BD is done when its last granule is fetched -- silicon
-    /// finishes a BD with its words still staged (`ChannelContext::egress_staging`).
+    /// TLAST. They are READ one per cycle (`ChannelContext::read_tail`): a granule
+    /// is ready (`StagedWord::ready_at`) when its last word is read and the BD is
+    /// done when its last word is read, not when it is fetched -- silicon FINISHED_BD
+    /// = N + 8 -- though still with its words staged (`ChannelContext::egress_staging`).
     /// The stream side is the staging drain, which runs whatever the FSM is
     /// doing (`drain_egress_staging`).
     ///
@@ -2529,13 +2543,20 @@ impl DmaEngine {
                 self.cycle_dma_banks |= fetch.bank_mask;
                 let channel = transfer.channel;
                 let tlast_suppress = transfer.effective_tlast_suppress();
+                // One word is read per cycle, behind every word fetched before: the granule's
+                // last word is read `words - 1` cycles after its first, and the granule enters
+                // the staging (becomes ready) then, all at once. Its words count against the
+                // staging from the fetch on (the memtile's in-flight latency words already did).
+                let first_read = self.read_clock.max(self.channels[ch_idx].read_tail + 1);
+                let last_read = first_read + fetch.words as u64 - 1;
+                self.channels[ch_idx].read_tail = last_read;
                 for &addr in &fetch.addrs[..fetch.words] {
                     let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
                         return TransferCycleResult::Error;
                     };
                     let ends_bd = transfer.remaining_bytes() <= 4;
                     let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
-                    let ready_at = self.read_clock + self.staged_word_latency();
+                    let ready_at = last_read + self.staged_word_latency();
                     self.channels[ch_idx]
                         .egress_staging
                         .push_back(StagedWord { data, ends_bd, ready_at });
@@ -2543,6 +2564,10 @@ impl DmaEngine {
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                 }
             }
+        }
+        // The BD's last word has left the transfer but is still being read: not done yet.
+        if transfer.remaining_bytes() == 0 && self.channels[ch_idx].read_tail > self.read_clock {
+            return TransferCycleResult::ReadInProgress;
         }
         if transfer.remaining_bytes() > 0
             && self.channels[ch_idx].egress_staging.is_empty()
@@ -4063,6 +4088,158 @@ mod bank_demand_tests {
             (1..=K as usize).map(|j| j * L as usize - 1).collect::<Vec<_>>(),
             "TLAST closes each BD"
         );
+    }
+
+    /// One MM2S BD of `n` words starting `phase` words into a 128-bit granule, run on `eng`'s
+    /// channel `mm2s` (BD releases lock 5). With `port_free` the test pops the hand-off word every
+    /// cycle (a consumer that never refuses); otherwise nothing leaves. Returns the engine step
+    /// at which the first word could be popped and the step at which the BD's lock release
+    /// landed (None if it never did within 600 steps).
+    fn run_one_bd(
+        mut eng: DmaEngine,
+        mut tile: Tile,
+        mm2s: u8,
+        n: u32,
+        phase: u64,
+        port_free: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        let mut host_mem = HostMemory::new();
+        // A memtile addresses its own memory through the Own window (0x80000) and its own locks
+        // at ids 64..; lock id 5 / window 0 would name the west neighbour's.
+        let (base, lock_id) = if tile.is_mem() {
+            (0x80400, 64 + 5)
+        } else {
+            (0x400, 5)
+        };
+        eng.configure_bd(0, BdConfig::simple_1d(base + 4 * phase, n * 4).with_release(lock_id, 1))
+            .unwrap();
+        eng.start_channel(mm2s, 0).unwrap();
+        let (mut first, mut finished) = (None, None);
+        for step in 0..600 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if first.is_none() && eng.peek_stream_out_for_channel(mm2s).is_some() {
+                first = Some(step);
+            }
+            if port_free {
+                while eng.pop_stream_out_for_channel(mm2s).is_some() {}
+            }
+            if finished.is_none() && tile.locks[5].value >= 1 {
+                finished = Some(step);
+            }
+        }
+        (first, finished)
+    }
+
+    /// Silicon reads ONE WORD PER CYCLE: MM2S FINISHED_BD lands N + 8 cycles after START_TASK for
+    /// every N tested (1..48 compute, 1..52 memtile; probe `gen_path_onset_probe.py`
+    /// prod_own_nN / mem_own_nN, data `build/experiments/path-capacity/onset-len` and
+    /// `onset-long`, two runs identical), even far past the port stall. So the BD finishes
+    /// when its last word has been read: consecutive lengths finish one step apart, on both tiles.
+    #[test]
+    fn mm2s_bd_finishes_one_cycle_per_word_after_the_first() {
+        type Make = fn() -> (DmaEngine, Tile, u8);
+        let makers: [(&str, Make); 2] = [
+            ("compute", || (DmaEngine::new_compute_tile(1, 2), Tile::compute(1, 2), 2)),
+            ("memtile", || (DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 6)),
+        ];
+        for (name, make) in makers {
+            let finish = |n: u32| {
+                let (eng, tile, ch) = make();
+                run_one_bd(eng, tile, ch, n, 0, true)
+                    .1
+                    .unwrap_or_else(|| panic!("{name} N={n} never finished"))
+            };
+            let base = finish(1);
+            for n in [2u32, 4, 8, 23, 46] {
+                assert_eq!(finish(n), base + n as usize - 1, "{name}: FINISHED_BD at N={n}");
+            }
+        }
+    }
+
+    /// The first word reaches the switch side once the first granule's last word has been read
+    /// (or the BD's last word, for a BD shorter than a granule): 11 + min(N, 4) cycles after
+    /// START_TASK on silicon (compute; the memtile one cycle later, which
+    /// `memtile_mm2s_fetch_latency_cycles` models). The N-dependence is what is asserted here; the
+    /// absolute offset is the port side's business.
+    #[test]
+    fn mm2s_first_word_is_offered_when_its_granule_has_been_read() {
+        type Make = fn() -> (DmaEngine, Tile, u8);
+        let makers: [(&str, Make); 2] = [
+            ("compute", || (DmaEngine::new_compute_tile(1, 2), Tile::compute(1, 2), 2)),
+            ("memtile", || (DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 6)),
+        ];
+        for (name, make) in makers {
+            let first = |n: u32| {
+                let (eng, tile, ch) = make();
+                run_one_bd(eng, tile, ch, n, 0, false)
+                    .0
+                    .unwrap_or_else(|| panic!("{name} N={n}: no word"))
+            };
+            let base = first(1);
+            for n in [2u32, 3, 4, 8, 23] {
+                assert_eq!(first(n), base + (n.min(4) as usize - 1), "{name}: first offer at N={n}");
+            }
+        }
+    }
+
+    /// Chained BDs are read back to back: silicon FINISHED_BD lands every L cycles for chained
+    /// L-word BDs (`gen_path_onset_probe.py` prod_own_c4x4 12/16/20/24, c8x2 16/24, memtile the
+    /// same, `build/experiments/path-capacity/onset-chain`), so a BD boundary costs the read side
+    /// nothing. The one idle cycle of the boundary is on the port side (`egress_gap`): the words
+    /// of consecutive BDs leave 5 cycles apart per 4-word BD.
+    #[test]
+    fn chained_mm2s_bds_are_read_back_to_back_with_the_boundary_bubble_on_the_port_side() {
+        const L: u32 = 4;
+        const K: u8 = 4;
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        for j in 0..K {
+            let mut bd = BdConfig::simple_1d(0x400 + 4 * (L as u64) * j as u64, L * 4).with_release(5, 1);
+            if j + 1 < K {
+                bd = bd.with_next(j + 1);
+            }
+            eng.configure_bd(j, bd).unwrap();
+        }
+        eng.start_channel(2, 0).unwrap();
+        let (mut finished, mut offered, mut last_lock) = (Vec::new(), Vec::new(), 0);
+        for step in 0..200 {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if tile.locks[5].value != last_lock {
+                finished.push(step);
+                last_lock = tile.locks[5].value;
+            }
+            if eng.pop_stream_out_for_channel(2).is_some() {
+                offered.push(step);
+            }
+        }
+        assert_eq!(finished.len(), K as usize);
+        for w in finished.windows(2) {
+            assert_eq!(w[1] - w[0], L as usize, "FINISHED_BD spacing: {finished:?}");
+        }
+        let firsts: Vec<usize> = (0..K as usize).map(|j| offered[j * L as usize]).collect();
+        for w in firsts.windows(2) {
+            assert_eq!(
+                w[1] - w[0],
+                L as usize + 1,
+                "port spacing per BD (4 words + the bubble): {offered:?}"
+            );
+        }
+    }
+
+    /// An MM2S into a consumer that takes nothing finishes a BD only if every fetch, the BD's
+    /// short tail included, finds a whole granule of staging free: silicon's longest BD that
+    /// finishes into a held S2MM is 48 words on a compute tile and 52 on a memtile (49..50 and
+    /// 53..55 never finish until the S2MM is released; the array-level
+    /// `path_capacity` tests). The emulator used to admit a 2-word tail into space a granule
+    /// would not fit, and finished 50 / 54. Here, starting 2 words into a granule with the port
+    /// held: a 26-word BD (granules 2,4,...,4) fits staging 27, a 28-word BD (a 2-word tail
+    /// behind 25 staged words) does not, though 25 + 2 <= 27.
+    #[test]
+    fn a_short_tail_reserves_a_whole_granule_of_staging() {
+        let run = |n| run_one_bd(DmaEngine::new_compute_tile(1, 2), Tile::compute(1, 2), 2, n, 2, false).1;
+        assert!(run(26).is_some(), "26 words: the last fetch is a full granule behind 21 staged -> fits");
+        assert_eq!(run(28), None, "28 words: a 2-word tail reserves 4 behind 25 staged: 29 > 27");
     }
 
     /// A staged word is read from memory when its granule is fetched, not when it

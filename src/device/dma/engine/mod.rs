@@ -675,6 +675,7 @@ impl DmaEngine {
         ch.read_backpressure = false;
         ch.egress_staging.clear();
         ch.egress_gap = 0;
+        ch.read_tail = 0;
         ch.egress_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;

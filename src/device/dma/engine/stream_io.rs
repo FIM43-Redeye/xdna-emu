@@ -585,9 +585,9 @@ impl DmaEngine {
         }
     }
 
-    /// Cycles from a granule fetch until its words can leave the staging: one
-    /// on a memtile (`DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES`), none on a compute
-    /// tile, whose fetched word leaves in the cycle it is fetched.
+    /// Cycles from the read of a granule's last word until its words can leave the
+    /// staging: one on a memtile (`DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES`), none on a
+    /// compute tile, whose granule leaves in the cycle its last word is read.
     pub(super) fn staged_word_latency(&self) -> u64 {
         if self.tile_kind.is_mem() {
             xdna_archspec::aie2::timing::DMA_MEMTILE_MM2S_FETCH_LATENCY_CYCLES as u64

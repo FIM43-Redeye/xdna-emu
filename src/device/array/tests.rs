@@ -1246,6 +1246,106 @@ mod path_capacity {
         assert_eq!(array.dma_engines[idx].input_fifo_capacity(), 16);
     }
 
+    /// Does an MM2S BD of `words` words, streamed through its tile's own switch into a held S2MM
+    /// on the same tile (phase 0, the silicon probes' `prod_own_nN` / `mem_own_nN`), reach its
+    /// FINISHED_BD (lock release) with the S2MM never released? `memtile` picks tile (1,1)
+    /// and the memtile addressing (Own window, own lock ids 64..); otherwise compute tile (1,2).
+    fn finishes_into_held_s2mm(words: u32, memtile: bool) -> bool {
+        use xdna_archspec::aie2::stream_switch::mem_tile;
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let (row, slave, master, mm2s, own_win, lock_base) = if memtile {
+            (1, mem_tile::DMA_SLAVE_START, mem_tile::DMA_MASTER_START, 6u8, 0x80000u64, 64u8)
+        } else {
+            (2, compute::DMA_SLAVE_START, compute::DMA_MASTER_START, 2u8, 0, 0)
+        };
+        let idx = array.tile_index(1, row);
+        array.tiles[idx]
+            .stream_switch
+            .configure_local_route(slave as usize, master as usize);
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(1, BdConfig::simple_1d(own_win + 0x400, words * 4).with_release(lock_base + 6, 1))
+            .unwrap();
+        dma.configure_bd(0, BdConfig::simple_1d(own_win + 0x4000, 4096).with_acquire(lock_base + 5, 1))
+            .unwrap();
+        dma.start_channel(0, 0).unwrap();
+        dma.start_channel(mm2s, 1).unwrap();
+        let mut host = HostMemory::new();
+        for _ in 0..600 {
+            array.step_data_movement(&mut host);
+        }
+        array.tiles[idx].locks[6].value >= 1
+    }
+
+    /// The longest MM2S BD that finishes into a held S2MM on its own tile (phase 0) is 48 words
+    /// on a compute tile and 52 on a memtile; 49 and 50 (compute), 53..55 (memtile) never
+    /// finish until the S2MM is released (silicon, `gen_path_onset_probe.py` prod_own_nN /
+    /// mem_own_nN, `build/experiments/path-capacity/onset-long`, two runs identical). A fetch
+    /// reserves a whole granule of staging, a BD's short tail included: the emulator used to
+    /// finish 50 / 54, admitting the tail into space a granule would not fit.
+    #[test]
+    fn the_longest_bd_that_finishes_into_a_held_s2mm_is_48_words_compute_52_memtile() {
+        assert!(finishes_into_held_s2mm(48, false));
+        assert!(!finishes_into_held_s2mm(49, false));
+        assert!(!finishes_into_held_s2mm(50, false));
+        assert!(finishes_into_held_s2mm(52, true));
+        assert!(!finishes_into_held_s2mm(53, true));
+        assert!(!finishes_into_held_s2mm(54, true));
+    }
+
+    /// Engine step (array cycles) at which an MM2S BD of `words` words on a tile's own
+    /// loop into a held S2MM reaches FINISHED_BD (lock 6 released), and when it first
+    /// offers a word to the switch (the S2MM channel's first stream word).
+    fn finished_and_first_offer(words: u32, memtile: bool) -> (usize, usize) {
+        use xdna_archspec::aie2::stream_switch::mem_tile;
+        let mut array = TileArray::npu1();
+        array.clock_mut().ungate_all();
+        let (row, slave, master, mm2s, own_win, lock_base) = if memtile {
+            (1, mem_tile::DMA_SLAVE_START, mem_tile::DMA_MASTER_START, 6u8, 0x80000u64, 64u8)
+        } else {
+            (2, compute::DMA_SLAVE_START, compute::DMA_MASTER_START, 2u8, 0, 0)
+        };
+        let idx = array.tile_index(1, row);
+        array.tiles[idx]
+            .stream_switch
+            .configure_local_route(slave as usize, master as usize);
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(1, BdConfig::simple_1d(own_win + 0x400, words * 4).with_release(lock_base + 6, 1))
+            .unwrap();
+        dma.configure_bd(0, BdConfig::simple_1d(own_win + 0x4000, 4096).with_acquire(lock_base + 5, 1))
+            .unwrap();
+        dma.start_channel(0, 0).unwrap();
+        dma.start_channel(mm2s, 1).unwrap();
+        let mut host = HostMemory::new();
+        let (mut finished, mut first) = (None, None);
+        for step in 0..600 {
+            array.step_data_movement(&mut host);
+            if first.is_none() && array.dma_engines[idx].stream_in_len() > 0 {
+                first = Some(step);
+            }
+            if finished.is_none() && array.tiles[idx].locks[6].value >= 1 {
+                finished = Some(step);
+            }
+        }
+        (finished.expect("BD finished"), first.expect("a word reached the S2MM"))
+    }
+
+    /// Silicon: FINISHED_BD = N + 8 (one word read per cycle), and the first word reaches the
+    /// switch at 11 + min(N, 4) (the first granule is visible once its last word, or the BD's, has
+    /// been read), compute and memtile alike (onset-len, onset-long). Only the N-dependence is
+    /// asserted: the absolute offsets are port-side calibration.
+    #[test]
+    fn the_own_loop_finishes_one_cycle_per_word_and_offers_after_the_first_granule() {
+        for memtile in [false, true] {
+            let (f1, o1) = finished_and_first_offer(1, memtile);
+            for n in [2u32, 4, 8, 23, 46] {
+                let (f, o) = finished_and_first_offer(n, memtile);
+                assert_eq!(f, f1 + n as usize - 1, "FINISHED_BD at N={n} (memtile={memtile})");
+                assert_eq!(o, o1 + n.min(4) as usize - 1, "first offer at N={n} (memtile={memtile})");
+            }
+        }
+    }
+
     /// A core writing into a held DMA on its own tile: 25 words leave the core's `ms` write
     /// (3 in its output buffer + 22 through the Core:0 slave port); with the word still in `r0`
     /// that is the 26 of the R4-D3 core row (silicon 26/34/42/50 for 0..3 hops).

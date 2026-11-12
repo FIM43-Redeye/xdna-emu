@@ -76,7 +76,8 @@ pub struct StagedWord {
     /// it (`drain_egress_staging`).
     pub ends_bd: bool,
     /// Engine step (`DmaEngine::read_clock`) from which the word can leave the
-    /// staging (`DmaEngine::staged_word_latency` after its fetch).
+    /// staging: the read of its granule's last word (one word per cycle behind every earlier fetch,
+    /// `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
     pub ready_at: u64,
 }
 
@@ -590,8 +591,9 @@ pub struct ChannelContext {
     /// Compute / memtile MM2S egress staging FIFO: words read from tile memory
     /// (a 16-byte granule per bank access), in order, not yet handed to the
     /// stream output register, each already carrying its TLAST. It belongs to
-    /// the channel, not to a BD: a BD finishes once its last word is FETCHED
-    /// into it, and the next BD fetches in behind words still waiting here.
+    /// the channel, not to a BD: a BD finishes once its last word has been READ
+    /// into it (one word per cycle, `read_tail`), and the next BD fetches in behind
+    /// words still waiting here.
     /// Silicon: an MM2S chain into a held consumer finishes exactly as many BDs
     /// as fit the path's whole absorb (48 words at 0 hops on a compute tile and
     /// a memtile, BDs of 2..24 words), not the absorb less this FIFO
@@ -604,6 +606,13 @@ pub struct ChannelContext {
     /// BD), which now sits on the port side because the next BD is already
     /// fetching behind the finished one's words.
     pub egress_gap: u16,
+    /// Engine step (`DmaEngine::read_clock`) at which the last word of everything fetched so
+    /// far has been read. The MM2S reads one word per cycle into its staging: a granule fetched
+    /// (bank access, admission) at step `t` has its words read from `max(t, read_tail + 1)` on,
+    /// enters the staging when its last word is read, and a BD is done when ITS last word is read
+    /// (`DmaEngine::staged_mm2s_cycle`). Words of a fetched granule count against the staging
+    /// from the fetch on (they sit in `egress_staging` with a future `ready_at`).
+    pub read_tail: u64,
     /// Held level of the stream-side STREAM_BACKPRESSURE for a staged MM2S: a
     /// staged word is waiting on a full output register.
     pub egress_backpressure: bool,
@@ -648,6 +657,7 @@ impl ChannelContext {
             read_ahead: VecDeque::new(),
             egress_staging: VecDeque::new(),
             egress_gap: 0,
+            read_tail: 0,
             egress_backpressure: false,
             read_completions: VecDeque::new(),
             read_backpressure: false,
@@ -795,6 +805,7 @@ impl ChannelContext {
         self.read_backpressure = false;
         self.egress_staging.clear();
         self.egress_gap = 0;
+        self.read_tail = 0;
         self.egress_backpressure = false;
     }
 }
