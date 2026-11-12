@@ -1137,9 +1137,7 @@ impl DmaEngine {
                 }
             }
 
-            ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, mut transfer }
-                if self.uses_word_clock(&transfer) =>
-            {
+            ChannelFsm::AcquiringLock { lock_id, transfer, .. } if self.uses_word_clock(&transfer) => {
                 self.step_word_clock_lock_wait(ch_idx, lock_id, transfer, tile, neighbors)
             }
 
@@ -2749,11 +2747,14 @@ impl DmaEngine {
         if transfer.remaining_bytes() == 0 && now < self.channels[ch_idx].access_settles_at {
             return TransferCycleResult::ReadInProgress;
         }
-        // DMA_MM2S_n_MEMORY_STARVATION: the staging ran dry with the port able to take a beat
-        // while the next granule was ready to access (sequenced) -- the memory side, not the
-        // word clock, is behind. Silicon reads 0 on every workload measured
-        // (2026-07-14-dma-bank-access-width.md).
+        // DMA_MM2S_n_MEMORY_STARVATION: the staging ran dry in the middle of a BD with the port
+        // able to take a beat while the next granule was ready to access (sequenced) -- the
+        // memory side, not the word clock, is behind. A BD that has not accessed memory yet
+        // is starting, not starving: silicon reads 0 on every workload measured
+        // (2026-07-14-dma-bank-access-width.md), including lock-started BDs whose first
+        // access lost the bank with the staging empty (lock-fetch probe, 2026-11).
         if transfer.remaining_bytes() > 0
+            && transfer.bytes_transferred > 0
             && sequenced >= granule_words
             && self.channels[ch_idx].egress_staging.is_empty()
             && self.can_push_stream_out_for_channel(transfer.channel)
@@ -4595,6 +4596,7 @@ mod bank_demand_tests {
             if grant.is_none() && phase_before == "AcquiringLock" && eng.channel_phase(2) != "AcquiringLock" {
                 grant = Some(step);
             }
+            assert!(!eng.mm2s_memory_starvation(0), "no MM2S memory starvation (step {step})");
             if let Some(g) = grant {
                 if eng.cycle_dma_banks != 0 {
                     accesses.push((step - g, eng.cycle_dma_banks));
@@ -4983,9 +4985,11 @@ mod bank_demand_tests {
 
         // The cold fetch is the exception, and it is silicon's exception too: with
         // an empty staging there is nothing to cover the loss, so the port idles
-        // for exactly the cycle the retry takes.
+        // for exactly the cycle the retry takes. A BD that has not accessed memory
+        // yet is starting, not starving: no MEMORY_STARVATION (silicon reads 0 for a
+        // lock-started BD whose first access lost the bank, lock-fetch probe).
         let (cold_cycles, cold_starved, _) = run(|i, _| i == 0);
-        assert_eq!(cold_starved, 1, "a denied FIRST fetch has no staging to hide behind");
+        assert_eq!(cold_starved, 0, "a denied FIRST fetch is not memory starvation");
         assert_eq!(cold_cycles, base_cycles + 1, "and costs exactly the one retry cycle");
     }
 
