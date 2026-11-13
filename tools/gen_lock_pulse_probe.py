@@ -275,6 +275,12 @@ def build_case(case: Case, out: Path, events: str = TRACE_EVENTS) -> None:
 
 RUNNER_EXTRA_ARGS_ENV = "BRIDGE_RUNNER_EXTRA_ARGS"
 
+# Start of the emulator's end-of-run line for shim DMA accesses its IOMMU model blocked
+# (crates/xdna-emu-ffi/src/host_faults.rs). Silicon completes such a run and logs the faults in
+# the kernel log; an emulator run that prints this line fails here as a hardware run with
+# IOMMU lines fails its kernel-log check.
+EMU_HOST_FAULT_MARKER = "XDNA_EMU_HOST_FAULT:"
+
 
 def runner_extra_args() -> list[str]:
     """Extra bridge-trace-runner arguments from $BRIDGE_RUNNER_EXTRA_ARGS (shell-split), e.g. "-v" to log every
@@ -321,6 +327,11 @@ def run_case_raw(out: Path, name: str, tag: str, backend: str, output: bool = Tr
     if p.returncode != 0:
         print(f"{name} {backend}: runner failed rc={p.returncode}")
         return False
+    if backend != "hw":
+        fault = next((ln for ln in p.stderr.splitlines() if ln.startswith(EMU_HOST_FAULT_MARKER)), None)
+        if fault:
+            print(f"{name} {backend}: shim DMA access outside every host buffer: {fault}")
+            return False
     return True
 
 

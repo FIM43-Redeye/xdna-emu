@@ -76,3 +76,18 @@ def test_runner_extra_args_come_from_the_environment(monkeypatch, tmp_path):
     (tmp_path / "c").mkdir()
     assert g.run_case_raw(tmp_path, "c", "t", "emu", output=False)
     assert seen["cmd"][-3:] == ["-v", "--post-completion-us", "5"]
+
+
+def test_an_emulator_run_with_a_blocked_host_access_fails(monkeypatch, tmp_path, capsys):
+    # The emulator reports a shim DMA access outside every host buffer on stderr, as the
+    # IOMMU logs one on silicon; the run completes, but the harness must treat it as failed.
+    class Faulted:
+        returncode, stdout = 0, ""
+        stderr = (f"{g.EMU_HOST_FAULT_MARKER} the IOMMU model blocked 32 bytes of shim DMA access ...\n"
+                  "XDNA_EMU_STATUS: halt_reason=completed cycles=10 max_cycles=0\n")
+
+    monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: Faulted())
+    (tmp_path / "c").mkdir()
+    assert not g.run_case_raw(tmp_path, "c", "t", "emu", output=False)
+    assert "outside every host buffer" in capsys.readouterr().out
+    assert g.EMU_HOST_FAULT_MARKER in (tmp_path / "c" / "t.emu" / "runner.log").read_text()
