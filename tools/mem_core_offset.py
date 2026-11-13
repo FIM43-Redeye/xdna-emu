@@ -40,18 +40,22 @@ CORE, MEM = 0, 1  # events.json pkt_type of a compute tile's two trace units
 
 
 def load_tiles(side_dir):
-    """{(col, row): {(pkt_type, name): [ts...]}} with columns/rows relative to the placement."""
+    """{(col, row): {(pkt_type, name): [ts...]}}, columns relative to the placement, rows physical.
+
+    Rows never shift: the capture's ``origin_row`` is its lowest traced row, which moves with the
+    set of traced tiles (a shim unit one capture carries and the other lacks).
+    """
     path = Path(side_dir) / "events.json"
     if not path.is_file():
         return None
     doc = json.loads(path.read_text())
     pl = doc.get("placement") or {}
-    oc, orow = pl.get("origin_col", 0), pl.get("origin_row", 0)
+    oc = pl.get("origin_col", 0)
     tiles = {}
     for e in doc.get("events", []):
         if e.get("pkt_type") not in (CORE, MEM):
             continue
-        tile = (max(e["col"] - oc, 0), max(e["row"] - orow, 0))
+        tile = (max(e["col"] - oc, 0), e["row"])
         tiles.setdefault(tile, {}).setdefault((e["pkt_type"], e["name"]), []).append(e["ts"])
     return tiles
 

@@ -475,6 +475,15 @@ def test_an_extra_silicon_shim_unit_leaves_the_core_rows_measured(tmp_path):
     assert rep.exit_code == 0
 
 
+def test_the_offset_section_places_tiles_on_physical_rows_too(tmp_path):
+    import mem_core_offset
+    core, shim = _core_and_shim()
+    mem = edge("X", periodic(3, 70), col=1, row=2, pkt=1)
+    d = write_run(tmp_path, "r", {K: {"hw": core + mem + shim, "emu": core + mem}}, observed_placement=True)
+    tiles = {s: mem_core_offset.load_tiles(d / f"t.peano.{s}") for s in ("hw", "emu")}
+    assert set(tiles["hw"]) == set(tiles["emu"]) == {(0, 2)}
+
+
 def test_only_filter(tmp_path):
     hw = edge("X", periodic(10, 10))
     base = {K: {"hw": hw, "emu": hw}, ("u", "peano"): {"hw": hw, "emu": hw}}
