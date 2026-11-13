@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""Runtime-sequence probe: how fast does the controller work through task pushes and syncs?
+
+The runtime sequence of a design is run by the device's command processor. This probe holds that
+sequence as the independent variable and reads its effect from one tile: shim (0,0)'s own trace
+unit (one timer) records START_TASK and FINISHED_TASK of all four of its DMA channels. The shim has
+a fixed event per channel (only the memtile needs a channel selector), so no selector programming
+is involved. The trace leaves through the next column's shim S2MM 1, which keeps all four channels
+of the shim under test free; its Start frame gives the trace start.
+
+Data paths are shim loopbacks through the shim's own stream switch: M0 -> S0 (MM2S 0 to S2MM 0) and
+M1 -> S1. Tasks are short host transfers; every BD has its own slice of the one host buffer
+(sources first, destinations after, the buffer sized from the largest offset + length).
+
+Family P, push spacing: pushes (a `dma_memcpy_nd`: BD blockwrite, address patch, Task_Queue write32)
+issued back to back with no sync between, then a sync on every awaited channel at the end.
+  pN_mm / pN_ss / pN_il   N pushes, all MM2S first, all S2MM first, interleaved (M, S, M, S, ..)
+  _kK                     K plain register writes before every push (they change nothing)
+  p8_mmpair, p4_same_*    the same channel twice in a row, against the same pushes spread over channels
+  p4_mm_notok, p8_mm_alltok   token only on the S2MM tasks / on every task (default: the last task of each channel)
+One shim has four channels, so N = 8 needs two tasks per channel (queue depth is 4).
+
+Family W, sync latency: a loopback of L words on M0 -> S0 (token on S0), a sync on S0 issued at once,
+then a marker push (8 words on M1, whose sink S1 was armed first and takes every marker). The marker's
+START_TASK stamps when the controller resumed: S0 FINISHED_TASK -> marker START_TASK is the quantity.
+  wP_L<L>                 P transfer-sync pairs in a row, L = 300 / 3000 / 30000 words
+  w1_late_L<L>            the sync follows 64 plain writes, so the task has finished before the sync is reached
+  w1_nosync_L<L>          control: the marker is pushed with no sync before it
+
+Reading the tables. A push's START_TASK stamps the push only while its channel is idle or prefetching
+a queued BD; a second task pushed to a busy channel can start later (same-channel cases). The `ops`
+column lists the opcodes strictly between a push's Task_Queue write32 and the previous one's: a push
+that carries a token has one more maskwrite32 than one that does not, which is why the token variants
+exist. In the late-sync cases the quantity includes the LATE_FILL writes the sequence executes
+between the task's end and the sync.
+
+    gen_runtime_seq_probe.py list
+    gen_runtime_seq_probe.py build OUT [--only CASE ..]
+    gen_runtime_seq_probe.py run OUT TAG --backend hw|emu [--only CASE ..]
+    gen_runtime_seq_probe.py table OUT RUN [RUN ..] [--only CASE ..]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "tools"))
+
+PUSH_WORDS = 8
+MARKER_WORDS = 8
+LATE_FILL = 64
+TAIL_FILL = 32                       # plain writes after the last sync: every task is long done
+SCRATCH_REG = 0x000340F0             # Timer_Trig_Event_Low_Value of the carrier shim: writing 0 changes nothing
+DIM_LIMIT = 1000                     # inner dimension of a long BD stays under the hardware size field
+
+CHANNELS = {"M0": ("MM2S", 0, "in0"), "M1": ("MM2S", 1, "in1"),
+            "S0": ("S2MM", 0, "out0"), "S1": ("S2MM", 1, "out1")}
+PATH_OF = {"M0": 0, "S0": 0, "M1": 1, "S1": 1}
+# Task_Queue (Start_Queue) registers of a shim tile, AM025.
+QUEUE_OFFSETS = {0x1D204: "S0", 0x1D20C: "S1", 0x1D214: "M0", 0x1D21C: "M1"}
+TXN_WRITE, TXN_BLOCKWRITE, TXN_MASKWRITE, TXN_PATCH, TXN_SYNC = 0, 1, 3, 0x81, 0x80
+KIND = {TXN_WRITE: "write32", TXN_BLOCKWRITE: "blockwrite", TXN_MASKWRITE: "maskwrite32",
+        TXN_PATCH: "patch", TXN_SYNC: "sync"}
+EVENT_ORDER = ("M0", "M1", "S0", "S1")
+
+
+# -- plan -------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Push:
+    ch: str
+    words: int
+    token: bool = True
+
+
+@dataclass(frozen=True)
+class Fill:
+    count: int
+
+
+@dataclass(frozen=True)
+class Sync:
+    ch: str
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    family: str
+    steps: tuple
+
+
+def _p_case(name: str, order: list[str], k: int = 0, tokens: str = "last") -> Case:
+    """Push order `order`, k fillers before every push, then a sync per awaited channel."""
+    last = {ch: i for i, ch in enumerate(order)}          # index of the last push of each channel
+    steps: list = []
+    for i, ch in enumerate(order):
+        if k:
+            steps.append(Fill(k))
+        token = {"last": last[ch] == i, "all": True,
+                 "s2mm": ch[0] == "S" and last[ch] == i}[tokens]
+        steps.append(Push(ch, PUSH_WORDS, token))
+    awaited = [ch for ch in EVENT_ORDER if ch in last and (tokens != "s2mm" or ch[0] == "S")]
+    steps += [Sync(ch) for ch in awaited] + [Fill(TAIL_FILL)]
+    return Case(name, "P", tuple(steps))
+
+
+def _w_case(name: str, pairs: int, words: int, late: bool = False, nosync: bool = False) -> Case:
+    steps: list = [Push("S1", MARKER_WORDS * pairs, True)]   # the marker sink, armed first
+    for _ in range(pairs):
+        steps += [Push("M0", words, False), Push("S0", words, True)]
+        if nosync:
+            steps.append(Push("M1", MARKER_WORDS, False))
+            continue
+        if late:
+            steps.append(Fill(LATE_FILL))
+        steps += [Sync("S0"), Push("M1", MARKER_WORDS, False)]
+    if nosync:
+        steps.append(Sync("S0"))
+    steps += [Sync("S1"), Fill(TAIL_FILL)]
+    return Case(name, "W", tuple(steps))
+
+
+def plan() -> dict[str, Case]:
+    mm8 = ["M0", "M1", "M0", "M1", "S0", "S1", "S0", "S1"]
+    cases = [
+        _p_case("p2_mm", ["M0", "S0"]), _p_case("p2_ss", ["S0", "M0"]),
+        _p_case("p4_mm", ["M0", "M1", "S0", "S1"]), _p_case("p4_ss", ["S0", "S1", "M0", "M1"]),
+        _p_case("p4_il", ["M0", "S0", "M1", "S1"]),
+        _p_case("p4_mm_notok", ["M0", "M1", "S0", "S1"], tokens="s2mm"),
+        _p_case("p8_mm", mm8), _p_case("p8_ss", ["S0", "S1", "S0", "S1", "M0", "M1", "M0", "M1"]),
+        _p_case("p8_il", ["M0", "S0", "M1", "S1", "M0", "S0", "M1", "S1"]),
+        _p_case("p8_mmpair", ["M0", "M0", "M1", "M1", "S0", "S0", "S1", "S1"]),
+        _p_case("p8_mm_alltok", mm8, tokens="all"),
+        _p_case("p4_same_mm", ["M0", "M0", "S0", "S0"]), _p_case("p4_same_ss", ["S0", "S0", "M0", "M0"]),
+    ]
+    for k in (4, 16):
+        cases += [_p_case(f"p4_mm_k{k}", ["M0", "M1", "S0", "S1"], k),
+                  _p_case(f"p4_ss_k{k}", ["S0", "S1", "M0", "M1"], k)]
+    for pairs in (1, 2, 4):
+        for words in (300, 3000, 30000):
+            cases.append(_w_case(f"w{pairs}_L{words}", pairs, words))
+    cases += [_w_case("w1_late_L300", 1, 300, late=True), _w_case("w1_late_L3000", 1, 3000, late=True),
+              _w_case("w2_late_L300", 2, 300, late=True), _w_case("w1_nosync_L300", 1, 300, nosync=True)]
+    return {c.name: c for c in cases}
+
+
+# -- layout and safety --------------------------------------------------------------------------------
+
+def pushes(case: Case) -> list[Push]:
+    return [s for s in case.steps if isinstance(s, Push)]
+
+
+def layout(case: Case) -> list[tuple[Push, int]]:
+    """(push, word offset in the host buffer): MM2S sources first, S2MM destinations after."""
+    src_total = sum(p.words for p in pushes(case) if p.ch[0] == "M")
+    nxt = {"M": 0, "S": src_total}
+    out = []
+    for p in pushes(case):
+        out.append((p, nxt[p.ch[0]]))
+        nxt[p.ch[0]] += p.words
+    return out
+
+
+def buffer_words(case: Case) -> int:
+    return max(off + p.words for p, off in layout(case))
+
+
+def validate(case: Case) -> None:
+    """Every task finishes and nothing waits on something that cannot happen."""
+    fed = {0: 0, 1: 0}          # MM2S words pushed per path so far
+    sunk = {0: 0, 1: 0}         # S2MM words pushed per path so far
+    tokens = {ch: 0 for ch in CHANNELS}
+    syncs = {ch: 0 for ch in CHANNELS}
+    last_push = {}
+    awaited_after = {}
+    for i, s in enumerate(case.steps):
+        if isinstance(s, Push):
+            if s.ch not in CHANNELS:
+                raise ValueError(f"{case.name}: channel {s.ch}")
+            (fed if s.ch[0] == "M" else sunk)[PATH_OF[s.ch]] += s.words
+            tokens[s.ch] += s.token
+            last_push[s.ch] = i
+        elif isinstance(s, Sync):
+            syncs[s.ch] += 1
+            if syncs[s.ch] > tokens[s.ch]:
+                raise ValueError(f"{case.name}: sync on {s.ch} with no token to wait for")
+            path = PATH_OF[s.ch]
+            if sunk[path] > fed[path]:
+                raise ValueError(f"{case.name}: sync on {s.ch} before its sink's words can arrive "
+                                 f"(sink {sunk[path]} words, fed {fed[path]})")
+            awaited_after[s.ch] = i
+    for path in (0, 1):
+        if fed[path] != sunk[path]:
+            raise ValueError(f"{case.name}: path {path} sink {sunk[path]} words but source {fed[path]}: "
+                             f"a task is never fed or never drained")
+    for ch, i in last_push.items():
+        if ch[0] == "S" and awaited_after.get(ch, -1) < i:
+            raise ValueError(f"{case.name}: the last task of {ch} is never awaited (no sync after it)")
+
+
+# -- MLIR -----------------------------------------------------------------------------------------------
+
+def _dims(words: int) -> tuple[int, int]:
+    """(outer, inner) with outer * inner == words and inner <= DIM_LIMIT."""
+    if words <= DIM_LIMIT:
+        return 1, words
+    inner = next(d for d in range(DIM_LIMIT, 0, -1) if words % d == 0)
+    return words // inner, inner
+
+
+def design_mlir(case: Case) -> str:
+    nwords = buffer_words(case)
+    m = f"memref<{nwords}xi32>"
+    consts: dict[int, str] = {}
+
+    def c(v: int) -> str:
+        consts.setdefault(v, f"%c{v}")
+        return consts[v]
+
+    body: list[str] = []
+    lay = iter(layout(case))
+    ident = {"S": 0, "M": 0}
+    next_bd = iter(range(0, 16))
+    for s in case.steps:
+        if isinstance(s, Fill):
+            body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count
+        elif isinstance(s, Push):
+            p, off = next(lay)
+            direction, ch, sym = CHANNELS[s.ch]
+            outer, inner = _dims(s.words)
+            tok = ", issue_token = true" if s.token else ""
+            body.append(f"      aiex.npu.dma_memcpy_nd(%buf[{c(0)}, {c(0)}, {c(0)}, {c(off)}] "
+                        f"[{c(1)}, {c(1)}, {c(outer)}, {c(inner)}] [{c(0)}, {c(0)}, {c(inner)}, {c(1)}]) "
+                        f"{{id = {next(next_bd)} : i64, metadata = @{sym}{tok}}} : {m}")
+        else:
+            body.append(f"      aiex.npu.dma_wait {{symbol = @{CHANNELS[s.ch][2]}}}")
+    events = [f"DMA_{CHANNELS[ch][0]}_{CHANNELS[ch][1]}_{what}_TASK" for ch in EVENT_ORDER
+              for what in ("START", "FINISHED")]
+    nl = "\n"
+    const_lines = [f"      {name} = arith.constant {v} : i64" for v, name in sorted(consts.items())]
+    return f"""module {{
+  aie.device(npu1_2col) {{
+    %t00 = aie.tile(0, 0)
+    %t10 = aie.tile(1, 0)
+    aie.flow(%t00, DMA : 0, %t00, DMA : 0)
+    aie.flow(%t00, DMA : 1, %t00, DMA : 1)
+    aie.shim_dma_allocation @in0 (%t00, MM2S, 0)
+    aie.shim_dma_allocation @in1 (%t00, MM2S, 1)
+    aie.shim_dma_allocation @out0 (%t00, S2MM, 0)
+    aie.shim_dma_allocation @out1 (%t00, S2MM, 1)
+    aie.trace @trace_shim(%t00) {{
+      aie.trace.packet id = 1 type = shimtile
+{nl.join(f'      aie.trace.event <"{e}">' for e in events)}
+      aie.trace.start broadcast = 15
+      aie.trace.stop broadcast = 14
+    }}
+    aie.runtime_sequence(%buf: {m}) {{
+      aie.trace.host_config {{buffer_size = 65536 : i32, egress_shim_col = 1 : i32}}
+      aie.trace.start_config @trace_shim
+      %c_reg = arith.constant {SCRATCH_REG} : i32
+      %c_zero = arith.constant 0 : i32
+{nl.join(const_lines)}
+{nl.join(body)}
+    }}
+  }}
+}}
+"""
+
+
+# -- instruction stream ---------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Op:
+    kind: str
+    col: int = 0
+    row: int = 0
+    offset: int = 0
+    words: int = 0
+
+
+def decode_ops(insts: bytes) -> list[Op]:
+    """The instruction stream as a list of ops; ValueError on an unknown opcode or a stream that
+    does not parse to its stated length."""
+    n_ops = struct.unpack_from("<I", insts, 8)[0]
+    off, out = 16, []
+    for _ in range(n_ops):
+        if off + 8 > len(insts):
+            raise ValueError("stream ends inside an op")
+        opcode = insts[off]
+        if opcode in (TXN_WRITE, TXN_MASKWRITE):
+            size = 24 if opcode == TXN_WRITE else 28
+            addr = struct.unpack_from("<I", insts, off + 8)[0]
+            out.append(Op(KIND[opcode], (addr >> 25) & 0x7F, (addr >> 20) & 0x1F, addr & 0xFFFFF))
+        elif opcode == TXN_BLOCKWRITE:
+            size = struct.unpack_from("<I", insts, off + 12)[0]
+            addr = struct.unpack_from("<I", insts, off + 8)[0]
+            out.append(Op("blockwrite", (addr >> 25) & 0x7F, (addr >> 20) & 0x1F, addr & 0xFFFFF,
+                          (size - 16) // 4))
+        elif opcode in (TXN_PATCH, TXN_SYNC):
+            size = struct.unpack_from("<I", insts, off + 4)[0]
+            out.append(Op(KIND[opcode]))
+        else:
+            raise ValueError(f"opcode {opcode:#x} at offset {off}")
+        off += size
+    if off != len(insts):
+        raise ValueError(f"stream parses to {off} bytes, file has {len(insts)}")
+    return out
+
+
+@dataclass(frozen=True)
+class PushOp:
+    index: int
+    channel: str
+
+
+def push_ops(ops: list[Op], data_col: int = 0) -> list[PushOp]:
+    """Task_Queue writes of the data shim, in order."""
+    return [PushOp(i, QUEUE_OFFSETS[o.offset]) for i, o in enumerate(ops)
+            if o.kind == "write32" and o.row == 0 and o.col == data_col and o.offset in QUEUE_OFFSETS]
+
+
+def between_pushes(ops: list[Op], pushes_: list[PushOp]) -> list[dict[str, int]]:
+    """For each pair of consecutive pushes the opcode kinds and counts strictly between them."""
+    out = []
+    for a, b in zip(pushes_, pushes_[1:]):
+        counts: dict[str, int] = {}
+        for o in ops[a.index + 1:b.index]:
+            counts[o.kind] = counts.get(o.kind, 0) + 1
+        out.append(counts)
+    return out
+
+
+def op_summary(counts: dict[str, int]) -> str:
+    return " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "-"
+
+
+# -- tables ---------------------------------------------------------------------------------------------
+
+def _stamps(events: list[dict], ch: str, what: str, trace_start: int) -> list[int]:
+    direction, num, _ = CHANNELS[ch]
+    name = f"DMA_{direction}_{num}_{what}_TASK"
+    return sorted(e["ts"] - trace_start for e in events if e["name"] == name)
+
+
+def push_rows(case: Case, events: list[dict], trace_start: int) -> list[dict]:
+    """One row per push in sequence order: the nth push of a channel takes the nth START_TASK of
+    that channel, and `gap` is the difference to the previous push's START."""
+    seen: dict[str, int] = {}
+    rows, prev = [], None
+    for p in pushes(case):
+        n = seen.get(p.ch, 0)
+        seen[p.ch] = n + 1
+        st = _stamps(events, p.ch, "START", trace_start)
+        start = st[n] if n < len(st) else None
+        rows.append({"ch": p.ch, "start": start,
+                     "gap": None if start is None or prev is None else start - prev})
+        prev = start if start is not None else prev
+    return rows
+
+
+def sync_rows(case: Case, events: list[dict], trace_start: int) -> list[dict]:
+    """Per transfer-sync pair: S0 FINISHED_TASK to the marker's START_TASK on M1, and the transfer
+    (S0 START to FINISHED)."""
+    s0_start = _stamps(events, "S0", "START", trace_start)
+    s0_fin = _stamps(events, "S0", "FINISHED", trace_start)
+    m1_start = _stamps(events, "M1", "START", trace_start)
+    rows = []
+    for i, (a, b) in enumerate(zip(s0_start, s0_fin)):
+        marker = m1_start[i] if i < len(m1_start) else None
+        rows.append({"pair": i, "s0_start": a, "s0_fin": b, "transfer": b - a,
+                     "marker": marker, "latency": None if marker is None else marker - b})
+    return rows
+
+
+def finish_check(case: Case, events: list[dict], trace_stop: int | None) -> tuple[str, list[str]]:
+    """ok when every pushed task has its START and FINISHED event and the trace runs on past the last."""
+    problems = []
+    last = 0
+    for ch in EVENT_ORDER:
+        n = sum(1 for p in pushes(case) if p.ch == ch)
+        for what in ("START", "FINISHED"):
+            st = _stamps(events, ch, what, 0)
+            if len(st) != n:
+                problems.append(f"missing {ch} {what}: {len(st)} of {n}")
+            last = max([last, *st])
+    if not problems and (trace_stop is None or trace_stop <= last):
+        problems.append(f"tail: trace stop {trace_stop} not after the last FINISHED_TASK {last}")
+    return ("finish ok" if not problems else "; ".join(problems)), problems
+
+
+# -- trace decoding (run directories) -------------------------------------------------------------------
+
+def trace_bounds(raw: bytes, col_pred=None) -> dict[tuple[int, int, int], tuple[int | None, int | None]]:
+    """{(pkt_type, row, col): (Start timer, stop timer)} of every mode-0 stream in a raw trace."""
+    from trace_decoder import decode_words, detect_per_tile_modes, TraceMode
+    from trace_decoder.frame import StartCmd, StopCmd, SyncCmd, RepeatCmd, EventCmd
+    sync = 1 << 18
+    words = list(struct.unpack(f"<{len(raw) // 4}I", raw[:len(raw) // 4 * 4]))
+    modes = detect_per_tile_modes(words)
+    out = {}
+    for key, cmds in decode_words(words, mode=None).items():
+        if modes.get(key) != TraceMode.EVENT_TIME:
+            continue
+        timer = start = stop = prev = None
+        timer, after_sync = 0, False
+        for cmd in cmds:
+            if isinstance(cmd, StartCmd):
+                timer = start = cmd.timer_value
+                prev = None
+                continue
+            if isinstance(cmd, SyncCmd):
+                timer += sync
+                after_sync = True
+                continue
+            if isinstance(cmd, RepeatCmd) and after_sync:
+                timer += cmd.count * sync
+                continue
+            after_sync = False
+            if isinstance(cmd, StopCmd):
+                stop = timer + cmd.idle_cycles
+            elif isinstance(cmd, EventCmd):
+                timer += 1 + cmd.cycles
+                prev = cmd
+            elif isinstance(cmd, RepeatCmd) and prev is not None:
+                timer += cmd.count if prev.cycles == 0 else cmd.count * (1 + prev.cycles)
+        out[key] = (start, stop)
+    return out
+
+
+def load_run(case_dir: Path, run: str) -> tuple[list[dict], int, int | None]:
+    """(shim events, trace Start timer, stop timer) of one run of one case."""
+    r = case_dir / run
+    events = json.loads((r / "events.json").read_text())["events"]
+    shim = [e for e in events if e["pkt_type"] == 2 and e["name"].startswith("DMA_")
+            and e["name"].endswith(("START_TASK", "FINISHED_TASK"))]
+    bounds = trace_bounds((r / "trace_raw.bin").read_bytes())
+    cols = sorted({e["col"] for e in shim})
+    key = next(k for k in bounds if k[0] == 2 and (not cols or k[2] == cols[0]))
+    start, stop = bounds[key]
+    return shim, start or 0, stop
+
+
+def _fmt(v) -> str:
+    return "-" if v is None else str(v)
+
+
+def case_table(case: Case, case_dir: Path, runs: list[str]) -> str:
+    meta = json.loads((case_dir / "case.json").read_text())
+    loaded = {}
+    for run in runs:
+        try:
+            loaded[run] = load_run(case_dir, run)
+        except (FileNotFoundError, StopIteration, KeyError) as e:
+            loaded[run] = None
+    lines = [f"== {case.name}  ({case.family}; {len(pushes(case))} pushes; "
+             f"{sum(isinstance(s, Sync) for s in case.steps)} syncs; host buffer {buffer_words(case)} words)"]
+    ok = {run: finish_check(case, v[0], v[2])[0] if v else "no data" for run, v in loaded.items()}
+    lines.append("finish: " + "; ".join(f"{run}: {t}" for run, t in ok.items()))
+    if case.family == "P":
+        between = meta.get("between", [])
+        lines.append("  push  ch  ops between this push's queue write and the previous one's   " +
+                     "  ".join(f"{r:>13}" for r in runs) + "   median")
+        pr = {run: push_rows(case, v[0], v[1]) for run, v in loaded.items() if v}
+        for i, p in enumerate(pushes(case)):
+            vals = [pr[run][i]["gap"] if run in pr else None for run in runs]
+            starts = [pr[run][i]["start"] if run in pr else None for run in runs]
+            ops = op_summary(between[i - 1]) if i and i - 1 < len(between) else "(first push)"
+            good = [v for v in vals if v is not None]
+            lines.append(f"  {i:>4}  {p.ch}  {ops:<60} " + "  ".join(f"{_fmt(v):>13}" for v in vals) +
+                         f"   {statistics.median(good) if good else '-'}")
+            lines.append(f"{'':9}START rel. trace start: " + "  ".join(f"{_fmt(v):>13}" for v in starts))
+    else:
+        sr = {run: sync_rows(case, v[0], v[1]) for run, v in loaded.items() if v}
+        npairs = max((len(r) for r in sr.values()), default=0)
+        lines.append("  pair  quantity (S0 FINISHED -> marker START)   " + "  ".join(f"{r:>9}" for r in runs) + "   median")
+        for i in range(npairs):
+            for label, key in (("latency", "latency"), ("transfer", "transfer"), ("S0 START", "s0_start")):
+                vals = [sr[run][i][key] if run in sr and i < len(sr[run]) else None for run in runs]
+                good = [v for v in vals if v is not None]
+                lines.append(f"  {i:>4}  {label:<40} " + "  ".join(f"{_fmt(v):>9}" for v in vals) +
+                             f"   {statistics.median(good) if good else '-'}")
+    return "\n".join(lines)
+
+
+# -- commands -----------------------------------------------------------------------------------------------
+
+def cmd_list(args) -> int:
+    for c in plan().values():
+        print(f"{c.name:<16} {c.family}  pushes={len(pushes(c))} syncs={sum(isinstance(s, Sync) for s in c.steps)} "
+              f"buffer={buffer_words(c)}")
+    return 0
+
+
+def _selected(args) -> list[Case]:
+    table = plan()
+    names = args.only or list(table)
+    return [table[n] for n in names]
+
+
+def cmd_build(args) -> int:
+    import gen_lock_pulse_probe as lp
+    out = Path(args.out_dir).resolve()
+    for case in _selected(args):
+        validate(case)
+        d = out / case.name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "aie.mlir").write_text(design_mlir(case))
+        lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+               "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+              cwd=d, log=d / "aiecc.log")
+        ops = decode_ops((d / "insts.bin").read_bytes())
+        pushes_ = push_ops(ops)
+        want = [p.ch for p in pushes(case)]
+        got = [p.channel for p in pushes_]
+        if got != want:
+            raise SystemExit(f"{case.name}: instruction stream pushes {got}, plan {want}")
+        between = between_pushes(ops, pushes_)
+        (d / "case.json").write_text(json.dumps(
+            {"case": case.name, "family": case.family, "pushes": want, "between": between,
+             "ops_total": len(ops), "buffer_words": buffer_words(case)}, indent=1) + "\n")
+        print(f"{case.name}: {len(want)} pushes, between consecutive pushes: " +
+              "; ".join(op_summary(b) for b in between[:3]) + (" ..." if len(between) > 3 else ""))
+    return 0
+
+
+def cmd_run(args) -> int:
+    import gen_lock_pulse_probe as lp
+    out = Path(args.out_dir).resolve()
+    for case in _selected(args):
+        if not lp.run_case(out, case.name, args.tag, args.backend, output=False):
+            print(f"{case.name}: run did not complete; stop")
+            return 1
+        if args.backend == "emu":
+            log = (out / case.name / f"{args.tag}.emu" / "runner.log").read_text()
+            if "halt_reason=completed" not in log:
+                print(f"{case.name}: emulator did not complete")
+                return 1
+    return 0
+
+
+def cmd_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for case in _selected(args):
+        print(case_table(case, out / case.name, args.runs))
+        print()
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    b = sub.add_parser("build")
+    b.add_argument("out_dir")
+    b.add_argument("--only", nargs="*", default=[])
+    r = sub.add_parser("run")
+    r.add_argument("out_dir")
+    r.add_argument("tag")
+    r.add_argument("--backend", choices=("hw", "emu"), required=True)
+    r.add_argument("--only", nargs="*", default=[])
+    t = sub.add_parser("table")
+    t.add_argument("out_dir")
+    t.add_argument("runs", nargs="+")
+    t.add_argument("--only", nargs="*", default=[])
+    args = ap.parse_args(argv)
+    return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
