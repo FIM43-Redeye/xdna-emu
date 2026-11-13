@@ -13,7 +13,8 @@ the silicon samples of both days (plus any given with ``--hw-samples``).
 Rows
 ----
 A row is (test, compiler, tile col/row, tile module, event name); columns are
-shifted by the file's placement origin so HW and EMU line up.  Its *series* is
+shifted by the file's placement origin column so HW and EMU line up, rows are
+physical and never shifted.  Its *series* is
 the list of event timestamps; a row's count is the length of its series.  A
 side that never fires a row has count 0, so a phantom row (EMU fires, silicon
 does not) is a plain 0 -> N count move.
@@ -325,18 +326,22 @@ class Side:
             return
         doc = json.loads((self.path / "events.json").read_text())
         pl = doc.get("placement") or {}
-        self._origin = (pl.get("origin_col", 0), pl.get("origin_row", 0))
+        # Only the column needs an origin: the run may be placed at a different start column, but
+        # rows are physical (0 shim, 1 memtile, 2+ compute) and never shift.  The capture's
+        # ``origin_row`` is the lowest traced row, which moves when one capture carries a shim or
+        # memtile unit the other lacks, so it is not used.
+        self._origin_col = pl.get("origin_col", 0)
         sn = doc.get("slot_names") or {}
         self._event_sets = {pt: tuple(sn[kind]) for pt, kind in _PT_CODE_TO_NAME.items()
                             if kind in sn}
         # (col, row, pkt_type, name, ts) of every event, level rows expanded where possible.
         rows, self._level_problem, units = _event_rows(self.path, doc)
-        oc, orow = self._origin
+        oc = self._origin_col
         self._units = (None if units is None else
-                       {(max(c - oc, 0), max(r - orow, 0), pt): st for (c, r, pt), st in units.items()})
+                       {(max(c - oc, 0), r, pt): st for (c, r, pt), st in units.items()})
         groups: dict[tuple, list[int]] = {}
         for col, row, pt, name, ts in rows:
-            groups.setdefault((max(col - oc, 0), max(row - orow, 0), pt, name), []).append(ts)
+            groups.setdefault((max(col - oc, 0), row, pt, name), []).append(ts)
         self._series = {k: series_from_stamps(v, k[3]) for k, v in groups.items()}
         self._loaded = True
 

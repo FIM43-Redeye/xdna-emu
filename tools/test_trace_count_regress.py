@@ -131,14 +131,15 @@ def _events_json(events):
             for e in plain]
 
 
-def write_run(root: Path, day: str, tests: dict, raw=True, stamp=True) -> Path:
+def write_run(root: Path, day: str, tests: dict, raw=True, stamp=True, observed_placement=False) -> Path:
     """tests: {(test, compiler): {"hw": [events] | None, "emu": [events] | None}}
 
     Level events are given one per asserted cycle.  With ``raw`` each side gets the trace_raw.bin
     that encodes them and an events.json as the decoder writes it (held cycles absent); without,
     only an events.json holding the given events.  ``stamp`` marks each capture with its day so
     sides given the same events are still distinct captures (a copied-forward dir is the
-    ``stamp=False`` case).
+    ``stamp=False`` case).  ``observed_placement`` writes the placement the trace parser writes: the
+    smallest column and row that produced an event, so it moves with the set of traced tiles.
     """
     d = root / day
     d.mkdir(parents=True)
@@ -154,6 +155,9 @@ def write_run(root: Path, day: str, tests: dict, raw=True, stamp=True) -> Path:
             slot_names = {k: list(_EVENT_SET) for k in _KINDS.values()}
             doc = {"schema_version": 1, "events": events, "slot_names": slot_names,
                    "placement": {"origin_col": 1, "origin_row": 0}}
+            if observed_placement and events:
+                doc["placement"] = {"origin_col": min(e["col"] for e in events if not e.get("unit_only")),
+                                    "origin_row": min(e["row"] for e in events if not e.get("unit_only"))}
             if raw and events:
                 (sd / "trace_raw.bin").write_bytes(_raw_trace(events))
                 doc["events"] = _events_json(events)
@@ -432,6 +436,43 @@ def test_tile_columns_are_shifted_by_placement(tmp_path):
             {"events": ev, "placement": {"origin_col": oc, "origin_row": 0}}))
     run_data = tcr.load_run(d)
     assert set(run_data[K]["hw"].series) == set(run_data[K]["emu"].series)
+
+
+# A shim row-0 unit that one capture carries and the other lacks.  The parser's observed origin is
+# the lowest traced row, so it differs between the two captures of one test; rows are physical
+# (0 shim, 1 memtile, 2+ compute) and must not follow it.
+def _core_and_shim():
+    core = edge("INSTR_VECTOR", periodic(5, 50), col=1, row=2) + level("LOCK_STALL", [1000], col=1, row=2)
+    shim = edge("DMA_S2MM_0_STREAM_STARVATION", periodic(3, 70), col=1, row=0, pkt=2)
+    return core, shim
+
+
+def test_rows_are_physical_and_do_not_follow_the_lowest_traced_row(tmp_path):
+    core, shim = _core_and_shim()
+    d = write_run(tmp_path, "r", {K: {"hw": core + shim, "emu": core}}, observed_placement=True)
+    docs = {s: json.loads((d / f"t.peano.{s}" / "events.json").read_text())["placement"] for s in ("hw", "emu")}
+    assert (docs["hw"]["origin_row"], docs["emu"]["origin_row"]) == (0, 2)   # the artefact's precondition
+    sides = tcr.load_run(d)[K]
+    assert (0, 2, 0, "INSTR_VECTOR") in sides["hw"].series
+    assert (0, 2, 0, "INSTR_VECTOR") in sides["emu"].series
+    assert (0, 0, 2, "DMA_S2MM_0_STREAM_STARVATION") in sides["hw"].series
+    assert set(sides["emu"].units) == {(0, 2, 0)} and (0, 0, 2) in sides["hw"].units
+
+
+def test_an_extra_silicon_shim_unit_leaves_the_core_rows_measured(tmp_path):
+    core, shim = _core_and_shim()
+    b = write_run(tmp_path, "base", {K: {"hw": core + shim, "emu": core}}, observed_placement=True)
+    moved = edge("INSTR_VECTOR", periodic(9, 50), col=1, row=2) + level("LOCK_STALL", [1000], col=1, row=2)
+    c = write_run(tmp_path, "cand", {K: {"emu": moved}}, observed_placement=True)
+    rep = tcr.compare_runs(b, c)
+    assert rep.not_measured == []
+    # the core row lands on its own coordinate on both sides, so the move is scored against silicon
+    r = only_row(rep, "INSTR_VECTOR")
+    assert (r.key.col, r.key.row, r.key.module) == (0, 2, 0) and r.hw_counts == [5]
+    # the one thing missing is the emulator's shim unit, at its own coordinate
+    (u,) = rep.emu_absent
+    assert (u.col, u.row, u.module) == (0, 0, 2)
+    assert rep.exit_code == 0
 
 
 def test_only_filter(tmp_path):
