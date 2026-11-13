@@ -266,7 +266,14 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("broadcast.per_hop_horizontal", SKEW, "Horizontal isotropy assumed."),
         measured("broadcast.per_hop_vertical", SKEW, "Vertical isotropy assumed (blocked on the cold-start fill gap)."),
         measured("broadcast.intra_tile_core_offset", SKEW, "Gauge-fixed at 0: only the core-memory contrast is observable."),
-        measured("broadcast.intra_tile_mem_offset", SKEW, "The add_one core-vs-memory-module signature contrast."),
+        unit("broadcast.intra_tile_mem_offset", HardwareObserved, Verification::Unverified,
+            "Compute memory module against the core (core is the gauge, 0). Started at 2, the raw add_one core-vs-memory event \
+            offset, which also held that event pair's wall-clock separation as then placed. 1 since the core memory-access and \
+            lock-release placement was corrected: derived from cross-unit event pairs, not from a skew sweep. On silicon \
+            LOCK_0_REL (memory unit) minus INSTR_EVENT_0 (core unit) is 5 and MEMORY_STALL (core unit) minus CONFLICT_DM_BANK \
+            (memory unit) is 1; each read one cycle off with 2. The median memory-minus-core offset over the suite's qualifying \
+            test-tiles (tools/mem_core_offset.py) went from -1 to 0. Few tiles qualify and the rest are host-timing outliers."),
+        unsourced("broadcast.intra_tile_memtile_offset", "The value the memory-module offset carried before it was re-measured (2). A memtile has no core module: nothing measures it against a core, so it is held, not calibrated."),
         measured("broadcast.calibrated", SKEW, "Flag: the constants above are a silicon calibration (SP-5c, reversible)."),
         // -- instruction --
         manual("instruction.data_memory_latency", "AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie \

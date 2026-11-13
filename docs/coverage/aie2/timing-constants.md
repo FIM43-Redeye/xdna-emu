@@ -6,7 +6,7 @@ Every `TimingModel` field with its provenance and verification verdict
 (`coverage/constants.rs`). The backlog lists what silicon contradicts or
 nothing has verified yet; settled values are toolchain-derived or measured.
 
-## Backlog (36)
+## Backlog (38)
 
 | Constant | Value | Provenance | Verification | Note |
 |----------|-------|------------|--------------|------|
@@ -44,10 +44,12 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `stream_switch.local_to_external_latency` | 4 | doc-specified | unverified | AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for. |
 | `stream_switch.external_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2. UNREAD: the ext->local path uses the local->local latency (equal value, 3, hides it). |
 | `stream_switch.packet_arbitration_overhead` | 1 | unspecified | unverified | Original estimate; AM020 ch.2 excludes it from the latency table and no capture exists. |
+| `broadcast.intra_tile_mem_offset` | 1 | hardware-observed | unverified | Compute memory module against the core (core is the gauge, 0). Started at 2, the raw add_one core-vs-memory event offset, which also held that event pair's wall-clock separation as then placed. 1 since the core memory-access and lock-release placement was corrected: derived from cross-unit event pairs, not from a skew sweep. On silicon LOCK_0_REL (memory unit) minus INSTR_EVENT_0 (core unit) is 5 and MEMORY_STALL (core unit) minus CONFLICT_DM_BANK (memory unit) is 1; each read one cycle off with 2. The median memory-minus-core offset over the suite's qualifying test-tiles (tools/mem_core_offset.py) went from -1 to 0. Few tiles qualify and the rest are host-timing outliers. |
+| `broadcast.intra_tile_memtile_offset` | 2 | unspecified | unverified | The value the memory-module offset carried before it was re-measured (2). A memtile has no core module: nothing measures it against a core, so it is held, not calibrated. |
 | `instruction.data_memory_latency` | 5 | doc-specified | unverified | AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie AIE2Schedule.td LoadLatency 5 (marked FIXME there). |
 | `instruction.branch_penalty` | 3 | unspecified | unverified | Original estimate (~3 fetch stages); llvm-aie MispredictPenalty is 4 (FIXME). The executor deliberately adds no branch penalty (the delay slots are the flush), so its live effect is unclear. |
 
-## Settled (33)
+## Settled (32)
 
 | Constant | Value | Provenance | Verification | Evidence and note |
 |----------|-------|------------|--------------|-------------------|
@@ -82,5 +84,4 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `broadcast.per_hop_horizontal` | 4 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Horizontal isotropy assumed. |
 | `broadcast.per_hop_vertical` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Vertical isotropy assumed (blocked on the cold-start fill gap). |
 | `broadcast.intra_tile_core_offset` | 0 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Gauge-fixed at 0: only the core-memory contrast is observable. |
-| `broadcast.intra_tile_mem_offset` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- The add_one core-vs-memory-module signature contrast. |
 | `broadcast.calibrated` | true | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Flag: the constants above are a silicon calibration (SP-5c, reversible). |

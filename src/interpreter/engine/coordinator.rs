@@ -441,7 +441,7 @@ impl InterpreterEngine {
     /// `origin_D` during execution -- so the export reproduces the exact
     /// constants the run used, not an independently-resolved copy.
     pub fn export_origin_d_sidecar(&self) -> serde_json::Value {
-        let (d_h, d_v, core_off, mem_off, calibrated) = self.device.effective_broadcast_timing();
+        let (d_h, d_v, core_off, mem_off, memtile_off, calibrated) = self.device.effective_broadcast_timing();
 
         let sources = self.device.flood_sources();
         let single = if sources.len() == 1 {
@@ -453,8 +453,14 @@ impl InterpreterEngine {
         let mut modules = serde_json::Map::new();
         if let Some((col, row)) = single {
             for (c, r, kind, d) in self.device.origin_d_table(
-                col, row, 15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
-                d_h, d_v, core_off, mem_off,
+                col,
+                row,
+                15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
+                d_h,
+                d_v,
+                core_off,
+                mem_off,
+                memtile_off,
             ) {
                 modules.insert(format!("{c}|{r}|{kind}"), serde_json::json!(d));
             }
@@ -5727,6 +5733,7 @@ mod tests {
             per_hop_vertical: 3,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            intra_tile_memtile_offset: 0,
             calibrated: true,
         }));
         {
@@ -5746,6 +5753,10 @@ mod tests {
 
     #[test]
     fn export_origin_d_sidecar_matches_committed_fixture() {
+        // Provenance of the values in the fixture: compute memory-module origin_D rows are
+        // core + 1 (intra offset 1: the raw add_one core-vs-memory offset 2, corrected by one
+        // cycle after the core memory-access and lock-release placement fix, 2026-11-13);
+        // memtile rows keep the old offset 2.
         // SP-5a Task 3: pin the REAL exported sidecar JSON as a committed
         // read-only golden file. The live export must equal it (drift fails
         // loudly). Regeneration is explicit and env-gated -- the default

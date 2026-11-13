@@ -46,6 +46,7 @@ mod tests {
             per_hop_vertical: d_v,
             intra_tile_core_offset: core_off,
             intra_tile_mem_offset: mem_off,
+            intra_tile_memtile_offset: mem_off,
             calibrated: false,
         };
         let suite = XclbinSuite::new();

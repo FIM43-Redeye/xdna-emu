@@ -1693,6 +1693,11 @@ pub struct BroadcastTiming {
     pub intra_tile_core_offset: u8,
     /// Additive offset for a compute tile's memory module (same baseline).
     pub intra_tile_mem_offset: u8,
+    /// Additive offset for a memtile's (single) module, same baseline. Separate from
+    /// the compute memory module's: a memtile has no core module, so nothing here
+    /// measures it against a core; it keeps the value the compute memory module
+    /// carried before that one was re-measured.
+    pub intra_tile_memtile_offset: u8,
     /// True once SP-5 has measured the per-hop/intra-tile constants on silicon.
     /// EXPLICIT, not inferred from "constants != 0" -- a genuinely measured d_v=0
     /// must not read as uncalibrated. The engine withholds causal_offset while
