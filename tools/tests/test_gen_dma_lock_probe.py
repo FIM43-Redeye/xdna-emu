@@ -709,6 +709,31 @@ def test_chain_design_s2mm_releaser_splits_the_receive_and_releases_a():
     assert f'aie.lock(%t02, {g.CHAIN_LOCK_RX}) {{init = 1 : i32, sym_name = "lRx"}}' in t
 
 
+def test_chain_bd_ids_pin_each_mm2s_bd_and_leave_the_default_design_unchanged():
+    c = chain("1 1", bd_ids=(0, 2, 3, 7))
+    b = bd_blocks(g.chain_design_mlir(c))
+    for name, i in (("head", 0), ("m0", 2), ("m1", 3), ("send", 7)):
+        assert f"{{bd_id = {i} : i32}}" in b[name], name
+    assert "bd_id" not in b["recv"]                                  # the S2MM BD stays aiecc's
+    assert c.design()["bd_ids"] == [0, 2, 3, 7]
+    plain = chain("1 1")
+    assert "bd_id" not in g.chain_design_mlir(plain) and "bd_ids" not in plain.design()
+
+
+def test_chain_bd_ids_must_name_every_mm2s_bd_once_within_the_tile():
+    for bad in ((0, 1, 2), (0, 1, 2, 3, 4), (0, 1, 1, 2), (0, 1, 2, 16), (0, 1, 2, -1)):
+        with pytest.raises(ValueError):
+            g.chain_validate(chain("1 1", bd_ids=bad))
+    g.chain_validate(chain("1 1", bd_ids=(9, 0, 15, 4)))
+
+
+def test_chain_bd_ids_parse_from_the_command_line():
+    args = type("A", (), {"mids": ["1", "1"], "head": 4, "big": 64, "d1s": [], "d2s": [0, 1], "releaser": "core",
+                          "bd_ids": [0, 2, 3, 7]})()
+    cases = g.chain_selection(args)
+    assert [c.bd_ids for c in cases] == [(0, 2, 3, 7)] * 2 and [c.d2 for c in cases] == [0, 1]
+
+
 def test_chain_design_sequence_only_sets_the_start_lock():
     for c in (chain("4c 8"), chain("8", releaser="s2mm")):
         seq = g.chain_design_mlir(c).split("aie.runtime_sequence")[1]

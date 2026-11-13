@@ -1222,6 +1222,7 @@ class ChainCase:
     d1: int = 0                    # nops between `event #0` and the core's release of B (needs a core BD)
     d2: int = 0                    # nops between `event #1` and the core's release of A
     releaser: str = "core"         # who releases A: "core" or "s2mm"
+    bd_ids: tuple = ()             # bd_id of every MM2S BD (head, mids, waiting BD); () = aiecc assigns
 
     @property
     def name(self) -> str:
@@ -1229,7 +1230,10 @@ class ChainCase:
         return "qs" if self.releaser == "s2mm" else f"q{self.d1:02d}_{self.d2:02d}"
 
     def design(self) -> dict:
-        return {"head": self.head, "mids": format_chain_mids(self.mids), "big": self.big, "releaser": self.releaser}
+        d = {"head": self.head, "mids": format_chain_mids(self.mids), "big": self.big, "releaser": self.releaser}
+        if self.bd_ids:
+            d["bd_ids"] = list(self.bd_ids)
+        return d
 
 
 def parse_chain_mids(tokens) -> tuple:
@@ -1272,6 +1276,9 @@ def chain_validate(c: ChainCase) -> None:
         raise ValueError(f"at most {CHAIN_MAX_BDS} BDs in the tile")
     if not (0 <= c.d1 <= CHAIN_MAX_D and 0 <= c.d2 <= CHAIN_MAX_D) or (c.d1 and not cores):
         raise ValueError(f"d1, d2 in 0..{CHAIN_MAX_D}; d1 only with a core BD")
+    if c.bd_ids and (len(c.bd_ids) != len(c.mids) + 2 or len(set(c.bd_ids)) != len(c.bd_ids)
+                     or not all(0 <= i < CHAIN_MAX_BDS for i in c.bd_ids)):
+        raise ValueError(f"bd_ids: one distinct id in 0..{CHAIN_MAX_BDS - 1} per MM2S BD (head, mids, waiting BD)")
     a, w = chain_buffers(c)[-1]
     if a + 4 * w > CHAIN_BUF_END:
         raise ValueError("head and mid buffers exceed logical bank 1")
@@ -1312,16 +1319,18 @@ def chain_design_mlir(c: ChainCase) -> str:
     bds, free_i = [], 0
     names = ["head", *(f"m{i}" for i in range(len(c.mids))), "send"]
 
-    def bd(label, buf, n_, acq, rel, nxt):
+    def bd(label, buf, n_, acq, rel, nxt, bd_id=None):
         s = f"    ^{label}:\n"
         if acq:
             s += f"      aie.use_lock({acq}, AcquireGreaterEqual, %c1)\n"
-        s += f"      aie.dma_bd({buf} : memref<{n_}xi32>)\n"
+        pin = "" if bd_id is None else f" {{bd_id = {bd_id} : i32}}"
+        s += f"      aie.dma_bd({buf} : memref<{n_}xi32>){pin}\n"
         if rel:
             s += f"      aie.use_lock({rel}, Release, %c1)\n"
         return s + f"      aie.next_bd ^{nxt}\n"
 
-    bds.append(bd("head", "%head_buf", c.head, "%lStart", "%lSync", names[1]))
+    ids = list(c.bd_ids) or [None] * (len(c.mids) + 2)
+    bds.append(bd("head", "%head_buf", c.head, "%lStart", "%lSync", names[1], ids[0]))
     for i, m in enumerate(c.mids):
         lock = None
         if m.lock == "core":
@@ -1330,8 +1339,8 @@ def chain_design_mlir(c: ChainCase) -> str:
             lock = f"%lF{free_i}"
             locks.append(f'    {lock} = aie.lock(%t02, {CHAIN_LOCK_FREE0 + free_i}) {{init = 1 : i32, sym_name = "lF{free_i}"}}')
             free_i += 1
-        bds.append(bd(f"m{i}", f"%m{i}_buf", m.words, lock, lock, names[i + 2]))
-    bds.append(bd("send", "%src", w, "%lA", "%lEnd", "end"))
+        bds.append(bd(f"m{i}", f"%m{i}_buf", m.words, lock, lock, names[i + 2], ids[i + 1]))
+    bds.append(bd("send", "%src", w, "%lA", "%lEnd", "end", ids[-1]))
     if c.releaser == "s2mm":
         recv = bd("recv", "%dst", pre_words, "%lRx", "%lA", "recv2") + \
             bd("recv2", "%dst2", w, None, None, "end")
@@ -1434,7 +1443,8 @@ def chain_check_design_dir(out: Path, c: ChainCase) -> None:
 def chain_selection(args) -> list:
     mids = parse_chain_mids(args.mids)
     pairs = [(0, 0)] if args.releaser == "s2mm" else [(a, b) for a in (args.d1s or [0]) for b in (args.d2s or [0])]
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser) for a, b in pairs]
+    ids = tuple(getattr(args, "bd_ids", None) or ())
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids) for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1512,6 +1522,8 @@ def add_chain_parsers(sub) -> None:
         sp.add_argument("--d1s", nargs="*", type=int, default=[], help="core nops before releasing B")
         sp.add_argument("--d2s", nargs="*", type=int, default=[], help="core nops before releasing A")
         sp.add_argument("--releaser", choices=("core", "s2mm"), default="core")
+        sp.add_argument("--bd-ids", nargs="*", type=int, default=[],
+                        help="bd_id of every MM2S BD in chain order (head, mids, waiting BD); default: aiecc assigns")
 
 
 CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table}
