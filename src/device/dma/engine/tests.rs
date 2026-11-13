@@ -3024,12 +3024,15 @@ fn chained_bd_lock_interval_baseline() {
         "expected exactly 2 FINISHED_BD events, got cycles {:?}",
         finished_bd_cycles
     );
-    // A 2-word BD is shorter than the lock hand-off: BD#1's lock is released by BD#0's
-    // FINISHED_BD (last access + 1), granted the cycle after, and BD#1 may access memory only
-    // from grant + 2 (`mm2s_lock_to_access_cycles`, lock-fetch probe), i.e. 4 cycles after
-    // BD#0's last access, while BD#0's 2 words leave in 2: the port idles 2 cycles at the
-    // boundary, not the 1 of a longer BD (`on16 off1`). Unmeasured for 2-word BDs on silicon.
-    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, 2, &finished_bd_cycles);
+    // A 2-word BD is shorter than the lock hand-off. BD#0 is granted at g and finishes at
+    // g + 3 (last access + 1), releasing BD#1's lock; the compute MM2S lock law (`LockPort`)
+    // grants BD#1 no earlier than that release + 2 and, from its request g + 3, not at
+    // g + 5 (the blocked phase): at g + 6. BD#1 accesses memory from grant + 2
+    // (`mm2s_lock_to_access_cycles`), 6 cycles after BD#0's last access, while BD#0's 2 words
+    // leave in 2: the port idles 4 cycles at the boundary. The law is measured on chains with
+    // the previous BD's lock released by the core or another channel; a BD releasing its own
+    // successor's lock on one channel, and 2-word BDs, are not measured on silicon.
+    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, 4, &finished_bd_cycles);
 }
 
 /// The port side of a chained MM2S: one run of `words` beats per BD (1 word/cyc

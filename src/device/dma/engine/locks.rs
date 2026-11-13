@@ -44,7 +44,7 @@ impl DmaEngine {
                 if let Some((lock_id, value)) =
                     self.channels[ch_idx].lock_port.presentation(self.read_clock + 1)
                 {
-                    self.submit_acquire_request(lock_id, value, tile, neighbors, ch_idx as u8);
+                    self.submit_acquire_request(lock_id, value, false, tile, neighbors, ch_idx as u8);
                 }
                 if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { .. }) {
                     continue;
@@ -58,6 +58,7 @@ impl DmaEngine {
                     self.submit_acquire_request(
                         *lock_id,
                         transfer.acquire_value,
+                        true,
                         tile,
                         neighbors,
                         ch_idx as u8,
@@ -90,6 +91,7 @@ impl DmaEngine {
         &self,
         lock_id: u8,
         acquire_value: i8,
+        sees_same_cycle_release: bool,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         ch_idx: u8,
@@ -128,6 +130,7 @@ impl DmaEngine {
             expected,
             delta,
             equal_mode,
+            sees_same_cycle_release,
         });
     }
 
@@ -323,6 +326,7 @@ impl DmaEngine {
             expected: 0,
             delta: release_value,
             equal_mode: false,
+            sees_same_cycle_release: true,
         });
     }
 

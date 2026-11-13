@@ -198,6 +198,17 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "Fitted (lock request and grant law). The request follows the sequencing of the previous BD's third-to-last word; 2 or 4 differ on about 50 rows only, the weakest-pinned constant with the release slot. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
         unit("dma.mm2s_lock_request_trigger_latency_cycles", HardwareObserved, Verification::Unverified,
             "Fitted (lock request and grant law). Q >= trigger word + 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_release_after_finish_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). One cycle, the previous lock BD's FINISHED_BD + 4, neither requests nor grants; only 4-word predecessors show it, read as that BD's own lock release (inferred). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_grant_period_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). From its request a channel's acquire is grantable in 2 of every 3 cycles; what blocks the third is not known. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_grant_blocked_phase", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). The blocked cycle is request + 2 mod 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        measured("dma.mm2s_lock_grant_visible_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py chain family): LOCK_SEL0_ACQ_GE \
+            fires exactly once per acquire, one cycle before DMA_MM2S_0_STALLED_LOCK falls, in every waiting row, and also \
+            when the lock was free; release to grant is 2 or 3 for core and S2MM releasers",
+            "Compute MM2S. The split of release + 2 into a release reaching the requester a cycle late and this cycle is \
+            the emulator's; only the sum and ACQ_GE at grant - 1 are observed."),
         measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
             every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
             5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \

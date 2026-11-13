@@ -1514,6 +1514,29 @@ pub struct DmaTiming {
     /// Cycles from the trigger word's sequencing to the lock request: 3. Fitted, same data.
     pub mm2s_lock_request_trigger_latency_cycles: u8,
 
+    /// Cycles from a compute-tile MM2S lock BD's FINISHED_BD to the one cycle in which the
+    /// channel's next lock request is neither made nor granted (read as the BD's own lock
+    /// release on the channel's lock port): 4. Fitted, same data; only 4-word predecessors
+    /// show the slot.
+    pub mm2s_lock_release_after_finish_cycles: u8,
+
+    /// Period of the compute-tile MM2S lock grant: from its request on, a channel's acquire
+    /// can be granted in 2 of every 3 cycles: 3. Fitted, same data. What blocks one cycle in
+    /// three is not known.
+    pub mm2s_lock_grant_period_cycles: u8,
+
+    /// The blocked phase of `mm2s_lock_grant_period_cycles`, counted from the request: 2.
+    /// Fitted, same data.
+    pub mm2s_lock_grant_blocked_phase: u8,
+
+    /// Cycles from the lock arbiter's grant of a compute-tile MM2S acquire
+    /// (LOCK_SEL*_ACQ_GE) to the channel holding the lock (STALLED_LOCK falling): 1. Measured
+    /// (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` chain family): ACQ_GE fires exactly once
+    /// per acquire, one cycle before STALLED_LOCK falls, in every waiting row, and also when
+    /// the lock was free. With a release reaching the requester the cycle after it is applied
+    /// this makes release to grant at least 2 (silicon: 2 or 3, core and S2MM releasers).
+    pub mm2s_lock_grant_visible_cycles: u8,
+
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
     /// holds (local slave 4 + master 4).

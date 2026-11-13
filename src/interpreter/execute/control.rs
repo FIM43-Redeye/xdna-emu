@@ -1148,6 +1148,7 @@ mod tests {
             expected: 1,
             delta: -1,
             equal_mode: false,
+            sees_same_cycle_release: true,
         });
 
         // Resolve arbiter: release applied first (lock 0 -> 1), then

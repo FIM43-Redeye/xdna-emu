@@ -1177,6 +1177,7 @@ impl Tile {
                 expected: 0,
                 delta,
                 equal_mode: false,
+                sees_same_cycle_release: true,
             });
         }
     }

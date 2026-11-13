@@ -59,6 +59,12 @@ pub struct LockRequest {
     pub delta: i8,
     /// For acquire: true = exact match (acq_eq), false = greater-or-equal (acq_ge)
     pub equal_mode: bool,
+    /// For acquire: whether a release of the same lock resolved in the same cycle counts.
+    /// False for a compute-tile MM2S (`LockPort`): silicon grants it no earlier than the
+    /// release + 2 (LOCK_SEL*_ACQ_GE at release + 1), so the release reaches it the cycle
+    /// after the arbiter applied it. True for every other requestor (unmeasured: the
+    /// emulator's same-cycle order).
+    pub sees_same_cycle_release: bool,
 }
 
 /// Per-lock contention statistics for debugging.
@@ -195,7 +201,11 @@ impl LockArbiter {
 
                 // Process releases first: they are non-blocking and succeed
                 // unless the lock is frozen. A release must not prevent a
-                // same-cycle acquire from seeing the updated value.
+                // same-cycle acquire from seeing the updated value -- unless the
+                // acquire is one that sees only settled releases
+                // (`sees_same_cycle_release`), which is judged on the lock as it
+                // was before them.
+                let before_releases = locks.get(lock_id).copied();
                 for &(idx, _) in &group_with_dist {
                     let req = &self.pending[idx];
                     if !req.is_acquire {
@@ -217,7 +227,9 @@ impl LockArbiter {
                         continue; // already handled above
                     }
                     if !any_acquire_granted {
-                        let granted = Self::try_apply(req, locks);
+                        let settled_ok = req.sees_same_cycle_release
+                            || before_releases.is_some_and(|mut l| Self::apply_to(req, &mut l));
+                        let granted = settled_ok && Self::try_apply(req, locks);
                         if granted {
                             any_acquire_granted = true;
                             if lock_id < self.stats.len() {
@@ -246,6 +258,11 @@ impl LockArbiter {
         let Some(lock) = locks.get_mut(req.lock_id) else {
             return false;
         };
+        Self::apply_to(req, lock)
+    }
+
+    /// Apply a request to one lock. Returns true if granted.
+    fn apply_to(req: &LockRequest, lock: &mut Lock) -> bool {
         let result = if !req.is_acquire {
             lock.release_with_value(req.delta)
         } else if req.equal_mode {

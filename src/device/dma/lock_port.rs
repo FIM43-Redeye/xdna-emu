@@ -2,16 +2,18 @@
 
 use super::word_clock::WordClock;
 use xdna_archspec::aie2::timing::{
-    DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES, DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES,
+    DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE, DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES, DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES,
+    DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES, DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES,
+    DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES,
 };
 
 /// The lock request of the next lock-acquiring BD, and when it may be granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request {
     /// The run's first BD: no previous BD or lock grant to time a request from. Presented
-    /// every cycle from `first_grant` (not measured; see `LockPort`).
+    /// every cycle from `first_grant - 1` (not measured; see `LockPort`).
     Ungated { first_grant: u64 },
-    /// Presented from the request step `q` on.
+    /// From the request step `q` on, grantable in 2 of every 3 steps.
     Gridded { q: u64 },
 }
 
@@ -22,25 +24,34 @@ struct Target {
     lock_id: u8,
     acquire_value: i8,
     request: Option<Request>,
+    /// Granted (held from the BD's `granted_at`): nothing more is presented for it.
+    granted: bool,
 }
 
-/// Compute-tile MM2S lock port: requests BD locks on silicon's timing.
+/// Compute-tile MM2S lock port: requests and holds BD locks on silicon's timing.
 ///
 /// Silicon (NPU1, `tools/gen_dma_lock_probe.py` sync and chain families, every design with
 /// at most four MM2S BDs): for a BD that acquires a lock, with g the grant of the channel's
 /// previous lock-acquiring BD and T the step the previous BD's trigger word was sequenced,
-/// the request is Q = max(g + 3, T + 3). The request is made while the channel is still on
-/// the BDs before (a free lock behind a 4-word lock BD and a 13-word lock-free BD is granted
-/// at g + 3, 5 cycles before the 13-word BD finishes), so it is channel state, not BD state.
+/// the request is Q = max(g + 3, T + 3), moved off DEAD = that previous lock BD's
+/// FINISHED_BD + 4. The grant G (STALLED_LOCK falling) is the first step >= max(Q, R + 2)
+/// with (G - Q) mod 3 != 2 and G != DEAD, R the release that made the lock available;
+/// LOCK_SEL*_ACQ_GE fires at G - 1 (the arbiter grants then, `DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES`
+/// before the channel holds it), and a release reaches this requester one step after the
+/// arbiter applied it. The request is made while the channel is still on the BDs before (a
+/// free lock behind a 4-word lock BD and a 13-word lock-free BD is granted at g + 3, 5 cycles
+/// before the 13-word BD finishes), so it is channel state, not BD state. What blocks one
+/// cycle in three is not known.
 ///
 /// Not measured, chosen here: a run's first BD (no previous BD, no previous grant) is
-/// requested every cycle from the cycle it becomes the target; a BD whose run has no previous
-/// lock grant but has a previous BD takes Q = T + 3.
+/// requested every cycle from the cycle it becomes the target, with Q its earliest grant;
+/// a BD whose run has no previous lock grant but has a previous BD takes Q = T + 3.
 #[derive(Debug, Clone, Default)]
 pub struct LockPort {
-    /// Grant step of the run's latest granted lock BD and its seq.
+    /// Grant step of the run's latest granted lock BD, its seq, and its FINISHED_BD step.
     last_grant: Option<u64>,
     last_seq: Option<u64>,
+    last_finish: Option<u64>,
     target: Option<Target>,
 }
 
@@ -49,23 +60,55 @@ impl LockPort {
         *self = Self::default();
     }
 
-    /// The lock the channel presents to the arbiter at step `at`, if it presents one: (lock
-    /// id, acquire value).
+    /// DEAD: the previous lock BD's own release slot (its FINISHED_BD + 4), once it finished.
+    fn dead(&self) -> Option<u64> {
+        self.last_finish.map(|f| f + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64)
+    }
+
+    /// The request step, moved off DEAD.
+    fn effective_q(&self, q: u64) -> u64 {
+        if Some(q) == self.dead() {
+            q + 1
+        } else {
+            q
+        }
+    }
+
+    /// The lock the channel presents to the arbiter at step `at` (whose grant would be held
+    /// from `at + 1`), if it presents one: (lock id, acquire value).
     pub fn presentation(&self, at: u64) -> Option<(u8, i8)> {
-        let t = self.target?;
+        let t = self.target.filter(|t| !t.granted)?;
+        let grant = at + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64;
         let ok = match t.request? {
-            Request::Ungated { first_grant } => at >= first_grant,
-            Request::Gridded { q } => at >= q,
+            Request::Ungated { first_grant } => grant >= first_grant,
+            Request::Gridded { q } => {
+                let q = self.effective_q(q);
+                grant >= q
+                    && (grant - q) % DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES as u64
+                        != DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE as u64
+                    && Some(grant) != self.dead()
+            }
         };
         ok.then_some((t.lock_id, t.acquire_value))
     }
 
     /// The arbiter granted this step's presentation (made at step `at`).
     pub fn granted(&mut self, wc: &mut WordClock, at: u64) {
-        let Some(t) = self.target else { return };
-        wc.set_granted(t.seq, at);
-        self.last_grant = Some(at);
+        let Some(t) = self.target.as_mut() else { return };
+        t.granted = true;
+        let t = *t;
+        let g = at + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64;
+        wc.set_granted(t.seq, g);
+        self.last_grant = Some(g);
         self.last_seq = Some(t.seq);
+        self.last_finish = None;
+    }
+
+    /// The current BD `seq` finished at `at`.
+    pub fn note_finished(&mut self, seq: u64, at: u64) {
+        if self.last_seq == Some(seq) {
+            self.last_finish = Some(at);
+        }
     }
 
     /// End of the channel's step at `now`: retire a target whose grant is held, pick the
@@ -87,7 +130,7 @@ impl LockPort {
                 })
                 .map(|b| {
                     let (lock_id, acquire_value) = b.spec.acquire.expect("filtered");
-                    Target { seq: b.seq, lock_id, acquire_value, request: None }
+                    Target { seq: b.seq, lock_id, acquire_value, request: None, granted: false }
                 });
         }
         let Some(mut t) = self.target else { return };
@@ -102,7 +145,9 @@ impl LockPort {
                 Some((None, _, _)) => None,
                 None => Some(match from_grant {
                     Some(q) => Request::Gridded { q },
-                    None => Request::Ungated { first_grant: now + 1 },
+                    None => {
+                        Request::Ungated { first_grant: now + 1 + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64 }
+                    }
                 }),
             };
             self.target = Some(t);

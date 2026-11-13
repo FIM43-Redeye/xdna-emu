@@ -1266,6 +1266,7 @@ fn memtile_lock_written_above_31_is_acquirable_by_dma() {
         expected: 1,
         delta: -1,
         equal_mode: false,
+        sees_same_cycle_release: true,
     });
     let results = tile.resolve_lock_requests(0);
     assert!(
