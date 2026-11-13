@@ -44,6 +44,8 @@ mod types;
 #[cfg(test)]
 mod iteration_tests;
 #[cfg(test)]
+mod lock_timing_tests;
+#[cfg(test)]
 mod ooo_tests;
 #[cfg(test)]
 mod readahead_tests;
