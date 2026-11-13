@@ -769,6 +769,8 @@ def test_chain_fill_releases_a_after_the_tail_and_leaves_the_default_unchanged()
     tail, tail2 = filled.index(".Ltail:"), filled.index(".Ltail2:")
     assert rels[0] < tail and all(tail < i < tail2 for i in rels[1:])
     assert ".Ltail2:" not in plain
+    iters = [ln for ln in filled if ln.startswith("movxm r0, #")][1:-1]   # the fill loops, between the two tails
+    assert len(iters) == 5 and len(set(iters)) == 5                       # growing: no two fill frames alike
     assert g.chain_design_mlir(chain("1 1")) == g.chain_design_mlir(chain("1 1", fill=5))
     assert "fill" not in chain("1 1").design() and chain("1 1", fill=5).design()["fill"] == 5
 
