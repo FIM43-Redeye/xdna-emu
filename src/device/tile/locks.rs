@@ -112,6 +112,11 @@ pub struct LockArbiter {
     /// Results of the last arbitration round.
     /// (requestor, lock_id, granted, is_acquire)
     results: Vec<(LockRequestor, usize, bool, bool)>,
+
+    /// Locks a core release reached at the start of this cycle (`note_arrived_release`), as
+    /// they were before it: an acquire that does not see a same-cycle release
+    /// (`sees_same_cycle_release`) is judged on this.
+    arrived_before: Vec<(usize, Lock)>,
 }
 
 impl LockArbiter {
@@ -124,7 +129,37 @@ impl LockArbiter {
             num_requestors: 1 + s2mm_channels as usize + mm2s_channels as usize,
             stats: vec![LockArbiterStats::default(); num_locks],
             results: Vec::with_capacity(8),
+            arrived_before: Vec::new(),
         }
+    }
+
+    /// Record that a core release reached `lock_id` at the start of this cycle, before
+    /// `resolve`, the lock having been `before` it: to the acquires that see only settled
+    /// releases it is a release of this cycle.
+    pub fn note_arrived_release(&mut self, lock_id: usize, before: Lock) {
+        if !self.arrived_before.iter().any(|(id, _)| *id == lock_id) {
+            self.arrived_before.push((lock_id, before));
+        }
+    }
+
+    /// Whether a core release arrived this cycle (or last, if no `resolve` ran since).
+    pub fn has_arrived_releases(&self) -> bool {
+        !self.arrived_before.is_empty()
+    }
+
+    /// Forget the previous cycle's arrived releases (the tile calls this before delivering).
+    pub fn clear_arrived_releases(&mut self) {
+        self.arrived_before.clear();
+    }
+
+    /// The lock as an acquire that sees only settled releases judges it: before this cycle's
+    /// arrived core releases.
+    fn settled(&self, lock_id: usize, locks: &[Lock]) -> Option<Lock> {
+        self.arrived_before
+            .iter()
+            .find(|(id, _)| *id == lock_id)
+            .map(|(_, l)| *l)
+            .or_else(|| locks.get(lock_id).copied())
     }
 
     /// Submit a lock request to the arbiter.
@@ -172,7 +207,10 @@ impl LockArbiter {
             if group.len() == 1 {
                 // Fast path: single requestor, no contention
                 let req = &self.pending[group[0]];
-                let granted = Self::try_apply(req, locks);
+                let settled_ok = !req.is_acquire
+                    || req.sees_same_cycle_release
+                    || self.settled(lock_id, locks).is_some_and(|mut l| Self::apply_to(req, &mut l));
+                let granted = settled_ok && Self::try_apply(req, locks);
                 if lock_id < self.stats.len() {
                     self.stats[lock_id].grants += granted as u64;
                 }
@@ -205,7 +243,7 @@ impl LockArbiter {
                 // acquire is one that sees only settled releases
                 // (`sees_same_cycle_release`), which is judged on the lock as it
                 // was before them.
-                let before_releases = locks.get(lock_id).copied();
+                let before_releases = self.settled(lock_id, locks);
                 for &(idx, _) in &group_with_dist {
                     let req = &self.pending[idx];
                     if !req.is_acquire {
@@ -250,6 +288,7 @@ impl LockArbiter {
         }
 
         self.pending.clear();
+        self.arrived_before.clear();
         &self.results
     }
 
@@ -294,6 +333,7 @@ impl LockArbiter {
     pub fn reset(&mut self) {
         self.pending.clear();
         self.results.clear();
+        self.arrived_before.clear();
         self.priority = 0;
         for s in &mut self.stats {
             *s = LockArbiterStats::default();

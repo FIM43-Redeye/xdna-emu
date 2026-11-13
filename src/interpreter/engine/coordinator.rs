@@ -792,6 +792,14 @@ impl InterpreterEngine {
         // propagates to DMA engines for DMA-side trace events.
         self.device.array.set_dma_cycle(self.total_cycles);
 
+        // Core lock releases performed last cycle reach their lock units now, before anyone
+        // looks at a lock this cycle (`Tile::deliver_core_lock_releases`).
+        for tile in &mut self.device.array.tiles {
+            if !tile.core_releases_in_transit.is_empty() || tile.lock_arbiter.has_arrived_releases() {
+                tile.deliver_core_lock_releases(self.total_cycles);
+            }
+        }
+
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
@@ -1190,7 +1198,11 @@ impl InterpreterEngine {
                         if let Some(neighbor) = device.tile_mut(ncol, nrow) {
                             for i in 0..modified.len().min(neighbor.locks.len()) {
                                 let delta = (modified[i].value as i16) - (neighbor.locks[i].value as i16);
-                                if delta != 0 {
+                                if delta > 0 {
+                                    // A release reaches the neighbour's lock unit the next
+                                    // cycle, as an own-tile one (`Tile::send_core_lock_release`).
+                                    neighbor.send_core_lock_release(i, delta as i8);
+                                } else if delta != 0 {
                                     neighbor.defer_core_lock_release(i, delta as i8);
                                 }
                             }
@@ -3112,6 +3124,177 @@ mod tests {
                 "the core's lone retry at {} is not a conflict",
                 c + 1
             );
+        }
+    }
+
+    /// What the arb probe's tile did, in engine cycles: the cycle the core's release reached
+    /// the lock unit (LOCK_0_REL), the MM2S's grant (it leaves its lock wait), the cycles bank `bank`
+    /// was contended and the core lost, the cycles MEMORY_STALL was asserted, and the issue
+    /// cycles of `event #0` / `event #1`.
+    #[derive(Debug)]
+    struct ArbProbeRun {
+        release: u64,
+        grant: u64,
+        contended: Vec<u64>,
+        core_lost: Vec<u64>,
+        memory_stall: Vec<u64>,
+        event0: u64,
+        event1: u64,
+    }
+
+    /// The arb probe (`tools/gen_dma_lock_probe.py` arb cases) on one tile: the core runs
+    /// `event #0; rel lock 0; k nops; n accesses (loads or stores at p0); 4 nops; event #1`
+    /// (the probe's own encodings), MM2S 0 waits on lock 0 with a 64-word BD reading 0x400
+    /// (granule g in physical bank g & 1), and the banks start from the probe design's
+    /// served-access history (`lock_fetch_history`: image lines, crt0 and frame stores).
+    fn run_arb_probe(k: usize, n: usize, store: bool, bank: usize) -> ArbProbeRun {
+        use crate::device::bank_arbiter::test_support::lock_fetch_history;
+        use crate::device::dma::BdConfig;
+        use crate::interpreter::engine::bank_census;
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        const MOV_R2_1: [u8; 4] = [0x99, 0x07, 0x80, 0x18];
+        const NOP: [u8; 2] = [0x01, 0x00];
+        const EVENT0: [u8; 4] = [0x19, 0x10, 0x00, 0x10];
+        const EVENT1: [u8; 4] = [0x19, 0x10, 0x00, 0x12];
+        const REL_LOCK0_R2: [u8; 4] = [0x19, 0x22, 0x00, 0x16];
+        const LDA_R26_P0: [u8; 4] = [0x59, 0xb4, 0x02, 0x00];
+        const ST_R2_P0: [u8; 4] = [0x19, 0x84, 0x02, 0x08];
+        let mut prog: Vec<u8> = Vec::new();
+        prog.extend(MOV_R2_1);
+        // Settle, as the probe's delay loop does: the MM2S parks on lock 0 long before the release.
+        for _ in 0..200 {
+            prog.extend(NOP);
+        }
+        let ev0_pc = prog.len() as u32;
+        prog.extend(EVENT0);
+        prog.extend(REL_LOCK0_R2);
+        for _ in 0..k {
+            prog.extend(NOP);
+        }
+        for _ in 0..n {
+            prog.extend(if store { ST_R2_P0 } else { LDA_R26_P0 });
+        }
+        for _ in 0..4 {
+            prog.extend(NOP);
+        }
+        let ev1_pc = prog.len() as u32;
+        prog.extend(EVENT1);
+        while prog.len() < 2048 {
+            prog.extend(NOP);
+        }
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
+            tile.write_program(0, &prog);
+            tile.bank_access_counts = lock_fetch_history(None).1;
+        }
+        engine.set_core_pointer(1, 2, 0, 0x70400 + 0x10 * bank as u32);
+        engine.enable_core(1, 2);
+        {
+            // The chained probe: a lock-free 4-word BD (0x4000) parks the channel in front of
+            // the BD that waits on lock 0.
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            dma.configure_bd(1, BdConfig::simple_1d(0x4000, 16).with_next(0)).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(0, -1).with_release(1, 1))
+                .unwrap();
+        }
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 1;
+        }
+
+        bank_census::enable();
+        let (mut release, mut grant, mut event0, mut event1) = (None, None, None, None);
+        let mut memory_stall = Vec::new();
+        for _ in 0..600 {
+            let cycle = engine.total_cycles();
+            let (pc, instrs) = {
+                let ctx = engine.core_context(1, 2).unwrap();
+                (ctx.pc(), ctx.instructions)
+            };
+            let released = engine.device().array.tile(1, 2).lock_release_count();
+            engine.step();
+            let issued = engine.core_context(1, 2).unwrap().instructions > instrs;
+            if issued && pc == ev0_pc {
+                event0.get_or_insert(cycle);
+            }
+            if issued && pc == ev1_pc {
+                event1.get_or_insert(cycle);
+            }
+            let tile = engine.device().array.tile(1, 2);
+            if tile.lock_release_count() > released && release.is_none() {
+                release = Some(cycle);
+            }
+            if release.is_some()
+                && engine.device().array.dma_engine(1, 2).unwrap().channel_phase(2) != "AcquiringLock"
+            {
+                grant.get_or_insert(cycle);
+            }
+            if tile.core_trace.level_asserted(core_events::MEMORY_STALL) {
+                memory_stall.push(cycle);
+            }
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let records = bank_census::take();
+        let bit = 1u16 << bank;
+        ArbProbeRun {
+            release: release.expect("the core released lock 0"),
+            grant: grant.expect("the MM2S was granted lock 0"),
+            contended: records
+                .iter()
+                .filter(|r| r.contended_banks & bit != 0)
+                .map(|r| r.cycle)
+                .collect(),
+            core_lost: records.iter().filter(|r| r.core_lost).map(|r| r.cycle).collect(),
+            memory_stall,
+            event0: event0.expect("event #0 issued"),
+            event1: event1.expect("event #1 issued"),
+        }
+    }
+
+    /// The arb probe's rows end to end (silicon, NPU1 2026-11, `tools/gen_dma_lock_probe.py`
+    /// arb cases). The MM2S's grant comes at LOCK_0_REL + 2 or + 3 (silicon: run to run for one
+    /// case; the emulator: fixed by the lock port's grid), so each case carries silicon's row
+    /// for both phases and is checked against the one the emulator's grant took. Memory module:
+    /// a core access k bundles after the `rel` meets its bank at LOCK_0_REL + k + 1 (147 of 147
+    /// conflict rows): the core's release reaches the lock unit one cycle after its
+    /// arbitration cycle (event #0 + 6 here) and the access reaches the bank in its memory
+    /// stage. Core module: MEMORY_STALL in the lost cycle, the losing access's issue + 4 (82
+    /// of 82 loss rows), and event #1 - event #0 = bundles + 1, + 1 per loss.
+    #[test]
+    fn the_arb_probe_rows_land_on_silicons_cycles() {
+        type Row = (&'static [u64], &'static [u64], u64); // contended (rel LOCK_0_REL), lost (rel event #0), window
+                                                          // (case, k, n, store, bank, grant + 2 row, grant + 3 row)
+        #[rustfmt::skip]
+        let cases: &[(&str, usize, usize, bool, usize, Row, Row)] = &[
+            ("ar0l1k09m0", 9, 1, false, 0, (&[], &[], 17), (&[10], &[16], 18)),
+            ("ar0l1k16m0", 16, 1, false, 0, (&[17], &[], 24), (&[], &[], 24)),
+            ("ar0l5k16m0", 16, 5, false, 0, (&[17, 18, 19, 20, 21], &[27], 29), (&[18, 19, 20, 21], &[27], 29)),
+            ("ar0s5k32m0", 32, 5, true, 0, (&[33, 34, 35], &[41], 45), (&[34, 35], &[41], 45)),
+            ("ar1l1k28m0", 28, 1, false, 1, (&[29], &[35], 37), (&[], &[], 36)),
+            ("ar1l3k20m0", 20, 3, false, 1, (&[21, 22], &[28], 31), (&[22], &[28], 31)),
+        ];
+        for &(case, k, n, store, bank, plus2, plus3) in cases {
+            let r = run_arb_probe(k, n, store, bank);
+            let (contended, lost, window) = match r.grant - r.release {
+                2 => plus2,
+                3 => plus3,
+                other => panic!("{case}: grant at release + {other} ({r:?})"),
+            };
+            let row = format!("{case} (grant + {})", r.grant - r.release);
+            assert_eq!(r.release - r.event0, 6, "{row}: LOCK_0_REL at the rel's issue + 5 ({r:?})");
+            let c: Vec<u64> = r.contended.iter().map(|c| c - r.release).collect();
+            assert_eq!(c, contended, "{row}: contended cycles after LOCK_0_REL ({r:?})");
+            let l: Vec<u64> = r.core_lost.iter().map(|c| c - r.event0).collect();
+            assert_eq!(l, lost, "{row}: lost cycles after event #0 ({r:?})");
+            let s: Vec<u64> = r.memory_stall.iter().map(|c| c - r.event0).collect();
+            assert_eq!(s, lost, "{row}: MEMORY_STALL in the lost cycle ({r:?})");
+            assert_eq!(r.event1 - r.event0, window, "{row}: event #1 - event #0 ({r:?})");
         }
     }
 
