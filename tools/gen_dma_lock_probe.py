@@ -3225,6 +3225,337 @@ def cmd_mq_packets(args) -> int:
 MQ_PACKET_MARGIN = 20              # cycles a deciding frame may move without reaching its unit's last packet
 
 
+# -- mr (mq round 2): the quiet stretch made on the array by a core-timed waker ------------------------------
+#
+# Round 1 (mq) gave three finish levels on silicon: grant + 54 after a compute trace packet crossed both the compute
+# and the memtile switch 4..98 cycles before the feed's restart, + 55 with the memtile busy (a shim fill) but the
+# compute switch quiet for 1112+ cycles, + 56 with both quiet (369+ memtile, 1131+ compute). The reading to test: each
+# of the two switches on the feed's path costs one cycle when it has been quiet long enough (thresholds theta_c,
+# theta_m). Round 1's quiet stretches were host timing; here the core times them. It releases lock W, waits exactly
+# D nops, then releases A as in mq. W starts a waker whose last beat ends a known number of cycles before the
+# feed's restart (T, calibrated on the emulator; the realised value is read per run):
+#   c  compute MM2S 1 -> compute S2MM 1 (MR_WAKE_WORDS words): the compute switch only;
+#   b  compute MM2S 1 -> memtile S2MM 1 (MR_WAKE_WORDS words): both switches, a data beat as the last activity;
+#   m  compute MM2S 1 -> memtile S2MM 2 (one word), whose BD releases memtile lock X, which starts memtile
+#      MM2S 1 -> memtile S2MM 1 (MR_MT_LOOP_WORDS words, the memtile switch only): the compute switch's last word is
+#      that trigger, more than MR_MT_LOOP_WORDS cycles before the restart.
+# Every waker BD with a lock has an acquire and a release (a BD holds one of each); the extra locks (W + 1 on the
+# compute tile, memtile locks 1 / 2) are released or acquired once and gate nothing else.
+# Nothing is timed by the host: the runtime sequence only sets go. The feed, the measured BD, the trailing BDs and
+# the core's fill releases are mq's. Why it cannot hang: every waker BD is matched (the S2MM ends take exactly what
+# the MM2S ends send), W and X are each released once and acquired once, and the rest is mq's argument.
+
+MR_LOCK_W = 4                      # compute lock: the core's release starts the waker
+MR_WAKE_WORDS = 16
+MR_MT_LOOP_WORDS = 1200            # m: the memtile loopback; the compute switch's last beat is older than this
+MR_MAX_T = 640
+MR_TS = {"c": (16, 64, 96, 112, 128, 160, 192, 256, 320, 384, 448, 512, 600),
+         "b": (8, 48, 96, 160, 256, 400, 600),
+         "m": (16, 64, 96, 104, 112, 120, 128, 136, 144, 160, 192, 224, 248)}
+# emulator calibration: D = T + MR_D_OFFSET[w] gives a quiet stretch of T cycles (compute: G minus the waker's
+# compute-side finish; memtile: the feed's North-master first beat minus the waker's last memtile beat)
+MR_D_OFFSET = {"c": 14, "b": 10, "m": 1214}
+MR_WSRC_ADDR = 0xC200              # bank 6: the waker meets nothing the S2MM or the core touches
+MR_WDST_ADDR = 0xC100
+# The hardware builds do not trace the waker: its events would make trace packets that cross both switches inside
+# the very window being measured (a calibration build that traced it put one 101 cycles before the restart). The
+# calibration builds (--trace-waker, emulator only) trace it and fix MR_D_OFFSET; the waker's timing is the core's
+# and the DMA's, the same in both builds. The core proves the waker finished on silicon: after B it acquires the
+# lock the waker MM2S 1 releases at its end (and, for c, the one compute S2MM 1 releases).
+MR_MEMMOD_EVENTS = MQ_MEMMOD_EVENTS
+MR_MEMTILE_EVENTS = ["PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_STALLED_1", "PORT_RUNNING_3",
+                     "DMA_MM2S_SEL0_STREAM_BACKPRESSURE", "DMA_MM2S_SEL0_FINISHED_BD"]
+MR_CAL_MEMMOD_EVENTS = ["LOCK_0_REL", "LOCK_1_REL", "DMA_S2MM_0_STALLED_LOCK", "DMA_S2MM_0_FINISHED_BD",
+                        "DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_1_FINISHED_BD",
+                        "DMA_S2MM_1_FINISHED_BD"]
+MR_CAL_MEMTILE_EVENTS = ["PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_STALLED_1", "PORT_RUNNING_2", "PORT_RUNNING_3",
+                         "PORT_RUNNING_4", "DMA_MM2S_SEL0_FINISHED_BD", "DMA_S2MM_SEL0_FINISHED_BD"]
+MR_LOCK_WD = MR_LOCK_W + 1         # released by the waker MM2S 1 at its end; the core acquires it after B
+MR_LOCK_CT, MR_LOCK_CD = 6, 7      # c: compute S2MM 1 acquires CT (init 1), releases CD; the core acquires CD
+
+
+@dataclass(frozen=True)
+class MrCase:
+    waker: str                     # "c" compute switch only, "b" both switches, "m" memtile switch only
+    t: int                         # nominal quiet cycles between the waker's last beat and the feed's restart
+
+    @property
+    def name(self) -> str:
+        return f"mr{self.waker}{self.t:03d}"
+
+
+def mr_validate(c: MrCase) -> None:
+    if c.waker not in MR_TS:
+        raise ValueError(f"waker must be one of {tuple(MR_TS)}")
+    if not 0 <= c.t <= MR_MAX_T:
+        raise ValueError(f"t must be 0..{MR_MAX_T}")
+    if mr_delay_nops(c) < 0:
+        raise ValueError(f"{c.name}: the waker cannot end that close to the restart")
+
+
+def mr_delay_nops(c: MrCase) -> int:
+    return c.t + MR_D_OFFSET[c.waker]
+
+
+def mr_plan() -> list[MrCase]:
+    return [MrCase(w, t) for w, ts in MR_TS.items() for t in ts]
+
+
+def mr_core_asm(c: MrCase) -> str:
+    mr_validate(c)
+    n = lp.nops
+    fill = []
+    for i in range(RING_FILL_RELEASES):
+        fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(MQ_SETTLE_ITERS, ".Lsettle"), *n(8),
+            f"  rel #{OWN + MR_LOCK_W}, r2", *n(mr_delay_nops(c)),
+            "  event #0", *n(MQ_D), f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8),
+            f"  acq #{OWN + MR_LOCK_WD}, r3", *n(4),
+            *([f"  acq #{OWN + MR_LOCK_CD}, r3", *n(4)] if c.waker == "c" else []), *fill,
+            *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def mr_design_mlir(c: MrCase) -> str:
+    mr_validate(c)
+    base = mq_design_mlir(MqCase("q"))
+    ww = 1 if c.waker == "m" else MR_WAKE_WORDS
+    src = ", ".join(str(0x0A000000 | j) for j in range(ww))
+    decl = (f"    %wsrc = aie.buffer(%t02) {{address = {MR_WSRC_ADDR} : i32, sym_name = \"wsrc\", initial_value = "
+            f"dense<[{src}]> : tensor<{ww}xi32>}} : memref<{ww}xi32>\n"
+            f"    %lW = aie.lock(%t02, {MR_LOCK_W}) {{init = 0 : i32, sym_name = \"lW\"}}\n"
+            f"    %lWd = aie.lock(%t02, {MR_LOCK_WD}) {{init = 0 : i32, sym_name = \"lWd\"}}\n")
+    mm2s1 = (f"    ^ws:\n      %w1 = aie.dma_start(MM2S, 1, ^w0, ^end)\n    ^w0:\n      %cw = arith.constant 1 : i32\n"
+             f"      aie.use_lock(%lW, AcquireGreaterEqual, %cw)\n      aie.dma_bd(%wsrc : memref<{ww}xi32>)\n"
+             f"      aie.use_lock(%lWd, Release, %cw)\n      aie.next_bd ^end\n")
+    s2mm1 = ""
+    mt_dma = ""
+    L = MR_MT_LOOP_WORDS
+    if c.waker == "c":
+        decl += (f"    %wdst = aie.buffer(%t02) {{address = {MR_WDST_ADDR} : i32, sym_name = \"wdst\"}} : "
+                 f"memref<{ww}xi32>\n    aie.flow(%t02, DMA : 1, %t02, DMA : 1)\n")
+        decl += (f"    %lCt = aie.lock(%t02, {MR_LOCK_CT}) {{init = 1 : i32, sym_name = \"lCt\"}}\n"
+                 f"    %lCd = aie.lock(%t02, {MR_LOCK_CD}) {{init = 0 : i32, sym_name = \"lCd\"}}\n")
+        s2mm1 = (f"    ^wr:\n      %w2 = aie.dma_start(S2MM, 1, ^wr0, ^end)\n    ^wr0:\n      %cc = arith.constant 1 : i32\n"
+                 f"      aie.use_lock(%lCt, AcquireGreaterEqual, %cc)\n      aie.dma_bd(%wdst : memref<{ww}xi32>)\n"
+                 f"      aie.use_lock(%lCd, Release, %cc)\n      aie.next_bd ^end\n")
+    elif c.waker == "b":
+        decl += (f"    %mdst = aie.buffer(%t01) {{sym_name = \"mdst\"}} : memref<{ww}xi32>\n"
+                 f"    aie.flow(%t02, DMA : 1, %t01, DMA : 1)\n")
+        mt_dma = (f"    ^ms1:\n      %b1 = aie.dma_start(S2MM, 1, ^mb0, ^end)\n    ^mb0:\n"
+                  f"      aie.dma_bd(%mdst : memref<{ww}xi32>)\n      aie.next_bd ^end\n")
+    else:
+        decl += (f"    %mtrig = aie.buffer(%t01) {{sym_name = \"mtrig\"}} : memref<1xi32>\n"
+                 f"    %mloop = aie.buffer(%t01) {{sym_name = \"mloop\"}} : memref<{L}xi32>\n"
+                 f"    %mlout = aie.buffer(%t01) {{sym_name = \"mlout\"}} : memref<{L}xi32>\n"
+                 f"    %lX = aie.lock(%t01, 0) {{init = 0 : i32, sym_name = \"lX\"}}\n"
+                 f"    %lXt = aie.lock(%t01, 1) {{init = 1 : i32, sym_name = \"lXt\"}}\n"
+                 f"    %lXd = aie.lock(%t01, 2) {{init = 0 : i32, sym_name = \"lXd\"}}\n"
+                 f"    aie.flow(%t02, DMA : 1, %t01, DMA : 2)\n    aie.flow(%t01, DMA : 1, %t01, DMA : 1)\n")
+        mt_dma = (f"    ^ms2:\n      %b2 = aie.dma_start(S2MM, 2, ^mt0, ^mm1)\n    ^mt0:\n"
+                  f"      %cx = arith.constant 1 : i32\n      aie.use_lock(%lXt, AcquireGreaterEqual, %cx)\n"
+                  f"      aie.dma_bd(%mtrig : memref<1xi32>)\n"
+                  f"      aie.use_lock(%lX, Release, %cx)\n      aie.next_bd ^end\n"
+                  f"    ^mm1:\n      %b3 = aie.dma_start(MM2S, 1, ^ml0, ^ms1)\n    ^ml0:\n      %cy = arith.constant 1 : i32\n"
+                  f"      aie.use_lock(%lX, AcquireGreaterEqual, %cy)\n      aie.dma_bd(%mloop : memref<{L}xi32>)\n"
+                  f"      aie.use_lock(%lXd, Release, %cy)\n      aie.next_bd ^end\n"
+                  f"    ^ms1:\n      %b1 = aie.dma_start(S2MM, 1, ^mo0, ^end)\n    ^mo0:\n"
+                  f"      aie.dma_bd(%mlout : memref<{L}xi32>)\n      aie.next_bd ^end\n")
+    # splice into mq's quiet design: declarations before the feed flow, compute DMA starts after S2MM 0's chain,
+    # memtile DMA starts after MM2S 0's chain
+    t = base.replace("    aie.flow(%t01, DMA : 0, %t02, DMA : 0)\n", decl + "    aie.flow(%t01, DMA : 0, %t02, DMA : 0)\n", 1)
+    t = t.replace("      %s0 = aie.dma_start(S2MM, 0, ^recv, ^end)", "      %s0 = aie.dma_start(S2MM, 0, ^recv, ^ws)", 1)
+    if s2mm1:
+        mm2s1 = mm2s1.replace("aie.dma_start(MM2S, 1, ^w0, ^end)", "aie.dma_start(MM2S, 1, ^w0, ^wr)")
+    mem_end = "      aie.next_bd ^end\n    ^end:\n      aie.end\n    }\n    %mt = aie.memtile_dma"
+    assert mem_end in t
+    t = t.replace(mem_end, "      aie.next_bd ^end\n" + mm2s1 + s2mm1 + "    ^end:\n      aie.end\n    }\n    %mt = aie.memtile_dma", 1)
+    if mt_dma:
+        first = "^ms1" if c.waker == "b" else "^ms2"
+        t = t.replace("      %m0 = aie.dma_start(MM2S, 0, ^f1, ^end)", f"      %m0 = aie.dma_start(MM2S, 0, ^f1, {first})", 1)
+        t = t.replace("    ^end:\n      aie.end\n    }\n    aie.runtime_sequence", mt_dma + "    ^end:\n      aie.end\n    }\n    aie.runtime_sequence", 1)
+    return t
+
+
+def mr_inject_args(routes: dict | None, trace_waker: bool = False) -> list[str]:
+    mm = MR_CAL_MEMMOD_EVENTS if trace_waker else MR_MEMMOD_EVENTS
+    mt = MR_CAL_MEMTILE_EVENTS if trace_waker else MR_MEMTILE_EVENTS
+    sel = MR_LOCK_W if trace_waker else FETCH_LOCK_B
+    a = ["--memmod-sweep-events", ",".join(mm), "--memmod-sel-locks", f"LOCK_SEL1:{sel}",
+         "--memtile-sweep-events", ",".join(mt),
+         "--memtile-sel-channels", "S2MM_SEL0:1,MM2S_SEL0:0",
+         "--core-grounding", FETCH_CORE_GROUNDING, "--core-sweep-events", ",".join(MQ_CORE_EVENTS)]
+    if routes:
+        a += ["--port-slots", f"0=DMA:0:slave,1=North:{routes['feed_north']}:master,2=DMA:1:master,"
+                              f"3=South:{routes['trace_south']}:master,4=DMA:1:slave"]
+    return a
+
+
+def mr_row(events, trace_waker: bool = True) -> dict:
+    """mq_row plus the waker: the core's release of W, the waker MM2S's grant after it, its FINISHED_BD and the
+    compute S2MM 1's (c) relative to G; the memtile quiet split into data beats (DMA 1 master / slave) and trace beats
+    (the trace route's South master)."""
+    r = mq_row(events)
+    if r.get("grant") is None:
+        return r
+    G = r["release"] + r["grant"]
+    mem: dict = {}
+    mt: dict = {}
+    for e in events:
+        if e.row == FETCH_ROW and e.pkt_type == PT_MEM:
+            mem.setdefault(e.name, []).append(e.ts)
+        elif e.row == 1 and e.pkt_type == 3:
+            mt.setdefault(e.name, []).append(e.ts)
+    wr = sorted(set(mem.get("LOCK_1_REL", []))) if trace_waker else []      # LOCK_1_REL follows W only then
+    r["w_rel"] = wr[0] if wr else None
+    r["w_grant"] = None
+    if wr:
+        for first, last in _runs(mem.get("DMA_MM2S_1_STALLED_LOCK", [])):
+            if first <= wr[0] <= last + 1:
+                r["w_grant"] = last + 1 - wr[0]
+    fm = sorted(set(mem.get("DMA_MM2S_1_FINISHED_BD", [])))
+    fs = sorted(set(mem.get("DMA_S2MM_1_FINISHED_BD", [])))
+    r["w_fin"] = fm[0] - G if fm else None
+    r["w_s2mm_fin"] = fs[0] - G if fs else None
+    f0 = r["north_first"]
+    r["quiet_data"] = r["quiet_trace"] = None
+    if f0 is not None:
+        data = [t for n in ("PORT_RUNNING_2", "PORT_RUNNING_4") for t in mt.get(n, []) if t < f0]
+        trace = [t for t in mt.get("PORT_RUNNING_3", []) if t < f0]
+        r["quiet_data"] = f0 - max(data) - 1 if data else None
+        r["quiet_trace"] = f0 - max(trace) - 1 if trace else None
+    return r
+
+
+def mr_missing(r: dict, c: MrCase, trace_waker: bool = True) -> list[str]:
+    """mq's checks (the core's fill releases come after its waits on the waker's locks, so a core that ended proves
+    the waker finished); the fill check is the memtile S2MM 1 finish, traced only in calibration builds."""
+    out = mq_missing(r, fill=trace_waker and c.waker in ("b", "m"))
+    if trace_waker and r.get("grant") is not None:
+        if r.get("w_fin") is None:
+            out.append("waker MM2S 1 did not finish")
+        if c.waker == "c" and r.get("w_s2mm_fin") is None:
+            out.append("waker S2MM 1 did not finish")
+    return out
+
+
+def format_mr_table(rows) -> str:
+    lines = ["case     run      grant  S2MM fin  starv after G+2  waker: W grant, MM2S fin, S2MM fin (rel G) | "
+             "memtile: North-G (two timers), quiet data, quiet trace    finish"]
+    q = lambda v: "-" if v is None else str(v)
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r.get("release") is None or r.get("grant") is None:
+            lines.append(f"{c.name:<8} {run:<8} no release / grant")
+            continue
+        chk = "finish ok" if not r.get("check") else "finish MISSING " + "; ".join(r["check"])
+        G = r["release"] + r["grant"]
+        lines.append(f"{c.name:<8} {run:<8} +{r['grant']:<2}    fin {q(r['fin']):<4}  starv [{_sl_runs(r['starv_after_g2'])}]"
+                     f"  W +{q(r['w_grant'])} fin {q(r['w_fin'])} s2mm {q(r['w_s2mm_fin'])} | "
+                     f"North-G {q(r['north_first'] - G if r['north_first'] is not None else None)} "
+                     f"quiet data {q(r['quiet_data'])} quiet trace {q(r['quiet_trace'])}  {chk}")
+    return "\n".join(lines)
+
+
+def mr_selection(args) -> list[MrCase]:
+    return [c for c in mr_plan() if not args.names or c.name in args.names]
+
+
+def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(mr_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(mr_design_mlir(c))
+
+    def compile_(routes):
+        lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+               "--out", "aie.mlir", "--trace-mode", "event_time", *mr_inject_args(routes, trace_waker),
+               "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+               "--config-src-mlir", "base.mlir", "--buffer-size", "65536"], cwd=d, log=d / "inject.log")
+        lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+               "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+              cwd=d, log=d / "aiecc.log")
+    compile_(None)
+    routes = mq_routes((d / "input_with_addresses.mlir").read_text())
+    compile_(routes)
+    if mq_routes((d / "input_with_addresses.mlir").read_text()) != routes:
+        raise SystemExit(f"{c.name}: routes changed between compiles")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "waker": c.waker, "t": c.t, "mr": True,
+                                             "trace_waker": trace_waker,
+                                             "delay_nops": mr_delay_nops(c), "fill_words": 0,
+                                             "buffer_words": 4, "routes": routes}) + "\n")
+
+
+def cmd_mr_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in mr_selection(args):
+        mr_build_case(c, out, args.trace_waker)
+        print("built", c.name)
+    return 0
+
+
+def cmd_mr_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in mr_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_mr_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in mr_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists():
+                rows.append((c, run, {"release": None}))
+                continue
+            tw = json.loads((out / c.name / "case.json").read_text()).get("trace_waker", False)
+            r = mr_row(load_level_events(run_dir), tw)
+            r["check"] = mr_missing(r, c, tw)
+            rows.append((c, run, r))
+    print(format_mr_table(rows))
+    return 0
+
+
+def cmd_mr_packets(args) -> int:
+    out = Path(args.out_dir).resolve()
+    bad = 0
+    for c in mr_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not (run_dir / "trace_raw.bin").exists():
+                continue
+            ev = list(load_level_events(run_dir))
+            r = mr_row(ev)
+            if r.get("grant") is None or r.get("fin") is None or r.get("north_first") is None:
+                print(f"{c.name:<8} {run:<8} no measured frames")
+                bad += 1
+                continue
+            mt: dict = {}
+            for e in ev:
+                if e.row == 1 and e.pkt_type == 3:
+                    mt.setdefault(e.name, []).append(e.ts)
+            p = mq_packet_positions((run_dir / "trace_raw.bin").read_bytes(), r, mt)
+            cells = []
+            for u in (1, 3):
+                x = p[u]
+                ok = x is not None and x["after"] >= 1 and (x["margin"] or 0) >= MQ_PACKET_MARGIN
+                bad += not ok
+                cells.append("none" if x is None else
+                             f"{x['cycle']} after {x['after']} margin {x['margin']} {'ok' if ok else 'AT RISK'}")
+            print(f"{c.name:<8} {run:<8} mem: {cells[0]} | memtile: {cells[1]} | last packet unit {p['last_packet_unit']}")
+    return 1 if bad else 0
+
+
 # -- refused-access probe (refuse-*): a lock BD after a BD whose accesses a core camp refused -------------
 #
 # Does the grant phase of a lock BD depend on what happened to the BD before it? Chained task on MM2S 0:
@@ -3625,7 +3956,21 @@ def build_parser() -> argparse.ArgumentParser:
     mp = sub.add_parser("mq-packets", help="memtile-fed probe: each unit's deciding frames against its last packet")
     mp.add_argument("out_dir")
     mp.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp):
+    rb2 = sub.add_parser("mr-build", help="mq round 2 (core-timed waker): build the plan's cases (or --names)")
+    rb2.add_argument("out_dir")
+    rb2.add_argument("--trace-waker", action="store_true",
+                     help="calibration build (emulator only): trace the waker, whose packets cross the window")
+    rr2 = sub.add_parser("mr-run", help="mq round 2: run the built cases to TAG.BACKEND/")
+    rr2.add_argument("out_dir")
+    rr2.add_argument("tag")
+    rr2.add_argument("--backend", choices=("hw", "emu"), required=True)
+    rt2 = sub.add_parser("mr-table", help="mq round 2: finish, waker, memtile quiet (data / trace)")
+    rt2.add_argument("out_dir")
+    rt2.add_argument("runs", nargs="+")
+    rp2 = sub.add_parser("mr-packets", help="mq round 2: each unit's deciding frames against its last packet")
+    rp2.add_argument("out_dir")
+    rp2.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp, rb2, rr2, rt2, rp2):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     return ap
 
@@ -3637,6 +3982,9 @@ def main(argv=None) -> int:
         return CHAIN_COMMANDS[args.cmd](args)
     if args.cmd.startswith("sl-"):
         return {"sl-build": cmd_sl_build, "sl-run": cmd_sl_run, "sl-table": cmd_sl_table}[args.cmd](args)
+    if args.cmd.startswith("mr-"):
+        return {"mr-build": cmd_mr_build, "mr-run": cmd_mr_run, "mr-table": cmd_mr_table,
+                "mr-packets": cmd_mr_packets}[args.cmd](args)
     if args.cmd.startswith("mq-"):
         return {"mq-build": cmd_mq_build, "mq-run": cmd_mq_run, "mq-table": cmd_mq_table,
                 "mq-packets": cmd_mq_packets}[args.cmd](args)

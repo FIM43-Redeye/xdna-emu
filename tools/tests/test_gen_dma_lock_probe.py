@@ -2017,3 +2017,85 @@ def test_cli_has_the_mq_subcommands():
     assert p.parse_args(["mq-run", "d", "e1", "--backend", "emu"]).backend == "emu"
     assert p.parse_args(["mq-table", "d", "e1.emu"]).runs == ["e1.emu"]
     assert p.parse_args(["mq-packets", "d", "e1.emu"]).runs == ["e1.emu"]
+
+
+# -- mr (round 2): the quiet stretch made on the array by a core-timed waker -------------------------------
+
+def mr(w="c", t=128):
+    return g.MrCase(waker=w, t=t)
+
+
+def test_mr_plan_covers_each_waker_over_its_grid():
+    plan = g.mr_plan()
+    names = [c.name for c in plan]
+    assert len(names) == len(set(names)) == sum(len(v) for v in g.MR_TS.values())
+    assert set(g.MR_TS) == {"c", "b", "m"} and mr("b", 8).name == "mrb008"
+    assert max(g.MR_TS["c"]) == 600 and min(g.MR_TS["b"]) <= 8
+    assert not set(names) & {c.name for c in g.mq_plan()}
+
+
+def test_mr_rejects_out_of_range():
+    for c in (mr("x"), mr("c", -1), mr("c", g.MR_MAX_T + 1)):
+        with pytest.raises(ValueError):
+            g.mr_validate(c)
+    g.mr_validate(mr("m", 0))
+
+
+def test_mr_core_releases_w_then_a_exactly_d_nops_later():
+    c = mr("b", 96)
+    body = bundles_of(g.mr_core_asm(c))
+    rw = body.index(f"rel #{g.OWN + g.MR_LOCK_W}, r2")
+    ra = [i for i, b in enumerate(body) if b == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"][0]
+    assert body.index("event #0") == rw + g.mr_delay_nops(c) + 1
+    assert all(b == "nop" for b in body[rw + 1:rw + 1 + g.mr_delay_nops(c)])
+    assert ra == body.index("event #0") + g.MQ_D + 1
+    assert g.mr_delay_nops(mr("b", 97)) - g.mr_delay_nops(c) == 1         # one nop per cycle of quiet
+    assert body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3") < rw
+
+
+def test_mr_designs_route_each_waker_where_it_belongs():
+    c, b, m = (g.mr_design_mlir(mr(w)) for w in "cbm")
+    for t in (c, b, m):
+        assert "aie.flow(%t01, DMA : 0, %t02, DMA : 0)" in t                 # the feed, as in mq
+        assert "aie.use_lock(%lW, AcquireGreaterEqual" in t and "aie.dma_start(MM2S, 1, ^w0" in t
+        assert "shim_dma_allocation" not in t and "dma_memcpy_nd" not in t   # nothing timed by the host
+    assert "aie.flow(%t02, DMA : 1, %t02, DMA : 1)" in c and "%t01, DMA : 1)" not in c
+    assert "aie.flow(%t02, DMA : 1, %t01, DMA : 1)" in b
+    assert "aie.flow(%t02, DMA : 1, %t01, DMA : 2)" in m and "aie.flow(%t01, DMA : 1, %t01, DMA : 1)" in m
+    assert "aie.use_lock(%lX, Release" in m and "aie.use_lock(%lX, AcquireGreaterEqual" in m
+    assert f"memref<{g.MR_MT_LOOP_WORDS}xi32>" in m and f"memref<{g.MR_WAKE_WORDS}xi32>" in b
+
+
+def test_mr_hardware_builds_do_not_trace_the_waker_and_calibration_builds_do():
+    routes = {"feed_north": 1, "fill_south": None, "trace_south": 3}
+    waker = {"DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_1_FINISHED_BD", "DMA_S2MM_1_FINISHED_BD", "PORT_RUNNING_2",
+             "PORT_RUNNING_4", "DMA_S2MM_SEL0_FINISHED_BD"}
+    hw = g.mr_inject_args(routes)
+    for flag in ("--memmod-sweep-events", "--memtile-sweep-events"):
+        assert not set(hw[hw.index(flag) + 1].split(",")) & waker
+    assert "PORT_RUNNING_3" in hw[hw.index("--memtile-sweep-events") + 1]           # trace crossings stay visible
+    cal = g.mr_inject_args(routes, trace_waker=True)
+    mm = cal[cal.index("--memmod-sweep-events") + 1].split(",")
+    assert len(mm) == 8 and {"DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_1_FINISHED_BD", "DMA_S2MM_1_FINISHED_BD"} <= set(mm)
+    assert cal[cal.index("--memmod-sel-locks") + 1] == f"LOCK_SEL1:{g.MR_LOCK_W}"
+    assert len(cal[cal.index("--memtile-sweep-events") + 1].split(",")) == 8
+    assert cal[cal.index("--port-slots") + 1].endswith(",4=DMA:1:slave")
+
+
+def test_mr_core_waits_for_the_waker_to_finish_after_b():
+    for w in "cbm":
+        body = bundles_of(g.mr_core_asm(mr(w)))
+        b = body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+        assert body.index(f"acq #{g.OWN + g.MR_LOCK_WD}, r3") > b
+        assert (f"acq #{g.OWN + g.MR_LOCK_CD}, r3" in body) == (w == "c")
+    t = g.mr_design_mlir(mr("c"))
+    assert "aie.use_lock(%lWd, Release" in t and "aie.use_lock(%lCd, Release" in t
+
+
+def test_mr_row_splits_the_memtile_quiet_into_data_and_trace_and_dates_the_waker():
+    e = mq_synthetic(fill_end=150)
+    e += [ev("LOCK_1_REL", 4000), ev("DMA_MM2S_1_FINISHED_BD", 4030)]
+    e += held("DMA_MM2S_1_STALLED_LOCK", 100, 4002)
+    r = g.mr_row(e)
+    assert r["w_rel"] == 4000 and r["w_grant"] == 3 and r["w_fin"] == 4030 - (5000 + 3)
+    assert r["quiet_data"] == 48 and r["quiet_trace"] == 199 - (200 - 393) - 1
