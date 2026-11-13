@@ -492,7 +492,25 @@ BD's grant g0 (its STALLED_LOCK falls).
     release + 2 in 39 rows and + 3 in 12 (first-BD lock-fetch probe; the emulator always + 2), and the second
     kind (the chained lock-fetch and arbitration probes' waiting BD) at + 2 or + 3 run to run for the same case
     (lock-fetch 24 / 8 rows, arb m = 0 99 / 51), where the emulator's phase is fixed per case. The anchor of
-    silicon's phase there is not known.
+    silicon's phase there is not known, and it is not observable in the existing captures (2026-11-13): their
+    memory-module trace starts with the channel already parked (494 to 499 cycles before the release) and holds no
+    DMA-side stamp before the first grant; of the trace start, the absolute timer, the core's periodic counter
+    event and its first LOCK_STALL, none predicts the 51 first-BD rows (or the 174 arb and 324 chained lock-fetch
+    rows): no residue of any of them is + 3 only. Open; needs a DMA-side stamp before the first grant (START_TASK
+    in the memory-module trace, or a lock-free one-word head BD) with the release swept over at least six cycles.
+  - *Grant phase of a lock BD whose previous BD had refused accesses* (open, 2026-11-13). Silicon grants the
+    producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
+    `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
+    282, 283) and (release - previous grant) mod 3 taking all three values in `collide`. The emulator lands on the
+    lock port's blocked phase (release + 3) in 3 of 15 `collide` transfers and 8 of 14 `sticky32` transfers: its
+    request Q = max(previous grant + 3, previous BD's third-to-last word sequenced + 3) sits at the previous grant
+    + 243 in every transfer, because the word clock runs at the access rate a granule or two ahead and never
+    reaches its cap. Tried and rejected: a grant-tied anchor (refuted by `collide`), a request anchored on the
+    previous BD's last access (refuted by the lock-timing rows: a free lock behind a 4-word head is granted at g + 3,
+    six 2-word free-lock BDs finish every 3 cycles, a free lock is granted five cycles before a 13-word lock-free
+    BD finishes), and a word-clock lead capped always (the parked rows fix the cap at 4 granules with latency 1,
+    which never binds mid-BD; it also breaks the ring camp). Needs a probe that refuses a controlled number of a
+    BD's accesses and sweeps the core's release of the next BD's lock over six or more cycles.
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
   - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). Still open: in
