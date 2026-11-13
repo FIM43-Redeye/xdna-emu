@@ -172,6 +172,69 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             path-capacity/onset-len + onset-long, two runs identical): first word offered at 11 + min(N, 4) while the BD's \
             last read lands at N + 8",
             "Compute value; the memtile pays memtile_mm2s_fetch_latency_cycles on top."),
+        unit("dma.mm2s_word_clock_start_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (tools/gen_path_onset_probe.py prod_own_nN, two runs identical): FINISHED_BD = \
+            START_TASK + N + 8; word 0 at + 7 follows from placing the access after the last word and the finish \
+            one cycle later, a placement that is not measured on the host path. Compute tiles, one value for every N."),
+        unit("dma.mm2s_word_clock_lead_granules", HardwareObserved, Verification::Unverified,
+            "Fitted (model M1g: 4 granules, a partial granule takes a slot, a slot frees when the access is \
+            presented). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families): a long-parked channel \
+            holds 4 granules at its grant whatever their size (a 2-word BD before a 14..17-word BD puts the lock \
+            request step where a 4-word one does); granules 0..3 at grant + 2..5, granule 4 at + 7, then every 4."),
+        unit("dma.mm2s_bd_switch_access_gap_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync family): a lock-free 5..8-word BD behind a parked \
+            4-word BD finishes 3 cycles after it, not 2. Compute tiles."),
+        unit("dma.mm2s_late_granule_access_gap_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (producer probe collide, 3 runs): after a refused MM2S access the next request comes \
+            no earlier than its service + 2 (with the 4-cycle request lattice, every conflict, stall and finish of 45 \
+            transfers); the ring camps' refused accesses are followed the next cycle by granules sequenced long before. \
+            Compute tiles."),
+        unit("dma.mm2s_access_to_offer_cycles", HardwareObserved, Verification::Unverified,
+            "Inferred. Neither side is a direct observation: the host-path access (7 + min(N, 4)) is the model's \
+            placement, and the lock-path offer (grant + 6) is the first word at the receiving DMA (grant + 9, \
+            NPU1 2026-11, tools/gen_dma_lock_probe.py) less a route of 3 that is not separated. The host first \
+            offer 11 + min(N, 4) (tools/gen_path_onset_probe.py) is measured. Compute tiles."),
+        measured("dma.mm2s_access_to_finish_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py): last access grant + 51, \
+            FINISHED_BD + 52, + 53 when a core access wins the bank at + 51",
+            "Paired with the lock-to-access latency through the conflict-stamp-equals-access assumption."),
+        measured("dma.mm2s_lock_to_access_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py, first-BD and chained): \
+            first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3",
+            "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency. Assumes a conflict \
+            event is stamped on the access cycle."),
+        unit("dma.mm2s_lock_request_after_grant_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). Q >= the previous lock BD's grant + 3; each value off by one breaks most chain rows. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_request_trigger_words", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). The request follows the sequencing of the previous BD's third-to-last word; 2 or 4 differ on about 50 rows only, the weakest-pinned constant with the release slot. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_request_trigger_latency_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). Q >= trigger word + 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_release_after_finish_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). One cycle, the previous lock BD's FINISHED_BD + 4, neither requests nor grants; only 4-word predecessors show it, read as that BD's own lock release (inferred). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_grant_period_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). From its request a channel's acquire is grantable in 2 of every 3 cycles; what blocks the third is not known. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_grant_blocked_phase", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). The blocked cycle is request + 2 mod 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        measured("dma.mm2s_lock_grant_visible_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py chain family): LOCK_SEL0_ACQ_GE \
+            fires exactly once per acquire, one cycle before DMA_MM2S_0_STALLED_LOCK falls, in every waiting row, and also \
+            when the lock was free; release to grant is 2 or 3 for core and S2MM releasers",
+            "Compute MM2S. The split of release + 2 into a release reaching the requester a cycle late and this cycle is \
+            the emulator's; only the sum and ACQ_GE at grant - 1 are observed."),
+        unit("dma.mm2s_lock_stall_after_sequencing_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the BD's first sequenced word + 2. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_stall_before_request_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the request - 1 (a free lock shows one cycle). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_stall_before_last_access_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the previous BD's last access - 1. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
+            every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
+            5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \
+            fit at period 5 and at no other",
+            "Compute tiles, one core port against DMA channels. Why 5 is not known; neighbour cores, wide accesses and \
+            memtile banks are unmeasured."),
+        unit("dma.bank_arbiter_dma_residue", HardwareObserved, Verification::Unverified,
+            "Fitted: only the bank's served count at a probe's window minus the residue is observable. NPU1 2026-11 \
+            (tools/gen_dma_lock_probe.py): with the count from reset (configuration-written 16-byte lines plus the core \
+            prologue's stores) banks 0 and 1 of one design, whose histories differ by two stores, need the same value, \
+            and all four DMA channels share it; the image-line unit is measured by adding initialised words."),
         // -- stream_switch --
         unit("stream_switch.local_slave_fifo_depth", DocSpecified, Verification::Verified { evidence: HOP_SLOPE.into() },
             "AM020 ch.2 'local slave ports ... 4-deep FIFO'. Also sizes EXTERNAL slaves (no separate field)."),
@@ -203,7 +266,14 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("broadcast.per_hop_horizontal", SKEW, "Horizontal isotropy assumed."),
         measured("broadcast.per_hop_vertical", SKEW, "Vertical isotropy assumed (blocked on the cold-start fill gap)."),
         measured("broadcast.intra_tile_core_offset", SKEW, "Gauge-fixed at 0: only the core-memory contrast is observable."),
-        measured("broadcast.intra_tile_mem_offset", SKEW, "The add_one core-vs-memory-module signature contrast."),
+        unit("broadcast.intra_tile_mem_offset", HardwareObserved, Verification::Unverified,
+            "Compute memory module against the core (core is the gauge, 0). Started at 2, the raw add_one core-vs-memory event \
+            offset, which also held that event pair's wall-clock separation as then placed. 1 since the core memory-access and \
+            lock-release placement was corrected: derived from cross-unit event pairs, not from a skew sweep. On silicon \
+            LOCK_0_REL (memory unit) minus INSTR_EVENT_0 (core unit) is 5 and MEMORY_STALL (core unit) minus CONFLICT_DM_BANK \
+            (memory unit) is 1; each read one cycle off with 2. The median memory-minus-core offset over the suite's qualifying \
+            test-tiles (tools/mem_core_offset.py) went from -1 to 0. Few tiles qualify and the rest are host-timing outliers."),
+        unsourced("broadcast.intra_tile_memtile_offset", "The value the memory-module offset carried before it was re-measured (2). A memtile has no core module: nothing measures it against a core, so it is held, not calibrated."),
         measured("broadcast.calibrated", SKEW, "Flag: the constants above are a silicon calibration (SP-5c, reversible)."),
         // -- instruction --
         manual("instruction.data_memory_latency", "AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie \

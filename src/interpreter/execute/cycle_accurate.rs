@@ -30,6 +30,7 @@ use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use xdna_archspec::aie2::isa::SemanticOp;
 use xdna_archspec::aie2::Bypass;
+use xdna_archspec::aie2::instruction_latency::CORE_MEMORY_ACCESS_CYCLES;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{HazardDetector, HazardStats, MemoryQuadrant};
 use crate::interpreter::traits::{ExecuteResult, Executor};
@@ -89,6 +90,23 @@ pub struct CycleAccurateExecutor {
     /// The cycle each `vldb.4x` gather in flight freezes the core for its memory cycle
     /// (see `take_due_gather`).
     gather_freezes: smallvec::SmallVec<[u64; 2]>,
+
+    /// Local data-memory accesses of issued bundles that their banks have not served yet
+    /// (see `due_bank_demand`).
+    bank_accesses: smallvec::SmallVec<[InFlightAccess; 4]>,
+
+    /// The cycle a core access lost its bank: the core is frozen for it (see
+    /// `settle_bank_arbitration`).
+    bank_freeze_at: Option<u64>,
+}
+
+/// One port's access of an issued bundle on its way to the data memory: it asks for `banks`
+/// at cycle `due`, the bundle's memory stage (`CORE_MEMORY_ACCESS_CYCLES` after it issued).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InFlightAccess {
+    due: u64,
+    port: crate::device::bank_arbiter::CorePort,
+    banks: u16,
 }
 
 /// Core lock requests in flight: they resolve together, in order, in front of the bundle
@@ -125,6 +143,8 @@ impl CycleAccurateExecutor {
             req_events_due: smallvec::SmallVec::new(),
             frozen_cycles: 0,
             gather_freezes: smallvec::SmallVec::new(),
+            bank_accesses: smallvec::SmallVec::new(),
+            bank_freeze_at: None,
         }
     }
 
@@ -141,10 +161,121 @@ impl CycleAccurateExecutor {
             return false;
         };
         self.gather_freezes.remove(i);
-        for at in &mut self.gather_freezes {
-            *at += 1;
+        // A lost access this cycle already froze everything in flight for it: one cycle.
+        if self.bank_freeze_at != Some(now) {
+            for at in &mut self.gather_freezes {
+                *at += 1;
+            }
+            for a in self.bank_accesses.iter_mut().filter(|a| a.due > now) {
+                a.due += 1;
+            }
         }
         true
+    }
+
+    /// The bank requests of the core's accesses whose memory stage is this cycle, one per
+    /// port (`Requester::Core`). A bundle's loads and stores ask for their banks
+    /// `CORE_MEMORY_ACCESS_CYCLES` after it issued (llvm-aie MemoryCycles<[5]>; silicon,
+    /// arb probe: MEMORY_STALL at issue + 4), on the cycle clock, whatever the core does
+    /// meanwhile: like a gather's memory cycle, a lock request's arbitration cycle or a held
+    /// acquire does not delay them; a frozen memory cycle does (`settle_bank_arbitration`,
+    /// `take_due_gather`).
+    pub fn due_bank_demand(&self, now: u64) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        self.bank_accesses
+            .iter()
+            .filter(|a| a.due <= now)
+            .map(|a| (crate::device::bank_arbiter::Requester::Core(a.port), a.banks))
+            .collect()
+    }
+
+    /// Apply this cycle's bank arbitration to the accesses `due_bank_demand` presented:
+    /// the banks each port won are served; if any access lost, the core is frozen this cycle
+    /// (AM020 ch.4:69, a refused access stalls the whole datapath; the bundle due to issue
+    /// waits, MEMORY_STALL), the refused banks retry next cycle and every other access still
+    /// in flight slips one cycle with the frozen pipeline, as after a gather's memory cycle.
+    pub fn settle_bank_arbitration(
+        &mut self,
+        now: u64,
+        granted: impl IntoIterator<Item = (crate::device::bank_arbiter::CorePort, u16)>,
+        lost: bool,
+    ) {
+        for (port, banks) in granted {
+            for a in self.bank_accesses.iter_mut().filter(|a| a.due <= now && a.port == port) {
+                a.banks &= !banks;
+            }
+        }
+        self.bank_accesses.retain(|a| a.banks != 0);
+        if !lost {
+            debug_assert!(
+                self.bank_accesses.iter().all(|a| a.due > now),
+                "an unserved access without a loss"
+            );
+            return;
+        }
+        for a in &mut self.bank_accesses {
+            a.due = a.due.max(now) + 1;
+        }
+        for at in self.gather_freezes.iter_mut().filter(|at| **at > now) {
+            *at += 1;
+        }
+        self.bank_freeze_at = Some(now);
+    }
+
+    /// Whether a memory cycle freezes the core now: a gather's, or an access that lost its bank.
+    fn take_memory_freeze(&mut self, now: u64) -> bool {
+        let gather = self.take_due_gather(now);
+        gather || self.bank_freeze_at == Some(now)
+    }
+
+    /// The local data-memory banks `bundle`'s load and store ports will need, one entry per
+    /// port, from the registers as they are before it executes.
+    fn bundle_bank_demand(
+        bundle: &VliwBundle,
+        ctx: &ExecutionContext,
+        layout: crate::device::banking::BankLayout,
+    ) -> smallvec::SmallVec<[(crate::device::bank_arbiter::CorePort, u16); 3]> {
+        use crate::device::bank_arbiter::CorePort;
+        use crate::device::banking::banks_for_access;
+        use crate::interpreter::bundle::SlotIndex;
+
+        let mut demand = smallvec::SmallVec::new();
+        for op in bundle.active_slots() {
+            if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
+                continue;
+            }
+            let is_store = matches!(op.semantic, Some(SemanticOp::Store));
+            let addr = if is_store {
+                MemoryUnit::get_store_address(op, ctx)
+            } else {
+                MemoryUnit::get_address(op, ctx)
+            };
+            let (quadrant, local_offset) = super::memory::decode_data_address(addr);
+            if quadrant != MemoryQuadrant::Local {
+                continue;
+            }
+            let mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
+            if mask == 0 {
+                continue;
+            }
+            let port = match op.slot {
+                SlotIndex::LoadA => CorePort::LoadA,
+                SlotIndex::LoadB => CorePort::LoadB,
+                SlotIndex::Store => CorePort::Store,
+                // A decoder-data regression here must degrade, not panic: the op is left out
+                // of the bank demand (debug builds catch it).
+                other => {
+                    debug_assert!(
+                        false,
+                        "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
+                         encoding only ever places Load semantics in LoadA/LoadB and Store \
+                         semantics in Store"
+                    );
+                    continue;
+                }
+            };
+            demand.push((port, mask));
+        }
+        demand
     }
 
     /// The raw lock ID of the in-flight acquire if it is due and cannot be granted now:
@@ -314,109 +445,6 @@ impl CycleAccurateExecutor {
         fire_watchpoint_events(tile, addr, is_store, cycle, pc);
     }
 
-    /// Banks this bundle's memory slots will need, WITHOUT executing it.
-    ///
-    /// Address generation is a pure function of register state (see
-    /// `MemoryUnit::get_address` / `get_store_address`), so the arbiter can be
-    /// asked for the banks a bundle will touch before deciding whether to let
-    /// it commit. This is the "request" half of request -> arbitrate ->
-    /// commit; nothing here advances the PC, the cycle counter, or moves any
-    /// data -- `ctx` is taken by shared reference.
-    ///
-    /// Only LOCAL data-memory accesses count: cross-tile (neighbour)
-    /// addresses decode to a non-`Local` `MemoryQuadrant` and are excluded,
-    /// mirroring the `quadrant == MemoryQuadrant::Local` gate the load/store
-    /// sites already use. A bundle with no local memory ops (or none at all)
-    /// returns an empty list and can always issue.
-    ///
-    /// Unlike `record_memory_access`'s stall counter (scalar-only, see the
-    /// comment there), this covers vector ops too: `banks_for_access` already
-    /// walks every 16-byte word a wide access spans, and per-bank arbitration
-    /// doesn't care about port width.
-    ///
-    /// Returns ONE entry per core memory PORT that has local demand this
-    /// cycle, not one OR'd mask -- a physical bank is genuinely single-port,
-    /// so the core's own load and store ports must be able to contend with
-    /// each other when they land on the same physical bank (AM020 ch.4:69;
-    /// see the design doc this implements). `op.slot` already tells us
-    /// exactly which port (`LoadA` / `LoadB` / `Store`) issued each access --
-    /// the VLIW bundle format has independent bit fields per port, so a
-    /// bundle can never carry more than one Load/Store op per port; there is
-    /// no "more slots than ports" case to handle here.
-    ///
-    /// `served` is the STICKY-GRANT set: per core port, the BANKS it already
-    /// won on an earlier cycle of this same stalled bundle. Those accesses
-    /// completed and latched in hardware, so on the retry cycle only the
-    /// UNSERVED banks re-request (AM020 ch.2:166 -- the losers retry, not the
-    /// winners). Per bank, not per port: a 32-byte vector access spans two
-    /// independently-arbitrated banks and can win one while losing the other.
-    /// Passing `&[]` means "fresh bundle, nothing served yet". The coordinator
-    /// accumulates this set from `Arbitration::granted_core_banks` across the
-    /// stall; re-presenting the full demand every cycle instead would
-    /// deterministically livelock any bundle whose own two ports target one
-    /// single-port bank, and can starve a two-bank access outright (see
-    /// `bank_arbiter`'s starvation proof).
-    pub fn peek_bank_demand(
-        &self,
-        bundle: &VliwBundle,
-        ctx: &ExecutionContext,
-        layout: crate::device::banking::BankLayout,
-        served: &[(crate::device::bank_arbiter::CorePort, u16)],
-    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
-        use crate::device::bank_arbiter::{CorePort, Requester};
-        use crate::device::banking::banks_for_access;
-        use crate::interpreter::bundle::SlotIndex;
-
-        let mut demand = Vec::new();
-        for op in bundle.active_slots() {
-            if !matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
-                continue;
-            }
-            let is_store = matches!(op.semantic, Some(SemanticOp::Store));
-            let addr = if is_store {
-                MemoryUnit::get_store_address(op, ctx)
-            } else {
-                MemoryUnit::get_address(op, ctx)
-            };
-            let (quadrant, local_offset) = super::memory::decode_data_address(addr);
-            if quadrant != MemoryQuadrant::Local {
-                continue;
-            }
-            let mut mask = banks_for_access(local_offset as u32, op.mem_width.bytes() as usize, layout);
-            if mask == 0 {
-                continue;
-            }
-            let port = match op.slot {
-                SlotIndex::LoadA => CorePort::LoadA,
-                SlotIndex::LoadB => CorePort::LoadB,
-                SlotIndex::Store => CorePort::Store,
-                // This is a per-issuing-core-cycle hot path (task 6 review,
-                // Minor-1): a decoder-data regression here must degrade, not
-                // panic the emulator. `debug_assert!` still catches the
-                // invariant violation loudly in debug/test builds; in
-                // release the op is simply skipped from this cycle's bank
-                // demand (the same as any other non-memory op).
-                other => {
-                    debug_assert!(
-                        false,
-                        "Load/Store semantic decoded into non-memory slot {other:?} -- the VLIW \
-                         encoding only ever places Load semantics in LoadA/LoadB and Store \
-                         semantics in Store"
-                    );
-                    continue;
-                }
-            };
-            if let Some((_, banks)) = served.iter().find(|(p, _)| *p == port) {
-                mask &= !banks; // banks won on an earlier cycle of this stall are latched
-            }
-            if mask == 0 {
-                continue; // whole access already served
-            }
-            demand.push((Requester::Core(port), mask));
-        }
-        demand
-    }
-
     /// Reset executor state (for new program).
     pub fn reset(&mut self) {
         self.pending_call_return_addr = None;
@@ -427,6 +455,9 @@ impl CycleAccurateExecutor {
         self.pending_lock = None;
         self.req_events_due.clear();
         self.frozen_cycles = 0;
+        self.gather_freezes.clear();
+        self.bank_accesses.clear();
+        self.bank_freeze_at = None;
     }
 
     /// Get statistics.
@@ -818,7 +849,9 @@ impl CycleAccurateExecutor {
         // stays on its tile's timer like every other core's. A gather's memory cycle that
         // falls on a lock-frozen cycle is that same cycle (silicon `gatacq_d0`: LOCK_STALL and
         // MEMORY_STALL together, one cycle).
-        let gather_due = self.take_due_gather(ctx.cycles);
+        // A memory cycle that freezes the core now: a gather's, or an access that lost its bank
+        // (`settle_bank_arbitration`). Both are the same frozen cycle (MEMORY_STALL).
+        let gather_due = self.take_memory_freeze(ctx.cycles);
         if self.frozen_cycles > 0 {
             self.frozen_cycles -= 1;
             ctx.record_stall(1);
@@ -984,6 +1017,15 @@ impl CycleAccurateExecutor {
         // Sample the shift register for fused vlda.ups whose stage-7 read
         // bundle arrived and write their converted accumulators.
         ctx.process_pending_ups_loads();
+
+        // The bundle issues: its loads and stores ask for their banks at its memory stage.
+        let layout = tile.bank_layout();
+        let due = start_cycle + CORE_MEMORY_ACCESS_CYCLES;
+        self.bank_accesses.extend(
+            Self::bundle_bank_demand(bundle, ctx, layout)
+                .into_iter()
+                .map(|(port, banks)| InFlightAccess { due, port, banks }),
+        );
 
         ctx.begin_bundle();
         // Overflow status flags due next bundle (srSRS_of, srUPS_of): after the snapshot.
@@ -1610,7 +1652,7 @@ mod tests {
             })
             .collect();
         let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-        tile.resolve_lock_requests(ctx.cycles); // own-tile releases go through the lock arbiter
+        tile.deliver_core_lock_releases(ctx.cycles); // own-tile releases reach the lock unit a cycle later
         let lost = reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
         (lost, [tile.locks[5].value, tile.locks[6].value])
     }
@@ -1734,7 +1776,7 @@ mod tests {
             bundles.extend(nops(7));
             // a refused acquire is released at once (wait 0)
             let issued = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-            tile.resolve_lock_requests(ctx.cycles);
+            tile.deliver_core_lock_releases(ctx.cycles);
             let deltas: Vec<u64> = issued.windows(2).map(|w| w[1].0 - w[0].0).collect();
             (deltas, issued.iter().map(|x| x.1).collect::<Vec<_>>(), tile.locks[5].value)
         };
@@ -1780,7 +1822,7 @@ mod tests {
                     })
                     .collect();
                 let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-                tile.resolve_lock_requests(ctx.cycles);
+                tile.deliver_core_lock_releases(ctx.cycles);
                 let lost: Vec<u64> =
                     reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
                 let resolves_at = if cond_first && cond & 1 == 0 { d + 4 } else { 4 };
@@ -2152,6 +2194,80 @@ mod tests {
         }
     }
 
+    /// A load asks for its bank CORE_MEMORY_ACCESS_CYCLES after its bundle issues, on the cycle
+    /// clock: the arbitration cycle of a release or a granted acquire issued before it does not
+    /// move the request (as for a gather's memory cycle, silicon `acqgat_d2`), and a bundle that
+    /// does not issue (the arbitration cycle, every cycle of a refused acquire) asks for nothing.
+    /// Silicon (arb probe, NPU1 2026-11): a load losing its bank raises MEMORY_STALL at its
+    /// issue + 4, the frozen memory cycle (82 of 82 loss rows).
+    #[test]
+    fn a_load_asks_for_its_bank_at_its_memory_stage() {
+        for (request, lock_value) in
+            [(release_own_lock_5(), 0u8), (acquire_own_lock_5(), 1), (acquire_own_lock_5(), 0)]
+        {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            ctx.pointer.write(0, 0x70400); // a local data-memory address
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = lock_value;
+            // the request, a load inside its window (+1), two nops, then six loads
+            let mut bundles = vec![make_bundle(vec![request.clone()]), make_bundle(vec![lda_r6_from_p0()])];
+            bundles.extend(nops(2));
+            for _ in 0..6 {
+                bundles.push(make_bundle(vec![lda_r6_from_p0()]));
+            }
+            let mut issued_loads = Vec::new();
+            let mut due = Vec::new();
+            let mut i = 0;
+            for _ in 0..80 {
+                let now = ctx.cycles;
+                if !executor.due_bank_demand(now).is_empty() {
+                    due.push(now);
+                }
+                executor.settle_bank_arbitration(
+                    now,
+                    executor
+                        .due_bank_demand(now)
+                        .into_iter()
+                        .map(|(r, b)| {
+                            let crate::device::bank_arbiter::Requester::Core(p) = r else {
+                                unreachable!()
+                            };
+                            (p, b)
+                        })
+                        .collect::<Vec<_>>(),
+                    false,
+                );
+                if i == bundles.len() {
+                    if executor.bank_accesses.is_empty() {
+                        break;
+                    }
+                    ctx.record_stall(1);
+                    continue;
+                }
+                let before = ctx.instructions;
+                if matches!(
+                    executor.execute(&bundles[i], &mut ctx, &mut tile),
+                    ExecuteResult::WaitLock { .. }
+                ) {
+                    if ctx.cycles > 30 {
+                        tile.locks[5].value = 1;
+                    }
+                }
+                if ctx.instructions > before {
+                    if bundles[i].active_slots().any(|o| o.semantic == Some(SemanticOp::Load)) {
+                        issued_loads.push(now);
+                    }
+                    i += 1;
+                }
+            }
+            let want: Vec<u64> = issued_loads.iter().map(|c| c + CORE_MEMORY_ACCESS_CYCLES).collect();
+            assert_eq!(due, want, "{:?} lock {lock_value}: every load at its issue + 4", request.semantic);
+            assert_eq!(issued_loads[0], 1, "the load inside the window issues at +1");
+            assert_eq!(due[0], 5, "and asks at +5, after the request's arbitration cycle at +4");
+        }
+    }
+
     #[test]
     fn a_refused_acquire_holds_the_fourth_bundle_and_raises_the_level_there() {
         let mut executor = CycleAccurateExecutor::new();
@@ -2408,7 +2524,7 @@ mod tests {
             assert_eq!((ctx.instructions, ctx.bundle_seq), (instrs, seq), "the held bundle never issues");
             assert!(ctx.cycles >= cycles + 3, "every held cycle is a stall");
             assert_eq!(executor.held_lock_acquire(&tile, None), Some(OWN_LOCK_5));
-            tile.resolve_lock_requests(ctx.cycles);
+            tile.deliver_core_lock_releases(ctx.cycles);
             assert_eq!(tile.locks[5].value, 0, "the refused release changed nothing");
             tile.locks[5].clear_flags();
             assert_eq!(executor.held_lock_acquire(&tile, None), None, "the clear frees the core");
@@ -2419,7 +2535,7 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
             }
-            tile.resolve_lock_requests(ctx.cycles);
+            tile.deliver_core_lock_releases(ctx.cycles);
             assert_eq!(tile.locks[5].value, 1, "the held release is performed once cleared");
         }
     }
@@ -3530,6 +3646,17 @@ mod tests {
     /// address `addr` via pointer register 0. Mirrors the
     /// `test_memory_load_timing` fixture, minus the tile (peek doesn't touch
     /// tile memory, only register state).
+    /// The bank requests `bundle` makes from its memory stage, as `due_bank_demand` presents them.
+    fn issued_demand(
+        bundle: &VliwBundle,
+        ctx: &ExecutionContext,
+    ) -> Vec<(crate::device::bank_arbiter::Requester, u16)> {
+        CycleAccurateExecutor::bundle_bank_demand(bundle, ctx, crate::device::banking::BankLayout::Compute)
+            .into_iter()
+            .map(|(port, banks)| (crate::device::bank_arbiter::Requester::Core(port), banks))
+            .collect()
+    }
+
     fn fixture_scalar_load_at(addr: u32) -> (CycleAccurateExecutor, VliwBundle, ExecutionContext) {
         let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
@@ -3545,11 +3672,11 @@ mod tests {
 
     #[test]
     fn peek_bank_demand_does_not_mutate_context_and_reports_banks() {
-        let (exec, bundle, ctx) = fixture_scalar_load_at(0x70410);
+        let (_, bundle, ctx) = fixture_scalar_load_at(0x70410);
         let before_pc = ctx.pc();
         let before_cycles = ctx.cycles;
 
-        let demand = exec.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
 
         assert_eq!(
             demand,
@@ -3566,15 +3693,13 @@ mod tests {
     #[test]
     fn peek_bank_demand_returns_empty_for_bundle_with_no_memory_ops() {
         // A bundle with only scalar ALU work touches no banks and can always issue.
-        let executor = CycleAccurateExecutor::new();
         let ctx = ExecutionContext::new();
         let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(2))
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1))]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert!(demand.is_empty());
     }
 
@@ -3586,7 +3711,6 @@ mod tests {
         // (every 128-bit word hits its own bank arbiter), so unlike the old
         // scalar-only stall counter in `record_memory_access`, the peek must
         // NOT skip vector ops.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400);
 
@@ -3597,8 +3721,7 @@ mod tests {
         load.is_vector = true;
         let bundle = make_bundle(vec![load]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert_eq!(
             demand,
             vec![(
@@ -3614,7 +3737,6 @@ mod tests {
         // 0x50100 decodes to the West neighbour quadrant (CardDir 5), not
         // Local. Non-local accesses are out of scope for this task -- the
         // peek must report no demand for them, not the local-offset bank.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x50100);
 
@@ -3623,14 +3745,12 @@ mod tests {
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(0))]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert!(demand.is_empty(), "neighbour-quadrant accesses are out of scope, must not appear in demand");
     }
 
     #[test]
     fn peek_bank_demand_covers_store_ops() {
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(1, 0x70410);
         ctx.scalar.write(0, 0xDEADBEEF);
@@ -3640,8 +3760,7 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::PointerReg(1))]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert_eq!(
             demand,
             vec![(
@@ -3667,7 +3786,6 @@ mod tests {
     fn core_self_collision_on_shared_physical_bank_is_detected() {
         // LoadA at 0x400, Store at 0x404: both addresses fall in the same
         // 16-byte word (0x400..0x40F) -> physical bank 0 for both.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400); // load address
         ctx.pointer.write(1, 0x70404); // store address -- same physical bank
@@ -3684,12 +3802,12 @@ mod tests {
                 .with_source(Operand::PointerReg(1)),
         ]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert_eq!(demand.len(), 2, "LoadA and Store are two independent ports, two demand entries");
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let arbitration = arb.arbitrate(&demand, &[]);
+        let arbitration =
+            arb.arbitrate(&demand, &mut crate::device::bank_arbiter::BankAccessCounts::default());
 
         assert_ne!(
             arbitration.contended_banks, 0,
@@ -3712,7 +3830,6 @@ mod tests {
         // -- the paired interleave puts them on different physical banks
         // (0 and 1), so they must NOT contend even though both are core
         // ports issuing in the same cycle.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400); // load address -> physical bank 0
         ctx.pointer.write(1, 0x70410); // store address -> physical bank 1
@@ -3729,12 +3846,12 @@ mod tests {
                 .with_source(Operand::PointerReg(1)),
         ]);
 
-        let demand =
-            executor.peek_bank_demand(&bundle, &ctx, crate::device::banking::BankLayout::Compute, &[]);
+        let demand = issued_demand(&bundle, &ctx);
         assert_eq!(demand.len(), 2);
 
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let arbitration = arb.arbitrate(&demand, &[]);
+        let arbitration =
+            arb.arbitrate(&demand, &mut crate::device::bank_arbiter::BankAccessCounts::default());
 
         assert_eq!(arbitration.contended_banks, 0, "different physical banks must not contend");
         assert!(arbitration.lost.is_empty());
@@ -3767,28 +3884,35 @@ mod tests {
                 .with_source(Operand::PointerReg(1)),
         ]);
 
-        let layout = crate::device::banking::BankLayout::Compute;
+        let mut executor = executor;
+        let issue = 10;
+        executor.bank_accesses = CycleAccurateExecutor::bundle_bank_demand(
+            &bundle,
+            &ctx,
+            crate::device::banking::BankLayout::Compute,
+        )
+        .into_iter()
+        .map(|(port, banks)| InFlightAccess { due: issue + CORE_MEMORY_ACCESS_CYCLES, port, banks })
+        .collect();
         let mut arb = crate::device::bank_arbiter::BankArbiter::new();
-        let mut served: Vec<(crate::device::bank_arbiter::CorePort, u16)> = Vec::new();
+        let mut counts = crate::device::bank_arbiter::BankAccessCounts::default();
         let mut stall_cycles = 0u32;
-
-        // Drive the coordinator loop the way Task 6 must: re-peek each cycle
-        // with the accumulated served set until the bundle can issue.
-        for _ in 0..8 {
-            let demand = executor.peek_bank_demand(&bundle, &ctx, layout, &served);
-            let a = arb.arbitrate(&demand, &[]);
-            if !a.core_lost() {
-                break; // every remaining port got its bank -- the bundle retires
+        let mut retry_demand = None;
+        for now in issue..issue + 12 {
+            let demand = executor.due_bank_demand(now);
+            if demand.is_empty() {
+                continue;
             }
-            stall_cycles += 1;
-            served.extend(a.granted_core_banks());
+            let a = arb.arbitrate(&demand, &mut counts);
+            executor.settle_bank_arbitration(now, a.granted_core_banks(), a.core_lost());
+            if a.core_lost() {
+                stall_cycles += 1;
+                retry_demand = Some(executor.due_bank_demand(now + 1).len());
+            }
         }
 
         assert_eq!(stall_cycles, 1, "a 2-way core self-collision must cost exactly ONE stall cycle");
-        assert_eq!(served.len(), 1, "exactly one port was served during the stall");
-        assert!(
-            executor.peek_bank_demand(&bundle, &ctx, layout, &served).len() == 1,
-            "the served port must not re-request; only the unserved port does"
-        );
+        assert_eq!(retry_demand, Some(1), "the served port must not re-request; only the unserved port does");
+        assert!(executor.bank_accesses.is_empty(), "both accesses are served");
     }
 }

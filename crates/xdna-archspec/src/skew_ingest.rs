@@ -10,6 +10,7 @@ pub fn uncalibrated() -> BroadcastTiming {
         per_hop_vertical: 0,
         intra_tile_core_offset: 0,
         intra_tile_mem_offset: 0,
+        intra_tile_memtile_offset: 0,
         calibrated: false,
     }
 }
@@ -31,17 +32,19 @@ pub fn broadcast_timing_from_json(v: &serde_json::Value) -> Result<BroadcastTimi
     let d_v = field_u8(v, &["d_v"]);
     let core = field_u8(v, &["intra", "core"]);
     let mem = field_u8(v, &["intra", "mem"]);
-    match (d_h, d_v, core, mem) {
-        (Some(h), Some(vv), Some(c), Some(m)) => Ok(BroadcastTiming {
+    let memtile = field_u8(v, &["intra", "memtile"]);
+    match (d_h, d_v, core, mem, memtile) {
+        (Some(h), Some(vv), Some(c), Some(m), Some(mt)) => Ok(BroadcastTiming {
             per_hop_horizontal: h,
             per_hop_vertical: vv,
             intra_tile_core_offset: c,
             intra_tile_mem_offset: m,
+            intra_tile_memtile_offset: mt,
             calibrated: true,
         }),
         _ => Err(format!(
             "calibrated skew_constants.json has a null/missing constant \
-             (d_h={d_h:?} d_v={d_v:?} core={core:?} mem={mem:?}); refusing to \
+             (d_h={d_h:?} d_v={d_v:?} core={core:?} mem={mem:?} memtile={memtile:?}); refusing to \
              build a model that claims calibrated with incomplete data"
         )),
     }
@@ -58,6 +61,7 @@ mod tests {
         assert_eq!(t.per_hop_vertical, 0);
         assert_eq!(t.intra_tile_core_offset, 0);
         assert_eq!(t.intra_tile_mem_offset, 0);
+        assert_eq!(t.intra_tile_memtile_offset, 0);
         assert!(!t.calibrated);
     }
 
@@ -65,7 +69,7 @@ mod tests {
     fn uncalibrated_json_maps_to_zeros() {
         let v = serde_json::json!({
             "calibrated": false, "d_h": null, "d_v": null,
-            "intra": {"core": null, "mem": null}
+            "intra": {"core": null, "mem": null, "memtile": null}
         });
         let t = broadcast_timing_from_json(&v).unwrap();
         assert!(!t.calibrated);
@@ -79,7 +83,7 @@ mod tests {
         // this test instead of passing silently.
         let v = serde_json::json!({
             "calibrated": true, "d_h": 4, "d_v": 2,
-            "intra": {"core": 1, "mem": 3}
+            "intra": {"core": 1, "mem": 3, "memtile": 5}
         });
         let t = broadcast_timing_from_json(&v).unwrap();
         assert!(t.calibrated);
@@ -87,13 +91,14 @@ mod tests {
         assert_eq!(t.per_hop_vertical, 2);
         assert_eq!(t.intra_tile_core_offset, 1);
         assert_eq!(t.intra_tile_mem_offset, 3);
+        assert_eq!(t.intra_tile_memtile_offset, 5);
     }
 
     #[test]
     fn calibrated_with_null_d_h_is_error() {
         let v = serde_json::json!({
             "calibrated": true, "d_h": null, "d_v": 2,
-            "intra": {"core": 1, "mem": 3}
+            "intra": {"core": 1, "mem": 3, "memtile": 5}
         });
         let err = broadcast_timing_from_json(&v).unwrap_err();
         assert!(err.contains("calibrated"), "{err}");
@@ -103,7 +108,7 @@ mod tests {
     fn calibrated_with_null_d_v_is_error() {
         let v = serde_json::json!({
             "calibrated": true, "d_h": 4, "d_v": null,
-            "intra": {"core": 1, "mem": 3}
+            "intra": {"core": 1, "mem": 3, "memtile": 5}
         });
         let err = broadcast_timing_from_json(&v).unwrap_err();
         assert!(err.contains("calibrated"), "{err}");

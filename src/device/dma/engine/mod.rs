@@ -44,6 +44,8 @@ mod types;
 #[cfg(test)]
 mod iteration_tests;
 #[cfg(test)]
+mod lock_timing_tests;
+#[cfg(test)]
 mod ooo_tests;
 #[cfg(test)]
 mod readahead_tests;
@@ -58,6 +60,7 @@ use super::channel::{ChannelContext, ChannelFsm, CompletionInfo, StagedWord};
 use super::compression;
 use super::timing::DmaTimingConfig;
 use super::transfer::{PadAction, Transfer, TransferDirection, TransferEndpoint};
+use super::word_clock::ChainBdSpec;
 use super::{BdConfig, ChannelType, DmaError, DmaResult};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileKind};
@@ -612,7 +615,23 @@ impl DmaEngine {
         // the DMA waits for buffer locks, potentially deadlocking other
         // packets sharing the same arbiter.
 
+        // A compute MM2S's word clock starts on the BD, lock or no lock, at the same point as
+        // after BdSetup on the lock-free path (BdSetup's last step + 1 +
+        // `mm2s_word_clock_start_cycles`): a lock-started BD skips BdSetup here, but not the BD
+        // load the clock waits for. (A lock-free BD sets it again when its BdSetup ends.)
+        let word_clock_from = self.uses_word_clock(&transfer).then(|| {
+            self.read_clock
+                + self.timing_config.bd_setup_cycles as u64
+                + 1
+                + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64
+        });
+
         // Determine initial FSM state based on whether lock acquisition is needed
+        if let Some(from) = word_clock_from {
+            let first = self.chain_bd_spec(bd_index, &transfer);
+            self.channels[ch_idx].word_clock.start(from, first);
+            self.channels[ch_idx].lock_port.clear();
+        }
         let ch = &mut self.channels[ch_idx];
         ch.error_event_reported = false;
         ch.current_bd = Some(bd_index);
@@ -685,6 +704,10 @@ impl DmaEngine {
         ch.egress_staging.clear();
         ch.egress_gap = 0;
         ch.read_tail = 0;
+        ch.word_clock.clear();
+        ch.lock_port.clear();
+        ch.access_settles_at = 0;
+        ch.access_from = 0;
         ch.egress_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;
@@ -694,7 +717,6 @@ impl DmaEngine {
         ch.warm_task_index = 0;
         ch.prefetch_start_emitted = false;
         ch.controller_dispatch_index = 0;
-        ch.backoff_left = 0;
         ch.prev_starving = false;
         ch.lock_wait_starving = false;
         ch.prev_lock_stalled = false;

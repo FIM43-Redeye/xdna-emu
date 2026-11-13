@@ -1,11 +1,10 @@
 //! FSM execution: the `step()` method and all helper methods it calls.
 
 use super::*;
-use crate::device::bank_arbiter::{Requester, NUM_DMA_CHANNELS};
+use crate::device::bank_arbiter::Requester;
 use crate::device::dma::channel::{PendingReadCompletion, PendingRelease};
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
-use smallvec::SmallVec;
 
 /// Map a resolved DMA target to the `AccessOrigin` the target tile's
 /// WatchPoint comparator should see.
@@ -41,22 +40,6 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
         None => true,
         Some(prev) => prev / granule != addr / granule,
     }
-}
-
-/// Is a staged MM2S near underflow: its read port has `read_backlog` cycles of reading queued,
-/// at/below `DmaEngine::URGENT_WATERMARK` (so it is about to idle), while `transfer`
-/// still has words to fetch?
-///
-/// Defined once so `next_granule_fetch` (the backoff override -- an urgent
-/// channel must never stall itself out via its own backoff) and
-/// `DmaEngine::urgent_channels` (the arbiter's urgency override) read the
-/// identical predicate and can never disagree about which MM2S channels are
-/// urgent. Callers gate on `DmaEngine::uses_egress_staging` first -- the
-/// staging occupancy is only meaningful for a channel that actually stages.
-/// Every word a transfer still has to move is unfetched: a fetched word
-/// leaves the transfer for the channel's staging (`egress_staging`).
-fn transfer_is_urgent(transfer: &Transfer, read_backlog: usize) -> bool {
-    transfer.remaining_bytes() > 0 && read_backlog <= DmaEngine::URGENT_WATERMARK
 }
 
 /// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
@@ -127,46 +110,6 @@ impl DmaEngine {
             demand.push((self.channel_requester(ch_idx as u8), mask));
         }
         demand
-    }
-
-    /// MM2S channels whose egress staging is `urgent` (near underflow) THIS
-    /// cycle -- the arbiter must serve them over the core or the stream
-    /// stalls. A companion to `peek_bank_demand`, not a replacement: it does
-    /// not change that method's return type (other callers depend on it),
-    /// and it reads the SAME channel staging occupancy through the
-    /// same `transfer_is_urgent` predicate `next_granule_fetch` uses for its
-    /// backoff override, so peek and urgency can never disagree about which
-    /// channel is which.
-    ///
-    /// `layout` mirrors `peek_bank_demand`'s signature (the coordinator calls
-    /// both together, see task-3), though urgency itself needs no bank-layout
-    /// information -- it is purely a function of FIFO occupancy, not of which
-    /// physical banks a fetch would touch.
-    ///
-    /// Scoped to compute tiles for the same reason as `peek_bank_demand`:
-    /// MemTile bank geometry is unvalidated, so a non-compute engine reports
-    /// no urgency at all.
-    pub fn urgent_channels(
-        &self,
-        _layout: crate::device::banking::BankLayout,
-    ) -> SmallVec<[Requester; NUM_DMA_CHANNELS]> {
-        let mut urgent = SmallVec::new();
-        if !self.tile_kind.is_compute() {
-            return urgent;
-        }
-
-        for (ch_idx, ch) in self.channels.iter().enumerate() {
-            let ChannelFsm::Transferring { transfer } = &ch.fsm else {
-                continue;
-            };
-            // `peek_bank_demand`'s caller runs before this cycle's step, which advances `read_clock`.
-            if self.uses_egress_staging(transfer)
-                && transfer_is_urgent(transfer, ch.read_backlog(self.read_clock + 1))
-            {
-                urgent.push(self.channel_requester(ch_idx as u8));
-            }
-        }
-        urgent
     }
 
     /// The `Requester` identity for a flat channel index, per direction.
@@ -397,28 +340,23 @@ impl DmaEngine {
     /// The fetch starts at the transfer's cursor (`address_gen.current()`): a
     /// fetched word leaves the transfer at once (it moves to the channel's
     /// `egress_staging`), so the cursor is always the first unfetched word, and
-    /// a drain -- which touches only the staging -- never moves it. A
-    /// re-presented demand (once the backoff below clears) is therefore always
-    /// identical to the one that lost, honouring the arbiter's retry contract
-    /// (AM020 ch.2:166) even though the RE-PRESENTATION is no longer immediate.
-    ///
-    /// A channel that lost its LAST fetch attempt withholds this demand entirely
-    /// for `DmaEngine::BACKOFF` cycles (see `ChannelContext::backoff_left`) --
-    /// UNLESS it is urgent (`transfer_is_urgent`), which always overrides: a
-    /// starving DMA must never stall itself out via its own backoff. The
-    /// withholding is what shifts the channel's next fetch attempt to a
-    /// different point in the core's period-8 march instead of retrying at the
-    /// identical cycle offset forever, which is what pinned a denied MM2S into a
-    /// deterministic anti-lock with a dense core (task-2, producer bank-collision
-    /// fix).
+    /// a drain -- which touches only the staging -- never moves it. A denied
+    /// demand is therefore re-presented, identical, the next cycle, honouring the
+    /// arbiter's retry contract (AM020 ch.2:166). Silicon retries a lost compute
+    /// MM2S access the next cycle: against a dense same-bank core every lost
+    /// granule shows as two CONFLICT_DM_BANK stamps on consecutive cycles, same
+    /// bank, the core winning both (producer probe, 2026-07, 535 pairs per run, 18-20
+    /// core stalls), and a lost last access moves FINISHED_BD by exactly one cycle
+    /// (lock-fetch probe, 2026-11). The 2-cycle backoff this used to apply (2026-07,
+    /// fitted to the conflict count while the access led the read cursor) is gone:
+    /// with the access paced by the word clock, the immediate retry reproduces the
+    /// probe's conflict pairs and per-transfer count.
     fn next_granule_fetch(
         &self,
         transfer: &Transfer,
         layout: crate::device::banking::BankLayout,
         at: u64,
     ) -> Option<GranuleFetch> {
-        use crate::device::banking::banks_for_access;
-
         let unfetched = (transfer.remaining_bytes() as usize).div_ceil(4);
         if unfetched == 0 {
             return None;
@@ -426,17 +364,46 @@ impl DmaEngine {
         let ch = &self.channels[transfer.channel as usize];
         let staged = ch.egress_staging.len();
 
-        if ch.backoff_left > 0 && !transfer_is_urgent(transfer, ch.read_backlog(at)) {
+        let fetch = self.granule_at_cursor(transfer, layout);
+
+        // A compute MM2S accesses a granule only once its word clock has sequenced every word
+        // of it, in an earlier cycle, and -- for a lock-started BD -- once the lock has been
+        // held `mm2s_lock_to_access_cycles` (`word_clock_mm2s_cycle`).
+        if self.uses_word_clock(transfer)
+            && (fetch.words as u32 > ch.word_clock.accessible_words(at)
+                || (transfer.acquire_lock.is_some() && at < ch.access_from)
+                || !ch.word_clock.switch_gap_allows(at)
+                || !ch.word_clock.late_gap_allows(at))
+        {
             return None;
         }
 
+        // Every fetch reserves a whole granule of staging, a BD's short tail (or a strided
+        // single-word fetch) included: silicon's longest BD that finishes into a held S2MM is
+        // 48 words (compute) / 52 (memtile), where admitting the tail into the space it
+        // actually needs finished 50 / 54.
+        let reserve = (layout.access_granule_bytes() / 4) as usize;
+        if staged + reserve > self.egress_staging_capacity() {
+            return None; // no room for a whole granule; wait for the stream to drain one
+        }
+        Some(fetch)
+    }
+
+    /// The granule at the transfer's cursor (`address_gen.current()`), whatever the channel's
+    /// gates: every word of the cursor's 16-byte granule that the transfer visits next,
+    /// contiguously. A strided BD whose next word lands in a different granule therefore
+    /// fetches one word and pays a bank access per word -- which is what silicon does. The
+    /// transfer must have a word left. Pure: walks a clone of the address generator.
+    fn granule_at_cursor(
+        &self,
+        transfer: &Transfer,
+        layout: crate::device::banking::BankLayout,
+    ) -> GranuleFetch {
+        use crate::device::banking::banks_for_access;
+
+        let unfetched = (transfer.remaining_bytes() as usize).div_ceil(4);
         let mut probe = transfer.address_gen.clone();
         let first = probe.current();
-
-        // The fetch brings in every word of `first`'s granule that this transfer
-        // visits next, contiguously. A strided BD whose next word lands in a
-        // different granule therefore fetches one word and pays a bank access per
-        // word -- which is what silicon does.
         let granule = layout.access_granule_bytes();
         let mut words = 1usize;
         let mut addrs = [first; 4];
@@ -453,19 +420,16 @@ impl DmaEngine {
             prev = addr;
             words += 1;
         }
-
-        // Every fetch reserves a whole granule of staging, a BD's short tail (or a strided
-        // single-word fetch) included: silicon's longest BD that finishes into a held S2MM is
-        // 48 words (compute) / 52 (memtile), where admitting the tail into the space it
-        // actually needs finished 50 / 54.
-        let reserve = (granule / 4) as usize;
-        if staged + reserve > self.egress_staging_capacity() {
-            return None; // no room for a whole granule; wait for the stream to drain one
-        }
-
         let mem_size = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
         let offset = Self::wrap_local_offset(first, mem_size) as u32;
-        Some(GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words, addrs })
+        GranuleFetch { bank_mask: banks_for_access(offset, 4, layout), words, addrs }
+    }
+
+    /// Whether a staged MM2S runs on the word clock (`word_clock_mm2s_cycle`): a compute
+    /// tile's. The memtile MM2S keeps the read-cursor rule (`staged_mm2s_cycle`); its access
+    /// position, start-up and finish have not been measured against the word clock.
+    pub(super) fn uses_word_clock(&self, transfer: &Transfer) -> bool {
+        self.tile_kind.is_compute() && self.uses_egress_staging(transfer)
     }
 
     /// Step the DMA engine by one cycle.
@@ -583,6 +547,13 @@ impl DmaEngine {
                 any_active = true;
             }
 
+            // The compute MM2S word clock sequences before anything else of the step reads it,
+            // and its lock port takes this step's grant.
+            if self.channels[ch_idx].word_clock.is_running() {
+                self.tick_word_clock(ch_idx);
+                self.absorb_lock_port_grant(ch_idx, tile);
+            }
+
             // Snapshot the egress backlog BEFORE the step pushes this cycle's
             // word, so `complete_or_drain` can tell a lagging sink from a
             // healthy one (see `ChannelContext::egress_backlog`).
@@ -629,31 +600,6 @@ impl DmaEngine {
                         // stream side live (see `is_held_inert`).
                         let mem_denied = self.is_mem_denied(ch_idx, denied);
                         self.step_channel_fsm(ch_idx, mem_denied, tile, neighbors, host_memory);
-                        if mem_denied {
-                            // Lost this cycle's bank arbitration: arm the
-                            // backoff so the NEXT fetch attempt (withheld by
-                            // `next_granule_fetch` while armed) lands at a
-                            // different point in the core's period-8 march
-                            // instead of retrying at the identical cycle
-                            // offset every time. Armed AFTER
-                            // `step_channel_fsm` already ran this cycle's own
-                            // fetch decision on the pre-arm value -- arming
-                            // it earlier would let this very cycle's
-                            // `do_transfer_cycle` see the new value one
-                            // cycle before the peek that preceded this step
-                            // did, a peek/commit disagreement. Only ever
-                            // reached for MM2S (a denied S2MM takes the
-                            // `is_held_inert` branch above), so this is
-                            // never armed for a channel that has no use for
-                            // it.
-                            self.channels[ch_idx].backoff_left = Self::BACKOFF;
-                        } else if self.channels[ch_idx].backoff_left > 0 {
-                            // Tick the countdown -- likewise AFTER this
-                            // cycle's own fetch decision ran on the
-                            // un-decremented value, for the same
-                            // peek/commit-agreement reason.
-                            self.channels[ch_idx].backoff_left -= 1;
-                        }
                         if matches!(
                             self.channels[ch_idx].fsm,
                             ChannelFsm::AcquiringLock { acquired: false, .. }
@@ -678,6 +624,15 @@ impl DmaEngine {
             {
                 self.drain_egress_staging(ch_idx);
                 any_active = true;
+            }
+
+            // The lock port drives the channel's STALLED_LOCK, then picks the chain's next lock
+            // BD and times its request.
+            if self.channels[ch_idx].word_clock.is_running() {
+                self.drive_lock_port_stall(ch_idx);
+                let now = self.read_clock;
+                let ch = &mut self.channels[ch_idx];
+                ch.lock_port.update(&ch.word_clock, now);
             }
 
             // BDs whose last read returns this cycle complete now: after the FSM
@@ -873,12 +828,13 @@ impl DmaEngine {
     ///
     /// - `channel_start_cycles`: generic "start trigger to first data" cost.
     ///   Fires on every task (every Idle->BdSetup), tile-agnostic, when
-    ///   `pays_channel_start`. The one exemption is a staged compute / memtile
-    ///   MM2S started from idle without a lock, whose first read lands at
-    ///   START_TASK + 9 on silicon (bd_setup 4 + memory_latency 5, FINISHED_BD =
-    ///   N + 8): that offset is measured, while `channel_start_cycles` itself is
-    ///   an unsourced estimate, so the caller passes `false` there rather than
-    ///   subtracting it afterwards.
+    ///   `pays_channel_start`. The one exemption is a staged memtile MM2S started
+    ///   from idle without a lock, whose first read lands at START_TASK + 9 on
+    ///   silicon (bd_setup 4 + memory_latency 5, FINISHED_BD = N + 8): that offset
+    ///   is measured, while `channel_start_cycles` itself is an unsourced estimate,
+    ///   so the caller passes `false` there rather than subtracting it afterwards.
+    ///   A compute MM2S does not come through MemoryLatency (word clock) and pays
+    ///   no bonus.
     /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
     ///   shim DMA touching host memory.  Fires on every task.  0 for MM2S:
     ///   its calibrated 325 is the read latency, charged per read between
@@ -1043,6 +999,20 @@ impl DmaEngine {
         let new_fsm = match fsm {
             ChannelFsm::BdSetup { cycles_remaining, mut transfer } => {
                 if cycles_remaining <= 1 {
+                    if self.uses_word_clock(&transfer) {
+                        // The word clock starts on the BD itself, lock or no lock.
+                        let first = self.chain_bd_spec(transfer.bd_index, &transfer);
+                        let from = self.read_clock
+                            + 1
+                            + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
+                        let ch = &mut self.channels[ch_idx];
+                        ch.word_clock.start(from, first);
+                        ch.lock_port.clear();
+                        // No access yet, so nothing to settle: a BD with no words (silicon: not
+                        // measured; this is the emulator's own timing, the end of BD setup) must
+                        // finish on its own state, not on an earlier BD's.
+                        ch.access_settles_at = 0;
+                    }
                     // BD setup done. Check if lock acquisition is needed.
                     // Packet header insertion is deferred until AFTER lock
                     // acquisition -- on real hardware, the DMA only emits
@@ -1060,23 +1030,37 @@ impl DmaEngine {
                     } else {
                         // No lock needed -- insert header now, go to MemoryLatency.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                        // A compute / memtile MM2S started from idle reads its first word at
-                        // START_TASK + 9 = bd_setup 4 + memory_latency 5 (silicon FINISHED_BD
-                        // = N + 8, `onset-len` / `onset-long` / `onset-chain` t4x4: first task
-                        // 12 for 4 words, every later task L + 8 after its START). The
-                        // `channel_start_cycles` term (2, an unsourced estimate from the
-                        // granule-at-fetch calibration) is not paid on this path; the lock path
-                        // and every other channel kind keep it.
-                        let pays_channel_start = !self.uses_egress_staging(&transfer);
-                        let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, pays_channel_start);
-                        ChannelFsm::MemoryLatency {
-                            cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
-                            transfer,
+                        if self.uses_word_clock(&transfer) {
+                            // A compute MM2S started from idle goes straight to its data phase:
+                            // the word clock (`word_clock_mm2s_cycle`) starts at
+                            // `word_clock_from`, and nothing touches memory before a granule
+                            // has been sequenced. FINISHED_BD = N + 8 (onset probes).
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, false);
+                            debug_assert_eq!(bonus, 0, "a compute MM2S pays no first-BD bonus");
+                            ChannelFsm::Transferring { transfer }
+                        } else {
+                            // A memtile MM2S started from idle reads its first word at
+                            // START_TASK + 9 = bd_setup 4 + memory_latency 5 (silicon FINISHED_BD
+                            // = N + 8, `onset-len` / `onset-long` / `onset-chain` t4x4: first task
+                            // 12 for 4 words, every later task L + 8 after its START). The
+                            // `channel_start_cycles` term (2, an unsourced estimate from the
+                            // granule-at-fetch calibration) is not paid on this path; the lock
+                            // path and every other channel kind keep it.
+                            let pays_channel_start = !self.uses_egress_staging(&transfer);
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, pays_channel_start);
+                            ChannelFsm::MemoryLatency {
+                                cycles_remaining: (self.timing_config.memory_latency_cycles as u16) + bonus,
+                                transfer,
+                            }
                         }
                     }
                 } else {
                     ChannelFsm::BdSetup { cycles_remaining: cycles_remaining - 1, transfer }
                 }
+            }
+
+            ChannelFsm::AcquiringLock { lock_id, transfer, .. } if self.uses_word_clock(&transfer) => {
+                self.step_word_clock_lock_wait(ch_idx, lock_id, transfer)
             }
 
             ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, mut transfer } => {
@@ -1441,6 +1425,17 @@ impl DmaEngine {
             }
         };
         self.channels[ch_idx].current_bd = Some(next_bd);
+        if self.uses_word_clock(&transfer) {
+            // The granules the word clock sequenced past the previous BD belong to this one. A
+            // chain rewritten under the clock (not the BD it ran ahead into) starts it afresh.
+            if !self.channels[ch_idx].word_clock.advance(next_bd) {
+                let first = self.chain_bd_spec(next_bd, &transfer);
+                self.channels[ch_idx].word_clock.start(self.read_clock + 1, first);
+                self.channels[ch_idx].lock_port.clear();
+            }
+        }
+        // As at the end of BD setup: this BD has not accessed memory, so nothing is settling.
+        self.channels[ch_idx].access_settles_at = 0;
 
         // (Recv-side BD-switch accept deassert is driven by the *accept* cursor
         // in `push_stream_in`/`note_stream_accepted`, NOT here: the memory-write
@@ -1456,6 +1451,11 @@ impl DmaEngine {
         // and the acquired-arm's is_first_bd dispatch (false here, BD
         // is chained) routes straight to Transferring/HostPipelineLatency.
         if let Some(lock_id) = transfer.acquire_lock {
+            // A compute MM2S may hold this BD's lock already: its lock port requests it while
+            // the channel is still on the BDs before (`LockPort`).
+            if let Some(g) = self.word_clock_grant(ch_idx) {
+                return self.take_word_clock_grant(ch_idx, lock_id, transfer, g);
+            }
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         }
 
@@ -1552,10 +1552,10 @@ impl DmaEngine {
     /// Gate `begin_completion` on the channel's egress stream having drained,
     /// for an MM2S that does not stage (zero padding, compression).
     ///
-    /// A staged compute / memtile MM2S finishes its BD once the last word is
-    /// fetched into the channel's egress staging (silicon,
-    /// build/experiments/pipeline-fill/chain): its words drain from there after
-    /// the BD, so it completes at once. Any other MM2S writes straight into the
+    /// A staged memtile MM2S finishes its BD once the last word is read into the
+    /// channel's egress staging (silicon, pipeline-fill chain probe): its words
+    /// drain from there after the BD, so it completes at once. (A compute MM2S
+    /// finishes one cycle after its last bank access instead, `word_clock_mm2s_cycle`.) Any other MM2S writes straight into the
     /// output register and keeps the older rule: it has not finished its BD
     /// until the last word has handshaked downstream (TVALID&&TREADY). If the
     /// sink is BEHIND -- the egress FIFO still held words from previous cycles
@@ -1628,7 +1628,7 @@ impl DmaEngine {
             self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_starving = false;
         }
-        if self.channels[ch_idx].prev_lock_stalled {
+        if self.channels[ch_idx].prev_lock_stalled && !self.channels[ch_idx].word_clock.is_running() {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_lock_stalled = false;
         }
@@ -1790,6 +1790,11 @@ impl DmaEngine {
 
     /// A BD has completed: stats, FINISHED_BD.
     fn note_bd_finished(&mut self, ch_idx: usize, completion: &CompletionInfo) {
+        let now = self.read_clock;
+        let ch = &mut self.channels[ch_idx];
+        if let Some(seq) = ch.word_clock.current().map(|b| b.seq) {
+            ch.lock_port.note_finished(seq, now);
+        }
         self.channels[ch_idx].stats.transfers_completed += 1;
         self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;
 
@@ -1898,6 +1903,8 @@ impl DmaEngine {
 
         // Channel goes cold; re-arm the first-BD bonus for any future task.
         self.channels[ch_idx].is_first_bd = true;
+        self.channels[ch_idx].word_clock.clear();
+        self.channels[ch_idx].lock_port.clear();
         (ChannelFsm::Idle, true)
     }
 
@@ -1949,6 +1956,9 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> TransferCycleResult {
+        if self.uses_word_clock(transfer) {
+            return self.word_clock_mm2s_cycle(ch_idx, mem_denied, transfer, tile, neighbors);
+        }
         if self.uses_egress_staging(transfer) {
             return self.staged_mm2s_cycle(ch_idx, mem_denied, transfer, tile, neighbors);
         }
@@ -2153,7 +2163,8 @@ impl DmaEngine {
     /// BD slot this acquire RECYCLES has its deferred release-trace scheduled --
     /// HW's LOCK_SEL*_REL trace fires at the BD-ring recycle, not at completion.
     fn on_acquire_granted(&mut self, ch_idx: usize, lock_id: u8, bd_index: u8) {
-        if self.channels[ch_idx].prev_lock_stalled {
+        // A compute MM2S's level belongs to its lock port (`drive_lock_port_stall`).
+        if self.channels[ch_idx].prev_lock_stalled && !self.channels[ch_idx].word_clock.is_running() {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_lock_stalled = false;
         }
@@ -2537,8 +2548,8 @@ impl DmaEngine {
         }
     }
 
-    /// One cycle of a compute / memtile MM2S (`uses_egress_staging`): the memory
-    /// side only. The channel fetches one 16-byte granule into its egress
+    /// One cycle of a memtile MM2S (`uses_egress_staging` without `uses_word_clock`; a
+    /// compute tile runs `word_clock_mm2s_cycle`): the memory side only. The channel fetches one 16-byte granule into its egress
     /// staging (`next_granule_fetch`, the whole of its bank demand this cycle)
     /// and the fetched words leave the transfer at once, each carrying its
     /// TLAST. They are READ one per cycle (`ChannelContext::read_tail`): a granule
@@ -2609,6 +2620,203 @@ impl DmaEngine {
             return TransferCycleResult::MemoryStarved;
         }
         TransferCycleResult::Continue
+    }
+
+    /// One cycle of a compute-tile MM2S (`uses_word_clock`): the memory side only.
+    ///
+    /// The channel's word clock (`ChannelContext::word_clock`, ticked at the start of every
+    /// step) sequences the BD's words (address generation) one per cycle and on past the BD's
+    /// last word into the chained BDs behind it, holding its lead while the channel is parked on
+    /// a lock (`WordClock`). A granule is accessed -- one 16-byte bank access, the channel's whole bank
+    /// demand this cycle -- in a cycle after its last word was sequenced, when the staging has
+    /// room for it and, for a lock-started BD, from grant + `mm2s_lock_to_access_cycles`
+    /// (`next_granule_fetch`). Its words enter the staging at the access and can leave for the
+    /// stream `mm2s_access_to_offer_cycles` later. The BD finishes
+    /// `mm2s_access_to_finish_cycles` after its last access, so a lost arbitration on the last
+    /// granule delays FINISHED_BD (silicon, lock-fetch probe) while one on an earlier granule
+    /// is covered by the word clock.
+    ///
+    /// A word sequenced this cycle is accessible from the next; a BD's first access comes
+    /// `mm2s_bd_switch_access_gap_cycles` after the previous BD's last. The stream side is the staging drain
+    /// (`drain_egress_staging`), which runs whatever the FSM is doing.
+    fn word_clock_mm2s_cycle(
+        &mut self,
+        ch_idx: usize,
+        mem_denied: bool,
+        transfer: &mut Transfer,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> TransferCycleResult {
+        use xdna_archspec::aie2::timing::{DMA_MM2S_ACCESS_TO_FINISH_CYCLES, DMA_MM2S_ACCESS_TO_OFFER_CYCLES};
+        let now = self.read_clock;
+        let layout = self.bank_layout();
+        let sequenced = self.channels[ch_idx].word_clock.accessible_words(now) as usize;
+        let granule_words = if transfer.remaining_bytes() > 0 {
+            self.granule_at_cursor(transfer, layout).words
+        } else {
+            0
+        };
+        if mem_denied {
+            // The access was presented and lost: it still frees its lead slot.
+            if self.next_granule_fetch(transfer, layout, now).is_some() {
+                self.channels[ch_idx].word_clock.note_presented(now);
+            }
+        } else {
+            if let Some(fetch) = self.next_granule_fetch(transfer, layout, now) {
+                self.cycle_dma_banks |= fetch.bank_mask;
+                let channel = transfer.channel;
+                let tlast_suppress = transfer.effective_tlast_suppress();
+                let ready_at = now + DMA_MM2S_ACCESS_TO_OFFER_CYCLES as u64;
+                for &addr in &fetch.addrs[..fetch.words] {
+                    let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
+                        return TransferCycleResult::Error;
+                    };
+                    let ends_bd = transfer.remaining_bytes() <= 4;
+                    let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
+                    self.channels[ch_idx]
+                        .egress_staging
+                        .push_back(StagedWord { data, ends_bd, ready_at });
+                    transfer.advance(4);
+                    self.channels[ch_idx].stats.bytes_transferred += 4;
+                }
+                self.channels[ch_idx].word_clock.note_access(now, fetch.words as u32);
+                if transfer.remaining_bytes() == 0 {
+                    self.channels[ch_idx].access_settles_at = now + DMA_MM2S_ACCESS_TO_FINISH_CYCLES as u64;
+                }
+            }
+        }
+        // The BD's last access has not settled yet: not done.
+        if transfer.remaining_bytes() == 0 && now < self.channels[ch_idx].access_settles_at {
+            return TransferCycleResult::ReadInProgress;
+        }
+        // DMA_MM2S_n_MEMORY_STARVATION: the staging ran dry in the middle of a BD with the port
+        // able to take a beat while the next granule was ready to access (sequenced) -- the
+        // memory side, not the word clock, is behind. A BD that has not accessed memory yet
+        // is starting, not starving: silicon reads 0 on every workload measured
+        // (2026-07-14-dma-bank-access-width.md), including lock-started BDs whose first
+        // access lost the bank with the staging empty (lock-fetch probe, 2026-11).
+        if transfer.remaining_bytes() > 0
+            && transfer.bytes_transferred > 0
+            && sequenced >= granule_words
+            && self.channels[ch_idx].egress_staging.is_empty()
+            && self.can_push_stream_out_for_channel(transfer.channel)
+        {
+            let dir_ch = self.per_direction_channel(transfer.channel) as usize;
+            if let Some(f) = self.mm2s_egress_empty_wanted.get_mut(dir_ch) {
+                *f = true;
+            }
+            return TransferCycleResult::MemoryStarved;
+        }
+        TransferCycleResult::Continue
+    }
+
+    /// One cycle of a compute MM2S BD waiting for its lock (`uses_word_clock`). The word clock
+    /// keeps sequencing (it does not wait for the lock) and the lock port (`LockPort`) requests
+    /// the lock; the bank access is what the lock gates. Once the lock is held the BD enters its data phase at once -- first BD and chained BD
+    /// alike, with no memory latency, channel start or post-grant countdown -- and may access
+    /// memory from grant + `mm2s_lock_to_access_cycles` (silicon: lock-fetch probe, first access
+    /// at grant + 2, first-BD == chained). The packet header is inserted at the grant.
+    fn step_word_clock_lock_wait(
+        &mut self,
+        ch_idx: usize,
+        lock_id: u8,
+        transfer: Box<Transfer>,
+    ) -> ChannelFsm {
+        let Some(granted_at) = self.word_clock_grant(ch_idx) else {
+            self.channels[ch_idx].stats.lock_wait_cycles += 1;
+            return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
+        };
+        self.take_word_clock_grant(ch_idx, lock_id, transfer, granted_at)
+    }
+
+    /// A compute MM2S's STALLED_LOCK level (`LockPort::stall_level`): up from P until the lock
+    /// is held, whatever BD the FSM is on (silicon: the waiting BD's level rises up to two
+    /// cycles before the BD before it finishes).
+    fn drive_lock_port_stall(&mut self, ch_idx: usize) {
+        let now = self.read_clock;
+        let ch = &self.channels[ch_idx];
+        let up = if ch.prev_lock_stalled {
+            !ch.lock_port.target_held(&ch.word_clock, now)
+        } else {
+            // P's last-access bound looks one step ahead: the BD before's last access is
+            // presented next step if it is the current BD's last granule and nothing but the bank
+            // arbitration can hold it (a refused access is not foreseen).
+            let next = ch.lock_port.predecessor_is_current(&ch.word_clock)
+                && ch.fsm.transfer().is_some_and(|t| {
+                    let layout = self.bank_layout();
+                    t.remaining_bytes() > 0
+                        && self.granule_at_cursor(t, layout).words as u64 * 4 >= t.remaining_bytes() as u64
+                        && self.next_granule_fetch(t, layout, now + 1).is_some()
+                });
+            ch.lock_port.stall_level(&ch.word_clock, now, next)
+        };
+        if up != self.channels[ch_idx].prev_lock_stalled {
+            self.channels[ch_idx].prev_lock_stalled = up;
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: up });
+        }
+    }
+
+    /// The step from which a compute MM2S holds its current BD's lock, if its lock port has
+    /// been granted it by now.
+    fn word_clock_grant(&self, ch_idx: usize) -> Option<u64> {
+        let now = self.read_clock;
+        self.channels[ch_idx]
+            .word_clock
+            .current()
+            .and_then(|b| b.granted_at)
+            .filter(|&g| g <= now)
+    }
+
+    /// A compute MM2S's current BD holds its lock (from `granted_at`): it enters its data
+    /// phase and may access memory from `granted_at` + `mm2s_lock_to_access_cycles`.
+    fn take_word_clock_grant(
+        &mut self,
+        ch_idx: usize,
+        lock_id: u8,
+        mut transfer: Box<Transfer>,
+        granted_at: u64,
+    ) -> ChannelFsm {
+        self.on_acquire_granted(ch_idx, lock_id, transfer.bd_index);
+        {
+            use xdna_archspec::aie2::timing::DMA_MM2S_LOCK_TO_ACCESS_CYCLES;
+            let ch = &mut self.channels[ch_idx];
+            ch.access_from = granted_at + DMA_MM2S_LOCK_TO_ACCESS_CYCLES as u64;
+        }
+        self.maybe_insert_packet_header_from_transfer(&mut transfer);
+        if self.channels[ch_idx].is_first_bd {
+            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, false);
+            debug_assert_eq!(bonus, 0, "a compute MM2S pays no first-BD bonus");
+        }
+        // A staged MM2S's BD-boundary idle cycle is on the port side (`egress_gap`).
+        self.take_bd_switch_bubble(ch_idx);
+        ChannelFsm::Transferring { transfer }
+    }
+
+    /// The word clock's view of BD `bd_index` as `transfer` loads it (its word count from the
+    /// transfer, the chain link and acquire from the BD).
+    pub(super) fn chain_bd_spec(&self, bd_index: u8, transfer: &Transfer) -> ChainBdSpec {
+        ChainBdSpec {
+            bd_index,
+            words: (transfer.total_bytes as u32).div_ceil(4),
+            acquire: transfer.acquire_lock.map(|l| (l, transfer.acquire_value)),
+            next_bd: transfer.next_bd,
+        }
+    }
+
+    /// One step of a compute MM2S channel's word clock (`WordClock::tick`), before the
+    /// channel's FSM step: the clock runs whatever the FSM is doing. The chained BDs it reaches
+    /// are read from the BD registers as they are now.
+    fn tick_word_clock(&mut self, ch_idx: usize) {
+        let now = self.read_clock;
+        let configs = &self.bd_configs;
+        self.channels[ch_idx].word_clock.tick(now, |i| {
+            configs.get(i as usize).map(|c| ChainBdSpec {
+                bd_index: i,
+                words: c.length.div_ceil(4),
+                acquire: c.acquire_lock.map(|l| (l, c.acquire_value)),
+                next_bd: c.next_bd,
+            })
+        });
     }
 
     /// Read one word of a staged MM2S granule from tile memory, at fetch time:
@@ -3726,13 +3934,10 @@ mod bank_demand_tests {
     /// other three beats of each granule come out of the egress staging FIFO
     /// with no memory access at all.
     ///
-    /// WHICH cycles those accesses land on is the staging FIFO's business, not a
-    /// fixed 1-in-4 rhythm: an empty FIFO refills as fast as it is allowed to, so
-    /// a transfer front-loads its fetches until the staging is full and only then
-    /// settles into one fetch per four drained words. That is what a real
-    /// prefetching FIFO does, and it is what gives the DMA the slack to absorb a
-    /// lost arbitration. The invariant silicon pins is the DENSITY -- 16 B per
-    /// access -- which is what the conflict-area inversion measured.
+    /// WHICH cycles those accesses land on is the word clock's business: a compute MM2S
+    /// accesses a granule the cycle after its last word has been sequenced, so a host-started
+    /// BD's accesses come one per four cycles (`word_clock_mm2s_cycle`). The invariant the
+    /// conflict-area inversion measured is the DENSITY -- 16 B per access.
     #[test]
     fn streaming_mm2s_claims_a_bank_once_per_granule() {
         let mut eng = DmaEngine::new_compute_tile(1, 2);
@@ -3750,10 +3955,10 @@ mod bank_demand_tests {
             assert!(guard < 50, "fixture did not reach Transferring in time");
         }
 
-        // The BD finishes once its second granule is staged; the six beats
-        // still in the staging then stream out with the channel idle.
+        // The word clock sequences the BD's 8 words one per cycle; each granule is accessed
+        // the cycle after its last word.
         let mut claimed = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..16 {
             let demand = eng.peek_bank_demand(BankLayout::Compute);
             claimed.push(demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0));
             eng.cycle_dma_banks = 0;
@@ -3777,10 +3982,10 @@ mod bank_demand_tests {
             32 / 16,
             "one bank access per 16-byte granule, not one per stream beat: {claimed:?}"
         );
-        // The BD is 8 words and the staging is deeper than that, so both granules
-        // are prefetched back to back and the remaining six beats stream out of
-        // the FIFO claiming nothing.
-        assert_eq!(claimed, vec![true, true, false, false, false, false, false, false]);
+        // Four cycles apart, one per four sequenced words.
+        let at: Vec<usize> = claimed.iter().enumerate().filter(|(_, c)| **c).map(|(i, _)| i).collect();
+        assert_eq!(at.len(), 2);
+        assert_eq!(at[1] - at[0], 4, "{claimed:?}");
     }
 
     /// A chained BD's FIRST data cycle must be arbitrated like every other data
@@ -3829,7 +4034,11 @@ mod bank_demand_tests {
                 "peek/commit disagreement stepping out of {phase_before}: the channel touched                  banks {:#06b} in a cycle whose arbitration only knew about {peeked:#06b}",
                 eng.cycle_dma_banks
             );
-            if phase_before == "AcquiringLock" && eng.channel_phase(2) != "AcquiringLock" {
+            // The channel moves onto BD1 holding its lock (granted while BD0 still ran, or the
+            // cycle it arrives).
+            if eng.channels[2].current_bd == Some(1)
+                && eng.channels[2].word_clock.current().is_some_and(|b| b.granted_at.is_some())
+            {
                 saw_lock_grant_boundary = true;
             }
 
@@ -4254,6 +4463,620 @@ mod bank_demand_tests {
         }
     }
 
+    /// A compute-tile MM2S BD of `n` words (BD releases lock 5), port always free, with the
+    /// steps in `deny` losing their bank arbitration. Returns, per engine step (the indexing of
+    /// `run_one_bd`), the MM2S bank accesses as (step, bank mask), the step at which the first
+    /// word could be popped, and the step at which FINISHED_BD (the lock release) landed.
+    fn run_compute_bd_accesses(n: u32, deny: &[usize]) -> (Vec<(usize, u16)>, usize, usize) {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, n * 4).with_release(5, 1))
+            .unwrap();
+        eng.start_channel(2, 0).unwrap();
+        let (mut accesses, mut first, mut finished) = (Vec::new(), None, None);
+        for step in 0..200 {
+            let peeked = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .find(|(r, _)| *r == Requester::Mm2s(0))
+                .map_or(0, |(_, m)| *m);
+            eng.cycle_dma_banks = 0;
+            let denied: &[Requester] = if deny.contains(&step) {
+                &[Requester::Mm2s(0)]
+            } else {
+                &[]
+            };
+            eng.step_with_denied(denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if denied.is_empty() {
+                assert_eq!(eng.cycle_dma_banks, peeked, "peek/commit disagreement at step {step}");
+            } else {
+                assert_ne!(peeked, 0, "the fixture denies step {step}, which presented no demand");
+            }
+            if eng.cycle_dma_banks != 0 {
+                accesses.push((step, eng.cycle_dma_banks));
+            }
+            if first.is_none() && eng.peek_stream_out_for_channel(2).is_some() {
+                first = Some(step);
+            }
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+            if finished.is_none() && tile.locks[5].value >= 1 {
+                finished = Some(step);
+            }
+        }
+        (accesses, first.expect("a word left"), finished.expect("the BD finished"))
+    }
+
+    /// A zero-length compute MM2S BD has no access to settle, so its finish must not depend on
+    /// what an earlier BD left in `access_settles_at`. Run it with the stale value at 0 and at a
+    /// step far in the future: FINISHED_BD must land on the same step. Silicon has not measured a
+    /// zero-length BD; the step asserted here is the emulator's own (the end of BD setup).
+    #[test]
+    fn a_zero_length_mm2s_bd_does_not_depend_on_a_stale_access_settle_time() {
+        let finish_step = |stale: u64| {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 0).with_release(5, 1)).unwrap();
+            eng.channels[2].access_settles_at = stale;
+            eng.start_channel(2, 0).unwrap();
+            (0..100usize).find(|_| {
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                tile.locks[5].value >= 1
+            })
+        };
+        let fresh = finish_step(0);
+        assert!(fresh.is_some(), "a zero-length BD finishes");
+        assert_eq!(finish_step(60), fresh);
+    }
+
+    /// A compute MM2S sequences its words one per cycle (the word clock) and accesses a granule
+    /// in the cycle after the granule's last word has been sequenced; FINISHED_BD follows the
+    /// last access by one cycle. On the host path the word clock starts 7 cycles after
+    /// START_TASK, which reproduces silicon's FINISHED_BD = N + 8 and first offer 11 + min(N, 4)
+    /// (onset probes) and the lock path's grant-relative access map (lock-fetch probe). Where
+    /// inside a granule the host-path access sits is not measured on its own; this pins M1's
+    /// placement. 16 words at 0x400: granules alternate bank 0 / bank 1.
+    #[test]
+    fn host_started_mm2s_accesses_each_granule_the_cycle_after_its_last_word() {
+        let (accesses, first, finished) = run_compute_bd_accesses(16, &[]);
+        assert_eq!(accesses, vec![(11, 0b01), (15, 0b10), (19, 0b01), (23, 0b10)]);
+        assert_eq!(first, 15, "the first granule is offered 4 cycles after its access");
+        assert_eq!(finished, 24, "FINISHED_BD one cycle after the last access (N + 8)");
+    }
+
+    /// Silicon (lock-fetch probe, 2026-11): a core access that wins the bank at the DMA's LAST
+    /// access delays FINISHED_BD by one cycle; one at the FIRST access delays only the stream.
+    /// The finish follows the last memory access, not a read cursor. Host-path form: the
+    /// denied access is retried the next cycle (a denial never backs the channel off).
+    #[test]
+    fn a_denied_last_access_delays_the_finish_and_a_denied_first_access_only_the_stream() {
+        let (_, base_first, base_finished) = run_compute_bd_accesses(16, &[]);
+        let (accesses, first, finished) = run_compute_bd_accesses(16, &[23]);
+        assert_eq!(accesses.last(), Some(&(24, 0b10)), "retried the next cycle");
+        assert_eq!((first, finished), (base_first, base_finished + 1));
+
+        let (accesses, first, finished) = run_compute_bd_accesses(16, &[11]);
+        assert_eq!(accesses, vec![(12, 0b01), (15, 0b10), (19, 0b01), (23, 0b10)]);
+        assert_eq!((first, finished), (base_first + 1, base_finished));
+    }
+
+    /// A compute-tile MM2S BD of `n` words that acquires lock 5 (== 1) and releases lock 6, parked
+    /// on the lock for 100 steps before lock 5 is set, port always free. `chained` puts a 4-word
+    /// lock-free BD in front of it (BD0 -> BD1), so the parked BD is a chained one; otherwise it
+    /// is the task's first BD. `deny` names steps relative to the grant g (the step the channel
+    /// leaves AcquiringLock) that lose their bank arbitration. Returns the parked BD's bank
+    /// accesses as (step - g, bank mask), its first offered word and its FINISHED_BD, both - g.
+    fn run_lock_started_bd(n: u32, chained: bool, deny: &[usize]) -> (Vec<(usize, u16)>, usize, usize) {
+        run_lock_started_bd_by(n, chained, |rel, _| deny.contains(&rel))
+    }
+
+    /// `run_lock_started_bd` with the denial chosen per presented demand: `lose(step - g,
+    /// denied_last_step)` is asked only on a step where the channel presents a bank demand after
+    /// the grant, and `denied_last_step` tells whether the previous step's demand lost.
+    fn run_lock_started_bd_by(
+        n: u32,
+        chained: bool,
+        mut lose: impl FnMut(usize, bool) -> bool,
+    ) -> (Vec<(usize, u16)>, usize, usize) {
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        let parked = BdConfig::simple_1d(0x400, n * 4).with_acquire(5, 1).with_release(6, 1);
+        if chained {
+            eng.configure_bd(0, BdConfig::simple_1d(0x2000, 16).with_next(1)).unwrap();
+            eng.configure_bd(1, parked).unwrap();
+        } else {
+            eng.configure_bd(0, parked).unwrap();
+        }
+        eng.start_channel(2, 0).unwrap();
+        let mut grant = None;
+        let (mut accesses, mut first, mut finished) = (Vec::new(), None, None);
+        let mut released = false;
+        let mut denied_last = false;
+        for step in 0..400usize {
+            if step == 100 {
+                tile.locks[5].value = 1;
+                // Everything the lock-free BD0 sent is out of the way by now.
+                assert!(eng.peek_stream_out_for_channel(2).is_none());
+                released = true;
+            }
+            let phase_before = eng.channel_phase(2);
+            let presents = eng
+                .peek_bank_demand(BankLayout::Compute)
+                .iter()
+                .any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0);
+            let denied: &[Requester] = match grant {
+                Some(g) if presents && lose(step - g, denied_last) => &[Requester::Mm2s(0)],
+                _ => &[],
+            };
+            denied_last = !denied.is_empty();
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step_with_denied(denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if grant.is_none() && phase_before == "AcquiringLock" && eng.channel_phase(2) != "AcquiringLock" {
+                grant = Some(step);
+            }
+            assert!(!eng.mm2s_memory_starvation(0), "no MM2S memory starvation (step {step})");
+            if let Some(g) = grant {
+                if eng.cycle_dma_banks != 0 {
+                    accesses.push((step - g, eng.cycle_dma_banks));
+                }
+                if first.is_none() && eng.peek_stream_out_for_channel(2).is_some() {
+                    first = Some(step - g);
+                }
+                if finished.is_none() && tile.locks[6].value >= 1 {
+                    finished = Some(step - g);
+                }
+            } else {
+                assert!(!released || eng.cycle_dma_banks == 0, "no access before the grant (step {step})");
+            }
+            while eng.pop_stream_out_for_channel(2).is_some() {}
+        }
+        (accesses, first.expect("a word left"), finished.expect("the BD finished"))
+    }
+
+    /// The grant-relative bank-access map of a 64-word lock-started compute MM2S (silicon,
+    /// `tools/gen_dma_lock_probe.py`, 2026-11, chained and first-BD alike): bank 0 at g + 2, 4,
+    /// 7, 15, 23, ..., 47, bank 1 at g + 3, 5, 11, 19, ..., 51 -- a burst of four granules from
+    /// grant + 2 (the word clock ran ahead while the BD waited for its lock), granule 4 at + 7,
+    /// then one per 4 cycles. The first-BD path pays no start-up of its own.
+    #[test]
+    fn lock_started_mm2s_first_access_is_two_cycles_after_the_grant() {
+        let mut expected = vec![(2, 0b01), (3, 0b10), (4, 0b01), (5, 0b10), (7, 0b01)];
+        for k in 5..16usize {
+            expected.push((11 + 4 * (k - 5), if k % 2 == 0 { 0b01 } else { 0b10 }));
+        }
+        for chained in [false, true] {
+            let (accesses, first, _) = run_lock_started_bd(64, chained, &[]);
+            assert_eq!(accesses, expected, "chained={chained}");
+            assert_eq!(first, 6, "first offer 4 cycles after the first access (chained={chained})");
+        }
+    }
+
+    /// FINISHED_BD one cycle after the last access: g + 52 for 64 words, g + 3 for a 1-word and
+    /// a 4-word BD (silicon: lock-fetch probe; the prewake probe's dummy BD; the packet-gap
+    /// probe's solo BD), first-BD and chained alike.
+    #[test]
+    fn lock_started_mm2s_finishes_one_cycle_after_its_last_access() {
+        for chained in [false, true] {
+            assert_eq!(run_lock_started_bd(64, chained, &[]).2, 52, "64 words, chained={chained}");
+            assert_eq!(run_lock_started_bd(1, chained, &[]).2, 3, "1 word, chained={chained}");
+            assert_eq!(run_lock_started_bd(4, chained, &[]).2, 3, "4 words, chained={chained}");
+        }
+    }
+
+    /// Silicon (lock-fetch probe): a core access winning the bank at the first DMA access (g + 2)
+    /// delays the stream by one cycle and not FINISHED_BD; granules 1..3 follow one per cycle.
+    #[test]
+    fn a_denied_first_lock_path_access_delays_only_the_stream() {
+        let (accesses, first, finished) = run_lock_started_bd(64, true, &[2]);
+        assert_eq!(&accesses[..5], &[(3, 0b01), (4, 0b10), (5, 0b01), (6, 0b10), (7, 0b01)]);
+        assert_eq!((first, finished), (7, 52));
+    }
+
+    /// Silicon (lock-fetch probe, three rows): a core access winning the bank at the last DMA
+    /// access (g + 51) delays FINISHED_BD by one cycle, to g + 53: the denied access is retried
+    /// the next cycle, though about 15 words are staged by then.
+    #[test]
+    fn a_denied_last_lock_path_access_delays_the_finish_one_cycle() {
+        let (accesses, _, finished) = run_lock_started_bd(64, true, &[51]);
+        assert_eq!(accesses.last(), Some(&(52, 0b10)));
+        assert_eq!(finished, 53);
+    }
+
+    /// What a bank of the probe's tile saw, grant-relative: contended cycles, the cycles the
+    /// core lost, the MM2S's bank accesses and its FINISHED_BD.
+    #[derive(Debug, Default)]
+    struct CoreContact {
+        contended: Vec<usize>,
+        core_lost: Vec<usize>,
+        finished: usize,
+    }
+
+    /// The arb / ring probe on the emulator's own MM2S: a lock-started 64-word BD on MM2S
+    /// channel `mm2s` (0 or 1) reading 0x400 (granule g in physical bank g & 1), parked 100
+    /// steps, against a core that makes `n` consecutive accesses on physical bank `bank` from
+    /// grant + `start` (negative: before the grant), a lost access repeated the next cycle.
+    /// Both go through the real arbiter on the tile's served-access count, which starts from
+    /// the probe design's history (`lock_fetch_history`, with `m` settle loads on the bank).
+    fn run_lock_started_bd_against_core(mm2s: u8, bank: usize, n: u32, start: i64, m: usize) -> CoreContact {
+        use crate::device::bank_arbiter::test_support::lock_fetch_history;
+        use crate::device::bank_arbiter::CorePort;
+        let flat = 2 + mm2s; // MM2S channels follow the two S2MM channels
+        let settle = if bank == 0 { 0x800 } else { 0x810 };
+        // The grant step is deterministic: find it with the core silent.
+        let grant_step = {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(6, 1))
+                .unwrap();
+            eng.start_channel(flat, 0).unwrap();
+            (0..400usize)
+                .find(|&step| {
+                    if step == 100 {
+                        tile.locks[5].value = 1;
+                    }
+                    let before = eng.channel_phase(flat);
+                    eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                    tile.resolve_lock_requests(0);
+                    eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                    while eng.pop_stream_out_for_channel(flat).is_some() {}
+                    before == "AcquiringLock" && eng.channel_phase(flat) != "AcquiringLock"
+                })
+                .expect("granted")
+        };
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        let (mut arb, counts) = lock_fetch_history(Some((settle, m)));
+        tile.bank_access_counts = counts;
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(6, 1))
+            .unwrap();
+        eng.start_channel(flat, 0).unwrap();
+        let bit = 1u16 << bank;
+        let first_core = (grant_step as i64 + start) as usize;
+        let mut core_left = n;
+        let mut out = CoreContact::default();
+        let mut finished = None;
+        for step in 0..400usize {
+            if step == 100 {
+                tile.locks[5].value = 1;
+            }
+            let mut demands = eng.peek_bank_demand(BankLayout::Compute);
+            if step >= first_core && core_left > 0 {
+                demands.push((Requester::Core(CorePort::LoadA), bit));
+            }
+            let a = arb.arbitrate(&demands, &mut tile.bank_access_counts);
+            let rel = step as i64 - grant_step as i64;
+            if a.contended_banks & bit != 0 {
+                out.contended.push(rel as usize);
+            }
+            if a.core_lost() {
+                out.core_lost.push(rel as usize);
+            } else if demands.iter().any(|(r, _)| matches!(r, Requester::Core(_))) {
+                core_left -= 1;
+            }
+            let denied: Vec<Requester> =
+                a.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if finished.is_none() && tile.locks[6].value >= 1 {
+                finished = Some(rel as usize);
+            }
+            while eng.pop_stream_out_for_channel(flat).is_some() {}
+        }
+        out.finished = finished.expect("the BD finished");
+        out
+    }
+
+    /// The arb probe's single-access, history and burst rows (silicon, NPU1 2026-11,
+    /// `tools/gen_dma_lock_probe.py` arb cases; a start one cycle early is the + 3 grant
+    /// phase) on the emulator's own lock-started MM2S and its retry: the same contended
+    /// cycles, the same core losses, FINISHED_BD at g + 52 except g + 53 after a won g + 51.
+    #[test]
+    fn the_emulated_mm2s_meets_and_loses_to_the_core_where_silicon_does() {
+        #[rustfmt::skip]
+        let rows: &[(usize, u32, i64, usize, &[usize], &[usize], usize)] = &[
+            // bank, n, start, m, contended, core lost, finish
+            (0, 1, 7, 0, &[7], &[7], 52),                        // T1 ar0l1k08m0
+            (0, 1, 6, 0, &[], &[], 52),                          // ar0l1k08m1 (+3)
+            (1, 1, 27, 0, &[27], &[27], 52),                     // T2 ar1l1k28m0
+            (1, 1, 19, 0, &[19], &[], 52),                       // ar1l1k20m0
+            (1, 1, 51, 0, &[51], &[], 53),                       // lock-fetch g + 51
+            (0, 1, 47, 0, &[47], &[47], 52),                     // T3 ar0l1k48m0
+            (0, 1, 15, 0, &[15], &[], 52),                       // ar0l1k16m0
+            (0, 1, 15, 4, &[15], &[15], 52),                     // T4 ar0l1k16m4
+            (0, 1, 15, 3, &[15], &[], 52),                       // ar0l1k16m3
+            (0, 1, 7, 2, &[7], &[], 52),                         // ar0l1k08m2
+            (0, 5, 15, 0, &[15, 16, 17, 18, 19], &[19], 52),     // T5 ar0l5k16m0
+            (0, 4, 15, 0, &[15, 16, 17, 18], &[], 52),           // ar0l4k16m0
+            (0, 5, 14, 0, &[15, 16, 17, 18], &[18], 52),         // ar0l5k16m0 (+3)
+            (0, 4, 23, 0, &[23, 24, 25, 26], &[26], 52),         // ar0l4k24m0
+            (0, 3, 31, 0, &[31, 32, 33], &[33], 52),             // ar0l3k32m0
+            (0, 3, 30, 0, &[31, 32], &[32], 52),                 // ar0l3k32m0 (+3)
+            (1, 2, 19, 0, &[19, 20], &[20], 52),                 // ar1l2k20m0
+            (1, 5, 35, 0, &[35, 36, 37, 38, 39], &[39], 52),     // ar1l5k36m0
+            (1, 4, 35, 0, &[35, 36, 37, 38], &[], 52),           // ar1l4k36m0
+        ];
+        for &(bank, n, start, m, contended, lost, finish) in rows {
+            let c = run_lock_started_bd_against_core(0, bank, n, start, m);
+            assert_eq!(
+                (c.contended.as_slice(), c.core_lost.as_slice(), c.finished),
+                (contended, lost, finish),
+                "bank {bank} n {n} g + {start} m {m}"
+            );
+        }
+    }
+
+    /// What a transfer of the producer probe's march did, grant-relative: the runs of consecutive
+    /// contended cycles on one bank (start, bank, length), the cycles the core lost (each one
+    /// MEMORY_STALL) and the MM2S's FINISHED_BD.
+    #[derive(Debug, Default)]
+    struct MarchContact {
+        runs: Vec<(usize, usize, usize)>,
+        core_lost: Vec<usize>,
+        finished: usize,
+    }
+
+    /// The producer probe's march on the emulator's own MM2S: a lock-started 256-word BD on
+    /// MM2S 0 reading 0x400 (granule g in physical bank g & 1), parked 100 steps, against a core
+    /// that stores every cycle from grant + 14 on, four stores per bank (store i in bank
+    /// (i >> 2) & 1), a refused store repeated the next cycle. The banks' served-access counts
+    /// are set at the march start so that the DMA wins a contended cycle on bank b when the bank
+    /// has served `phase[b]` (mod 5) accesses since the march started: the phase pair the
+    /// producer fit gives each transfer (its counts carry over from transfer to transfer).
+    fn run_lock_started_bd_against_march(phase: [u64; 2]) -> MarchContact {
+        use crate::device::bank_arbiter::{BankAccessCounts, BankArbiter, CorePort};
+        const MARCH: usize = 14;
+        let flat = 2;
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 1024).with_acquire(5, 1).with_release(6, 1))
+            .unwrap();
+        eng.start_channel(flat, 0).unwrap();
+        let mut arb = BankArbiter::new();
+        tile.bank_access_counts = BankAccessCounts::default();
+        let mut grant: Option<usize> = None;
+        let mut store = 0usize;
+        let mut out = MarchContact::default();
+        let mut last_contended: Option<(usize, usize)> = None;
+        for step in 0..800usize {
+            if step == 100 {
+                tile.locks[5].value = 1;
+            }
+            let rel = grant.map(|g| step - g);
+            if rel == Some(MARCH) {
+                for (b, p) in phase.iter().enumerate() {
+                    // win iff served % 5 == 2: served at the march start = 2 - phase (mod 5)
+                    while tile.bank_access_counts.served(b) % 5 != (7 - p) % 5 {
+                        tile.bank_access_counts.serve(b);
+                    }
+                }
+            }
+            let mut demands = eng.peek_bank_demand(BankLayout::Compute);
+            let core_bank = (store >> 2) & 1;
+            let marching = rel.is_some_and(|r| r >= MARCH);
+            if marching {
+                demands.push((Requester::Core(CorePort::Store), 1 << core_bank));
+            }
+            let a = arb.arbitrate(&demands, &mut tile.bank_access_counts);
+            let denied: Vec<Requester> =
+                a.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
+            if let Some(r) = rel.filter(|_| marching) {
+                if a.contended_banks != 0 {
+                    match (out.runs.last_mut(), last_contended) {
+                        (Some(run), Some((t, b))) if t + 1 == r && b == core_bank => run.2 += 1,
+                        _ => out.runs.push((r, core_bank, 1)),
+                    }
+                    last_contended = Some((r, core_bank));
+                }
+                if a.core_lost() {
+                    out.core_lost.push(r);
+                } else {
+                    store += 1;
+                }
+            }
+            let before = eng.channel_phase(flat);
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if grant.is_none() && before == "AcquiringLock" && eng.channel_phase(flat) != "AcquiringLock" {
+                grant = Some(step);
+            }
+            while eng.pop_stream_out_for_channel(flat).is_some() {}
+            if let Some(r) = rel {
+                if out.finished == 0 && tile.locks[6].value >= 1 {
+                    out.finished = r;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The producer probe's transfers (silicon, `collide`, run 1, grant-relative; the phase pair
+    /// per transfer from the arb-winner producer fit, which reproduces every conflict and stall
+    /// of 45 transfers): type A (3, 2) contacts 15b0x3 19b1x3, the core losing the last cycle of
+    /// each; type B (1, 4) 15b0x1 (lost) 19b1x4, then a contact of 2 on alternate banks every 4
+    /// cycles from 25 for the rest of the BD, the core winning both (58 runs); type C (0, 0)
+    /// 15b0x3 20b1x2 then every 4 from 24 (58 runs, no loss); type D (2, 3) 15b0x2 19b1x4
+    /// 24b0x3, each lost on its last cycle. After a refused access the MM2S's next granule asks
+    /// two cycles after it (`DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES`), which keeps it in step
+    /// with the core's 4-store dwell.
+    #[test]
+    fn the_emulated_mm2s_against_the_producer_march_matches_silicon() {
+        let every4 = |from: usize, first_bank: usize, n: usize| -> Vec<(usize, usize, usize)> {
+            (0..n).map(|i| (from + 4 * i, (first_bank + i) & 1, 2)).collect()
+        };
+        let mut b_runs = vec![(15, 0, 1), (19, 1, 4)];
+        b_runs.extend(every4(25, 0, 56));
+        let mut c_runs = vec![(15, 0, 3), (20, 1, 2)];
+        c_runs.extend(every4(24, 0, 56));
+        #[rustfmt::skip]
+        let rows: &[(&str, [u64; 2], Vec<(usize, usize, usize)>, &[usize])] = &[
+            ("A", [3, 2], vec![(15, 0, 3), (19, 1, 3)], &[17, 21]),
+            ("B", [1, 4], b_runs, &[15]),
+            ("C", [0, 0], c_runs, &[]),
+            ("D", [2, 3], vec![(15, 0, 2), (19, 1, 4), (24, 0, 3)], &[16, 22, 26]),
+        ];
+        for (name, phase, runs, lost) in rows {
+            let c = run_lock_started_bd_against_march(*phase);
+            assert_eq!(&c.runs, runs, "type {name}: contact runs");
+            assert_eq!(&c.core_lost, lost, "type {name}: core losses");
+        }
+    }
+
+    /// Ring camp (silicon, ring probe rgm0 r1 grant + 2 / rgm1 r1 grant + 3): the core loads
+    /// bank 0 every cycle from the release + 1 (camp start) for 90 cycles against MM2S 0 or 1.
+    /// Camp-relative, the core loses at 7, 12, 17, 22, 27, 32 | 37, 42, 52, and the bank is
+    /// contended over the runs 3..7 9..12 14..17 19..22 24..27 (32 | 33..37) 40..42 48..52.
+    #[test]
+    fn the_emulated_mm2s_against_a_camping_core_matches_the_ring_camp() {
+        #[rustfmt::skip]
+        let rows: &[(u8, i64, &[usize], &[(usize, usize)])] = &[
+            (0, 1, &[7, 12, 17, 22, 27, 32, 42, 52], &[(3, 7), (9, 12), (14, 17), (19, 22), (24, 27), (32, 32), (40, 42), (48, 52)]),
+            (1, 2, &[7, 12, 17, 22, 27, 37, 42, 52], &[(4, 7), (9, 12), (14, 17), (19, 22), (25, 27), (33, 37), (41, 42), (49, 52)]),
+        ];
+        for &(mm2s, camp_before_grant, lost, runs) in rows {
+            let c = run_lock_started_bd_against_core(mm2s, 0, 90, -camp_before_grant, 0);
+            let camp =
+                |v: &[usize]| -> Vec<usize> { v.iter().map(|&t| t + camp_before_grant as usize).collect() };
+            assert_eq!(camp(&c.core_lost), lost, "MM2S {mm2s}: core losses, camp-relative");
+            let expected: Vec<usize> = runs.iter().flat_map(|&(a, b)| a..=b).collect();
+            assert_eq!(camp(&c.contended), expected, "MM2S {mm2s}: contended runs, camp-relative");
+        }
+    }
+
+    /// Silicon (lock-fetch probe, two passes): of the ~40 conflict rows in which a core access won
+    /// the bank at one DMA access, those at g + 3, 4, 5, 7, 11, 15, ..., 47 delayed neither
+    /// FINISHED_BD (g + 52); only the first access (g + 2, the stream) and the last (g + 51, the
+    /// finish, g + 53) moved anything. And the dedicated collision probe measured
+    /// `T_collide / T_apart = 1.0000` for a lock-started MM2S that lost 112 arbitrations in 16
+    /// transfers and paid 5 cycles in all: a lock-started BD loses its warm arbitrations at no
+    /// cost, because the staging that its parked word clock filled covers the retry. Here every
+    /// warm access loses once (each retried the next cycle) and the finish stays at g + 52.
+    #[test]
+    fn a_lock_started_mm2s_loses_its_warm_bank_arbitrations_at_no_cost() {
+        let base = run_lock_started_bd(64, true, &[]);
+        assert_eq!(base.2, 52);
+        for cell in [3usize, 4, 5, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47] {
+            let (_, _, finished) = run_lock_started_bd(64, true, &[cell]);
+            assert_eq!(finished, 52, "one denial at g + {cell}");
+        }
+        for chained in [false, true] {
+            let (accesses, _, finished) =
+                run_lock_started_bd_by(64, chained, |rel, denied_last| rel > 2 && rel < 51 && !denied_last);
+            assert_eq!(finished, 52, "every warm access lost once, chained={chained}");
+            assert_eq!(accesses.len(), 16, "all 16 granules are still accessed");
+        }
+    }
+
+    /// The lead of a BD parked on its lock counts every granule the word clock has started, the
+    /// chained next BD's included. Silicon (`tools/gen_dma_lock_probe.py` fetch `--sync --pre2`,
+    /// 2026-11): a 4-word BD parked on its lock, chained to a lock-free BD of N words, finishes
+    /// that BD N - 11 cycles after its own (21 for N = 32 in 102 rows, 5 for N = 16): the park
+    /// holds the parked BD's granule and the next BD's first 3, which go out in the burst, and
+    /// the next BD's remaining granules follow the clock from the parked BD's first access.
+    #[test]
+    fn a_parked_bds_lead_carries_into_its_lock_free_next_bd() {
+        for (n, gap) in [(32u32, 21usize), (16, 5)] {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(
+                0,
+                BdConfig::simple_1d(0x2000, 16)
+                    .with_acquire(5, 1)
+                    .with_release(6, 1)
+                    .with_next(1),
+            )
+            .unwrap();
+            eng.configure_bd(1, BdConfig::simple_1d(0x400, n * 4).with_release(7, 1))
+                .unwrap();
+            eng.start_channel(2, 0).unwrap();
+            let (mut f0, mut f1) = (None, None);
+            for step in 0..400usize {
+                if step == 100 {
+                    tile.locks[5].value = 1;
+                }
+                eng.reset_cycle_drain_counters();
+                eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                tile.resolve_lock_requests(0);
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while eng.pop_stream_out_for_channel(2).is_some() {}
+                if f0.is_none() && tile.locks[6].value >= 1 {
+                    f0 = Some(step);
+                }
+                if f1.is_none() && tile.locks[7].value >= 1 {
+                    f1 = Some(step);
+                }
+            }
+            assert_eq!(f1.unwrap() - f0.unwrap(), gap, "N = {n}");
+        }
+    }
+
+    /// A chained 64-word BD whose lock arrives d cycles after the channel reached it finishes at
+    /// the later of its word clock and its grant: FINISHED_BD - the previous BD's FINISHED_BD =
+    /// max(64, grant - previous finish + 52). Silicon (`tools/gen_dma_lock_probe.py` fetch
+    /// `--sync --pre2 32`, 2026-11, 291 rows, no exception): exactly 64 when the lock is free on
+    /// request or granted up to 12 cycles after the previous finish, grant + 52 from there on.
+    /// The grant is the cycle from which the channel holds the lock (`LockPort`), which may come
+    /// before the channel reaches the BD.
+    #[test]
+    fn a_chained_lock_bd_finishes_at_the_later_of_its_word_clock_and_its_grant() {
+        for d in -8i64..=24 {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x2000, 128).with_release(6, 1).with_next(1))
+                .unwrap();
+            eng.configure_bd(1, BdConfig::simple_1d(0x400, 256).with_acquire(5, 1).with_release(7, 1))
+                .unwrap();
+            eng.start_channel(2, 0).unwrap();
+            // BD0 (32 words, host-started) finishes at step 40 (N + 8).
+            let f0 = 40i64;
+            let (mut grant, mut f1) = (None, None);
+            for step in 0..400i64 {
+                if step == f0 + d {
+                    tile.locks[5].value = 1;
+                }
+                eng.cycle_dma_banks = 0;
+                eng.reset_cycle_drain_counters();
+                eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+                tile.resolve_lock_requests(0);
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                while eng.pop_stream_out_for_channel(2).is_some() {}
+                if step == f0 {
+                    assert_eq!(tile.locks[6].value, 1, "BD0 finished at {f0}");
+                }
+                if grant.is_none() {
+                    // The engine step counter starts at 1 on step 0.
+                    let wc = &eng.channels[2].word_clock;
+                    grant = wc
+                        .bds()
+                        .find(|b| b.spec.bd_index == 1)
+                        .and_then(|b| b.granted_at)
+                        .map(|g| g as i64 - 1);
+                }
+                if f1.is_none() && tile.locks[7].value >= 1 {
+                    f1 = Some(step);
+                }
+            }
+            let (g, f1) = (grant.expect("granted") - f0, f1.expect("BD1 finished") - f0);
+            assert_eq!(f1, 64.max(g + 52), "d = {d}: grant at previous finish + {g}");
+        }
+    }
+
     /// An MM2S into a consumer that takes nothing finishes a BD only if every fetch, the BD's
     /// short tail included, finds a whole granule of staging free: silicon's longest BD that
     /// finishes into a held S2MM is 48 words on a compute tile and 52 on a memtile (49..50 and
@@ -4306,157 +5129,45 @@ mod bank_demand_tests {
         assert!(words[stale..].iter().all(|w| w >> 24 == 0x0B), "the rest is the new data");
     }
 
-    /// `urgent_channels` and `peek_bank_demand` read the identical per-transfer
-    /// `staged_words` state (`transfer_is_urgent`) -- a channel just entering
-    /// `Transferring` has an empty staging FIFO with the whole BD still
-    /// unfetched, which is as near underflow as it gets, so it must report
-    /// urgent immediately. Once the front-loading fetch tops the FIFO up past
-    /// `DmaEngine::URGENT_WATERMARK`, the same channel must stop reporting
-    /// urgent even though it is still mid-transfer -- urgency is about FIFO
-    /// occupancy, not whether the channel has more work left.
+    /// A denied compute MM2S re-presents the identical demand the next cycle, whatever its
+    /// staging holds (the producer probe's 56 DMA wins came at the same staging as its 1557
+    /// losses). Silicon: against a dense same-bank core every lost granule shows as
+    /// CONFLICT_DM_BANK stamps on consecutive cycles on the same bank (producer probe, 2026-07),
+    /// and a lost last access moves FINISHED_BD by one cycle (lock-fetch probe, 2026-11).
     #[test]
-    fn urgent_channels_reports_only_a_near_underflow_mm2s() {
-        let mut eng = DmaEngine::new_compute_tile(1, 2);
-        let mut tile = Tile::compute(1, 2);
-        let mut host_mem = HostMemory::new();
-
-        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
-        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
-
-        let mut guard = 0;
-        while eng.channel_phase(2) != "Transferring" {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            guard += 1;
-            assert!(guard < 50, "fixture did not reach Transferring in time");
-        }
-
-        assert_eq!(eng.staged_words(2), 0, "fixture must start with an empty staging FIFO");
-        assert!(
-            eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "an empty staging FIFO with stream still to feed must report urgent"
-        );
-
-        // Drain like the array's stream router every cycle -- the
-        // front-loading fetch tops the FIFO up past the watermark once it
-        // has room to.
-        for _ in 0..4 {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            while eng.pop_stream_out_for_channel(2).is_some() {}
-        }
-        let staged = eng.staged_words(2);
-        assert!(
-            staged > DmaEngine::URGENT_WATERMARK,
-            "fixture must actually reach a topped-up FIFO: staged={staged}"
-        );
-        assert!(
-            !eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "a topped-up FIFO (staged={staged}) must not report urgent"
-        );
-    }
-
-    /// The load-bearing half of the producer bank-collision fix: a denied
-    /// MM2S must not re-present its granule demand on the very next cycle.
-    /// Withholding it for `DmaEngine::BACKOFF` cycles is what shifts the next
-    /// fetch attempt to a different point in the core's period-8 march --
-    /// without it, a denied channel retries at the IDENTICAL cycle offset
-    /// forever, which is the deterministic anti-lock this fix replaces.
-    #[test]
-    fn denied_mm2s_backs_off_then_re_presents_at_a_shifted_cycle() {
-        let mut eng = DmaEngine::new_compute_tile(1, 2);
-        let mut tile = Tile::compute(1, 2);
-        let mut host_mem = HostMemory::new();
-
-        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
-        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
-
-        let mut guard = 0;
-        while eng.channel_phase(2) != "Transferring" {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            guard += 1;
-            assert!(guard < 50, "fixture did not reach Transferring in time");
-        }
-
-        // Run past the cold-start urgent window into a topped-up, NON-urgent
-        // state -- the denial under test must exercise plain backoff, not the
-        // urgency override.
-        for _ in 0..4 {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            while eng.pop_stream_out_for_channel(2).is_some() {}
-        }
-        let demand = eng.peek_bank_demand(BankLayout::Compute);
-        let demand_mask = demand.iter().find(|(r, _)| *r == Requester::Mm2s(0)).map_or(0, |(_, m)| *m);
-        assert_ne!(demand_mask, 0, "fixture must land on a cycle presenting a fetch demand");
-        assert!(
-            eng.staged_words(2) > DmaEngine::URGENT_WATERMARK,
-            "the denial under test must land on a non-urgent, well-buffered fetch: staged={}",
-            eng.staged_words(2)
-        );
-        assert!(
-            !eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "fixture must not be urgent going into the denial"
-        );
-
-        // Deny it.
-        eng.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-        while eng.pop_stream_out_for_channel(2).is_some() {}
-
-        // Hold: for BACKOFF cycles the channel must present NO demand at
-        // all, even though the stream side keeps draining underneath it.
-        for hold in 0..DmaEngine::BACKOFF {
-            let demand = eng.peek_bank_demand(BankLayout::Compute);
-            assert!(
-                demand.iter().all(|(r, _)| *r != Requester::Mm2s(0)),
-                "backoff cycle {hold}: a denied non-urgent MM2S must not re-present its demand"
+    fn a_denied_mm2s_re_presents_its_demand_the_next_cycle() {
+        for warm in [false, true] {
+            let mut eng = DmaEngine::new_compute_tile(1, 2);
+            let mut tile = Tile::compute(1, 2);
+            let mut host_mem = HostMemory::new();
+            eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
+            // Channel 2 = MM2S ch0. The port is held, so the staging fills: the first demand
+            // finds it empty, a later one holds more than a granule.
+            eng.start_channel(2, 0).unwrap();
+            let mut guard = 0;
+            let demand = loop {
+                let demand = eng.peek_bank_demand(BankLayout::Compute);
+                let staged = eng.staged_words(2);
+                let wanted = if warm { staged > 4 } else { staged == 0 };
+                if demand.iter().any(|(r, _)| *r == Requester::Mm2s(0)) && wanted {
+                    break demand;
+                }
+                eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+                guard += 1;
+                assert!(guard < 50, "the fixture never presented the wanted demand (warm={warm})");
+            };
+            eng.step_with_denied(
+                &[Requester::Mm2s(0)],
+                &mut tile,
+                &mut NeighborTiles::empty(),
+                &mut host_mem,
             );
-            eng.step_with_denied(&[], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            while eng.pop_stream_out_for_channel(2).is_some() {}
+            assert_eq!(
+                eng.peek_bank_demand(BankLayout::Compute),
+                demand,
+                "the identical demand, the next cycle (warm={warm})"
+            );
         }
-
-        // Backoff elapsed: the channel re-presents -- at whatever bank the
-        // staging cursor now sits at (shifted by the cycles it held), not
-        // necessarily the one it lost.
-        let demand = eng.peek_bank_demand(BankLayout::Compute);
-        assert!(
-            demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0),
-            "after BACKOFF cycles the channel must re-present its granule demand"
-        );
-    }
-
-    /// A starving DMA must never stall itself out via its own backoff: a
-    /// channel denied while urgent (FIFO near underflow) re-presents on the
-    /// very next cycle despite the fresh denial arming the backoff counter.
-    #[test]
-    fn urgent_denial_does_not_back_off() {
-        let mut eng = DmaEngine::new_compute_tile(1, 2);
-        let mut tile = Tile::compute(1, 2);
-        let mut host_mem = HostMemory::new();
-
-        eng.configure_bd(0, BdConfig::simple_1d(0x400, 256)).unwrap();
-        eng.start_channel(2, 0).unwrap(); // channel 2 = MM2S ch0
-
-        let mut guard = 0;
-        while eng.channel_phase(2) != "Transferring" {
-            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            guard += 1;
-            assert!(guard < 50, "fixture did not reach Transferring in time");
-        }
-        assert_eq!(eng.staged_words(2), 0, "fixture must start with an empty, urgent staging FIFO");
-        assert!(eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)));
-
-        // Deny the cold (urgent) fetch.
-        eng.step_with_denied(&[Requester::Mm2s(0)], &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-
-        // Urgency overrides backoff: the channel re-presents immediately,
-        // despite the denial having just armed BACKOFF cycles of hold.
-        let demand = eng.peek_bank_demand(BankLayout::Compute);
-        assert!(
-            demand.iter().any(|(r, m)| *r == Requester::Mm2s(0) && *m != 0),
-            "an urgent (near-underflow) channel must re-present immediately despite the fresh denial"
-        );
-        assert!(
-            eng.urgent_channels(BankLayout::Compute).contains(&Requester::Mm2s(0)),
-            "the channel must still read as urgent going into the retry"
-        );
     }
 
     /// The MM2S egress staging FIFO is what lets the tile DMA lose most of its
@@ -4468,9 +5179,8 @@ mod bank_demand_tests {
     /// Deny the channel every time it presents a bank demand; it re-presents and
     /// wins the retry the next cycle (a round-robin loss, which is exactly what
     /// silicon's DMA suffers). Once the staging has anything in it at all, the
-    /// transfer must take the SAME number of cycles as the undenied baseline and
-    /// must never report memory starvation, because the staging covers the
-    /// delayed refill.
+    /// transfer must never report memory starvation, and on the host path costs one
+    /// cycle in all (see the assertion), because the staging covers the delayed refill.
     ///
     /// The one denial that CAN cost a cycle is the very first fetch of a
     /// transfer, when the staging is genuinely empty and there is nothing to
@@ -4504,20 +5214,9 @@ mod bank_demand_tests {
                     .map(|(_, m)| *m)
                     .unwrap_or(0);
                 let staged = eng.staged_words(2);
-                // Pre-backoff (task-2), a denied channel re-presented the
-                // IDENTICAL demand on the very next cycle -- draining does not
-                // move the fetch cursor, so nothing about the demand itself
-                // changes across a denial. Backoff means the re-presentation is
-                // no longer immediate: `next_granule_fetch` withholds the
-                // demand for BACKOFF cycles unless urgent (see
-                // `denied_mm2s_backs_off_then_re_presents_at_a_shifted_cycle`
-                // and `urgent_denial_does_not_back_off`, which pin the exact
-                // cadence). This test only cares about the STEADY-STATE
-                // throughput/starvation properties asserted below, which
-                // backoff must preserve regardless of cadence -- `denied_last`
-                // here just stops the harness from choosing to deny a channel
-                // backoff has already silenced (its mask is already 0, so
-                // `lose` would be false either way; kept for clarity).
+                // A denied channel re-presents the IDENTICAL demand on the very next
+                // cycle (`a_denied_mm2s_re_presents_its_demand_the_next_cycle`);
+                // `denied_last` lets that retry win, so each granule loses once.
                 let lose = mask != 0 && !denied_last && deny(presented, staged);
                 if mask != 0 {
                     presented += 1;
@@ -4549,16 +5248,21 @@ mod bank_demand_tests {
             denied_starved, 0,
             "a bank denial must be absorbed by the egress staging, not reported as memory starvation"
         );
-        assert_eq!(
-            denied_cycles, base_cycles,
-            "losing every bank arbitration must cost ZERO cycles (HW: T_collide/T_apart = 1.0000)"
-        );
+        // Host-started, the word clock holds no lead over the accesses: each granule is accessed
+        // as soon as it is sequenced and offered 4 cycles later, just in time for the stream.
+        // Losing every warm arbitration therefore slips the stream once, by the one retry
+        // cycle; every later granule is still retried within the slack that slip created.
+        // (The silicon zero-cost measurement, T_collide/T_apart = 1.0000, is of a lock-started
+        // MM2S, whose word clock runs ahead while it waits for the lock.)
+        assert_eq!(denied_cycles, base_cycles + 1, "losing every bank arbitration costs one cycle once");
 
         // The cold fetch is the exception, and it is silicon's exception too: with
         // an empty staging there is nothing to cover the loss, so the port idles
-        // for exactly the cycle the retry takes.
+        // for exactly the cycle the retry takes. A BD that has not accessed memory
+        // yet is starting, not starving: no MEMORY_STARVATION (silicon reads 0 for a
+        // lock-started BD whose first access lost the bank, lock-fetch probe).
         let (cold_cycles, cold_starved, _) = run(|i, _| i == 0);
-        assert_eq!(cold_starved, 1, "a denied FIRST fetch has no staging to hide behind");
+        assert_eq!(cold_starved, 0, "a denied FIRST fetch is not memory starvation");
         assert_eq!(cold_cycles, base_cycles + 1, "and costs exactly the one retry cycle");
     }
 

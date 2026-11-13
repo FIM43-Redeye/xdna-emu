@@ -188,14 +188,26 @@ pub mod instruction_latency {
     /// `operand_cycles[0] = 2`.
     pub const VECTOR_PACK: u8 = 2;
 
+    /// Cycles after a core load or store issues at which it reaches its data-memory bank:
+    /// 4, the memory stage E5.
+    ///
+    /// Source: llvm-aie `AIE2Schedule.td`, `MemoryCycles<[5]>` (counted from 1, issue = E1)
+    /// on every scalar load (`II_LDA*`), full-word store (`II_ST*`), vector load and the
+    /// gather. Silicon (Phoenix, `tools/gen_dma_lock_probe.py` arb cases): a load or store
+    /// that loses its bank to the DMA raises MEMORY_STALL 4 cycles after it issues, in the
+    /// core module's own timer (every one of 82 loss rows), the stamp a gather's frozen
+    /// memory cycle has. `II_VST_SRS` / `II_VST_CONV` (`[7]`) and part-word stores
+    /// (`[5, 11]`) are not measured and are given the same stage.
+    pub const CORE_MEMORY_ACCESS_CYCLES: u64 = 4;
+
     /// Cycles after a `vldb.4x` gather issues at which it freezes the core for one cycle
-    /// (MEMORY_STALL): 4, whatever the gather's width, half and lane addresses.
+    /// (MEMORY_STALL): its memory stage, whatever the gather's width, half and lane addresses.
     ///
     /// Source: silicon (Phoenix, `tools/gen_lock_stall_probe.py` `gpos` and `b2b` gather
     /// pairs, `tools/gen_lock_pulse_probe.py` gather cases; build/experiments/vec-gather-cycle).
     /// llvm-aie models no stall: `II_VLDB_4X` holds W_RS_PORT and LOAD_UNIT_A besides its
     /// own unit and has `MemoryCycles<[5]>`, like every load.
-    pub const GATHER_MEMORY_STALL_CYCLES: u64 = 4;
+    pub const GATHER_MEMORY_STALL_CYCLES: u64 = CORE_MEMORY_ACCESS_CYCLES;
 }
 
 /// Stream switch port type identifier (xdna-emu convention, not hardware).

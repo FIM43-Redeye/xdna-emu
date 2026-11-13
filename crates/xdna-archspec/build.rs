@@ -529,6 +529,32 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.dma.mm2s_read_to_offer_cycles
         )
         .unwrap();
+        for (name, value) in [
+            ("DMA_MM2S_WORD_CLOCK_START_CYCLES", t.dma.mm2s_word_clock_start_cycles),
+            ("DMA_MM2S_WORD_CLOCK_LEAD_GRANULES", t.dma.mm2s_word_clock_lead_granules),
+            ("DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES", t.dma.mm2s_bd_switch_access_gap_cycles),
+            ("DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES", t.dma.mm2s_late_granule_access_gap_cycles),
+            ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
+            ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
+            ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),
+            ("DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES", t.dma.mm2s_lock_request_after_grant_cycles),
+            ("DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS", t.dma.mm2s_lock_request_trigger_words),
+            ("DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES", t.dma.mm2s_lock_request_trigger_latency_cycles),
+            ("DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES", t.dma.mm2s_lock_release_after_finish_cycles),
+            ("DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES", t.dma.mm2s_lock_grant_period_cycles),
+            ("DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE", t.dma.mm2s_lock_grant_blocked_phase),
+            ("DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES", t.dma.mm2s_lock_grant_visible_cycles),
+            ("DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES", t.dma.mm2s_lock_stall_after_sequencing_cycles),
+            ("DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES", t.dma.mm2s_lock_stall_before_request_cycles),
+            (
+                "DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES",
+                t.dma.mm2s_lock_stall_before_last_access_cycles,
+            ),
+            ("BANK_ARBITER_PERIOD", t.dma.bank_arbiter_period),
+            ("BANK_ARBITER_DMA_RESIDUE", t.dma.bank_arbiter_dma_residue),
+        ] {
+            writeln!(out, "    pub const {name}: u8 = {value};").unwrap();
+        }
         writeln!(out, "    pub const DMA_SHIM_S2MM_INGRESS_DEPTH: u8 = {};", t.dma.shim_s2mm_ingress_depth)
             .unwrap();
         writeln!(out).unwrap();
@@ -636,6 +662,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             out,
             "    pub const BROADCAST_INTRA_TILE_MEM_OFFSET: u8 = {};",
             t.broadcast.intra_tile_mem_offset
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const BROADCAST_INTRA_TILE_MEMTILE_OFFSET: u8 = {};",
+            t.broadcast.intra_tile_memtile_offset
         )
         .unwrap();
         writeln!(

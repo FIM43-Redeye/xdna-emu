@@ -1501,6 +1501,7 @@ mod tests {
             per_hop_vertical: 3,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            intra_tile_memtile_offset: 0,
             calibrated: true,
         }));
         assert_eq!(t2.broadcast_timing_override.as_ref().unwrap().per_hop_vertical, 3);

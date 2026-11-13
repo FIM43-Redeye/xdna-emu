@@ -247,12 +247,35 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             memtile_mm2s_egress_fifo_depth: 31,
             memtile_mm2s_fetch_latency_cycles: 1,
             mm2s_read_to_offer_cycles: 3,
+            // Compute MM2S word clock (silicon onset + lock-fetch probes, 2026-11). See the
+            // DmaTiming field docs.
+            mm2s_word_clock_start_cycles: 3,
+            mm2s_word_clock_lead_granules: 4,
+            mm2s_bd_switch_access_gap_cycles: 2,
+            mm2s_late_granule_access_gap_cycles: 2,
+            mm2s_access_to_offer_cycles: 4,
+            mm2s_access_to_finish_cycles: 1,
+            mm2s_lock_to_access_cycles: 2,
+            mm2s_lock_request_after_grant_cycles: 3,
+            mm2s_lock_request_trigger_words: 3,
+            mm2s_lock_request_trigger_latency_cycles: 3,
+            mm2s_lock_release_after_finish_cycles: 4,
+            mm2s_lock_grant_period_cycles: 3,
+            mm2s_lock_grant_blocked_phase: 2,
+            mm2s_lock_grant_visible_cycles: 1,
+            mm2s_lock_stall_after_sequencing_cycles: 2,
+            mm2s_lock_stall_before_request_cycles: 1,
+            mm2s_lock_stall_before_last_access_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
             // task-holding S2MM takes two more than the master-port FIFO alone and whose
             // MM2S stall boundary moved out one word with the hand-off (2026-11-11). See
             // the field doc.
             shim_s2mm_ingress_depth: 66,
+            // Compute-tile bank arbitration (silicon arb/ring probes, 2026-11). See the
+            // DmaTiming field docs.
+            bank_arbiter_period: 5,
+            bank_arbiter_dma_residue: 2,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /
@@ -299,7 +322,8 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         // intra-tile values on Phoenix silicon and the Phase-6 flip becomes
         // a reviewable JSON+regen diff. See the add_one signature
         // (core-memtile=+2, memmod-memtile=+4, core-memmod=-2) -- only the
-        // -2 intra-tile term lives here. `.expect()` is the build-fails-loud
+        // intra-tile term lives here (compute memory module 1 since the core
+        // placement fix, memtile 2; see skew_constants.json). `.expect()` is the build-fails-loud
         // guard: a future calibrated-with-null file panics the build here.
         broadcast: crate::skew_ingest::broadcast_timing_from_json(
             &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json"))
@@ -395,7 +419,10 @@ mod tests {
         assert_eq!(t.per_hop_horizontal, 4);
         assert_eq!(t.per_hop_vertical, 2);
         assert_eq!(t.intra_tile_core_offset, 0);
-        assert_eq!(t.intra_tile_mem_offset, 2);
+        // Compute memory module 1 (raw add_one offset 2, corrected one cycle after the core
+        // memory-access and lock-release placement fix, 2026-11-13); memtile keeps 2.
+        assert_eq!(t.intra_tile_mem_offset, 1);
+        assert_eq!(t.intra_tile_memtile_offset, 2);
     }
 
     /// Build a minimal ArchModel with one tile type, one module, and one

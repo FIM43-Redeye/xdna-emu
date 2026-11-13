@@ -1,33 +1,42 @@
-//! Per-physical-bank memory arbiter: core-class priority with a DMA urgency
-//! override.
+//! Per-physical-bank memory arbiter of a compute tile: a served-access count
+//! decides core versus DMA.
 //!
-//! Per AM020 ch.2: each memory bank has its own arbiter, which serves
-//! requesters round-robin so none starves. A bank accepts one request per
-//! cycle; when several requesters hit the same bank in one cycle, one wins
-//! and the rest stall for a cycle and retry.
+//! Per AM020 ch.2: each memory bank has its own arbiter. A bank accepts one
+//! request per cycle; when several requesters hit the same bank in one cycle,
+//! one wins and the rest stall for a cycle and retry.
 //!
 //! Arbitration is over PHYSICAL banks (single-port SRAMs), not the four
 //! programmer-visible logical banks -- the hardware exposes eight
 //! CONFLICT_DM_BANK events, and an HW capture confirmed a single logical bank
 //! splitting its conflicts across two independently-counted arbiters.
 //!
-//! # Class priority and urgency (winner selection)
+//! # Core versus DMA: the served-access count (winner selection)
 //!
-//! AM020's "round-robin" describes the retry mechanism (below), not a promise
-//! that every requester is treated identically: the compute core outranks the
-//! DMA on a contended bank, EXCEPT an urgent DMA -- its egress FIFO near
-//! underflow, `DmaEngine::urgent_channels` -- outranks the core right back, so
-//! the stream never actually underflows waiting its turn. `arbitrate`'s
-//! `winner_class` picks the class -- first non-empty of [urgent DMA, core,
-//! other DMA] -- and round-robin applies ONLY WITHIN that class: the rotor
-//! still advances by one every contended cycle regardless of who wins (no
-//! identity is ever skipped over indefinitely), but it adjudicates a tie
-//! inside the winning class only, never across classes. `two_core_ports_still_rotate_within_the_core_class`
-//! and `two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent`
-//! pin that within-class rotation for both classes; `core_beats_nonurgent_dma_on_a_contended_bank`,
-//! `urgent_dma_beats_the_core`, `core_beats_the_same_dma_every_cycle_without_urgency`,
-//! and `dma_is_not_starved_because_urgency_escalates_before_underflow` pin the
-//! cross-class priority and its urgency override.
+//! Each physical bank counts the accesses it has SERVED since reset
+//! (`BankAccessCounts`): core loads and stores, the accesses of all four DMA
+//! channels, and configuration writes (once per initialised 16-byte line). A
+//! refused request adds nothing. In a cycle where the core and at least one
+//! DMA channel want the same bank, the DMA is served when that count is at
+//! `BANK_ARBITER_DMA_RESIDUE` modulo `BANK_ARBITER_PERIOD`, and the core is
+//! served otherwise. The loser retries the next cycle, so a core that wants a
+//! bank every cycle lets a waiting DMA in once in every five served cycles,
+//! never after more than four refusals. Measured on Phoenix (NPU1) with the
+//! lock-fetch arbitration and ring-order probes (`tools/gen_dma_lock_probe.py`
+//! arb / ring cases, 222 silicon rows, every one as the rule predicts): MM2S 0
+//! and 1 and S2MM 0 and 1 all win on the same single residue of the same
+//! count, and serving one channel advances the count the others see. Whether
+//! the DMA is about to run dry plays no part (the producer probe's 56 DMA wins
+//! came at the same staging as its 1557 losses).
+//!
+//! Not measured, and modelled by keeping the arbiter's existing rotor: which
+//! DMA channel is served when two or more want the bank in the same cycle
+//! (with or without the core), and which core port is served when two of the
+//! core's own ports want one bank. Among the requesters of the winning class
+//! (DMA or core) the rotor picks, by stable requester identity
+//! (`Requester::ordinal`), and it advances by one every contended cycle.
+//! Neighbouring cores accessing this tile's memory, vector-width accesses
+//! spanning two banks and memory-tile banks (never arbitrated here) are
+//! unmeasured too.
 //!
 //! # The retry contract (load-bearing invariant)
 //!
@@ -49,13 +58,14 @@
 //!   rest.
 //!
 //! Under that contract a pending requester re-asks at every bank it still needs
-//! while that bank's rotor sweeps, so each bank grants it within at most
-//! `NUM_REQUESTERS` contended cycles and the whole access completes within that
-//! same bound -- PROVIDED it stays inside the winning class every cycle it
-//! contends. A non-urgent DMA pitted against an ever-present core is, by
-//! design, never inside the winning class: that is not starvation in the
-//! AM020 sense, it is why urgency escalation exists (see above) -- the real
-//! system asserts `urgent` well before the egress FIFO underflows.
+//! while that bank's rotor sweeps, so within one class each bank grants it
+//! within at most `NUM_REQUESTERS` contended cycles. Across classes the count
+//! is the guarantee: a DMA waiting against an ever-present core is served
+//! within `BANK_ARBITER_PERIOD` cycles (the count advances once per served
+//! cycle), and the core is served in every contended cycle but one in five.
+//! Several DMA channels share the one DMA turn, so a DMA channel kept waiting
+//! by another DMA channel waits for the next turn (silicon: an MM2S starved for
+//! 21 cycles behind its sibling while the core camped).
 //!
 //! # What is proven, and what is not
 //!
@@ -63,11 +73,9 @@
 //! model really generates (1-, 2- and 3-bank), every demand period up to
 //! 2*`NUM_REQUESTERS` and phase, 5 requester mixes, two rival cadences, and
 //! every rotor skew -- with per-BANK sticky retry. No starvation; worst wait 6
-//! cycles against the bound of 7. All 5 mixes stay WITHIN one priority class
-//! (core-vs-core or DMA-vs-DMA): a plain round-robin sweep can no longer make
-//! a cross-class "nobody starves" claim, since class priority makes that false
-//! by design for a non-urgent DMA against an ever-present core. Cross-class
-//! fairness is the urgency guarantee proven separately (above).
+//! cycles against the bound of 7. All 5 mixes stay WITHIN one class
+//! (core-vs-core or DMA-vs-DMA); `a_camping_core_lets_a_waiting_dma_in_within_one_period`
+//! pins the cross-class bound.
 //!
 //! That bound is proven ONLY for the per-bank retry discipline. An
 //! ALL-OR-NOTHING retry -- re-present the whole multi-bank mask, discarding the
@@ -76,7 +84,7 @@
 //! each single-bank rival keeps winning its own.
 //! `multi_bank_requester_starves_without_per_bank_stickiness` pins that
 //! counter-example. The core honours the per-bank contract
-//! (`CoreInterpreter::bank_served_banks`).
+//! (`CycleAccurateExecutor::settle_bank_arbitration` keeps only the refused banks of an access).
 //!
 //! A denied DMA channel does NOT: it re-presents its whole mask, because
 //! `DmaEngine::step_with_denied` skips its FSM step entirely and it therefore
@@ -98,7 +106,9 @@
 //! reintroduced, the single-bank invariant it depends on must be reintroduced
 //! with it, or the retry must go per-bank.
 
-use super::banking::COMPUTE_PHYSICAL_BANKS;
+use smallvec::SmallVec;
+
+use super::banking::{BankLayout, COMPUTE_PHYSICAL_BANKS};
 
 /// Which of the compute core's three independent memory ports issued a
 /// request. AM020 ch.4:69: the core has two load ports and one store port,
@@ -255,17 +265,71 @@ impl Arbitration {
     }
 }
 
-/// One round-robin arbiter per physical bank.
+/// Per physical bank of a compute tile's data memory: the accesses it has served since
+/// reset. The core-versus-DMA decision reads it (`BankArbiter::arbitrate`).
+///
+/// Lives on the tile (`Tile::bank_access_counts`), not on the arbiter, because the
+/// configuration path writes the initial image into data memory before any core or DMA
+/// runs, and silicon counts those writes: one access per initialised 16-byte line, per bank
+/// (`record_config_write`). Reset with the tile (a partition or column reset): separately
+/// loaded runs of one design show the same phase on silicon.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BankAccessCounts {
+    served: [u64; COMPUTE_PHYSICAL_BANKS as usize],
+}
+
+impl BankAccessCounts {
+    /// Accesses physical bank `bank` has served since reset.
+    pub fn served(&self, bank: usize) -> u64 {
+        self.served[bank]
+    }
+
+    /// One access served by `bank` this cycle.
+    pub(crate) fn serve(&mut self, bank: usize) {
+        self.served[bank] += 1;
+    }
+
+    /// A configuration-path write of `len` bytes at tile-local `offset` (the program image's
+    /// data, written before the core and DMA run, or any other host or control write into
+    /// data memory): each 16-byte line it touches is one access of that line's bank.
+    ///
+    /// The unit is measured for the image load (silicon, ring probe with extra initialised
+    /// words in bank 0: 1 to 4 words in one line move the count by 1, 5 words over two lines
+    /// and 12 words over lines b0, b1, b0 by 2). That a single-word register write into data
+    /// memory (control packets, a host `write32`) counts as one access too is the same rule
+    /// applied to a path that is not measured.
+    pub fn record_config_write(&mut self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let line = BankLayout::Compute.access_granule_bytes() as usize;
+        let mem = xdna_archspec::aie2::compute::MEMORY_SIZE as usize;
+        let first = offset / line;
+        let last = (offset + len - 1) / line;
+        for l in first..=last {
+            let addr = (l * line) % mem;
+            self.serve(BankLayout::Compute.physical_bank(addr as u32) as usize);
+        }
+    }
+
+    /// Whether a contended `bank` serves the DMA this cycle: its served count is at the DMA
+    /// residue (module docs).
+    fn dma_turn(&self, bank: usize) -> bool {
+        use xdna_archspec::aie2::timing::{BANK_ARBITER_DMA_RESIDUE, BANK_ARBITER_PERIOD};
+        self.served[bank] % BANK_ARBITER_PERIOD as u64 == BANK_ARBITER_DMA_RESIDUE as u64
+    }
+}
+
+/// One arbiter per physical bank: the served-access count (`BankAccessCounts`) decides core
+/// versus DMA, a round-robin rotor decides within the winning class.
 #[derive(Clone, Debug)]
 pub struct BankArbiter {
     /// Per bank: the requester ORDINAL (a stable identity, never a
-    /// demand-list position) that has priority next. Advances by exactly one
-    /// position every time this bank is actually contended, regardless of
-    /// who wins -- a steady rotation through the fixed set of possible
-    /// requesters, so a requester that only shows up intermittently still
-    /// gets its scheduled turn instead of being repeatedly skipped by
-    /// whichever requester happened to be present most recently (AM020
-    /// ch.2:166 anti-starvation guarantee).
+    /// demand-list position) that has priority next WITHIN a class (DMA
+    /// channels among themselves, core ports among themselves). Advances by
+    /// exactly one position every time this bank is contended, regardless of
+    /// who wins. Which DMA channel silicon serves when several wait is not
+    /// measured; this is the emulator's existing order, kept as such.
     rotor: [u8; COMPUTE_PHYSICAL_BANKS as usize],
 }
 
@@ -281,22 +345,19 @@ impl BankArbiter {
     }
 
     /// Arbitrate one cycle. `demands` is each requester and the bitmask of
-    /// physical banks it needs this cycle. `urgent` is the set of DMA
-    /// channels whose egress FIFO is near underflow this cycle -- they must
-    /// be served or the stream starves.
+    /// physical banks it needs this cycle; `counts` is the tile's
+    /// served-access count, which this advances by one for every bank that
+    /// serves an access this cycle (contended or not).
     ///
-    /// Grants at most one requester per contended bank. The winner is chosen
-    /// by CLASS, not by a single flat rotor: hardware gives the compute core
-    /// priority over the DMA, except an urgent DMA (FIFO near underflow)
-    /// overrides the core so the stream does not starve. Within whichever
-    /// class wins, priority still rotates by stable requester identity
-    /// (`Requester::ordinal`), not by position in this cycle's `demands`
-    /// slice. A requester denied ANY bank it needs is reported in `lost` --
-    /// it must stall and retry the whole request next cycle. A requester
-    /// that got every bank it needed is reported in `granted` -- its access
-    /// completed; it must not re-request (see the module-level retry
-    /// contract).
-    pub fn arbitrate(&mut self, demands: &[(Requester, u16)], urgent: &[Requester]) -> Arbitration {
+    /// Grants at most one requester per bank. On a bank wanted by the core and
+    /// by a DMA channel the count picks the class (module docs); within the
+    /// class, and on a bank wanted only by DMA channels or only by core ports,
+    /// the rotor picks by stable requester identity (`Requester::ordinal`). A
+    /// requester denied ANY bank it needs is reported in `lost` -- it must
+    /// stall and retry next cycle. A requester that got every bank it needed
+    /// is reported in `granted` -- its access completed; it must not
+    /// re-request (see the module-level retry contract).
+    pub fn arbitrate(&mut self, demands: &[(Requester, u16)], counts: &mut BankAccessCounts) -> Arbitration {
         debug_assert!(
             {
                 let mut seen = [false; NUM_REQUESTERS];
@@ -308,77 +369,61 @@ impl BankArbiter {
              self-contend and silently corrupt arbitration): {demands:?}"
         );
 
-        // Urgency keyed by ordinal, computed once per call rather than
-        // rescanning `urgent` for every contended bank.
-        let mut is_urgent = [false; NUM_REQUESTERS];
-        for r in urgent {
-            is_urgent[r.ordinal()] = true;
-        }
-
         let mut out = Arbitration::default();
         let mut denied = [0u16; NUM_REQUESTERS]; // ordinal -> mask of banks lost
 
         for bank in 0..COMPUTE_PHYSICAL_BANKS as usize {
             let bit = 1u16 << bank;
             // Who wants this bank, by stable ordinal (not demand-list index).
-            let wanters: Vec<usize> = demands
+            let wanters: SmallVec<[usize; NUM_REQUESTERS]> = demands
                 .iter()
                 .filter(|(_, mask)| mask & bit != 0)
                 .map(|(who, _)| who.ordinal())
                 .collect();
 
-            if wanters.len() < 2 {
-                continue; // free, or uncontended -- granted, nothing to do
+            if wanters.is_empty() {
+                continue;
             }
-            out.contended_banks |= bit;
+            if wanters.len() > 1 {
+                out.contended_banks |= bit;
 
-            // Class selection: an urgent DMA (FIFO near underflow) outranks
-            // everything, else the core outranks a non-urgent DMA. Core
-            // ordinals are always < NUM_CORE_PORTS; anything else is a DMA
-            // channel.
-            let urgent_dma: Vec<usize> = wanters.iter().copied().filter(|&ord| is_urgent[ord]).collect();
-            let core: Vec<usize> = wanters.iter().copied().filter(|&ord| ord < NUM_CORE_PORTS).collect();
-            let winner_class = if !urgent_dma.is_empty() {
-                &urgent_dma
-            } else if !core.is_empty() {
-                &core
-            } else {
-                &wanters
-            };
+                // Class: core ordinals are always < NUM_CORE_PORTS; anything
+                // else is a DMA channel. Only a core-versus-DMA bank consults
+                // the count.
+                let core: SmallVec<[usize; NUM_REQUESTERS]> =
+                    wanters.iter().copied().filter(|&ord| ord < NUM_CORE_PORTS).collect();
+                let dma: SmallVec<[usize; NUM_REQUESTERS]> =
+                    wanters.iter().copied().filter(|&ord| ord >= NUM_CORE_PORTS).collect();
+                let winner_class = if core.is_empty() || dma.is_empty() {
+                    &wanters
+                } else if counts.dma_turn(bank) {
+                    &dma
+                } else {
+                    &core
+                };
 
-            // Round-robin WITHIN the winning class: the wanter whose ordinal
-            // is first at-or-after the rotor wins, wrapping around the fixed
-            // requester space.
-            //
-            // Ceiling: the steady +1 rotor + first-at-or-after rule splits two
-            // ADJACENT ordinals ~6/7 vs ~1/7, not evenly. Two MM2S channels
-            // continuously urgent on the SAME physical bank would let the loser
-            // win only ~1/7 of cycles and, draining 1 word/cy from staged<=4,
-            // it could underflow the urgency watermark (a stream bubble the
-            // urgency class is meant to prevent). Timing-only, never
-            // corruption; unreachable on the validation corpus (a compute tile
-            // rarely runs two MM2S saturating one bank). Upgrade path if it
-            // ever bites: an even-split (least-recently-won) rotor within the
-            // winning class instead of the fixed +1 tick.
-            let start = self.rotor[bank] as usize;
-            let winner_ordinal = *winner_class
-                .iter()
-                .min_by_key(|&&ord| (ord + NUM_REQUESTERS - start) % NUM_REQUESTERS)
-                .expect("winner_class is non-empty (derived from wanters, which has >= 2 elements)");
+                // Round-robin WITHIN the winning class: the wanter whose ordinal
+                // is first at-or-after the rotor wins, wrapping around the fixed
+                // requester space.
+                let start = self.rotor[bank] as usize;
+                let winner_ordinal = *winner_class
+                    .iter()
+                    .min_by_key(|&&ord| (ord + NUM_REQUESTERS - start) % NUM_REQUESTERS)
+                    .expect("winner_class is non-empty (derived from wanters, which has >= 2 elements)");
 
-            for &ord in &wanters {
-                if ord != winner_ordinal {
-                    denied[ord] |= bit;
+                for &ord in &wanters {
+                    if ord != winner_ordinal {
+                        denied[ord] |= bit;
+                    }
                 }
+                // Advance one position every contended cycle, regardless of who
+                // won: jumping to the winner's position would let a pair of
+                // continuously-present rivals trap the pointer between
+                // themselves, phase-locking out an intermittent requester.
+                self.rotor[bank] = ((start + 1) % NUM_REQUESTERS) as u8;
             }
-            // Advance one position every contended cycle, regardless of who
-            // won -- see the `rotor` field doc for why this must not simply
-            // jump to (winner + 1): jumping to the winner's position lets a
-            // pair of continuously-present rivals trap the pointer between
-            // themselves, phase-locking out an intermittent requester
-            // forever. A steady tick guarantees every ordinal's turn comes
-            // up on schedule.
-            self.rotor[bank] = ((start + 1) % NUM_REQUESTERS) as u8;
+            // The bank served exactly one access this cycle, whoever made it.
+            counts.serve(bank);
         }
 
         for (who, mask) in demands.iter() {
@@ -394,76 +439,405 @@ impl BankArbiter {
     }
 }
 
+/// Test fixtures shared with the DMA engine's arbitration tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::device::banking::banks_for_access;
+
+    pub(crate) fn lone_core_access(
+        arb: &mut BankArbiter,
+        counts: &mut BankAccessCounts,
+        port: CorePort,
+        local: u32,
+    ) {
+        let mask = banks_for_access(local, 4, BankLayout::Compute);
+        let a = arb.arbitrate(&[(Requester::Core(port), mask)], counts);
+        assert!(a.lost.is_empty() && a.contended_banks == 0);
+    }
+
+    /// The lock-fetch / arb / ring probe design's data-memory accesses before its window, in
+    /// the order they happen: the configuration image's initialised buffers (src: 64 words at
+    /// 0x400; ldbuf: 16 words at 0x800), the crt0 stores of p7 and lr (tile-local 0x4, 0x0),
+    /// the kernel's frame stores of r16..r31 (0x20..0x5C), then `settle` extra loads at one
+    /// address (the arb probe's `m` loads before the release). Counted, not offset: the result
+    /// is whatever the accesses add up to.
+    pub(crate) fn lock_fetch_history(settle: Option<(u32, usize)>) -> (BankArbiter, BankAccessCounts) {
+        let mut arb = BankArbiter::new();
+        let mut counts = BankAccessCounts::default();
+        counts.record_config_write(0x400, 64 * 4);
+        counts.record_config_write(0x800, 16 * 4);
+        for addr in [0x4, 0x0] {
+            lone_core_access(&mut arb, &mut counts, CorePort::Store, addr);
+        }
+        for addr in (0x20..0x60).step_by(4) {
+            lone_core_access(&mut arb, &mut counts, CorePort::Store, addr);
+        }
+        if let Some((addr, m)) = settle {
+            for _ in 0..m {
+                lone_core_access(&mut arb, &mut counts, CorePort::LoadA, addr);
+            }
+        }
+        (arb, counts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn core_beats_nonurgent_dma_on_a_contended_bank() {
-        let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(
-            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)],
-            &[], // no urgent DMA
-        );
-        assert_eq!(a.contended_banks, 1 << 0);
-        assert!(a.lost.contains(&Requester::S2mm(0)), "the DMA loses to the core by class priority");
-        assert!(!a.core_lost(), "the core wins");
+    // -- the served-access count (silicon: lock-fetch arb and ring probes, NPU1 2026-11) ------
+    //
+    // Cycles below are relative to the MM2S 0 lock grant g (Part-1 rows) or to the core's camp
+    // start (ring rows), as the probe tables give them. Every expected number is a silicon
+    // measurement; the harness inputs are the DMA's request cycles (the probe's MM2S access map,
+    // or the first cycle of each measured contact run) and the core's access cycles.
+
+    /// MM2S 0 bank accesses of the probe's 64-word lock-started BD, grant-relative (silicon map).
+    const LOCK_FETCH_MM2S_BANK0: &[u64] = &[2, 4, 7, 15, 23, 31, 39, 47];
+    const LOCK_FETCH_MM2S_BANK1: &[u64] = &[3, 5, 11, 19, 27, 35, 43, 51];
+
+    use test_support::{lock_fetch_history, lone_core_access};
+
+    /// What one bank saw over a window: the cycles it was contended (CONFLICT_DM_BANK), the
+    /// cycles the core lost (each one MEMORY_STALL), and when each DMA request was served.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Window {
+        contended: Vec<u64>,
+        core_lost: Vec<u64>,
+        dma_served: Vec<(Requester, u64)>,
     }
 
-    #[test]
-    fn urgent_dma_beats_the_core() {
-        let mut arb = BankArbiter::new();
-        let a = arb.arbitrate(
-            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Mm2s(0), 1 << 0)],
-            &[Requester::Mm2s(0)], // MM2S is near FIFO underflow
-        );
-        assert!(a.lost.contains(&Requester::Core(CorePort::LoadA)), "urgent DMA forces the grant");
-        assert!(a.core_lost());
-    }
-
-    #[test]
-    fn two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent() {
-        // Two DMA channels can be near FIFO underflow AT ONCE (e.g. both
-        // denied long enough by the core to escalate). Both then outrank the
-        // core, and within that urgent-DMA class the existing rotor rule
-        // still applies -- neither is starved by the other, bounded by the
-        // same NUM_REQUESTERS contended-cycle bound as any other class.
-        // Interleaved with a cycle where NEITHER is urgent, the core resumes
-        // winning immediately: urgency is a per-cycle override, not a
-        // lasting demotion of the core.
-        let mut arb = BankArbiter::new();
-        let demands = [
-            (Requester::Core(CorePort::LoadA), 1u16 << 0),
-            (Requester::Mm2s(0), 1u16 << 0),
-            (Requester::Mm2s(1), 1u16 << 0),
-        ];
-        let both_urgent = [Requester::Mm2s(0), Requester::Mm2s(1)];
-
-        let mut since_win = [0u32; 2]; // [Mm2s(0), Mm2s(1)]
-        for cycle in 0..(4 * NUM_REQUESTERS as u32) {
-            let a = arb.arbitrate(&demands, &both_urgent);
-            assert!(a.core_lost(), "cycle {cycle}: two urgent DMA channels must both outrank the core");
-
-            for (i, who) in [Requester::Mm2s(0), Requester::Mm2s(1)].into_iter().enumerate() {
-                if a.lost.contains(&who) {
-                    since_win[i] += 1;
-                } else {
-                    since_win[i] = 0;
+    /// Drive one physical bank cycle by cycle from cycle 0 to `until`. The core makes `n`
+    /// consecutive accesses on `port` from `start`, one per cycle; a lost access repeats the
+    /// next cycle. Each DMA requester asks at each of its arrival cycles and holds the request
+    /// until served (a denied DMA retries the next cycle); a request whose arrival passed while
+    /// an earlier one was waiting is presented the cycle after that one is served.
+    fn run_bank(
+        arb: &mut BankArbiter,
+        counts: &mut BankAccessCounts,
+        bank: usize,
+        core: Option<(CorePort, u64, u32)>,
+        dma: &[(Requester, &[u64])],
+        until: u64,
+    ) -> Window {
+        let bit = 1u16 << bank;
+        let mut next = vec![0usize; dma.len()];
+        let mut core_left = core.map_or(0, |(_, _, n)| n);
+        let mut w = Window::default();
+        for t in 0..until {
+            let mut demands: Vec<(Requester, u16)> = Vec::new();
+            if let Some((port, start, _)) = core {
+                if t >= start && core_left > 0 {
+                    demands.push((Requester::Core(port), bit));
                 }
-                assert!(
-                    since_win[i] <= NUM_REQUESTERS as u32,
-                    "cycle {cycle}: {who:?} has gone {} contended cycles without winning against \
-                     its urgent peer -- exceeds the within-class round-robin bound",
-                    since_win[i]
+            }
+            for (i, (who, arrivals)) in dma.iter().enumerate() {
+                if next[i] < arrivals.len() && arrivals[next[i]] <= t {
+                    demands.push((*who, bit));
+                }
+            }
+            if demands.is_empty() {
+                continue;
+            }
+            let a = arb.arbitrate(&demands, counts);
+            if a.contended_banks & bit != 0 {
+                w.contended.push(t);
+            }
+            if a.core_lost() {
+                w.core_lost.push(t);
+            } else if demands.iter().any(|(r, _)| matches!(r, Requester::Core(_))) {
+                core_left -= 1;
+            }
+            for (i, (who, _)) in dma.iter().enumerate() {
+                if a.granted.contains(who) {
+                    next[i] += 1;
+                    w.dma_served.push((*who, t));
+                }
+            }
+        }
+        w
+    }
+
+    /// Part-1 probe row: `n` same-bank core accesses from grant + `start` against MM2S 0's
+    /// lock-started BD, with `m` settle loads on the bank before the release.
+    fn arb_row(bank: usize, port: CorePort, n: u32, start: u64, m: usize) -> Window {
+        let settle_addr = if bank == 0 { 0x800 } else { 0x810 };
+        let (mut arb, mut counts) = lock_fetch_history(Some((settle_addr, m)));
+        let map = if bank == 0 {
+            LOCK_FETCH_MM2S_BANK0
+        } else {
+            LOCK_FETCH_MM2S_BANK1
+        };
+        run_bank(&mut arb, &mut counts, bank, Some((port, start, n)), &[(Requester::Mm2s(0), map)], 60)
+    }
+
+    /// The count from reset, counted (the probe analysis's accounting, now the emulator's):
+    /// bank 0 has served 8 + 2 image lines, 2 crt0 stores and 8 frame stores before the
+    /// window, bank 1 8 + 2 lines and 8 frame stores.
+    #[test]
+    fn the_lock_fetch_design_reaches_its_window_with_20_and_18_served_accesses() {
+        let (_, counts) = lock_fetch_history(None);
+        assert_eq!((counts.served(0), counts.served(1)), (20, 18));
+        for bank in 2..COMPUTE_PHYSICAL_BANKS as usize {
+            assert_eq!(counts.served(bank), 0, "bank {bank}");
+        }
+    }
+
+    /// T1 (calibrates the residue): a single bank-0 load at g + 7 loses (5 of 5 contacts);
+    /// one cycle earlier (grant phase + 3) it meets nothing.
+    #[test]
+    fn t1_a_single_bank0_load_at_g7_loses_the_bank() {
+        for port in [CorePort::LoadA, CorePort::Store] {
+            let w = arb_row(0, port, 1, 7, 0);
+            assert_eq!((w.contended, w.core_lost), (vec![7], vec![7]), "{port:?}");
+        }
+        let w = arb_row(0, CorePort::LoadA, 1, 6, 0);
+        assert_eq!((w.contended, w.core_lost), (vec![], vec![]));
+    }
+
+    /// T2 (the count from reset, no per-bank constant): bank 1's single load loses at g + 27
+    /// and wins at every other MM2S access; at g + 51 the denied DMA access is served at g + 52
+    /// (FINISHED_BD + 53 on silicon) and that lone retry is not a conflict.
+    #[test]
+    fn t2_a_single_bank1_load_loses_only_at_g27() {
+        let w = arb_row(1, CorePort::LoadA, 1, 27, 0);
+        assert_eq!((w.contended, w.core_lost), (vec![27], vec![27]));
+        for cell in [3u64, 5, 11, 19, 35, 43, 51] {
+            let w = arb_row(1, CorePort::LoadA, 1, cell, 0);
+            assert_eq!((w.contended, w.core_lost), (vec![cell], vec![]), "g + {cell}");
+        }
+        let w = arb_row(1, CorePort::LoadA, 1, 51, 0);
+        assert_eq!(w.dma_served.last(), Some(&(Requester::Mm2s(0), 52)));
+    }
+
+    /// T3: bank 0's single load also loses at g + 47 (5 of 5, predicted from the count before
+    /// it was run) and wins at g + 2, 4, 15, 23, 31 and 39.
+    #[test]
+    fn t3_a_single_bank0_load_loses_at_g47_and_wins_elsewhere() {
+        let w = arb_row(0, CorePort::LoadA, 1, 47, 0);
+        assert_eq!((w.contended, w.core_lost), (vec![47], vec![47]));
+        for cell in [2u64, 4, 15, 23, 31, 39] {
+            let w = arb_row(0, CorePort::LoadA, 1, cell, 0);
+            assert_eq!((w.contended, w.core_lost), (vec![cell], vec![]), "g + {cell}");
+        }
+    }
+
+    /// T4, history: the core's own uncontended loads long before the DMA runs advance the
+    /// count. Four settle loads turn the g + 15 contact into a loss (2 of 2), one to three keep
+    /// it a win; one to four turn the g + 7 loss into a win (9 of 9).
+    #[test]
+    fn t4_settle_loads_before_the_release_move_the_losing_access() {
+        let w = arb_row(0, CorePort::LoadA, 1, 15, 4);
+        assert_eq!((w.contended, w.core_lost), (vec![15], vec![15]));
+        for m in 1..=3 {
+            let w = arb_row(0, CorePort::LoadA, 1, 15, m);
+            assert_eq!((w.contended, w.core_lost), (vec![15], vec![]), "m = {m}");
+        }
+        for m in 1..=4 {
+            let w = arb_row(0, CorePort::LoadA, 1, 7, m);
+            assert_eq!((w.contended, w.core_lost), (vec![7], vec![]), "m = {m}");
+        }
+    }
+
+    /// T5, bursts (table rows; a start one cycle early is the + 3 grant phase): the DMA is
+    /// refused while the count is off its residue and served at the first contended cycle on
+    /// it, at most the 5th; the conflict event marks every contended cycle including the one
+    /// the DMA won, and not the core's lone retry after it. Stores behave as loads.
+    #[test]
+    fn t5_bursts_let_the_dma_in_on_the_residue_and_mark_every_contended_cycle() {
+        #[rustfmt::skip]
+        let rows: &[(usize, u32, u64, &[u64], &[u64])] = &[
+            // bank, n, start, contended, core lost
+            (0, 5, 15, &[15, 16, 17, 18, 19], &[19]),   // ar0l5k16m0
+            (0, 6, 15, &[15, 16, 17, 18, 19], &[19]),   // ar0l6k16m0
+            (0, 5, 14, &[15, 16, 17, 18], &[18]),       // ar0l5k16m0 (+3)
+            (0, 4, 15, &[15, 16, 17, 18], &[]),         // ar0l4k16m0
+            (0, 4, 14, &[15, 16, 17], &[]),             // ar0l4k16m0 (+3)
+            (0, 2, 14, &[15], &[]),                     // ar0l2k16m0 (+3)
+            (0, 3, 23, &[23, 24, 25], &[]),             // ar0l3k24m0
+            (0, 4, 23, &[23, 24, 25, 26], &[26]),       // ar0l4k24m0
+            (0, 4, 22, &[23, 24, 25], &[25]),           // ar0l4k24m0 (+3)
+            (0, 2, 31, &[31, 32], &[]),                 // ar0l2k32m0
+            (0, 3, 31, &[31, 32, 33], &[33]),           // ar0l3k32m0
+            (0, 3, 30, &[31, 32], &[32]),               // ar0l3k32m0 (+3)
+            (0, 6, 31, &[31, 32, 33], &[33]),           // ar0l6k32m0
+            (1, 2, 19, &[19, 20], &[20]),               // ar1l2k20m0
+            (1, 3, 18, &[19], &[19]),                   // ar1l3k20m0 (+3)
+            (1, 4, 35, &[35, 36, 37, 38], &[]),         // ar1l4k36m0
+            (1, 4, 34, &[35, 36, 37], &[]),             // ar1l4k36m0 (+3)
+            (1, 5, 35, &[35, 36, 37, 38, 39], &[39]),   // ar1l5k36m0
+            (1, 5, 34, &[35, 36, 37, 38], &[38]),       // ar1l5k36m0 (+3)
+            (1, 6, 35, &[35, 36, 37, 38, 39], &[39]),   // ar1l6k36m0
+        ];
+        for &(bank, n, start, contended, lost) in rows {
+            let w = arb_row(bank, CorePort::LoadA, n, start, 0);
+            assert_eq!(
+                (w.contended.as_slice(), w.core_lost.as_slice()),
+                (contended, lost),
+                "bank {bank} n {n} g + {start}"
+            );
+            if bank == 0 {
+                let s = arb_row(bank, CorePort::Store, n, start, 0);
+                assert_eq!(
+                    (s.contended, s.core_lost),
+                    (w.contended, w.core_lost),
+                    "stores, n {n} g + {start}"
                 );
             }
         }
+    }
 
-        // No DMA urgent this cycle: the core is not permanently demoted by
-        // having lost to urgency -- it must win the very next non-urgent
-        // cycle.
-        let a = arb.arbitrate(&demands, &[]);
-        assert!(!a.core_lost(), "with no DMA urgent, the core must win -- it is not starved across cycles");
+    /// The image unit (ring probe, extra initialised words in bank 0 at 0x0C00 / 0x0C20): one
+    /// count per initialised 16-byte line of the bank, not per word and not per buffer.
+    #[test]
+    fn a_configuration_write_counts_once_per_16_byte_line_of_each_bank() {
+        let bank0 = |writes: &[(usize, usize)]| {
+            let mut c = BankAccessCounts::default();
+            for &(addr, words) in writes {
+                c.record_config_write(addr, 4 * words);
+            }
+            (c.served(0), c.served(1))
+        };
+        for words in 1..=4 {
+            assert_eq!(bank0(&[(0xC00, words)]), (1, 0), "{words} words in one line");
+        }
+        assert_eq!(bank0(&[(0xC00, 4), (0xC20, 1)]), (2, 0), "5 words, two buffers, two lines");
+        assert_eq!(bank0(&[(0xC00, 12)]), (2, 1), "12 words in one buffer: lines b0, b1, b0");
+    }
+
+    /// Ring camp, `variant` against a core that loads bank 0 every cycle from camp + 0
+    /// (silicon: 90 consecutive loads), with `extra` (address, words) initialised in bank 0.
+    fn ring_camp(dma: Requester, arrivals: &[u64], extra: &[(usize, usize)]) -> Window {
+        let (mut arb, mut counts) = lock_fetch_history(None);
+        for &(addr, words) in extra {
+            counts.record_config_write(addr, 4 * words);
+        }
+        run_bank(&mut arb, &mut counts, 0, Some((CorePort::LoadA, 0, 90)), &[(dma, arrivals)], 120)
+    }
+
+    /// T4 (ring order): each of the four DMA channels against a camping core is let in at one
+    /// residue of the count, the same one (camp cycle mod 5 = 2 from the common count), after
+    /// 0..4 refusals, and the core loses exactly those cycles. Arrivals are the first cycles of
+    /// the measured contact runs (one run per DMA request); the run ends and the losses are
+    /// the rule's.
+    #[test]
+    fn ring_each_dma_channel_against_a_camping_core_wins_on_the_same_single_residue() {
+        #[rustfmt::skip]
+        let rows: &[(Requester, &[u64], &[u64])] = &[
+            // rgm0 r1 (grant + 2)
+            (Requester::Mm2s(0), &[3, 9, 14, 19, 24, 32, 40, 48], &[7, 12, 17, 22, 27, 32, 42, 52]),
+            // rgm1 r1 (grant + 3)
+            (Requester::Mm2s(1), &[4, 9, 14, 19, 25, 33, 41, 49], &[7, 12, 17, 22, 27, 37, 42, 52]),
+            // rgs0 r2
+            (Requester::S2mm(0), &[18, 26, 34, 42, 50, 58, 66, 74], &[22, 27, 37, 42, 52, 62, 67, 77]),
+            // rgs1 r1
+            (Requester::S2mm(1), &[27, 35, 43, 51, 59, 67, 75, 83], &[27, 37, 47, 52, 62, 67, 77, 87]),
+        ];
+        for &(dma, arrivals, lost) in rows {
+            let w = ring_camp(dma, arrivals, &[]);
+            assert_eq!(w.core_lost, lost, "{dma:?}");
+            let served: Vec<u64> = w.dma_served.iter().map(|&(_, t)| t).collect();
+            assert_eq!(served, lost, "{dma:?}: served exactly where the core lost");
+            for &t in lost {
+                assert_eq!(t % 5, 2, "{dma:?}: the one residue");
+            }
+            // every refused cycle and the won one are conflicts: the runs arrival..=served
+            let runs: Vec<u64> = arrivals.iter().zip(lost).flat_map(|(&a, &l)| a..=l).collect();
+            assert_eq!(w.contended, runs, "{dma:?}");
+        }
+    }
+
+    /// T5 (ring pads): one extra initialised line in bank 0 moves the residue from 2 to 1, two
+    /// lines (in two buffers, or one 12-word buffer over lines b0, b1, b0) to 0.
+    #[test]
+    fn ring_pad_lines_shift_the_dma_turn() {
+        #[rustfmt::skip]
+        let rows: &[(&[(usize, usize)], &[u64], &[u64])] = &[
+            (&[(0xC00, 1)], &[3, 8, 13, 18, 24, 32, 40, 48], &[6, 11, 16, 21, 26, 36, 41, 51]),          // p1 r1
+            (&[(0xC00, 4)], &[3, 8, 13, 18, 24, 32, 40, 48], &[6, 11, 16, 21, 26, 36, 41, 51]),          // p4 r2
+            (&[(0xC00, 4), (0xC20, 1)], &[3, 7, 12, 17, 24, 32, 40, 48], &[5, 10, 15, 20, 25, 35, 40, 50]), // p5 r2
+            (&[(0xC00, 12)], &[3, 7, 12, 17, 24, 32, 40, 48], &[5, 10, 15, 20, 25, 35, 40, 50]),         // p12o r1
+        ];
+        for &(extra, arrivals, lost) in rows {
+            let w = ring_camp(Requester::Mm2s(0), arrivals, extra);
+            assert_eq!(w.core_lost, lost, "pads {extra:?}");
+        }
+    }
+
+    /// T6: two DMA channels with the core camping share the ONE DMA turn: the core loses
+    /// exactly every 5th cycle at the residue while either waits (rgmm n120 / rgms n090: 16
+    /// losses, camp + 7, 12, ..., 82, never two in a row), and a served access to one channel
+    /// advances the count the other sees. Which channel takes a turn is the rotor's (unmeasured).
+    #[test]
+    fn two_dma_channels_with_a_camping_core_share_one_dma_turn() {
+        let (mut arb, mut counts) = lock_fetch_history(None);
+        let m0: &[u64] = &[3, 9, 14, 19, 24, 32, 40, 48];
+        let m1: &[u64] = &[3, 9, 14, 19, 24, 32, 40, 48];
+        let w = run_bank(
+            &mut arb,
+            &mut counts,
+            0,
+            Some((CorePort::LoadA, 0, 120)),
+            &[(Requester::Mm2s(0), m0), (Requester::Mm2s(1), m1)],
+            140,
+        );
+        let expected: Vec<u64> = (0..16).map(|i| 7 + 5 * i).collect();
+        assert_eq!(w.core_lost, expected);
+        assert_eq!(w.dma_served.len(), 16);
+    }
+
+    /// Two DMA channels meeting at a bank with the core silent raise the conflict event (ring
+    /// mx: one CONFLICT_DM_BANK_0 per run, 6 of 6). Which one is served is not measured.
+    #[test]
+    fn two_dma_channels_meeting_at_a_bank_are_a_conflict() {
+        let mut arb = BankArbiter::new();
+        let mut counts = BankAccessCounts::default();
+        let a = arb.arbitrate(&[(Requester::Mm2s(0), 1), (Requester::Mm2s(1), 1)], &mut counts);
+        assert_eq!(a.contended_banks, 1);
+        assert_eq!((a.granted.len(), a.lost.len()), (1, 1));
+        assert_eq!(counts.served(0), 1);
+    }
+
+    /// Served accesses advance the count, contended or not, one per bank per cycle; refused
+    /// requests add nothing.
+    #[test]
+    fn only_served_accesses_advance_the_count() {
+        let mut arb = BankArbiter::new();
+        let mut counts = BankAccessCounts::default();
+        arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 0b01), (Requester::S2mm(0), 0b10)], &mut counts);
+        assert_eq!((counts.served(0), counts.served(1)), (1, 1));
+        arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 0b01), (Requester::S2mm(0), 0b01)], &mut counts);
+        assert_eq!(counts.served(0), 2, "a contended bank serves one access, the loser adds nothing");
+    }
+
+    /// The cross-class bound (silicon sticky captures: 113 five-cycle runs, all ending with the
+    /// DMA served, none longer): whatever the count's phase, a DMA waiting against a core that
+    /// wants the bank every cycle is served within 5 contended cycles, and then the core again.
+    #[test]
+    fn a_camping_core_lets_a_waiting_dma_in_within_one_period() {
+        for phase in 0..5u64 {
+            let mut arb = BankArbiter::new();
+            let mut counts = BankAccessCounts::default();
+            for _ in 0..phase {
+                lone_core_access(&mut arb, &mut counts, CorePort::LoadA, 0);
+            }
+            let w = run_bank(
+                &mut arb,
+                &mut counts,
+                0,
+                Some((CorePort::LoadA, 0, 40)),
+                &[(Requester::S2mm(0), &[0, 0, 0, 0])],
+                50,
+            );
+            let served: Vec<u64> = w.dma_served.iter().map(|&(_, t)| t).collect();
+            assert!(served[0] < 5, "phase {phase}: first DMA turn within 5 cycles ({served:?})");
+            assert!(
+                served.windows(2).all(|p| p[1] - p[0] == 5),
+                "phase {phase}: then every 5th ({served:?})"
+            );
+            assert_eq!(w.core_lost, served);
+        }
     }
 
     #[test]
@@ -473,8 +847,8 @@ mod tests {
         let mut arb = BankArbiter::new();
         let d =
             [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::Core(CorePort::Store), 1u16 << 0)];
-        let first = arb.arbitrate(&d, &[]).lost;
-        let second = arb.arbitrate(&d, &[]).lost;
+        let first = arb.arbitrate(&d, &mut BankAccessCounts::default()).lost;
+        let second = arb.arbitrate(&d, &mut BankAccessCounts::default()).lost;
         assert_eq!(first.len(), 1);
         assert_ne!(first, second, "within-core rotation still alternates the loser");
     }
@@ -482,8 +856,10 @@ mod tests {
     #[test]
     fn no_contention_everyone_wins() {
         let mut arb = BankArbiter::new();
-        let a =
-            arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 1)], &[]);
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 1)],
+            &mut BankAccessCounts::default(),
+        );
         assert!(a.lost.is_empty());
         assert_eq!(a.contended_banks, 0);
     }
@@ -491,30 +867,12 @@ mod tests {
     #[test]
     fn same_bank_collision_grants_exactly_one() {
         let mut arb = BankArbiter::new();
-        let a =
-            arb.arbitrate(&[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)], &[]);
+        let a = arb.arbitrate(
+            &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)],
+            &mut BankAccessCounts::default(),
+        );
         assert_eq!(a.lost.len(), 1, "exactly one requester loses a single bank");
         assert_eq!(a.contended_banks, 1 << 0);
-    }
-
-    #[test]
-    fn core_beats_the_same_dma_every_cycle_without_urgency() {
-        // Class priority replaces the old symmetric round-robin expectation:
-        // the core does not merely tend to win, it wins EVERY contended
-        // cycle against a non-urgent DMA, with no alternation at all. AM020's
-        // "round-robin to avoid starving any requester" is still the anti-
-        // starvation mechanism, but it now operates WITHIN a priority class
-        // (see `two_core_ports_still_rotate_within_the_core_class`) plus
-        // urgency escalation across classes (see
-        // `dma_is_not_starved_because_urgency_escalates_before_underflow`),
-        // not as a single flat rotor over every requester.
-        let mut arb = BankArbiter::new();
-        let demands = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        for cycle in 0..10 {
-            let a = arb.arbitrate(&demands, &[]);
-            assert!(!a.core_lost(), "cycle {cycle}: the core must win every contended cycle");
-            assert!(a.lost.contains(&Requester::S2mm(0)), "cycle {cycle}: the DMA must lose every cycle");
-        }
     }
 
     #[test]
@@ -523,40 +881,11 @@ mod tests {
         // Core needs banks 0 and 1; DMA contends only on bank 1.
         let a = arb.arbitrate(
             &[(Requester::Core(CorePort::LoadA), (1 << 0) | (1 << 1)), (Requester::S2mm(0), 1 << 1)],
-            &[],
+            &mut BankAccessCounts::default(),
         );
         // Whoever loses bank 1 is reported; contention is only on bank 1.
         assert_eq!(a.contended_banks, 1 << 1);
         assert_eq!(a.lost.len(), 1);
-    }
-
-    #[test]
-    fn dma_is_not_starved_because_urgency_escalates_before_underflow() {
-        // AM020 ch.2:166's anti-starvation guarantee didn't disappear, it
-        // MOVED: a non-urgent DMA losing every single cycle to the core
-        // (see `core_beats_the_same_dma_every_cycle_without_urgency`) is not
-        // "starvation" in the AM020 sense, because the real system asserts
-        // `urgent` well before the egress FIFO actually underflows
-        // (`DmaEngine::urgent_channels` / `transfer_is_urgent`) -- and an
-        // urgent DMA overrides the core outright (`urgent_dma_beats_the_core`).
-        // Model that lifecycle: the DMA loses while it can afford to wait,
-        // then wins the instant urgency is asserted, then the core resumes
-        // winning once the pressure is off -- urgency is a per-cycle
-        // override, not a lasting demotion of the core.
-        let mut arb = BankArbiter::new();
-        let demands = [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::S2mm(0), 1u16 << 0)];
-
-        for cycle in 0..5 {
-            let a = arb.arbitrate(&demands, &[]);
-            assert!(a.lost.contains(&Requester::S2mm(0)), "cycle {cycle}: DMA loses while it can wait");
-        }
-
-        let a = arb.arbitrate(&demands, &[Requester::S2mm(0)]);
-        assert!(!a.lost.contains(&Requester::S2mm(0)), "urgency wins the grant before FIFO underflow");
-        assert!(a.core_lost());
-
-        let a = arb.arbitrate(&demands, &[]);
-        assert!(!a.core_lost(), "the core resumes winning immediately once no DMA is urgent");
     }
 
     /// One requester in the starvation sweep: who it is, the bank mask it
@@ -603,7 +932,10 @@ mod tests {
         let mut arb = BankArbiter::new();
         for _ in 0..skew {
             // Contend bank 0 only: bank 0's rotor advances, the others do not.
-            arb.arbitrate(&[(Requester::Core(CorePort::Store), 1 << 0), (Requester::Mm2s(1), 1 << 0)], &[]);
+            arb.arbitrate(
+                &[(Requester::Core(CorePort::Store), 1 << 0), (Requester::Mm2s(1), 1 << 0)],
+                &mut BankAccessCounts::default(),
+            );
         }
 
         // Per requester: (cycle the request issued, banks still unserved).
@@ -627,7 +959,7 @@ mod tests {
                 continue;
             }
 
-            let a = arb.arbitrate(&demands, &[]);
+            let a = arb.arbitrate(&demands, &mut BankAccessCounts::default());
             contended |= a.contended_banks;
             for (i, r) in reqs.iter().enumerate() {
                 let Some((issued, unserved)) = pending[i] else {
@@ -685,13 +1017,11 @@ mod tests {
         // all-or-nothing RETRY is what starves. This test pins that fact so
         // nobody re-introduces the all-or-nothing retry.
         //
-        // All three parties are DMA, not the core: under class priority the
-        // core would win any bank it contends UNCONDITIONALLY (see the module
-        // docs), which would make this about cross-class priority instead of
-        // the within-class rotor phase-lock the test exists to pin. The
-        // within-class math is unaffected by class priority (a bank with no
-        // core wanter and no urgent DMA falls through to the plain flat rotor,
-        // same as before this arbiter had classes at all).
+        // All three parties are DMA, not the core: a core-versus-DMA bank is
+        // decided by the served-access count (module docs), which would make
+        // this about the count instead of the within-class rotor phase-lock the
+        // test exists to pin. A bank with no core wanter falls through to the
+        // plain rotor.
         let victim = Requester::S2mm(1);
         let reqs = |sticky| {
             vec![
@@ -750,11 +1080,9 @@ mod tests {
         // adversarial phases rather than hardcoding one -- the claim is that a
         // starving phase EXISTS for a real DMA channel against real rivals (two
         // other DMA channels, each hammering one of its banks), not that any
-        // particular skew is magic. Both rivals are DMA, not a core port:
-        // under class priority a core rival would win its bank UNCONDITIONALLY
-        // (see the module docs), which would make the victim's non-starvation
-        // hinge on cross-class urgency instead of on the within-class rotor
-        // this test exists to pin. Starvation is checked as zero grants over
+        // particular skew is magic. Both rivals are DMA, not a core port: a
+        // core rival's bank would be decided by the served-access count (see the
+        // module docs), not by the within-class rotor this test exists to pin. Starvation is checked as zero grants over
         // CYCLES cycles of continuous demand.
         let victim = Requester::Mm2s(0);
         let rivals = [(Requester::S2mm(0), 1u16 << 0), (Requester::S2mm(1), 1u16 << 1)];
@@ -839,17 +1167,12 @@ mod tests {
         // vacuous cell (rivals that never collide with the victim) fails loudly
         // instead of passing for free.
         //
-        // All 5 mixes are now WITHIN one priority class (core-vs-core or
-        // DMA-vs-DMA), never core-vs-DMA: class priority (module docs) makes a
-        // continuously-present, non-urgent DMA lose every single cycle to the
-        // core by DESIGN, so a plain "nobody starves" sweep can no longer
-        // include that pairing without hard-coding a false claim. This sweep
-        // proves what's still true unconditionally -- the round-robin retry
-        // bound holds WITHIN a class, for every mask/period/phase/skew the
-        // model generates. Cross-class fairness is a SEPARATE, urgency-gated
-        // guarantee, proven by `core_beats_the_same_dma_every_cycle_without_urgency`,
-        // `urgent_dma_beats_the_core`, `dma_is_not_starved_because_urgency_escalates_before_underflow`,
-        // and `two_urgent_dma_channels_rotate_and_the_core_still_wins_when_neither_is_urgent`.
+        // All 5 mixes are WITHIN one class (core-vs-core or DMA-vs-DMA): a
+        // core-versus-DMA bank is decided by the served-access count, not the
+        // rotor, and has its own bound (one turn per BANK_ARBITER_PERIOD served
+        // cycles, `a_camping_core_lets_a_waiting_dma_in_within_one_period`).
+        // This sweep proves the round-robin retry bound WITHIN a class, for
+        // every mask/period/phase/skew the model generates.
         let victim_mixes: [(Requester, Vec<Requester>); 5] = [
             // core self-collision vs 1 other port
             (Requester::Core(CorePort::LoadA), vec![Requester::Core(CorePort::LoadB)]),
@@ -957,7 +1280,7 @@ mod tests {
             [(Requester::Core(CorePort::LoadA), 1u16 << 0), (Requester::Core(CorePort::Store), 1u16 << 0)];
 
         // Cycle 0: both ports present, one wins, the bundle stalls.
-        let c0 = arb.arbitrate(&full, &[]);
+        let c0 = arb.arbitrate(&full, &mut BankAccessCounts::default());
         assert_eq!(c0.contended_banks, 1 << 0);
         assert_eq!(c0.granted.len(), 1, "a single-port bank grants exactly one port");
         assert_eq!(c0.lost.len(), 1);
@@ -981,7 +1304,7 @@ mod tests {
             .collect();
         assert_eq!(retry.len(), 1, "only the unserved port re-presents");
 
-        let c1 = arb.arbitrate(&retry, &[]);
+        let c1 = arb.arbitrate(&retry, &mut BankAccessCounts::default());
         assert_eq!(c1.contended_banks, 0, "nothing left to contend with");
         assert!(c1.lost.is_empty());
         assert!(!c1.core_lost(), "the bundle retires after exactly ONE stall cycle");
@@ -1000,16 +1323,18 @@ mod tests {
         // requester per contended bank, so only checking `lost.len()` never
         // distinguishes them.
         let mut arb = BankArbiter::new();
-        let d0 = [(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::S2mm(0), 1 << 0)];
-        let first = arb.arbitrate(&d0, &[]);
+        // Two DMA channels: a core-versus-DMA bank is decided by the count, not
+        // the rotor, so only a same-class pair exercises the rotor.
+        let d0 = [(Requester::Mm2s(0), 1 << 0), (Requester::S2mm(0), 1 << 0)];
+        let first = arb.arbitrate(&d0, &mut BankAccessCounts::default());
 
         // Bank 3 has never been touched. If its rotor is truly independent,
         // its very first contention must resolve exactly like bank 0's very
         // first contention did (both start from a fresh rotor). A shared
         // rotor would instead carry over bank 0's post-arbitration state and
         // flip the winner.
-        let d3 = [(Requester::Core(CorePort::LoadA), 1 << 3), (Requester::S2mm(0), 1 << 3)];
-        let a = arb.arbitrate(&d3, &[]);
+        let d3 = [(Requester::Mm2s(0), 1 << 3), (Requester::S2mm(0), 1 << 3)];
+        let a = arb.arbitrate(&d3, &mut BankAccessCounts::default());
         assert_eq!(a.contended_banks, 1 << 3);
         assert_eq!(a.lost, first.lost, "bank 3's rotor must be independent of bank 0's");
     }
@@ -1023,7 +1348,7 @@ mod tests {
         let mut arb = BankArbiter::new();
         let a = arb.arbitrate(
             &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Core(CorePort::Store), 1 << 0)],
-            &[],
+            &mut BankAccessCounts::default(),
         );
         assert_eq!(a.contended_banks, 1 << 0, "same-bank load+store must contend");
         assert_eq!(a.lost.len(), 1, "exactly one of the two ports loses");
@@ -1041,7 +1366,7 @@ mod tests {
         let mut arb = BankArbiter::new();
         let a = arb.arbitrate(
             &[(Requester::Core(CorePort::LoadA), 1 << 0), (Requester::Core(CorePort::Store), 1 << 1)],
-            &[],
+            &mut BankAccessCounts::default(),
         );
         assert_eq!(a.contended_banks, 0, "different physical banks must not contend");
         assert!(a.lost.is_empty());
@@ -1060,7 +1385,7 @@ mod tests {
                 (Requester::Core(CorePort::LoadB), 1 << 0),
                 (Requester::Core(CorePort::Store), 1 << 0),
             ],
-            &[],
+            &mut BankAccessCounts::default(),
         );
         assert_eq!(a.contended_banks, 1 << 0);
         assert_eq!(a.lost.len(), 2, "two of the three ports must lose a single-port bank");

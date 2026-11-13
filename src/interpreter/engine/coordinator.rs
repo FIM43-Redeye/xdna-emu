@@ -123,9 +123,9 @@ struct CoreState {
     /// a multi-cycle conflict renders as one B..E span rather than one pulse
     /// per conflicting cycle. See `mem_stall_edge`.
     mem_stall_active: bool,
-    /// The core was frozen for a gather's memory cycle in this cycle's execute phase
-    /// (`StepResult::Frozen { memory_stall: true, .. }`): a MEMORY_STALL cycle like a lost
-    /// bank arbitration. Consumed by Phase E.
+    /// The core was frozen for a memory cycle in this cycle's execute phase (a gather's, or
+    /// an access that lost its bank: `StepResult::Frozen { memory_stall: true, .. }`).
+    /// Consumed by Phase E.
     memory_frozen: bool,
 }
 
@@ -441,7 +441,7 @@ impl InterpreterEngine {
     /// `origin_D` during execution -- so the export reproduces the exact
     /// constants the run used, not an independently-resolved copy.
     pub fn export_origin_d_sidecar(&self) -> serde_json::Value {
-        let (d_h, d_v, core_off, mem_off, calibrated) = self.device.effective_broadcast_timing();
+        let (d_h, d_v, core_off, mem_off, memtile_off, calibrated) = self.device.effective_broadcast_timing();
 
         let sources = self.device.flood_sources();
         let single = if sources.len() == 1 {
@@ -453,8 +453,14 @@ impl InterpreterEngine {
         let mut modules = serde_json::Map::new();
         if let Some((col, row)) = single {
             for (c, r, kind, d) in self.device.origin_d_table(
-                col, row, 15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
-                d_h, d_v, core_off, mem_off,
+                col,
+                row,
+                15, // BROADCAST channel 15 = timer-reset; matches flood_sources().
+                d_h,
+                d_v,
+                core_off,
+                mem_off,
+                memtile_off,
             ) {
                 modules.insert(format!("{c}|{r}|{kind}"), serde_json::json!(d));
             }
@@ -740,16 +746,17 @@ impl InterpreterEngine {
     ///   Phase 1: sync DMA start requests from tiles to DMA engines.
     ///   Phase A: each DMA channel declares the banks it intends to touch this
     ///            cycle (`DmaEngine::peek_bank_demand`). No transfer.
-    ///   Phase B: each core that can issue declares its next bundle's bank
-    ///            demand (`CoreInterpreter::peek_bank_demand`). A core stalled
-    ///            on a lock/DMA/stream declares nothing. No commit.
+    ///   Phase B: each core declares the banks of its accesses in flight whose
+    ///            memory stage (issue + 4) is this cycle
+    ///            (`CoreInterpreter::peek_bank_demand`). No commit.
     ///   Phase C: per compute tile, per physical bank, round-robin arbitration
     ///            (`BankArbiter::arbitrate`).
     ///   Phase D: commit the winners, withhold the losers --
-    ///              core lost -> `stall_for_bank` (1 cycle, PC unchanged, the
-    ///                           SAME bundle retries next cycle) and its
-    ///                           `step` is skipped ENTIRELY (Phase 2 below);
-    ///              core won  -> step the core normally;
+    ///              core lost -> the core is frozen this cycle (its step is a
+    ///                           `Frozen` memory-stall cycle; the access
+    ///                           retries next cycle, every access in flight
+    ///                           slips one cycle);
+    ///              core won  -> the access is done; step the core normally;
     ///              DMA lost  -> the channel's FSM step is skipped, so it
     ///                           re-presents the identical demand next cycle;
     ///              DMA won   -> transfers (Phase 3).
@@ -790,6 +797,14 @@ impl InterpreterEngine {
         // propagation) can time-stamp events with the right cycle. Also
         // propagates to DMA engines for DMA-side trace events.
         self.device.array.set_dma_cycle(self.total_cycles);
+
+        // Core lock releases performed last cycle reach their lock units now, before anyone
+        // looks at a lock this cycle (`Tile::deliver_core_lock_releases`).
+        for tile in &mut self.device.array.tiles {
+            if !tile.core_releases_in_transit.is_empty() || tile.lock_arbiter.has_arrived_releases() {
+                tile.deliver_core_lock_releases(self.total_cycles);
+            }
+        }
 
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
@@ -855,34 +870,10 @@ impl InterpreterEngine {
                     ctx.cycle_counter_base = timer.wrapping_sub(ctx.cycles);
                 }
 
-                // Phase D (core): this core lost a bank it needs, so its
-                // bundle does NOT commit this cycle. `stall_for_bank` already
-                // charged the one-cycle stall during arbitration; calling
-                // `step` as well would clear WaitBank, execute the bundle
-                // anyway, and double-charge the tick -- so the two are
-                // strictly exclusive, enforced by this `continue`. The PC is
-                // untouched, so the SAME bundle re-arbitrates next cycle
-                // (AM020 ch.2:166 retry contract).
-                if arbitration[self.device.array.tile_index(col as u8, row as u8)].core_lost {
-                    // Mirror the stall into Core_Status the same way every
-                    // other stall class does (task 6 review, Important-1): a
-                    // WaitBank cycle IS a memory-bank access that lost
-                    // arbitration, i.e. exactly the AM025 Memory_Stall_*
-                    // condition, so it gets the same `mem` bit as a real
-                    // memory stall. Without this, Core_Status read while
-                    // bank-stalled would show a running core, and a
-                    // Debug_Control2 MEM_STALL_HALT enable would never fire
-                    // on a lost bank arbitration. `update_stalls` also
-                    // re-evaluates the stall-halt latch, so that enable now
-                    // takes effect here exactly as it does for the other
-                    // stall classes below.
-                    if let Some(tile) = self.device.tile_mut(col, row) {
-                        tile.core_debug.update_stalls(true, false, false, false);
-                    }
-                    all_halted = false;
-                    any_running = true;
-                    continue;
-                }
+                // Phase D (core): a core whose access lost its bank was told so in
+                // `arbitrate_memory_banks` (`settle_bank_arbitration`); its step is this
+                // cycle's frozen memory cycle (`StepResult::Frozen`, memory stall), whatever
+                // bundle it was about to issue.
 
                 // AIE2 lock quadrant routing: copy neighbor locks before stepping,
                 // then write changes back after. Per mlir-aie getLockLocalBaseIndex:
@@ -1213,7 +1204,11 @@ impl InterpreterEngine {
                         if let Some(neighbor) = device.tile_mut(ncol, nrow) {
                             for i in 0..modified.len().min(neighbor.locks.len()) {
                                 let delta = (modified[i].value as i16) - (neighbor.locks[i].value as i16);
-                                if delta != 0 {
+                                if delta > 0 {
+                                    // A release reaches the neighbour's lock unit the next
+                                    // cycle, as an own-tile one (`Tile::send_core_lock_release`).
+                                    neighbor.send_core_lock_release(i, delta as i8);
+                                } else if delta != 0 {
                                     neighbor.defer_core_lock_release(i, delta as i8);
                                 }
                             }
@@ -1733,14 +1728,16 @@ impl InterpreterEngine {
         // Phase E: emit this cycle's bank-arbitration events.
         //
         // Both events come from the SAME arbitration that already decided who
-        // commits (Phases A-C), so they land in the cycle the contention
-        // actually happened -- not a cycle late, and not from a second,
-        // independently-scoped conflict detector (the executor's old
-        // commit-time detector is retired; see `record_memory_access`).
+        // commits (Phases A-C), not from a second, independently-scoped
+        // conflict detector (the executor's old commit-time detector is
+        // retired; see `record_memory_access`).
         //
         //   * CONFLICT_DM_BANK_N on the memory-module trace unit, once per
-        //     bank that had more than one requester this cycle.
-        //   * MEMORY_STALL on the core-module trace unit, as a held LEVEL:
+        //     bank that had more than one requester this cycle, in that cycle:
+        //     every cycle the core and a DMA (or two DMAs) wanted the bank,
+        //     whoever was served, and never a lone retry (silicon, arb probe).
+        //   * MEMORY_STALL on the core-module trace unit, in each cycle the
+        //     core lost (its frozen memory cycle; silicon, arb probe), as a held LEVEL:
         //     `mem_stall_edge` turns the per-cycle "core lost" boolean into
         //     rising/falling edges, so a sustained stall renders as one B..E
         //     span instead of one pulse per cycle (HW samples MEMORY_STALL as
@@ -1767,10 +1764,15 @@ impl InterpreterEngine {
                     // cycle (AM020 ch.4:69 -- a conflict on any port stalls the
                     // whole datapath). Cycle-stat counter ticks every stalled
                     // cycle, independent of the trace-edge collapsing.
-                    let stalled = arb.core_lost || std::mem::take(&mut self.cores[core_idx].memory_frozen);
-                    if stalled {
+                    let frozen = std::mem::take(&mut self.cores[core_idx].memory_frozen);
+                    if arb.core_lost || frozen {
                         self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
                     }
+                    // MEMORY_STALL is stamped in the lost cycle itself, the core's frozen
+                    // memory cycle, as a gather's (silicon, arb probe: issue + 4 in the core
+                    // module's timer, 82 of 82 loss rows; gather `gat`: issue + 4). A loss
+                    // while the core is held on a lock still raises it (unmeasured).
+                    let stalled = arb.core_lost || frozen;
 
                     let Some(active) = mem_stall_edge(stalled, self.cores[core_idx].mem_stall_active) else {
                         continue;
@@ -2229,14 +2231,10 @@ impl InterpreterEngine {
     /// Phase 2 (it cannot issue). Declaring for them would deny the other agent
     /// a bank against a requester that never runs.
     ///
-    /// The core's stall is applied HERE, not in Phase 2, so that `step` and
-    /// `stall_for_bank` can never both run for one core in one cycle: Phase 2
-    /// skips a core whose `core_lost` is set. `accumulate_bank_grants` runs
-    /// after `stall_for_bank` (which asserts the sticky mask is empty on a
-    /// FRESH stall) and feeds the ports that already won back into the next
-    /// cycle's peek, so a bundle whose own ports collide converges instead of
-    /// livelocking. The mask is reset inside `try_resume_stall` when WaitBank
-    /// resolves -- the coordinator keeps no second copy.
+    /// The core's requests are the accesses of bundles it issued earlier whose memory stage
+    /// is this cycle (`CoreInterpreter::peek_bank_demand`); the outcome goes straight back to
+    /// it (`settle_bank_arbitration`): the served banks are done, and a loss freezes the core
+    /// for this cycle, which its step in Phase 2 turns into a `Frozen` memory-stall cycle.
     fn arbitrate_memory_banks(&mut self) -> Vec<TileArbitration> {
         let mut out = vec![TileArbitration::default(); self.device.array.tiles.len()];
 
@@ -2263,18 +2261,12 @@ impl InterpreterEngine {
                 // slots cover every real case with no heap allocation.
                 let mut demands: SmallVec<[(Requester, u16); 5]> = SmallVec::new();
                 let mut dma_demand = 0u16;
-                // Egress-FIFO-urgent DMA channels (Task 2's `urgent_channels`):
-                // read alongside `peek_bank_demand` from the same `engine`/
-                // `layout` so urgency and demand agree on the same cycle's
-                // `staged_words` state.
-                let mut urgent: SmallVec<[Requester; 4]> = SmallVec::new();
                 if self.device.array.clock().is_module_active(c, r, ModuleKind::Dma)
                     && !self.device.array.clock().is_adaptive_dma_engaged(c, r)
                 {
                     if let Some(engine) = self.device.array.dma_engine(c, r) {
                         demands.extend(engine.peek_bank_demand(layout));
                         dma_demand = demands.iter().fold(0u16, |m, (_, banks)| m | banks);
-                        urgent.extend(engine.urgent_channels(layout));
                     }
                 }
 
@@ -2282,19 +2274,19 @@ impl InterpreterEngine {
                 if self.cores[core_idx].enabled
                     && self.device.array.clock().is_module_active(c, r, ModuleKind::Core)
                 {
-                    let tile = &self.device.array.tiles[tile_idx];
                     let core = &mut self.cores[core_idx];
-                    demands.extend(core.interpreter.peek_bank_demand(&core.context, tile, layout));
+                    demands.extend(core.interpreter.peek_bank_demand(&core.context));
                 }
 
                 if demands.is_empty() {
                     continue;
                 }
 
-                // Phase C: arbitrate. `urgent` overrides round-robin fairness
-                // for DMA channels whose egress FIFO is near underflow, so a
-                // starving stream wins the bank over an otherwise-fair core.
-                let arb = self.bank_arbiters[tile_idx].arbitrate(&demands, &urgent);
+                // Phase C: arbitrate. The tile's served-access count decides
+                // core versus DMA (`bank_arbiter` module docs) and advances
+                // for every access a bank serves this cycle.
+                let arb = self.bank_arbiters[tile_idx]
+                    .arbitrate(&demands, &mut self.device.array.tiles[tile_idx].bank_access_counts);
 
                 out[tile_idx].contended_banks = arb.contended_banks;
                 out[tile_idx].denied_dma =
@@ -2302,23 +2294,13 @@ impl InterpreterEngine {
 
                 out[tile_idx].dma_demand = dma_demand;
 
-                if arb.core_lost() {
-                    out[tile_idx].core_lost = true;
-                    let core = &mut self.cores[core_idx];
-                    core.interpreter.stall_for_bank(&mut core.context);
-                    core.interpreter.accumulate_bank_grants(arb.granted_core_banks());
-                } else {
-                    // Constraint: a core that is NOT mid bank-stall must carry
-                    // no sticky served-ports mask -- otherwise the next bundle
-                    // would silently have those ports dropped from arbitration.
-                    // (`try_resume_stall`'s WaitBank arm owns the reset; the
-                    // coordinator keeps no second copy of the mask.)
-                    debug_assert!(
-                        self.cores[core_idx].interpreter.status() == CoreStatus::WaitBank
-                            || self.cores[core_idx].interpreter.bank_served_banks().is_empty(),
-                        "a freshly-issuing bundle must start with an empty served mask"
-                    );
-                }
+                out[tile_idx].core_lost = arb.core_lost();
+                let core = &mut self.cores[core_idx];
+                core.interpreter.settle_bank_arbitration(
+                    &core.context,
+                    arb.granted_core_banks(),
+                    arb.core_lost(),
+                );
             }
         }
 
@@ -3003,61 +2985,17 @@ mod tests {
         assert_eq!(engine.enabled_cores(), 0);
     }
 
-    #[test]
-    fn wait_bank_core_does_not_count_as_all_cores_blocked() {
-        // A bank-stalled core is making BOUNDED progress: the arbiter is
-        // round-robin over a fixed requester set and provably
-        // starvation-free (see `no_requester_starves_under_the_retry_contract`
-        // near the bank arbiter), so the core is guaranteed to win its bank
-        // within a bounded number of cycles. That's fundamentally unlike
-        // WaitingLock/WaitingDma/WaitingStream, which may block indefinitely
-        // (e.g. a lock another core never releases).
-        //
-        // all_cores_blocked()'s only consumer is the FFI warm-up break
-        // (crates/xdna-emu-ffi/src/backend.rs), which means "stop warming up,
-        // NO core can make forward progress." If WaitBank counted here, the
-        // common warm-up shape -- N-1 cores parked on WaitingLock while the
-        // last core is still mid init-loop -- would flip all_cores_blocked()
-        // true the instant that last core self-collides on a bank for a
-        // single cycle, breaking warm-up before the init loop finishes and
-        // letting NPU instructions write tile memory too early.
-        let mut engine = InterpreterEngine::new_npu1();
-        engine.enable_core(1, 2);
-
-        let idx = engine.core_index(1, 2).expect("(1,2) is a valid compute tile");
-        let core_state = &mut engine.cores[idx];
-        core_state.interpreter.stall_for_bank(&mut core_state.context);
-
-        assert_eq!(engine.core_status(1, 2), Some(CoreStatus::WaitBank));
-        assert!(
-            !engine.all_cores_blocked(),
-            "a WaitBank core must not count toward all_cores_blocked() -- \
-             it is bounded-progress, not indefinitely blocked"
-        );
-    }
-
     /// End-to-end: a core storing into physical bank 0 every cycle while an
-    /// urgent MM2S DMA channel reads from the SAME bank must actually lose
-    /// some of those cycles to the arbiter -- and pay for them.
-    ///
-    /// The class-priority bank arbiter (c1e404a5/c01ff205/a9c2e134) makes the
-    /// core beat any non-urgent DMA on a contended bank; the only DMA that
-    /// overrides the core is an *urgent* MM2S -- one whose egress staging FIFO
-    /// is at/below `DmaEngine::URGENT_WATERMARK`
-    /// (`uses_egress_staging(transfer) && transfer_is_urgent(transfer)`,
-    /// stepping.rs). So this fixture keeps the MM2S egress drained every step
-    /// (mirroring `route_dma_to_tile_switches`) to hold it near underflow --
-    /// that is what makes it urgent often enough to actually deny the core.
-    /// This is HW-faithful, not a workaround: the producer finding measured
-    /// ~18-20 core stalls on Phoenix from exactly this shape (a dense core
-    /// losing bank arbitration to an urgent, egress-draining MM2S).
+    /// MM2S DMA channel reads from the SAME bank must actually lose some of
+    /// those cycles to the arbiter -- and pay for them. The bank's served-access
+    /// count lets the waiting DMA in once in every 5 served cycles (silicon:
+    /// the producer probe's dense march-store lost 18-20 cycles per run).
     ///
     /// This is the wiring test for the request -> arbitrate -> commit loop:
-    /// the arbiter, the two peeks and `stall_for_bank` all have their own unit
+    /// the arbiter, the two peeks and the core's memory freeze all have their own unit
     /// tests, but only the coordinator can prove that a real bundle competing
     /// with a real DMA transfer over a real bank ends up stalled, that the
-    /// stall costs a cycle, and that MEMORY_STALL is emitted for it. Under the
-    /// retroactive Phase-4 observer this charged nothing.
+    /// stall costs a cycle, and that MEMORY_STALL is emitted for it.
     #[test]
     fn core_and_dma_contending_for_one_bank_costs_the_core_cycles() {
         use crate::device::dma::BdConfig;
@@ -3098,11 +3036,7 @@ mod tests {
             tile.dma_channels[2].start_queue = 0;
         }
 
-        // Drain the MM2S egress every step so its staging FIFO stays near
-        // underflow -- urgent -- instead of topping up past the watermark and
-        // losing its override. This is exactly how
-        // `urgent_channels_reports_only_a_near_underflow_mm2s`
-        // (stepping.rs:3501) keeps a channel urgent.
+        // Drain the MM2S egress every step so the channel keeps fetching.
         for _ in 0..400 {
             engine.step();
             let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
@@ -3135,11 +3069,263 @@ mod tests {
     /// doing exactly this).
     ///
     /// Reuses `core_and_dma_contending_for_one_bank_costs_the_core_cycles`'s
-    /// contention fixture -- a core storing into bank 0 every cycle against
-    /// an urgent, egress-drained MM2S reading the same bank, whose own
-    /// `memory_stalls` assertion already proves the core loses arbitration
-    /// here -- but reads the count off a core-module perf counter configured
-    /// with start_event=MEMORY_STALL(23) instead of the timing-context stat.
+    /// contention fixture -- a core storing into bank 0 every cycle against an
+    /// MM2S reading the same bank, whose own `memory_stalls` assertion already
+    /// proves the core loses arbitration here -- but reads the count off a
+    /// core-module perf counter configured with start_event=MEMORY_STALL(23)
+    /// instead of the timing-context stat.
+    /// Event semantics (silicon, lock-fetch arb probe, NPU1 2026-11): a cycle the core loses
+    /// the bank is a frozen cycle with MEMORY_STALL raised in it (core module: the losing
+    /// access's issue + 4, 82 of 82 loss rows, as a gather's frozen memory cycle), one stall
+    /// cycle per lost cycle. The silicon "+1" between MEMORY_STALL and CONFLICT_DM_BANK is a
+    /// difference of two trace units' timers, not a latency. CONFLICT_DM_BANK marks every cycle
+    /// the core and the DMA both wanted the bank, the one the DMA won included, and never the
+    /// core's lone retry after it. Same fixture as
+    /// `core_and_dma_contending_for_one_bank_costs_the_core_cycles`: a core storing into bank 0
+    /// every cycle against an MM2S reading bank 0.
+    #[test]
+    fn a_lost_bank_cycle_raises_memory_stall_in_that_cycle() {
+        use crate::device::dma::BdConfig;
+        use crate::interpreter::engine::bank_census;
+        use crate::interpreter::state::MOD_BASE_DJ;
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
+            let mut prog = [0u8; 256];
+            for chunk in prog.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&STORE_BUNDLE);
+            }
+            tile.write_program(0, &prog);
+        }
+        engine.set_core_pointer(1, 2, 0, 0x70400);
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(1, 2);
+        engine
+            .device_mut()
+            .array
+            .dma_engine_mut(1, 2)
+            .unwrap()
+            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
+            .unwrap();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0;
+        }
+
+        bank_census::enable();
+        let mut level = Vec::new(); // (cycle, MEMORY_STALL asserted at the end of it)
+        for _ in 0..300 {
+            let cycle = engine.total_cycles();
+            engine.step();
+            let tile = engine.device().array.tile(1, 2);
+            level.push((cycle, tile.core_trace.level_asserted(core_events::MEMORY_STALL)));
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let records = bank_census::take();
+        let lost: Vec<u64> = records.iter().filter(|r| r.core_lost).map(|r| r.cycle).collect();
+        let contended: Vec<u64> =
+            records.iter().filter(|r| r.contended_banks & 1 != 0).map(|r| r.cycle).collect();
+        assert!(lost.len() >= 2, "the fixture must make the core lose ({lost:?})");
+        let stalled: Vec<u64> = level.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
+        assert_eq!(stalled, lost, "MEMORY_STALL in each lost cycle, one per loss");
+        for c in &lost {
+            assert!(contended.contains(c), "the cycle the DMA won is a conflict ({c})");
+            assert!(
+                !contended.contains(&(c + 1)) || lost.contains(&(c + 1)) || {
+                    // the core's retry is contended only if the DMA wants the bank again then
+                    let r = records.iter().find(|r| r.cycle == c + 1).unwrap();
+                    r.dma_demand & 1 != 0
+                },
+                "the core's lone retry at {} is not a conflict",
+                c + 1
+            );
+        }
+    }
+
+    /// What the arb probe's tile did, in engine cycles: the cycle the core's release reached
+    /// the lock unit (LOCK_0_REL), the MM2S's grant (it leaves its lock wait), the cycles bank `bank`
+    /// was contended and the core lost, the cycles MEMORY_STALL was asserted, and the issue
+    /// cycles of `event #0` / `event #1`.
+    #[derive(Debug)]
+    struct ArbProbeRun {
+        release: u64,
+        grant: u64,
+        contended: Vec<u64>,
+        core_lost: Vec<u64>,
+        memory_stall: Vec<u64>,
+        event0: u64,
+        event1: u64,
+    }
+
+    /// The arb probe (`tools/gen_dma_lock_probe.py` arb cases) on one tile: the core runs
+    /// `event #0; rel lock 0; k nops; n accesses (loads or stores at p0); 4 nops; event #1`
+    /// (the probe's own encodings), MM2S 0 waits on lock 0 with a 64-word BD reading 0x400
+    /// (granule g in physical bank g & 1), and the banks start from the probe design's
+    /// served-access history (`lock_fetch_history`: image lines, crt0 and frame stores).
+    fn run_arb_probe(settle: usize, k: usize, n: usize, store: bool, bank: usize) -> ArbProbeRun {
+        use crate::device::bank_arbiter::test_support::lock_fetch_history;
+        use crate::device::dma::BdConfig;
+        use crate::interpreter::engine::bank_census;
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        const MOV_R2_1: [u8; 4] = [0x99, 0x07, 0x80, 0x18];
+        const NOP: [u8; 2] = [0x01, 0x00];
+        const EVENT0: [u8; 4] = [0x19, 0x10, 0x00, 0x10];
+        const EVENT1: [u8; 4] = [0x19, 0x10, 0x00, 0x12];
+        const REL_LOCK0_R2: [u8; 4] = [0x19, 0x22, 0x00, 0x16];
+        const LDA_R26_P0: [u8; 4] = [0x59, 0xb4, 0x02, 0x00];
+        const ST_R2_P0: [u8; 4] = [0x19, 0x84, 0x02, 0x08];
+        let mut prog: Vec<u8> = Vec::new();
+        prog.extend(MOV_R2_1);
+        // Settle, as the probe's delay loop does: the MM2S parks on lock 0 long before the release.
+        for _ in 0..settle {
+            prog.extend(NOP);
+        }
+        let ev0_pc = prog.len() as u32;
+        prog.extend(EVENT0);
+        prog.extend(REL_LOCK0_R2);
+        for _ in 0..k {
+            prog.extend(NOP);
+        }
+        for _ in 0..n {
+            prog.extend(if store { ST_R2_P0 } else { LDA_R26_P0 });
+        }
+        for _ in 0..4 {
+            prog.extend(NOP);
+        }
+        let ev1_pc = prog.len() as u32;
+        prog.extend(EVENT1);
+        while prog.len() < 2048 {
+            prog.extend(NOP);
+        }
+
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
+            tile.write_program(0, &prog);
+            tile.bank_access_counts = lock_fetch_history(None).1;
+        }
+        engine.set_core_pointer(1, 2, 0, 0x70400 + 0x10 * bank as u32);
+        engine.enable_core(1, 2);
+        {
+            // The chained probe: a lock-free 4-word BD (0x4000) parks the channel in front of
+            // the BD that waits on lock 0.
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            dma.configure_bd(1, BdConfig::simple_1d(0x4000, 16).with_next(0)).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(0, -1).with_release(1, 1))
+                .unwrap();
+        }
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 1;
+        }
+
+        bank_census::enable();
+        let (mut release, mut grant, mut event0, mut event1) = (None, None, None, None);
+        let mut memory_stall = Vec::new();
+        for _ in 0..600 {
+            let cycle = engine.total_cycles();
+            let (pc, instrs) = {
+                let ctx = engine.core_context(1, 2).unwrap();
+                (ctx.pc(), ctx.instructions)
+            };
+            let released = engine.device().array.tile(1, 2).lock_release_count();
+            engine.step();
+            let issued = engine.core_context(1, 2).unwrap().instructions > instrs;
+            if issued && pc == ev0_pc {
+                event0.get_or_insert(cycle);
+            }
+            if issued && pc == ev1_pc {
+                event1.get_or_insert(cycle);
+            }
+            let tile = engine.device().array.tile(1, 2);
+            if tile.lock_release_count() > released && release.is_none() {
+                release = Some(cycle);
+            }
+            if release.is_some()
+                && engine.device().array.dma_engine(1, 2).unwrap().channel_phase(2) != "AcquiringLock"
+            {
+                grant.get_or_insert(cycle);
+            }
+            if tile.core_trace.level_asserted(core_events::MEMORY_STALL) {
+                memory_stall.push(cycle);
+            }
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let records = bank_census::take();
+        let bit = 1u16 << bank;
+        ArbProbeRun {
+            release: release.expect("the core released lock 0"),
+            grant: grant.expect("the MM2S was granted lock 0"),
+            contended: records
+                .iter()
+                .filter(|r| r.contended_banks & bit != 0)
+                .map(|r| r.cycle)
+                .collect(),
+            core_lost: records.iter().filter(|r| r.core_lost).map(|r| r.cycle).collect(),
+            memory_stall,
+            event0: event0.expect("event #0 issued"),
+            event1: event1.expect("event #1 issued"),
+        }
+    }
+
+    /// The arb probe's rows end to end (silicon, NPU1 2026-11, `tools/gen_dma_lock_probe.py`
+    /// arb cases). The MM2S's grant comes at LOCK_0_REL + 2 or + 3 (silicon: run to run for one
+    /// case; the emulator: fixed by the lock port's grid), so each case carries silicon's row
+    /// for both phases and is checked against the one the emulator's grant took. Memory module:
+    /// a core access k bundles after the `rel` meets its bank at LOCK_0_REL + k + 1 (147 of 147
+    /// conflict rows): the core's release reaches the lock unit one cycle after its
+    /// arbitration cycle (event #0 + 6 here) and the access reaches the bank in its memory
+    /// stage. Core module: MEMORY_STALL in the lost cycle, the losing access's issue + 4 (82
+    /// of 82 loss rows), and event #1 - event #0 = bundles + 1, + 1 per loss.
+    #[test]
+    fn the_arb_probe_rows_land_on_silicons_cycles() {
+        type Row = (&'static [u64], &'static [u64], u64); // contended (rel LOCK_0_REL), lost (rel event #0), window
+                                                          // (case, k, n, store, bank, grant + 2 row, grant + 3 row)
+        #[rustfmt::skip]
+        let cases: &[(&str, usize, usize, bool, usize, Row, Row)] = &[
+            ("ar0l1k09m0", 9, 1, false, 0, (&[], &[], 17), (&[10], &[16], 18)),
+            ("ar0l1k16m0", 16, 1, false, 0, (&[17], &[], 24), (&[], &[], 24)),
+            ("ar0l5k16m0", 16, 5, false, 0, (&[17, 18, 19, 20, 21], &[27], 29), (&[18, 19, 20, 21], &[27], 29)),
+            ("ar0s5k32m0", 32, 5, true, 0, (&[33, 34, 35], &[41], 45), (&[34, 35], &[41], 45)),
+            ("ar1l1k28m0", 28, 1, false, 1, (&[29], &[35], 37), (&[], &[], 36)),
+            ("ar1l3k20m0", 20, 3, false, 1, (&[21, 22], &[28], 31), (&[22], &[28], 31)),
+        ];
+        let mut phases = std::collections::BTreeSet::new();
+        // Three settle lengths move the release across the lock port's 3-cycle grant grid, so both
+        // grant phases (and silicon's row for each) are exercised.
+        for (settle, &(case, k, n, store, bank, plus2, plus3)) in
+            [200, 201, 202].into_iter().flat_map(|s| cases.iter().map(move |c| (s, c)))
+        {
+            let r = run_arb_probe(settle, k, n, store, bank);
+            phases.insert(r.grant - r.release);
+            let (contended, lost, window) = match r.grant - r.release {
+                2 => plus2,
+                3 => plus3,
+                other => panic!("{case}: grant at release + {other} ({r:?})"),
+            };
+            let row = format!("{case} settle {settle} (grant + {})", r.grant - r.release);
+            assert_eq!(r.release - r.event0, 6, "{row}: LOCK_0_REL at the rel's issue + 5 ({r:?})");
+            let c: Vec<u64> = r.contended.iter().map(|c| c - r.release).collect();
+            assert_eq!(c, contended, "{row}: contended cycles after LOCK_0_REL ({r:?})");
+            let l: Vec<u64> = r.core_lost.iter().map(|c| c - r.event0).collect();
+            assert_eq!(l, lost, "{row}: lost cycles after event #0 ({r:?})");
+            let s: Vec<u64> = r.memory_stall.iter().map(|c| c - r.event0).collect();
+            assert_eq!(s, lost, "{row}: MEMORY_STALL in the lost cycle ({r:?})");
+            assert_eq!(r.event1 - r.event0, window, "{row}: event #1 - event #0 ({r:?})");
+        }
+        assert_eq!(phases, [2, 3].into(), "both grant phases exercised");
+    }
+
     #[test]
     fn core_losing_bank_arbitration_ticks_a_core_perf_counter_armed_by_memory_stall() {
         use crate::device::dma::BdConfig;
@@ -3188,10 +3374,7 @@ mod tests {
             tile.core_perf_counters.write_control_start_stop(ctrl0, 0, 1, 7);
         }
 
-        // Drain the MM2S egress every step so its staging FIFO stays near
-        // underflow -- urgent -- which is the one thing that overrides the
-        // core's class priority on the contended bank (see the sibling test
-        // above for the full model).
+        // Drain the MM2S egress every step so the channel keeps fetching.
         for _ in 0..400 {
             engine.step();
             let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
@@ -3664,8 +3847,8 @@ mod tests {
         // `mem_stall_active` is the held-level edge state for MEMORY_STALL: the
         // coordinator only emits an event when it CHANGES. Its tile-side
         // counterpart (`dma_mem_pressure_active`) is cleared by the array reset,
-        // so leaving this one set is a half-reset: a run that ends with a core in
-        // WaitBank leaves it true, and the first cycle of the NEXT run in which
+        // so leaving this one set is a half-reset: a run that ends with a core
+        // losing a bank leaves it true, and the first cycle of the NEXT run in which
         // the core does not lose a bank emits a MEMORY_STALL *deassert* on a
         // freshly-armed trace unit -- a phantom falling edge with no rising edge
         // before it. Same class as the pending-mem-trace and perf-counter leaks
@@ -5550,6 +5733,7 @@ mod tests {
             per_hop_vertical: 3,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            intra_tile_memtile_offset: 0,
             calibrated: true,
         }));
         {
@@ -5569,6 +5753,10 @@ mod tests {
 
     #[test]
     fn export_origin_d_sidecar_matches_committed_fixture() {
+        // Provenance of the values in the fixture: compute memory-module origin_D rows are
+        // core + 1 (intra offset 1: the raw add_one core-vs-memory offset 2, corrected by one
+        // cycle after the core memory-access and lock-release placement fix, 2026-11-13);
+        // memtile rows keep the old offset 2.
         // SP-5a Task 3: pin the REAL exported sidecar JSON as a committed
         // read-only golden file. The live export must equal it (drift fails
         // loudly). Regeneration is explicit and env-gated -- the default
