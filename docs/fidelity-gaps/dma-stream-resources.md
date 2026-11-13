@@ -603,7 +603,7 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     reads LOCK_0_REL - `event #0` = 4 (silicon 5) and MEMORY_STALL - conflict = 2 (silicon 1). The split itself
     rests on the gather's stamp (MEMORY_STALL in the frozen cycle) and the toolchain's E5, not on these: any split
     that fits the same-unit rows leaves equal residuals. Inferred from them: the intra-tile timer offset
-    (`BROADCAST_INTRA_TILE_MEM_OFFSET`, 2, calibrated on add_one) would read 1 on these probes. Not changed here. Unmeasured: a vst.srs / vst.conv (E7) or part-word store
+    (`BROADCAST_INTRA_TILE_MEM_OFFSET`, then 2, calibrated on add_one) reads 1 on these probes; it is 1 since (see `broadcast.intra_tile_mem_offset` in the timing-constants coverage table; the memtile keeps 2 under its own constant). Unmeasured: a vst.srs / vst.conv (E7) or part-word store
     (E5, E11) arbitrates at E5 like the rest; an access lost while the core is held on a lock costs no extra
     cycle; the data itself still moves at issue.
   - *Rows outside the probes' shape.* An access in flight reaches its bank whatever the core does meanwhile
