@@ -41,6 +41,7 @@
 //! let output: Vec<u32> = mem.read_slice(0x2000_0000, 8);
 //! ```
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 
@@ -168,6 +169,47 @@ impl ExternalRegion {
     }
 }
 
+/// A device access to host memory that the IOMMU model blocked: bytes
+/// `[address, address + len)` lie on no page of any mapped buffer.
+///
+/// Consecutive blocked bytes of one direction merge into one record, so a
+/// DMA task that runs off its buffer shows up as one record per run of pages
+/// outside every buffer, not one per word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedAccess {
+    pub address: u64,
+    pub len: u64,
+    pub write: bool,
+}
+
+/// Blocked accesses kept per memory before only the totals grow; a run that
+/// produces more is already reported loudly and the first records name it.
+const MAX_BLOCKED_RECORDS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct BlockedLog {
+    records: Vec<BlockedAccess>,
+    total_bytes: u64,
+    dropped_records: u64,
+}
+
+impl BlockedLog {
+    fn record(&mut self, address: u64, len: u64, write: bool) {
+        self.total_bytes += len;
+        if let Some(last) = self.records.last_mut() {
+            if last.write == write && last.address + last.len == address {
+                last.len += len;
+                return;
+            }
+        }
+        if self.records.len() < MAX_BLOCKED_RECORDS {
+            self.records.push(BlockedAccess { address, len, write });
+        } else {
+            self.dropped_records += 1;
+        }
+    }
+}
+
 /// Simulated host/DDR memory.
 ///
 /// Uses sparse storage (BTreeMap) to efficiently handle large address spaces
@@ -187,6 +229,18 @@ pub struct HostMemory {
 
     /// Total bytes written (for diagnostics)
     total_bytes_written: u64,
+
+    /// IOMMU model: when set, a device access (`read_*`/`write_*`) to a page
+    /// that no named region or external mapping touches is blocked -- a
+    /// blocked write changes nothing, a blocked read returns zeros -- and
+    /// recorded, as the IOMMU blocks and logs a device access to a page the
+    /// process has not mapped. Host-side accesses (`host_read_bytes` /
+    /// `host_write_bytes`) are never blocked. Off by default: bare memories
+    /// in tests address host memory without registering regions.
+    iommu_guard: bool,
+
+    /// Accesses the guard blocked; interior mutability because reads are `&self`.
+    blocked: RefCell<BlockedLog>,
 }
 
 impl HostMemory {
@@ -203,7 +257,67 @@ impl HostMemory {
             regions: Vec::new(),
             external_regions: Vec::new(),
             total_bytes_written: 0,
+            iommu_guard: false,
+            blocked: RefCell::new(BlockedLog::default()),
         }
+    }
+
+    /// Turn the IOMMU model on or off (see the `iommu_guard` field).
+    pub fn set_iommu_guard(&mut self, on: bool) {
+        self.iommu_guard = on;
+    }
+
+    /// Whether the IOMMU model blocks accesses outside every mapped page.
+    pub fn iommu_guard(&self) -> bool {
+        self.iommu_guard
+    }
+
+    /// Number of blocked-access records so far (merged runs, capped).
+    pub fn blocked_record_count(&self) -> usize {
+        self.blocked.borrow().records.len()
+    }
+
+    /// Blocked-access records from index `from` on.
+    pub fn blocked_accesses_since(&self, from: usize) -> Vec<BlockedAccess> {
+        let log = self.blocked.borrow();
+        log.records.get(from..).map(<[BlockedAccess]>::to_vec).unwrap_or_default()
+    }
+
+    /// Total bytes blocked, and records dropped past the cap, since the last take.
+    pub fn blocked_totals(&self) -> (u64, u64) {
+        let log = self.blocked.borrow();
+        (log.total_bytes, log.dropped_records)
+    }
+
+    /// Take and clear the blocked-access log.
+    pub fn take_blocked_accesses(&mut self) -> Vec<BlockedAccess> {
+        std::mem::take(&mut *self.blocked.borrow_mut()).records
+    }
+
+    /// Whether any named region or external mapping touches the 4 KiB page at `page`.
+    fn page_mapped(&self, page: u64) -> bool {
+        let end = page.saturating_add(Self::PAGE_SIZE as u64);
+        self.regions.iter().any(|r| r.overlaps(page, Self::PAGE_SIZE))
+            || self.external_regions.iter().any(|r| r.base_address < end && r.end() > page)
+    }
+
+    /// Split `[addr, addr + len)` at page boundaries into runs that are all
+    /// mapped or all unmapped: (start offset, length, mapped).
+    fn page_runs(&self, addr: u64, len: usize) -> Vec<(usize, usize, bool)> {
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut done = 0usize;
+        while done < len {
+            let cur = addr.wrapping_add(done as u64);
+            let in_page = Self::PAGE_SIZE - (cur & !Self::PAGE_MASK) as usize;
+            let n = in_page.min(len - done);
+            let mapped = self.page_mapped(cur & Self::PAGE_MASK);
+            match runs.last_mut() {
+                Some(last) if last.2 == mapped => last.1 += n,
+                _ => runs.push((done, n, mapped)),
+            }
+            done += n;
+        }
+        runs
     }
 
     /// Map live caller-owned memory at a host address.
@@ -413,8 +527,43 @@ impl HostMemory {
         u64::from_le_bytes(buf)
     }
 
-    /// Write a byte slice to memory.
+    /// Write a byte slice to memory as a device access: under the IOMMU
+    /// model, bytes on unmapped pages are dropped and recorded.
     pub fn write_bytes(&mut self, addr: u64, data: &[u8]) {
+        if !self.iommu_guard {
+            return self.host_write_bytes(addr, data);
+        }
+        for (off, n, mapped) in self.page_runs(addr, data.len()) {
+            let a = addr.wrapping_add(off as u64);
+            if mapped {
+                self.host_write_bytes(a, &data[off..off + n]);
+            } else {
+                self.blocked.get_mut().record(a, n as u64, true);
+            }
+        }
+    }
+
+    /// Read bytes as a device access: under the IOMMU model, bytes on
+    /// unmapped pages read as zero and are recorded. What a blocked read
+    /// returns on silicon is not observed (the reading channel's data went
+    /// to a destination that also faulted); zeros is the choice here.
+    pub fn read_bytes(&self, addr: u64, buf: &mut [u8]) {
+        if !self.iommu_guard {
+            return self.host_read_bytes(addr, buf);
+        }
+        for (off, n, mapped) in self.page_runs(addr, buf.len()) {
+            let a = addr.wrapping_add(off as u64);
+            if mapped {
+                self.host_read_bytes(a, &mut buf[off..off + n]);
+            } else {
+                buf[off..off + n].fill(0);
+                self.blocked.borrow_mut().record(a, n as u64, false);
+            }
+        }
+    }
+
+    /// Write a byte slice to memory from the host side: never blocked.
+    pub fn host_write_bytes(&mut self, addr: u64, data: &[u8]) {
         let mut current_addr = addr;
         let mut remaining = data;
 
@@ -453,8 +602,8 @@ impl HostMemory {
         self.total_bytes_written += data.len() as u64;
     }
 
-    /// Read bytes from memory into a buffer.
-    pub fn read_bytes(&self, addr: u64, buf: &mut [u8]) {
+    /// Read bytes from the host side: never blocked.
+    pub fn host_read_bytes(&self, addr: u64, buf: &mut [u8]) {
         let mut current_addr = addr;
         let mut offset_in_buf = 0;
 
@@ -503,7 +652,7 @@ impl HostMemory {
     pub fn write_slice<T: Copy>(&mut self, addr: u64, data: &[T]) {
         let byte_len = std::mem::size_of_val(data);
         let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
-        self.write_bytes(addr, bytes);
+        self.host_write_bytes(addr, bytes);
 
         // Update region stats
         if let Some(region) = self.regions.iter_mut().find(|r| r.overlaps(addr, byte_len)) {
@@ -515,7 +664,7 @@ impl HostMemory {
     pub fn read_slice<T: Copy + Default>(&mut self, addr: u64, count: usize) -> Vec<T> {
         let byte_len = count * std::mem::size_of::<T>();
         let mut bytes = vec![0u8; byte_len];
-        self.read_bytes(addr, &mut bytes);
+        self.host_read_bytes(addr, &mut bytes);
 
         // Update region stats
         if let Some(region) = self.regions.iter_mut().find(|r| r.overlaps(addr, byte_len)) {
@@ -564,13 +713,14 @@ impl HostMemory {
         self.regions.clear();
         self.external_regions.clear();
         self.total_bytes_written = 0;
+        *self.blocked.get_mut() = BlockedLog::default();
     }
 
     /// Hexdump a memory region for debugging.
     pub fn hexdump(&self, addr: u64, len: usize) -> String {
         let mut result = String::new();
         let mut buf = vec![0u8; len];
-        self.read_bytes(addr, &mut buf);
+        self.host_read_bytes(addr, &mut buf);
 
         for (i, chunk) in buf.chunks(16).enumerate() {
             let line_addr = addr + (i * 16) as u64;
@@ -892,5 +1042,119 @@ mod tests {
         assert_eq!(external[0], 0x44);
         assert_eq!(mem.read_u8(0xb000), 0x55);
         assert!(mem.regions().is_empty());
+    }
+
+    // -- IOMMU model ---------------------------------------------------------------------------
+
+    fn guarded() -> HostMemory {
+        let mut mem = HostMemory::new();
+        mem.allocate_region("a", 0x10_0000, 0x1000).unwrap();
+        mem.allocate_region("b", 0x10_3000, 0x2000).unwrap();
+        mem.set_iommu_guard(true);
+        mem
+    }
+
+    #[test]
+    fn guard_is_off_by_default_and_unmapped_accesses_then_land() {
+        let mut mem = HostMemory::new();
+        assert!(!mem.iommu_guard());
+        mem.write_u32(0x5000, 7);
+        assert_eq!(mem.read_u32(0x5000), 7);
+        assert_eq!(mem.blocked_record_count(), 0);
+    }
+
+    #[test]
+    fn a_device_write_off_every_mapped_page_changes_nothing_and_is_recorded() {
+        let mut mem = guarded();
+        mem.write_u32(0x10_1000, 0xDEAD_BEEF); // the page after "a": unmapped
+        assert_eq!(mem.host_memory_word(0x10_1000), 0);
+        assert_eq!(
+            mem.blocked_accesses_since(0),
+            vec![BlockedAccess { address: 0x10_1000, len: 4, write: true }]
+        );
+    }
+
+    #[test]
+    fn a_device_read_off_every_mapped_page_returns_zeros_and_is_recorded() {
+        let mut mem = guarded();
+        mem.host_write_bytes(0x10_2000, &[1, 2, 3, 4]); // host side: lands in a sparse page
+        assert_eq!(mem.read_u32(0x10_2000), 0);
+        assert_eq!(
+            mem.blocked_accesses_since(0),
+            vec![BlockedAccess { address: 0x10_2000, len: 4, write: false }]
+        );
+    }
+
+    #[test]
+    fn mapping_is_page_granular_as_the_iommu_maps_pages() {
+        let mut mem = HostMemory::new();
+        mem.allocate_region("odd", 0x20_0000, 100).unwrap();
+        mem.set_iommu_guard(true);
+        mem.write_u32(0x20_0F00, 5); // past the region's 100 bytes, inside its page
+        assert_eq!(mem.read_u32(0x20_0F00), 5);
+        assert_eq!(mem.blocked_record_count(), 0);
+    }
+
+    #[test]
+    fn an_access_straddling_the_end_of_a_buffer_lands_up_to_the_page_and_no_further() {
+        let mut mem = guarded();
+        mem.write_bytes(0x10_0FFC, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(mem.host_memory_word(0x10_0FFC), u32::from_le_bytes([1, 2, 3, 4]));
+        assert_eq!(mem.host_memory_word(0x10_1000), 0);
+        assert_eq!(
+            mem.blocked_accesses_since(0),
+            vec![BlockedAccess { address: 0x10_1000, len: 4, write: true }]
+        );
+    }
+
+    #[test]
+    fn consecutive_blocked_words_merge_and_directions_do_not() {
+        let mut mem = guarded();
+        for i in 0..4 {
+            mem.write_u32(0x10_1000 + 4 * i, 1);
+        }
+        let _ = mem.read_u32(0x10_1010);
+        mem.write_u32(0x10_1010, 1);
+        assert_eq!(
+            mem.blocked_accesses_since(0),
+            vec![
+                BlockedAccess { address: 0x10_1000, len: 16, write: true },
+                BlockedAccess { address: 0x10_1010, len: 4, write: false },
+                BlockedAccess { address: 0x10_1010, len: 4, write: true },
+            ]
+        );
+        assert_eq!(mem.blocked_totals(), (24, 0));
+        assert_eq!(mem.take_blocked_accesses().len(), 3);
+        assert_eq!(mem.blocked_record_count(), 0);
+    }
+
+    #[test]
+    fn host_side_accesses_are_never_blocked() {
+        let mut mem = guarded();
+        mem.host_write_bytes(0x10_1000, &[9; 4]);
+        let mut b = [0u8; 4];
+        mem.host_read_bytes(0x10_1000, &mut b);
+        assert_eq!(b, [9; 4]);
+        assert_eq!(mem.blocked_record_count(), 0);
+    }
+
+    #[test]
+    fn external_mappings_count_as_mapped() {
+        let mut backing = [0u8; 16];
+        let mut mem = HostMemory::new();
+        unsafe { mem.map_external(0x30_0000, backing.as_mut_ptr(), backing.len()) }.unwrap();
+        mem.set_iommu_guard(true);
+        mem.write_u32(0x30_0004, 0x0102_0304);
+        assert_eq!(mem.blocked_record_count(), 0);
+        mem.unmap_external(0x30_0000, 16).unwrap();
+        assert_eq!(backing[4..8], [4, 3, 2, 1]);
+    }
+
+    impl HostMemory {
+        fn host_memory_word(&self, addr: u64) -> u32 {
+            let mut b = [0u8; 4];
+            self.host_read_bytes(addr, &mut b);
+            u32::from_le_bytes(b)
+        }
     }
 }

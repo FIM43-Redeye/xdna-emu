@@ -365,6 +365,8 @@ pub(crate) fn run_interpreter(
     }
     // Each run is one command: it gets a fresh watchdog window.
     engine.device_mut().tdr_detectors[xdna_emu_core::device::context::DEFAULT_CONTEXT.0 as usize].begin_run();
+    // Shim DMA accesses the host-memory IOMMU model blocks during this run.
+    let mut host_faults = crate::host_faults::HostFaultTracker::new(engine);
 
     // Warm-up: let cores run to their first blocking point before
     // processing NPU instructions.  On real hardware, the core has been
@@ -417,6 +419,8 @@ pub(crate) fn run_interpreter(
                 log::error!("NPU executor fatal: {}", msg);
                 // Flush trace before returning so partial data reaches DDR.
                 engine.flush_trace_to_host();
+                host_faults.observe(engine);
+                report_host_faults(&host_faults, engine);
                 return RunOutcome { cycles, halt: HaltKind::Error };
             }
             npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
@@ -450,6 +454,7 @@ pub(crate) fn run_interpreter(
         }
 
         engine.step();
+        host_faults.observe(engine);
         // Tier B: drain newly-recorded async errors and fire the registered
         // callback (if any). Mirrors the flush_trace_to_host pattern -- FFI
         // layer observes between engine steps.
@@ -504,6 +509,8 @@ pub(crate) fn run_interpreter(
     // Trace units may have partial packets buffered; flush() pads and emits
     // them, then step_data_movement() routes them through the network.
     engine.flush_trace_to_host();
+    host_faults.observe(engine);
+    report_host_faults(&host_faults, engine);
 
     // SP-4b: alongside the trace flush, optionally write the origin_d.json
     // sidecar (per-module broadcast timer-reset arrival + calibrated flag --
@@ -557,6 +564,15 @@ pub(crate) fn run_interpreter(
     };
 
     RunOutcome { cycles, halt }
+}
+
+/// Print the run's blocked-access summary, if any: always on stderr (the
+/// harness check does not depend on the log level) and at error level.
+fn report_host_faults(tracker: &crate::host_faults::HostFaultTracker, engine: &InterpreterEngine) {
+    if let Some(line) = tracker.summary(engine) {
+        log::error!("{line}");
+        eprintln!("{line}");
+    }
 }
 
 fn build_engine_signals(engine: &InterpreterEngine) -> xdna_emu_core::device::tdr::EngineSignals {

@@ -46,6 +46,7 @@ mod classify;
 mod config;
 pub mod context;
 mod execution;
+pub mod host_faults;
 mod memory;
 mod query;
 
@@ -341,6 +342,12 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     };
 
     let mut backend = backend;
+    // Host buffers reach the device through the IOMMU: a shim DMA access to a
+    // page no registered buffer touches is blocked and reported, never landed.
+    // (Interpreter backend; aiesim keeps its own host-memory bridge.)
+    if let Some(engine) = backend.as_interpreter_mut() {
+        engine.host_memory_mut().set_iommu_guard(true);
+    }
     if let Some(dir) = xdna_emu_core::interpreter::engine::device_state::state_dir_from_env() {
         open_device_state(backend.as_mut(), &dir);
     }
@@ -537,10 +544,14 @@ mod tests {
     fn test_alloc_buffer_rounds_up_size() {
         unsafe {
             with_handle(|h| {
-                // Allocating 1 byte should still consume a full page.
+                // Allocating 1 byte should still consume a full page (then the guard gap).
                 let a1 = xdna_emu_alloc_buffer(h, 1);
                 let a2 = xdna_emu_alloc_buffer(h, 1);
-                assert_eq!(a2 - a1, 4096, "1-byte alloc should round up to 4096");
+                assert_eq!(
+                    a2 - a1,
+                    4096 + crate::memory::ALLOC_GUARD_GAP,
+                    "1-byte alloc should round up to 4096"
+                );
             });
         }
     }

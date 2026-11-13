@@ -78,13 +78,13 @@ pub unsafe extern "C" fn xdna_emu_write_host_memory(
     let handle = &mut *handle;
     let data_slice = slice::from_raw_parts(data, size as usize);
 
-    // Write as u32 words
+    // Write as u32 words. A host-side access: the IOMMU model never blocks it.
     let host_mem = handle.backend.host_memory_mut();
     for (i, chunk) in data_slice.chunks(4).enumerate() {
         let mut word = [0u8; 4];
         word[..chunk.len()].copy_from_slice(chunk);
         let value = u32::from_le_bytes(word);
-        host_mem.write_u32(address + (i * 4) as u64, value);
+        host_mem.host_write_bytes(address + (i * 4) as u64, &value.to_le_bytes());
     }
 
     log::debug!("Wrote {} bytes to host memory at 0x{:x}", size, address);
@@ -116,11 +116,11 @@ pub unsafe extern "C" fn xdna_emu_read_host_memory(
     let handle = &mut *handle;
     let data_slice = slice::from_raw_parts_mut(data, size as usize);
 
-    // Read as u32 words
+    // Read as u32 words. A host-side access: the IOMMU model never blocks it.
     let host_mem = handle.backend.host_memory_mut();
     for (i, chunk) in data_slice.chunks_mut(4).enumerate() {
-        let value = host_mem.read_u32(address + (i * 4) as u64);
-        let bytes = value.to_le_bytes();
+        let mut bytes = [0u8; 4];
+        host_mem.host_read_bytes(address + (i * 4) as u64, &mut bytes);
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
 
@@ -228,6 +228,18 @@ pub unsafe extern "C" fn xdna_emu_add_host_buffer(
     XdnaEmuResult::Success
 }
 
+/// Unmapped address space left after every fresh allocation. The IOMMU model
+/// blocks a shim DMA access to a page no buffer touches; with buffers packed
+/// back to back, a task that runs off the end of one buffer would land in the
+/// next one instead and corrupt it silently. One GiB is far past any overrun a
+/// runtime sequence's BDs produce in practice and still leaves room for
+/// 2^17 allocations below the shim DMA's 48-bit address limit.
+pub(crate) const ALLOC_GUARD_GAP: u64 = 1 << 30;
+
+/// Shim DMA BD addresses are 48-bit byte addresses (Base_Address_High holds
+/// bits [47:32]); a buffer must end below this.
+const SHIM_DMA_ADDRESS_LIMIT: u64 = 1 << 48;
+
 /// Allocate a host memory buffer of the given size.
 ///
 /// Returns a page-aligned base address (u64) on success, or 0 on failure.
@@ -269,6 +281,12 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size:
         .map(|i| handle.free_list.swap_remove(i).0);
 
     let addr = recycled.unwrap_or(handle.next_alloc_addr);
+    if recycled.is_none() && addr.checked_add(aligned_size).map_or(true, |end| end > SHIM_DMA_ADDRESS_LIMIT) {
+        log::error!(
+            "alloc_buffer: no address space left below the 48-bit shim DMA limit for {aligned_size} bytes"
+        );
+        return 0;
+    }
 
     let host_mem = handle.backend.host_memory_mut();
     let name = format!("alloc_{:x}", addr);
@@ -286,7 +304,7 @@ pub unsafe extern "C" fn xdna_emu_alloc_buffer(handle: *mut XdnaEmuHandle, size:
     handle.backend.add_host_buffer(addr, aligned_size as usize);
 
     if recycled.is_none() {
-        handle.next_alloc_addr = addr + aligned_size;
+        handle.next_alloc_addr = addr + aligned_size + ALLOC_GUARD_GAP;
     }
 
     log::debug!(

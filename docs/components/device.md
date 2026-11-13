@@ -18,7 +18,7 @@ matches reality.
 | `arch_handle.rs` | `ArchHandle` -- runtime device handle that fans out to the right `xdna_archspec` model |
 | `model.rs` | Device-level model glue (size, tile-kind classification, lookups) |
 | `registers.rs` | `RegisterInfo`, `RegisterModule`, `TileAddress` -- CDO address decoding |
-| `host_memory.rs` | `HostMemory` -- simulated DDR with named regions and direction tracking |
+| `host_memory.rs` | `HostMemory` -- simulated DDR with named regions and direction tracking; optional IOMMU model (`set_iommu_guard`, on in the FFI): a device access to a page no region or mapping touches is blocked (write dropped, read zeros) and recorded, as the IOMMU blocks and logs it |
 | `banking.rs` | Memory bank conflict modeling |
 | `bank_arbiter.rs` | Compute-tile data-memory bank arbiter: per-bank served-access count (`BankAccessCounts`, on the tile) decides core versus DMA |
 | `ops.rs` | `DeviceOp` -- the 8-variant operation vocabulary that CDO and NPU paths share |
