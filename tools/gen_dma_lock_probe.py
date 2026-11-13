@@ -81,8 +81,12 @@ prints per case and run: d (measured: release minus the pre BD's FINISHED_BD), t
 after that finish, grant minus release, MM2S and S2MM finish minus grant, and conflicts relative to the grant.
 `--free` adds lsfree (lock A starts at 1). Bank cases (lsa/lsb) add one core load k nops after the release.
 `--memmod-event-swap OLD=NEW` (fetch-build and chain-build too) exchanges one traced memory-module event for another in
-the same slot, e.g. DMA_S2MM_0_FINISHED_BD=DMA_MM2S_0_MEMORY_STARVATION. Lock events other than lock 0's only follow
-another lock once Locks_Event_Selection_n is programmed (every selector resets to lock 0); the swap does not do that.
+the same slot, e.g. DMA_S2MM_0_FINISHED_BD=DMA_MM2S_0_MEMORY_STARVATION; `--memmod-event-add NAME` appends one to a list with a free
+slot. LOCK_n_REL follows Locks_Event_Selection_n, which resets to lock 0 for every n: `--sync --lock-event-select 1=1` writes
+selector 1 (offset and field from the register database) in the runtime sequence before the start lock is set, so with
+`--memmod-event-add LOCK_1_REL` the head BD's release of the sync lock is stamped. Each extra register write or traced
+event in the sequence shifts every stamp of a run by the same amount (112 cycles in the emulator) and can move the phase
+of the core against the DMA by a cycle, so compare cycle offsets inside one run, not absolute stamps.
 
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR --sync [--ds 0 4 8] [--banks none|0|1] [--ks ..] [--free]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu --sync [same selection]
@@ -381,6 +385,61 @@ FETCH_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINI
 FETCH_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
 
 
+MEMMOD_ADD_HELP = ("append one memory-module trace event to the list (NAME, e.g. LOCK_1_REL); errors when the "
+                   "trace unit's eight slots are full or NAME is already traced. Applied after --memmod-event-swap")
+LOCK_SELECT_HELP = ("--sync: program lock event selector N to watch lock LOCK_ID (repeatable): a runtime-sequence "
+                    "register write placed before the start lock is set. LOCK_n_REL / LOCK_SELn_* events follow "
+                    "selector n, which resets to lock 0; selector 0 is left at its reset (LOCK_0_REL is lock 0)")
+COMPUTE_MEM_MODULE = "memory"      # the register database's name for the compute tile memory module
+LOCK_SELECT_REGISTER = "Locks_Event_Selection_{n}"
+
+
+def parse_lock_event_select(text: str) -> tuple[int, int]:
+    """`N=LOCK_ID` -> (N, LOCK_ID); the argparse type of --lock-event-select."""
+    n, sep, lock = text.partition("=")
+    try:
+        if not sep:
+            raise ValueError
+        return int(n, 0), int(lock, 0)
+    except ValueError:
+        raise ValueError(f"expected N=LOCK_ID, got {text!r}") from None
+
+
+def compute_memory_registers() -> dict:
+    """The compute tile memory module of mlir-aie's AM025 register database as {register name: entry}."""
+    import toolchain_paths
+    path = toolchain_paths.resolve_mlir_aie() / "lib" / "Dialect" / "AIE" / "Util" / "aie_registers_aie2.json"
+    return {r["name"]: r for r in json.loads(path.read_text())["modules"][COMPUTE_MEM_MODULE]["registers"]}
+
+
+def lock_event_select_writes(selects) -> list[tuple[int, int]]:
+    """(tile-local address, value) of the register write for each (selector n, lock id).
+
+    Offset, the Lock_Select field and the Lock_Value reset come from the register database; Lock_Value
+    (the trigger value of the EQUAL_TO_VALUE events, which the probe does not use) is written at its reset."""
+    import re
+    regs = compute_memory_registers()
+    count = sum(1 for name in regs if re.fullmatch(r"Locks_Event_Selection_\d+", name))
+    seen = set()
+    out = []
+    for n, lock in selects:
+        if n == 0:
+            raise ValueError("selector 0 stays at its reset (lock 0): LOCK_0_REL is the core's release of lock 0")
+        if not 0 < n < count:
+            raise ValueError(f"selector {n} out of range (1..{count - 1})")
+        if n in seen:
+            raise ValueError(f"selector {n} given twice")
+        seen.add(n)
+        reg = regs[LOCK_SELECT_REGISTER.format(n=n)]
+        fields = {f["name"]: f for f in reg["bit_fields"]}
+        sel, val = fields["Lock_Select"], fields["Lock_Value"]
+        lo, hi = sel["bit_range"]
+        if not 0 <= lock < 1 << (hi - lo + 1):
+            raise ValueError(f"lock {lock} out of range (0..{(1 << (hi - lo + 1)) - 1})")
+        out.append((int(reg["offset"], 0), (lock << lo) | int(val["reset"], 0)))
+    return out
+
+
 MEMMOD_SWAP_HELP = ("replace one memory-module trace event by another (OLD=NEW, e.g. "
                     "DMA_S2MM_0_FINISHED_BD=DMA_MM2S_0_MEMORY_STARVATION); the trace unit has a fixed number of slots, "
                     "so it is a swap, in the same slot. LOCK_n_REL / LOCK_SELn_* events follow "
@@ -393,6 +452,36 @@ def parse_event_swap(text: str) -> tuple[str, str]:
     if not sep or not old.strip() or not new.strip() or "=" in new:
         raise ValueError(f"expected OLD=NEW, got {text!r}")
     return old.strip(), new.strip()
+
+
+MEMMOD_TRACE_SLOTS = 8             # event slots of one trace unit
+
+
+def _check_memmod_event_name(name: str) -> None:
+    try:
+        from aie.utils.trace.events import MemEventAIE2
+    except ImportError:               # no mlir-aie python on the path: the injector rejects a bad name itself
+        return
+    if name not in MemEventAIE2.__members__:
+        raise ValueError(f"unknown memory-module event {name}")
+
+
+def apply_event_add(events: list[str], name: str | None) -> list[str]:
+    """The memory-module event list with NAME appended (None: unchanged); the list must have a free slot."""
+    if name is None:
+        return list(events)
+    if name in events:
+        raise ValueError(f"{name} is already in the memory-module list")
+    if len(events) >= MEMMOD_TRACE_SLOTS:
+        raise ValueError(f"the memory-module list is full ({MEMMOD_TRACE_SLOTS} slots); use --memmod-event-swap")
+    _check_memmod_event_name(name)
+    return [*events, name]
+
+
+def edit_memmod_events(events: list[str], swap: tuple[str, str] | None = None,
+                       add: str | None = None) -> list[str]:
+    """The variant's list after --memmod-event-swap, then --memmod-event-add."""
+    return apply_event_add(apply_event_swap(events, swap), add)
 
 
 def apply_event_swap(events: list[str], swap: tuple[str, str] | None) -> list[str]:
@@ -408,12 +497,7 @@ def apply_event_swap(events: list[str], swap: tuple[str, str] | None) -> list[st
         raise ValueError(f"{old} is not in the memory-module list ({', '.join(events)})")
     if new in events:
         raise ValueError(f"{new} is already in the memory-module list")
-    try:
-        from aie.utils.trace.events import MemEventAIE2
-    except ImportError:               # no mlir-aie python on the path: the injector rejects a bad name itself
-        MemEventAIE2 = None
-    if MemEventAIE2 is not None and new not in MemEventAIE2.__members__:
-        raise ValueError(f"unknown memory-module event {new}")
+    _check_memmod_event_name(new)
     return [new if e == old else e for e in events]
 FETCH_CORE_GROUNDING = "PERF_CNT_2"
 # tile (0,2) is physical column 1; trace pkt_type 0 = core module, 1 = memory module
@@ -537,8 +621,9 @@ def fetch_design_mlir(chained: bool = False, task: bool = False) -> str:
 """
 
 
-def fetch_inject_args(start: bool = False, swap: tuple[str, str] | None = None) -> list[str]:
-    events = apply_event_swap(FETCH_MEMMOD_EVENTS + ([FETCH_START_EVENT] if start else []), swap)
+def fetch_inject_args(start: bool = False, swap: tuple[str, str] | None = None,
+                      add: str | None = None) -> list[str]:
+    events = edit_memmod_events(FETCH_MEMMOD_EVENTS + ([FETCH_START_EVENT] if start else []), swap, add)
     return ["--memmod-sweep-events", ",".join(events),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
@@ -811,7 +896,7 @@ def load_level_events(run_dir: Path):
 # -- lock-to-fetch: build / run / table ---------------------------------------------
 
 def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both", start: bool = False,
-                     swap: tuple[str, str] | None = None) -> None:
+                     swap: tuple[str, str] | None = None, add: str | None = None) -> None:
     """Case k of a lock-to-fetch variant. With `start` (the --start-task cases) the number is the pre-release
     nop count, there is no core load, and the task-start event joins the memory-module list."""
     name = fetch_case_name(k, chained, bank, start)
@@ -821,7 +906,7 @@ def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both
     lp.assemble(asm, d / "core.o", "k_core")
     (d / "base.mlir").write_text(fetch_design_mlir(chained, task=start))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(start, swap),
+           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(start, swap, add),
            "--trace-config-out", "trace_config.json", "--config-test-name", name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
@@ -855,7 +940,8 @@ def cmd_fetch_build(args) -> int:
     start = getattr(args, "start_task", False)
     for bank in fetch_banks(args):
         for k in fetch_values(args):
-            fetch_build_case(k, out, args.chained, bank, start, getattr(args, "memmod_event_swap", None))
+            fetch_build_case(k, out, args.chained, bank, start, getattr(args, "memmod_event_swap", None),
+                             getattr(args, "memmod_event_add", None))
             print("built", fetch_case_name(k, args.chained, bank, start))
     return 0
 
@@ -983,7 +1069,7 @@ def sync_core_asm(c: SyncCase) -> str:
     return lp.frame(body)
 
 
-def sync_design_mlir(c: SyncCase) -> str:
+def sync_design_mlir(c: SyncCase, selects=()) -> str:
     """MM2S 0: pre BD (acquire START, 4 words of `pre`, release SYNC) chained to the BD that waits on A.
 
     The runtime sequence's only action is setting START, after the trace is armed, so the pre BD runs
@@ -991,6 +1077,9 @@ def sync_design_mlir(c: SyncCase) -> str:
     w, p = FETCH_WORDS, FETCH_PRE_WORDS
     q = c.pre2
     dw = w + p + q
+    sel = "".join(f"      %c_sa{i} = arith.constant {a} : i32\n      %c_sv{i} = arith.constant {v} : i32\n"
+                  f"      aiex.npu.write32(%c_sa{i}, %c_sv{i}) {{column = 0 : i32, row = {FETCH_ROW} : i32}} : i32, i32\n"
+                  for i, (a, v) in enumerate(lock_event_select_writes(selects))) if selects else ""
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
     pre_init = ", ".join(str(0x0C000000 | j) for j in range(p))
@@ -1046,7 +1135,7 @@ def sync_design_mlir(c: SyncCase) -> str:
     aie.runtime_sequence(%dummy: memref<4xi32>) {{
       %c_zero = arith.constant 0 : i32
       %c_one = arith.constant 1 : i32
-      aiex.set_lock(%lStart, %c_one)
+{sel}      aiex.set_lock(%lStart, %c_one)
 {pad}
     }}
   }}
@@ -1054,8 +1143,8 @@ def sync_design_mlir(c: SyncCase) -> str:
 """
 
 
-def sync_inject_args(bank: str, swap: tuple[str, str] | None = None) -> list[str]:
-    events = apply_event_swap(SYNC_MAIN_EVENTS + (SYNC_CONFLICT_EVENTS if bank != "none" else []), swap)
+def sync_inject_args(bank: str, swap: tuple[str, str] | None = None, add: str | None = None) -> list[str]:
+    events = edit_memmod_events(SYNC_MAIN_EVENTS + (SYNC_CONFLICT_EVENTS if bank != "none" else []), swap, add)
     return ["--memmod-sweep-events", ",".join(events),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
@@ -1162,13 +1251,14 @@ def format_sync_summary(rows) -> str:
     return "\n".join(lines)
 
 
-def sync_build_case(c: SyncCase, out: Path, swap: tuple[str, str] | None = None) -> None:
+def sync_build_case(c: SyncCase, out: Path, swap: tuple[str, str] | None = None, add: str | None = None,
+                    selects=()) -> None:
     d = out / c.name
     d.mkdir(parents=True, exist_ok=True)
     lp.assemble(sync_core_asm(c), d / "core.o", "k_core")
-    (d / "base.mlir").write_text(sync_design_mlir(c))
+    (d / "base.mlir").write_text(sync_design_mlir(c, selects))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-           "--out", "aie.mlir", "--trace-mode", "event_time", *sync_inject_args(c.bank, swap),
+           "--out", "aie.mlir", "--trace-mode", "event_time", *sync_inject_args(c.bank, swap, add),
            "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
@@ -1177,7 +1267,9 @@ def sync_build_case(c: SyncCase, out: Path, swap: tuple[str, str] | None = None)
           cwd=d, log=d / "aiecc.log")
     (d / "case.json").write_text(json.dumps({"case": c.name, "d": c.d, "bank": c.bank, "k": c.k,
                                              "free": c.free, "pre2": c.pre2, "sync": True,
-                                             **({"memmod_event_swap": list(swap)} if swap else {})}) + "\n")
+                                             **({"memmod_event_swap": list(swap)} if swap else {}),
+                                             **({"memmod_event_add": add} if add else {}),
+                                             **({"lock_event_select": [list(x) for x in selects]} if selects else {})}) + "\n")
 
 
 def sync_selection(args) -> list[SyncCase]:
@@ -1189,7 +1281,8 @@ def sync_selection(args) -> list[SyncCase]:
 def cmd_sync_build(args) -> int:
     out = Path(args.out_dir).resolve()
     for c in sync_selection(args):
-        sync_build_case(c, out, getattr(args, "memmod_event_swap", None))
+        sync_build_case(c, out, getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None),
+                        getattr(args, "lock_event_select", None) or ())
         print("built", c.name)
     return 0
 
@@ -1432,8 +1525,8 @@ def chain_design_mlir(c: ChainCase) -> str:
 """
 
 
-def chain_inject_args(swap: tuple[str, str] | None = None) -> list[str]:
-    return ["--memmod-sweep-events", ",".join(apply_event_swap(CHAIN_MEM_EVENTS, swap)),
+def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None) -> list[str]:
+    return ["--memmod-sweep-events", ",".join(edit_memmod_events(CHAIN_MEM_EVENTS, swap, add)),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
 
@@ -1503,7 +1596,7 @@ def cmd_chain_build(args) -> int:
         lp.assemble(chain_core_asm(c), d / "core.o", "k_core")
         (d / "base.mlir").write_text(chain_design_mlir(c))
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None)),
+               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None)),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
               cwd=d, log=d / "inject.log")
@@ -1558,6 +1651,7 @@ def add_chain_parsers(sub) -> None:
     ct.add_argument("runs", nargs="+")
     cb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                     help=MEMMOD_SWAP_HELP)
+    cb.add_argument("--memmod-event-add", default=None, metavar="NAME", help=MEMMOD_ADD_HELP)
     for sp in (cb, cr, ct):
         sp.add_argument("--mids", nargs="*", default=[], help="mid BDs: words, then c (core lock) or f (free lock)")
         sp.add_argument("--head", type=int, default=4, help="head BD words")
@@ -2537,6 +2631,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="both = two loads (lfk/lfc); 0 or 1 = one load on that bank (lfa/lfb chained, lfd/lfe first-BD)")
     fb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                     help=MEMMOD_SWAP_HELP)
+    fb.add_argument("--memmod-event-add", default=None, metavar="NAME", help=MEMMOD_ADD_HELP)
+    fb.add_argument("--lock-event-select", type=parse_lock_event_select, action="append", default=None,
+                    metavar="N=LOCK_ID", help=LOCK_SELECT_HELP)
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
     fr.add_argument("out_dir")
     fr.add_argument("tag")
@@ -2609,6 +2706,8 @@ def main(argv=None) -> int:
     if args.cmd.startswith("arb-"):
         return {"arb-build": cmd_arb_build, "arb-run": cmd_arb_run, "arb-table": cmd_arb_table}[args.cmd](args)
     if args.cmd.startswith("fetch-"):
+        if getattr(args, "lock_event_select", None) and not args.sync:
+            ap.error("--lock-event-select needs --sync")
         if args.start_task and args.sync:
             ap.error("--start-task and --sync are separate variants")
         if args.sync:

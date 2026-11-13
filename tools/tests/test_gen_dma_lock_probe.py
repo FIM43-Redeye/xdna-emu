@@ -1373,3 +1373,85 @@ def test_cli_option_is_on_the_sync_fetch_and_chain_builders():
     for cmd in (["fetch-build", "d", "--sync"], ["fetch-build", "d"], ["chain-build", "d"]):
         ns = g.build_parser().parse_args(cmd + ["--memmod-event-swap", "A=B"])
         assert ns.memmod_event_swap == ("A", "B")
+
+
+# -- memory-module event add (--memmod-event-add) and lock event selectors (--lock-event-select) -----------
+
+def test_add_appends_one_event_and_keeps_the_rest():
+    out = g.apply_event_add(g.SYNC_MAIN_EVENTS, "LOCK_1_REL")
+    assert out == g.SYNC_MAIN_EVENTS + ["LOCK_1_REL"]
+    assert g.apply_event_add(g.SYNC_MAIN_EVENTS, None) == g.SYNC_MAIN_EVENTS
+
+
+def test_add_rejects_a_traced_name_a_full_list_and_an_unknown_name():
+    with pytest.raises(ValueError, match="already"):
+        g.apply_event_add(g.SYNC_MAIN_EVENTS, "LOCK_0_REL")
+    full = g.SYNC_MAIN_EVENTS + ["CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "LOCK_1_REL", "LOCK_2_REL"]
+    assert len(full) == g.MEMMOD_TRACE_SLOTS
+    with pytest.raises(ValueError, match="full"):
+        g.apply_event_add(full, "LOCK_3_REL")
+    pytest.importorskip("aie.utils.trace.events")
+    with pytest.raises(ValueError, match="unknown memory-module event"):
+        g.apply_event_add(g.SYNC_MAIN_EVENTS, "LOCK_1_RELL")
+
+
+def test_inject_args_apply_swap_then_add():
+    a = g.sync_inject_args("0", ("DMA_S2MM_0_FINISHED_BD", "LOCK_2_REL"), "LOCK_1_REL")
+    ev = a[a.index("--memmod-sweep-events") + 1].split(",")
+    assert ev == ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "LOCK_2_REL",
+                  "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "LOCK_1_REL"]
+    assert g.sync_inject_args("none", None, None) == g.sync_inject_args("none")
+
+
+def test_parse_lock_event_select():
+    assert g.parse_lock_event_select("1=1") == (1, 1)
+    for bad in ("1", "a=1", "1=", "1=2=3", ""):
+        with pytest.raises(ValueError, match="N=LOCK_ID"):
+            g.parse_lock_event_select(bad)
+
+
+def regdb_or_skip():
+    try:
+        return g.compute_memory_registers()
+    except Exception as e:                                                  # no mlir-aie checkout
+        pytest.skip(f"register database not available: {e}")
+
+
+def test_lock_event_select_write_comes_from_the_register_database():
+    regdb_or_skip()
+    (addr, val), = g.lock_event_select_writes([(1, 1)])
+    assert addr == 0x1F104                                   # Locks_Event_Selection_1, memory module
+    assert val == (1 << 16) | 0x3F                           # Lock_Select = 1, Lock_Value left at its reset
+    (addr7, val7), = g.lock_event_select_writes([(7, 15)])
+    assert (addr7, val7) == (0x1F11C, (15 << 16) | 0x3F)
+
+
+def test_lock_event_select_rejects_selector_zero_and_out_of_range():
+    regdb_or_skip()
+    with pytest.raises(ValueError, match="selector 0"):
+        g.lock_event_select_writes([(0, 1)])
+    with pytest.raises(ValueError, match="selector"):
+        g.lock_event_select_writes([(8, 1)])
+    with pytest.raises(ValueError, match="lock"):
+        g.lock_event_select_writes([(1, 16)])
+    with pytest.raises(ValueError, match="twice"):
+        g.lock_event_select_writes([(1, 1), (1, 2)])
+
+
+def test_sync_design_programs_selectors_before_the_start_lock_and_default_is_unchanged():
+    regdb_or_skip()
+    base = g.sync_design_mlir(sync_case())
+    assert "%c_sa0" not in base and g.sync_design_mlir(sync_case(), ()) == base
+    text = g.sync_design_mlir(sync_case(), [(1, 1)])
+    w = ("%c_sa0 = arith.constant 127236 : i32\n      %c_sv0 = arith.constant 65599 : i32\n"
+         "      aiex.npu.write32(%c_sa0, %c_sv0) {column = 0 : i32, row = 2 : i32} : i32, i32")
+    assert w in text
+    assert text.index(w) < text.index("aiex.set_lock(%lStart")
+
+
+def test_cli_has_the_add_and_select_options_on_fetch_build():
+    ns = g.build_parser().parse_args(["fetch-build", "d", "--sync", "--memmod-event-add", "LOCK_1_REL",
+                                      "--lock-event-select", "1=1", "--lock-event-select", "2=3"])
+    assert ns.memmod_event_add == "LOCK_1_REL" and ns.lock_event_select == [(1, 1), (2, 3)]
+    ns = g.build_parser().parse_args(["chain-build", "d", "--memmod-event-add", "LOCK_1_REL"])
+    assert ns.memmod_event_add == "LOCK_1_REL"
