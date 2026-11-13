@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; open: chains of short BDs before the waiting BD, a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
+status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; chains of short lock BDs before the waiting BD modelled 2026-11-13: three lock BDs in flight, every earlier release slot, the stall rise from the first granule, 148 / 148 fitted and 41 / 41 held-out silicon rows; open: six lock-free short BDs before the waiting BD and one five-BD row, a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
 ---
 
 # DMA & Stream Resource Gaps
@@ -406,7 +406,8 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
     urgency override this bullet described (a compute MM2S with 4 words or fewer staged beat the core) is gone.
   - *Short chained locked BDs and the grant.* Modelled since 2026-11-12 by the lock request and grant law (next
     section): the lock is requested ahead of the previous BD's finish and granted at release + 2 or + 3. Chains of
-    two or more short BDs before the waiting BD remain open there.
+    short lock BDs before the waiting BD are modelled since 2026-11-13 (next section); six lock-free short BDs
+    before it remain open there.
   - *Packet header.* The header of a lock-started compute MM2S's packet BD leaves at the grant, 6 cycles ahead of
     its payload (4 words: g + 0, then g + 6..9); on silicon header and payload are contiguous.
   - *First word at the receiving DMA.* The first word reaches the own-tile S2MM at g + 10 (silicon g + 9; the
@@ -437,7 +438,10 @@ BD's grant g0 (its STALLED_LOCK falls).
   free lock is granted at g + 3, 5 cycles before the 13-word BD finishes. STALLED_LOCK shows on [P, G - 1] with
   P = max(S + 2, Q - 1, the previous BD's last access - 1), S the cycle the BD's first word is sequenced: it can
   rise before the BD before finishes, and a lock free on request shows one cycle. The channel side is the
-  word clock with a 4-granule park (previous section's model, revised below). Evidence: 2348 of 2348 rows of
+  word clock with a 4-granule park (previous section's model, revised below). Revised for short chains (below):
+  P = max(D, Q, the previous BD's last access) - 1 with D the cycle the BD's first granule is fully sequenced
+  (S + 3 for a 4-word granule, so the same cycle there), and DEAD every earlier lock BD's FINISHED_BD + 4.
+  Evidence: 2348 of 2348 rows of
   every design with at most four MM2S BDs match this rule; about 2102 of them are the rows it was fitted to and
   246 (a 2-word mid BD before 11..17-word BDs) were predicted before they were measured. What blocks one cycle in
   three is not known. One input is a fitted proxy: the core's release of a mid lock B is not traced, so the rows
@@ -451,8 +455,29 @@ BD's grant g0 (its STALLED_LOCK falls).
   channel's STALLED_LOCK; the previous BD's last access is looked ahead one cycle. Constants:
   `mm2s_lock_request_after_grant_cycles` 3, `mm2s_lock_request_trigger_words` 3,
   `mm2s_lock_request_trigger_latency_cycles` 3, `mm2s_lock_release_after_finish_cycles` 4,
-  `mm2s_lock_grant_period_cycles` 3, `mm2s_lock_grant_blocked_phase` 2, the three STALLED_LOCK offsets (all
-  fitted) and `mm2s_lock_grant_visible_cycles` 1 (measured).
+  `mm2s_lock_grant_period_cycles` 3, `mm2s_lock_grant_blocked_phase` 2, `mm2s_lock_bds_in_flight` 3, the three
+  STALLED_LOCK offsets (`mm2s_lock_stall_before_first_granule_cycles` 1, `..._before_request_cycles` 1,
+  `..._before_last_access_cycles` 1; all fitted) and `mm2s_lock_grant_visible_cycles` 1 (measured).
+- **Short chains of lock BDs (modelled 2026-11-13).** Probes: chain families k4f (K = 1..5 four-word mids on free
+  locks, A's release swept over 18 cases) and c1f..c4f (six 1..4-word mids on free locks). Three terms, each pinned
+  by rows: (a) a lock BD starts sequencing no earlier than the lock release (FINISHED_BD + 4) of the lock BD three
+  before it (`WordClock`, `mm2s_lock_bds_in_flight`). MEASURED: the sequencing starts implied by the rises and
+  finishes -- k4f3's third mid has no STALLED_LOCK blip and finishes at 12, so its first word is sequenced at
+  exactly 7, and the 64-word BD behind two, three or five mids starts at 7, 11, 19 (clock floors 72, 76, 84; from
+  the fourth mid on every mid finishes 4 cycles after the one before). INFERRED: that 7 / 10 / 13 / 16 / 19 are
+  the releases of the lock BD three before (a lock port holding three lock BDs between sequencing start and
+  release). (b) DEAD holds every earlier lock BD's release slot: k4f5 is never granted at 20, its fourth mid's
+  FINISHED_BD 16 + 4 (MEASURED; that it is that BD's release slot is the same reading as DEAD's). (c) STALLED_LOCK's
+  first term is the BD's first granule fully sequenced - 1: c3f's third 3-word mid, first word at 7, blips at 8
+  (MEASURED). Evidence: fitted on k4f1/2/3/5, c1f and c3f (148 / 148 rows), predicted before scoring k4f4, c2f and
+  c4f (41 / 41); two or four BDs in flight, a release offset of 3 or 5, counting lock-free BDs, DEAD of the
+  previous BD only, or the S + 2 rise each lose fitted rows, and none of the three terms moves an in-scope row
+  (2348 / 2348). Lock-free chains of up to five 1- or 4-word BDs follow the law unchanged (kn rows; kn1x2, kn1x5,
+  kn4x4 held out, 6 / 6). Emulator (integrated
+  probe runs, release library): model-free, each silicon k4f row against the emulator run whose release lands on
+  the same cycle after g0, 166 / 166 identical (before: 32, k4f1 only; k4f2..5 now 34 / 33 / 34 / 33); every other
+  emulator scorer unchanged (sync 34 / 34, phase 428 / 428, chain 554 / 554, model-free 969 / 969 and 170 / 170,
+  arb same case 113 / 174, ring 23 / 48, producer collide 1095 / 18 / 9 of 15, sticky32 456 / 143).
 - **Word clock, revised (M1g).** The 16-word lead resuming at grant + 3 is replaced: the clock counts granules (a
   BD's short tail is a granule of its own), and while the channel is parked on a lock (the BD at the head of the
   accesses, or the BD it sequences into, acquires a lock and has presented no access) at most 4 started granules
@@ -473,19 +498,24 @@ BD's grant g0 (its STALLED_LOCK falls).
   interval, every FINISHED_BD). After g0 the emulator's release comes 2 or 3 cycles earlier than silicon's for
   the same case, and its event 0 with it (the core reaches event 0 early against the DMA's first grant,
   upstream of this model), so a same-case comparison does not match: the model is exercised in the release
-  frame. Outside the rule (c, kn, k4f) the emulator
-  follows the rule on 108 of 110 runs; the other two (six 1-word lock-free mid BDs) are where the parked lead
-  and the always-bounded fit part (grant release + 2 against + 3); against silicon k4f1 matches 31 / 31 and
-  k4f2..5 match none, as the rule does not.
+  frame. On the short-chain designs (c, kn, k4f; 110 runs) the emulator follows the short-chain rule below on 108
+  (before 2026-11-13: 32); the other two (six 1-word lock-free mid BDs, c1n / kn1x6) are where the parked lead and
+  the always-bounded fit part (grant release + 2 against + 3).
 - **Still different (open gaps).**
-  - *Chains of two or more short BDs before the waiting BD* (families c, kn, k4f; out of the rule's scope, not
-    fitted). Measured: six lock-free 1..3-word BDs finish every 2 cycles (4-word: 3 5 7 9 11 13 16), six 1..3-word
-    BDs on free locks every 3 with a one-cycle STALLED_LOCK at grant - 1 (4-word: 3 6 9 12 16 20 24); with K
-    lock-free mids the waiting BD's STALLED_LOCK rises at 2K + 1 for K = 1..4 (and 5 with 1-word mids) but at 13
-    for five 4-word mids and 20 for six (bd_id 7 or chain depth 7, not separated); with K four-word mids on free
-    locks the rule holds for K = 1 only (K = 2: the waiting BD's rise 9 and its finish at 72, rule 8 and 70; from
-    the third mid no blip and from the fourth FINISHED_BD every 4, rule every 3). The emulator follows the rule
-    there, so it differs from silicon on these chains.
+  - *Six lock-free short BDs before the waiting BD* (families c1n..c4n, kn1x6 / kn4x6; open). Measured: the mids
+    finish as the law says (every 2 cycles; 4-word: 3 5 7 9 11 13 16), but the waiting BD's STALLED_LOCK rises at
+    20 for 1- to 4-word mids (the law: the previous BD's last access - 1, 13 / 13 / 14 / 17), and its grant phase
+    moves with the mid length: Q = 0, 1, 2, 0 mod 3 for 1-, 2-, 3-, 4-word mids (the law's trigger gives 1, 1, 0,
+    2; each design has releases at only two cycles, so only Q mod 3 is fixed). The 64-word BD's finish is
+    grant-limited in every row, so when it starts sequencing is not visible. In all of them the waiting BD is the
+    chain's eighth BD and bd_id 7; a seven-BD chain (kn4x5) rises as the law says, so it is a step at the eighth BD
+    or at bd_id 7, which the rows cannot separate. One more row is off: five 4-word mids with A released at 46
+    (kn4x5 t2) is granted at 49 (Q = 1 mod 3; the law gives 48). A trigger fitted to those residues (the sequencer
+    free to start the previous BD) was refuted by held-out rows. Pinned at the emulator's own cycles
+    (`lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles`). Needs: the six-BD lock-free chain with
+    the waiting BD's bd_id pinned low against 7, and bd_id 7 at a shallow depth (`gen_dma_lock_probe.py chain-build
+    --bd-ids`), A released early (the clock-limited finish shows the sequencing start) and late over three
+    consecutive cycles (Q mod 3).
   - *A run's first lock BD.* The law needs a previous BD or grant. A BD with neither (a task's first BD) is
     requested every cycle from when it becomes the request target; one with a previous BD but no earlier grant in
     the run takes Q = T + 3. Both are measured but not reproduced in phase: silicon grants a task's first BD at
