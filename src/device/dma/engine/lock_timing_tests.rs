@@ -7,6 +7,7 @@
 //! FINISHED_BD pulses.
 
 use super::*;
+use crate::device::bank_arbiter::Requester;
 use crate::interpreter::state::EventType;
 
 /// What a run shows on the memory-module trace, by cycle.
@@ -161,15 +162,181 @@ fn shim_mm2s_lock_grant_is_unchanged_by_the_compute_lock_law() {
     }
 }
 
-/// A compute-tile S2MM's acquire is not measured (the law was measured on MM2S BDs): pinned.
+// --------------------------------------------------------------------------------------------
+// Compute-tile S2MM after a lock grant: the sl family of `tools/gen_dma_lock_probe.py` (an
+// own-tile MM2S feeds S2MM 0, whose BD is parked on a lock the core releases at R). Silicon
+// (NPU1, 2026-11): G = R + 2 or R + 3; the 16 held words are written a granule per cycle at
+// G + 2..5, the streamed granules from G + 10 every 4 cycles, FINISHED_BD one cycle after the
+// last write; one STREAM_STARVATION cycle at G + 2 when the BD wants more than it holds.
+// --------------------------------------------------------------------------------------------
+
+/// What a parked compute S2MM shows: the release R, the grant G (STALLED_LOCK falls), its bank
+/// writes (cycle, mask), FINISHED_BD cycles and STREAM_STARVATION cycles.
+#[derive(Debug, Default)]
+struct S2mmRun {
+    release: u64,
+    grant: u64,
+    writes: Vec<(u64, u16)>,
+    finishes: Vec<u64>,
+    starving: Vec<u64>,
+}
+
+/// An S2MM 0 BD of `words` words acquiring lock 3, its ingress filled to capacity by a feed of
+/// `words` words (one per cycle when the ingress takes it, as the routing pass does), the lock
+/// released by a core at cycle `release`. `refuse(cycle, mask)` refuses a presented write.
+fn parked_s2mm(words: u32, release: u64, refuse: impl Fn(u64, u16) -> bool) -> S2mmRun {
+    use crate::device::banking::BankLayout;
+    let mut eng = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = Tile::compute(1, 2);
+    let mut host = HostMemory::new();
+    eng.configure_bd(0, BdConfig::simple_1d(0x400, words * 4).with_acquire(3, -1))
+        .unwrap();
+    eng.start_channel(0, 0).unwrap();
+    let mut run = S2mmRun::default();
+    let mut fed = 0u32;
+    let mut stall_up = false;
+    let mut starving = false;
+    for cycle in 1..release + 200 {
+        eng.set_current_cycle(cycle);
+        eng.reset_cycle_drain_counters();
+        eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        if cycle == release {
+            tile.defer_core_lock_release(3, 1);
+        }
+        tile.resolve_lock_requests(cycle);
+        let demand = eng
+            .peek_bank_demand(BankLayout::Compute)
+            .iter()
+            .find(|(r, _)| *r == Requester::S2mm(0))
+            .map_or(0, |(_, m)| *m);
+        let denied: Vec<Requester> = if demand != 0 && refuse(cycle, demand) {
+            vec![Requester::S2mm(0)]
+        } else {
+            vec![]
+        };
+        eng.cycle_dma_banks = 0;
+        eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host);
+        assert_eq!(
+            eng.cycle_dma_banks,
+            if denied.is_empty() { demand } else { 0 },
+            "cycle {cycle}: peek / commit"
+        );
+        if eng.cycle_dma_banks != 0 {
+            run.writes.push((cycle, eng.cycle_dma_banks));
+        }
+        let offered = fed < words;
+        eng.note_stream_offer(0, offered);
+        if offered && eng.can_accept_stream_in_for_routing(0) {
+            assert!(eng.push_stream_in(StreamData { data: fed, tlast: false, channel: 0 }));
+            fed += 1;
+        }
+        eng.settle_stream_starvation();
+        for (c, e) in eng.drain_trace_events() {
+            match e {
+                EventType::DmaStalledLock { channel: 0, active } => {
+                    if stall_up && !active && c >= release {
+                        run.grant = c;
+                    }
+                    stall_up = active;
+                }
+                EventType::DmaFinishedBd { channel: 0 } => run.finishes.push(c),
+                EventType::DmaStreamStarvation { channel: 0, active } => starving = active,
+                _ => {}
+            }
+        }
+        if starving && cycle >= release {
+            run.starving.push(cycle);
+        }
+        for (c, e) in tile.mem_trace_pending.drain(..) {
+            if matches!(e, EventType::LockRelease { lock_id: 3 }) {
+                run.release = c;
+            }
+        }
+    }
+    run
+}
+
+/// Writes relative to the grant.
+fn rel(run: &S2mmRun) -> Vec<u64> {
+    run.writes.iter().map(|&(c, _)| c - run.grant).collect()
+}
+
 #[test]
-fn compute_s2mm_lock_grant_is_unchanged_by_the_compute_lock_law() {
-    for (free, expected) in [(false, (60, vec![(1, 59)], vec![72])), (true, (1, vec![], vec![17]))] {
-        let mut eng = DmaEngine::new_compute_tile(1, 2);
-        eng.configure_bd(0, BdConfig::simple_1d(0x400, 64).with_acquire(3, -1)).unwrap();
-        eng.start_channel(0, 0).unwrap();
-        let got = pinned_grant(Rig::new(eng, Tile::compute(1, 2), 0), 3, free, Some(0));
-        assert_eq!(got, expected, "compute S2MM, lock free = {free}");
+fn a_parked_compute_s2mm_is_granted_two_or_three_cycles_after_the_release() {
+    // Silicon (sl release sweep, 51 runs): + 2 or + 3, never less. The task's first lock BD
+    // counts its grid from the task anchor, so one release cycle in three is granted at + 3.
+    let mut offsets = std::collections::BTreeSet::new();
+    for release in 60..66 {
+        let run = parked_s2mm(16, release, |_, _| false);
+        assert_eq!(run.release, release);
+        let g = run.grant - run.release;
+        assert!(g == 2 || g == 3, "release {release}: grant + {g}");
+        offsets.insert(g);
+    }
+    assert_eq!(offsets.into_iter().collect::<Vec<_>>(), vec![2, 3], "both phases occur");
+}
+
+#[test]
+fn a_parked_compute_s2mm_writes_its_held_words_a_granule_per_cycle_from_grant_plus_two() {
+    // Silicon (sl N sweep, first BD): N = 4, 8, 12, 16 finish at G + 3, 4, 5, 6 (3 / 3 runs
+    // each); the k sweep puts the held writes at G + 2, 4 (bank 0) and 3, 5 (bank 1).
+    for (n, fin) in [(4u32, 3u64), (8, 4), (12, 5), (16, 6)] {
+        let run = parked_s2mm(n, 60, |_, _| false);
+        let held: Vec<u64> = (2..2 + n as u64 / 4).collect();
+        assert_eq!(rel(&run), held, "N = {n}");
+        assert_eq!(run.finishes, vec![run.grant + fin], "N = {n}: FINISHED_BD");
+        assert!(run.starving.is_empty(), "N = {n} <= 16: no starvation");
+    }
+    let run = parked_s2mm(16, 60, |_, _| false);
+    let masks: Vec<u16> = run.writes.iter().map(|&(_, m)| m).collect();
+    assert_eq!(masks[0], masks[2]);
+    assert_eq!(masks[1], masks[3]);
+    assert_ne!(masks[0], masks[1], "consecutive granules alternate banks");
+}
+
+#[test]
+fn a_parked_compute_s2mm_streams_its_later_granules_from_grant_plus_ten() {
+    // Silicon (sl k sweep, N sweep, release sweep): granule 4 at G + 10, then every 4 cycles
+    // (G + 14, 18, 22 seen); N = 20 finishes at G + 11, N = 64 at G + 55 (chained and first BD);
+    // one STREAM_STARVATION cycle at G + 2 when the BD wants more than its 16 held words.
+    let run = parked_s2mm(64, 60, |_, _| false);
+    let mut want: Vec<u64> = vec![2, 3, 4, 5];
+    want.extend((0..12).map(|j| 10 + 4 * j));
+    assert_eq!(rel(&run), want);
+    assert_eq!(run.finishes, vec![run.grant + 55]);
+    assert_eq!(run.starving, vec![run.grant + 2]);
+    let run = parked_s2mm(20, 60, |_, _| false);
+    assert_eq!(run.finishes, vec![run.grant + 11]);
+    assert_eq!(run.starving, vec![run.grant + 2]);
+}
+
+#[test]
+fn a_refused_compute_s2mm_write_leaves_its_ingress_side_unchanged() {
+    // Silicon (sl camps: a core camping on the even granules' bank): the refusals delay the
+    // writes, but the STREAM_STARVATION cycle stays at G + 2 and the refill is as without them.
+    let free = parked_s2mm(64, 60, |_, _| false);
+    let g = free.grant;
+    let even = free.writes[0].1;
+    let camp = parked_s2mm(64, 60, |c, m| m == even && (g + 2..g + 4).contains(&c));
+    assert_eq!(camp.grant, g);
+    assert_eq!(&rel(&camp)[..5], &[4, 5, 6, 7, 10], "granules 0..3 queue behind the refused write");
+    assert_eq!(camp.starving, free.starving, "the ingress side does not see the refusals");
+    assert_eq!(camp.finishes, free.finishes);
+}
+
+#[test]
+fn after_a_refused_write_a_granule_not_ready_before_it_comes_two_cycles_later() {
+    // Silicon (sl camps): the last bank-0 granule (14) refused from G + 50 and served at G + 54,
+    // the last granule (15, ready at G + 54) then written at G + 56: FINISHED_BD G + 57 (G + 56
+    // in the other grant phase, served at G + 53). The compute MM2S's late-granule gap.
+    let free = parked_s2mm(64, 60, |_, _| false);
+    let g = free.grant;
+    let even = free.writes[0].1;
+    for (last_refused, fin) in [(53u64, 57u64), (52, 56)] {
+        let camp = parked_s2mm(64, 60, |c, m| m == even && (g + 50..=g + last_refused).contains(&c));
+        let w = rel(&camp);
+        assert_eq!(&w[w.len() - 2..], &[last_refused + 1, last_refused + 3]);
+        assert_eq!(camp.finishes, vec![g + fin]);
     }
 }
 // --------------------------------------------------------------------------------------------

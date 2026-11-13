@@ -1588,6 +1588,47 @@ pub struct DmaTiming {
     /// bank access: 1. Fitted, same data.
     pub mm2s_lock_stall_before_last_access_cycles: u8,
 
+    /// Cycles from the lock grant of a lock-started **compute-tile** S2MM BD (the cycle it
+    /// holds the lock, STALLED_LOCK falling) until its first bank write: 2, first-BD and
+    /// chained alike, as `mm2s_lock_to_access_cycles`. Silicon (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py` sl family): a core load meets the write of the first held
+    /// granule at grant + 2 (k sweep), and a held 4-word BD finishes at grant + 3 (N sweep).
+    pub s2mm_lock_to_write_cycles: u8,
+
+    /// Cycles a word spends in a **compute-tile** S2MM's ingress before the granule it
+    /// completes can be written: 4. The S2MM writes one granule (its words that share a 16-byte
+    /// line) per cycle, once every word of it has been in the ingress this long. Fitted
+    /// (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` sl family): after a parked BD's grant G the
+    /// four held granules are written at G + 2..5 and the first streamed one at G + 10, its
+    /// last word having entered at G + 6 behind the write that freed the room; only the sum
+    /// from entry to write is observed. The lock-free ring rows (S2MM writes 6 cycles after the
+    /// old first-word placement) give the same 4.
+    pub s2mm_ingress_to_write_cycles: u8,
+
+    /// Origin of a **compute-tile** S2MM's lock grant grid after an earlier grant of the
+    /// channel: the grid (period `mm2s_lock_grant_period_cycles`, blocked phase
+    /// `mm2s_lock_grant_blocked_phase`) is counted from the previous grant + 2. Fitted (NPU1,
+    /// 2026-11, objectfifo_turns_walkers re-traced with lock selectors): the grant after the core's
+    /// release R is R + 3 exactly when (R - previous grant) mod 3 = 2, 119 of 119 iterations;
+    /// anchored on the previous FINISHED_BD instead it fails. Only the residue is observed.
+    pub s2mm_lock_grid_after_grant_cycles: u8,
+
+    /// Granules a **compute-tile** S2MM holds between its ingress and its bank writes: 4. A
+    /// granule leaves the ingress when it is ready (`s2mm_ingress_to_write_cycles`) whether or
+    /// not the bank serves its write, and waits here to be written, one per cycle from the
+    /// head. Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` sl camps: a core camping on
+    /// the bank of the even granules refuses their writes up to 4 cycles): the ingress side is
+    /// unchanged by the refusals (feeding MM2S's backpressure falls at grant + 6, the
+    /// STREAM_STARVATION pulse at + 2, as without the camp), which needs at least 3; the value
+    /// 4 (the granules a parked channel holds) is a choice, nothing larger was refused.
+    pub s2mm_write_queue_granules: u8,
+
+    /// Cycles from a **compute-tile** S2MM BD's last bank write to its FINISHED_BD: 1. Silicon
+    /// (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` sl family): a held 4-word BD is written at
+    /// its grant + 2 (k sweep) and finishes at + 3 (N sweep); 64 words: last write + 54, finish
+    /// + 55.
+    pub s2mm_write_to_finish_cycles: u8,
+
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
     /// holds (local slave 4 + master 4).

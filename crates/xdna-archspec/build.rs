@@ -555,6 +555,11 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
                 "DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES",
                 t.dma.mm2s_lock_stall_before_last_access_cycles,
             ),
+            ("DMA_S2MM_LOCK_TO_WRITE_CYCLES", t.dma.s2mm_lock_to_write_cycles),
+            ("DMA_S2MM_INGRESS_TO_WRITE_CYCLES", t.dma.s2mm_ingress_to_write_cycles),
+            ("DMA_S2MM_LOCK_GRID_AFTER_GRANT_CYCLES", t.dma.s2mm_lock_grid_after_grant_cycles),
+            ("DMA_S2MM_WRITE_QUEUE_GRANULES", t.dma.s2mm_write_queue_granules),
+            ("DMA_S2MM_WRITE_TO_FINISH_CYCLES", t.dma.s2mm_write_to_finish_cycles),
             ("BANK_ARBITER_PERIOD", t.dma.bank_arbiter_period),
             ("BANK_ARBITER_DMA_RESIDUE", t.dma.bank_arbiter_dma_residue),
         ] {

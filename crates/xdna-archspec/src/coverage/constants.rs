@@ -232,6 +232,19 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the request - 1 (a free lock shows one cycle). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
         unit("dma.mm2s_lock_stall_before_last_access_cycles", HardwareObserved, Verification::Unverified,
             "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the previous BD's last access - 1. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        measured("dma.s2mm_lock_to_write_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py sl family, a compute S2MM BD \
+            parked on a core-released lock): first bank write grant + 2 (k sweep, both banks), a held 4-word BD finishes at \
+            grant + 3; first-BD and chained alike",
+            "Compute tiles. Assumes a conflict event is stamped on the access cycle, as for the MM2S."),
+        unit("dma.s2mm_ingress_to_write_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (sl family k sweep, NPU1 2026-11): the first streamed granule after a parked BD's grant G is written at G + 10, its last word having entered the ingress at G + 6 in the emulator's refill; later granules every 4 cycles; the held word count N = 4..20 and 64 finishes follow. Only the sum from entry to write is observed. Compute tiles."),
+        unit("dma.s2mm_lock_grid_after_grant_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (objectfifo_turns_walkers re-traced with lock selectors, NPU1 2026-11, 3 runs): the S2MM grant after a core release R is R + 3 exactly when (R - the channel's previous grant) mod 3 = 2, 119 of 119 iterations; only the residue is observed. Compute tiles."),
+        unit("dma.s2mm_write_queue_granules", HardwareObserved, Verification::Unverified,
+            "Inferred lower bound (sl camps, NPU1 2026-11): with a core refusing the even granules' writes for up to 4 cycles the ingress side is unchanged (backpressure fall grant + 6, starvation pulse + 2), which needs at least 3 granules between ingress and bank; 4 is a choice. Compute tiles."),
+        measured("dma.s2mm_write_to_finish_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py sl family): a held 4-word BD \
+            written at grant + 2 finishes at grant + 3; 64 words: last write + 54, FINISHED_BD + 55",
+            "Compute tiles."),
         measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
             every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
             5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \

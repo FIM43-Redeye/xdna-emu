@@ -288,7 +288,10 @@ impl DmaEngine {
             if let Some(c) = self.channels.get_mut(ch) {
                 c.accept_awaiting_drain = false;
             }
-            self.stream_in[ch].push_back(data);
+            self.stream_in[ch].push_back(IngressWord { data, entered: self.read_clock });
+            if let Some(f) = self.s2mm_word_entered.get_mut(ch) {
+                *f = true;
+            }
             if self.channels.get(ch).is_some_and(|c| c.accept_ooo_header) {
                 self.accept_ooo_header(ch, data.data);
             } else {
@@ -432,7 +435,10 @@ impl DmaEngine {
         // has drained from the ingress. The block is armed at BD completion and
         // cleared when the first word of the next BD is accepted; while it stands,
         // any residual prior-BD occupancy refuses the stream.
-        if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain) && current > 0 {
+        if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain)
+            && current > 0
+            && !self.drain_gate_open(channel as usize)
+        {
             return false;
         }
         current < self.channel_input_capacity(channel)
@@ -472,7 +478,7 @@ impl DmaEngine {
     /// Phase 4's `can_accept_stream_in_for_routing` can enforce the registered-
     /// FIFO ordering invariant (#140 phase-ordering fix).
     pub(super) fn pop_stream_in_for_channel(&mut self, channel: u8) -> Option<StreamData> {
-        let word = self.stream_in.get_mut(channel as usize)?.pop_front()?;
+        let word = self.stream_in.get_mut(channel as usize)?.pop_front()?.data;
         if let Some(c) = self.stream_in_drained_this_cycle.get_mut(channel as usize) {
             *c += 1;
         }
@@ -498,6 +504,9 @@ impl DmaEngine {
             *f = false;
         }
         for f in &mut self.s2mm_beat_offered {
+            *f = false;
+        }
+        for f in &mut self.s2mm_word_entered {
             *f = false;
         }
         for f in &mut self.mm2s_egress_empty_wanted {
@@ -562,12 +571,37 @@ impl DmaEngine {
             return;
         }
         for ch in 0..self.s2mm_count {
-            let high = self.lock_wait_wants_beat(ch) && !self.s2mm_beat_offered[ch];
-            if high != self.channels[ch].lock_wait_starving {
-                self.channels[ch].lock_wait_starving = high;
+            // One level: the lock wait's and the granule writer's (the grant hands it over).
+            let was = self.channels[ch].lock_wait_starving || self.channels[ch].writer_starving;
+            self.channels[ch].lock_wait_starving =
+                self.lock_wait_wants_beat(ch) && !self.s2mm_beat_offered[ch];
+            self.channels[ch].writer_starving = self.granule_writer_starves(ch);
+            let high = self.channels[ch].lock_wait_starving || self.channels[ch].writer_starving;
+            if high != was {
                 self.trace(EventType::DmaStreamStarvation { channel: ch as u8, active: high });
             }
         }
+    }
+
+    /// A compute S2MM's granule writer runs (`compute_s2mm_cycle`) and its stream side starves
+    /// this cycle: the BD still wants words its ingress does not hold, the ingress has room
+    /// after this cycle's write, and no word entered. Silicon (NPU1, 2026-11, sl family): a
+    /// one-cycle pulse at the grant + 2 of a parked BD that wants more than its 16 held words
+    /// (N >= 20), none for N <= 16. Here that is the first write freeing room that the
+    /// registered ready signal shows only the next cycle (`can_accept_stream_in_for_routing`).
+    /// The cause on silicon is not known (INFERRED). A control-path refusal (the BD-switch
+    /// ready gap) is not starvation.
+    fn granule_writer_starves(&self, ch: usize) -> bool {
+        let c = &self.channels[ch];
+        let ChannelFsm::Transferring { transfer } = &c.fsm else {
+            return false;
+        };
+        self.uses_granule_writer(transfer)
+            && c.accept_bd == Some(transfer.bd_index)
+            && c.accept_words_remaining > 0
+            && c.bd_switch_accept_block == 0
+            && !self.s2mm_word_entered[ch]
+            && self.stream_in[ch].len() < self.channel_input_capacity(ch as u8)
     }
 
     /// S2MM channel `ch` is armed, waiting on the lock of its task's first BD, and that BD has
@@ -647,6 +681,16 @@ impl DmaEngine {
         (DMA_MM2S_READ_TO_OFFER_CYCLES + memtile) as u64
     }
 
+    /// Whether a compute S2MM's one-BD-lookahead gate is open with the previous BD's words still
+    /// in its ingress: the BD they belong to holds its lock and is writing them (its granule
+    /// writer, `compute_s2mm_cycle`). The gate holds a chain off a lock-stalled BD (#140 send
+    /// cadence), but a writing BD's words wait `DMA_S2MM_INGRESS_TO_WRITE_CYCLES` in the
+    /// ingress, and silicon streams chained BDs one BD-switch cycle apart
+    /// (objectfifo_turns_walkers re-trace: 64-word BDs finish 65 cycles apart).
+    fn drain_gate_open(&self, ch: usize) -> bool {
+        matches!(&self.channels[ch].fsm, ChannelFsm::Transferring { transfer } if self.uses_granule_writer(transfer))
+    }
+
     /// Check if a specific S2MM channel can accept a word from the routing phase.
     ///
     /// Like `can_accept_stream_in_for_channel` but enforces the registered-FIFO
@@ -680,6 +724,7 @@ impl DmaEngine {
         // last word leaves, matching HW's registered TREADY.
         if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain)
             && current + drained > 0
+            && !self.drain_gate_open(channel as usize)
         {
             return false;
         }

@@ -3442,16 +3442,21 @@ mod tests {
     /// three values moves the release across that phase.
     #[test]
     fn a_core_held_on_a_dma_release_issues_on_silicons_cycle() {
+        // The head BD is a task's first lock BD, granted on the first-BD grid counted from its
+        // task start (`LockPort`), so the go cycles do not walk its finish through all three
+        // residues against the held core's resume phase: the + 5 / + 6 split over a short sweep
+        // depends on where the two phases sit, and only the two values are pinned here (silicon:
+        // + 5 in 1132 runs, + 6 in 567, both phases random against each other).
         let mut after = std::collections::BTreeMap::new();
-        for go in [300, 301, 302] {
+        for go in 300..306 {
             let (finished, release, event0) = run_sync_head(go);
             assert_eq!(release - finished, 3, "go {go}: release at FINISHED_BD + 3");
             *after.entry(event0 - finished).or_insert(0) += 1;
         }
         assert_eq!(
-            after,
-            [(5, 2), (6, 1)].into(),
-            "event #0 at FINISHED_BD + 5 twice, + 6 once in three phases"
+            after.keys().copied().collect::<Vec<u64>>(),
+            vec![5, 6],
+            "event #0 at FINISHED_BD + 5 or + 6: {after:?}"
         );
     }
 

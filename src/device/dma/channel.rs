@@ -609,6 +609,20 @@ pub struct ChannelContext {
     /// Compute-tile MM2S lock port (`LockPort`): when the chain's next lock BD is requested and
     /// granted. Idle on every other channel.
     pub lock_port: super::lock_port::LockPort,
+    /// Compute-tile S2MM lock port (`S2mmPort`): the grant grid and the first write after a
+    /// grant. Idle on every other channel.
+    pub s2mm_port: super::s2mm_port::S2mmPort,
+    /// Held level of a compute S2MM's STREAM_STARVATION while its granule writer runs
+    /// (`DmaEngine::settle_stream_starvation`).
+    pub writer_starving: bool,
+    /// A compute S2MM's write queue (`DmaEngine::compute_s2mm_cycle`): granules taken from the
+    /// ingress and not yet written (word count, step taken), and their words.
+    pub s2mm_write_queue: VecDeque<(usize, u64)>,
+    pub s2mm_write_words: VecDeque<super::engine::StreamData>,
+    /// Step the queue's head write was first presented to the bank (won or lost).
+    pub s2mm_head_presented: Option<u64>,
+    /// Step from which the next write may come after a refused one (`late_gap`).
+    pub s2mm_late_gap_until: u64,
     /// Engine step at which the current BD's last bank access has settled and FINISHED_BD may
     /// be stamped (last access + `mm2s_access_to_finish_cycles`).
     pub access_settles_at: u64,
@@ -663,6 +677,12 @@ impl ChannelContext {
             read_tail: 0,
             word_clock: Default::default(),
             lock_port: Default::default(),
+            s2mm_port: Default::default(),
+            writer_starving: false,
+            s2mm_write_queue: VecDeque::new(),
+            s2mm_write_words: VecDeque::new(),
+            s2mm_head_presented: None,
+            s2mm_late_gap_until: 0,
             access_settles_at: 0,
             access_from: 0,
             egress_backpressure: false,
@@ -816,6 +836,12 @@ impl ChannelContext {
         self.read_tail = 0;
         self.word_clock.clear();
         self.lock_port.clear();
+        self.s2mm_port.clear();
+        self.writer_starving = false;
+        self.s2mm_write_queue.clear();
+        self.s2mm_write_words.clear();
+        self.s2mm_head_presented = None;
+        self.s2mm_late_gap_until = 0;
         self.access_settles_at = 0;
         self.access_from = 0;
         self.egress_backpressure = false;

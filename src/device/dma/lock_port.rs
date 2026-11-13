@@ -14,8 +14,9 @@ use xdna_archspec::aie2::timing::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request {
     /// The run's first BD: no previous BD or lock grant to time a request from. Presented
-    /// every cycle from `first_grant - 1` (outside the rule; see `LockPort`).
-    Ungated { first_grant: u64 },
+    /// from `first_grant - 1` on the grid counted from `origin`, the run's first sequenced word
+    /// (see `LockPort`).
+    Ungated { first_grant: u64, origin: u64 },
     /// From the request step `q` on, grantable in 2 of every 3 steps.
     Gridded { q: u64 },
 }
@@ -67,6 +68,16 @@ pub struct LockPort {
     /// DEAD: the release slots (FINISHED_BD + 4) of the run's latest finished lock BDs.
     release_slots: VecDeque<u64>,
     target: Option<Target>,
+    /// Grid origin of the BD `seq` whose predecessor had refused accesses: that BD's
+    /// FINISHED_BD - 1 (seq, origin).
+    finish_origin: Option<(u64, u64)>,
+}
+
+/// Whether a grant at `grant` is open on the grid counted from `origin` (period
+/// `DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES`, one blocked phase).
+fn open_on_grid(grant: u64, origin: u64) -> bool {
+    let period = DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES as i64;
+    (grant as i64 - origin as i64).rem_euclid(period) != DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE as i64
 }
 
 impl LockPort {
@@ -93,13 +104,11 @@ impl LockPort {
         let t = self.target.filter(|t| !t.granted)?;
         let grant = at + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64;
         let ok = match t.request? {
-            Request::Ungated { first_grant } => grant >= first_grant,
+            Request::Ungated { first_grant, origin } => grant >= first_grant && open_on_grid(grant, origin),
             Request::Gridded { q } => {
                 let q = self.effective_q(q);
-                grant >= q
-                    && (grant - q) % DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES as u64
-                        != DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE as u64
-                    && !self.dead(grant)
+                let origin = self.finish_origin.filter(|&(seq, _)| seq == t.seq).map_or(q, |(_, o)| o);
+                grant >= q && open_on_grid(grant, origin) && !self.dead(grant)
             }
         };
         ok.then_some((t.lock_id, t.acquire_value))
@@ -116,9 +125,16 @@ impl LockPort {
         self.last_seq = Some(t.seq);
     }
 
-    /// The current BD finished at `at`; `acquires` says it held a lock (its release slot is
-    /// FINISHED_BD + 4).
-    pub fn note_finished(&mut self, acquires: bool, at: u64) {
+    /// The current BD `seq` finished at `at`; `acquires` says it held a lock (its release slot
+    /// is FINISHED_BD + 4), `refused` that the bank refused one of its accesses: then the next
+    /// BD's grid is counted from this FINISHED_BD - 1 (silicon, refused-access probe: the grant
+    /// is release + 3 exactly when (release - FINISHED_BD) mod 3 = 2, 144 of 144 runs, also where
+    /// late refusals moved the finish; for a BD served as presented that origin is the request's
+    /// own residue, so only refused predecessors change).
+    pub fn note_finished(&mut self, seq: u64, acquires: bool, refused: bool, at: u64) {
+        if refused {
+            self.finish_origin = Some((seq + 1, at.saturating_sub(1)));
+        }
         if acquires {
             self.release_slots
                 .push_back(at + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64);
@@ -163,9 +179,10 @@ impl LockPort {
                 Some((None, _, _)) => None,
                 None => Some(match from_grant {
                     Some(q) => Request::Gridded { q },
-                    None => {
-                        Request::Ungated { first_grant: now + 1 + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64 }
-                    }
+                    None => Request::Ungated {
+                        first_grant: now + 1 + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64,
+                        origin: wc.from(),
+                    },
                 }),
             };
             self.target = Some(t);
@@ -189,7 +206,7 @@ impl LockPort {
         }
         let q = match t.request {
             None => return false,
-            Some(Request::Ungated { first_grant }) => first_grant,
+            Some(Request::Ungated { first_grant, .. }) => first_grant,
             Some(Request::Gridded { q }) => self.effective_q(q),
         };
         if q > now + DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES as u64 {

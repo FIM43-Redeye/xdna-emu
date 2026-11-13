@@ -4946,14 +4946,13 @@ fn lock_wait_starvation_ends_when_the_lock_is_granted() {
 
     rig.tile.locks[rig.lock].set(1);
     rig.run(10, |_| false);
-    let granted_at = rig
-        .levels
-        .iter()
-        .skip(30)
-        .position(|&h| !h)
-        .expect("the level must fall at the grant");
-    assert!(granted_at < 5, "the level falls within the lock grant, not later ({granted_at})");
     assert!(!rig.eng.channel_lock_stalled(0));
+    // The lock wait's part of the level ends with the grant; a compute S2MM's granule writer
+    // takes it over without a gap while the BD still wants words and none is offered
+    // (`granule_writer_starves`; emulator choice, the empty-ingress grant is not measured).
+    assert!(!rig.eng.channels[0].lock_wait_starving, "the lock-wait level ends at the grant");
+    assert!(rig.eng.channels[0].writer_starving, "the writer starves on with nothing offered");
+    assert!(rig.levels.iter().skip(29).all(|&h| h), "one level, no dip at the hand-over");
 }
 
 #[test]

@@ -179,6 +179,10 @@ impl DmaEngine {
                 .map_or(0, |f| f.bank_mask);
         }
 
+        if self.uses_granule_writer(transfer) {
+            return self.s2mm_writer_plan(transfer, layout, self.read_clock + 1).1;
+        }
+
         let bytes_remaining = transfer.remaining_bytes() as usize;
         if bytes_remaining == 0 {
             return 0;
@@ -432,6 +436,215 @@ impl DmaEngine {
         self.tile_kind.is_compute() && self.uses_egress_staging(transfer)
     }
 
+    /// Whether an S2MM transfer runs through the compute granule writer (`compute_s2mm_cycle`):
+    /// a compute tile's plain S2MM. Decompression, finish-on-TLAST and out-of-order packets keep
+    /// the word path (their granule boundaries depend on the stream's content; unmeasured).
+    pub(super) fn uses_granule_writer(&self, transfer: &Transfer) -> bool {
+        self.tile_kind.is_compute()
+            && transfer.direction == TransferDirection::S2MM
+            && !self.is_decompression_enabled(transfer.channel)
+            && self.get_channel_fot_mode(transfer.channel) == 0
+            && !self.is_out_of_order_enabled(transfer.channel)
+    }
+
+    /// The next granule of a compute S2MM's transfer that is not yet in its write queue: how
+    /// many words it has (the BD's next words sharing one 16-byte line, after the `queued`
+    /// words already taken). 0 if every word is queued. Pure.
+    fn s2mm_next_granule_words(
+        &self,
+        transfer: &Transfer,
+        queued: usize,
+        layout: crate::device::banking::BankLayout,
+    ) -> usize {
+        let remaining = (transfer.remaining_bytes() as usize).div_ceil(4);
+        if queued >= remaining {
+            return 0;
+        }
+        let granule = layout.access_granule_bytes();
+        let mut probe = transfer.address_gen.clone();
+        let mut last = transfer.last_access_addr;
+        for _ in 0..queued {
+            last = Some(probe.current());
+            probe.next();
+        }
+        let mut words = 0usize;
+        while words < remaining - queued {
+            let addr = probe.current();
+            if words > 0 && word_opens_granule(last, addr, granule) {
+                break;
+            }
+            words += 1;
+            last = Some(addr);
+            if probe.next().is_none() {
+                break;
+            }
+        }
+        words
+    }
+
+    /// A compute S2MM's step at `at`: (the words of the granule it moves from its ingress into
+    /// its write queue, if it moves one; the bank mask of the write it presents, 0 if none).
+    /// Pure, so the bank peek and the commit agree.
+    ///
+    /// Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` sl family): after a parked BD's
+    /// grant G the 16 words held in the ingress are written a granule per cycle at G + 2..5,
+    /// alternating banks; later granules every 4 cycles, the first at G + 10; FINISHED_BD one
+    /// cycle after the last write (a held 4-word BD at G + 3, 64 words at G + 55, chained and
+    /// first BD alike). With a core camping on the bank (refusing writes for up to 4 cycles) the
+    /// ingress side is unchanged -- the feeding MM2S's backpressure still falls at G + 6, the
+    /// one-cycle STREAM_STARVATION is still at G + 2 -- so a granule leaves the ingress whether
+    /// or not its write is served: here into a write queue of
+    /// `DMA_S2MM_WRITE_QUEUE_GRANULES`, written from its head one granule per cycle. A granule
+    /// (the BD's next words that share a 16-byte line) leaves the ingress once every word of it
+    /// has been there `DMA_S2MM_INGRESS_TO_WRITE_CYCLES`, one per step, and for a lock-started
+    /// BD from its grant + `DMA_S2MM_LOCK_TO_WRITE_CYCLES`; it can be written in the same step.
+    /// After a write the bank refused, a granule that was not ready before the cycle that write
+    /// was served is written `DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES` after it, as the compute
+    /// MM2S's late-granule gap (`WordClock::late_gap_allows`): the sl camps' last write (a
+    /// refused bank-0 granule served at G + 54, the last granule ready at G + 54) finishes at
+    /// G + 57, and at G + 56 in the other grant phase (served at + 53).
+    fn s2mm_writer_plan(
+        &self,
+        transfer: &Transfer,
+        layout: crate::device::banking::BankLayout,
+        at: u64,
+    ) -> (Option<usize>, u16) {
+        use xdna_archspec::aie2::timing::{DMA_S2MM_INGRESS_TO_WRITE_CYCLES, DMA_S2MM_WRITE_QUEUE_GRANULES};
+        let ch = transfer.channel as usize;
+        let c = &self.channels[ch];
+        let queued: usize = c.s2mm_write_queue.iter().map(|g| g.0).sum();
+        let lock_open = transfer.acquire_lock.is_none() || at >= c.s2mm_port.write_from();
+        let mut take = None;
+        if lock_open && c.s2mm_write_queue.len() < DMA_S2MM_WRITE_QUEUE_GRANULES as usize {
+            let words = self.s2mm_next_granule_words(transfer, queued, layout);
+            if words > 0 {
+                let ready = self
+                    .stream_in
+                    .get(ch)
+                    .and_then(|q| q.get(words - 1))
+                    .is_some_and(|w| at >= w.entered + DMA_S2MM_INGRESS_TO_WRITE_CYCLES as u64);
+                take = ready.then_some(words);
+            }
+        }
+        let head = c
+            .s2mm_write_queue
+            .front()
+            .map(|g| g.0)
+            .or(take)
+            .filter(|_| at >= c.s2mm_late_gap_until);
+        let mask = head.map_or(0, |words| self.granule_capped_words(transfer, words, layout).1);
+        (take, mask)
+    }
+
+    /// One step of a compute S2MM's granule writer (`s2mm_writer_plan`): move the granule that
+    /// is ready from the ingress into the write queue, then write the queue's head granule
+    /// unless the bank refused it (`mem_denied`). Waiting raises no event here; the channel's
+    /// STREAM_STARVATION is the ingress side's (`settle_stream_starvation`).
+    fn compute_s2mm_cycle(
+        &mut self,
+        mem_denied: bool,
+        transfer: &mut Transfer,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> TransferCycleResult {
+        let layout = self.bank_layout();
+        let ch = transfer.channel as usize;
+        let (take, _) = self.s2mm_writer_plan(transfer, layout, self.read_clock);
+        if let Some(words) = take {
+            for _ in 0..words {
+                let w = self
+                    .pop_stream_in_for_channel(ch as u8)
+                    .expect("planned words are in the ingress");
+                self.channels[ch].s2mm_write_words.push_back(w);
+            }
+            self.channels[ch].s2mm_write_queue.push_back((words, self.read_clock));
+        }
+        let now = self.read_clock;
+        if self.channels[ch].s2mm_write_queue.is_empty() || now < self.channels[ch].s2mm_late_gap_until {
+            return TransferCycleResult::ReadInProgress;
+        }
+        self.channels[ch].s2mm_head_presented.get_or_insert(now);
+        if mem_denied {
+            return TransferCycleResult::ReadInProgress;
+        }
+        let (words, _) = self.channels[ch].s2mm_write_queue.pop_front().expect("checked");
+        let refused = self.channels[ch].s2mm_head_presented.take().is_some_and(|p| p < now);
+        let granule = layout.access_granule_bytes();
+        for _ in 0..words {
+            let data = self.channels[ch].s2mm_write_words.pop_front().expect("queued words");
+            let addr = transfer.current_address();
+            self.word_opens_granule = word_opens_granule(transfer.last_access_addr, addr, granule);
+            if !self.store_s2mm_word(addr, data, tile, neighbors) {
+                return TransferCycleResult::Error;
+            }
+            transfer.advance(4);
+            self.channels[ch].stats.bytes_transferred += 4;
+        }
+        if refused {
+            // Was the next granule ready (taken from the ingress) before this cycle?
+            let ready_before = self.channels[ch]
+                .s2mm_write_queue
+                .front()
+                .is_some_and(|&(_, taken)| taken < now);
+            if !ready_before {
+                self.channels[ch].s2mm_late_gap_until =
+                    now + xdna_archspec::aie2::timing::DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES as u64;
+            }
+        }
+        TransferCycleResult::Continue
+    }
+
+    /// Store one word of a compute S2MM's granule write at `addr` (the bank access is recorded
+    /// on the granule's first word), as `transfer_s2mm` does for a word from the ingress.
+    fn store_s2mm_word(
+        &mut self,
+        addr: u64,
+        data: StreamData,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> bool {
+        let mem_size = tile.data_memory().len();
+        let Some((target_kind, target_tile, offset)) =
+            self.resolve_s2mm_target(addr, mem_size, tile, neighbors)
+        else {
+            return false;
+        };
+        if offset + 4 > mem_size {
+            let msg = format!(
+                "DMA({},{}) S2MM addr=0x{:X} wraps past memory end (size=0x{:X}) -- bus error",
+                self.col, self.row, addr, mem_size,
+            );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
+            return false;
+        }
+        if self.word_opens_granule {
+            self.cycle_dma_banks |=
+                crate::device::banking::banks_for_access(offset as u32, 4, self.bank_layout());
+        }
+        target_tile.data_memory_mut()[offset..offset + 4].copy_from_slice(&data.data.to_le_bytes());
+        if crate::debug::watch::is_watched(offset as u64, 4) {
+            crate::debug::watch::log_dma_write(
+                self.current_cycle,
+                self.col,
+                self.row,
+                offset as u64,
+                data.data,
+                &format!("S2MM{}", data.channel),
+            );
+        }
+        let origin = dma_access_origin(target_kind);
+        fire_watchpoint_events_with_origin(
+            target_tile,
+            offset as u32,
+            true,
+            self.current_cycle,
+            None,
+            origin,
+        );
+        true
+    }
+
     /// Step the DMA engine by one cycle.
     ///
     /// This processes all active channels, moving data between memory and streams.
@@ -514,7 +727,12 @@ impl DmaEngine {
     /// `next_granule_fetch` for why draining does not move the MM2S fetch
     /// cursor), honouring the AM020 ch.2:166 retry contract.
     fn is_held_inert(&self, ch_idx: usize, denied: &[Requester]) -> bool {
-        self.is_mem_denied(ch_idx, denied) && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
+        // A compute S2MM's granule writer keeps its ingress side live (`compute_s2mm_cycle`).
+        let writer = matches!(&self.channels[ch_idx].fsm, ChannelFsm::Transferring { transfer }
+            if self.uses_granule_writer(transfer));
+        self.is_mem_denied(ch_idx, denied)
+            && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
+            && !writer
     }
 
     fn step_impl(
@@ -557,6 +775,14 @@ impl DmaEngine {
             {
                 self.drain_read_ahead(ch_idx);
                 any_active = true;
+            }
+
+            // A compute S2MM's STALLED_LOCK falls in the step it holds its grant.
+            if self.channels[ch_idx].s2mm_port.take_fall(self.read_clock)
+                && self.channels[ch_idx].prev_lock_stalled
+            {
+                self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
+                self.channels[ch_idx].prev_lock_stalled = false;
             }
 
             // The compute MM2S word clock sequences before anything else of the step reads it,
@@ -1110,6 +1336,18 @@ impl DmaEngine {
                     // Check if arbiter granted the acquire (submitted in pre-step pass)
                     if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
                         self.on_acquire_granted(ch_idx, lock_id, transfer.bd_index);
+                        if self.is_compute_s2mm(ch_idx) {
+                            // A compute S2MM holds the grant one step after the arbiter gave it
+                            // and writes from two steps after that, first-BD and chained alike:
+                            // no post-grant countdown, memory latency or start bonus (silicon, sl
+                            // family; `S2mmPort`).
+                            self.channels[ch_idx].s2mm_port.granted(self.read_clock);
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, false);
+                            debug_assert_eq!(bonus, 0, "a compute S2MM pays no first-BD bonus");
+                            self.maybe_insert_packet_header_from_transfer(&mut transfer);
+                            self.channels[ch_idx].fsm = ChannelFsm::Transferring { transfer };
+                            return;
+                        }
                         // For a chained BD with no post-grant cooldown
                         // (cycles_remaining=0 from enter_chained_bd), collapse
                         // the AcquiringLock{acquired=true,cr=0} -> Transferring
@@ -1322,6 +1560,14 @@ impl DmaEngine {
                 if transfer.remaining_bytes() == 0 {
                     if read_ahead {
                         self.retire_issued_bd(ch_idx, transfer, tile, neighbors)
+                    } else if self.uses_granule_writer(&transfer) {
+                        // FINISHED_BD one cycle after the last write (silicon, sl family: a held
+                        // 4-word BD written at its grant + 2 finishes at + 3).
+                        ChannelFsm::StartupHold {
+                            cycles_remaining: xdna_archspec::aie2::timing::DMA_S2MM_WRITE_TO_FINISH_CYCLES
+                                as u16,
+                            transfer,
+                        }
                     } else {
                         self.complete_or_hold(ch_idx, transfer, tile, neighbors)
                     }
@@ -1808,8 +2054,10 @@ impl DmaEngine {
     fn note_bd_finished(&mut self, ch_idx: usize, completion: &CompletionInfo) {
         let now = self.read_clock;
         let ch = &mut self.channels[ch_idx];
-        if let Some((seq, acquires)) = ch.word_clock.current().map(|b| (b.seq, b.spec.acquire.is_some())) {
-            ch.lock_port.note_finished(acquires, now);
+        if let Some((seq, acquires, refused)) =
+            ch.word_clock.current().map(|b| (b.seq, b.spec.acquire.is_some(), b.refused))
+        {
+            ch.lock_port.note_finished(seq, acquires, refused, now);
             ch.word_clock.note_finished(seq, now);
         }
         self.channels[ch_idx].stats.transfers_completed += 1;
@@ -1978,6 +2226,9 @@ impl DmaEngine {
         }
         if self.uses_egress_staging(transfer) {
             return self.staged_mm2s_cycle(ch_idx, mem_denied, transfer, tile, neighbors);
+        }
+        if self.uses_granule_writer(transfer) {
+            return self.compute_s2mm_cycle(mem_denied, transfer, tile, neighbors);
         }
         // Any other MM2S (zero padding, compression, shim) writes its words
         // straight into the output register, so it waits behind words a
@@ -2181,7 +2432,11 @@ impl DmaEngine {
     /// HW's LOCK_SEL*_REL trace fires at the BD-ring recycle, not at completion.
     fn on_acquire_granted(&mut self, ch_idx: usize, lock_id: u8, bd_index: u8) {
         // A compute MM2S's level belongs to its lock port (`drive_lock_port_stall`).
-        if self.channels[ch_idx].prev_lock_stalled && !self.channels[ch_idx].word_clock.is_running() {
+        // A compute S2MM's falls when it holds the grant (`step_impl`, `S2mmPort::take_fall`).
+        if self.channels[ch_idx].prev_lock_stalled
+            && !self.channels[ch_idx].word_clock.is_running()
+            && !self.is_compute_s2mm(ch_idx)
+        {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_lock_stalled = false;
         }
@@ -3819,21 +4074,35 @@ mod bank_demand_tests {
 
         // Stage and consume the first cycle's 4 words so the channel is
         // genuinely mid-transfer.
+        // A compute S2MM writes a granule once its words have been in the ingress
+        // `DMA_S2MM_INGRESS_TO_WRITE_CYCLES` (`s2mm_writer_plan`): the words wait that long.
+        let wait = xdna_archspec::aie2::timing::DMA_S2MM_INGRESS_TO_WRITE_CYCLES as usize;
         for i in 0..4u32 {
             eng.push_stream_in(StreamData { data: 0xAAAA_0000 | i, tlast: false, channel: 0 });
         }
-        eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        for _ in 0..wait {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
         assert_eq!(
             eng.channel_stats(0).unwrap().bytes_transferred,
             16,
-            "fixture setup must consume exactly one cycle's words"
+            "fixture setup must consume exactly one granule's words"
         );
         assert_eq!(eng.channel_phase(0), "Transferring", "fixture must still have work left");
 
-        // Stage the second (final) cycle's 4 words for the caller's tests.
+        // Stage the second (final) granule's 4 words for the caller's tests, aged so that the
+        // next step writes them.
         for i in 4..8u32 {
             eng.push_stream_in(StreamData { data: 0xAAAA_0000 | i, tlast: false, channel: 0 });
         }
+        for _ in 1..wait {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        }
+        assert_eq!(
+            eng.channel_stats(0).unwrap().bytes_transferred,
+            16,
+            "the second granule is not written yet"
+        );
 
         (eng, tile, host_mem)
     }
@@ -5325,6 +5594,10 @@ mod bank_demand_tests {
         // port can.
         for i in 0..4u32 {
             eng.push_stream_in(StreamData { data: 0xBEEF_0000 | i, tlast: i == 3, channel: 0 });
+        }
+        // ... and has been there long enough to be written (`s2mm_writer_plan`).
+        for _ in 1..xdna_archspec::aie2::timing::DMA_S2MM_INGRESS_TO_WRITE_CYCLES {
+            eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
         }
 
         let mut claimed = Vec::new();

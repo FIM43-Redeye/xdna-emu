@@ -67,6 +67,15 @@ use crate::device::tile::{Tile, TileKind};
 use crate::interpreter::state::EventType;
 use crate::interpreter::timing::sync::LockTimingState;
 
+/// A word in an S2MM channel's ingress, with the engine step it entered in (`read_clock`): a
+/// compute S2MM writes a granule only once its words have been in the ingress
+/// `DMA_S2MM_INGRESS_TO_WRITE_CYCLES` (`DmaEngine::compute_s2mm_cycle`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IngressWord {
+    pub data: StreamData,
+    pub entered: u64,
+}
+
 /// DMA engine for a single tile.
 #[derive(Debug)]
 pub struct DmaEngine {
@@ -112,7 +121,7 @@ pub struct DmaEngine {
     /// Each S2MM channel has its own FIFO, matching real hardware where each
     /// channel connects to a dedicated stream switch master port. This prevents
     /// one channel's traffic (e.g., trace) from blocking another (e.g., output).
-    pub(super) stream_in: Vec<VecDeque<StreamData>>,
+    pub(super) stream_in: Vec<VecDeque<IngressWord>>,
 
     /// Task complete token output buffer.
     /// Tokens are emitted when tasks complete with Enable_Token_Issue set.
@@ -186,6 +195,9 @@ pub struct DmaEngine {
     /// took it. Set by the routing pass (Phase 4) via `note_stream_offer`, cleared with the
     /// other per-cycle signals; read by `settle_stream_starvation`.
     pub(super) s2mm_beat_offered: Vec<bool>,
+    /// Per S2MM channel: a word entered its ingress this cycle (`push_stream_in`). Feeds the
+    /// granule writer's STREAM_STARVATION (`settle_stream_starvation`).
+    pub(super) s2mm_word_entered: Vec<bool>,
 
     /// Per-MM2S-channel: the stream port could have taken a beat this cycle and
     /// the channel's egress staging FIFO was EMPTY --
@@ -256,6 +268,7 @@ impl DmaEngine {
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             s2mm_ingress_full_offered: vec![false; s2mm_channels],
             s2mm_beat_offered: vec![false; s2mm_channels],
+            s2mm_word_entered: vec![false; s2mm_channels],
             mm2s_egress_empty_wanted: vec![false; mm2s_channels],
             fatal_errors: Vec::new(),
             lock_recorder: None,
@@ -604,6 +617,15 @@ impl DmaEngine {
         // pop runs ahead of via the input FIFO + objfifo double-buffer.
         if direction == TransferDirection::S2MM {
             self.init_accept_cursor(ch_idx, bd_index);
+            // A compute S2MM's lock grid for the task's first lock BD is counted from where a
+            // compute MM2S's word clock would start (`S2mmPort`).
+            if self.tile_kind.is_compute() {
+                let anchor = self.read_clock
+                    + self.timing_config.bd_setup_cycles as u64
+                    + 1
+                    + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
+                self.channels[ch_idx].s2mm_port.start_task(anchor);
+            }
             self.channels[ch_idx].lock_wait_starve_from =
                 self.current_cycle + xdna_archspec::aie2::timing::DMA_S2MM_STARVATION_ARM_CYCLES as u64;
         }
@@ -691,6 +713,7 @@ impl DmaEngine {
         }
         if self.channels[ch_idx].prev_starving
             || self.channels[ch_idx].lock_wait_starving
+            || self.channels[ch_idx].writer_starving
             || self.channels[ch_idx].read_backpressure
             || self.channels[ch_idx].egress_backpressure
         {
@@ -706,6 +729,12 @@ impl DmaEngine {
         ch.read_tail = 0;
         ch.word_clock.clear();
         ch.lock_port.clear();
+        ch.s2mm_port.clear();
+        ch.writer_starving = false;
+        ch.s2mm_write_queue.clear();
+        ch.s2mm_write_words.clear();
+        ch.s2mm_head_presented = None;
+        ch.s2mm_late_gap_until = 0;
         ch.access_settles_at = 0;
         ch.access_from = 0;
         ch.egress_backpressure = false;
@@ -943,6 +972,15 @@ impl DmaEngine {
                     && self.mm2s_memory_starvation(self.per_direction_channel(channel)) =>
             {
                 Some(DmaStall::Other)
+            }
+            // A compute S2MM's granule writer with nothing to write: starved when its ingress and
+            // write queue are empty, otherwise waiting on words to settle or on the bank.
+            ChannelFsm::Transferring { transfer } if self.uses_granule_writer(transfer) => {
+                if ch.s2mm_write_queue.is_empty() && !self.has_stream_in_for_channel(channel) {
+                    Some(DmaStall::Starved)
+                } else {
+                    Some(DmaStall::Other)
+                }
             }
             ChannelFsm::Transferring { transfer } if ch.prev_starving => {
                 Some(match transfer.direction {

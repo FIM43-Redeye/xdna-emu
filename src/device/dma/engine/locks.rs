@@ -21,6 +21,11 @@ impl DmaEngine {
         }
     }
 
+    /// Whether flat channel `ch_idx` is a compute-tile S2MM (lock port `S2mmPort`).
+    pub(super) fn is_compute_s2mm(&self, ch_idx: usize) -> bool {
+        self.tile_kind.is_compute() && matches!(self.channel_type(ch_idx as u8), ChannelType::S2MM)
+    }
+
     /// Map a channel index to a LockRequestor for arbiter submission.
     pub fn channel_requestor(&self, ch_idx: u8) -> crate::device::tile::LockRequestor {
         use crate::device::tile::LockRequestor;
@@ -57,10 +62,16 @@ impl DmaEngine {
                     if self.acquire_blocked_by_parked_releases(ch_idx) {
                         continue;
                     }
+                    // A compute S2MM presents only on its lock grid's open cycles and, as the
+                    // compute MM2S lock port, sees a release from the cycle after it arrived.
+                    let compute_s2mm = self.is_compute_s2mm(ch_idx);
+                    if compute_s2mm && !self.channels[ch_idx].s2mm_port.presents(self.read_clock + 1) {
+                        continue;
+                    }
                     self.submit_acquire_request(
                         *lock_id,
                         transfer.acquire_value,
-                        true,
+                        !compute_s2mm,
                         tile,
                         neighbors,
                         ch_idx as u8,

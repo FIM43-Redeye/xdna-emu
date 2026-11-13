@@ -71,6 +71,7 @@ pub mod compression;
 pub mod fifo;
 pub mod token;
 pub mod lock_port;
+pub mod s2mm_port;
 pub mod word_clock;
 
 pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig, ZeroPadConfig};

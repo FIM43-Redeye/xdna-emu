@@ -55,6 +55,8 @@ pub struct ChainBd {
     first_presented: Option<u64>,
     /// Step from which the channel holds the BD's lock, once granted (`LockPort`).
     pub granted_at: Option<u64>,
+    /// The bank refused one of the BD's accesses (it was served later than first presented).
+    pub refused: bool,
 }
 
 impl ChainBd {
@@ -69,6 +71,7 @@ impl ChainBd {
             first_presented: None,
             trigger_at: None,
             granted_at: None,
+            refused: false,
         }
     }
 
@@ -210,6 +213,11 @@ impl WordClock {
         self.lock_bds[back]
             .1
             .is_some_and(|f| now >= f + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64)
+    }
+
+    /// Step from which the clock sequences (the run's first word).
+    pub fn from(&self) -> u64 {
+        self.from
     }
 
     /// Whether the clock has been started (a compute MM2S channel with work).
@@ -361,6 +369,7 @@ impl WordClock {
             .is_some_and(|p| p < at);
         self.note_presented(at);
         let Some(cur) = self.bds.front_mut() else { return };
+        cur.refused |= refused;
         cur.accessed_words += words;
         cur.last_access = Some(at);
         let seq = cur.seq;
