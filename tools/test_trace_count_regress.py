@@ -547,3 +547,92 @@ def test_cli_hw_samples_option(tmp_path, capsys):
 
 def test_cli_missing_dir_is_error(tmp_path):
     assert tcr.main([str(tmp_path / "nope"), str(tmp_path / "nope2")]) == 2
+
+
+# --- cross-module (memory minus core) offset ---------------------------------
+
+def unit_pair(mem_shift, core_shift=0, tile=(1, 2), n=3):
+    """One core edge row and one memory edge row, each seen n times; the memory unit shifted."""
+    col, row = tile
+    return (edge("INSTR_VECTOR", periodic(n, 20, 1000 + core_shift), col=col, row=row, pkt=0)
+            + edge("X", periodic(n, 20, 1005 + mem_shift), col=col, row=row, pkt=1))
+
+
+def offset_run(tmp_path, base_mem, cand_mem, hw_mems=(0,), k=K, hw_core=0):
+    """Baseline and candidate dirs whose emulator memory unit is shifted by base_mem / cand_mem
+    cycles against silicon; one extra silicon sample per entry of hw_mems."""
+    b = write_run(tmp_path, "base", {k: {"hw": unit_pair(hw_mems[0], hw_core), "emu": unit_pair(base_mem)}}, raw=False, stamp=False)
+    c = write_run(tmp_path, "cand", {k: {"hw": unit_pair(hw_mems[0], hw_core), "emu": unit_pair(cand_mem)}}, raw=False, stamp=False)
+    extra = [write_run(tmp_path, f"hw{i}", {k: {"hw": unit_pair(m)}}, raw=False, stamp=False)
+             for i, m in enumerate(hw_mems[1:])]
+    return b, c, extra
+
+
+def offset_row(rep, k=K, tile=(0, 2)):
+    rows = [r for r in rep.offsets if (r.test, r.compiler, r.tile) == (*k, tile)]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_a_uniform_memory_shift_in_the_candidate_is_flagged(tmp_path):
+    b, c, x = offset_run(tmp_path, 0, 1)
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    row = offset_row(rep)
+    assert (row.baseline, row.candidate) == (0, 1)
+    assert row.gate_fail and rep.exit_code == 1
+    assert "[GATE]" in tcr.format_text(rep)
+
+
+def test_a_shift_toward_silicon_is_better_not_flagged(tmp_path):
+    b, c, x = offset_run(tmp_path, 2, 0)
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    row = offset_row(rep)
+    assert row.verdict == "better" and not row.gate_fail and rep.exit_code == 0
+
+
+def test_a_shift_inside_silicons_own_spread_is_not_flagged(tmp_path):
+    # silicon's memory unit itself sits at 0, 1 or 2 across samples: emulator at 1 or 2 is inside
+    b, c, x = offset_run(tmp_path, 1, 2, hw_mems=(0, 1, 2))
+    row = offset_row(tcr.compare_runs(b, c, hw_samples=x))
+    assert row.spread == 2 and row.verdict == "unchanged" and not row.gate_fail
+
+
+def test_a_shift_leaving_silicons_spread_is_flagged(tmp_path):
+    b, c, x = offset_run(tmp_path, 1, 3, hw_mems=(0, 1, 2))
+    row = offset_row(tcr.compare_runs(b, c, hw_samples=x))
+    assert row.gate_fail
+
+
+def test_an_unmeasurable_tile_is_reported_and_not_flagged(tmp_path):
+    only_core = edge("INSTR_VECTOR", periodic(3, 20))
+    b = write_run(tmp_path, "base", {K: {"hw": only_core, "emu": only_core}}, raw=False, stamp=False)
+    c = write_run(tmp_path, "cand", {K: {"hw": only_core, "emu": only_core}}, raw=False, stamp=False)
+    rep = tcr.compare_runs(b, c)
+    assert rep.offsets == [] and rep.exit_code == 0
+    # measurable on the baseline only: unmeasured, never failed
+    b2 = write_run(tmp_path, "base2", {K: {"hw": unit_pair(0), "emu": unit_pair(0)}}, raw=False, stamp=False)
+    c2 = write_run(tmp_path, "cand2", {K: {"hw": unit_pair(0), "emu": only_core}}, raw=False, stamp=False)
+    rep = tcr.compare_runs(b2, c2)
+    row = offset_row(rep)
+    assert row.verdict == "unmeasured" and row.candidate is None and not row.gate_fail
+    assert not any(o.gate_fail for o in rep.offsets) and "unmeasured" in tcr.format_text(rep)
+
+
+def test_offset_summary_line_and_switch(tmp_path, capsys):
+    b, c, x = offset_run(tmp_path, 0, 1)
+    assert tcr.main([str(b), str(c)]) == 1
+    out = capsys.readouterr().out
+    assert "cross-module offset: 1 tiles measured; median candidate offset 1; " \
+           "within 0.5 of silicon: baseline 1, candidate 0" in out
+    assert out.rstrip().endswith("RESULT: FAIL")
+    assert tcr.main([str(b), str(c), "--no-offset"]) == 0
+    assert "cross-module" not in capsys.readouterr().out
+
+
+def test_a_move_on_a_workload_dominated_tile_is_reported_not_flagged(tmp_path):
+    # the memory unit sits 500 cycles from silicon on both sides: the pairing is workload, not timer
+    b, c, x = offset_run(tmp_path, 500, 501)
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    row = offset_row(rep)
+    assert row.verdict == "workload-dominated" and not row.gate_fail
+    assert not any(o.gate_fail for o in rep.offsets)

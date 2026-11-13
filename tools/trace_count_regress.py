@@ -92,6 +92,26 @@ not better" include equal and undefined.
 * count equal: pattern better -> improved, pattern worse -> regressed (soft,
   does not fail the gate), else neutral.
 
+Cross-module offset
+-------------------
+The compute tile's memory and core trace units are timed from different broadcast paths, so
+the two disagree with silicon on time by a small fixed number of cycles, and a change to one
+unit's timer moves every one of its rows by the same amount, which no per-row score above
+sees.  ``mem_core_offset`` measures it (memory-unit minus core-unit stamp difference of
+causally tied events, emulator minus silicon; its docstring has the method).  The gate
+reports one row per (test, tile) with that offset for baseline and candidate over the same
+silicon samples (the baseline and candidate dirs' own plus ``--hw-samples``), and the spread
+of the silicon samples' own offsets.  The distance of a side from silicon is the distance of
+zero to the band [min, max] of its per-sample offsets, so silicon's own spread is absorbed
+the way the count band absorbs it.  A row is a *gate failure* when the candidate's distance
+exceeds the baseline's by more than OFFSET_EPS (half a cycle: medians of even sample counts
+land on half cycles); a smaller candidate distance is "better".  A timer offset is a few
+cycles; a tile whose baseline or candidate offset exceeds OFFSET_GATE_MAX is one where the
+tied events are separated by the workload's own run-to-run timing (silicon samples of such
+tiles differ by hundreds to thousands of cycles), so a one-cycle move there is noise: it is
+reported as "workload-dominated" and never fails.  A tile measurable on only
+one side is "unmeasured" and never fails.  ``--no-offset`` leaves the section out.
+
 Exit status: 1 when any row is a gate failure: a row regressing on both
 scores (an undefined pattern counts as not improving, so phantom rows on
 quiet channels fail), or a repeatable-HW exact count match breaking without
@@ -109,6 +129,7 @@ import hashlib
 import json
 import math
 import re
+import statistics
 import struct
 import sys
 from dataclasses import dataclass, field, asdict
@@ -127,6 +148,10 @@ from trace_decoder.decode import _PT_CODE_TO_NAME  # noqa: E402
 PATTERN_EPS = 0.5      # cycles of W1 movement below which the pattern is "unchanged"
 PHASE_FRAC = 0.10      # phase shift allowed to move the count by this fraction of HW max
 PHASE_MIN_COUNT = 2    # ... but at least this many events/intervals
+OFFSET_EPS = 0.5       # cycles a tile's cross-module offset may move away from silicon
+OFFSET_GATE_MAX = 16   # beyond this many cycles an offset is workload, not timer: reported, not gated
+
+import mem_core_offset  # noqa: E402  (the measurement the offset section is built on)
 
 # Level events: high for as many cycles as the condition holds.  This mirrors
 # crates/xdna-archspec trace_events::is_level_event by name family; validated
@@ -372,13 +397,16 @@ class Report:
     # (test, compiler, sample label, reason): silicon samples not used.
     dropped_samples: list[tuple] = field(default_factory=list)
 
+    # Cross-module offset rows, one per (test, tile); empty when switched off.
+    offsets: list = field(default_factory=list)
+
     @property
     def changed(self):
         return self.rows
 
     @property
     def exit_code(self) -> int:
-        return 1 if any(r.gate_fail for r in self.rows) else 0
+        return 1 if any(r.gate_fail for r in self.rows) or any(o.gate_fail for o in self.offsets) else 0
 
     def of(self, verdict):
         return sorted((r for r in self.rows if r.verdict == verdict),
@@ -403,6 +431,56 @@ class Report:
             "pattern_distance_after": round(sum(r.pattern_after for r in pat), 3),
             "pattern_rows": len(pat),
         }
+
+
+@dataclass
+class OffsetRow:
+    """One (test, tile): memory-minus-core offset, emulator against silicon, in cycles."""
+    test: str
+    compiler: str
+    tile: tuple
+    spread: float | None           # max - min of the silicon samples' offsets (candidate's set)
+    baseline: float | None         # median over silicon samples; None when unmeasurable
+    candidate: float | None
+    distance_baseline: float | None
+    distance_candidate: float | None
+    verdict: str                   # better / worse / unchanged / unmeasured
+    gate_fail: bool
+
+
+def band_offset_distance(offsets: list[float]) -> float:
+    """Distance of zero (the emulator agreeing with silicon) from the band the per-sample offsets span."""
+    lo, hi = min(offsets), max(offsets)
+    return 0.0 if lo <= 0 <= hi else min(abs(lo), abs(hi))
+
+
+def compare_offsets(baseline: Path, candidate: Path, silicon_dirs: list[Path],
+                    only: list[str] | None = None) -> list[OffsetRow]:
+    dirs = [baseline, candidate, *silicon_dirs]
+    b = mem_core_offset.measure_samples(baseline, dirs, only or ())
+    c = mem_core_offset.measure_samples(candidate, dirs, only or ())
+    rows = []
+    for key in sorted(b.keys() | c.keys(), key=lambda k: (k[0], k[1])):
+        test, _, comp = key[0].rpartition(".")
+        bs, cs = b.get(key), c.get(key)
+        if not bs or not cs:
+            rows.append(OffsetRow(test, comp, key[1], None, statistics_median(bs), statistics_median(cs),
+                                  None, None, "unmeasured", False))
+            continue
+        db, dc = band_offset_distance(bs), band_offset_distance(cs)
+        if max(abs(statistics.median(bs)), abs(statistics.median(cs))) > OFFSET_GATE_MAX:
+            rows.append(OffsetRow(test, comp, key[1], max(cs) - min(cs), statistics.median(bs),
+                                  statistics.median(cs), db, dc, "workload-dominated", False))
+            continue
+        verdict = ("worse" if dc - db > OFFSET_EPS else "better" if db - dc > OFFSET_EPS
+                   else "unchanged")
+        rows.append(OffsetRow(test, comp, key[1], max(cs) - min(cs), statistics_median(bs),
+                              statistics_median(cs), db, dc, verdict, verdict == "worse"))
+    return rows
+
+
+def statistics_median(v):
+    return statistics.median(v) if v else None
 
 
 def _classify(cb, ca, pb, pa, hw_max, exact_broken):
@@ -454,10 +532,12 @@ def _usable_hw_samples(tc, b, c, extra, rep):
 
 
 def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
-                 hw_samples: list[Path] | None = None) -> Report:
+                 hw_samples: list[Path] | None = None, offsets: bool = True) -> Report:
     base, cand = load_run(baseline), load_run(candidate)
     extra = [(d, load_run(d)) for d in (hw_samples or [])]
     rep = Report()
+    if offsets:
+        rep.offsets = compare_offsets(baseline, candidate, hw_samples or [], only)
     keep = (lambda t: True) if not only else (lambda t: t in only)
     rep.only_in_baseline = sorted(k for k in base.keys() - cand.keys() if keep(k[0]))
     rep.only_in_candidate = sorted(k for k in cand.keys() - base.keys() if keep(k[0]))
@@ -541,6 +621,30 @@ def _line(r: RowResult) -> str:
             + ("  [GATE]" if r.gate_fail else ""))
 
 
+def _g(v):
+    return "-" if v is None else f"{v:g}"
+
+
+def offset_section(rows: list[OffsetRow]) -> list[str]:
+    ok = [r for r in rows if r.verdict != "unmeasured"]
+    out = ["", f"Cross-module offset, memory minus core, emulator vs silicon, cycles ({len(rows)} test-tiles):"]
+    for r in rows:
+        out.append(f"  {r.test}.{r.compiler} tile{r.tile}: silicon spread {_g(r.spread)}; "
+                   f"baseline {_g(r.baseline)}, candidate {_g(r.candidate)}; {r.verdict}"
+                   + ("  [GATE]" if r.gate_fail else ""))
+    if ok:
+        near = lambda f: sum(1 for r in ok if abs(f(r)) < 0.5)
+        out.append(f"cross-module offset: {len(ok)} tiles measured; median candidate offset "
+                   f"{statistics.median(r.candidate for r in ok):g}; within 0.5 of silicon: "
+                   f"baseline {near(lambda r: r.baseline)}, candidate {near(lambda r: r.candidate)}; "
+                   f"{sum(r.gate_fail for r in ok)} gate failures"
+                   f"; {len(rows) - len(ok)} unmeasured; "
+                   f"{sum(r.verdict == 'workload-dominated' for r in ok)} workload-dominated (not gated)")
+    else:
+        out.append(f"cross-module offset: no tile measurable ({len(rows)} unmeasured)")
+    return out
+
+
 def format_text(rep: Report) -> str:
     s = rep.summary()
     out = [
@@ -568,6 +672,8 @@ def format_text(rep: Report) -> str:
     if rep.unscored:
         out += ["", f"Unscored rows ({len(rep.unscored)}):"] + [
             f"  {k.test}.{k.compiler} {k.tile()} {k.event}: {why}" for k, why in rep.unscored]
+    if rep.offsets:
+        out += offset_section(rep.offsets)
     out.append("")
     out.append("RESULT: " + ("FAIL" if rep.exit_code else "ok"))
     return "\n".join(out)
@@ -589,6 +695,7 @@ def to_json(rep: Report) -> dict:
         "skipped": [list(t) for t in rep.skipped],
         "unscored": [{"key": asdict(k), "reason": why} for k, why in rep.unscored],
         "dropped_samples": [list(t) for t in rep.dropped_samples],
+        "offsets": [asdict(o) for o in rep.offsets],
     }
 
 
@@ -600,6 +707,8 @@ def main(argv=None) -> int:
     ap.add_argument("--hw-samples", nargs="+", metavar="DIR", default=[],
                     help="further result dirs whose HW samples count as silicon samples "
                          "(identical captures and other event sets are dropped)")
+    ap.add_argument("--no-offset", action="store_true",
+                    help="leave out the cross-module (memory minus core) offset section")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     for d in (args.baseline, args.candidate, *args.hw_samples):
@@ -607,7 +716,8 @@ def main(argv=None) -> int:
             print(f"error: not a directory: {d}", file=sys.stderr)
             return 2
     rep = compare_runs(Path(args.baseline), Path(args.candidate), only=args.only,
-                       hw_samples=[Path(d) for d in args.hw_samples])
+                       hw_samples=[Path(d) for d in args.hw_samples],
+                       offsets=not args.no_offset)
     print(json.dumps(to_json(rep), indent=1) if args.json else format_text(rep))
     return rep.exit_code
 
