@@ -22,6 +22,7 @@ import argparse
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -272,6 +273,15 @@ def build_case(case: Case, out: Path, events: str = TRACE_EVENTS) -> None:
         "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"], cwd=d, log=d / "aiecc.log")
 
 
+RUNNER_EXTRA_ARGS_ENV = "BRIDGE_RUNNER_EXTRA_ARGS"
+
+
+def runner_extra_args() -> list[str]:
+    """Extra bridge-trace-runner arguments from $BRIDGE_RUNNER_EXTRA_ARGS (shell-split), e.g. "-v" to log every
+    buffer object's device address and size in runner.log."""
+    return shlex.split(os.environ.get(RUNNER_EXTRA_ARGS_ENV, ""))
+
+
 def run_case_raw(out: Path, name: str, tag: str, backend: str, output: bool = True) -> bool:
     """Run one built case to `TAG.BACKEND/trace_raw.bin`; no decoding. `output` passes the
     design's output buffer (designs whose runtime sequence has none pass False)."""
@@ -280,7 +290,8 @@ def run_case_raw(out: Path, name: str, tag: str, backend: str, output: bool = Tr
     r.mkdir(parents=True, exist_ok=True)
     cmd = [str(RUNNER), "--xclbin", str(d / "aie.xclbin"), "--instr", str(d / "insts.bin"),
            "--trace-out", str(r / "trace_raw.bin"), "--trace-size", "65536",
-           *(["--output", str(r / "out.bin")] if output else [])]
+           *(["--output", str(r / "out.bin")] if output else []),
+           *runner_extra_args()]
     env = dict(os.environ)
     if backend == "hw":
         env.pop("XDNA_EMU", None)

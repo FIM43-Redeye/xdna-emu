@@ -56,3 +56,23 @@ def test_gather_cases_set_up_the_lane_addresses_before_the_window():
     assert asm.index("vbcst.32 x8, r7") < asm.index("event #0") < asm.index(g.GATHER)
     assert [i for i, b in enumerate(case.window) if b != g.N] == [0, 3]
     assert "vbcst" not in g.cases()["acq_free"].consumer_asm()
+
+
+def test_runner_extra_args_come_from_the_environment(monkeypatch, tmp_path):
+    monkeypatch.delenv(g.RUNNER_EXTRA_ARGS_ENV, raising=False)
+    assert g.runner_extra_args() == []
+    monkeypatch.setenv(g.RUNNER_EXTRA_ARGS_ENV, "-v --post-completion-us 5")
+    assert g.runner_extra_args() == ["-v", "--post-completion-us", "5"]
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return Done()
+
+    monkeypatch.setattr(g.subprocess, "run", fake_run)
+    (tmp_path / "c").mkdir()
+    assert g.run_case_raw(tmp_path, "c", "t", "emu", output=False)
+    assert seen["cmd"][-3:] == ["-v", "--post-completion-us", "5"]
