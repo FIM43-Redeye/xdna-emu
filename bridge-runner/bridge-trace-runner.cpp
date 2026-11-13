@@ -53,6 +53,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <condition_variable>
 #include <deque>
@@ -77,6 +78,7 @@
 // Slot-id accessor isolated in its own TU (uses the xdna-driver XRT source
 // tree's internal shim header). See hwctx_slot.{h,cpp}.
 #include "hwctx_slot.h"
+#include "insts_bounds.h"
 
 namespace {
 
@@ -287,6 +289,13 @@ void print_usage(const char* argv0) {
         "     [--post-completion-us N] \\\n"
         "     [--snapshot-on-timeout <dir>] [-v]\n"
         "\n"
+        "  %s --print-arg-sizes <insts.bin>\n"
+        "  %s --check-bounds <insts.bin> [IDX=BYTES ...]\n"
+        "     # no device: the data-buffer sizes the runner derives, or every\n"
+        "     # shim DMA task's host-buffer range checked against the sizes\n"
+        "     # (exit 0 inside, 3 outside, 2 undecodable). Every run makes\n"
+        "     # the same check first and refuses to run on a failure.\n"
+        "\n"
         "  %s --batch-stdin [--xclbin <path>] [--kernel <name>]\n"
         "     [--qos-gops N --qos-fps N] [-v]\n"
         "     # read one command line per stdin line in the same syntax\n"
@@ -297,7 +306,7 @@ void print_usage(const char* argv0) {
         "Kernel args are discovered from xclbin metadata -- no hardcoded\n"
         "group_id mapping. The trace buffer is identified as the last\n"
         "buffer kernarg after inputs/outputs.\n",
-        argv0, argv0);
+        argv0, argv0, argv0, argv0);
 }
 
 // Tokenise a stdin command line into argv-style tokens. Supports simple
@@ -1041,172 +1050,60 @@ std::vector<uint32_t> load_instr_binary(const std::string& path) {
     return words;
 }
 
-/// Walk insts.bin's DdrPatch ops and return the largest arg_idx, which is
-/// the BO regmap slot the firmware patches for the trace shim DMA. The
-/// trace BO is always added last by the inject flow, so its arg_idx
-/// dominates. Returns -1 if no DdrPatch ops are found, the file isn't a
-/// recognizable insts.bin, or the structure is malformed -- callers should
-/// fall back to the legacy "last buffer kernarg = trace" heuristic in that
-/// case. Mirrors tools/trace-sweep.py::_discover_trace_buf_idx so the
-/// standalone runner default lines up with how trace-sweep already drives
-/// --trace-buf-idx.
-int discover_trace_buf_idx_from_insts(const std::string& path) {
-    constexpr uint32_t INSTS_HEADER_BYTES = 16;
-    constexpr uint32_t INSTS_MAGIC = 0x06030100u;
-    constexpr uint8_t  OPCODE_WRITE32     = 0x00;
-    constexpr uint8_t  OPCODE_BLOCKWRITE  = 0x01;
-    constexpr uint8_t  OPCODE_MASKWRITE   = 0x03;
-    constexpr uint8_t  OPCODE_DDR_PATCH   = 0x81;
-
+/// Read a whole file as bytes; empty if it cannot be read.
+std::vector<uint8_t> read_file_bytes(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return -1;
+    if (!f) return {};
     std::streamsize bytes = f.tellg();
-    if (bytes < static_cast<std::streamsize>(INSTS_HEADER_BYTES)) return -1;
-    f.seekg(0);
+    if (bytes <= 0) return {};
     std::vector<uint8_t> data(static_cast<size_t>(bytes));
-    if (!f.read(reinterpret_cast<char*>(data.data()), bytes)) return -1;
-
-    uint32_t magic = static_cast<uint32_t>(data[0])
-                   | (static_cast<uint32_t>(data[1]) << 8)
-                   | (static_cast<uint32_t>(data[2]) << 16)
-                   | (static_cast<uint32_t>(data[3]) << 24);
-    if (magic != INSTS_MAGIC) return -1;
-
-    uint32_t total_size = static_cast<uint32_t>(data[12])
-                        | (static_cast<uint32_t>(data[13]) << 8)
-                        | (static_cast<uint32_t>(data[14]) << 16)
-                        | (static_cast<uint32_t>(data[15]) << 24);
-    size_t end = std::min<size_t>(data.size(), total_size);
-    size_t off = INSTS_HEADER_BYTES;
-    int max_arg_idx = -1;
-    while (off + 4 <= end) {
-        uint8_t opcode = data[off];
-        size_t op_size;
-        if (opcode == OPCODE_WRITE32) {
-            op_size = 24;
-        } else if (opcode == OPCODE_BLOCKWRITE) {
-            if (off + 16 > end) break;
-            op_size = static_cast<uint32_t>(data[off + 12])
-                    | (static_cast<uint32_t>(data[off + 13]) << 8)
-                    | (static_cast<uint32_t>(data[off + 14]) << 16)
-                    | (static_cast<uint32_t>(data[off + 15]) << 24);
-        } else if (opcode == OPCODE_MASKWRITE) {
-            op_size = 28;
-        } else if (opcode == OPCODE_DDR_PATCH) {
-            op_size = 48;
-            // Payload starts at off+8; arg_idx is one byte at payload[24].
-            if (off + 8 + 24 < end) {
-                int arg_idx = data[off + 8 + 24];
-                if (arg_idx > max_arg_idx) max_arg_idx = arg_idx;
-            }
-        } else {
-            // Unknown opcode -- can't trust the rest, stop walking.
-            break;
-        }
-        off += op_size;
-    }
-    return max_arg_idx;
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(data.data()), bytes)) return {};
+    return data;
 }
 
-/// Walk insts.bin and return, per data-buffer index (0-based among the
-/// kernel's data buffers -- the SAME index space --trace-buf-idx uses), the
-/// byte extent the compiled kernel's shim-DMA BDs reach into that buffer: the
-/// largest offset (the patch's arg_plus) + Buffer_Length * 4 over every BD
-/// patched onto it. Empty on any parse failure -- callers fall back to the declared
-/// (pointer) size, so kernels that were already sized correctly are
-/// unaffected.
-///
-/// Derivation (toolchain-grounded, verified on sp5_skew_r1's insts.bin):
-/// mlir-aie's NPU lowering emits, for each DDR buffer, a BLOCKWRITE that
-/// programs the shim BD -- whose FIRST payload word is Buffer_Length in
-/// 32-bit words (AIE2 shim NOC BD word 0; confirmed against the AM025
-/// register DB and empirically: trace BD 0x1000 words = 16384 B, output BD
-/// 0x800 words = 8192 B) -- immediately followed by the DdrPatch op carrying
-/// that buffer's arg_idx. So the BLOCKWRITE most recently seen before a
-/// DdrPatch describes that patch's buffer, and (payload[0] * 4) is its
-/// required byte size.
+/// Every shim DMA task of an instruction stream as a byte range in the host
+/// buffer its BD is patched onto (insts_bounds.h). Throws
+/// insts_bounds::DecodeError when the stream cannot be decoded completely.
+std::vector<insts_bounds::BdAccess> bd_accesses_of(const std::vector<uint32_t>& words) {
+    return insts_bounds::shim_bd_accesses(reinterpret_cast<const uint8_t*>(words.data()),
+                                          words.size() * sizeof(uint32_t));
+}
+
+std::vector<insts_bounds::BdAccess> bd_accesses_of_file(const std::string& path) {
+    auto data = read_file_bytes(path);
+    if (data.empty()) throw insts_bounds::DecodeError("cannot read " + path);
+    return insts_bounds::shim_bd_accesses(data.data(), data.size());
+}
+
+/// The largest data-buffer index any shim DMA task of insts.bin is patched
+/// onto: the trace buffer, which the trace inject flow always adds last.
+/// Returns -1 if the stream cannot be decoded or patches nothing -- callers
+/// fall back to the legacy "last buffer kernarg = trace" heuristic. Mirrors
+/// tools/trace-sweep.py::_discover_trace_buf_idx.
+int discover_trace_buf_idx_from_insts(const std::string& path) {
+    try {
+        int max_arg_idx = -1;
+        for (const auto& a : bd_accesses_of_file(path)) max_arg_idx = std::max(max_arg_idx, a.arg_idx);
+        return max_arg_idx;
+    } catch (const insts_bounds::DecodeError&) {
+        return -1;
+    }
+}
+
+/// Per data-buffer index (0-based among the kernel's data buffers -- the SAME
+/// index space --trace-buf-idx uses), the bytes the compiled kernel's shim-DMA
+/// tasks reach into that buffer: the largest end over every task patched onto
+/// it, each task's range evaluated from its BD's length, dimensions and patch
+/// offset (insts_bounds.h).
 ///
 /// Why the runner needs this: XRT kernel-arg metadata reports an NPU buffer
 /// arg as its 8-byte pointer size, not the buffer's extent. An input buffer
 /// is sized from its --input file; but an OUTPUT-ONLY buffer has no file to
-/// infer from, so without this it is allocated at the 8-byte pointer size
-/// and the kernel's output DMA overruns it -- an intermittent IOMMU
-/// IO_PAGE_FAULT when the overrun lands on an unmapped page, silent DDR
-/// corruption when it lands on a mapped neighbor. (Root-caused 2026-07-01 on
-/// the SP-5b R1 gate: output BO 8 B, drain 8192 B, fault at BO+0x1000.)
-std::unordered_map<int, size_t> discover_arg_sizes_from_insts(const std::string& path) {
-    constexpr uint32_t INSTS_HEADER_BYTES = 16;
-    constexpr uint32_t INSTS_MAGIC = 0x06030100u;
-    constexpr uint8_t  OPCODE_WRITE32     = 0x00;
-    constexpr uint8_t  OPCODE_BLOCKWRITE  = 0x01;
-    constexpr uint8_t  OPCODE_MASKWRITE   = 0x03;
-    constexpr uint8_t  OPCODE_DDR_PATCH   = 0x81;
-    constexpr uint64_t DDR_AIE_ADDR_OFFSET = 0x80000000ull;
-    constexpr uint32_t NUM_FIRMWARE_TRANSLATED_ARGS = 5;
-
-    std::unordered_map<int, size_t> sizes;
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return sizes;
-    std::streamsize bytes = f.tellg();
-    if (bytes < static_cast<std::streamsize>(INSTS_HEADER_BYTES)) return sizes;
-    f.seekg(0);
-    std::vector<uint8_t> data(static_cast<size_t>(bytes));
-    if (!f.read(reinterpret_cast<char*>(data.data()), bytes)) return sizes;
-
-    auto u32 = [&](size_t o) -> uint32_t {
-        return static_cast<uint32_t>(data[o])
-             | (static_cast<uint32_t>(data[o + 1]) << 8)
-             | (static_cast<uint32_t>(data[o + 2]) << 16)
-             | (static_cast<uint32_t>(data[o + 3]) << 24);
-    };
-    if (u32(0) != INSTS_MAGIC) return sizes;
-    size_t end = std::min<size_t>(data.size(), u32(12));
-    size_t off = INSTS_HEADER_BYTES;
-
-    // Track the Buffer_Length (in words) of the most recent BD-config
-    // BLOCKWRITE; a following DdrPatch binds it to a data-buffer arg_idx.
-    size_t last_bd_len_words = 0;
-    bool have_bd_len = false;
-    while (off + 4 <= end) {
-        uint8_t opcode = data[off];
-        size_t op_size;
-        if (opcode == OPCODE_WRITE32) {
-            op_size = 24;
-        } else if (opcode == OPCODE_BLOCKWRITE) {
-            if (off + 16 > end) break;
-            op_size = u32(off + 12);
-            if (op_size < 20 || off + 20 > end) { have_bd_len = false; }
-            else { last_bd_len_words = u32(off + 16); have_bd_len = true; }  // payload[0]
-        } else if (opcode == OPCODE_MASKWRITE) {
-            op_size = 28;
-        } else if (opcode == OPCODE_DDR_PATCH) {
-            op_size = 48;
-            if (off + 48 <= end) {
-                int arg_idx = data[off + 8 + 24];
-                // Words 10..11: arg_plus, the byte offset of the BD's start in the buffer. Args
-                // at index >= 5 may carry the DDR aperture offset folded in (mlir-aie
-                // TxnEncoding.h txn_append_arg_patch); that is not extent.
-                uint64_t arg_plus = static_cast<uint64_t>(u32(off + 40))
-                                  | (static_cast<uint64_t>(u32(off + 44)) << 32);
-                if (static_cast<uint32_t>(arg_idx) >= NUM_FIRMWARE_TRANSLATED_ARGS
-                    && arg_plus >= DDR_AIE_ADDR_OFFSET) {
-                    arg_plus -= DDR_AIE_ADDR_OFFSET;
-                }
-                if (have_bd_len && last_bd_len_words > 0) {
-                    // A buffer must hold every BD that reaches into it: the largest
-                    // offset + length over all of them, not the last BD's length.
-                    size_t need = static_cast<size_t>(arg_plus) + last_bd_len_words * 4;
-                    size_t& cur = sizes[arg_idx];
-                    cur = std::max(cur, need);
-                }
-            }
-            have_bd_len = false;  // consume: each patch binds one BD config
-        } else {
-            break;  // unknown opcode -- can't trust the rest
-        }
-        off += op_size;
-    }
-    return sizes;
+/// infer from, so without this it would be allocated at the 8-byte pointer
+/// size and the kernel's output DMA would overrun it.
+std::map<int, uint64_t> arg_sizes_of(const std::vector<insts_bounds::BdAccess>& accesses) {
+    return insts_bounds::extents(accesses);
 }
 
 /// Read the contents of a file into a BO's host-mapped memory, up to the BO's
@@ -2102,6 +1999,73 @@ RunOutcome execute_run(
         auto data_arg_binding = resolve_bindings(
             plan, roles, inputs, args.outputs, ctrlpkts);
 
+        // --- Buffer sizes and host-buffer bounds, before anything is submitted ---
+        //
+        // Every shim DMA task the instruction stream pushes, as a byte range
+        // in the buffer its BD is patched onto, decoded from the stream that
+        // is actually submitted (after any preamble splice). An undecodable
+        // stream is refused: its tasks' ranges are unknown, so no buffer
+        // size can be shown to hold them.
+        std::vector<insts_bounds::BdAccess> bd_accesses;
+        try {
+            bd_accesses = bd_accesses_of(instr_words);
+        } catch (const insts_bounds::DecodeError& e) {
+            throw std::runtime_error(std::string("refusing to run: cannot bound the host-buffer accesses of ")
+                                     + args.instr_bin + ": " + e.what());
+        }
+        // Toolchain-derived floor for data-buffer sizes: XRT arg metadata
+        // reports only the 8-byte pointer size, so an output-only buffer
+        // (no --input to infer its extent from) would be under-allocated.
+        // Buffer ordering: buffer_indices = [instr, bo0, bo1, ...], so a
+        // data-buffer index d maps to buffer_indices[d + 1]; the insts
+        // arg_idx IS that d (same space as --trace-buf-idx).
+        auto insts_arg_sizes = arg_sizes_of(bd_accesses);
+        std::vector<size_t> buffer_indices;
+        for (const auto& k : kargs) if (!k.is_scalar()) buffer_indices.push_back(k.index);
+        auto data_index_of = [&](size_t karg_idx) -> int {
+            auto pos_it = std::find(buffer_indices.begin(), buffer_indices.end(), karg_idx);
+            if (pos_it == buffer_indices.end() || pos_it == buffer_indices.begin()) return -1;  // pos 0 is instr
+            return static_cast<int>(pos_it - buffer_indices.begin()) - 1;
+        };
+
+        std::vector<size_t> middle_sizes(plan.middle_buf_indices.size());
+        std::map<int, uint64_t> allocated_bytes;  // data-buffer index -> bytes this run allocates
+        for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
+            size_t karg_idx = plan.middle_buf_indices[slot];
+            size_t sz = middle_slot_size(kargs[karg_idx], data_arg_binding[slot]);
+            int d = data_index_of(karg_idx);
+            auto sit = insts_arg_sizes.find(d);
+            if (d >= 0 && sit != insts_arg_sizes.end() && sit->second > sz) {
+                if (verbose) {
+                    std::fprintf(stderr,
+                        "[bo-size] karg %zu: floored %zu -> %zu bytes"
+                        " (compiled BD reach from insts)\n",
+                        karg_idx, sz, static_cast<size_t>(sit->second));
+                }
+                sz = static_cast<size_t>(sit->second);
+            }
+            middle_sizes[slot] = sz;
+            if (d >= 0) allocated_bytes[d] = sz;
+        }
+        if (int d = data_index_of(plan.trace_idx); d >= 0) allocated_bytes[d] = args.trace_size_bytes;
+
+        // Refuse a run whose buffer descriptors leave their host buffer. The
+        // floor above makes data buffers big enough by construction; what is
+        // left to catch is a buffer sized by something else (the trace size,
+        // a slot the classifier binds differently) and any future change to
+        // the sizing rule.
+        if (auto bad = insts_bounds::violations(bd_accesses, allocated_bytes); !bad.empty()) {
+            std::string msg = "refusing to run: " + std::to_string(bad.size())
+                            + " shim DMA task(s) leave their host buffer:";
+            for (size_t k = 0; k < bad.size() && k < 8; ++k) msg += "\n  " + bad[k];
+            if (bad.size() > 8) msg += "\n  ... and " + std::to_string(bad.size() - 8) + " more";
+            throw std::runtime_error(msg);
+        }
+        if (verbose) {
+            std::fprintf(stderr, "[bounds] %zu shim DMA task(s) checked against their host buffers: all inside\n",
+                         bd_accesses.size());
+        }
+
         // Rebuild hw_context + kernel per run to sidestep the
         // alternating-TIMEOUT pattern that hits on hw_context reuse.
         // Two paths: async pipeline (default) hands us a pre-built
@@ -2152,40 +2116,6 @@ RunOutcome execute_run(
         // BOs were reallocated between launches in the same hw_context.
         size_t instr_bytes = instr_words.size() * sizeof(uint32_t);
         bool need_full_rebuild = !prep.pool_ready;
-        // Toolchain-derived floor for output-buffer sizes: XRT arg metadata
-        // reports only the 8-byte pointer size, so an output-only buffer
-        // (no --input to infer its extent from) would be under-allocated and
-        // the kernel's output DMA would overrun it. discover_arg_sizes_from_insts
-        // recovers each data buffer's real DMA transfer length from the
-        // compiled BD. Buffer ordering: buffer_indices = [instr, bo0, bo1, ...],
-        // so a data-buffer index d maps to buffer_indices[d + 1]; the insts
-        // arg_idx IS that d (same space as --trace-buf-idx).
-        auto insts_arg_sizes = discover_arg_sizes_from_insts(args.instr_bin);
-        std::vector<size_t> buffer_indices;
-        for (const auto& k : kargs) if (!k.is_scalar()) buffer_indices.push_back(k.index);
-
-        std::vector<size_t> middle_sizes(plan.middle_buf_indices.size());
-        for (size_t slot = 0; slot < plan.middle_buf_indices.size(); ++slot) {
-            size_t karg_idx = plan.middle_buf_indices[slot];
-            size_t sz = middle_slot_size(kargs[karg_idx], data_arg_binding[slot]);
-            auto pos_it = std::find(buffer_indices.begin(), buffer_indices.end(), karg_idx);
-            if (pos_it != buffer_indices.end()) {
-                size_t pos = static_cast<size_t>(pos_it - buffer_indices.begin());
-                if (pos >= 1) {  // pos 0 is instr; data buffers start at 1
-                    auto sit = insts_arg_sizes.find(static_cast<int>(pos - 1));
-                    if (sit != insts_arg_sizes.end() && sit->second > sz) {
-                        if (verbose) {
-                            std::fprintf(stderr,
-                                "[bo-size] karg %zu: floored %zu -> %zu bytes"
-                                " (compiled BD transfer length from insts)\n",
-                                karg_idx, sz, sit->second);
-                        }
-                        sz = sit->second;
-                    }
-                }
-            }
-            middle_sizes[slot] = sz;
-        }
 
         // Size-mismatch check. We rebuild the whole pool rather than
         // per-slot reallocation so the xrt::run re-setarg is a clean
@@ -2778,17 +2708,54 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
 int main(int argc, char** argv) {
     // `--print-arg-sizes INSTS`: print the per-data-buffer byte extents the runner derives
     // from a compiled instruction stream ("index bytes" per line) and exit; no device use.
-    if (argc == 3 && std::string(argv[1]) == "--print-arg-sizes") {
-        auto sizes = discover_arg_sizes_from_insts(argv[2]);
-        std::vector<std::pair<int, size_t>> v(sizes.begin(), sizes.end());
-        std::sort(v.begin(), v.end());
-        for (const auto& [idx, bytes] : v) std::printf("%d %zu\n", idx, bytes);
-        return 0;
+    // `--check-bounds INSTS [IDX=BYTES ...]`: print every shim DMA task's range ("op N col C
+    // CHANNEL BD B arg A start end", hex bytes), then check them against the given buffer
+    // sizes; exit 0 if all inside, 3 if any leaves its buffer, 2 if the stream cannot be
+    // decoded. No device use.
+    if (argc >= 3 && (std::string(argv[1]) == "--print-arg-sizes" || std::string(argv[1]) == "--check-bounds")) {
+        const bool check = std::string(argv[1]) == "--check-bounds";
+        if (!check && argc != 3) { print_usage(argv[0]); return 1; }
+        std::vector<insts_bounds::BdAccess> accesses;
+        try {
+            accesses = bd_accesses_of_file(argv[2]);
+        } catch (const insts_bounds::DecodeError& e) {
+            std::fprintf(stderr, "error: cannot bound the host-buffer accesses of %s: %s\n", argv[2], e.what());
+            return 2;
+        }
+        if (!check) {
+            for (const auto& [idx, bytes] : arg_sizes_of(accesses))
+                std::printf("%d %llu\n", idx, static_cast<unsigned long long>(bytes));
+            return 0;
+        }
+        std::map<int, uint64_t> sizes;
+        for (int i = 3; i < argc; ++i) {
+            std::string kv = argv[i];
+            auto eq = kv.find('=');
+            if (eq == std::string::npos) { std::fprintf(stderr, "error: expected IDX=BYTES, got '%s'\n", argv[i]); return 1; }
+            sizes[std::stoi(kv.substr(0, eq))] = std::stoull(kv.substr(eq + 1), nullptr, 0);
+        }
+        for (const auto& a : accesses)
+            std::printf("op %zu col %u %s BD %u arg %d 0x%llx 0x%llx\n", a.op_index, a.col, a.channel, a.bd,
+                        a.arg_idx, (unsigned long long)a.start, (unsigned long long)a.end);
+        auto bad = insts_bounds::violations(accesses, sizes);
+        for (const auto& line : bad) std::fprintf(stderr, "outside: %s\n", line.c_str());
+        return bad.empty() ? 0 : 3;
     }
     OuterArgs outer;
     RunArgs run;
     if (int rc = parse_cli(argc, argv, outer, run); rc != 0) return rc;
 
+    // An instruction stream whose shim DMA tasks cannot be bounded is refused
+    // before the device is opened (single-shot; batch runs refuse per run).
+    if (!outer.batch_stdin && !run.instr_bin.empty()) {
+        try {
+            (void)bd_accesses_of_file(run.instr_bin);
+        } catch (const insts_bounds::DecodeError& e) {
+            std::fprintf(stderr, "error: refusing to run: cannot bound the host-buffer accesses of %s: %s\n",
+                         run.instr_bin.c_str(), e.what());
+            return 2;
+        }
+    }
     try {
         Session session{xrt::device(0), try_load_classifier(outer.verbose),
                         outer.verbose, outer.qos, {}};
