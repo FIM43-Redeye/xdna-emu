@@ -16,6 +16,8 @@
 
 use std::path::Path;
 
+use crate::device::trace_unit::{END_TOKEN_COUNT_BITS, END_TOKEN_LEN, END_TOKEN_OPCODE};
+
 // -------------------------------------------------------------------------
 // Event group definitions
 // -------------------------------------------------------------------------
@@ -440,6 +442,15 @@ pub struct DecodedEvent {
     pub abs_cycle: u64,
 }
 
+/// The end-of-stream token of one tile's stream (see [`decode_binary_trace_with_ends`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamEnd {
+    /// Timeline cycle of the last frame (Repeats included) when the token was read.
+    pub abs_cycle: u64,
+    /// The token's count: idle cycles from `abs_cycle` to the stop (Syncs not included).
+    pub idle_cycles: u64,
+}
+
 /// Trim a raw trace buffer to just the region containing real data.
 ///
 /// NPU trace buffers are typically 1MB, mostly filled with padding (0xFE
@@ -521,11 +532,21 @@ fn is_valid_trace_header(word: u32) -> bool {
 /// | Repeat0  | bits[7:4]=1110     | 1     | N/A       | N/A        |
 /// | Padding  | 0xFE               | 1     | N/A       | N/A        |
 /// | Sync     | 0xFF               | 1     | N/A       | N/A        |
+/// | End      | bits[7:2]=110111   | 4     | N/A       | count [17:0] (idle cycles to the stop) |
 ///
 /// Note: the emulator's trace_unit.rs encoder uses a different bit layout
 /// (slot in [6:4] for Single1/2), which is a known divergence from hardware.
 /// This decoder implements the hardware format for NPU trace compatibility.
 pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
+    decode_binary_trace_with_ends(data).0
+}
+
+/// [`decode_binary_trace`], and the end-of-stream tokens met on the way (0xDC and an 18-bit
+/// idle-cycle count; silicon ends every stream with one unless its packet was lost, and
+/// a buffer of several tiles' streams holds several). The token is an end marker carrying
+/// a count, not filler: the events are the same with or without it.
+pub fn decode_binary_trace_with_ends(data: &[u8]) -> (Vec<DecodedEvent>, Vec<StreamEnd>) {
+    let mut ends = Vec::new();
     let trimmed_len = trim_trace_buffer(data);
     let data = &data[..trimmed_len];
 
@@ -614,9 +635,17 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
                 i += 1;
                 continue;
             }
-            // Filler: bits[7:2] = 110111
-            if b & 0xFC == 0xDC {
-                i += 4;
+            // End token: bits[7:2] = 110111, then a 3-byte count (18 bits)
+            if b & 0xFC == END_TOKEN_OPCODE & 0xFC {
+                if i + END_TOKEN_LEN > 28 {
+                    break;
+                }
+                let count = (((payload[i + 1] as u64) << 16)
+                    | ((payload[i + 2] as u64) << 8)
+                    | (payload[i + 3] as u64))
+                    & ((1 << END_TOKEN_COUNT_BITS) - 1);
+                ends.push(StreamEnd { abs_cycle, idle_cycles: count });
+                i += END_TOKEN_LEN;
                 continue;
             }
             // Repeat1: bits[7:2] = 110110
@@ -750,7 +779,7 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
         pkt_offset += packet_size;
     }
 
-    events
+    (events, ends)
 }
 
 // -------------------------------------------------------------------------
@@ -1765,6 +1794,31 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0], DecodedEvent { slot: 1, abs_cycle: 103 });
         assert_eq!(decoded[1], DecodedEvent { slot: 2, abs_cycle: 108 });
+    }
+
+    #[test]
+    fn the_end_token_is_a_marker_with_a_count_not_filler() {
+        // Silicon core tail: Single2(slot 0, 1024), Repeat0(5), end token with count 422.
+        let events = vec![
+            0xF0, 0, 0, 0, 0, 0, 0x04, 0x00, // Start: timer = 1024
+            0xA0, 0x04, 0x00, 0xE5, 0xDC, 0x00, 0x01, 0xA6,
+        ];
+        let packet = make_trace_packet(&events);
+        let (decoded, ends) = decode_binary_trace_with_ends(&packet);
+        // 1 + 5 repeats of the 1024-cycle frame; the token adds no event
+        assert_eq!(decoded.len(), 6);
+        assert_eq!(decoded, decode_binary_trace(&packet));
+        // the timeline stands at the last frame: 1024 + 6 * 1024
+        assert_eq!(ends, vec![StreamEnd { abs_cycle: 1024 + 6 * 1024, idle_cycles: 422 }]);
+    }
+
+    #[test]
+    fn the_end_token_count_is_eighteen_bits_and_a_quiet_tile_has_only_the_token() {
+        let events = vec![0xF0, 0, 0, 0, 0, 0, 0, 100, 0xDC, 0x03, 0xFF, 0xEA];
+        let packet = make_trace_packet(&events);
+        let (decoded, ends) = decode_binary_trace_with_ends(&packet);
+        assert!(decoded.is_empty());
+        assert_eq!(ends, vec![StreamEnd { abs_cycle: 100, idle_cycles: (3 << 16) | 0xFFEA }]);
     }
 
     #[test]

@@ -1524,6 +1524,16 @@ pub struct StreamSwitchTiming {
     pub inter_tile_hop_latency: u8,
     /// Packet switch arbitration overhead per packet header.
     pub packet_arbitration_overhead: u8,
+    /// Cycles a completed trace packet is held in the trace unit's output stage before its first
+    /// word is handed to the trace slave port: **8, measured on the shim tile's trace unit
+    /// only** (NPU1, 2026-11-11, three captures of `objectfifo_repeat_init_values_repeat`,
+    /// `add_one_objFifo_elf`, `objectfifo_channel_turns`, `objectfifo_turns_walkers`,
+    /// `add_one_two_txn`, `add_one_ctrl_packet_4_cores`): a shim trace packet's first word
+    /// reaches the shim S2MM 10 cycles after the cycle its completing byte is written, whatever
+    /// that byte is. The emulator's path from hand-off to S2MM takes 2, hence 8. The core,
+    /// memory-module and memtile trace units use the same value by inference: their timers are
+    /// not synchronised with the shim's, so the absolute delay is not observable there.
+    pub trace_packet_emit_cycles: u8,
 }
 
 /// Broadcast-event timer-reset propagation timing.

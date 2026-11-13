@@ -67,9 +67,16 @@ class StartCmd(TraceCommand):
 
 @dataclass(frozen=True)
 class StopCmd(TraceCommand):
-    """Segment-end marker.  No payload required by the byte stream itself;
-    higher-level decoders may attach a timestamp from a preceding
-    EventCmd."""
+    """End-of-stream token (opcode 0xDC, 4 bytes, 4-byte aligned).
+
+    ``idle_cycles`` is its 18-bit count: the idle cycles from the last frame (Repeats
+    included) to the stop event.  Every silicon stream ends with one, apart from the
+    ones whose packet was lost; Syncs before it carry the wraps of the field, so the
+    whole idle time is ``Syncs * 2**18 + idle_cycles``.  The timeline conversions do not
+    add it to the timer: it is the stop, not an event.
+    """
+
+    idle_cycles: int = 0
 
 
 @dataclass(frozen=True)

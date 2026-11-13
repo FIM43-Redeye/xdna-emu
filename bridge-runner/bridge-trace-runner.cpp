@@ -1110,8 +1110,9 @@ int discover_trace_buf_idx_from_insts(const std::string& path) {
 
 /// Walk insts.bin and return, per data-buffer index (0-based among the
 /// kernel's data buffers -- the SAME index space --trace-buf-idx uses), the
-/// byte length the compiled kernel's shim-DMA BD transfers to/from that
-/// buffer. Empty on any parse failure -- callers fall back to the declared
+/// byte extent the compiled kernel's shim-DMA BDs reach into that buffer: the
+/// largest offset (the patch's arg_plus) + Buffer_Length * 4 over every BD
+/// patched onto it. Empty on any parse failure -- callers fall back to the declared
 /// (pointer) size, so kernels that were already sized correctly are
 /// unaffected.
 ///
@@ -1140,6 +1141,8 @@ std::unordered_map<int, size_t> discover_arg_sizes_from_insts(const std::string&
     constexpr uint8_t  OPCODE_BLOCKWRITE  = 0x01;
     constexpr uint8_t  OPCODE_MASKWRITE   = 0x03;
     constexpr uint8_t  OPCODE_DDR_PATCH   = 0x81;
+    constexpr uint64_t DDR_AIE_ADDR_OFFSET = 0x80000000ull;
+    constexpr uint32_t NUM_FIRMWARE_TRANSLATED_ARGS = 5;
 
     std::unordered_map<int, size_t> sizes;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -1178,10 +1181,23 @@ std::unordered_map<int, size_t> discover_arg_sizes_from_insts(const std::string&
             op_size = 28;
         } else if (opcode == OPCODE_DDR_PATCH) {
             op_size = 48;
-            if (off + 8 + 24 < end) {
+            if (off + 48 <= end) {
                 int arg_idx = data[off + 8 + 24];
+                // Words 10..11: arg_plus, the byte offset of the BD's start in the buffer. Args
+                // at index >= 5 may carry the DDR aperture offset folded in (mlir-aie
+                // TxnEncoding.h txn_append_arg_patch); that is not extent.
+                uint64_t arg_plus = static_cast<uint64_t>(u32(off + 40))
+                                  | (static_cast<uint64_t>(u32(off + 44)) << 32);
+                if (static_cast<uint32_t>(arg_idx) >= NUM_FIRMWARE_TRANSLATED_ARGS
+                    && arg_plus >= DDR_AIE_ADDR_OFFSET) {
+                    arg_plus -= DDR_AIE_ADDR_OFFSET;
+                }
                 if (have_bd_len && last_bd_len_words > 0) {
-                    sizes[arg_idx] = last_bd_len_words * 4;
+                    // A buffer must hold every BD that reaches into it: the largest
+                    // offset + length over all of them, not the last BD's length.
+                    size_t need = static_cast<size_t>(arg_plus) + last_bd_len_words * 4;
+                    size_t& cur = sizes[arg_idx];
+                    cur = std::max(cur, need);
                 }
             }
             have_bd_len = false;  // consume: each patch binds one BD config
@@ -2719,6 +2735,15 @@ int run_batch_stdin(Session& session, const OuterArgs& outer, const char* argv0)
 } // anonymous namespace
 
 int main(int argc, char** argv) {
+    // `--print-arg-sizes INSTS`: print the per-data-buffer byte extents the runner derives
+    // from a compiled instruction stream ("index bytes" per line) and exit; no device use.
+    if (argc == 3 && std::string(argv[1]) == "--print-arg-sizes") {
+        auto sizes = discover_arg_sizes_from_insts(argv[2]);
+        std::vector<std::pair<int, size_t>> v(sizes.begin(), sizes.end());
+        std::sort(v.begin(), v.end());
+        for (const auto& [idx, bytes] : v) std::printf("%d %zu\n", idx, bytes);
+        return 0;
+    }
     OuterArgs outer;
     RunArgs run;
     if (int rc = parse_cli(argc, argv, outer, run); rc != 0) return rc;
