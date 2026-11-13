@@ -1455,3 +1455,198 @@ def test_cli_has_the_add_and_select_options_on_fetch_build():
     assert ns.memmod_event_add == "LOCK_1_REL" and ns.lock_event_select == [(1, 1), (2, 3)]
     ns = g.build_parser().parse_args(["chain-build", "d", "--memmod-event-add", "LOCK_1_REL"])
     assert ns.memmod_event_add == "LOCK_1_REL"
+
+
+# -- lock-held S2MM probe (sl-*): release -> S2MM grant, and what follows it ----------------------------
+
+def sl(head=True, d=12, kind="none", k=0, p=0):
+    return g.SlCase(head=head, d=d, kind=kind, k=k, p=p)
+
+
+def test_sl_case_names_are_distinct_and_clear_of_the_other_variants():
+    plan = g.sl_plan()
+    names = [c.name for c in plan]
+    assert len(names) == len(set(names))
+    assert sl().name == "slh12" and sl(False, 10).name == "slf10"
+    assert sl(True, 12, "load", 3, 1).name == "slh12k03p1" and sl(False, 12, "camp").name == "slf12camp"
+    other = {g.fetch_case_name(k, c, b) for k in range(65) for (c, b) in g.FETCH_PREFIX}
+    other |= {sync_case(d).name for d in g.SYNC_DEFAULT_DS} | {c.name for c in g.ring_plan()}
+    assert not set(names) & other
+
+
+def test_sl_plan_covers_the_specified_sweeps():
+    plan = g.sl_plan()
+    assert len(plan) == 64
+    ds = tuple(range(g.SL_FIRST_D, g.SL_FIRST_D + 6))
+    for head in (True, False):                              # the release sweep: six consecutive d, both variants
+        assert [c.d for c in plan if c.head == head and c.kind == "none"] == list(ds)
+        assert sum(c.kind == "camp" and c.head == head for c in plan) == 1
+    loads = [c for c in plan if c.kind == "load"]
+    assert {c.d for c in loads} == {g.SL_LOAD_D} and all(c.head for c in loads)   # one d, the chained variant
+    assert {(c.k, c.p) for c in loads} == {(k, p) for k in range(25) for p in (0, 1)}
+    assert g.SL_LOAD_D in ds
+
+
+def test_sl_rejects_out_of_range():
+    for c in (sl(d=-1), sl(d=g.SYNC_MAX_D + 1), sl(kind="x"), sl(kind="load", k=-1), sl(kind="load", k=65),
+              sl(kind="load", p=2)):
+        with pytest.raises(ValueError):
+            g.sl_validate(c)
+    g.sl_validate(sl(kind="load", k=0, p=1))
+
+
+def test_sl_core_releases_a_after_d_nops_then_one_load_k_nops_later():
+    body = bundles_of(g.sl_core_asm(sl(d=7, kind="load", k=3, p=1)))
+    i = body.index("event #0")
+    assert body[i + 1:i + 8] == ["nop"] * 7
+    assert body[i + 8] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    assert body[i + 9:i + 12] == ["nop"] * 3
+    assert body[i + 12] == "lda r26, [p0, #16]"                       # parity 1 = the odd granule's physical bank
+    assert phys_bank(g.FETCH_LD_ADDR + 16) == 1 and phys_bank(g.FETCH_LD_ADDR) == 0
+    assert sum(b.startswith("lda r2") or b.startswith("lda r3") for b in body) == 1
+    assert "lda r26, [p0, #0]" in [b for b in bundles_of(g.sl_core_asm(sl(kind="load", p=0)))]
+
+
+def test_sl_core_waits_for_go_first_and_for_the_s2mm_release_only():
+    body = bundles_of(g.sl_core_asm(sl()))
+    go = body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3")
+    assert go < body.index("event #0")
+    done = body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    assert done > body.index(f"rel #{g.OWN + g.FETCH_LOCK_A}, r2")
+    assert sum(b.startswith("acq ") for b in body) == 2                    # nothing waits on a host-fed lock
+    assert sum(b == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2" for b in body[done:]) == g.RING_FILL_RELEASES
+    assert not [b for b in body[go:body.index("event #0")] if b.startswith(("lda", "st "))]
+
+
+def test_sl_core_camp_is_the_existing_90_loads_on_bank_0():
+    body = bundles_of(g.sl_core_asm(sl(kind="camp")))
+    i = body.index("event #0")
+    camp = body[i + 14:i + 14 + 90]
+    assert len(camp) == 90 and all(b.startswith("lda ") for b in camp)
+    assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in camp} == {0}
+    assert body[i + 14 + 90] == "nop"
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [sl(), sl(kind="load", k=24, p=1), sl(False, 15, "camp")])
+def test_sl_core_assembles(c, tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.sl_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_sl_design_chained_s2mm_head_then_the_lock_bd():
+    t = g.sl_design_mlir(sl(head=True))
+    assert 'aie.lock(%t02, 0) {init = 0 : i32, sym_name = "lA"}' in t                 # lock 0: the reset selector
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" in t
+    send = t.split("^send:")[1].split("^recv_start:")[0]
+    assert "use_lock" not in send and "dma_bd(%feed : memref<68xi32>)" in send         # lock-free, 4 + 64 words
+    assert "aie.dma_start(S2MM, 0, ^head, ^end)" in t
+    head = t.split("^head:")[1].split("^recv:")[0]
+    assert "use_lock" not in head and "dma_bd(%dst : memref<4xi32>)" in head and "next_bd ^recv" in head
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert recv.index("use_lock(%lA, AcquireGreaterEqual") < recv.index("dma_bd(%sdst : memref<64xi32>") \
+        < recv.index("use_lock(%lB, Release")
+    assert phys_bank(g.RING_SDST_ADDR) == 0 and phys_bank(g.RING_FEED_ADDR) == 2
+
+
+def test_sl_design_first_bd_variant_has_no_head_and_the_mm2s_sends_64_words():
+    t = g.sl_design_mlir(sl(head=False))
+    assert "aie.dma_start(S2MM, 0, ^recv, ^end)" in t and "^head:" not in t
+    assert "dma_bd(%feed : memref<64xi32>)" in t
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert "use_lock(%lA, AcquireGreaterEqual" in recv and "dma_bd(%sdst : memref<64xi32>" in recv
+
+
+def test_sl_variants_share_buffers_and_the_sequence_only_sets_go():
+    def bufs(t):
+        return [ln.strip() for ln in t.splitlines() if "aie.buffer" in ln and "feed" not in ln]
+    assert bufs(g.sl_design_mlir(sl(True))) == bufs(g.sl_design_mlir(sl(False)))
+    addrs = [int(ln.split("address = ")[1].split(" ")[0]) for ln in bufs(g.sl_design_mlir(sl()))]
+    assert addrs == sorted(addrs)
+    seq = g.sl_design_mlir(sl()).split("aie.runtime_sequence")[1]
+    assert "aiex.set_lock(%lGo" in seq
+    for forbidden in ("dma_wait", "dma_memcpy_nd", "npu.sync", "dma_start_task"):
+        assert forbidden not in seq
+
+
+def test_sl_event_lists_fit_the_eight_slots_and_name_the_specified_events():
+    assert g.SL_MEMMOD_EVENTS == ["LOCK_0_REL", "DMA_S2MM_0_STALLED_LOCK", "DMA_S2MM_0_FINISHED_BD",
+                                  "DMA_MM2S_0_STREAM_BACKPRESSURE", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                                  "DMA_S2MM_0_STREAM_STARVATION", "DMA_S2MM_0_MEMORY_BACKPRESSURE"]
+    assert len(g.SL_MEMMOD_EVENTS) == g.MEMMOD_TRACE_SLOTS
+    a = g.sl_inject_args(sl())
+    assert a[a.index("--memmod-sweep-events") + 1].split(",") == g.SL_MEMMOD_EVENTS
+    assert a[a.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,LOCK_STALL"
+    pytest.importorskip("aie.utils.trace.events")
+    for name in g.SL_MEMMOD_EVENTS:
+        g._check_memmod_event_name(name)
+
+
+def sl_synthetic(rel=1000, grant_after=4, fin=76, bp_fall=6, conflicts=(), starv=(), fills=g.RING_FILL_RELEASES,
+                 s2mm_fins=1, bp=True):
+    G = rel + grant_after
+    e = held("DMA_S2MM_0_STALLED_LOCK", 100, G - 1)                      # parked since boot
+    e += [ev("LOCK_0_REL", rel)] + [ev("LOCK_0_REL", rel + 500 + 30 * i) for i in range(fills)]
+    if bp:
+        e += held("DMA_MM2S_0_STREAM_BACKPRESSURE", 150, G + bp_fall - 1)
+    e += [ev("DMA_S2MM_0_FINISHED_BD", G + fin + 7 * i) for i in range(s2mm_fins)]
+    for bank, at in conflicts:
+        e.append(ev(f"CONFLICT_DM_BANK_{bank}", G + at))
+    for a, z in starv:
+        e += held("DMA_S2MM_0_STREAM_STARVATION", G + a, G + z)
+    return e
+
+
+def test_sl_row_numbers_relative_to_the_grant():
+    r = g.sl_row(sl_synthetic(rel=1000, grant_after=4, fin=76, bp_fall=6, conflicts=[(0, 17), (1, 25), (0, 33)],
+                              starv=[(3, 3)]))
+    assert r["release"] == 1000 and r["grant"] == 4
+    assert r["s2mm_fin"] == [76]
+    assert r["bp_fall"] == 6
+    assert r["starvation"] == [(3, 3)]
+    assert r["conflicts"] == {0: [17, 33], 1: [25]}
+    assert r["releases"] == 1 + g.RING_FILL_RELEASES
+    assert g.sl_missing(r, sl()) == []
+
+
+def test_sl_row_ignores_the_boot_time_head_finish_and_the_early_backpressure():
+    e = sl_synthetic() + [ev("DMA_S2MM_0_FINISHED_BD", 50)]
+    r = g.sl_row(e)
+    assert r["s2mm_fin"] == [76]                                        # only finishes after the release count
+
+
+def test_sl_row_no_release_or_no_grant_says_so():
+    assert g.sl_row([])["release"] is None
+    assert g.sl_missing(g.sl_row([]), sl()) == ["no LOCK_0_REL"]
+    e = [x for x in sl_synthetic() if x.name != "DMA_S2MM_0_STALLED_LOCK"]
+    r = g.sl_row(e)
+    assert r["grant"] is None and "grant" in g.sl_missing(r, sl())
+
+
+def test_sl_missing_flags_an_unfinished_task_and_a_core_that_never_ended():
+    r = g.sl_row(sl_synthetic(s2mm_fins=0, bp=False, fills=3))
+    miss = g.sl_missing(r, sl())
+    assert any("S2MM FINISHED_BD" in m for m in miss) and any("BACKPRESSURE never fell" in m for m in miss)
+    assert any("core" in m for m in miss)
+
+
+def test_format_sl_table_has_one_line_per_run_with_the_decided_columns():
+    r = g.sl_row(sl_synthetic(conflicts=[(0, 17)], starv=[(3, 3)]))
+    r["check"] = g.sl_missing(r, sl())
+    text = g.format_sl_table([(sl(), "e1.emu", r)])
+    line = [ln for ln in text.splitlines() if ln.startswith("slh12")][0]
+    for want in ("e1.emu", "1000", "grant +4", "fin +76", "bp +6", "starv [+3]", "B0 [+17]", "finish ok"):
+        assert want in line
+    assert "no LOCK_0_REL" in g.format_sl_table([(sl(), "e1.emu", {"release": None})])
+
+
+def test_cli_has_the_sl_subcommands():
+    ns = g.build_parser().parse_args(["sl-build", "d", "--names", "slh12"])
+    assert ns.cmd == "sl-build" and ns.names == ["slh12"]
+    ns = g.build_parser().parse_args(["sl-table", "d", "e1.emu"])
+    assert ns.runs == ["e1.emu"]
+    ns = g.build_parser().parse_args(["sl-run", "d", "e1", "--backend", "emu"])
+    assert ns.backend == "emu"

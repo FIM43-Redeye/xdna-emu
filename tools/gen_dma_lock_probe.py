@@ -107,6 +107,18 @@ core releases s nops after the camp (s swept over six values). See the section c
     python3 tools/gen_dma_lock_probe.py refuse-run OUT_DIR TAG --backend hw|emu [--names ...]
     python3 tools/gen_dma_lock_probe.py refuse-table OUT_DIR RUN [RUN ...] [--names ...]
 
+Lock-held S2MM probe (`sl-build`, `sl-run`, `sl-table`; cases slhDD / slfDD, slhDDkKKpP, slhDDcamp). The S2MM side of
+the lock-grant timing: an MM2S lock-free BD feeds the tile's own S2MM 0, whose 64-word BD waits on lock A (a lock-free
+4-word head BD chained in front of it in `slh`, the task's first BD in `slf`). The core releases A d nops after
+`event #0` and then does nothing, makes one load k nops later at granule parity p, or camps on bank 0. The table reads
+only the memory-module unit: the grant (STALLED_LOCK fall) after the release, the S2MM FINISHED_BD, the MM2S
+backpressure fall, STREAM_STARVATION and the conflict stamps, all relative to the grant. See the section comment above
+`SlCase`.
+
+    python3 tools/gen_dma_lock_probe.py sl-build OUT_DIR [--names slh12 ...]
+    python3 tools/gen_dma_lock_probe.py sl-run OUT_DIR TAG --backend hw|emu [--names ...]
+    python3 tools/gen_dma_lock_probe.py sl-table OUT_DIR RUN [RUN ...] [--names ...]
+
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained] [--banks both 0 1]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...] [--chained] [--banks ...]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...] [--chained] [--banks ...]
@@ -2309,6 +2321,304 @@ def cmd_ring_table(args) -> int:
     return 0
 
 
+# -- lock-held S2MM probe (sl-*): the S2MM grant after a core release ------------------------------------
+#
+# The compute tile's S2MM side of the lock-grant timing: how many cycles after a core's release of lock A does an
+# S2MM BD parked on A get its grant (STALLED_LOCK falls), how long after the grant does it finish, when does the
+# MM2S feeding it stop backpressuring, and where do the stream-rate writes fall against a core load or camp on the
+# bank the S2MM writes. Everything is read from the memory-module trace unit (one timer, no cross-unit skew).
+#
+#   MM2S 0: one lock-free BD (the `feed` buffer, banks 2/3), started at boot, into the tile's own S2MM 0 over the
+#           local loopback. It sends exactly what the S2MM takes: 68 words with a head BD, 64 without.
+#   S2MM 0: with a head (`slh`): a lock-free 4-word head BD (into `dst`) chained to the 64-word BD, so the measured BD
+#           is a chained BD; without (`slf`): the 64-word BD is the task's first BD. The 64-word BD acquires lock A
+#           (lock 0, init 0, so LOCK_0_REL follows it at the selector's reset), writes `sdst` (0x1000, banks 0/1: granule
+#           g in physical bank g & 1) and releases lock B when it finishes.
+#   core:   wait on the go lock (set by the runtime sequence after the trace is armed), settle, `event #0`, d nops,
+#           release A; then nothing (`none`), one load from `ldbuf` k nops later at granule parity p (`load`: offset
+#           16 * p, physical bank p), or the 90-load camp on bank 0 (`camp`); then wait on B (the S2MM's release) and
+#           release A RING_FILL_RELEASES more times plus a tail, which fill the last trace packets (as the ring family).
+# Why it cannot hang: the core waits only on go (set by the sequence, which always reaches it) and on B, released by the
+# S2MM BD after the 64 words the MM2S sends; the MM2S is lock-free and the S2MM takes exactly its words; the sequence
+# waits on nothing in the tile.
+
+SL_FIRST_D = 10                    # the release sweep: SL_DS = six consecutive d (the sync family's banked rows)
+SL_DS = tuple(range(SL_FIRST_D, SL_FIRST_D + 6))
+SL_LOAD_D = 12                     # the d of the k sweep and of the camp
+SL_KS = tuple(range(25))
+SL_PARITIES = (0, 1)
+SL_CAMP_N = 90
+SL_KINDS = ("none", "load", "camp")
+SL_HEAD_WORDS = 4
+SL_HEAD_ADDR = FETCH_DST_ADDR      # the head BD's destination: clear of banks 0..3
+SL_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_S2MM_0_STALLED_LOCK", "DMA_S2MM_0_FINISHED_BD",
+                    "DMA_MM2S_0_STREAM_BACKPRESSURE", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                    "DMA_S2MM_0_STREAM_STARVATION", "DMA_S2MM_0_MEMORY_BACKPRESSURE"]
+SL_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
+
+
+@dataclass(frozen=True)
+class SlCase:
+    head: bool                     # True: S2MM head BD chained to the lock BD; False: the lock BD is the first BD
+    d: int                         # nops between `event #0` and the release of A
+    kind: str = "none"             # "none", "load" (one load k nops after the release) or "camp"
+    k: int = 0
+    p: int = 0                     # the load's granule parity = its physical bank (offset 16 * p)
+
+    @property
+    def name(self) -> str:
+        stem = f"sl{'h' if self.head else 'f'}{self.d:02d}"
+        if self.kind == "load":
+            return f"{stem}k{self.k:02d}p{self.p}"
+        return stem + ("camp" if self.kind == "camp" else "")
+
+    @property
+    def words(self) -> int:
+        """What the MM2S sends and the S2MM takes in all."""
+        return FETCH_WORDS + (SL_HEAD_WORDS if self.head else 0)
+
+
+def sl_validate(c: SlCase) -> None:
+    if not 0 <= c.d <= SYNC_MAX_D:
+        raise ValueError(f"d must be 0..{SYNC_MAX_D}")
+    if c.kind not in SL_KINDS:
+        raise ValueError(f"kind must be one of {SL_KINDS}")
+    if c.kind == "load":
+        if c.k not in FETCH_KS:
+            raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
+        if c.p not in SL_PARITIES:
+            raise ValueError("p must be 0 or 1")
+
+
+def sl_core_asm(c: SlCase) -> str:
+    sl_validate(c)
+    n = lp.nops
+    if c.kind == "load":
+        after = [*n(c.k), f"  lda r26, [p0, #{16 * c.p}]"]
+    elif c.kind == "camp":
+        offs = RING_CAMP_OFFSETS[0]
+        after = [f"  lda {ARB_LOAD_REGS[i % len(ARB_LOAD_REGS)]}, [p0, #{offs[i % len(offs)]}]"
+                 for i in range(SL_CAMP_N)]
+    else:
+        after = []
+    fill = []
+    for i in range(RING_FILL_RELEASES):
+        fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
+            "  event #0", *n(c.d), f"  rel #{OWN + FETCH_LOCK_A}, r2", *after, *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8), *fill,
+            *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def sl_design_mlir(c: SlCase) -> str:
+    sl_validate(c)
+    w, h = FETCH_WORDS, SL_HEAD_WORDS
+    feed = ", ".join(str(0x0E000000 | j) for j in range(c.words))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    head_bd = (f"    ^head:\n      aie.dma_bd(%dst : memref<{h}xi32>)\n      aie.next_bd ^recv\n") if c.head else ""
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+    %sdst = aie.buffer(%t02) {{address = {RING_SDST_ADDR} : i32, sym_name = "sdst"}} : memref<{w}xi32>
+    %feed = aie.buffer(%t02) {{address = {RING_FEED_ADDR} : i32, sym_name = "feed", initial_value = dense<[{feed}]> : tensor<{c.words}xi32>}} : memref<{c.words}xi32>
+    %dst = aie.buffer(%t02) {{address = {SL_HEAD_ADDR} : i32, sym_name = "dst"}} : memref<{h}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
+    %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
+    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(MM2S, 0, ^send, ^recv_start)
+    ^send:
+      aie.dma_bd(%feed : memref<{c.words}xi32>)
+      aie.next_bd ^end
+    ^recv_start:
+      %s1 = aie.dma_start(S2MM, 0, {"^head" if c.head else "^recv"}, ^end)
+{head_bd}    ^recv:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%sdst : memref<{w}xi32>)
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lB, Release, %cb)
+      aie.next_bd ^end
+    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lGo, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def sl_inject_args(c: SlCase) -> list[str]:
+    return ["--memmod-sweep-events", ",".join(SL_MEMMOD_EVENTS),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(SL_CORE_EVENTS)]
+
+
+def sl_plan() -> list[SlCase]:
+    """64 cases: the release sweep (six d, no core access) on both variants, the k x parity sweep at one d on the
+    chained variant, and the camp at that d on both variants."""
+    cases = [SlCase(head, d) for head in (True, False) for d in SL_DS]
+    cases += [SlCase(True, SL_LOAD_D, "load", k, p) for k in SL_KS for p in SL_PARITIES]
+    cases += [SlCase(head, SL_LOAD_D, "camp") for head in (True, False)]
+    return cases
+
+
+def sl_row(events) -> dict:
+    """One run as numbers relative to the release and the S2MM grant, memory-module timer only.
+
+    grant = cycles from the first LOCK_0_REL to the cycle after the S2MM STALLED_LOCK interval holding it ends.
+    Every other cycle count is relative to that grant cycle G: S2MM FINISHED_BD after the release (the head BD's
+    finish is before it), the MM2S STREAM_BACKPRESSURE fall (bp_fall: the first run still asserted at the release,
+    ending one cycle before), STREAM_STARVATION and MEMORY_BACKPRESSURE runs, conflict stamps per bank. The MM2S's own
+    FINISHED_BD is not traced: its one BD is absorbed by the path (about 60 words) and ends at boot, before the trace
+    is armed, so the MM2S finishing shows only as its backpressure falling.
+    `releases` counts LOCK_0_REL: the core's one release plus its RING_FILL_RELEASES after it got B."""
+    mem: dict = {}
+    for e in events:
+        if e.row == FETCH_ROW and e.pkt_type == PT_MEM:
+            mem.setdefault(e.name, []).append(e.ts)
+    rels = sorted(set(mem.get("LOCK_0_REL", [])))
+    if not rels:
+        return {"release": None}
+    rel = rels[0]
+    r: dict = {"release": rel, "grant": None, "releases": len(rels), "s2mm_fin": [],
+               "bp_fall": None, "starvation": [], "membp": [], "conflicts": {0: [], 1: []}}
+    for first, last in _runs(mem.get("DMA_S2MM_0_STALLED_LOCK", [])):
+        if first <= rel <= last + 1:
+            r["grant"] = last + 1 - rel
+    if r["grant"] is None:
+        return r
+    G = rel + r["grant"]
+    r["s2mm_fin"] = [t - G for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t > rel]
+    bp = [(a, z) for a, z in _runs(mem.get("DMA_MM2S_0_STREAM_BACKPRESSURE", [])) if z + 1 > rel]
+    r["bp_fall"] = bp[0][1] + 1 - G if bp else None
+    r["starvation"] = [(a - G, z - G) for a, z in _runs(mem.get("DMA_S2MM_0_STREAM_STARVATION", [])) if z >= rel]
+    r["membp"] = [(a - G, z - G) for a, z in _runs(mem.get("DMA_S2MM_0_MEMORY_BACKPRESSURE", [])) if z >= rel]
+    for bank in (0, 1):
+        r["conflicts"][bank] = [t - G for t in sorted(set(mem.get(f"CONFLICT_DM_BANK_{bank}", []))) if t >= rel]
+    return r
+
+
+def sl_missing(r: dict, c: SlCase) -> list[str]:
+    """What a run lacks of the finish check: the release, the grant, the S2MM lock BD's one FINISHED_BD after the
+    release, the MM2S's backpressure falling (its words went into the S2MM) and the core's fill releases (it got
+    past the wait on B, so it ended)."""
+    if r.get("release") is None:
+        return ["no LOCK_0_REL"]
+    out = []
+    if r["grant"] is None:
+        return ["grant"]
+    if len(r["s2mm_fin"]) != 1:
+        out.append(f"S2MM FINISHED_BD x{len(r['s2mm_fin'])} (want 1)")
+    if r["bp_fall"] is None:
+        out.append("MM2S STREAM_BACKPRESSURE never fell")
+    if r["releases"] != 1 + RING_FILL_RELEASES:
+        out.append(f"core did not reach its end (LOCK_0_REL x{r['releases']}, want {1 + RING_FILL_RELEASES})")
+    return out
+
+
+def _sl_runs(runs) -> str:
+    return ",".join(f"+{a}" if a == z else f"+{a}..+{z}" for a, z in runs) or "-"
+
+
+def format_sl_table(rows) -> str:
+    """rows: (SlCase, run name, sl_row dict). Every cycle count is relative to the S2MM grant except `grant` (after
+    the release); the release is the memory-module timer stamp."""
+    lines = ["case          run      release  grant     S2MM fin  bp fall  starv           B0 conflicts"
+             "                B1 conflicts                finish"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r["release"] is None:
+            lines.append(f"{c.name:<13} {run:<8} no LOCK_0_REL event")
+            continue
+        if r["grant"] is None:
+            lines.append(f"{c.name:<13} {run:<8} {r['release']:>7}  no S2MM grant (no STALLED_LOCK interval holds the release)")
+            continue
+        cf = {b: ",".join(f"+{t}" for t in r["conflicts"][b]) or "-" for b in (0, 1)}
+        chk = "finish ok" if not r.get("check") else "finish MISSING " + "; ".join(r["check"])
+        lines.append(f"{c.name:<13} {run:<8} {r['release']:>7}  grant +{r['grant']:<2} "
+                     f"fin {','.join(f'{t:+d}' for t in r['s2mm_fin']) or '?':<5} "
+                     f"bp {_num(r['bp_fall']) if r['bp_fall'] is not None else '?':<4} "
+                     f"starv [{_sl_runs(r['starvation'])}]  B0 [{cf[0]}]  B1 [{cf[1]}]  {chk}")
+    return "\n".join(lines)
+
+
+def sl_selection(args) -> list[SlCase]:
+    return [c for c in sl_plan() if not args.names or c.name in args.names]
+
+
+def sl_build_case(c: SlCase, out: Path) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(sl_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(sl_design_mlir(c))
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *sl_inject_args(c),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "head": c.head, "d": c.d, "kind": c.kind,
+                                             "k": c.k, "p": c.p, "sl": True}) + "\n")
+
+
+def cmd_sl_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sl_selection(args):
+        sl_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_sl_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sl_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_sl_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in sl_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"release": None}))
+                continue
+            r = sl_row(load_level_events(run_dir))
+            r["check"] = sl_missing(r, c)
+            rows.append((c, run, r))
+    print(format_sl_table(rows))
+    return 0
+
+
 # -- refused-access probe (refuse-*): a lock BD after a BD whose accesses a core camp refused -------------
 #
 # Does the grant phase of a lock BD depend on what happened to the BD before it? Chained task on MM2S 0:
@@ -2688,7 +2998,16 @@ def build_parser() -> argparse.ArgumentParser:
     xt = sub.add_parser("refuse-table", help="refused-access probe: per-run grant offsets and the finish check")
     xt.add_argument("out_dir")
     xt.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt):
+    sb = sub.add_parser("sl-build", help="lock-held S2MM probe: build the plan's cases (or --names)")
+    sb.add_argument("out_dir")
+    sr = sub.add_parser("sl-run", help="lock-held S2MM probe: run the built cases to TAG.BACKEND/")
+    sr.add_argument("out_dir")
+    sr.add_argument("tag")
+    sr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    st = sub.add_parser("sl-table", help="lock-held S2MM probe: release -> grant, finish, back-pressure, conflicts")
+    st.add_argument("out_dir")
+    st.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     return ap
 
@@ -2698,6 +3017,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.cmd in CHAIN_COMMANDS:
         return CHAIN_COMMANDS[args.cmd](args)
+    if args.cmd.startswith("sl-"):
+        return {"sl-build": cmd_sl_build, "sl-run": cmd_sl_run, "sl-table": cmd_sl_table}[args.cmd](args)
     if args.cmd.startswith("refuse-"):
         return {"refuse-build": cmd_refuse_build, "refuse-run": cmd_refuse_run,
                 "refuse-table": cmd_refuse_table}[args.cmd](args)
