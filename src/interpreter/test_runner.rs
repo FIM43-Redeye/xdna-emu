@@ -1973,7 +1973,15 @@ mod tests {
                 .dma_engine(consumer_col, consumer_row)
                 .map_or(false, |e| e.channel_active(s2mm_channel));
 
-            if producer_done && consumer_done {
+            // A finished BD's lock release is still on its way to the lock unit for a few cycles.
+            let releases_landed = runner
+                .engine
+                .device()
+                .array
+                .tiles
+                .iter()
+                .all(|t| t.dma_releases_in_transit.is_empty());
+            if producer_done && consumer_done && releases_landed {
                 completed_cycle = cycle + 1;
                 eprintln!("Both transfers completed in {} cycles", completed_cycle);
                 break;

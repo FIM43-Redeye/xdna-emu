@@ -798,11 +798,11 @@ impl InterpreterEngine {
         // propagates to DMA engines for DMA-side trace events.
         self.device.array.set_dma_cycle(self.total_cycles);
 
-        // Core lock releases performed last cycle reach their lock units now, before anyone
-        // looks at a lock this cycle (`Tile::deliver_core_lock_releases`).
+        // Core lock releases performed last cycle, and DMA BD releases due now, reach their lock
+        // units before anyone looks at a lock this cycle (`Tile::deliver_lock_releases`).
         for tile in &mut self.device.array.tiles {
-            if !tile.core_releases_in_transit.is_empty() || tile.lock_arbiter.has_arrived_releases() {
-                tile.deliver_core_lock_releases(self.total_cycles);
+            if tile.has_lock_releases_in_transit() || tile.lock_arbiter.has_arrived_releases() {
+                tile.deliver_lock_releases(self.total_cycles);
             }
         }
 
@@ -1261,6 +1261,10 @@ impl InterpreterEngine {
         let denied: Vec<&[Requester]> = arbitration.iter().map(|a| a.denied_dma.as_slice()).collect();
         let (dma_active, streams_moved, _words_routed) =
             self.device.array.step_data_movement_with_denied(&mut self.host_memory, &denied);
+        // A DMA BD release still on its way to a lock unit is DMA work: the run must not end
+        // before it lands.
+        let dma_active =
+            dma_active || self.device.array.tiles.iter().any(|t| !t.dma_releases_in_transit.is_empty());
 
         // A DMA channel entering Error pulses its module's hardware error
         // event once. The normal event publisher owns group promotion,
@@ -3324,6 +3328,195 @@ mod tests {
             assert_eq!(r.event1 - r.event0, window, "{row}: event #1 - event #0 ({r:?})");
         }
         assert_eq!(phases, [2, 3].into(), "both grant phases exercised");
+    }
+
+    /// One run of the sync probe's head (`tools/gen_dma_lock_probe.py` sync family) on one tile:
+    /// the core holds on `acq #49, r3` (lock 1, -1; the probe's own encodings) four bundles in
+    /// front of `event #0`; MM2S 0's head BD (4 words) waits on lock 2, which is set at cycle
+    /// `go`, and releases lock 1 when it finishes. Returns the cycles of the head's FINISHED_BD,
+    /// of lock 1's release reaching the lock unit, and of `event #0`'s issue.
+    fn run_sync_head(go: u64) -> (u64, u64, u64) {
+        use crate::device::dma::BdConfig;
+        const MOV_R2_1: [u8; 4] = [0x99, 0x07, 0x80, 0x18];
+        const MOV_R3_M1: [u8; 4] = [0x99, 0xff, 0xcf, 0x18];
+        const NOP: [u8; 2] = [0x01, 0x00];
+        const ACQ_LOCK1_R3: [u8; 4] = [0x19, 0x32, 0x22, 0x16];
+        const EVENT0: [u8; 4] = [0x19, 0x10, 0x00, 0x10];
+        let mut prog: Vec<u8> = Vec::new();
+        prog.extend(MOV_R2_1);
+        prog.extend(MOV_R3_M1);
+        prog.extend(NOP);
+        prog.extend(NOP);
+        prog.extend(ACQ_LOCK1_R3);
+        for _ in 0..4 {
+            prog.extend(NOP);
+        }
+        let ev0_pc = prog.len() as u32;
+        prog.extend(EVENT0);
+        while prog.len() < 2048 {
+            prog.extend(NOP);
+        }
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine
+            .device_mut()
+            .tile_mut(1, 2)
+            .expect("compute tile (1,2)")
+            .write_program(0, &prog);
+        engine.enable_core(1, 2);
+        {
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            dma.configure_bd(
+                1,
+                BdConfig::simple_1d(0x4000, 16)
+                    .with_acquire(2, -1)
+                    .with_release(1, 1)
+                    .with_next(0),
+            )
+            .unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x400, 256).with_acquire(0, -1))
+                .unwrap();
+        }
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 1;
+        }
+        let (mut finished, mut release, mut event0) = (None, None, None);
+        for _ in 0..go + 100 {
+            let cycle = engine.total_cycles();
+            if cycle == go {
+                engine.device_mut().tile_mut(1, 2).unwrap().locks[2].set(1);
+            }
+            let (pc, instrs) = {
+                let ctx = engine.core_context(1, 2).unwrap();
+                (ctx.pc(), ctx.instructions)
+            };
+            let released = engine.device().array.tile(1, 2).lock_release_count();
+            let done = engine
+                .device()
+                .array
+                .dma_engine(1, 2)
+                .unwrap()
+                .channel_stats(2)
+                .unwrap()
+                .transfers_completed;
+            engine.step();
+            if engine.core_context(1, 2).unwrap().instructions > instrs && pc == ev0_pc {
+                event0.get_or_insert(cycle);
+            }
+            if engine.device().array.tile(1, 2).lock_release_count() > released {
+                release.get_or_insert(cycle);
+            }
+            if engine
+                .device()
+                .array
+                .dma_engine(1, 2)
+                .unwrap()
+                .channel_stats(2)
+                .unwrap()
+                .transfers_completed
+                > done
+            {
+                finished.get_or_insert(cycle);
+            }
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+        }
+        (
+            finished.expect("the head BD finished"),
+            release.expect("lock 1 released"),
+            event0.expect("event #0 issued"),
+        )
+    }
+
+    /// The sync designs' head (silicon, NPU1 2026-11, `tools/gen_dma_lock_probe.py` sync and
+    /// chain families, 34 sync cases ls00..ls40 / lsfree and every repeated run): a core held on
+    /// the head BD's release of its go lock issues `event #0` at the head's FINISHED_BD + 5 in two
+    /// runs of three and + 6 in one (memory unit FINISHED_BD against core unit INSTR_EVENT_0,
+    /// raw stamps g0 + 3 and g0 + 9 / + 10, with the core's timer one ahead: 1132 runs at + 9,
+    /// 567 at + 10; the same binary gives either). Read as: the BD's release reaches the lock
+    /// unit at FINISHED_BD + 3 (`bd_lock_release_after_finish_cycles`, measured on the S2MM
+    /// releaser), the held core's arbitration cycle is that cycle, the held bundle issues the
+    /// cycle after or, off the core's 3-cycle resume phase, one later. Moving the go cycle over
+    /// three values moves the release across that phase.
+    #[test]
+    fn a_core_held_on_a_dma_release_issues_on_silicons_cycle() {
+        let mut after = std::collections::BTreeMap::new();
+        for go in [300, 301, 302] {
+            let (finished, release, event0) = run_sync_head(go);
+            assert_eq!(release - finished, 3, "go {go}: release at FINISHED_BD + 3");
+            *after.entry(event0 - finished).or_insert(0) += 1;
+        }
+        assert_eq!(
+            after,
+            [(5, 2), (6, 1)].into(),
+            "event #0 at FINISHED_BD + 5 twice, + 6 once in three phases"
+        );
+    }
+
+    /// A compute S2MM BD's lock release reaches the lock unit at its FINISHED_BD + 3 (silicon,
+    /// NPU1 2026-11, `tools/gen_dma_lock_probe.py` chain family with an S2MM releaser, s1n08 ..
+    /// s1n32: LOCK_0_REL - DMA_S2MM_0_FINISHED_BD = 3 in 18 of 18 runs, one trace unit). Here a
+    /// 12-word MM2S BD feeds the tile's own S2MM, whose 12-word BD releases lock 0.
+    #[test]
+    fn a_compute_s2mm_release_reaches_the_lock_unit_three_cycles_after_its_finish() {
+        use crate::device::dma::BdConfig;
+        use xdna_archspec::aie2::stream_switch::compute;
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        let mut prog: Vec<u8> = Vec::new();
+        while prog.len() < 2048 {
+            prog.extend([0x01u8, 0x00]);
+        }
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &prog);
+        engine.enable_core(1, 2);
+        engine
+            .device_mut()
+            .tile_mut(1, 2)
+            .unwrap()
+            .stream_switch
+            .configure_local_route(compute::DMA_SLAVE_START as usize, compute::DMA_MASTER_START as usize);
+        {
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            dma.configure_bd(0, BdConfig::simple_1d(0x2000, 48).with_release(0, 1)).unwrap();
+            dma.configure_bd(1, BdConfig::simple_1d(0x400, 48)).unwrap();
+            dma.start_channel(0, 0).unwrap();
+            dma.start_channel(2, 1).unwrap();
+        }
+        let (mut finished, mut release) = (None, None);
+        for _ in 0..300 {
+            let cycle = engine.total_cycles();
+            let released = engine.device().array.tile(1, 2).lock_release_count();
+            let done = engine
+                .device()
+                .array
+                .dma_engine(1, 2)
+                .unwrap()
+                .channel_stats(0)
+                .unwrap()
+                .transfers_completed;
+            engine.step();
+            if engine.device().array.tile(1, 2).lock_release_count() > released {
+                release.get_or_insert(cycle);
+            }
+            if engine
+                .device()
+                .array
+                .dma_engine(1, 2)
+                .unwrap()
+                .channel_stats(0)
+                .unwrap()
+                .transfers_completed
+                > done
+            {
+                finished.get_or_insert(cycle);
+            }
+        }
+        let (finished, release) =
+            (finished.expect("the S2MM BD finished"), release.expect("lock 0 released"));
+        assert_eq!(release - finished, 3);
+        assert_eq!(engine.device().array.tile(1, 2).locks[0].value, 1);
     }
 
     #[test]

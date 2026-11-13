@@ -1,6 +1,8 @@
 //! Lock resolution and submission for DMA engine.
 
 use super::*;
+use crate::device::tile::DmaReleaseInTransit;
+use xdna_archspec::aie2::timing::DMA_BD_LOCK_RELEASE_AFTER_FINISH_CYCLES;
 
 impl DmaEngine {
     /// A compute MM2S lock port's presentation of this step (made in `submit_lock_requests`)
@@ -156,6 +158,42 @@ impl DmaEngine {
     ) {
         self.release_lock_value(lock_id, release_value, tile, neighbors, ch_idx);
         self.emit_lock_release_trace_at(lock_id, self.current_cycle, tile, neighbors);
+    }
+
+    /// A compute-tile BD's lock release at its FINISHED_BD (now): it reaches the lock unit
+    /// `DMA_BD_LOCK_RELEASE_AFTER_FINISH_CYCLES` later (`Tile::send_dma_lock_release`), where
+    /// LOCK_n_REL is stamped and waiting requesters see it. Memtile and shim releases keep their
+    /// own paths (unmeasured).
+    pub(super) fn send_lock_release_after_finish(
+        &mut self,
+        lock_id: u8,
+        release_value: i8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        ch_idx: usize,
+    ) {
+        let latency = DMA_BD_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64;
+        let arrival = self.current_cycle + latency;
+        let arrival_dma_clock = self.read_clock + latency;
+        let lock_target = self.resolve_lock_id(lock_id);
+        if let Some((target_tile, local_id)) = self.resolve_lock_tile(lock_id, tile, neighbors) {
+            target_tile.send_dma_lock_release(DmaReleaseInTransit {
+                lock_id: local_id as usize,
+                delta: release_value,
+                arrival,
+                arrival_dma_clock,
+            });
+        }
+        if let Some(LockTarget::Own(local_id)) = lock_target {
+            if let Some(rec) = &mut self.lock_recorder {
+                rec.push(LockEvent {
+                    cycle: arrival,
+                    channel_flat: ch_idx as u8,
+                    lock_local_id: local_id,
+                    op: LockOp::Release,
+                });
+            }
+        }
     }
 
     /// Whether a release now has to wait: its lock holds an overflow / underflow flag, or an

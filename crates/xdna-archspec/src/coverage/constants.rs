@@ -209,6 +209,12 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "Fitted (lock request and grant law). Q >= trigger word + 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
         unit("dma.mm2s_lock_release_after_finish_cycles", HardwareObserved, Verification::Unverified,
             "Fitted (lock request and grant law). One cycle, a lock BD's FINISHED_BD + 4, neither requests nor grants: the previous lock BD's in designs with at most four MM2S BDs (only 4-word predecessors show it), every earlier lock BD's in the short-BD chains (k4f5: never granted at the fourth BD's FINISHED_BD + 4); read as that BD's own lock release (inferred). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        measured("dma.bd_lock_release_after_finish_cycles", "NPU1 2026-11 (tools/gen_dma_lock_probe.py chain family, \
+            S2MM releaser s1n08..s1n32): the S2MM BD's LOCK_0_REL at its DMA_S2MM_0_FINISHED_BD + 3 in 18 of 18 runs, one \
+            trace unit; the MM2S waiting on it granted at LOCK_0_REL + 2 or + 3",
+            "Compute tiles, MM2S and S2MM. The MM2S side is inferred: a core waiting on the sync designs' head-BD release \
+            reaches INSTR_EVENT_0 at its FINISHED_BD + 5 (+ 6 off the core's resume phase) across the trace units. Memtile \
+            and shim release paths are unmeasured and keep their own timing."),
         unit("dma.mm2s_lock_bds_in_flight", HardwareObserved, Verification::Unverified,
             "Fitted (short-BD chains). A lock BD starts sequencing no earlier than the lock release (FINISHED_BD + 4) of the lock BD three before it. NPU1 2026-11 (tools/gen_dma_lock_probe.py chain families k4f and c1f..c4f): the sequencing starts (7, 11, 19) are implied by measured STALLED_LOCK rises and FINISHED_BDs, reading them as these releases is inferred; 148 of 148 fitted rows, 41 of 41 held-out rows predicted before they were scored; two or four lose fitted rows."),
         unit("dma.mm2s_lock_grant_period_cycles", HardwareObserved, Verification::Unverified,

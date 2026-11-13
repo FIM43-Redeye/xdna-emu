@@ -260,6 +260,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             mm2s_lock_request_trigger_words: 3,
             mm2s_lock_request_trigger_latency_cycles: 3,
             mm2s_lock_release_after_finish_cycles: 4,
+            bd_lock_release_after_finish_cycles: 3,
             mm2s_lock_bds_in_flight: 3,
             mm2s_lock_grant_period_cycles: 3,
             mm2s_lock_grant_blocked_phase: 2,

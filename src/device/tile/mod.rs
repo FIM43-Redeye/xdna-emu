@@ -125,6 +125,20 @@ pub struct CoreBufEvent {
     pub row: u8,
 }
 
+/// A compute-tile DMA BD's lock release on its way to the lock unit (`Tile::send_dma_lock_release`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaReleaseInTransit {
+    /// The lock, local to the tile that holds it.
+    pub lock_id: usize,
+    /// The release's change.
+    pub delta: i8,
+    /// The cycle it reaches the lock unit (the array clock the engine runs on).
+    pub arrival: u64,
+    /// The same moment on the sending DMA engine's own step clock (`read_clock`), for an engine
+    /// stepped on its own.
+    pub arrival_dma_clock: u64,
+}
+
 #[derive(Debug)]
 pub struct Tile {
     /// Tile type
@@ -401,8 +415,13 @@ pub struct Tile {
 
     /// Core lock releases on their way to this tile's lock unit: sent in a core's arbitration
     /// cycle (`send_core_lock_release`), applied at the start of the next cycle
-    /// (`deliver_core_lock_releases`).
+    /// (`deliver_lock_releases`).
     pub core_releases_in_transit: Vec<(usize, i8)>,
+
+    /// Compute-tile DMA BD lock releases on their way to this tile's lock unit, sent at the
+    /// BD's FINISHED_BD (`send_dma_lock_release`), applied at the start of their arrival cycle
+    /// (`deliver_lock_releases`).
+    pub dma_releases_in_transit: Vec<DmaReleaseInTransit>,
 
     /// MemTile DMA Event Channel Selection register (offset 0xA06A0).
     ///
@@ -593,6 +612,7 @@ impl Tile {
             pending_ctrl_response: std::collections::VecDeque::new(),
             lock_release_count: 0,
             core_releases_in_transit: Vec::new(),
+            dma_releases_in_transit: Vec::new(),
             memtile_dma_event_chan_sel: 0,
             lock_event_selected: {
                 let sel = Self::lock_selection_layout(tile_kind);
@@ -1229,7 +1249,7 @@ impl Tile {
 
     /// A core's release of one of this tile's locks, performed in the core's arbitration
     /// cycle (the cycle in front of the fourth bundle after its `rel`): it reaches the lock
-    /// unit the next cycle, `deliver_core_lock_releases`. Silicon (arb probe, NPU1 2026-11):
+    /// unit the next cycle, `deliver_lock_releases`. Silicon (arb probe, NPU1 2026-11):
     /// the memory module stamps LOCK_n_REL one cycle after that arbitration cycle (a core
     /// access k bundles after the `rel` meets the bank at LOCK_n_REL + k + 1, the access
     /// being in its memory stage, issue + 4), and a DMA waiting on the lock is granted from
@@ -1241,29 +1261,81 @@ impl Tile {
         }
     }
 
-    /// Apply the core releases sent last cycle, at the start of `cycle`: before any requester
-    /// of this cycle looks, so a core's acquire decided this cycle sees them, as it saw a
-    /// release resolved at the end of the cycle before. LOCK_n_REL is stamped `cycle`. To the
-    /// acquires that see only settled releases (`LockRequest::sees_same_cycle_release`) they
-    /// are this cycle's releases.
-    pub fn deliver_core_lock_releases(&mut self, cycle: u64) {
+    /// A compute-tile DMA BD's release of one of this tile's locks, sent at the BD's
+    /// FINISHED_BD: it reaches the lock unit at `arrival` (FINISHED_BD +
+    /// `DMA_BD_LOCK_RELEASE_AFTER_FINISH_CYCLES`), where it is stamped and seen like a core's
+    /// release arriving that cycle. Silicon (chain family, S2MM releaser): LOCK_0_REL at the
+    /// S2MM's FINISHED_BD + 3 in every run; a core held on the head BD's release in the sync
+    /// designs reaches INSTR_EVENT_0 two cycles after that arrival (three off its resume phase).
+    pub fn send_dma_lock_release(&mut self, release: DmaReleaseInTransit) {
+        if release.lock_id < self.locks.len() {
+            self.dma_releases_in_transit.push(release);
+        }
+    }
+
+    /// The DMA BD releases due by `dma_clock` (the sending engine's own step clock), for a DMA
+    /// engine stepped without the interpreter engine, which delivers them at the start of their
+    /// arrival cycle before any DMA step looks (`deliver_lock_releases`). Stamped at their
+    /// arrival cycle; not recorded as arrived for settled-only acquires (no cycle start here).
+    pub fn deliver_dma_lock_releases_by_dma_clock(&mut self, dma_clock: u64) {
+        let mut waiting = Vec::new();
+        for r in std::mem::take(&mut self.dma_releases_in_transit) {
+            if r.arrival_dma_clock > dma_clock || !self.arrive_release(r.lock_id, r.delta, r.arrival, false) {
+                waiting.push(r);
+            }
+        }
+        self.dma_releases_in_transit = waiting;
+    }
+
+    /// Whether a lock release (a core's or a DMA BD's) is still on its way to this tile's lock
+    /// unit.
+    pub fn has_lock_releases_in_transit(&self) -> bool {
+        !self.core_releases_in_transit.is_empty() || !self.dma_releases_in_transit.is_empty()
+    }
+
+    /// Apply, at the start of `cycle`, the core releases sent last cycle and the DMA BD
+    /// releases due by now: before any requester of this cycle looks, so a core's acquire
+    /// decided this cycle sees them, as it saw a release resolved at the end of the cycle
+    /// before. LOCK_n_REL is stamped `cycle`. To the acquires that see only settled releases
+    /// (`LockRequest::sees_same_cycle_release`) they are this cycle's releases.
+    pub fn deliver_lock_releases(&mut self, cycle: u64) {
         self.lock_arbiter.clear_arrived_releases();
         for (lock_id, delta) in std::mem::take(&mut self.core_releases_in_transit) {
-            let before = self.locks[lock_id];
-            if self.locks[lock_id].release_with_value(delta) != LockResult::Success {
+            if !self.arrive_release(lock_id, delta, cycle, true) {
                 // The core checked the lock was not frozen when it performed the release.
                 log::warn!(
                     "Tile({},{}) core release of lock {lock_id} refused on arrival",
                     self.col,
                     self.row
                 );
-                continue;
             }
-            self.lock_arbiter.note_arrived_release(lock_id, before);
-            self.lock_release_count += 1;
-            self.mem_trace_pending
-                .push((cycle, EventType::LockRelease { lock_id: lock_id as u8 }));
         }
+        // A DMA release that finds its lock flagged on arrival waits there for the clear and is
+        // never dropped, as a BD release parked on a frozen lock (INFERRED for the transit
+        // window: only a release of another requester inside it can raise the flag).
+        let mut waiting = Vec::new();
+        for r in std::mem::take(&mut self.dma_releases_in_transit) {
+            if r.arrival > cycle || !self.arrive_release(r.lock_id, r.delta, cycle, true) {
+                waiting.push(r);
+            }
+        }
+        self.dma_releases_in_transit = waiting;
+    }
+
+    /// One release reaching the lock unit at `cycle`; false if the lock refuses it (flagged).
+    /// `at_cycle_start`: delivered before this cycle's requesters, so it counts as arrived.
+    fn arrive_release(&mut self, lock_id: usize, delta: i8, cycle: u64, at_cycle_start: bool) -> bool {
+        let before = self.locks[lock_id];
+        if self.locks[lock_id].release_with_value(delta) != LockResult::Success {
+            return false;
+        }
+        if at_cycle_start {
+            self.lock_arbiter.note_arrived_release(lock_id, before);
+        }
+        self.lock_release_count += 1;
+        self.mem_trace_pending
+            .push((cycle, EventType::LockRelease { lock_id: lock_id as u8 }));
+        true
     }
 
     /// Resolve all pending lock requests using round-robin arbitration.

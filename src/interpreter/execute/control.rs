@@ -931,7 +931,7 @@ mod tests {
         // The release is sent to the lock unit, not yet applied
         assert_eq!(tile.locks[3].value, 0, "not applied yet: on its way to the lock unit");
         // The release reaches the lock unit the next cycle
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         assert_eq!(tile.locks[3].value, 1, "applied when it reaches the lock unit");
     }
 
@@ -1036,7 +1036,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[3].value, 0, "not applied yet: on its way to the lock unit");
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         assert_eq!(tile.locks[3].value, 4, "applied when it reaches the lock unit");
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[4].value, 5, "not applied yet: on its way to the lock unit");
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         assert_eq!(tile.locks[4].value, 8, "5 + 3 = 8 after arbiter resolve");
     }
 
@@ -1074,7 +1074,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[6].value, 60, "not applied yet: on its way to the lock unit");
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         assert_eq!(tile.locks[6].value, 6, "Committed modulo 64");
         assert!(tile.locks[6].overflow, "Overflow flag set");
     }
@@ -1114,7 +1114,7 @@ mod tests {
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         // Lock ID 48 maps to own-tile lock 0 (East/Internal quadrant), deferred
         assert_eq!(tile.locks[0].value, 0, "not applied yet: on its way to the lock unit");
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         assert_eq!(tile.locks[0].value, 1, "applied when it reaches the lock unit");
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
 
         // The release reaches the lock unit (lock 0 -> 1), then the arbiter
         // resolves: the acquire sees it (1 >= 1, granted, lock 1 -> 0).
-        tile.deliver_core_lock_releases(0);
+        tile.deliver_lock_releases(0);
         tile.resolve_lock_requests(0);
 
         // Both succeeded in the same cycle: release +1 then acquire -1

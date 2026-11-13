@@ -1652,7 +1652,7 @@ mod tests {
             })
             .collect();
         let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-        tile.deliver_core_lock_releases(ctx.cycles); // own-tile releases reach the lock unit a cycle later
+        tile.deliver_lock_releases(ctx.cycles); // own-tile releases reach the lock unit a cycle later
         let lost = reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
         (lost, [tile.locks[5].value, tile.locks[6].value])
     }
@@ -1776,7 +1776,7 @@ mod tests {
             bundles.extend(nops(7));
             // a refused acquire is released at once (wait 0)
             let issued = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-            tile.deliver_core_lock_releases(ctx.cycles);
+            tile.deliver_lock_releases(ctx.cycles);
             let deltas: Vec<u64> = issued.windows(2).map(|w| w[1].0 - w[0].0).collect();
             (deltas, issued.iter().map(|x| x.1).collect::<Vec<_>>(), tile.locks[5].value)
         };
@@ -1822,7 +1822,7 @@ mod tests {
                     })
                     .collect();
                 let reads = issue_all(&mut executor, &mut ctx, &mut tile, &bundles, 0, true);
-                tile.deliver_core_lock_releases(ctx.cycles);
+                tile.deliver_lock_releases(ctx.cycles);
                 let lost: Vec<u64> =
                     reads.iter().enumerate().map(|(i, r)| r.0 - reads[0].0 - i as u64).collect();
                 let resolves_at = if cond_first && cond & 1 == 0 { d + 4 } else { 4 };
@@ -2524,7 +2524,7 @@ mod tests {
             assert_eq!((ctx.instructions, ctx.bundle_seq), (instrs, seq), "the held bundle never issues");
             assert!(ctx.cycles >= cycles + 3, "every held cycle is a stall");
             assert_eq!(executor.held_lock_acquire(&tile, None), Some(OWN_LOCK_5));
-            tile.deliver_core_lock_releases(ctx.cycles);
+            tile.deliver_lock_releases(ctx.cycles);
             assert_eq!(tile.locks[5].value, 0, "the refused release changed nothing");
             tile.locks[5].clear_flags();
             assert_eq!(executor.held_lock_acquire(&tile, None), None, "the clear frees the core");
@@ -2535,7 +2535,7 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
             }
-            tile.deliver_core_lock_releases(ctx.cycles);
+            tile.deliver_lock_releases(ctx.cycles);
             assert_eq!(tile.locks[5].value, 1, "the held release is performed once cleared");
         }
     }

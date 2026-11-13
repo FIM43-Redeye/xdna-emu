@@ -1323,7 +1323,9 @@ mod path_capacity {
             if first.is_none() && array.dma_engines[idx].stream_in_len() > 0 {
                 first = Some(step);
             }
-            if finished.is_none() && array.tiles[idx].locks[6].value >= 1 {
+            if finished.is_none()
+                && array.dma_engines[idx].channel_stats(mm2s).unwrap().transfers_completed >= 1
+            {
                 finished = Some(step);
             }
         }

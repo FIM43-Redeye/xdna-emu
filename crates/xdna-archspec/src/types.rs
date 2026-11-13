@@ -1540,6 +1540,14 @@ pub struct DmaTiming {
     /// sequencing (`mm2s_lock_bds_in_flight`).
     pub mm2s_lock_release_after_finish_cycles: u8,
 
+    /// Cycles from a compute-tile DMA BD's FINISHED_BD until its lock release reaches the
+    /// lock unit (LOCK_n_REL is stamped, waiting requesters see it): 3. Silicon (NPU1,
+    /// 2026-11, `tools/gen_dma_lock_probe.py` chain family with an S2MM releaser, s1n*): the
+    /// S2MM BD's LOCK_0_REL at its FINISHED_BD + 3 in 18 of 18 runs, one trace unit. The MM2S
+    /// side is inferred from the sync designs (a core waiting on the head BD's release reaches
+    /// INSTR_EVENT_0 at FINISHED_BD + 5 or, off its resume phase, + 6).
+    pub bd_lock_release_after_finish_cycles: u8,
+
     /// Lock-acquiring BDs a compute-tile MM2S holds between a BD's sequencing start and its
     /// lock release (FINISHED_BD + `mm2s_lock_release_after_finish_cycles`): 3. A lock BD
     /// starts sequencing no earlier than the release of the lock BD three before it. Fitted

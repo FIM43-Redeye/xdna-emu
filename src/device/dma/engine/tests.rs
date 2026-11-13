@@ -3025,14 +3025,15 @@ fn chained_bd_lock_interval_baseline() {
         finished_bd_cycles
     );
     // A 2-word BD is shorter than the lock hand-off. BD#0 is granted at g and finishes at
-    // g + 3 (last access + 1), releasing BD#1's lock; the compute MM2S lock law (`LockPort`)
-    // grants BD#1 no earlier than that release + 2 and, from its request g + 3, not at
-    // g + 5 (the blocked phase): at g + 6. BD#1 accesses memory from grant + 2
-    // (`mm2s_lock_to_access_cycles`), 6 cycles after BD#0's last access, while BD#0's 2 words
-    // leave in 2: the port idles 4 cycles at the boundary. The law is measured on chains with
+    // g + 3 (last access + 1); its release of BD#1's lock reaches the lock unit at g + 6
+    // (FINISHED_BD + `bd_lock_release_after_finish_cycles`). The compute MM2S lock law
+    // (`LockPort`) grants BD#1 no earlier than that release + 2 and, from its request g + 3,
+    // not at g + 8 (the blocked phase): at g + 9. BD#1 accesses memory from grant + 2
+    // (`mm2s_lock_to_access_cycles`), 9 cycles after BD#0's last access, while BD#0's 2 words
+    // leave in 2: the port idles 7 cycles at the boundary. The law is measured on chains with
     // the previous BD's lock released by the core or another channel; a BD releasing its own
     // successor's lock on one channel, and 2-word BDs, are not measured on silicon.
-    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, 4, &finished_bd_cycles);
+    assert_port_runs_with_boundary_bubbles(&beats, 2, 2, &[7], &finished_bd_cycles);
 }
 
 /// The port side of a chained MM2S: one run of `words` beats per BD (1 word/cyc
@@ -3044,7 +3045,7 @@ fn assert_port_runs_with_boundary_bubbles(
     beats: &[usize],
     bds: usize,
     words: usize,
-    bubble: usize,
+    bubbles: &[usize],
     finished: &[u64],
 ) {
     let first = beats.iter().position(|&n| n > 0).expect("no beat left the port");
@@ -3070,11 +3071,11 @@ fn assert_port_runs_with_boundary_bubbles(
     }
     runs.push(run);
     assert_eq!(runs, vec![words; bds], "one beat run per BD: {beats:?}");
-    assert_eq!(gaps, vec![bubble; bds - 1], "a {bubble}-cycle bubble at each BD boundary: {beats:?}");
+    assert_eq!(gaps, bubbles, "the idle cycles at each BD boundary: {beats:?}");
     assert_eq!(finished.len(), bds, "one FINISHED_BD per BD: {finished:?}");
     let mut end = first as u64;
     for (j, &f) in finished.iter().enumerate() {
-        end += words as u64 + if j > 0 { bubble as u64 } else { 0 };
+        end += words as u64 + if j > 0 { bubbles[j - 1] as u64 } else { 0 };
         assert!(f < end, "BD {j} finished at {f}, after its last beat left at {}: {finished:?}", end - 1);
     }
 }
@@ -3160,7 +3161,12 @@ fn chained_bd_16w_lock_interval_diagnostic() {
             _ => None,
         })
         .collect();
-    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, 1, &finished_bd_cycles);
+    // The first boundary is longer: BD#0 finishes as soon as its words are staged, and BD#1
+    // waits for BD#0's release of lock 1 to reach the lock unit (FINISHED_BD + 3) and for its
+    // grant (release + 2 at the earliest). Later BDs finish far enough ahead of their beats
+    // that the hand-off is hidden. A channel releasing its own next BD's lock is not measured
+    // on silicon (the `on16 off1` cadence is a memtile trace).
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &[4, 1, 1], &finished_bd_cycles);
 }
 
 /// Diagnostic: chained BDs *without* locks. Pure chain overhead, no
@@ -3214,7 +3220,7 @@ fn chained_bd_no_lock_interval_diagnostic() {
     // cycles, then the per-BD `off1` HW shows whether or not the BD carries
     // locks (#140 stream-rate metering); the bubble sits on the port side
     // (`ChannelContext::egress_gap`).
-    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, 1, &finished_bd_cycles);
+    assert_port_runs_with_boundary_bubbles(&beats, 4, 16, &[1, 1, 1], &finished_bd_cycles);
 }
 
 /// Cross-lock handoff: a chained BD's release is DEFERRED to the next BD's
@@ -3236,8 +3242,8 @@ fn chained_bd_no_lock_interval_diagnostic() {
 ///
 /// This drives a single compute-tile channel whose BD0 releases lock 2 and
 /// chains to BD1, which acquires lock 1. lock 1 starts unavailable, so BD1
-/// blocks. While blocked, lock 2 must already read 1 -- the functional release
-/// fired at BD0 completion, available immediately to a waiting consumer.
+/// blocks. While blocked, lock 2 must come to read 1 -- the release reaches the
+/// lock unit a fixed 3 cycles after BD0's completion, not at BD-slot reuse.
 #[test]
 fn cross_lock_release_is_prompt_not_deferred() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);
@@ -3280,14 +3286,21 @@ fn cross_lock_release_is_prompt_not_deferred() {
         }
     }
 
-    // BD0 has completed. Its cross-lock release of lock2 fired INLINE at
-    // completion, so lock2 MUST read 1 here even though BD1 is still blocked --
-    // a waiting consumer (e.g. the core) must be able to proceed immediately.
-    assert_eq!(
-        tile.locks[2].value, 1,
-        "cross-lock functional release must be prompt: lock2 should be 1 at BD0 completion, got {}",
-        tile.locks[2].value
-    );
+    // BD0 has completed. Its cross-lock release of lock2 reaches the lock unit
+    // FINISHED_BD + 3 (`bd_lock_release_after_finish_cycles`), whatever BD1 does:
+    // lock2 MUST read 1 within those cycles while BD1 is still blocked -- a
+    // waiting consumer (e.g. the core) must not depend on the channel's next acquire.
+    let mut waited = 0;
+    while tile.locks[2].value == 0 {
+        assert!(waited < 3, "cross-lock release must land FINISHED_BD + 3 at the latest");
+        engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+        tile.resolve_lock_requests(0);
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        waited += 1;
+        assert!(matches!(engine.channel_state(2), ChannelState::WaitingForLock(1)), "BD1 still blocked");
+    }
+    assert_eq!(tile.locks[2].value, 1, "cross-lock release landed while BD1 is blocked");
 
     // Phase 2: free lock1 and run to completion; BD1's own release also fires.
     tile.locks[1].set(1);

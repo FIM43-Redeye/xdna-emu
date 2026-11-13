@@ -527,6 +527,18 @@ impl DmaEngine {
         let mut any_active = false;
         let mut any_waiting = false;
         self.read_clock += 1;
+        // BD releases sent by this engine land in their lock units on their own here when nothing
+        // else delivers them first (the interpreter engine does, at the start of the cycle).
+        if self.tile_kind.is_compute() {
+            for t in [Some(&mut *tile), neighbors.west.as_deref_mut(), neighbors.east.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                if !t.dma_releases_in_transit.is_empty() {
+                    t.deliver_dma_lock_releases_by_dma_clock(self.read_clock);
+                }
+            }
+        }
 
         for ch_idx in 0..self.channels.len() {
             let phase_before = self.channels[ch_idx].fsm.phase_name();
@@ -1650,12 +1662,14 @@ impl DmaEngine {
                 self.channels[ch_idx].parked_releases.push_back((lock_id, release_value));
                 return self.after_transfer_done(ch_idx, completion, tile, neighbors);
             }
-            // The FUNCTIONAL semaphore release is ALWAYS prompt (inline at
-            // completion): the lock value a waiting consumer acquires must be
-            // available immediately. Deferring it deadlocks a DMA->core handoff
-            // with no buffer slack -- the compute core is not a DMA channel, so
-            // it can neither trigger a buffer swap nor be reached by the
-            // deadlock-break flush (see PendingRelease).
+            // The FUNCTIONAL semaphore release never waits on the channel: tying it
+            // to anything the channel does next deadlocks a DMA->core handoff with no
+            // buffer slack -- the compute core is not a DMA channel, so it can
+            // neither trigger a buffer swap nor be reached by the deadlock-break
+            // flush (see PendingRelease). On a compute tile it reaches the lock unit
+            // a fixed DMA_BD_LOCK_RELEASE_AFTER_FINISH_CYCLES after FINISHED_BD
+            // (silicon, S2MM releaser: LOCK_n_REL at FINISHED_BD + 3); elsewhere it
+            // is applied at completion (unmeasured).
             //
             // On a memtile S2MM cross-lock handoff the OBSERVABLE LockRelease
             // trace event is deferred to the BD slot's reuse (HW LOCK_SEL1_REL
@@ -1682,6 +1696,8 @@ impl DmaEngine {
                     ready_cycle: self.current_cycle + latency,
                     trace_at: None,
                 });
+            } else if self.tile_kind.is_compute() {
+                self.send_lock_release_after_finish(lock_id, release_value, tile, neighbors, ch_idx);
             } else {
                 // No trace deferral: functional release + trace event inline.
                 self.apply_lock_release_direct(lock_id, release_value, tile, neighbors, ch_idx);
@@ -4362,7 +4378,7 @@ mod bank_demand_tests {
             if port_free {
                 while eng.pop_stream_out_for_channel(mm2s).is_some() {}
             }
-            if finished.is_none() && tile.locks[5].value >= 1 {
+            if finished.is_none() && eng.channel_stats(mm2s).unwrap().transfers_completed >= 1 {
                 finished = Some(step);
             }
         }
@@ -4441,12 +4457,12 @@ mod bank_demand_tests {
             eng.configure_bd(j, bd).unwrap();
         }
         eng.start_channel(2, 0).unwrap();
-        let (mut finished, mut offered, mut last_lock) = (Vec::new(), Vec::new(), 0);
+        let (mut finished, mut offered, mut last_finished) = (Vec::new(), Vec::new(), 0);
         for step in 0..200 {
             eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            if tile.locks[5].value != last_lock {
+            if eng.channel_stats(2).unwrap().transfers_completed != last_finished {
                 finished.push(step);
-                last_lock = tile.locks[5].value;
+                last_finished = eng.channel_stats(2).unwrap().transfers_completed;
             }
             if eng.pop_stream_out_for_channel(2).is_some() {
                 offered.push(step);
@@ -4501,7 +4517,7 @@ mod bank_demand_tests {
                 first = Some(step);
             }
             while eng.pop_stream_out_for_channel(2).is_some() {}
-            if finished.is_none() && tile.locks[5].value >= 1 {
+            if finished.is_none() && eng.channel_stats(2).unwrap().transfers_completed >= 1 {
                 finished = Some(step);
             }
         }
@@ -4523,7 +4539,7 @@ mod bank_demand_tests {
             eng.start_channel(2, 0).unwrap();
             (0..100usize).find(|_| {
                 eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-                tile.locks[5].value >= 1
+                eng.channel_stats(2).unwrap().transfers_completed >= 1
             })
         };
         let fresh = finish_step(0);
@@ -4628,7 +4644,9 @@ mod bank_demand_tests {
                 if first.is_none() && eng.peek_stream_out_for_channel(2).is_some() {
                     first = Some(step - g);
                 }
-                if finished.is_none() && tile.locks[6].value >= 1 {
+                if finished.is_none()
+                    && eng.channel_stats(2).unwrap().transfers_completed >= 1 + chained as u64
+                {
                     finished = Some(step - g);
                 }
             } else {
@@ -4768,7 +4786,7 @@ mod bank_demand_tests {
             eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
             tile.resolve_lock_requests(0);
             eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-            if finished.is_none() && tile.locks[6].value >= 1 {
+            if finished.is_none() && eng.channel_stats(flat).unwrap().transfers_completed >= 1 {
                 finished = Some(rel as usize);
             }
             while eng.pop_stream_out_for_channel(flat).is_some() {}
@@ -4896,7 +4914,7 @@ mod bank_demand_tests {
             }
             while eng.pop_stream_out_for_channel(flat).is_some() {}
             if let Some(r) = rel {
-                if out.finished == 0 && tile.locks[6].value >= 1 {
+                if out.finished == 0 && eng.channel_stats(flat).unwrap().transfers_completed >= 1 {
                     out.finished = r;
                     break;
                 }
@@ -5015,10 +5033,10 @@ mod bank_demand_tests {
                 tile.resolve_lock_requests(0);
                 eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
                 while eng.pop_stream_out_for_channel(2).is_some() {}
-                if f0.is_none() && tile.locks[6].value >= 1 {
+                if f0.is_none() && eng.channel_stats(2).unwrap().transfers_completed >= 1 {
                     f0 = Some(step);
                 }
-                if f1.is_none() && tile.locks[7].value >= 1 {
+                if f1.is_none() && eng.channel_stats(2).unwrap().transfers_completed >= 2 {
                     f1 = Some(step);
                 }
             }
@@ -5058,7 +5076,7 @@ mod bank_demand_tests {
                 eng.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
                 while eng.pop_stream_out_for_channel(2).is_some() {}
                 if step == f0 {
-                    assert_eq!(tile.locks[6].value, 1, "BD0 finished at {f0}");
+                    assert_eq!(eng.channel_stats(2).unwrap().transfers_completed, 1, "BD0 finished at {f0}");
                 }
                 if grant.is_none() {
                     // The engine step counter starts at 1 on step 0.
@@ -5069,7 +5087,7 @@ mod bank_demand_tests {
                         .and_then(|b| b.granted_at)
                         .map(|g| g as i64 - 1);
                 }
-                if f1.is_none() && tile.locks[7].value >= 1 {
+                if f1.is_none() && eng.channel_stats(2).unwrap().transfers_completed >= 2 {
                     f1 = Some(step);
                 }
             }
