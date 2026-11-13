@@ -326,6 +326,14 @@ full packet), and the decoder shows it as a Start without the End token. The gat
   share is listed as standing).
 - A side without `trace_raw.bin` cannot show absence; all its units count as carried.
 
+**Standing misses.** The gate lists only rows whose emulator count changed, so a row the emulator has
+always got wrong is silent. The last report section, "Standing misses", counts the measured rows
+(some silicon sample carries the unit) whose candidate count lies outside the same widened silicon band
+and that did not change between baseline and candidate (a changed row is listed once, above). It is an
+inventory: never gated, no effect on the exit status or any verdict; the JSON `standing_misses` holds
+every row. Level rows that could not be reconstructed stay unscored; no row class is special-cased
+(free-running `PERF_CNT_2` rows are judged like any other).
+
 **Event overrides for one test** (environment, read by `emu-bridge-test.sh`; each applies to every compute tile of the
 tests it runs, so run it on one test): `XDNA_TRACE_MEMMOD_EVENTS` replaces the memory-module event list,
 `XDNA_TRACE_CORE_EVENTS`, `XDNA_TRACE_MEMTILE_EVENTS`, `XDNA_TRACE_SHIM_EVENTS` the others. A memory-module
