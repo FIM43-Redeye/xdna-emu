@@ -163,7 +163,8 @@ def _p_case(name: str, order: list[str], k: int = 0, tokens: str = "last") -> Ca
 
 
 def _w_case(name: str, pairs: int, words: int, late: bool = False, nosync: bool = False, *, fill: int = 0,
-            marks: bool = False, dummy: bool = False, events: tuple = DEFAULT_EVENTS) -> Case:
+            marks: bool = False, dummy: bool = False, events: tuple = DEFAULT_EVENTS,
+            tail_rounds: int = TAIL_ROUNDS) -> Case:
     """W stream. `fill` plain writes follow every S0 push (`late` is the 64-write case); `nosync` pushes the marker
     with no sync before it (the syncs follow all the pushes); `dummy` puts an 8-word S0 task and its sync ahead of
     the pairs; `marks` brackets every measured sync with the two user-event writes."""
@@ -187,7 +188,7 @@ def _w_case(name: str, pairs: int, words: int, late: bool = False, nosync: bool 
         for _ in range(pairs):
             steps += sync("S0")
     steps += sync("S1")
-    steps += drain_syncs(steps) + closing_tail() + [Fill(TAIL_FILL)]
+    steps += drain_syncs(steps) + closing_tail(tail_rounds) + [Fill(TAIL_FILL)]
     return Case(name, "W", tuple(steps), events)
 
 
@@ -204,11 +205,11 @@ def drain_syncs(steps: list) -> list:
     return [Sync(ch) for ch in EVENT_ORDER for _ in range(surplus[ch])]
 
 
-def closing_tail() -> list:
-    """TAIL_ROUNDS rounds of one token-carrying task per channel, each round followed by a sync on every
+def closing_tail(rounds: int = TAIL_ROUNDS) -> list:
+    """`rounds` rounds of one token-carrying task per channel, each round followed by a sync on every
     channel: the sequence cannot end before every channel's last task has finished."""
     steps: list = []
-    for _ in range(TAIL_ROUNDS):
+    for _ in range(rounds):
         steps += [Push(ch, TAIL_WORDS, True, tail=True) for ch in TAIL_ORDER]
         steps += [Sync(ch) for ch in EVENT_ORDER]
     return steps
@@ -245,8 +246,9 @@ def plan_9d() -> dict[str, Case]:
     for name, pairs, words, late in (("w1_late_L300", 1, 300, True), ("w1_L300", 1, 300, False),
                                      ("w1_L3000", 1, 3000, False), ("w1_L30000", 1, 30000, False),
                                      ("w2_L30000", 2, 30000, False)):
-        cases += [_w_case(f"{name}_tw", pairs, words, late, events=BRACKET_EVENTS),
-                  _w_case(f"{name}_br", pairs, words, late, marks=True, events=BRACKET_EVENTS)]
+        # four tail rounds: the six traced events per round of a bracketed case match the eight of a probe 9c case
+        cases += [_w_case(f"{name}_tw", pairs, words, late, events=BRACKET_EVENTS, tail_rounds=4),
+                  _w_case(f"{name}_br", pairs, words, late, marks=True, events=BRACKET_EVENTS, tail_rounds=4)]
     cases += [_w_case(f"w1_L{words}", 1, words) for words in (1000, 10000, 20000)]
     cases += [_w_case("w1_late_L30000", 1, 30000, late=True)]
     cases += [_w_case(f"w1_f{n}_L3000", 1, 3000, fill=n) for n in (16, 32)]
@@ -376,7 +378,7 @@ def design_mlir(case: Case) -> str:
     lay = iter(layout(case))
     ident = {"S": 0, "M": 0}
     next_bd = iter(range(0, 16))
-    tail_bd = iter(TAIL_BD_IDS * TAIL_ROUNDS)
+    tail_bd = iter(TAIL_BD_IDS * (sum(1 for p in pushes(case) if p.tail) // len(TAIL_BD_IDS)))
     for s in case.steps:
         if isinstance(s, Fill):
             body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count

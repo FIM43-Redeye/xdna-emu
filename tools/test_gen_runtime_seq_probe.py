@@ -465,10 +465,13 @@ def test_a_twin_is_its_bracketed_case_without_the_marks_and_traces_the_same_even
 
 
 def test_bracketed_streams_are_shaped_like_their_unbracketed_cases():
+    """The measured section (everything before the closing tail) of a twin is its unbracketed case's."""
+    def measured(c):
+        k = next(i for i, s in enumerate(c.steps) if isinstance(s, g.Push) and s.tail)
+        return c.steps[:k]
     for base in MARKED:
         plain = case9(base) if base in g.plan_9d() else g.plan()[base]
-        tw = case9(f"{base}_tw")
-        assert tw.steps == plain.steps
+        assert measured(case9(f"{base}_tw")) == measured(plain)
 
 
 def test_marks_are_event_generate_writes_to_the_traced_shim_not_the_carrier():
@@ -606,3 +609,36 @@ def test_marks_in_ops_counts_event_generate_writes_at_the_traced_shim():
     ops = [g.Op("write32", 0, 0, 0x34008), g.Op("write32", 1, 0, 0x34008), g.Op("write32", 0, 0, 0x340F0),
            g.Op("write32", 0, 0, 0x34008)]
     assert g.marks_in_ops(ops) == 2
+
+
+def traced_tail_events(c):
+    """Events the closing tail puts in the trace: a traced START or FINISHED per tail task."""
+    n = 0
+    for p in g.pushes(c):
+        if p.tail:
+            d, num, _ = g.CHANNELS[p.ch]
+            n += sum(1 for w in ("START", "FINISHED") if f"DMA_{d}_{num}_{w}_TASK" in c.events)
+    return n
+
+
+def test_a_bracketed_case_has_the_tail_volume_of_probe_9c_cases():
+    """With two slots given to user events a three-round tail traces 18 events, not 24: the extra round keeps the
+    number of packets that follow the deciding events as large as in probe 9c."""
+    ref = traced_tail_events(case("w1_L300"))
+    assert ref == 24
+    for base in MARKED:
+        for suffix in ("br", "tw"):
+            c = case9(f"{base}_{suffix}")
+            assert traced_tail_events(c) == ref
+            assert sum(1 for p in g.pushes(c) if p.tail) == 16
+
+
+def test_tail_rounds_scale_the_tail_and_its_bd_ids():
+    import re
+    c = case9("w1_L300_br")
+    ids = [int(x) for x in re.findall(r"id = (\d+) : i64", g.design_mlir(c))]
+    n = len(g.measured_pushes(c))
+    assert ids[n:] == list(g.TAIL_BD_IDS) * 4 and max(ids) < 16
+    assert [s for s in c.steps if isinstance(s, g.Push) and s.tail][:4] == \
+        [g.Push(ch, g.TAIL_WORDS, True, True) for ch in g.TAIL_ORDER]
+    assert len(g.closing_tail(4)) == len(g.closing_tail(2)) * 2 and g.closing_tail() == g.closing_tail(g.TAIL_ROUNDS)
