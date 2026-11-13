@@ -1083,6 +1083,341 @@ def cmd_sync_table(args) -> int:
     return 0
 
 
+# -- lock request/grant timing family (chain-*): any chain of BDs between the head and the waiting BD ---------
+#
+# MM2S 0 runs one chained task: the head BD (acquires START, which the runtime sequence sets after the trace is
+# armed, sends `head` words, releases SYNC), then the mid BDs in order, then the waiting BD (acquires lock A = lock 0,
+# sends `big` words of `src`, releases END). A mid BD is lock-free ("8"), takes its own lock that starts at 1 ("8f":
+# free when asked), or takes lock B that the core releases ("8c": at most one). The core blocks on SYNC, runs
+# `event #0`, d1 nops, releases B (only with a core BD), `event #1`, d2 nops, releases A. With `releaser = "s2mm"`
+# the core releases nothing: the loopback S2MM's first BD (all the words before the waiting BD) releases A when it
+# finishes, and a second S2MM BD takes the waiting BD's words.
+# Why it cannot hang: every lock a BD waits on is either free at start (the "f" locks, the S2MM's lRx), set by the
+# sequence (START), or released by a party whose own waits are earlier in the same chain: the core waits only on SYNC
+# (the head's release) and then releases B and A unconditionally; the S2MM's first BD needs only the words the MM2S
+# sends before the waiting BD. Nothing waits on the host.
+
+CHAIN_LOCK_B, CHAIN_LOCK_RX, CHAIN_LOCK_FREE0 = 4, 5, 6   # B: the core-released mid BD's lock; RX: the S2MM's
+CHAIN_MAX_FREE = 16 - CHAIN_LOCK_FREE0                     # free locks 6..15
+CHAIN_MAX_BDS = 16                                         # BD descriptors of a compute tile's DMA
+CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffers: logical bank 1
+CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
+CHAIN_MAX_D = 40
+CHAIN_LOCK_KINDS = {"": "none", "f": "free", "c": "core"}
+CHAIN_MEM_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD",
+                    "LOCK_SEL0_ACQ_GE"]
+CHAIN_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "LOCK_STALL"]
+
+
+@dataclass(frozen=True)
+class ChainBd:
+    words: int
+    lock: str = "none"             # "none" | "free" | "core"
+
+
+@dataclass(frozen=True)
+class ChainCase:
+    mids: tuple = ()               # ChainBd, in chain order between the head and the waiting BD
+    head: int = 4                  # words of the head BD (acquires START, releases SYNC)
+    big: int = 64                  # words of the waiting BD (acquires A)
+    d1: int = 0                    # nops between `event #0` and the core's release of B (needs a core BD)
+    d2: int = 0                    # nops between `event #1` and the core's release of A
+    releaser: str = "core"         # who releases A: "core" or "s2mm"
+
+    @property
+    def name(self) -> str:
+        """q<d1>_<d2>; one design per output directory (design.json), so the name only carries the delays."""
+        return "qs" if self.releaser == "s2mm" else f"q{self.d1:02d}_{self.d2:02d}"
+
+    def design(self) -> dict:
+        return {"head": self.head, "mids": format_chain_mids(self.mids), "big": self.big, "releaser": self.releaser}
+
+
+def parse_chain_mids(tokens) -> tuple:
+    """["8", "4c", "2f"] -> ChainBd tuple. Validation (counts, sizes) is chain_validate's."""
+    out = []
+    for t in tokens:
+        digits = t.rstrip("cf")
+        if not digits.isdigit() or t[len(digits):] not in CHAIN_LOCK_KINDS:
+            raise ValueError(f"mid BD spec {t!r}: words then optional c (core lock) or f (free lock)")
+        out.append(ChainBd(int(digits), CHAIN_LOCK_KINDS[t[len(digits):]]))
+    return tuple(out)
+
+
+def format_chain_mids(mids) -> str:
+    back = {v: k for k, v in CHAIN_LOCK_KINDS.items()}
+    return " ".join(f"{m.words}{back[m.lock]}" for m in mids)
+
+
+def chain_buffers(c: ChainCase) -> list:
+    """(address, words) of the head buffer then each mid BD's, packed from 0x4000 on 32-byte boundaries (aiecc
+    requires 256-bit aligned buffers)."""
+    out, a = [], CHAIN_BUF_BASE
+    for w in (c.head, *(m.words for m in c.mids)):
+        out.append((a, w))
+        a += -(-4 * w // 32) * 32
+    return out
+
+
+def chain_validate(c: ChainCase) -> None:
+    if c.releaser not in ("core", "s2mm"):
+        raise ValueError("releaser must be core or s2mm")
+    if any(m.words < 1 for m in c.mids) or c.head < 1 or not 1 <= c.big <= CHAIN_MAX_BIG:
+        raise ValueError(f"every BD needs >= 1 word; big at most {CHAIN_MAX_BIG}")
+    cores = sum(m.lock == "core" for m in c.mids)
+    if cores > 1 or (cores and c.releaser == "s2mm"):
+        raise ValueError("at most one core-released mid BD, and none with the S2MM releaser")
+    if sum(m.lock == "free" for m in c.mids) > CHAIN_MAX_FREE:
+        raise ValueError(f"at most {CHAIN_MAX_FREE} free-lock mid BDs")
+    if 1 + len(c.mids) + 1 + (2 if c.releaser == "s2mm" else 1) > CHAIN_MAX_BDS:
+        raise ValueError(f"at most {CHAIN_MAX_BDS} BDs in the tile")
+    if not (0 <= c.d1 <= CHAIN_MAX_D and 0 <= c.d2 <= CHAIN_MAX_D) or (c.d1 and not cores):
+        raise ValueError(f"d1, d2 in 0..{CHAIN_MAX_D}; d1 only with a core BD")
+    a, w = chain_buffers(c)[-1]
+    if a + 4 * w > CHAIN_BUF_END:
+        raise ValueError("head and mid buffers exceed logical bank 1")
+
+
+def chain_core_asm(c: ChainCase) -> str:
+    """Block on SYNC, `event #0`, [d1 nops, release B], `event #1`, d2 nops, release A (core releaser only)."""
+    chain_validate(c)
+    n = lp.nops
+    rel_b = [*n(c.d1), f"  rel #{OWN + CHAIN_LOCK_B}, r2"] if any(m.lock == "core" for m in c.mids) else []
+    rel_a = [*n(c.d2), f"  rel #{OWN + SYNC_LOCK_A}, r2"] if c.releaser == "core" else []
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + SYNC_LOCK_SYNC}, r3", *n(LOCK_SETTLE_BUNDLES),
+            "  event #0", *rel_b, "  event #1", *rel_a, *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def chain_design_mlir(c: ChainCase) -> str:
+    chain_validate(c)
+    w = FETCH_WORDS if c.big == FETCH_WORDS else c.big
+    bufs = chain_buffers(c)
+    lines = []
+    for i, (a, n_) in enumerate(bufs):
+        name = "head" if i == 0 else f"m{i - 1}"
+        init = ", ".join(str(((0x0C + i) << 24) | j) for j in range(n_))
+        lines.append(f"    %{name}_buf = aie.buffer(%t02) {{address = {a} : i32, sym_name = \"{name}_buf\", "
+                     f"initial_value = dense<[{init}]> : tensor<{n_}xi32>}} : memref<{n_}xi32>")
+    pre_words = sum(n_ for _, n_ in bufs)
+    locks = [f'    %lA = aie.lock(%t02, {SYNC_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}',
+             f'    %lSync = aie.lock(%t02, {SYNC_LOCK_SYNC}) {{init = 0 : i32, sym_name = "lSync"}}',
+             f'    %lStart = aie.lock(%t02, {SYNC_LOCK_START}) {{init = 0 : i32, sym_name = "lStart"}}',
+             f'    %lEnd = aie.lock(%t02, {SYNC_LOCK_END}) {{init = 0 : i32, sym_name = "lEnd"}}']
+    if any(m.lock == "core" for m in c.mids):
+        locks.append(f'    %lB = aie.lock(%t02, {CHAIN_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}')
+    if c.releaser == "s2mm":
+        locks.append(f'    %lRx = aie.lock(%t02, {CHAIN_LOCK_RX}) {{init = 1 : i32, sym_name = "lRx"}}')
+    bds, free_i = [], 0
+    names = ["head", *(f"m{i}" for i in range(len(c.mids))), "send"]
+
+    def bd(label, buf, n_, acq, rel, nxt):
+        s = f"    ^{label}:\n"
+        if acq:
+            s += f"      aie.use_lock({acq}, AcquireGreaterEqual, %c1)\n"
+        s += f"      aie.dma_bd({buf} : memref<{n_}xi32>)\n"
+        if rel:
+            s += f"      aie.use_lock({rel}, Release, %c1)\n"
+        return s + f"      aie.next_bd ^{nxt}\n"
+
+    bds.append(bd("head", "%head_buf", c.head, "%lStart", "%lSync", names[1]))
+    for i, m in enumerate(c.mids):
+        lock = None
+        if m.lock == "core":
+            lock = "%lB"
+        elif m.lock == "free":
+            lock = f"%lF{free_i}"
+            locks.append(f'    {lock} = aie.lock(%t02, {CHAIN_LOCK_FREE0 + free_i}) {{init = 1 : i32, sym_name = "lF{free_i}"}}')
+            free_i += 1
+        bds.append(bd(f"m{i}", f"%m{i}_buf", m.words, lock, lock, names[i + 2]))
+    bds.append(bd("send", "%src", w, "%lA", "%lEnd", "end"))
+    if c.releaser == "s2mm":
+        recv = bd("recv", "%dst", pre_words, "%lRx", "%lA", "recv2") + \
+            bd("recv2", "%dst2", w, None, None, "end")
+        dst = (f"    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} : memref<{pre_words}xi32>\n"
+               f"    %dst2 = aie.buffer(%t02) {{address = {FETCH_DST_ADDR + 0x2000} : i32, sym_name = \"dst2\"}} "
+               f": memref<{w}xi32>")
+    else:
+        recv = bd("recv", "%dst", pre_words + w, None, None, "end")
+        dst = (f"    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} "
+               f": memref<{pre_words + w}xi32>")
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    nl = "\n"
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+{nl.join(lines)}
+{dst}
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+{nl.join(locks)}
+    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %c1 = arith.constant 1 : i32
+      %s0 = aie.dma_start(MM2S, 0, ^head, ^recv_start)
+{"".join(bds)}    ^recv_start:
+      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
+{recv}    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lStart, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def chain_inject_args() -> list[str]:
+    return ["--memmod-sweep-events", ",".join(CHAIN_MEM_EVENTS),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
+
+
+def chain_row(events) -> dict:
+    """One run relative to g0, the head BD's grant (the cycle after its START wait, the first MM2S STALLED_LOCK
+    run, falls). Every later STALLED_LOCK run, every MM2S/S2MM FINISHED_BD, the lock-A releases and ACQ_GE events
+    (memory-module timer) and the first INSTR_EVENT_0/1 (core timer; one time base on this tile) are kept."""
+    mem, core = {}, {}
+    for e in events:
+        if e.row == FETCH_ROW:
+            (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+    runs = _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", []))
+    if not runs:
+        return {"g0": None}
+    g0 = runs[0][1] + 1
+
+    def rel(name, src=mem):
+        return [t - g0 for t in sorted(set(src.get(name, [])))]
+    ev0, ev1 = rel("INSTR_EVENT_0", core), rel("INSTR_EVENT_1", core)
+    return {"g0": g0, "stalls": [(a - g0, b - g0) for a, b in runs[1:]], "fins": rel("DMA_MM2S_0_FINISHED_BD"),
+            "rel_a": rel("LOCK_0_REL"), "acq_a": rel("LOCK_SEL0_ACQ_GE"), "s2mm_fins": rel("DMA_S2MM_0_FINISHED_BD"),
+            "ev0": ev0[0] if ev0 else None, "ev1": ev1[0] if ev1 else None}
+
+
+def format_chain_table(rows) -> str:
+    """rows: (ChainCase, run, chain_row dict). Every number is cycles after g0 (the head BD's grant)."""
+    def ts(v):
+        return "[" + " ".join(f"{t:+d}" for t in v) + "]"
+    lines = ["case   run      (cycles after g0, the head BD's grant; stalls = later MM2S STALLED_LOCK runs)"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r.get("g0") is None:
+            lines.append(f"{c.name} {run} no head wait (no STALLED_LOCK run)")
+            continue
+        st = "[" + " ".join(_interval(a, b) for a, b in r["stalls"]) + "]"
+        lines.append(f"{c.name} {run} stalls {st} fins {ts(r['fins'])} relA {ts(r['rel_a'])} acqA {ts(r['acq_a'])} "
+                     f"s2mm {ts(r['s2mm_fins'])} ev0 {_num(r['ev0'])} ev1 {_num(r['ev1'])}")
+    return "\n".join(lines)
+
+
+def chain_check_design_dir(out: Path, c: ChainCase) -> None:
+    """One design per directory: refuse to mix designs (case names carry only the delays)."""
+    f = out / "design.json"
+    if f.exists() and json.loads(f.read_text()) != c.design():
+        raise ValueError(f"{out} holds design {f.read_text().strip()}, not {c.design()}")
+
+
+def chain_selection(args) -> list:
+    mids = parse_chain_mids(args.mids)
+    pairs = [(0, 0)] if args.releaser == "s2mm" else [(a, b) for a in (args.d1s or [0]) for b in (args.d2s or [0])]
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser) for a, b in pairs]
+    for c in out:
+        chain_validate(c)
+    return out
+
+
+def cmd_chain_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    cases = chain_selection(args)
+    chain_check_design_dir(out, cases[0])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "design.json").write_text(json.dumps(cases[0].design()) + "\n")
+    for c in cases:
+        d = out / c.name
+        d.mkdir(parents=True, exist_ok=True)
+        lp.assemble(chain_core_asm(c), d / "core.o", "k_core")
+        (d / "base.mlir").write_text(chain_design_mlir(c))
+        lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(),
+               "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+               "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+              cwd=d, log=d / "inject.log")
+        lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+               "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+              cwd=d, log=d / "aiecc.log")
+        (d / "case.json").write_text(json.dumps({**c.design(), "case": c.name, "d1": c.d1, "d2": c.d2}) + "\n")
+        print("built", c.name)
+    return 0
+
+
+def cmd_chain_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    cases = chain_selection(args)
+    chain_check_design_dir(out, cases[0])
+    for c in cases:
+        if not (out / c.name).is_dir():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_chain_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    cases = chain_selection(args)
+    chain_check_design_dir(out, cases[0])
+    rows = []
+    for c in cases:
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"g0": None}))
+                continue
+            rows.append((c, run, chain_row(load_level_events(run_dir))))
+    print(format_chain_table(rows))
+    return 0
+
+
+def add_chain_parsers(sub) -> None:
+    """chain-build / chain-run / chain-table: the lock request/grant timing family (see chain_design_mlir)."""
+    cb = sub.add_parser("chain-build", help="lock timing chain: build one design's cases into OUT_DIR")
+    cr = sub.add_parser("chain-run", help="lock timing chain: run the built cases to TAG.BACKEND/")
+    ct = sub.add_parser("chain-table", help="lock timing chain: stamps relative to the head BD's grant")
+    for sp in (cb, cr, ct):
+        sp.add_argument("out_dir")
+    cr.add_argument("tag")
+    cr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    ct.add_argument("runs", nargs="+")
+    for sp in (cb, cr, ct):
+        sp.add_argument("--mids", nargs="*", default=[], help="mid BDs: words, then c (core lock) or f (free lock)")
+        sp.add_argument("--head", type=int, default=4, help="head BD words")
+        sp.add_argument("--big", type=int, default=FETCH_WORDS, help="waiting BD words")
+        sp.add_argument("--d1s", nargs="*", type=int, default=[], help="core nops before releasing B")
+        sp.add_argument("--d2s", nargs="*", type=int, default=[], help="core nops before releasing A")
+        sp.add_argument("--releaser", choices=("core", "s2mm"), default="core")
+
+
+CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table}
+
+
 # -- bank arbitration probe (arb-*): who wins a core-vs-DMA bank conflict --------------------------
 #
 # The chained lock-fetch design, with a core program that makes n consecutive same-bank accesses (loads
@@ -1769,6 +2104,7 @@ def main(argv=None) -> int:
         sp.add_argument("--free", action="store_true", help="--sync: also the lock-free-on-request case (lsfree)")
         sp.add_argument("--pre2", type=int, default=0, help="--sync: words of a second lock-free pre BD (cases ltDD...)")
         sp.add_argument("--free-only", action="store_true", help="--sync: only lsfree")
+    add_chain_parsers(sub)
     ab = sub.add_parser("arb-build", help="bank arbitration probe: build the plan's cases (or --names)")
     ab.add_argument("out_dir")
     ar = sub.add_parser("arb-run", help="bank arbitration probe: run the built cases to TAG.BACKEND/")
@@ -1790,6 +2126,8 @@ def main(argv=None) -> int:
     for sp in (ab, ar, at, rb, rr, rt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     args = ap.parse_args(argv)
+    if args.cmd in CHAIN_COMMANDS:
+        return CHAIN_COMMANDS[args.cmd](args)
     if args.cmd.startswith("ring-"):
         return {"ring-build": cmd_ring_build, "ring-run": cmd_ring_run, "ring-table": cmd_ring_table}[args.cmd](args)
     if args.cmd.startswith("arb-"):

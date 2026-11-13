@@ -629,6 +629,163 @@ def test_load_case_labels_distinguish_k_and_bank():
     assert [ln.split()[0] for ln in g.format_sync_table(rows).splitlines()[1:]] == ["a11k10", "b11k02"]
 
 
+# -- lock request/grant timing family (chain-*) -------------------------------------
+
+def chain(mids="", **kw):
+    return g.ChainCase(mids=g.parse_chain_mids(mids.split()), **kw)
+
+
+def test_chain_mid_specs_parse_words_and_lock_kind():
+    assert g.parse_chain_mids(["8", "4c", "2f"]) == (g.ChainBd(8), g.ChainBd(4, "core"), g.ChainBd(2, "free"))
+    assert g.format_chain_mids(g.parse_chain_mids(["8", "4c", "2f"])) == "8 4c 2f"
+    for bad in (["0"], ["4x"], ["c"], ["4c", "4c"]):
+        with pytest.raises(ValueError):
+            g.chain_validate(chain(" ".join(bad)))
+
+
+def test_chain_case_names_carry_the_core_delays_and_stay_clear_of_the_other_families():
+    assert chain("4c 8", d1=3, d2=7).name == "q03_07"
+    assert chain("8", d2=12).name == "q00_12"
+    assert chain("8", releaser="s2mm").name == "qs"
+    other = {g.fetch_case_name(k, c, b) for k in range(65) for (c, b) in g.FETCH_PREFIX}
+    other |= {g.SyncCase(d).name for d in range(41)} | {g.SyncCase(d, pre2=4).name for d in range(41)}
+    assert not {chain("4c", d1=a, d2=b).name for a in range(41) for b in range(41)} & other
+
+
+def test_chain_validate_limits():
+    for bad in (chain("4", d1=1), chain("4c", d1=41), chain("4", d2=-1), chain(big=0), chain(big=257),
+                chain(head=0), chain(" ".join(["1f"] * 11)), chain(" ".join(["1"] * 14)),
+                chain(" ".join(["1"] * 13), releaser="s2mm"),
+                chain("4c", releaser="s2mm"), chain("4", releaser="x")):
+        with pytest.raises(ValueError):
+            g.chain_validate(bad)
+    g.chain_validate(chain(" ".join(["1f"] * 10)))
+    g.chain_validate(chain(" ".join(["1"] * 13)))                # head + 13 + send + recv = the 16 BDs
+
+
+def bd_blocks(text):
+    """{block name: block text} of the aie.mem body."""
+    mem = text.split("%mem = aie.mem(%t02) {")[1].split("aie.runtime_sequence")[0]
+    out = {}
+    for part in mem.split("\n    ^")[1:]:
+        name, body = part.split(":", 1)
+        out[name] = body
+    return out
+
+
+def test_chain_design_bd_order_locks_and_sizes():
+    t = g.chain_design_mlir(chain("4c 8 2f", big=16))
+    b = bd_blocks(t)
+    assert "aie.dma_start(MM2S, 0, ^head, ^recv_start)" in t
+    assert "aie.use_lock(%lStart, AcquireGreaterEqual" in b["head"] and "aie.use_lock(%lSync, Release" in b["head"]
+    assert "memref<4xi32>" in b["head"] and "aie.next_bd ^m0" in b["head"]
+    assert "aie.use_lock(%lB, AcquireGreaterEqual" in b["m0"] and "aie.use_lock(%lB, Release" in b["m0"]
+    assert "memref<4xi32>" in b["m0"] and "aie.next_bd ^m1" in b["m0"]
+    assert "use_lock" not in b["m1"] and "memref<8xi32>" in b["m1"] and "aie.next_bd ^m2" in b["m1"]
+    assert "aie.use_lock(%lF0, AcquireGreaterEqual" in b["m2"] and "aie.use_lock(%lF0, Release" in b["m2"]
+    assert "aie.next_bd ^send" in b["m2"]
+    assert "aie.use_lock(%lA, AcquireGreaterEqual" in b["send"] and "memref<16xi32>" in b["send"]
+    assert "aie.use_lock(%lEnd, Release" in b["send"]
+    assert "memref<34xi32>" in b["recv"] and "use_lock" not in b["recv"]          # 4 + 4 + 8 + 2 + 16
+    assert f'aie.lock(%t02, {g.CHAIN_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}' in t
+    assert f'aie.lock(%t02, {g.CHAIN_LOCK_FREE0}) {{init = 1 : i32, sym_name = "lF0"}}' in t
+    assert 'aie.lock(%t02, 0) {init = 0 : i32, sym_name = "lA"}' in t
+
+
+def test_chain_design_buffers_are_disjoint_and_clear_of_banks_0_1_and_the_destination():
+    c = chain("4c 40 33 2f 1f")
+    spans = g.chain_buffers(c)
+    flat = sorted((a, a + 4 * w) for a, w in spans)
+    assert all(e <= s for (_, e), (s, _) in zip(flat, flat[1:]))
+    assert all(a % 32 == 0 and 0x4000 <= a and a + 4 * w <= 0x8000 for a, w in spans)
+
+
+def test_chain_design_s2mm_releaser_splits_the_receive_and_releases_a():
+    t = g.chain_design_mlir(chain("8 4", releaser="s2mm"))
+    b = bd_blocks(t)
+    assert "aie.use_lock(%lRx, AcquireGreaterEqual" in b["recv"] and "aie.use_lock(%lA, Release" in b["recv"]
+    assert "memref<16xi32>" in b["recv"] and "aie.next_bd ^recv2" in b["recv"]     # head 4 + 8 + 4
+    assert "memref<64xi32>" in b["recv2"] and "use_lock" not in b["recv2"]
+    assert f'aie.lock(%t02, {g.CHAIN_LOCK_RX}) {{init = 1 : i32, sym_name = "lRx"}}' in t
+
+
+def test_chain_design_sequence_only_sets_the_start_lock():
+    for c in (chain("4c 8"), chain("8", releaser="s2mm")):
+        seq = g.chain_design_mlir(c).split("aie.runtime_sequence")[1]
+        assert seq.count("aiex.set_lock") == 1 and "aiex.set_lock(%lStart" in seq
+        for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync"):
+            assert forbidden not in seq
+
+
+def test_chain_core_releases_b_then_a_after_the_sync_lock():
+    body = bundles_of(g.chain_core_asm(chain("4c 8", d1=3, d2=5)))
+    acq = body.index(f"acq #{g.OWN + g.SYNC_LOCK_SYNC}, r3")
+    e0, e1 = body.index("event #0"), body.index("event #1")
+    rb, ra = body.index(f"rel #{g.OWN + g.CHAIN_LOCK_B}, r2"), body.index(f"rel #{g.OWN + g.SYNC_LOCK_A}, r2")
+    assert acq < e0 < rb < e1 < ra
+    assert body[e0 + 1:rb] == ["nop"] * 3 and rb + 1 == e1 and body[e1 + 1:ra] == ["nop"] * 5
+
+
+def test_chain_core_without_a_core_bd_releases_only_a_and_s2mm_releaser_none():
+    body = bundles_of(g.chain_core_asm(chain("8", d2=4)))
+    assert not any(x.startswith(f"rel #{g.OWN + g.CHAIN_LOCK_B}") for x in body)
+    e1, ra = body.index("event #1"), body.index(f"rel #{g.OWN + g.SYNC_LOCK_A}, r2")
+    assert body.index("event #0") + 1 == e1 and body[e1 + 1:ra] == ["nop"] * 4
+    s = bundles_of(g.chain_core_asm(chain("8", releaser="s2mm")))
+    assert not any(x.startswith("rel #") for x in s) and "event #0" in s
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [chain("4c 8", d1=0, d2=0), chain("4c", d1=40, d2=40), chain("8", releaser="s2mm")])
+def test_chain_core_assembles(c, tmp_path):
+    s = tmp_path / "c.s"
+    s.write_text(g.chain_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "c.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_chain_event_lists():
+    a = g.chain_inject_args()
+    assert a[a.index("--memmod-sweep-events") + 1].split(",") == [
+        "LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD", "LOCK_SEL0_ACQ_GE"]
+    assert a[a.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,LOCK_STALL"
+
+
+def test_chain_row_is_relative_to_the_head_grant_and_keeps_every_stall_run():
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499)                  # head's wait for START: grant 500
+    e += held("DMA_MM2S_0_STALLED_LOCK", 504, 515)                 # a core BD's wait
+    e += held("DMA_MM2S_0_STALLED_LOCK", 530, 530)                 # a one-cycle blip
+    e += [ev("DMA_MM2S_0_FINISHED_BD", t) for t in (503, 519, 590)] + [ev("LOCK_0_REL", 527)]
+    e += [ev("LOCK_SEL0_ACQ_GE", 531), ev("DMA_S2MM_0_FINISHED_BD", 620)]
+    e += [ev("INSTR_EVENT_0", 509, pkt=0), ev("INSTR_EVENT_1", 514, pkt=0), ev("INSTR_EVENT_0", 900, pkt=0)]
+    r = g.chain_row(e)
+    assert r["g0"] == 500
+    assert r["stalls"] == [(4, 15), (30, 30)] and r["fins"] == [3, 19, 90] and r["rel_a"] == [27]
+    assert r["acq_a"] == [31] and r["s2mm_fins"] == [120] and r["ev0"] == 9 and r["ev1"] == 14
+
+
+def test_chain_row_without_a_head_wait_says_so():
+    assert g.chain_row([ev("LOCK_0_REL", 10)]) == {"g0": None}
+
+
+def test_format_chain_table_one_line_per_case_and_run():
+    r = {"g0": 500, "stalls": [(4, 15)], "fins": [3, 19, 90], "rel_a": [27], "acq_a": [], "s2mm_fins": [120],
+         "ev0": 9, "ev1": 14}
+    text = g.format_chain_table([(chain("4c", d1=1, d2=2), "p1.hw", r), (chain("4c", d1=0, d2=2), "p1.hw", {"g0": None})])
+    lines = text.splitlines()
+    assert lines[1].startswith("q00_02 p1.hw") and "no head wait" in lines[1]
+    assert lines[2].startswith("q01_02 p1.hw") and "stalls [+4..+15]" in lines[2] and "fins [+3 +19 +90]" in lines[2]
+    assert "relA [+27]" in lines[2] and "ev0 +9 ev1 +14" in lines[2]
+
+
+def test_chain_build_refuses_a_directory_built_for_another_design(tmp_path):
+    (tmp_path / "design.json").write_text('{"head": 4, "mids": "8", "big": 64, "releaser": "core"}\n')
+    with pytest.raises(ValueError):
+        g.chain_check_design_dir(tmp_path, chain("4c 8"))
+    g.chain_check_design_dir(tmp_path, chain("8"))
+
+
 # -- bank arbitration probe (arb-*) ---------------------------------------------------
 
 def arb(bank=0, op="l", n=1, k=16, m=0):
