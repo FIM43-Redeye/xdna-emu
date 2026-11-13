@@ -137,6 +137,8 @@ pub struct DmaReleaseInTransit {
     /// The same moment on the sending DMA engine's own step clock (`read_clock`), for an engine
     /// stepped on its own.
     pub arrival_dma_clock: u64,
+    /// The sending engine's tile (col, row): only that engine's clock times the entry.
+    pub sender: (u8, u8),
 }
 
 #[derive(Debug)]
@@ -1273,14 +1275,17 @@ impl Tile {
         }
     }
 
-    /// The DMA BD releases due by `dma_clock` (the sending engine's own step clock), for a DMA
+    /// The DMA BD releases `sender` sent that are due by `dma_clock` (its own step clock), for a DMA
     /// engine stepped without the interpreter engine, which delivers them at the start of their
     /// arrival cycle before any DMA step looks (`deliver_lock_releases`). Stamped at their
     /// arrival cycle; not recorded as arrived for settled-only acquires (no cycle start here).
-    pub fn deliver_dma_lock_releases_by_dma_clock(&mut self, dma_clock: u64) {
+    pub fn deliver_dma_lock_releases_by_dma_clock(&mut self, sender: (u8, u8), dma_clock: u64) {
         let mut waiting = Vec::new();
         for r in std::mem::take(&mut self.dma_releases_in_transit) {
-            if r.arrival_dma_clock > dma_clock || !self.arrive_release(r.lock_id, r.delta, r.arrival, false) {
+            if r.sender != sender
+                || r.arrival_dma_clock > dma_clock
+                || !self.arrive_release(r.lock_id, r.delta, r.arrival, false)
+            {
                 waiting.push(r);
             }
         }

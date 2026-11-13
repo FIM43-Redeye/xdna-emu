@@ -182,6 +182,7 @@ impl DmaEngine {
                 delta: release_value,
                 arrival,
                 arrival_dma_clock,
+                sender: (self.col, self.row),
             });
         }
         if let Some(LockTarget::Own(local_id)) = lock_target {

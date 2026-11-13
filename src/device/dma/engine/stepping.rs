@@ -535,7 +535,7 @@ impl DmaEngine {
                 .flatten()
             {
                 if !t.dma_releases_in_transit.is_empty() {
-                    t.deliver_dma_lock_releases_by_dma_clock(self.read_clock);
+                    t.deliver_dma_lock_releases_by_dma_clock((self.col, self.row), self.read_clock);
                 }
             }
         }

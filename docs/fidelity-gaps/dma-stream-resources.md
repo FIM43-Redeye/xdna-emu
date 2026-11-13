@@ -495,7 +495,8 @@ BD's grant g0 (its STALLED_LOCK falls).
   rule 554 / 554 (the core's release of B is not traced; the emulator's own core path, event + nops + 3 or 4,
   gives the same score either way). Model-free, each silicon row against the emulator run whose release lands
   on the same cycle after g0: 889 / 889 sync rows and 163 / 163 chain rows identical (grant, every STALLED_LOCK
-  interval, every FINISHED_BD). Same case (no frame mapping), since the head BD's release reaches the lock unit
+  interval, every FINISHED_BD); with the release at FINISHED_BD + 3 more emulator runs share a silicon row's
+  release cycle: 1107 / 1107 sync rows, 745 / 745 chain rows, k4f 178 / 178. Same case (no frame mapping), since the head BD's release reaches the lock unit
   at FINISHED_BD + 3 (2026-11-13, below): 26 / 34 sync rows identical (before 1 / 34), LOCK_0_REL and event 0
   equal to silicon's on 22 rows and one cycle early on 12, which are silicon's other resume phase of the held
   core (the same binary gives either run to run; the emulator's run is deterministic). On the short-chain designs (c, kn, k4f; 110 runs) the emulator follows the short-chain rule below on 108
@@ -611,8 +612,12 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   count), 18 stalls; with the lock law 0 / 0 / none; with the core-side placement 603 / 24 / 12, 2 2 2 2 0;
   with the late-granule gap (next section) 1095 conflicts, 18 stalls, 9 of 15 transfers colliding,
   2 1 0 3 0 repeating, 12 of 15 transfers identical to silicon contact for contact and finish (`collide` is a
-  FITTED row since then: the gap's form was set by it). Held out: `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls, unchanged by the gap (with the lock law, same
-  count: 545 / 157); no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
+  FITTED row since then: the gap's form was set by it). With the compute BD release at FINISHED_BD + 3
+  (2026-11-13): 1100 / 20 / 9; the first grant after the head BD's finish is 285 as on all three silicon runs
+  (was 283), and the first transfer takes silicon r3's contacts (4 stalls) where it took r1 / r2's (2): 12 of
+  15 transfers identical to silicon r3, as before to r1, the same three transfers one cycle off. Held out:
+  `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls, unchanged by the gap (with the lock law, same
+  count: 545 / 157); 443 / 136 with the release at FINISHED_BD + 3; no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.

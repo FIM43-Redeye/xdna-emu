@@ -1057,3 +1057,26 @@ fn shim_demux_dma_select_on_a_port_without_dma_drains_nothing() {
     tile.parse_shim_demux_config((1 << 8) | (1 << 10));
     assert_eq!(tile.shim_mux_s2mm_masters, vec![None, None]);
 }
+
+/// A DMA BD release in transit is timed only by the engine that sent it: an engine stepped on its
+/// own delivers its own releases when its clock reaches their arrival, never another engine's
+/// (whose clock may run ahead of the sender's when the sender's module was gated).
+#[test]
+fn a_dma_release_in_transit_is_delivered_only_by_its_senders_clock() {
+    use crate::device::tile::DmaReleaseInTransit;
+    let mut tile = Tile::compute(1, 2);
+    tile.send_dma_lock_release(DmaReleaseInTransit {
+        lock_id: 3,
+        delta: 1,
+        arrival: 50,
+        arrival_dma_clock: 10,
+        sender: (2, 2),
+    });
+    tile.deliver_dma_lock_releases_by_dma_clock((1, 2), 40);
+    assert_eq!(tile.locks[3].value, 0, "another engine's clock does not deliver it");
+    tile.deliver_dma_lock_releases_by_dma_clock((2, 2), 9);
+    assert_eq!(tile.locks[3].value, 0, "not before its arrival on the sender's clock");
+    tile.deliver_dma_lock_releases_by_dma_clock((2, 2), 10);
+    assert_eq!(tile.locks[3].value, 1);
+    assert!(tile.dma_releases_in_transit.is_empty());
+}
