@@ -289,6 +289,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // (4 cycles) to a core-to-core transit (gen_stream_rtt_probe.py).
             inter_tile_hop_latency: 0,
             packet_arbitration_overhead: 1,
+            trace_packet_emit_cycles: 8,
         },
         instruction: InstructionTiming { data_memory_latency: 5, branch_penalty: 3 },
         // Sourced from the committed data/skew_constants.json via skew_ingest

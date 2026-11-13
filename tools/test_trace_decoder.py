@@ -36,6 +36,7 @@ from trace_decoder import (
     PacketType,
     RepeatCmd,
     StartCmd,
+    StopCmd,
     SyncCmd,
     TraceMode,
     decode_words,
@@ -194,7 +195,8 @@ def test_mode0_decode_matches_oracle_byte_for_byte(fixture_words, oracle_command
     for (pt, r, c), our_cmds in ours_per_tile.items():
         oracle_cmds_raw = oracle[pt][f"{r},{c}"]
         oracle_canonical = [_oracle_to_canonical(d) for d in oracle_cmds_raw]
-        ours_canonical = [_cmd_to_oracle_dict(cmd) for cmd in our_cmds]
+        # mlir-aie drops the end token; we keep it as a StopCmd (tested below).
+        ours_canonical = [_cmd_to_oracle_dict(cmd) for cmd in our_cmds if not isinstance(cmd, StopCmd)]
         assert ours_canonical == oracle_canonical, (
             f"mismatch at tile pkt_type={pt} row={r} col={c}\n"
             f"ours[:5]={ours_canonical[:5]}\n"
@@ -213,7 +215,8 @@ def test_mode0_command_count_per_tile(fixture_words, oracle_commands):
     oracle = oracle_commands["trace_types"]
     for (pt, r, c), our_cmds in ours.items():
         oracle_n = len(oracle[pt][f"{r},{c}"])
-        assert len(our_cmds) == oracle_n, (pt, r, c, len(our_cmds), oracle_n)
+        n = sum(1 for c in our_cmds if not isinstance(c, StopCmd))
+        assert n == oracle_n, (pt, r, c, n, oracle_n)
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +663,50 @@ def test_a_sync_is_one_wrap_of_the_cycles_field_and_a_repeat_repeats_it():
     ts = [e.ts for e in events]
     assert ts == [100 + 3 * (1 << 18) + 213569, 100 + 2 * (3 * (1 << 18) + 213569)]
     assert ts[1] - ts[0] == 1_000_001
+
+
+# ---------------------------------------------------------------------------
+# End-of-stream token: 0xDC and an 18-bit count of idle cycles, not filler.  The byte
+# sequences are tails of silicon streams (three captures; every stream ends with one unless
+# its packet was lost).
+# ---------------------------------------------------------------------------
+
+
+def _decode_mode0(byte_stream):
+    from trace_decoder.modes import mode0
+    return list(mode0.decode(list(byte_stream)))
+
+
+def test_the_end_token_is_a_stop_with_its_idle_count():
+    # core tail: Single2(slot 0, 1024), Repeat0(5), end token with count 422
+    cmds = _decode_mode0([0xA0, 0x04, 0x00, 0xE5, 0xDC, 0x00, 0x01, 0xA6, 0xFE, 0xFE])
+    assert cmds == [EventCmd(1, 1024), RepeatCmd(5), StopCmd(idle_cycles=422)]
+
+
+def test_the_end_token_count_uses_the_two_high_bits_of_byte_one():
+    cmds = _decode_mode0([0xDC, 0x03, 0xFF, 0xEA])
+    assert cmds == [StopCmd(idle_cycles=(3 << 16) | 0xFFEA)]
+
+
+def test_a_held_level_ends_with_a_zero_count():
+    # shim tail: Single0(slot 7, 0), Repeat1(706), end token 0
+    cmds = _decode_mode0([0x70, 0xDA, 0xC2, 0xFE, 0xDC, 0x00, 0x00, 0x00])
+    assert cmds == [EventCmd(0x80, 0), RepeatCmd(706), StopCmd(idle_cycles=0)]
+
+
+def test_a_quiet_tile_is_start_sync_repeat_and_the_end_token():
+    # `Start Sync Rep0(1) DC`: two wraps of the field, then the rest in the count (10990)
+    stream = [0xF0, 0, 0, 0, 0, 0, 0x04, 0x00, 0xFF, 0xE1, 0xFE, 0xFE, 0xDC, 0x00, 0x2A, 0xEE]
+    cmds = _decode_mode0(stream)
+    assert cmds == [StartCmd(1024), SyncCmd(), RepeatCmd(1), StopCmd(idle_cycles=10990)]
+
+
+def test_the_end_token_adds_nothing_to_the_timeline():
+    from trace_decoder.decode import rebuild_timeline_mode0
+
+    cmds = {(0, 2, 1): [StartCmd(100), EventCmd(1, 4), StopCmd(idle_cycles=422)]}
+    events = rebuild_timeline_mode0(cmds, {0: {"2,1": ["PERF"] + [""] * 7}})
+    assert [e.ts for e in events] == [105]
 
 
 # ---------------------------------------------------------------------------

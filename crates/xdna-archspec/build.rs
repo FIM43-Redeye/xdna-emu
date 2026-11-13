@@ -590,6 +590,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             t.stream_switch.packet_arbitration_overhead
         )
         .unwrap();
+        writeln!(
+            out,
+            "    pub const STREAM_TRACE_PACKET_EMIT_CYCLES: u8 = {};",
+            t.stream_switch.trace_packet_emit_cycles
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "    // Route latency (derived from stream switch timing)").unwrap();

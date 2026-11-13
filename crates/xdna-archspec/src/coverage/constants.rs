@@ -194,6 +194,11 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             The value 2 it replaces came from one memtile->compute capture that two mechanisms fit."),
         unsourced("stream_switch.packet_arbitration_overhead", "Original estimate; AM020 ch.2 excludes it from the latency table \
             and no capture exists."),
+        measured("stream_switch.trace_packet_emit_cycles", "NPU1 2026-11-11/12, shim tile trace unit only: three silicon \
+            captures of six trace tests (shim trace packets, last token a single or multiple frame, a saturated Repeat1 or a \
+            Repeat followed by a frame: delay 11 after the last covered cycle) minus the emulator's 2-cycle path",
+            "Measured on the shim; applied to the core, memory-module and memtile trace units by inference (their timers \
+            are not synchronised with the shim's, so the absolute delay is not observable there)."),
         // -- broadcast --
         measured("broadcast.per_hop_horizontal", SKEW, "Horizontal isotropy assumed."),
         measured("broadcast.per_hop_vertical", SKEW, "Vertical isotropy assumed (blocked on the cold-start fill gap)."),

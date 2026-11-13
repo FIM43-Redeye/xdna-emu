@@ -134,6 +134,15 @@ pub struct TileArray {
     /// Each tile has exactly one DMA engine.
     pub(crate) dma_engines: Vec<DmaEngine>,
 
+    /// Per tile: its adaptively gated switch skipped this cycle's first routing pass with no
+    /// word in a slave port. A word that then crosses in wakes it for the next cycle's second
+    /// pass, not its first (`late_wake`).
+    pub(super) ss_gated_idle_first_pass: Vec<bool>,
+
+    /// Per tile: a word reached the gated switch after the first routing pass; the switch
+    /// stays asleep through the next cycle's first pass (see `step_tile_switches_impl`).
+    pub(super) ss_late_wake: Vec<bool>,
+
     /// Fatal errors accumulated during data movement.
     ///
     /// These represent conditions that are impossible on real hardware
@@ -290,6 +299,8 @@ impl TileArray {
             tile_col_start,
             rows,
             tiles,
+            ss_gated_idle_first_pass: vec![false; tile_present.len()],
+            ss_late_wake: vec![false; tile_present.len()],
             tile_present,
             dma_engines,
             fatal_errors: Vec::new(),
@@ -582,6 +593,8 @@ impl TileArray {
     }
 
     pub fn reset(&mut self) {
+        self.ss_gated_idle_first_pass.fill(false);
+        self.ss_late_wake.fill(false);
         for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
             if !present {
                 continue;
