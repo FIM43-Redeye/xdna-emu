@@ -429,7 +429,11 @@ def decode_one_ours(np_mod, td_mod,
         max_pt = max((pt for (pt, _, _) in commands_per_tile), default=-1)
         trace_types = [dict() for _ in range(max(4, max_pt + 1))]
         for (pt, r, c), cmds in commands_per_tile.items():
-            trace_types[pt][f"{r},{c}"] = [_cmd_to_oracle_dict(cmd) for cmd in cmds]
+            # mlir-aie's command list has no end token (it skips the opcode), so the
+            # drop-in output leaves our StopCmd out.
+            trace_types[pt][f"{r},{c}"] = [
+                _cmd_to_oracle_dict(cmd) for cmd in cmds if type(cmd).__name__ != "StopCmd"
+            ]
         Path(out_commands).write_text(json.dumps({"trace_types": trace_types}, indent=2))
 
     if out_perfetto:
