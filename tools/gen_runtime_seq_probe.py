@@ -123,7 +123,8 @@ def _p_case(name: str, order: list[str], k: int = 0, tokens: str = "last") -> Ca
                  "s2mm": ch[0] == "S" and last[ch] == i}[tokens]
         steps.append(Push(ch, PUSH_WORDS, token))
     awaited = [ch for ch in EVENT_ORDER if ch in last and (tokens != "s2mm" or ch[0] == "S")]
-    steps += [Sync(ch) for ch in awaited] + closing_tail() + [Fill(TAIL_FILL)]
+    steps += [Sync(ch) for ch in awaited]
+    steps += drain_syncs(steps) + closing_tail() + [Fill(TAIL_FILL)]
     return Case(name, "P", tuple(steps))
 
 
@@ -139,8 +140,22 @@ def _w_case(name: str, pairs: int, words: int, late: bool = False, nosync: bool 
         steps += [Sync("S0"), Push("M1", MARKER_WORDS, False)]
     if nosync:
         steps.append(Sync("S0"))
-    steps += [Sync("S1"), *closing_tail(), Fill(TAIL_FILL)]
+    steps += [Sync("S1")]
+    steps += drain_syncs(steps) + closing_tail() + [Fill(TAIL_FILL)]
     return Case(name, "W", tuple(steps))
+
+
+def drain_syncs(steps: list) -> list:
+    """One sync per token the measured section issued but did not wait for (a token that arrives before its sync is
+    kept, so a surplus one would satisfy a later sync early): after these, every channel's tokens and syncs are
+    level, so each tail sync waits for its own round's task."""
+    surplus = {ch: 0 for ch in EVENT_ORDER}
+    for s in steps:
+        if isinstance(s, Push) and s.token:
+            surplus[s.ch] += 1
+        elif isinstance(s, Sync):
+            surplus[s.ch] -= 1
+    return [Sync(ch) for ch in EVENT_ORDER for _ in range(surplus[ch])]
 
 
 def closing_tail() -> list:
@@ -239,6 +254,10 @@ def validate(case: Case) -> None:
             raise ValueError(f"{case.name}: the last task of {ch} is never awaited (no sync after it)")
         if not case.steps[i].token:
             raise ValueError(f"{case.name}: the last task of {ch} carries no token, so no sync can cover it")
+    for ch in CHANNELS:
+        if tokens[ch] != syncs[ch]:
+            raise ValueError(f"{case.name}: {ch} issues {tokens[ch]} tokens but has {syncs[ch]} syncs; a surplus "
+                             f"token would let a later sync return before its own task")
     syncs_at = [i for i, s in enumerate(case.steps) if isinstance(s, Sync)]
     if syncs_at and any(isinstance(s, Push) for s in case.steps[syncs_at[-1]:]):
         raise ValueError(f"{case.name}: a push after the last sync")

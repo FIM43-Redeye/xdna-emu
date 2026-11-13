@@ -344,3 +344,29 @@ def test_case_table_lists_only_the_measured_pushes(tmp_path):
         g.load_run = real_load
     rows = [l for l in text.splitlines() if l.strip().startswith(("0  ", "1  ", "2  "))]
     assert len(rows) == 2 and "2 pushes + 12 tail" in text
+
+
+def test_tokens_and_syncs_are_level_on_every_channel():
+    for c in g.plan().values():
+        for ch in g.EVENT_ORDER:
+            tok = sum(1 for s in c.steps if isinstance(s, g.Push) and s.ch == ch and s.token)
+            syn = sum(1 for s in c.steps if isinstance(s, g.Sync) and s.ch == ch)
+            assert tok == syn, (c.name, ch)
+
+
+def test_all_token_case_drains_its_surplus_before_the_tail():
+    c = case("p8_mm_alltok")
+    first_tail = next(i for i, s in enumerate(c.steps) if isinstance(s, g.Push) and s.tail)
+    before = c.steps[:first_tail]
+    for ch in g.EVENT_ORDER:
+        tok = sum(1 for s in before if isinstance(s, g.Push) and s.ch == ch and s.token)
+        syn = sum(1 for s in before if isinstance(s, g.Sync) and s.ch == ch)
+        assert tok == syn == 2, ch
+    assert g.drain_syncs(list(case("p8_mm").steps[:12])) == []
+
+
+def test_validate_rejects_a_surplus_token():
+    bad = g.Case("bad", "P", (g.Push("M0", 8, True), g.Push("S0", 8, True), g.Push("M0", 8, True),
+                              g.Push("S0", 8, True), g.Sync("S0"), g.Sync("S0"), g.Sync("M0"), *g.closing_tail()))
+    with pytest.raises(ValueError, match="surplus|tokens"):
+        g.validate(bad)
