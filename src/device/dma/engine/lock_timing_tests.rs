@@ -546,7 +546,7 @@ fn the_chain_designs_grants_land_on_silicons_cycle() {
 }
 
 /// STALLED_LOCK of a compute MM2S lock BD (`LockPort::stall_level`): shown on [P, G - 1] with
-/// P = max(S + 2, Q - 1, the previous BD's last access - 1), so it can rise before the channel
+/// P = max(D, Q, the previous BD's last access) - 1 (D its first granule fully sequenced), so it can rise before the channel
 /// leaves the BD before, and a lock free on request shows one cycle. LOCK_SEL0_ACQ_GE fires
 /// once per acquire at G - 1, a free lock's included. Silicon (NPU1, 2026-11,
 /// `tools/gen_dma_lock_probe.py` sync and chain families, g0 frame): T5 (lsfree: one cycle at
@@ -647,9 +647,9 @@ fn the_measured_table_rows_land_on_silicons_cycles() {
 /// c2f): six lock-free 2-word BDs behind the head finish every 2 cycles (g0 + 3, 5, ..., 15);
 /// six 2-word BDs each on its own free lock every 3 (3, 6, ..., 21), each with a one-cycle
 /// STALLED_LOCK at its grant - 1 (2, 5, ..., 17). Only the mids are asserted: the waiting BD
-/// behind such a chain is outside the rule's scope (its STALLED_LOCK rises at g0 + 20 behind
-/// six lock-free mids and at 21 behind six free-lock ones on silicon; open, see the DMA gap
-/// doc).
+/// behind six lock-free mids is outside the law (its STALLED_LOCK rises at g0 + 20 on silicon;
+/// open, pinned in `lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles`); behind
+/// six free-lock ones it rises at 21 (`a_chain_of_short_lock_bds_holds_three_lock_bds_in_flight`).
 #[test]
 fn a_chain_of_short_bds_keeps_silicons_cadence_up_to_the_waiting_bd() {
     let obs = run_chain(4, &mids("2 2 2 2 2 2"), 64, Releaser::Free, Releaser::Core(45));
@@ -657,4 +657,105 @@ fn a_chain_of_short_bds_keeps_silicons_cadence_up_to_the_waiting_bd() {
     let obs = run_chain(4, &mids("2f 2f 2f 2f 2f 2f"), 64, Releaser::Free, Releaser::Core(45));
     assert_eq!(obs.finishes[..7], [3, 6, 9, 12, 15, 18, 21], "c2f");
     assert_eq!(obs.stalls[..6], [(2, 2), (5, 5), (8, 8), (11, 11), (14, 14), (17, 17)], "c2f blips");
+}
+
+/// Chains of short lock BDs before the waiting BD (silicon, NPU1 2026-11,
+/// `tools/gen_dma_lock_probe.py` chain families k4f, c1f..c4f; head frame, the core releases A
+/// at g0 + R, the LOCK_0_REL stamp). Three terms beyond the request and grant law:
+/// (a) a lock BD starts sequencing no earlier than the lock release (FINISHED_BD + 4) of the
+///     third lock BD before it: MEASURED, the sequencing starts the rises and finishes imply
+///     (k4f3: the third mid shows no STALLED_LOCK blip and finishes at 12, so its first word is
+///     sequenced at exactly 7; the 64-word BD of k4f2 / k4f3 / k4f5 from 7 / 11 / 19, its clock
+///     floor 72 / 76 / 84); INFERRED, that these are the releases of the third lock BD before;
+/// (b) a grant never falls on the release slot of any earlier lock BD of the run (k4f5: never
+///     at 20, the fourth mid's FINISHED_BD 16 + 4);
+/// (c) STALLED_LOCK rises at max(the first granule fully sequenced, Q, the previous BD's last
+///     access) - 1 (c3f: the third 3-word mid, first word at 7, blips at 8).
+/// Rows of the fitted designs and of the held-out ones (k4f4, c2f, c4f: predicted, then scored
+/// once against silicon).
+#[test]
+fn a_chain_of_short_lock_bds_holds_three_lock_bds_in_flight() {
+    #[rustfmt::skip]
+    let rows: &[(&str, i64, i64, &[(i64, i64)], &[i64])] = &[
+        // mids, RA, grant of A, STALLED_LOCK after the head, FINISHED_BD (silicon)
+        ("4f", 15, 18, &[(2, 2), (5, 17)], &[3, 6, 70]), // k4f1 q00_00 p1.hw
+        ("4f 4f", 15, 18, &[(2, 2), (5, 5), (9, 17)], &[3, 6, 9, 72]), // k4f2 q00_00 p1.hw
+        ("4f 4f", 17, 19, &[(2, 2), (5, 5), (9, 18)], &[3, 6, 9, 72]), // k4f2 q00_02 p1.hw
+        ("4f 4f 4f", 15, 18, &[(2, 2), (5, 5), (13, 17)], &[3, 6, 9, 12, 76]), // k4f3 q00_00 p1.hw
+        ("4f 4f 4f", 17, 19, &[(2, 2), (5, 5), (13, 18)], &[3, 6, 9, 12, 76]), // k4f3 q00_02 p1.hw
+        ("4f 4f 4f 4f", 15, 18, &[(2, 2), (5, 5), (17, 17)], &[3, 6, 9, 12, 16, 80]), // k4f4 q00_00 p1.hw (held out)
+        ("4f 4f 4f 4f", 18, 21, &[(2, 2), (5, 5), (17, 20)], &[3, 6, 9, 12, 16, 80]), // k4f4 q00_02 p1.hw (held out)
+        ("4f 4f 4f 4f 4f", 16, 19, &[(2, 2), (5, 5)], &[3, 6, 9, 12, 16, 20, 84]), // k4f5 q00_00 p1.hw
+        ("4f 4f 4f 4f 4f", 18, 22, &[(2, 2), (5, 5), (21, 21)], &[3, 6, 9, 12, 16, 20, 84]), // k4f5 q00_02 p1.hw
+        ("1f 1f 1f 1f 1f 1f", 46, 48, &[(2, 2), (5, 5), (8, 8), (11, 11), (14, 14), (17, 17), (21, 47)], &[3, 6, 9, 12, 15, 18, 21, 100]), // c1f q00_30 t1.hw
+        ("2f 2f 2f 2f 2f 2f", 45, 48, &[(2, 2), (5, 5), (8, 8), (11, 11), (14, 14), (17, 17), (21, 47)], &[3, 6, 9, 12, 15, 18, 21, 100]), // c2f q00_30 t2.hw (held out)
+        ("3f 3f 3f 3f 3f 3f", 45, 48, &[(2, 2), (5, 5), (8, 8), (11, 11), (14, 14), (17, 17), (21, 47)], &[3, 6, 9, 12, 15, 18, 21, 100]), // c3f q00_30 t1.hw
+        ("4f 4f 4f 4f 4f 4f", 45, 47, &[(2, 2), (5, 5), (25, 46)], &[3, 6, 9, 12, 16, 20, 24, 99]), // c4f q00_30 t1.hw (held out)
+        ("4f 4f 4f 4f 4f 4f", 46, 48, &[(2, 2), (5, 5), (25, 47)], &[3, 6, 9, 12, 16, 20, 24, 100]), // c4f q00_30 t2.hw (held out)
+    ];
+    for &(spec, ra, grant, stalls, finishes) in rows {
+        let obs = run_chain(4, &mids(spec), 64, Releaser::Free, Releaser::Core(ra));
+        assert_eq!(
+            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+            (grant, grant, stalls, finishes),
+            "{spec}, RA {ra}"
+        );
+    }
+}
+
+/// Chains of K <= 5 lock-free short BDs before the waiting BD (silicon, NPU1 2026-11, chain
+/// family kn, head frame): the request and grant law holds unchanged (the waiting BD's
+/// STALLED_LOCK rises at the previous BD's last access - 1 = 2K + 1). kn1x2 / kn1x5 / kn4x4
+/// were held out of the short-chain fit and scored once.
+#[test]
+fn a_chain_of_up_to_five_lock_free_short_bds_keeps_the_grant_law() {
+    #[rustfmt::skip]
+    let rows: &[(&str, i64, i64, &[(i64, i64)], &[i64])] = &[
+        ("1 1", 45, 48, &[(5, 47)], &[3, 5, 7, 100]), // kn1x2 q00_30 t1.hw (held out)
+        ("1 1 1 1 1", 45, 47, &[(11, 46)], &[3, 5, 7, 9, 11, 13, 99]), // kn1x5 q00_30 t1.hw (held out)
+        ("4 4 4", 46, 48, &[(7, 47)], &[3, 5, 7, 9, 100]), // kn4x3 q00_30 t2.hw
+        ("4 4 4 4", 45, 47, &[(9, 46)], &[3, 5, 7, 9, 11, 99]), // kn4x4 q00_30 t1.hw (held out)
+        ("4 4 4 4", 46, 48, &[(9, 47)], &[3, 5, 7, 9, 11, 100]), // kn4x4 q00_30 t2.hw (held out)
+        ("4 4 4 4 4", 45, 47, &[(13, 46)], &[3, 5, 7, 9, 11, 13, 99]), // kn4x5 q00_30 t1.hw
+    ];
+    for &(spec, ra, grant, stalls, finishes) in rows {
+        let obs = run_chain(4, &mids(spec), 64, Releaser::Free, Releaser::Core(ra));
+        assert_eq!(
+            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+            (grant, grant, stalls, finishes),
+            "{spec}, RA {ra}"
+        );
+    }
+}
+
+/// PIN, NOT SILICON: lock-free chains where the request and grant law misses silicon (open, see
+/// the DMA gap doc). These are the emulator's own cycles, pinned so that a later model of these
+/// rows shows up as a deliberate change. Silicon (NPU1 2026-11, chain families c / kn, head
+/// frame) differs as follows:
+/// - six lock-free mids (the waiting BD is the chain's eighth BD and bd_id 7): STALLED_LOCK
+///   rises at 20 on silicon for 1- to 4-word mids (the emulator: the previous BD's last access
+///   - 1 = 13, or 14 / 17 with 3- / 4-word mids), and the grant phase moves with the mid
+///   length (c1n RA 45 -> 48 on silicon, 47 here; c2n RA 45 -> 47, 46 -> 49 as here);
+/// - five lock-free 4-word mids, RA 46 (kn4x5 q00_30 t2.hw): silicon grants at 49 and rises at
+///   13, FINISHED_BD 101; the emulator grants at 48.
+#[test]
+fn lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles() {
+    #[rustfmt::skip]
+    let rows: &[(&str, i64, i64, &[(i64, i64)], &[i64])] = &[
+        // mids, RA, grant, stalls, finishes (EMULATOR; silicon in the comment)
+        ("1 1 1 1 1 1", 45, 47, &[(13, 46)], &[3, 5, 7, 9, 11, 13, 15, 99]), // c1n t1: silicon 48, [(20, 47)], .. 100
+        ("1 1 1 1 1 1", 46, 48, &[(13, 47)], &[3, 5, 7, 9, 11, 13, 15, 100]), // c1n t2: silicon 48, [(20, 47)]
+        ("2 2 2 2 2 2", 45, 47, &[(13, 46)], &[3, 5, 7, 9, 11, 13, 15, 99]), // c2n t1: silicon 47, [(20, 46)]
+        ("2 2 2 2 2 2", 46, 49, &[(13, 48)], &[3, 5, 7, 9, 11, 13, 15, 101]), // c2n t3: silicon 49, [(20, 48)]
+        ("4 4 4 4 4 4", 45, 48, &[(17, 47)], &[3, 5, 7, 9, 11, 13, 16, 100]), // c4n t2: silicon 48, [(20, 47)]
+        ("4 4 4 4 4", 46, 48, &[(13, 47)], &[3, 5, 7, 9, 11, 13, 100]), // kn4x5 t2: silicon 49, [(13, 48)], .. 101
+    ];
+    for &(spec, ra, grant, stalls, finishes) in rows {
+        let obs = run_chain(4, &mids(spec), 64, Releaser::Free, Releaser::Core(ra));
+        assert_eq!(
+            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+            (grant, grant, stalls, finishes),
+            "{spec}, RA {ra}"
+        );
+    }
 }
