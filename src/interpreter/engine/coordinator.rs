@@ -123,15 +123,10 @@ struct CoreState {
     /// a multi-cycle conflict renders as one B..E span rather than one pulse
     /// per conflicting cycle. See `mem_stall_edge`.
     mem_stall_active: bool,
-    /// The core was frozen for a gather's memory cycle in this cycle's execute phase
-    /// (`StepResult::Frozen { memory_stall: true, .. }`): a MEMORY_STALL cycle like a lost
-    /// bank arbitration. Consumed by Phase E.
+    /// The core was frozen for a memory cycle in this cycle's execute phase (a gather's, or
+    /// an access that lost its bank: `StepResult::Frozen { memory_stall: true, .. }`).
+    /// Consumed by Phase E.
     memory_frozen: bool,
-    /// The core lost a bank arbitration in the previous cycle. A lost cycle's
-    /// MEMORY_STALL is stamped the cycle after it (silicon, lock-fetch arb probe:
-    /// all 82 loss rows one cycle after the losing CONFLICT_DM_BANK stamp; the
-    /// producer probe's 56 stalls likewise), so Phase E raises the level from this.
-    bank_lost_last_cycle: bool,
 }
 
 /// Held-level edge decision for a per-cycle win/loss boolean against its
@@ -174,7 +169,6 @@ impl CoreState {
             active_this_cycle: false,
             mem_stall_active: false,
             memory_frozen: false,
-            bank_lost_last_cycle: false,
         }
     }
 
@@ -193,7 +187,6 @@ impl CoreState {
         // would emit a phantom falling edge after reset.
         self.mem_stall_active = false;
         self.memory_frozen = false;
-        self.bank_lost_last_cycle = false;
     }
 }
 
@@ -747,16 +740,17 @@ impl InterpreterEngine {
     ///   Phase 1: sync DMA start requests from tiles to DMA engines.
     ///   Phase A: each DMA channel declares the banks it intends to touch this
     ///            cycle (`DmaEngine::peek_bank_demand`). No transfer.
-    ///   Phase B: each core that can issue declares its next bundle's bank
-    ///            demand (`CoreInterpreter::peek_bank_demand`). A core stalled
-    ///            on a lock/DMA/stream declares nothing. No commit.
+    ///   Phase B: each core declares the banks of its accesses in flight whose
+    ///            memory stage (issue + 4) is this cycle
+    ///            (`CoreInterpreter::peek_bank_demand`). No commit.
     ///   Phase C: per compute tile, per physical bank, round-robin arbitration
     ///            (`BankArbiter::arbitrate`).
     ///   Phase D: commit the winners, withhold the losers --
-    ///              core lost -> `stall_for_bank` (1 cycle, PC unchanged, the
-    ///                           SAME bundle retries next cycle) and its
-    ///                           `step` is skipped ENTIRELY (Phase 2 below);
-    ///              core won  -> step the core normally;
+    ///              core lost -> the core is frozen this cycle (its step is a
+    ///                           `Frozen` memory-stall cycle; the access
+    ///                           retries next cycle, every access in flight
+    ///                           slips one cycle);
+    ///              core won  -> the access is done; step the core normally;
     ///              DMA lost  -> the channel's FSM step is skipped, so it
     ///                           re-presents the identical demand next cycle;
     ///              DMA won   -> transfers (Phase 3).
@@ -862,34 +856,10 @@ impl InterpreterEngine {
                     ctx.cycle_counter_base = timer.wrapping_sub(ctx.cycles);
                 }
 
-                // Phase D (core): this core lost a bank it needs, so its
-                // bundle does NOT commit this cycle. `stall_for_bank` already
-                // charged the one-cycle stall during arbitration; calling
-                // `step` as well would clear WaitBank, execute the bundle
-                // anyway, and double-charge the tick -- so the two are
-                // strictly exclusive, enforced by this `continue`. The PC is
-                // untouched, so the SAME bundle re-arbitrates next cycle
-                // (AM020 ch.2:166 retry contract).
-                if arbitration[self.device.array.tile_index(col as u8, row as u8)].core_lost {
-                    // Mirror the stall into Core_Status the same way every
-                    // other stall class does (task 6 review, Important-1): a
-                    // WaitBank cycle IS a memory-bank access that lost
-                    // arbitration, i.e. exactly the AM025 Memory_Stall_*
-                    // condition, so it gets the same `mem` bit as a real
-                    // memory stall. Without this, Core_Status read while
-                    // bank-stalled would show a running core, and a
-                    // Debug_Control2 MEM_STALL_HALT enable would never fire
-                    // on a lost bank arbitration. `update_stalls` also
-                    // re-evaluates the stall-halt latch, so that enable now
-                    // takes effect here exactly as it does for the other
-                    // stall classes below.
-                    if let Some(tile) = self.device.tile_mut(col, row) {
-                        tile.core_debug.update_stalls(true, false, false, false);
-                    }
-                    all_halted = false;
-                    any_running = true;
-                    continue;
-                }
+                // Phase D (core): a core whose access lost its bank was told so in
+                // `arbitrate_memory_banks` (`settle_bank_arbitration`); its step is this
+                // cycle's frozen memory cycle (`StepResult::Frozen`, memory stall), whatever
+                // bundle it was about to issue.
 
                 // AIE2 lock quadrant routing: copy neighbor locks before stepping,
                 // then write changes back after. Per mlir-aie getLockLocalBaseIndex:
@@ -1733,8 +1703,8 @@ impl InterpreterEngine {
         //     bank that had more than one requester this cycle, in that cycle:
         //     every cycle the core and a DMA (or two DMAs) wanted the bank,
         //     whoever was served, and never a lone retry (silicon, arb probe).
-        //   * MEMORY_STALL on the core-module trace unit, one cycle after each
-        //     cycle the core lost (silicon, arb probe), as a held LEVEL:
+        //   * MEMORY_STALL on the core-module trace unit, in each cycle the
+        //     core lost (its frozen memory cycle; silicon, arb probe), as a held LEVEL:
         //     `mem_stall_edge` turns the per-cycle "core lost" boolean into
         //     rising/falling edges, so a sustained stall renders as one B..E
         //     span instead of one pulse per cycle (HW samples MEMORY_STALL as
@@ -1765,12 +1735,11 @@ impl InterpreterEngine {
                     if arb.core_lost || frozen {
                         self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
                     }
-                    // A lost bank arbitration is stamped one cycle late (see
-                    // `bank_lost_last_cycle`); a gather's frozen memory cycle on
-                    // its own cycle, as before.
-                    let lost_before =
-                        std::mem::replace(&mut self.cores[core_idx].bank_lost_last_cycle, arb.core_lost);
-                    let stalled = lost_before || frozen;
+                    // MEMORY_STALL is stamped in the lost cycle itself, the core's frozen
+                    // memory cycle, as a gather's (silicon, arb probe: issue + 4 in the core
+                    // module's timer, 82 of 82 loss rows; gather `gat`: issue + 4). A loss
+                    // while the core is held on a lock still raises it (unmeasured).
+                    let stalled = arb.core_lost || frozen;
 
                     let Some(active) = mem_stall_edge(stalled, self.cores[core_idx].mem_stall_active) else {
                         continue;
@@ -2229,14 +2198,10 @@ impl InterpreterEngine {
     /// Phase 2 (it cannot issue). Declaring for them would deny the other agent
     /// a bank against a requester that never runs.
     ///
-    /// The core's stall is applied HERE, not in Phase 2, so that `step` and
-    /// `stall_for_bank` can never both run for one core in one cycle: Phase 2
-    /// skips a core whose `core_lost` is set. `accumulate_bank_grants` runs
-    /// after `stall_for_bank` (which asserts the sticky mask is empty on a
-    /// FRESH stall) and feeds the ports that already won back into the next
-    /// cycle's peek, so a bundle whose own ports collide converges instead of
-    /// livelocking. The mask is reset inside `try_resume_stall` when WaitBank
-    /// resolves -- the coordinator keeps no second copy.
+    /// The core's requests are the accesses of bundles it issued earlier whose memory stage
+    /// is this cycle (`CoreInterpreter::peek_bank_demand`); the outcome goes straight back to
+    /// it (`settle_bank_arbitration`): the served banks are done, and a loss freezes the core
+    /// for this cycle, which its step in Phase 2 turns into a `Frozen` memory-stall cycle.
     fn arbitrate_memory_banks(&mut self) -> Vec<TileArbitration> {
         let mut out = vec![TileArbitration::default(); self.device.array.tiles.len()];
 
@@ -2276,9 +2241,8 @@ impl InterpreterEngine {
                 if self.cores[core_idx].enabled
                     && self.device.array.clock().is_module_active(c, r, ModuleKind::Core)
                 {
-                    let tile = &self.device.array.tiles[tile_idx];
                     let core = &mut self.cores[core_idx];
-                    demands.extend(core.interpreter.peek_bank_demand(&core.context, tile, layout));
+                    demands.extend(core.interpreter.peek_bank_demand(&core.context));
                 }
 
                 if demands.is_empty() {
@@ -2297,23 +2261,13 @@ impl InterpreterEngine {
 
                 out[tile_idx].dma_demand = dma_demand;
 
-                if arb.core_lost() {
-                    out[tile_idx].core_lost = true;
-                    let core = &mut self.cores[core_idx];
-                    core.interpreter.stall_for_bank(&mut core.context);
-                    core.interpreter.accumulate_bank_grants(arb.granted_core_banks());
-                } else {
-                    // Constraint: a core that is NOT mid bank-stall must carry
-                    // no sticky served-ports mask -- otherwise the next bundle
-                    // would silently have those ports dropped from arbitration.
-                    // (`try_resume_stall`'s WaitBank arm owns the reset; the
-                    // coordinator keeps no second copy of the mask.)
-                    debug_assert!(
-                        self.cores[core_idx].interpreter.status() == CoreStatus::WaitBank
-                            || self.cores[core_idx].interpreter.bank_served_banks().is_empty(),
-                        "a freshly-issuing bundle must start with an empty served mask"
-                    );
-                }
+                out[tile_idx].core_lost = arb.core_lost();
+                let core = &mut self.cores[core_idx];
+                core.interpreter.settle_bank_arbitration(
+                    &core.context,
+                    arb.granted_core_banks(),
+                    arb.core_lost(),
+                );
             }
         }
 
@@ -2998,39 +2952,6 @@ mod tests {
         assert_eq!(engine.enabled_cores(), 0);
     }
 
-    #[test]
-    fn wait_bank_core_does_not_count_as_all_cores_blocked() {
-        // A bank-stalled core is making BOUNDED progress: the arbiter is
-        // round-robin over a fixed requester set and provably
-        // starvation-free (see `no_requester_starves_under_the_retry_contract`
-        // near the bank arbiter), so the core is guaranteed to win its bank
-        // within a bounded number of cycles. That's fundamentally unlike
-        // WaitingLock/WaitingDma/WaitingStream, which may block indefinitely
-        // (e.g. a lock another core never releases).
-        //
-        // all_cores_blocked()'s only consumer is the FFI warm-up break
-        // (crates/xdna-emu-ffi/src/backend.rs), which means "stop warming up,
-        // NO core can make forward progress." If WaitBank counted here, the
-        // common warm-up shape -- N-1 cores parked on WaitingLock while the
-        // last core is still mid init-loop -- would flip all_cores_blocked()
-        // true the instant that last core self-collides on a bank for a
-        // single cycle, breaking warm-up before the init loop finishes and
-        // letting NPU instructions write tile memory too early.
-        let mut engine = InterpreterEngine::new_npu1();
-        engine.enable_core(1, 2);
-
-        let idx = engine.core_index(1, 2).expect("(1,2) is a valid compute tile");
-        let core_state = &mut engine.cores[idx];
-        core_state.interpreter.stall_for_bank(&mut core_state.context);
-
-        assert_eq!(engine.core_status(1, 2), Some(CoreStatus::WaitBank));
-        assert!(
-            !engine.all_cores_blocked(),
-            "a WaitBank core must not count toward all_cores_blocked() -- \
-             it is bounded-progress, not indefinitely blocked"
-        );
-    }
-
     /// End-to-end: a core storing into physical bank 0 every cycle while an
     /// MM2S DMA channel reads from the SAME bank must actually lose some of
     /// those cycles to the arbiter -- and pay for them. The bank's served-access
@@ -3038,7 +2959,7 @@ mod tests {
     /// the producer probe's dense march-store lost 18-20 cycles per run).
     ///
     /// This is the wiring test for the request -> arbitrate -> commit loop:
-    /// the arbiter, the two peeks and `stall_for_bank` all have their own unit
+    /// the arbiter, the two peeks and the core's memory freeze all have their own unit
     /// tests, but only the coordinator can prove that a real bundle competing
     /// with a real DMA transfer over a real bank ends up stalled, that the
     /// stall costs a cycle, and that MEMORY_STALL is emitted for it.
@@ -3121,13 +3042,16 @@ mod tests {
     /// core-module perf counter configured with start_event=MEMORY_STALL(23)
     /// instead of the timing-context stat.
     /// Event semantics (silicon, lock-fetch arb probe, NPU1 2026-11): a cycle the core loses
-    /// the bank raises MEMORY_STALL one cycle later (82 of 82 loss rows), one stall cycle per
-    /// lost cycle; CONFLICT_DM_BANK marks every cycle the core and the DMA both wanted the bank,
-    /// the one the DMA won included, and never the core's lone retry after it. Same fixture as
+    /// the bank is a frozen cycle with MEMORY_STALL raised in it (core module: the losing
+    /// access's issue + 4, 82 of 82 loss rows, as a gather's frozen memory cycle), one stall
+    /// cycle per lost cycle. The silicon "+1" between MEMORY_STALL and CONFLICT_DM_BANK is a
+    /// difference of two trace units' timers, not a latency. CONFLICT_DM_BANK marks every cycle
+    /// the core and the DMA both wanted the bank, the one the DMA won included, and never the
+    /// core's lone retry after it. Same fixture as
     /// `core_and_dma_contending_for_one_bank_costs_the_core_cycles`: a core storing into bank 0
     /// every cycle against an MM2S reading bank 0.
     #[test]
-    fn a_lost_bank_cycle_raises_memory_stall_one_cycle_later() {
+    fn a_lost_bank_cycle_raises_memory_stall_in_that_cycle() {
         use crate::device::dma::BdConfig;
         use crate::interpreter::engine::bank_census;
         use crate::interpreter::state::MOD_BASE_DJ;
@@ -3176,8 +3100,7 @@ mod tests {
             records.iter().filter(|r| r.contended_banks & 1 != 0).map(|r| r.cycle).collect();
         assert!(lost.len() >= 2, "the fixture must make the core lose ({lost:?})");
         let stalled: Vec<u64> = level.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
-        let expected: Vec<u64> = lost.iter().map(|c| c + 1).collect();
-        assert_eq!(stalled, expected, "MEMORY_STALL one cycle after each lost cycle, one per loss");
+        assert_eq!(stalled, lost, "MEMORY_STALL in each lost cycle, one per loss");
         for c in &lost {
             assert!(contended.contains(c), "the cycle the DMA won is a conflict ({c})");
             assert!(
@@ -3713,8 +3636,8 @@ mod tests {
         // `mem_stall_active` is the held-level edge state for MEMORY_STALL: the
         // coordinator only emits an event when it CHANGES. Its tile-side
         // counterpart (`dma_mem_pressure_active`) is cleared by the array reset,
-        // so leaving this one set is a half-reset: a run that ends with a core in
-        // WaitBank leaves it true, and the first cycle of the NEXT run in which
+        // so leaving this one set is a half-reset: a run that ends with a core
+        // losing a bank leaves it true, and the first cycle of the NEXT run in which
         // the core does not lose a bank emits a MEMORY_STALL *deassert* on a
         // freshly-armed trace unit -- a phantom falling edge with no rising edge
         // before it. Same class as the pending-mem-trace and perf-counter leaks
