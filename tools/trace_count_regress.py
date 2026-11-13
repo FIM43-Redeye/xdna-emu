@@ -119,6 +119,15 @@ packets hold a Start frame; ``Side.units``):
 * The cross-module offset section already skips a sample that lacks either unit (no rows, no
   offset); it is unchanged.
 
+Standing misses
+---------------
+Only changed rows are listed above, so a row the emulator has always got wrong is silent.  A
+*standing miss* is a measured row (some silicon sample carries its unit, after ``--exclude-cut-tails``
+if given) that did not change between the baseline and candidate emulator runs and whose candidate
+count lies outside the same widened silicon band the changed rows use.  Level rows that could not
+be reconstructed stay unscored; no row class is treated specially.  The text report ends with the
+total and a breakdown; the JSON ``standing_misses`` holds every row.  Never gated.
+
 Cross-module offset
 -------------------
 The compute tile's memory and core trace units are timed from different broadcast paths, so
@@ -478,6 +487,20 @@ class NotMeasured:
 
 
 @dataclass
+class StandingMiss:
+    """A measured row whose emulator count is outside the silicon band in baseline and candidate.
+
+    The row did not change between the two emulator runs (so it is not a changed row) and is not
+    gated: the list is the inventory of what the emulator has always got wrong.
+    """
+    key: RowKey
+    emu_count: int
+    hw_counts: list[int]
+    hw_carrying: int
+    hw_total: int
+
+
+@dataclass
 class UnitCoverage:
     """One trace unit (tile, module) of a test: who carries it.
 
@@ -516,6 +539,8 @@ class Report:
 
     # Rows no silicon sample measured (the unit is absent from all of them): neither pass nor fail.
     not_measured: list = field(default_factory=list)
+    # Measured rows outside the silicon band that did not change between the emulator runs.
+    standing: list = field(default_factory=list)
     # Per trace unit: how many silicon samples carry it, and how many of those lost their tail.
     units: list = field(default_factory=list)
 
@@ -554,6 +579,7 @@ class Report:
             "rows_changed": len(self.rows),
             "rows_unscored": len(self.unscored),
             "rows_not_measured": len(self.not_measured),
+            "rows_standing_miss": len(self.standing),
             "units_absent_from_hw_samples": sum(1 for u in self.units if u.hw_carrying < u.hw_total),
             "hw_samples_without_unit": sum(u.hw_total - u.hw_carrying for u in self.units),
             "hw_samples_tail_cut": sum(u.hw_tail_cut for u in self.units),
@@ -743,6 +769,9 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
             moved = (len(eb) != len(ec)
                      or (pb is not None and pa is not None and abs(pa - pb) > PATTERN_EPS))
             if not moved:
+                if ca > 0:
+                    rep.standing.append(StandingMiss(
+                        rk, len(ec), hw_counts, len(carrying), len(hw_sides_all)))
                 continue
             exact = len(set(hw_counts)) == 1 and len(hw_counts) > 1 and cb == 0 and ca > 0
             verdict, label, gate = _classify(cb, ca, pb, pa, max(hw_counts), exact)
@@ -831,6 +860,24 @@ def offset_section(rows: list[OffsetRow]) -> list[str]:
     return out
 
 
+def standing_section(rows: list[StandingMiss], limit: int = 12) -> list[str]:
+    """Non-gating inventory: total, then counts by test family and by module/event."""
+    def top(counter, label):
+        items = counter.most_common()
+        shown = [f"  {n:4d}  {name}" for name, n in items[:limit]]
+        if len(items) > limit:
+            shown.append(f"  {sum(n for _, n in items[limit:]):4d}  ({len(items) - limit} more {label})")
+        return shown
+    # The test name's trailing ".<placement>" suffix is not part of the family.
+    family = collections.Counter(re.sub(r"\.\d+_\d+$", "", r.key.test) for r in rows)
+    kind = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
+    event = collections.Counter(f"{kind.get(r.key.module, r.key.module)} {r.key.event}" for r in rows)
+    return (["", f"Standing misses ({len(rows)}): measured on silicon, emulator count outside the "
+                 f"band in baseline and candidate, unchanged between them; not gated (JSON lists them)",
+             " by test family:"] + top(family, "families")
+            + [" by module and event:"] + top(event, "events"))
+
+
 def format_text(rep: Report) -> str:
     s = rep.summary()
     out = [
@@ -878,6 +925,8 @@ def format_text(rep: Report) -> str:
             f"  {k.test}.{k.compiler} {k.tile()} {k.event}: {why}" for k, why in rep.unscored]
     if rep.offsets:
         out += offset_section(rep.offsets)
+    if rep.standing:
+        out += standing_section(rep.standing)
     out.append("")
     out.append("RESULT: " + ("FAIL" if rep.exit_code else "ok"))
     return "\n".join(out)
@@ -900,6 +949,7 @@ def to_json(rep: Report) -> dict:
         "unscored": [{"key": asdict(k), "reason": why} for k, why in rep.unscored],
         "dropped_samples": [list(t) for t in rep.dropped_samples],
         "offsets": [asdict(o) for o in rep.offsets],
+        "standing_misses": [dict(asdict(m), key=asdict(m.key)) for m in rep.standing],
         "not_measured": [dict(asdict(n), key=asdict(n.key)) for n in rep.not_measured],
         "units": [asdict(u) for u in rep.units],
         "emu_absent": [asdict(u) for u in rep.emu_absent],

@@ -822,3 +822,79 @@ def test_a_move_on_a_workload_dominated_tile_is_reported_not_flagged(tmp_path):
     row = offset_row(rep)
     assert row.verdict == "workload-dominated" and not row.gate_fail
     assert not any(o.gate_fail for o in rep.offsets)
+
+
+# --- standing misses --------------------------------------------------------
+
+def standing_setup(tmp_path, hw, emu, hw_extra=()):
+    """The same emulator capture in baseline and candidate, so no row changes."""
+    b = write_run(tmp_path, "base", {K: {"hw": hw, "emu": emu}})
+    c = write_run(tmp_path, "cand", {K: {"hw": hw, "emu": emu}})
+    extra = [write_run(tmp_path, f"extra{i}", {K: {"hw": e}}) for i, e in enumerate(hw_extra)]
+    return b, c, extra
+
+
+def test_a_standing_miss_is_counted_and_listed_in_json(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    b, c, x = standing_setup(tmp_path, hw, edge("X", periodic(3, 50)), hw_extra=[hw])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    assert rep.rows == [] and rep.exit_code == 0
+    (m,) = rep.standing
+    assert (m.key.event, m.emu_count, m.hw_counts) == ("X", 3, [10, 10, 10])
+    doc = tcr.to_json(rep)
+    assert doc["summary"]["rows_standing_miss"] == 1
+    (j,) = doc["standing_misses"]
+    assert j["key"]["test"] == "t" and j["key"]["event"] == "X" and j["emu_count"] == 3
+    assert j["hw_counts"] == [10, 10, 10]
+    text = tcr.format_text(rep)
+    assert "Standing misses (1)" in text and "RESULT: ok" in text
+
+
+def test_a_row_inside_the_band_is_not_a_standing_miss(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    b, c, x = standing_setup(tmp_path, hw, edge("X", periodic(10, 50)), hw_extra=[hw])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    assert rep.standing == []
+    assert "Standing misses" not in tcr.format_text(rep)
+
+
+def test_the_standing_miss_uses_the_widened_band(tmp_path):
+    # silicon 10 and 12: band [8, 14]; an emulator at 13 sits inside, at 15 outside
+    a, b2 = edge("X", periodic(10, 50)), edge("X", periodic(12, 50))
+    for n, expect in ((13, 0), (15, 1)):
+        d = tmp_path / str(n)
+        d.mkdir()
+        b = write_run(d, "base", {K: {"hw": a, "emu": edge("X", periodic(n, 50))}})
+        c = write_run(d, "cand", {K: {"hw": a, "emu": edge("X", periodic(n, 50))}})
+        x = write_run(d, "extra", {K: {"hw": b2}})
+        assert len(tcr.compare_runs(b, c, hw_samples=[x]).standing) == expect
+
+
+def test_a_row_not_measured_on_silicon_is_not_a_standing_miss(tmp_path):
+    only_core = edge("INSTR_VECTOR", periodic(5, 50))
+    mem = edge("X", periodic(7, 50), pkt=1)
+    b, c, x = standing_setup(tmp_path, only_core, mem + only_core)
+    rep = tcr.compare_runs(b, c)
+    assert len(rep.not_measured) == 1 and rep.standing == []
+
+
+def test_a_changed_row_is_not_double_reported(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    b = write_run(tmp_path, "base", {K: {"hw": hw, "emu": edge("X", periodic(3, 50))}})
+    c = write_run(tmp_path, "cand", {K: {"hw": hw, "emu": edge("X", periodic(4, 50))}})
+    rep = tcr.compare_runs(b, c)
+    assert len(rep.rows) == 1 and rep.standing == []
+
+
+def test_a_zero_emulator_row_the_silicon_unit_carries_is_a_standing_miss(tmp_path):
+    hw = edge("X", periodic(1, 50)) + edge("INSTR_VECTOR", periodic(5, 50))
+    b, c, x = standing_setup(tmp_path, hw, edge("INSTR_VECTOR", periodic(5, 50)))
+    rep = tcr.compare_runs(b, c)
+    assert [(m.key.event, m.emu_count) for m in rep.standing] == [("X", 0)]
+
+
+def test_standing_misses_never_change_the_exit_status(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    b, c, x = standing_setup(tmp_path, hw, edge("X", periodic(3, 50)))
+    assert tcr.compare_runs(b, c).exit_code == 0
+    assert tcr.main([str(b), str(c)]) == 0
