@@ -547,25 +547,29 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   24 of 174 and 10 of 48 (with a shifted-case mapping 174 of 174 and 34 of 48). Producer probe `collide`
   (conflict cycles counted level-expanded, silicon 1098 / 1098 / 1103; MEMORY_STALL 18 / 18 / 20; 9 of 15
   transfers colliding, stalls per transfer 2 1 0 3 0 repeating): before the lock law 1077 conflicts (another
-  count), 18 stalls; with the lock law 0 / 0 / none; now 603 conflicts, 24 stalls, 12 of 15 transfers
-  colliding, 2 2 2 2 0. `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls (with the lock law, same
+  count), 18 stalls; with the lock law 0 / 0 / none; with the core-side placement 603 / 24 / 12, 2 2 2 2 0;
+  with the late-granule gap (next section) 1095 conflicts, 18 stalls, 9 of 15 transfers colliding,
+  2 1 0 3 0 repeating, 12 of 15 transfers identical to silicon contact for contact and finish. `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls (with the lock law, same
   count: 545 / 157); no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
     In the two-channel camps the emulator splits the turns differently (MM2S 0 finishes at g + 52, silicon
     g + 58; with an S2MM, MM2S 0 at g + 82 against g + 62), though the 16 core losses fall where silicon's do.
-  - *Producer collisions.* Each transfer's first contacts now land as on silicon (first transfer
-    15b0x3* 19b1x3*, the second 15b0x1* 19b1x4, grant-relative), but after them the emulator's MM2S falls out of
-    step with the core's store dwells: silicon keeps meeting the march every 4 cycles for the rest of the BD
-    (runs of 2, core winning), the emulator meets it once or twice more and then not at all, so it has about
-    half the conflict cycles (603 against 1098) and the wrong per-transfer pattern (2 2 2 2 0 against
-    2 1 0 3 0). The first divergence: after the second transfer's `19b1x4` (the MM2S refused three times on
-    bank 1) silicon's next contact is at grant + 25, the emulator's at + 24. Silicon's MM2S keeps its request
-    lattice after a delayed access (next request no earlier than service + 2, fitted from the producer
-    captures); the emulator has no such rule (its fetches are paced by the word clock and the staging), so the
-    likely cause is DMA side, not shown. Also seen: silicon's MM2S stream backpressure at grant + 6 and + 15,
-    none in the emulator.
+  - *Producer collisions* (late-granule gap **modelled** 2026-11-13). After an access the bank refused, silicon's
+    MM2S asks for its next granule no earlier than two cycles after the refused one was served when that granule
+    was not accessible before (the producer fit's max(lattice slot, service + 2); in word-clock terms the
+    lattice slot is the cycle the granule becomes accessible); a granule accessible earlier follows the next
+    cycle (ring camps), and an access served at once leaves the next one to the word clock (every uncontended
+    lock-timing row). `DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES` (2, fitted), `WordClock::late_gap_allows`; test
+    `the_emulated_mm2s_against_the_producer_march_matches_silicon` (types A to D, contact for contact). Still
+    open: the third transfer of every five (the type-C transfer after a type B: 3 of 15) is granted one cycle
+    later against the core's stores than on silicon (grant to grant 1809 then 1806 against 1808 / 1807), so
+    its first contact is 15b0x2 19b1x2 instead of 15b0x3 20b1x2 and it finishes at g + 246, not 247; a 3-cycle
+    phase (the lock port's grid or the core's resume phase on lk_empty) is the likely seat, not shown. The
+    silicon MM2S stream backpressure at grant + 6 and + 15 (the stream goes to the shim S2MM, column 0) has no
+    emulator counterpart and is not needed by the 12 matching transfers: the channel has staging slack (15 to 18
+    of 27 words), so a one-cycle hold does not move its granule requests.
   - *Where the core's access sits* (**fixed** 2026-11-13). Silicon, one trace unit at a time: in the core
     module a load or store that loses its bank raises MEMORY_STALL at its issue + 4 (82 of 82 loss rows), the
     stamp a gather's frozen memory cycle has (counter reads put that freeze at issue + 4); llvm-aie gives loads,
