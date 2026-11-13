@@ -12,7 +12,7 @@ use xdna_archspec::aie2::timing::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Request {
     /// The run's first BD: no previous BD or lock grant to time a request from. Presented
-    /// every cycle from `first_grant - 1` (not measured; see `LockPort`).
+    /// every cycle from `first_grant - 1` (outside the rule; see `LockPort`).
     Ungated { first_grant: u64 },
     /// From the request step `q` on, grantable in 2 of every 3 steps.
     Gridded { q: u64 },
@@ -42,10 +42,13 @@ struct Target {
 /// arbiter applied it. STALLED_LOCK shows on [P, G - 1] with P = max(S + 2, Q - 1, the
 /// previous BD's last access - 1), S the step the BD's first word was sequenced.
 ///
-/// Not measured, chosen here: a run's first BD (no previous BD, no previous grant) is
-/// requested every cycle from the cycle it becomes the target, with Q its earliest grant;
-/// a BD whose run has no previous lock grant but has a previous BD takes Q = T + 3; the
-/// predicted last-access term of P assumes the access is not refused by the bank.
+/// Outside the rule, chosen here: a run's first BD (no previous BD, no previous grant) is
+/// requested every cycle from the cycle it becomes the target, with Q its earliest grant, so a
+/// release is always followed by the grant at + 2. Silicon's first-BD lock-fetch rows give + 2
+/// in 39 rows and + 3 in 12, a phase this rule does not reproduce (open: its anchor is not
+/// known). A BD whose run has no previous lock grant but has a previous BD takes Q = T + 3
+/// (not measured on its own). The predicted last-access term of P assumes the access is not
+/// refused by the bank (not measured).
 #[derive(Debug, Clone, Default)]
 pub struct LockPort {
     /// Grant step of the run's latest granted lock BD, its seq, and its FINISHED_BD step.

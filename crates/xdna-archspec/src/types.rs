@@ -1460,8 +1460,11 @@ pub struct DmaTiming {
     /// Granules a compute-tile MM2S word clock may have started ahead of the channel's
     /// presented bank accesses: 4. The clock sequences one word per cycle, granule by granule
     /// (4 words; a BD's short tail is a granule of its own and takes a whole slot), in chain
-    /// order across BD boundaries and lock waits; a granule starts only while fewer than this
-    /// many started granules wait for their access to be presented. Fitted (NPU1, 2026-11,
+    /// order across BD boundaries and lock waits. While the channel is parked on a lock (the BD
+    /// at the head of its accesses, or the BD it sequences into, acquires a lock and has not
+    /// presented an access) a granule starts only while fewer than this many started granules
+    /// wait for their access to be presented; unparked the clock runs on (a core camping on the
+    /// bank finds the DMA ready after every lost run, ring probe). Fitted (NPU1, 2026-11,
     /// `tools/gen_dma_lock_probe.py` sync and chain families): a long-parked channel holds 4
     /// granules at its grant whatever their size (a 2-word BD before a 14..17-word BD puts the
     /// lock-request step at 14/15, as with a 4-word one; a 16-word lead would put it at

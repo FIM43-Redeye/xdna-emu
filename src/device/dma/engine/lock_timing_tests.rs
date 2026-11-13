@@ -563,3 +563,98 @@ fn stalled_lock_rises_at_p_and_acq_ge_fires_the_cycle_before_the_grant() {
     let obs = run_chain(4, &mids("4f 16"), 64, Releaser::Free, Releaser::Core(15));
     assert_eq!((obs.stalls.as_slice(), obs.grant), (&[(2, 2), (13, 16)][..], 17), "b2n16, R 15");
 }
+
+/// The rows of the measured table (T1..T4, T6, T8..T10, T12; silicon, NPU1 2026-11,
+/// `tools/gen_dma_lock_probe.py` sync and chain families, g0 frame), each a measured row:
+/// T1 pre2 32, R 25 -> 27, 26 -> 29, 27 -> 29, 30 -> 32, 33 -> 35; T2 pre2 16, R 14 -> 17,
+/// 15 -> 17, 17 -> 20 (P 9, FINISHED 8 and 72); T3 pre2 5..8, R 15 / 16 -> 18 (FINISHED 6);
+/// T4 pre2 13 (P 7, FINISHED 8, 70 when granted by 18); T6 a 4-word mid on B: R g1 + 2 ->
+/// g1 + 4, g1 + 4 -> g1 + 6, g1 + 5 -> g1 + 9 (g1 + 7 its release slot, g1 + 8 the blocked
+/// phase), g1 + 8 -> g1 + 10, free -> g1 + 3; T8 pre2 20: g1 + 11, 12, 14, pre2 16 free:
+/// g1 + 8; T9 an 8-word mid: R g1 + 5 -> g1 + 7; T10 an S2MM releaser, R 38 -> 41; T12 a
+/// free-lock mid: R 15 -> 17, 16 -> 18, 17 -> 20, 20 -> 23, 23 -> 26, 26 -> 29, 28 -> 30.
+#[test]
+fn the_measured_table_rows_land_on_silicons_cycles() {
+    #[rustfmt::skip]
+    let sync: &[(&str, u32, i64, Option<i64>, &[(i64, i64)], &[i64])] = &[
+        // silicon row, N, R, grant, STALLED_LOCK after the head, FINISHED_BD
+        ("lt10 s2.hw", 32, 25, Some(27), &[(25, 26)], &[3, 24, 88]),
+        ("lt11 s3.hw", 32, 26, Some(29), &[(25, 28)], &[3, 24, 88]),
+        ("lt12 s2.hw", 32, 27, Some(29), &[(25, 28)], &[3, 24, 88]),
+        ("lt16 s2.hw", 32, 30, Some(32), &[(25, 31)], &[3, 24, 88]),
+        ("lt18 s1.hw", 32, 33, Some(35), &[(25, 34)], &[3, 24, 88]),
+        ("lt00 p1.hw", 16, 14, Some(17), &[(9, 16)], &[3, 8, 72]),
+        ("lt01 p1.hw", 16, 15, Some(17), &[(9, 16)], &[3, 8, 72]),
+        ("lt02 p1.hw", 16, 17, Some(20), &[(9, 19)], &[3, 8, 72]),
+        ("lt00 p1.hw", 5, 15, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt02 p1.hw", 5, 16, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt00 p1.hw", 6, 15, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt01 p2.hw", 6, 16, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt01 p1.hw", 7, 15, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt01 p2.hw", 7, 16, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt00 p2.hw", 8, 15, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt01 p1.hw", 8, 16, Some(18), &[(4, 17)], &[3, 6, 70]),
+        ("lt00 p1.hw", 13, 14, Some(16), &[(7, 15)], &[3, 8, 70]),
+        ("lt01 p1.hw", 13, 15, Some(18), &[(7, 17)], &[3, 8, 70]),
+        ("lt02 p1.hw", 13, 16, Some(18), &[(7, 17)], &[3, 8, 70]),
+    ];
+    for &(row, n, r, grant, stalls, finishes) in sync {
+        let mids = if n == 0 { vec![] } else { vec![Mid::Plain(n)] };
+        let obs = run_chain(4, &mids, 64, Releaser::Free, Releaser::Core(r));
+        assert_eq!((obs.stalls.as_slice(), obs.finishes.as_slice()), (stalls, finishes), "{row}");
+        if let Some(g) = grant {
+            assert_eq!((obs.held, obs.grant), (g, g), "{row}: grant");
+        }
+    }
+    #[rustfmt::skip]
+    let chain: &[(&str, u32, &str, u32, i64, i64, i64, &[(i64, i64)], &[i64])] = &[
+        // row, head, mids, waiting BD, RB, RA, grant, stalls, finishes (silicon; RB the fitted proxy)
+        ("T6 R g1+2: b1n00 q00_02 p2.hw", 4, "4c", 64, 15, 20, 22, &[(2, 17), (20, 21)], &[3, 21, 74]),
+        ("T6 R g1+4: b1n00 q00_03 p1.hw", 4, "4c", 64, 14, 20, 22, &[(2, 15), (18, 21)], &[3, 19, 74]),
+        ("T6 R g1+5: b1n00 q00_04 p1.hw", 4, "4c", 64, 14, 21, 25, &[(2, 15), (18, 24)], &[3, 19, 77]),
+        ("T6 R g1+8: b1n00 q00_07 p2.hw", 4, "4c", 64, 14, 24, 26, &[(2, 15), (18, 25)], &[3, 19, 78]),
+        ("T6 free: b1n00 q00_00 p1.hw", 4, "4c", 64, 15, 17, 21, &[(2, 17), (20, 20)], &[3, 21, 74]),
+        ("T8 G g1+11: b1n20 q00_00 p1.hw", 4, "4c 20", 64, 15, 17, 29, &[(2, 17)], &[3, 21, 30, 94]),
+        ("T8 G g1+12: b1n20 q00_09 p1.hw", 4, "4c 20", 64, 14, 26, 28, &[(2, 15)], &[3, 19, 28, 92]),
+        ("T8 G g1+14: b1n20 q00_10 p1.hw", 4, "4c 20", 64, 14, 27, 30, &[(2, 15), (29, 29)], &[3, 19, 28, 92]),
+        ("T8 free g1+8: b1n16 q00_00 p1.hw", 4, "4c 16", 64, 14, 16, 24, &[(2, 15)], &[3, 19, 24, 88]),
+        ("T9 R g1+5: b3p08 q00_04 p2.hw", 4, "8c", 64, 14, 21, 23, &[(2, 15), (18, 22)], &[3, 20, 76]),
+        ("T12 R 15: b2n16 q00_00 p1.hw", 4, "4f 16", 64, 14, 15, 17, &[(2, 2), (13, 16)], &[3, 6, 12, 76]),
+        ("T12 R 16: b2n16 q00_01 p1.hw", 4, "4f 16", 64, 14, 16, 18, &[(2, 2), (13, 17)], &[3, 6, 12, 76]),
+        ("T12 R 17: b2n16 q00_01 p2.hw", 4, "4f 16", 64, 15, 17, 20, &[(2, 2), (13, 19)], &[3, 6, 12, 76]),
+        ("T12 R 20: b2n16 q00_04 p1.hw", 4, "4f 16", 64, 15, 20, 23, &[(2, 2), (13, 22)], &[3, 6, 12, 76]),
+        ("T12 R 23: b2n16 q00_07 p2.hw", 4, "4f 16", 64, 15, 23, 26, &[(2, 2), (13, 25)], &[3, 6, 12, 78]),
+        ("T12 R 26: b2n16 q00_11 p1.hw", 4, "4f 16", 64, 14, 26, 29, &[(2, 2), (13, 28)], &[3, 6, 12, 81]),
+        ("T12 R 28: b2n16 q00_12 p1.hw", 4, "4f 16", 64, 15, 28, 30, &[(2, 2), (13, 29)], &[3, 6, 12, 82]),
+        ("T10: s1n16 qs t1.hw", 4, "16", 64, 14, 38, 41, &[(9, 40)], &[3, 8, 93]),
+    ];
+    for &(row, head, spec, big, rb, ra, grant, stalls, finishes) in chain {
+        let a = if row.starts_with("T10") {
+            Releaser::S2mm(ra)
+        } else {
+            Releaser::Core(ra)
+        };
+        let obs = run_chain(head, &mids(spec), big, Releaser::Core(rb), a);
+        assert_eq!(
+            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+            (grant, grant, stalls, finishes),
+            "{row}"
+        );
+    }
+}
+
+/// T11, the mid BDs of the short-BD cadence chains (silicon, NPU1 2026-11, chain family c2n /
+/// c2f): six lock-free 2-word BDs behind the head finish every 2 cycles (g0 + 3, 5, ..., 15);
+/// six 2-word BDs each on its own free lock every 3 (3, 6, ..., 21), each with a one-cycle
+/// STALLED_LOCK at its grant - 1 (2, 5, ..., 17). Only the mids are asserted: the waiting BD
+/// behind such a chain is outside the rule's scope (its STALLED_LOCK rises at g0 + 20 behind
+/// six lock-free mids and at 21 behind six free-lock ones on silicon; open, see the DMA gap
+/// doc).
+#[test]
+fn a_chain_of_short_bds_keeps_silicons_cadence_up_to_the_waiting_bd() {
+    let obs = run_chain(4, &mids("2 2 2 2 2 2"), 64, Releaser::Free, Releaser::Core(45));
+    assert_eq!(obs.finishes[..7], [3, 5, 7, 9, 11, 13, 15], "c2n");
+    let obs = run_chain(4, &mids("2f 2f 2f 2f 2f 2f"), 64, Releaser::Free, Releaser::Core(45));
+    assert_eq!(obs.finishes[..7], [3, 6, 9, 12, 15, 18, 21], "c2f");
+    assert_eq!(obs.stalls[..6], [(2, 2), (5, 5), (8, 8), (11, 11), (14, 14), (17, 17)], "c2f blips");
+}

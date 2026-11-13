@@ -2623,10 +2623,10 @@ impl DmaEngine {
 
     /// One cycle of a compute-tile MM2S (`uses_word_clock`): the memory side only.
     ///
-    /// The channel's word clock sequences the BD's words (address generation) one per cycle,
-    /// from `ChannelContext::word_clock_from` on, and on past the BD's last word into its
-    /// chained next BD (`word_clock_sequences`, which also holds the lead of a BD waiting for
-    /// its lock). A granule is accessed -- one 16-byte bank access, the channel's whole bank
+    /// The channel's word clock (`ChannelContext::word_clock`, ticked at the start of every
+    /// step) sequences the BD's words (address generation) one per cycle and on past the BD's
+    /// last word into the chained BDs behind it, holding its lead while the channel is parked on
+    /// a lock (`WordClock`). A granule is accessed -- one 16-byte bank access, the channel's whole bank
     /// demand this cycle -- in a cycle after its last word was sequenced, when the staging has
     /// room for it and, for a lock-started BD, from grant + `mm2s_lock_to_access_cycles`
     /// (`next_granule_fetch`). Its words enter the staging at the access and can leave for the
@@ -2635,8 +2635,8 @@ impl DmaEngine {
     /// granule delays FINISHED_BD (silicon, lock-fetch probe) while one on an earlier granule
     /// is covered by the word clock.
     ///
-    /// Both decisions read the start-of-cycle count of sequenced words: a word sequenced this
-    /// cycle is accessible from the next. The stream side is the staging drain
+    /// A word sequenced this cycle is accessible from the next; a BD's first access comes
+    /// `mm2s_bd_switch_access_gap_cycles` after the previous BD's last. The stream side is the staging drain
     /// (`drain_egress_staging`), which runs whatever the FSM is doing.
     fn word_clock_mm2s_cycle(
         &mut self,
@@ -2710,8 +2710,8 @@ impl DmaEngine {
     }
 
     /// One cycle of a compute MM2S BD waiting for its lock (`uses_word_clock`). The word clock
-    /// keeps sequencing (it does not wait for the lock); the bank access is what the lock
-    /// gates. On the grant the BD enters its data phase at once -- first BD and chained BD
+    /// keeps sequencing (it does not wait for the lock) and the lock port (`LockPort`) requests
+    /// the lock; the bank access is what the lock gates. Once the lock is held the BD enters its data phase at once -- first BD and chained BD
     /// alike, with no memory latency, channel start or post-grant countdown -- and may access
     /// memory from grant + `mm2s_lock_to_access_cycles` (silicon: lock-fetch probe, first access
     /// at grant + 2, first-BD == chained). The packet header is inserted at the grant.
@@ -4859,12 +4859,12 @@ mod bank_demand_tests {
         }
     }
 
-    /// The lead of a BD waiting for its lock counts every word the word clock has sequenced, the
+    /// The lead of a BD parked on its lock counts every granule the word clock has started, the
     /// chained next BD's included. Silicon (`tools/gen_dma_lock_probe.py` fetch `--sync --pre2`,
     /// 2026-11): a 4-word BD parked on its lock, chained to a lock-free BD of N words, finishes
-    /// that BD N - 11 cycles after its own (21 for N = 32 in 102 rows, 5 for N = 16): the 16-word
-    /// lead holds the parked BD's 4 words and the next BD's first 12, which go out in the burst,
-    /// and the next BD's remaining words follow the clock from grant + 3.
+    /// that BD N - 11 cycles after its own (21 for N = 32 in 102 rows, 5 for N = 16): the park
+    /// holds the parked BD's granule and the next BD's first 3, which go out in the burst, and
+    /// the next BD's remaining granules follow the clock from the parked BD's first access.
     #[test]
     fn a_parked_bds_lead_carries_into_its_lock_free_next_bd() {
         for (n, gap) in [(32u32, 21usize), (16, 5)] {
