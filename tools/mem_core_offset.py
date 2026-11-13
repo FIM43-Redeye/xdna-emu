@@ -83,8 +83,8 @@ def tile_offsets(emu, hw):
     return out
 
 
-def measure(emu_tree, silicon_dirs, only=()):
-    """{(test.compiler, tile): median over silicon samples of the offset}."""
+def measure_samples(emu_tree, silicon_dirs, only=()):
+    """{(test.compiler, tile): [offset per silicon sample]}, one entry per silicon dir that has the test."""
     result = {}
     for emu_dir in sorted(Path(emu_tree).glob("*.emu")):
         key = emu_dir.name[: -len(".emu")]
@@ -93,16 +93,18 @@ def measure(emu_tree, silicon_dirs, only=()):
         emu = load_tiles(emu_dir)
         if not emu:
             continue
-        per_tile = {}
         for sd in silicon_dirs:
             hw = load_tiles(Path(sd) / f"{key}.hw")
             if not hw:
                 continue
             for tile, off in tile_offsets(emu, hw).items():
-                per_tile.setdefault(tile, []).append(off)
-        for tile, offs in per_tile.items():
-            result[(key, tile)] = statistics.median(offs)
+                result.setdefault((key, tile), []).append(off)
     return result
+
+
+def measure(emu_tree, silicon_dirs, only=()):
+    """{(test.compiler, tile): median over silicon samples of the offset}."""
+    return {k: statistics.median(v) for k, v in measure_samples(emu_tree, silicon_dirs, only).items()}
 
 
 def summarise(values):

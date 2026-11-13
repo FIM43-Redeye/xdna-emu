@@ -72,3 +72,14 @@ def test_cli_prints_per_tile_and_summary(tmp_path, capsys):
     assert M.main(["--emu", str(emu), "--silicon", str(hw)]) == 0
     out = capsys.readouterr().out
     assert "t.chess tile(0, 2)" in out and "-1" in out and "1 test-tiles; median -1" in out
+
+
+def test_measure_samples_keeps_one_offset_per_silicon_sample(tmp_path):
+    emu = tmp_path / "emu"
+    write_side(emu, "t.chess.emu", rows(0, 2))
+    hws = []
+    for i, mem_hw in enumerate((0, 1, 1)):
+        d = tmp_path / f"hw{i}"
+        write_side(d, "t.chess.hw", rows(0, mem_hw))
+        hws.append(d)
+    assert M.measure_samples(emu, hws) == {("t.chess", (0, 2)): [2, 1, 1]}
