@@ -541,10 +541,14 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             ("DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS", t.dma.mm2s_lock_request_trigger_words),
             ("DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES", t.dma.mm2s_lock_request_trigger_latency_cycles),
             ("DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES", t.dma.mm2s_lock_release_after_finish_cycles),
+            ("DMA_MM2S_LOCK_BDS_IN_FLIGHT", t.dma.mm2s_lock_bds_in_flight),
             ("DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES", t.dma.mm2s_lock_grant_period_cycles),
             ("DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE", t.dma.mm2s_lock_grant_blocked_phase),
             ("DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES", t.dma.mm2s_lock_grant_visible_cycles),
-            ("DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES", t.dma.mm2s_lock_stall_after_sequencing_cycles),
+            (
+                "DMA_MM2S_LOCK_STALL_BEFORE_FIRST_GRANULE_CYCLES",
+                t.dma.mm2s_lock_stall_before_first_granule_cycles,
+            ),
             ("DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES", t.dma.mm2s_lock_stall_before_request_cycles),
             (
                 "DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES",

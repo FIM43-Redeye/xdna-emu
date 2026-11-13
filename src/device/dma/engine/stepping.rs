@@ -1792,8 +1792,9 @@ impl DmaEngine {
     fn note_bd_finished(&mut self, ch_idx: usize, completion: &CompletionInfo) {
         let now = self.read_clock;
         let ch = &mut self.channels[ch_idx];
-        if let Some(seq) = ch.word_clock.current().map(|b| b.seq) {
-            ch.lock_port.note_finished(seq, now);
+        if let Some((seq, acquires)) = ch.word_clock.current().map(|b| (b.seq, b.spec.acquire.is_some())) {
+            ch.lock_port.note_finished(acquires, now);
+            ch.word_clock.note_finished(seq, now);
         }
         self.channels[ch_idx].stats.transfers_completed += 1;
         self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;

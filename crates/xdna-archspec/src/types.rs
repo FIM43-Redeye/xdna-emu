@@ -1535,8 +1535,18 @@ pub struct DmaTiming {
     /// Cycles from a compute-tile MM2S lock BD's FINISHED_BD to the one cycle in which the
     /// channel's next lock request is neither made nor granted (read as the BD's own lock
     /// release on the channel's lock port): 4. Fitted, same data; only 4-word predecessors
-    /// show the slot.
+    /// show the slot. The short-BD chains (k4f, c1f..c4f) show every earlier lock BD's slot
+    /// blocking a grant, and the same cycle bounding when the lock BD three later starts
+    /// sequencing (`mm2s_lock_bds_in_flight`).
     pub mm2s_lock_release_after_finish_cycles: u8,
+
+    /// Lock-acquiring BDs a compute-tile MM2S holds between a BD's sequencing start and its
+    /// lock release (FINISHED_BD + `mm2s_lock_release_after_finish_cycles`): 3. A lock BD
+    /// starts sequencing no earlier than the release of the lock BD three before it. Fitted
+    /// (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` chain families k4f and c1f..c4f): the
+    /// sequencing starts are implied by measured STALLED_LOCK rises and FINISHED_BDs; reading
+    /// them as those releases is inferred. Two or four lose fitted rows.
+    pub mm2s_lock_bds_in_flight: u8,
 
     /// Period of the compute-tile MM2S lock grant: from its request on, a channel's acquire
     /// can be granted in 2 of every 3 cycles: 3. Fitted, same data. What blocks one cycle in
@@ -1556,10 +1566,11 @@ pub struct DmaTiming {
     pub mm2s_lock_grant_visible_cycles: u8,
 
     /// STALLED_LOCK of a compute-tile MM2S lock BD rises no earlier than this many cycles
-    /// after the BD's first word is sequenced: 2. Fitted (NPU1, 2026-11,
-    /// `tools/gen_dma_lock_probe.py`); the other two bounds are
+    /// before the BD's first granule has its last word sequenced: 1. Fitted (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py`; a 3-word BD sequenced from 7 rises at 8, chain c3f; for a
+    /// 4-word first granule this is the first word + 2); the other two bounds are
     /// `mm2s_lock_stall_before_request_cycles` and `mm2s_lock_stall_before_last_access_cycles`.
-    pub mm2s_lock_stall_after_sequencing_cycles: u8,
+    pub mm2s_lock_stall_before_first_granule_cycles: u8,
 
     /// STALLED_LOCK rises no earlier than this many cycles before the BD's lock request: 1.
     /// Fitted, same data (a free lock shows a one-cycle level before its grant).

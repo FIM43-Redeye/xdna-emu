@@ -1,10 +1,12 @@
 //! Compute-tile MM2S lock port: when a BD's lock is requested and granted.
 
+use std::collections::VecDeque;
+
 use super::word_clock::WordClock;
 use xdna_archspec::aie2::timing::{
     DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE, DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES, DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES,
     DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES, DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES,
-    DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES, DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES,
+    DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES, DMA_MM2S_LOCK_STALL_BEFORE_FIRST_GRANULE_CYCLES,
     DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES, DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES,
 };
 
@@ -34,13 +36,21 @@ struct Target {
 /// Silicon (NPU1, `tools/gen_dma_lock_probe.py` sync and chain families, every design with
 /// at most four MM2S BDs): for a BD that acquires a lock, with g the grant of the channel's
 /// previous lock-acquiring BD and T the step the previous BD's trigger word was sequenced,
-/// the request is Q = max(g + 3, T + 3), moved off DEAD = that previous lock BD's
-/// FINISHED_BD + 4. The grant G (STALLED_LOCK falling) is the first step >= max(Q, R + 2)
-/// with (G - Q) mod 3 != 2 and G != DEAD, R the release that made the lock available;
-/// LOCK_SEL*_ACQ_GE fires at G - 1 (the arbiter grants then, `DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES`
-/// before the channel holds it), and a release reaches this requester one step after the
-/// arbiter applied it. STALLED_LOCK shows on [P, G - 1] with P = max(S + 2, Q - 1, the
-/// previous BD's last access - 1), S the step the BD's first word was sequenced.
+/// the request is Q = max(g + 3, T + 3), moved off DEAD, the release slots (FINISHED_BD + 4)
+/// of the run's earlier lock BDs. The grant G (STALLED_LOCK falling) is the first step >=
+/// max(Q, R + 2) with (G - Q) mod 3 != 2 and G not in DEAD, R the release that made the lock
+/// available; LOCK_SEL*_ACQ_GE fires at G - 1 (the arbiter grants then,
+/// `DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES` before the channel holds it), and a release reaches
+/// this requester one step after the arbiter applied it. STALLED_LOCK shows on [P, G - 1] with
+/// P = max(D, Q, the previous BD's last access) - 1, D the step the BD's first granule has its
+/// last word sequenced.
+///
+/// DEAD and D as stated come from the short-BD chains (chain families k4f, c1f..c4f): a chain
+/// of 4-word free-lock BDs is never granted at the fourth BD's FINISHED_BD + 4 two BDs before
+/// the waiting one (MEASURED; that it is that BD's own release slot is INFERRED), and a 3-word
+/// BD whose first word is sequenced at 7 shows STALLED_LOCK from 8 (MEASURED). Designs with
+/// at most four BDs have one earlier lock BD whose slot can matter and a 4-word first granule
+/// (D - 1 = S + 2), where the two readings agree.
 ///
 /// Outside the rule, chosen here: a run's first BD (no previous BD, no previous grant) is
 /// requested every cycle from the cycle it becomes the target, with Q its earliest grant, so a
@@ -51,10 +61,11 @@ struct Target {
 /// refused by the bank (not measured).
 #[derive(Debug, Clone, Default)]
 pub struct LockPort {
-    /// Grant step of the run's latest granted lock BD, its seq, and its FINISHED_BD step.
+    /// Grant step of the run's latest granted lock BD, and its seq.
     last_grant: Option<u64>,
     last_seq: Option<u64>,
-    last_finish: Option<u64>,
+    /// DEAD: the release slots (FINISHED_BD + 4) of the run's latest finished lock BDs.
+    release_slots: VecDeque<u64>,
     target: Option<Target>,
 }
 
@@ -63,18 +74,17 @@ impl LockPort {
         *self = Self::default();
     }
 
-    /// DEAD: the previous lock BD's own release slot (its FINISHED_BD + 4), once it finished.
-    fn dead(&self) -> Option<u64> {
-        self.last_finish.map(|f| f + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64)
+    /// Whether `at` is in DEAD: an earlier lock BD's release slot.
+    fn dead(&self, at: u64) -> bool {
+        self.release_slots.contains(&at)
     }
 
     /// The request step, moved off DEAD.
-    fn effective_q(&self, q: u64) -> u64 {
-        if Some(q) == self.dead() {
-            q + 1
-        } else {
-            q
+    fn effective_q(&self, mut q: u64) -> u64 {
+        while self.dead(q) {
+            q += 1;
         }
+        q
     }
 
     /// The lock the channel presents to the arbiter at step `at` (whose grant would be held
@@ -89,7 +99,7 @@ impl LockPort {
                 grant >= q
                     && (grant - q) % DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES as u64
                         != DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE as u64
-                    && Some(grant) != self.dead()
+                    && !self.dead(grant)
             }
         };
         ok.then_some((t.lock_id, t.acquire_value))
@@ -104,13 +114,18 @@ impl LockPort {
         wc.set_granted(t.seq, g);
         self.last_grant = Some(g);
         self.last_seq = Some(t.seq);
-        self.last_finish = None;
     }
 
-    /// The current BD `seq` finished at `at`.
-    pub fn note_finished(&mut self, seq: u64, at: u64) {
-        if self.last_seq == Some(seq) {
-            self.last_finish = Some(at);
+    /// The current BD finished at `at`; `acquires` says it held a lock (its release slot is
+    /// FINISHED_BD + 4).
+    pub fn note_finished(&mut self, acquires: bool, at: u64) {
+        if acquires {
+            self.release_slots
+                .push_back(at + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64);
+            // Slots further back lie before any request still being timed.
+            while self.release_slots.len() > 8 {
+                self.release_slots.pop_front();
+            }
         }
     }
 
@@ -166,8 +181,10 @@ impl LockPort {
         if bd.granted_at.is_some_and(|g| g <= now) {
             return false;
         }
-        let Some(start) = bd.start_at else { return false };
-        if start + (DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES as u64) > now {
+        let Some(first_done) = bd.first_granule_done_at() else {
+            return false;
+        };
+        if first_done > now + DMA_MM2S_LOCK_STALL_BEFORE_FIRST_GRANULE_CYCLES as u64 {
             return false;
         }
         let q = match t.request {

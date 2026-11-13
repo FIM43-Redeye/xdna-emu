@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 
 use xdna_archspec::aie2::timing::{
     DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES,
+    DMA_MM2S_LOCK_BDS_IN_FLIGHT, DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES,
     DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS, DMA_MM2S_WORD_CLOCK_LEAD_GRANULES,
 };
 
@@ -82,6 +83,11 @@ impl ChainBd {
         self.spec.acquire.is_some() && self.first_presented.is_none_or(|p| p >= now)
     }
 
+    /// Step the BD's first granule has its last word sequenced, once it was started.
+    pub fn first_granule_done_at(&self) -> Option<u64> {
+        self.start_at.map(|s| s + GRANULE_WORDS.min(self.spec.words).max(1) as u64 - 1)
+    }
+
     /// Whether every word has been accessed.
     pub fn fully_accessed(&self) -> bool {
         self.accessed_words >= self.spec.words
@@ -130,6 +136,15 @@ impl SeqGranule {
 /// finds the DMA ready after every lost run, and a lost first access leaves granule 4 at grant
 /// + 7 (lock-fetch probe). M1g bounds the lead always; in the uncontended rows it was fitted to
 /// the two readings agree.
+///
+/// A lock-acquiring BD starts sequencing no earlier than the lock release (FINISHED_BD +
+/// `DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES`) of the run's lock BD
+/// `DMA_MM2S_LOCK_BDS_IN_FLIGHT` lock BDs before it, and the clock, sequencing in order, waits
+/// with it. Silicon (NPU1, 2026-11, chain families k4f and c1f..c4f, head frame): MEASURED, the
+/// sequencing starts the rises and finishes imply (the third of a chain of 4-word free-lock BDs
+/// starts at exactly 7, the 64-word BD behind two, three or five of them at 7, 11 or 19);
+/// INFERRED, that those are the release cycles of the third lock BD before (three lock BDs in
+/// flight between sequencing start and release). No chain with three lock BDs or fewer meets it.
 #[derive(Debug, Clone, Default)]
 pub struct WordClock {
     /// Step from which the clock sequences.
@@ -147,6 +162,9 @@ pub struct WordClock {
     /// Step from which the next access may come, after an access whose next granule was not
     /// sequenced yet (`late_gap_allows`).
     late_gap_until: u64,
+    /// The run's lock-acquiring BDs in chain order (seq, FINISHED_BD step once finished), the
+    /// latest few: the in-flight bound looks `DMA_MM2S_LOCK_BDS_IN_FLIGHT` back.
+    lock_bds: VecDeque<(u64, Option<u64>)>,
 }
 
 impl WordClock {
@@ -165,6 +183,33 @@ impl WordClock {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.bds.push_back(ChainBd::new(seq, spec));
+        if spec.acquire.is_some() {
+            self.lock_bds.push_back((seq, None));
+            while self.lock_bds.len() > 2 * DMA_MM2S_LOCK_BDS_IN_FLIGHT as usize + 2 {
+                self.lock_bds.pop_front();
+            }
+        }
+    }
+
+    /// BD `seq` finished (its FINISHED_BD) at step `at`.
+    pub fn note_finished(&mut self, seq: u64, at: u64) {
+        if let Some(e) = self.lock_bds.iter_mut().find(|e| e.0 == seq) {
+            e.1 = Some(at);
+        }
+    }
+
+    /// Whether lock BD `seq` may start sequencing at `now`: the lock BD
+    /// `DMA_MM2S_LOCK_BDS_IN_FLIGHT` lock BDs before it has released its lock by then.
+    fn lock_bd_may_start(&self, seq: u64, now: u64) -> bool {
+        let Some(i) = self.lock_bds.iter().position(|e| e.0 == seq) else {
+            return true;
+        };
+        let Some(back) = i.checked_sub(DMA_MM2S_LOCK_BDS_IN_FLIGHT as usize) else {
+            return true;
+        };
+        self.lock_bds[back]
+            .1
+            .is_some_and(|f| now >= f + DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES as u64)
     }
 
     /// Whether the clock has been started (a compute MM2S channel with work).
@@ -219,6 +264,12 @@ impl WordClock {
         let Some(pos) = self.bds.iter().position(|b| b.started_words < b.spec.words) else {
             return;
         };
+        if self.bds[pos].started_words == 0
+            && self.bds[pos].spec.acquire.is_some()
+            && !self.lock_bd_may_start(self.bds[pos].seq, now)
+        {
+            return;
+        }
         let head = self.granules.front().and_then(|g| self.bd(g.bd_seq)).unwrap_or(&self.bds[pos]);
         if head.parks(now) || self.bds[pos].parks(now) {
             let waiting = self.granules.iter().filter(|g| g.presented_at.is_none_or(|p| p >= now)).count();
