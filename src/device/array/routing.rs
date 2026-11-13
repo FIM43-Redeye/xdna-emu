@@ -88,9 +88,25 @@ impl TileArray {
             // +2, the same route on through the next column's shim +2, memtile trace -> shim
             // +1, shim trace -> next shim +0; and the shim's own trace packets reach its S2MM
             // at the same delay after thousands of quiet cycles as after none. Measured for
-            // trace words; that a data word into a quiet shim switch is not held either is
-            // INFERRED (the same switch).
+            // trace words and for words entering from North and West.
+            //
+            // One shim entry keeps the earlier charge: a data word of the shim's own DMA MM2S
+            // (the slave its mux feeds, `shim_mux_mm2s_slaves`) into a quiet shim switch is held
+            // one cycle, both passes skipped as for any gated switch. UNMEASURED, kept from the
+            // earlier model. The switch is stepped as a whole, so a trace word that happens to
+            // sit in it in that same cycle waits with the DMA word.
             let shim = matches!(self.tiles[i].tile_kind, TileKind::ShimNoc | TileKind::ShimPl);
+            if shim && self.clock.is_adaptive_ss_engaged(col, row) {
+                let tile = &self.tiles[i];
+                let dma_word = tile
+                    .shim_mux_mm2s_slaves
+                    .iter()
+                    .flatten()
+                    .any(|&s| tile.stream_switch.slaves.get(s).is_some_and(|p| p.has_data()));
+                if dma_word {
+                    continue;
+                }
+            }
             if !shim {
                 if advance && std::mem::take(&mut self.ss_late_wake[i]) {
                     continue;

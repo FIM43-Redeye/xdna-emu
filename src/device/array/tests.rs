@@ -1487,6 +1487,19 @@ mod gate_wake {
         }
     }
 
+    /// The shim's own DMA MM2S 0 entry: the slave the shim mux's DMA:0 -> South 3 feeds.
+    const SHIM_DMA_SLAVE: usize = shim::SOUTH_SLAVE_START as usize + 3;
+
+    fn shim_dma_to_memtile() -> Route {
+        Route {
+            start: (COL, 0, SHIM_DMA_SLAVE),
+            hops: vec![
+                (COL, 0, SHIM_DMA_SLAVE, shim::NORTH_MASTER_START as usize),
+                (COL, 1, mem_tile::SOUTH_SLAVE_START as usize, mem_tile::NORTH_MASTER_START as usize),
+            ],
+        }
+    }
+
     /// Steps from the push until the packet's first word is in the route's last master, with the switches in
     /// `gated` idle long enough to have engaged their adaptive gate and every other switch awake.
     fn steps_to_arrive(route: &Route, gated: &[(u8, u8)]) -> u32 {
@@ -1514,6 +1527,10 @@ mod gate_wake {
             );
         }
         let (scol, srow, sport) = route.start;
+        if sport == SHIM_DMA_SLAVE && srow == 0 {
+            // what the shim mux programming records for MM2S 0 (`Tile::shim_mux_mm2s_slaves`)
+            array.tile_mut(scol, srow).shim_mux_mm2s_slaves[0] = Some(SHIM_DMA_SLAVE);
+        }
         let sidx = array.tile_index(scol, srow);
         let header = PacketHeader::new(1, scol, srow).with_type(PacketType::Trace).encode();
         array.tiles[sidx].stream_switch.slaves[sport].push_with_tlast(header, false);
@@ -1569,5 +1586,14 @@ mod gate_wake {
     fn a_shim_trace_word_pays_nothing() {
         assert_eq!(wake_cost(&shim_own(), &[(COL, 0)]), 0);
         assert_eq!(wake_cost(&shim_to_next_shim(), &[(COL, 0), (COL + 1, 0)]), 0);
+    }
+
+    /// Unmeasured, kept from the earlier model: a data word of the shim's own DMA MM2S into a
+    /// quiet shim switch is held one cycle (the measured exemptions are trace words and words
+    /// from North and West).
+    #[test]
+    fn a_shim_dma_word_into_a_quiet_shim_switch_is_held_one_cycle() {
+        assert_eq!(wake_cost(&shim_dma_to_memtile(), &[(COL, 0)]), 1);
+        assert_eq!(wake_cost(&shim_dma_to_memtile(), &[(COL, 0), (COL, 1)]), 2);
     }
 }
