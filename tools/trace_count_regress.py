@@ -56,8 +56,9 @@ Scores (both are distances to silicon, lower is better)
   underestimate silicon's run-to-run spread and a 1-event EMU move inside it is
   not a regression. A repeatable row (all samples equal) stays exact. The band
   is the same for baseline and candidate scoring, so only the EMU change moves
-  the score.  ``hw_repeatable`` is True when two or more HW samples have the
-  same count.
+  the score.  Samples whose stream lost its tail are lower bounds and band differently (see
+  "Absent units and cut tails").  ``hw_repeatable`` is True when two or more uncut HW samples
+  have the same count.
 * Pattern score: 1-Wasserstein distance (cycles) between the EMU's and HW's
   inter-event gap distributions.  Gaps are shift invariant (no anchoring),
   and W1 is in cycles, so "gap 128 vs silicon 140" scores 12 and "131" scores
@@ -108,10 +109,22 @@ packets hold a Start frame; ``Side.units``):
   emulator's counts, neither pass nor fail (a gap that stays visible, not a row that vanishes).
 * A carried unit whose stream has no End token lost its tail (the events after the last full
   packet): "tail not delivered".  Reported per row and in the summary; counts of such samples
-  are lower bounds and bias a band low.  They stay in the band unless ``--exclude-cut-tails`` is
-  given, which leaves them out (a row with none left is then not measured).  Excluding is
-  opt-in: on the banked suite it moved 43 bands (mostly the free-running PERF_CNT_2 of the core
-  unit) but no gate verdict, and it would leave single-sample bands and unmeasured rows.
+  are lower bounds, not measurements (events after the cut are lost), and the gate scores them
+  as such (``count_band``): a cut sample constrains the row from below only.
+    - Mixed row (some samples uncut): the uncut samples form the band as usual.  A cut sample at
+      or below their minimum is consistent with it and adds nothing; one above their maximum
+      raises the band's top (the true count reaches at least that far).  So a free-running count
+      that cut tails bias low can no longer widen a band downward and hide an emulator that is
+      too high.
+    - All-cut row: bounded from below only.  Its lower edge is the smallest bound widened
+      downward by the spread of the bounds; there is no upper edge, so the row can fail only by
+      falling below the bound, and an emulator above it is consistent (events past the cut are
+      exactly what the stream cannot show).  The row line says "lower bound only", the JSON row
+      carries ``hw_lower_bounded: true``, and ``hw_cut`` flags each sample.
+  A cut sample's count is printed as a bound (``>=7``).  ``hw_repeatable`` and the broken-exact-
+  match rule look at the uncut samples only.  The pattern score still uses every sample's gaps
+  (a cut stream's gaps are a true prefix).  ``--exclude-cut-tails`` is retired: it discarded the
+  information the bound uses, and it left single-sample bands or unmeasured rows.
 * The emulator side is not excused: a unit the candidate emulator trace lacks while silicon
   carries it fails the gate when the baseline emulator trace carried it; when both emulator
   traces lack it, it is listed as standing (a gap, not a regression).
@@ -122,9 +135,9 @@ packets hold a Start frame; ``Side.units``):
 Standing misses
 ---------------
 Only changed rows are listed above, so a row the emulator has always got wrong is silent.  A
-*standing miss* is a measured row (some silicon sample carries its unit, after ``--exclude-cut-tails``
-if given) that did not change between the baseline and candidate emulator runs and whose candidate
-count lies outside the same widened silicon band the changed rows use.  Level rows that could not
+*standing miss* is a measured row (some silicon sample carries its unit) that did not change between the baseline and candidate emulator runs and whose candidate
+count lies outside the same silicon band the changed rows use (lower-bound semantics for cut
+streams included; the JSON rows carry ``hw_cut`` / ``hw_lower_bounded``).  Level rows that could not
 be reconstructed stay unscored; no row class is treated specially.  The text report ends with the
 total and a breakdown; the JSON ``standing_misses`` holds every row.  Never gated.
 

@@ -318,9 +318,14 @@ full packet), and the decoder shows it as a Start without the End token. The gat
 - A row no usable silicon sample carries is listed under "not measured on silicon" with the
   emulator's counts; it is neither pass nor fail.
 - A carried unit with no End token is reported as "tail not delivered" (its counts are lower
-  bounds). Such samples stay in the band by default; `--exclude-cut-tails` leaves them out. It is
-  opt-in because on the banked suite excluding them moved bands (mostly the core unit's
-  free-running `PERF_CNT_2`) but no gate verdict, and it leaves single-sample bands.
+  bounds). A cut sample is scored as a lower bound, not a measurement: it constrains the row from
+  below only. Among uncut samples it adds nothing when it is at or below their minimum (otherwise a
+  free-running count that cut tails bias low would widen the band downward and hide an emulator
+  that is too high) and raises the band's top when it is above their maximum. A row whose samples
+  are all cut has no upper edge: its lower edge is the smallest bound widened by the spread of the
+  bounds, so it fails only by falling below the bound; the report line says "lower bound only" and
+  the JSON row has `hw_lower_bounded`. A cut count is printed as `>=N`. `--exclude-cut-tails` is
+  retired (it threw away what the bound uses).
 - The emulator gets no such allowance: a unit the candidate emulator trace lacks while silicon
   carries it fails the gate if the baseline emulator trace had it (a gap both emulator traces
   share is listed as standing).
