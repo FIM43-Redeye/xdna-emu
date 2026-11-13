@@ -533,9 +533,11 @@ BD's grant g0 (its STALLED_LOCK falls).
     starts at boot on its first lock BD and meets a core load after the release (`vec_nan_fp32_dense_add`,
     `vec_nan_bf16_dense_add`, `vec_nan_fp32_dense_sub`, `vec_nan_bf16_dense_sub`, Peano, three silicon samples
     each): silicon stamps CONFLICT_DM_BANK_0 at the last release pulse + 4, the emulator's slot, in 2 of 12
-    samples, at + 10 in 3 (where a + 3 grant's access at grant + 7 falls) and not at all in 7; the emulator
-    stamps + 4 in all four kernels. So a 0 / 0 / 0 kernel (`vec_nan_bf16_dense_sub`) is one draw, not a
-    systematic difference.
+    samples and at + 10 in 3 (where a + 3 grant's access at grant + 7 falls); the other 7 captures carry no
+    memory-module packet from the compute tile at all and so show nothing either way. The emulator stamps + 4
+    in all four kernels. Among the 5 captures that carry the packet the phase varies run to run; a 0 / 0 / 0
+    kernel (`vec_nan_bf16_dense_sub`) is three captures without the packet, not three samples without a
+    conflict.
   - *Grant phase of a lock BD whose previous BD had refused accesses* (open, 2026-11-13). Silicon grants the
     producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
     `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
