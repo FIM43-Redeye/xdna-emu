@@ -48,13 +48,14 @@ shim DMA task the stream pushes (Task_Queue write, BD chain, the BD's length,
 dimensions and iteration, and the DdrPatch that binds the BD to a buffer) to
 the byte range it reaches, and allocates each buffer up to the largest end.
 
-Before the hardware context is set up, the runner then checks every task
+Before any buffer is allocated or the run submitted, the runner then checks every task
 against the buffers it actually allocates (including the trace buffer's
 `--trace-size` and buffers sized from `--input` files) and refuses the run,
 exit 1 with each offending task named, if any task leaves its buffer. A
 stream it cannot decode completely (an opcode it does not know, an op that
-does not fit, a task on a BD with no host-buffer patch) is refused outright,
-before the device is opened (exit 2): its tasks' reach is unknown.
+does not fit, a task on a BD with no host-buffer patch) is refused outright
+(a single-shot run: exit 2, before the device is opened): its tasks' reach is
+unknown.
 
 Two device-free modes expose the same computation:
 
