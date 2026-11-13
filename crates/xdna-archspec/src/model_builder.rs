@@ -247,12 +247,34 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             memtile_mm2s_egress_fifo_depth: 31,
             memtile_mm2s_fetch_latency_cycles: 1,
             mm2s_read_to_offer_cycles: 3,
+            // Compute MM2S word clock (silicon onset + lock-fetch probes, 2026-11). See the
+            // DmaTiming field docs.
+            mm2s_word_clock_start_cycles: 3,
+            mm2s_word_clock_lead_granules: 4,
+            mm2s_bd_switch_access_gap_cycles: 2,
+            mm2s_access_to_offer_cycles: 4,
+            mm2s_access_to_finish_cycles: 1,
+            mm2s_lock_to_access_cycles: 2,
+            mm2s_lock_request_after_grant_cycles: 3,
+            mm2s_lock_request_trigger_words: 3,
+            mm2s_lock_request_trigger_latency_cycles: 3,
+            mm2s_lock_release_after_finish_cycles: 4,
+            mm2s_lock_grant_period_cycles: 3,
+            mm2s_lock_grant_blocked_phase: 2,
+            mm2s_lock_grant_visible_cycles: 1,
+            mm2s_lock_stall_after_sequencing_cycles: 2,
+            mm2s_lock_stall_before_request_cycles: 1,
+            mm2s_lock_stall_before_last_access_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
             // task-holding S2MM takes two more than the master-port FIFO alone and whose
             // MM2S stall boundary moved out one word with the hand-off (2026-11-11). See
             // the field doc.
             shim_s2mm_ingress_depth: 66,
+            // Compute-tile bank arbitration (silicon arb/ring probes, 2026-11). See the
+            // DmaTiming field docs.
+            bank_arbiter_period: 5,
+            bank_arbiter_dma_residue: 2,
         },
         stream_switch: StreamSwitchTiming {
             // FIFO depths in 32-bit-word units, per AM020 ch2 (AIE-ML /

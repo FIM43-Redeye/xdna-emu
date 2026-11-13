@@ -330,6 +330,12 @@ pub struct Tile {
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
 
+    /// Accesses each physical data-memory bank has served since reset: the core-versus-DMA
+    /// arbitration state (`crate::device::bank_arbiter::BankAccessCounts`). On the tile, not in
+    /// the coordinator's arbiter, because the configuration path counts the lines it writes.
+    /// Compute tiles only; memtile banks are not arbitrated.
+    pub bank_access_counts: crate::device::bank_arbiter::BankAccessCounts,
+
     /// Held-level state for DMA_S2MM_n_MEMORY_BACKPRESSURE /
     /// DMA_MM2S_n_MEMORY_STARVATION (mem events 39-42, compute tiles only):
     /// true while DMA channel identity `idx` (`[S2MM ch0.., MM2S ch0..]`, see
@@ -392,6 +398,11 @@ pub struct Tile {
     /// Used by stall detection to distinguish 'slow but working' from
     /// 'stuck in an infinite loop'.
     lock_release_count: u64,
+
+    /// Core lock releases on their way to this tile's lock unit: sent in a core's arbitration
+    /// cycle (`send_core_lock_release`), applied at the start of the next cycle
+    /// (`deliver_core_lock_releases`).
+    pub core_releases_in_transit: Vec<(usize, i8)>,
 
     /// MemTile DMA Event Channel Selection register (offset 0xA06A0).
     ///
@@ -574,12 +585,14 @@ impl Tile {
                 None
             },
             cycle_dma_banks: 0,
+            bank_access_counts: Default::default(),
             dma_mem_pressure_active: [false; DMA_PRESSURE_SIGNAL_COUNT],
             core_edge_detectors: [EdgeDetector::default(); 2],
             mem_edge_detectors: [EdgeDetector::default(); 2],
             pending_broadcasts: Vec::new(),
             pending_ctrl_response: std::collections::VecDeque::new(),
             lock_release_count: 0,
+            core_releases_in_transit: Vec::new(),
             memtile_dma_event_chan_sel: 0,
             lock_event_selected: {
                 let sel = Self::lock_selection_layout(tile_kind);
@@ -1209,7 +1222,47 @@ impl Tile {
                 expected: 0,
                 delta,
                 equal_mode: false,
+                sees_same_cycle_release: true,
             });
+        }
+    }
+
+    /// A core's release of one of this tile's locks, performed in the core's arbitration
+    /// cycle (the cycle in front of the fourth bundle after its `rel`): it reaches the lock
+    /// unit the next cycle, `deliver_core_lock_releases`. Silicon (arb probe, NPU1 2026-11):
+    /// the memory module stamps LOCK_n_REL one cycle after that arbitration cycle (a core
+    /// access k bundles after the `rel` meets the bank at LOCK_n_REL + k + 1, the access
+    /// being in its memory stage, issue + 4), and a DMA waiting on the lock is granted from
+    /// there (LOCK_n_REL + 2); a core held on the lock resumes as before (lock-stall `lk_D`:
+    /// 7 or 8 cycles after the releasing core's counter read in front of its `rel`).
+    pub fn send_core_lock_release(&mut self, lock_id: usize, delta: i8) {
+        if lock_id < self.locks.len() {
+            self.core_releases_in_transit.push((lock_id, delta));
+        }
+    }
+
+    /// Apply the core releases sent last cycle, at the start of `cycle`: before any requester
+    /// of this cycle looks, so a core's acquire decided this cycle sees them, as it saw a
+    /// release resolved at the end of the cycle before. LOCK_n_REL is stamped `cycle`. To the
+    /// acquires that see only settled releases (`LockRequest::sees_same_cycle_release`) they
+    /// are this cycle's releases.
+    pub fn deliver_core_lock_releases(&mut self, cycle: u64) {
+        self.lock_arbiter.clear_arrived_releases();
+        for (lock_id, delta) in std::mem::take(&mut self.core_releases_in_transit) {
+            let before = self.locks[lock_id];
+            if self.locks[lock_id].release_with_value(delta) != LockResult::Success {
+                // The core checked the lock was not frozen when it performed the release.
+                log::warn!(
+                    "Tile({},{}) core release of lock {lock_id} refused on arrival",
+                    self.col,
+                    self.row
+                );
+                continue;
+            }
+            self.lock_arbiter.note_arrived_release(lock_id, before);
+            self.lock_release_count += 1;
+            self.mem_trace_pending
+                .push((cycle, EventType::LockRelease { lock_id: lock_id as u8 }));
         }
     }
 

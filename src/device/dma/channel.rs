@@ -76,8 +76,9 @@ pub struct StagedWord {
     /// it (`drain_egress_staging`).
     pub ends_bd: bool,
     /// Engine step (`DmaEngine::read_clock`) from which the word can leave the
-    /// staging: the read of its granule's last word (one word per cycle behind every earlier fetch,
-    /// `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
+    /// staging. Memtile: the read of its granule's last word (one word per cycle behind every
+    /// earlier fetch, `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
+    /// Compute: the granule's bank access plus `mm2s_access_to_offer_cycles`.
     pub ready_at: u64,
 }
 
@@ -410,26 +411,6 @@ pub struct ChannelContext {
     /// `warm_task_index`.
     pub controller_dispatch_index: u32,
 
-    /// Cycles remaining before this MM2S channel may present a granule fetch
-    /// demand again, after losing a bank arbitration (task-2 producer
-    /// bank-collision fix). Set to `DmaEngine::BACKOFF` when `is_mem_denied`
-    /// holds this channel this cycle; ticks down by one every cycle
-    /// thereafter. `step_impl` arms/decrements it AFTER this cycle's own
-    /// `step_channel_fsm` call, not before, so this cycle's fetch decision
-    /// (inside that call) and the external peek that preceded this step both
-    /// see the value as it stood at the START of the cycle -- arming or
-    /// decrementing earlier would let this cycle's own commit see a value
-    /// one step ahead of what was peeked, a peek/commit disagreement.
-    /// `next_granule_fetch` withholds its demand entirely while this is
-    /// nonzero, UNLESS the channel is urgent (FIFO near underflow), which
-    /// always overrides. This is what shifts a denied channel's next fetch
-    /// attempt to a different point in the core's period-8 march instead of
-    /// retrying at the identical cycle offset forever -- the old
-    /// immediate-retry contract pinned the channel into a deterministic
-    /// anti-lock with a dense core. Reset to 0 on stop_channel (channel
-    /// reset == fresh boot), like `warm_task_index`/`prev_starving`.
-    pub backoff_left: u8,
-
     /// Performance counters.
     pub stats: ChannelStats,
 
@@ -600,9 +581,9 @@ pub struct ChannelContext {
     /// Compute / memtile MM2S egress staging FIFO: words read from tile memory
     /// (a 16-byte granule per bank access), in order, not yet handed to the
     /// stream output register, each already carrying its TLAST. It belongs to
-    /// the channel, not to a BD: a BD finishes once its last word has been READ
-    /// into it (one word per cycle, `read_tail`), and the next BD fetches in behind
-    /// words still waiting here.
+    /// the channel, not to a BD: a memtile BD finishes once its last word has been READ
+    /// into it (one word per cycle, `read_tail`), a compute BD one cycle after its last
+    /// bank access, and the next BD fetches in behind words still waiting here.
     /// Silicon: an MM2S chain into a held consumer finishes exactly as many BDs
     /// as fit the path's whole absorb (48 words at 0 hops on a compute tile and
     /// a memtile, BDs of 2..24 words), not the absorb less this FIFO
@@ -622,18 +603,24 @@ pub struct ChannelContext {
     /// (`DmaEngine::staged_mm2s_cycle`). Words of a fetched granule count against the staging
     /// from the fetch on (they sit in `egress_staging` with a future `ready_at`).
     pub read_tail: u64,
+    /// Compute-tile MM2S word clock (`DmaEngine::word_clock_mm2s_cycle`): the granules it has
+    /// sequenced ahead of the bank accesses, across the BD chain. Empty on every other channel.
+    pub word_clock: super::word_clock::WordClock,
+    /// Compute-tile MM2S lock port (`LockPort`): when the chain's next lock BD is requested and
+    /// granted. Idle on every other channel.
+    pub lock_port: super::lock_port::LockPort,
+    /// Engine step at which the current BD's last bank access has settled and FINISHED_BD may
+    /// be stamped (last access + `mm2s_access_to_finish_cycles`).
+    pub access_settles_at: u64,
+    /// Engine step from which a lock-started BD may access memory (its grant +
+    /// `mm2s_lock_to_access_cycles`); unused by a BD without an acquire.
+    pub access_from: u64,
     /// Held level of the stream-side STREAM_BACKPRESSURE for a staged MM2S: a
     /// staged word is waiting on a full output register.
     pub egress_backpressure: bool,
 }
 
 impl ChannelContext {
-    /// Cycles of reading still queued at engine step `at` (before that step's own fetch): the
-    /// words fetched but not yet read, at one per cycle. 0 when the read port is idle.
-    pub fn read_backlog(&self, at: u64) -> usize {
-        (self.read_tail + 1).saturating_sub(at) as usize
-    }
-
     pub fn new(index: u8) -> Self {
         Self {
             fsm: ChannelFsm::Idle,
@@ -650,7 +637,6 @@ impl ChannelContext {
             warm_task_index: 0,
             prefetch_start_emitted: false,
             controller_dispatch_index: 0,
-            backoff_left: 0,
             stats: ChannelStats::default(),
             prev_starving: false,
             prev_lock_stalled: false,
@@ -675,6 +661,10 @@ impl ChannelContext {
             egress_staging: VecDeque::new(),
             egress_gap: 0,
             read_tail: 0,
+            word_clock: Default::default(),
+            lock_port: Default::default(),
+            access_settles_at: 0,
+            access_from: 0,
             egress_backpressure: false,
             read_completions: VecDeque::new(),
             read_backpressure: false,
@@ -805,7 +795,6 @@ impl ChannelContext {
         self.warm_task_index = 0;
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
-        self.backoff_left = 0;
         self.stats = ChannelStats::default();
         self.pending_releases.clear();
         self.swap_free_watch = None;
@@ -825,6 +814,10 @@ impl ChannelContext {
         self.egress_staging.clear();
         self.egress_gap = 0;
         self.read_tail = 0;
+        self.word_clock.clear();
+        self.lock_port.clear();
+        self.access_settles_at = 0;
+        self.access_from = 0;
         self.egress_backpressure = false;
     }
 }

@@ -264,9 +264,10 @@ pub(super) enum TransferCycleResult {
     /// (`DMA_MM2S_n_MEMORY_STARVATION`).  The dual of `Stalled`, read from the
     /// other end of the same FIFO, and mutually exclusive with it.
     MemoryStarved,
-    /// Staged MM2S: every word of the BD has left the transfer (fetched) but the last one has
-    /// not been read yet -- the MM2S reads one word per cycle (`ChannelContext::read_tail`). The BD
-    /// is not done; this is neither stream nor memory starvation.
+    /// Staged MM2S: every word of the BD has left the transfer (fetched) but the BD is not
+    /// done -- on a memtile the last word has not been read yet (one word per cycle,
+    /// `ChannelContext::read_tail`), on a compute tile the last bank access has not settled
+    /// (`access_settles_at`). Neither stream nor memory starvation.
     ReadInProgress,
     /// FoT TLAST received, finish early
     FotFinish,

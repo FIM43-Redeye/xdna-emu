@@ -715,6 +715,7 @@ fn test_lock_event_reaches_trace_unit() {
         expected: 1,
         delta: -1,
         equal_mode: false,
+        sees_same_cycle_release: true,
     });
     let results = tile.resolve_lock_requests(100);
 
@@ -766,6 +767,7 @@ fn test_lock_release_event_reaches_trace_unit() {
         expected: 0,
         delta: 1,
         equal_mode: false,
+        sees_same_cycle_release: true,
     });
     let results = tile.resolve_lock_requests(50);
 

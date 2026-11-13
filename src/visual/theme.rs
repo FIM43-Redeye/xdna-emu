@@ -103,10 +103,7 @@ impl Palette {
             TileState::NotEnabled => self.band_grey,
             TileState::Ready | TileState::Idle => self.band_pale,
             TileState::Running | TileState::Dma | TileState::Stream => self.band_green,
-            TileState::WaitLock(_)
-            | TileState::WaitDma(_)
-            | TileState::WaitStream(_)
-            | TileState::WaitBank => self.band_amber,
+            TileState::WaitLock(_) | TileState::WaitDma(_) | TileState::WaitStream(_) => self.band_amber,
             TileState::Done => self.band_blue,
             TileState::Error => self.band_red,
         }
@@ -139,7 +136,6 @@ mod tests {
         assert_eq!(palette.band(&TileState::WaitLock(1)), palette.band_amber);
         assert_eq!(palette.band(&TileState::WaitDma(1)), palette.band_amber);
         assert_eq!(palette.band(&TileState::WaitStream(1)), palette.band_amber);
-        assert_eq!(palette.band(&TileState::WaitBank), palette.band_amber);
         assert_eq!(palette.band(&TileState::Done), palette.band_blue);
         assert_eq!(palette.band(&TileState::Error), palette.band_red);
         assert_eq!(palette.band(&TileState::Dma), palette.band_green);

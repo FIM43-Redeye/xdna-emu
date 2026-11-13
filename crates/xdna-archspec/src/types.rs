@@ -1453,6 +1453,113 @@ pub struct DmaTiming {
     /// granule-at-fetch calibration, where this delay was folded into the start latency.
     pub mm2s_read_to_offer_cycles: u8,
 
+    /// Cycles from the end of a **compute-tile** MM2S BD's setup until its word clock sequences
+    /// the first word: 3. A compute MM2S sequences its BD's words (address generation) one per
+    /// cycle, accesses a granule the cycle after the granule's last word has been sequenced,
+    /// and stamps FINISHED_BD `mm2s_access_to_finish_cycles` after the last access. Fitted
+    /// (NPU1, 2026-11, `tools/gen_path_onset_probe.py` `prod_own_nN`, two runs identical):
+    /// FINISHED_BD = START_TASK + N + 8 for N = 1..48 = word 0 at START_TASK + 7
+    /// (`bd_setup_cycles` 4 + 3), last word at + 6 + N, access + 1, finish + 1. The memtile
+    /// keeps the older read-cursor rule (its access position is not measured).
+    pub mm2s_word_clock_start_cycles: u8,
+
+    /// Granules a compute-tile MM2S word clock may have started ahead of the channel's
+    /// presented bank accesses: 4. The clock sequences one word per cycle, granule by granule
+    /// (4 words; a BD's short tail is a granule of its own and takes a whole slot), in chain
+    /// order across BD boundaries and lock waits. While the channel is parked on a lock (the BD
+    /// at the head of its accesses, or the BD it sequences into, acquires a lock and has not
+    /// presented an access) a granule starts only while fewer than this many started granules
+    /// wait for their access to be presented; unparked the clock runs on (a core camping on the
+    /// bank finds the DMA ready after every lost run, ring probe). Fitted (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py` sync and chain families): a long-parked channel holds 4
+    /// granules at its grant whatever their size (a 2-word BD before a 14..17-word BD puts the
+    /// lock-request step at 14/15, as with a 4-word one; a 16-word lead would put it at
+    /// 16/17), granules 0..3 of a 64-word BD go out at grant + 2..5, granule 4 at + 7, then
+    /// one per 4 cycles. A slot frees when the access is presented: a core access that wins
+    /// the bank at grant + 2 leaves granule 4 at + 7 (lock-fetch probe).
+    pub mm2s_word_clock_lead_granules: u8,
+
+    /// Cycles between the last bank access of a compute-tile MM2S BD and the first access of
+    /// the next BD on the channel: at least 2. Fitted (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`
+    /// sync family): a 4-word parked BD finishes at grant + 3 and a lock-free 5..8-word BD
+    /// behind it 3 cycles later, not 2.
+    pub mm2s_bd_switch_access_gap_cycles: u8,
+
+    /// Cycles from a compute-tile MM2S granule's bank access until its words can be offered
+    /// to the stream: 4. Silicon (NPU1, 2026-11): host-started first offer at START_TASK +
+    /// 11 + min(N, 4) against the first access at + 7 + min(N, 4) (`gen_path_onset_probe.py`),
+    /// and the lock path's first offer at grant + 6 against its first access at grant + 2
+    /// (`gen_dma_lock_probe.py` with the prewake probe's first-word timing).
+    pub mm2s_access_to_offer_cycles: u8,
+
+    /// Cycles from a compute-tile MM2S BD's last bank access until its FINISHED_BD: 1.
+    /// Silicon (NPU1, 2026-11, `gen_dma_lock_probe.py`): last access at grant + 51,
+    /// FINISHED_BD at grant + 52 in every clean row, and + 53 in the three rows where a core
+    /// access won the bank at grant + 51. A constant offset between the CONFLICT_DM_BANK stamp
+    /// and the access would move this and the lock-to-access latency in opposite directions.
+    pub mm2s_access_to_finish_cycles: u8,
+
+    /// Cycles from the lock grant of a lock-started **compute-tile** MM2S BD (the cycle it
+    /// leaves the lock wait, STALLED_LOCK falling) until its first bank access may happen: 2.
+    /// Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`, first-BD and chained alike): first
+    /// access at grant + 2, none at + 0 or + 1 on either bank; the word clock sequenced the
+    /// BD's first granules during the wait, so nothing else is paid after the grant (no memory
+    /// latency, no channel start). The 1-word dummy BD of `tools/gen_path_onset_probe.py`
+    /// `prewake-run` finishes at grant + 3 the same way.
+    pub mm2s_lock_to_access_cycles: u8,
+
+    /// Compute-tile MM2S lock request: cycles after the grant of the channel's previous
+    /// lock-acquiring BD before the next lock BD is requested (Q >= g + 3): 3. Fitted (NPU1,
+    /// 2026-11, `tools/gen_dma_lock_probe.py` sync and chain families, see `LockPort` in the
+    /// emulator): a free lock behind a 4-word lock BD is granted 3 cycles after that BD's grant.
+    pub mm2s_lock_request_after_grant_cycles: u8,
+
+    /// Compute-tile MM2S lock request trigger: the next BD's lock is requested
+    /// `mm2s_lock_request_trigger_latency_cycles` after the clock sequences this many words
+    /// before the end of the BD before it (its third-to-last word; its first if it is
+    /// shorter): 3. Fitted, same data.
+    pub mm2s_lock_request_trigger_words: u8,
+
+    /// Cycles from the trigger word's sequencing to the lock request: 3. Fitted, same data.
+    pub mm2s_lock_request_trigger_latency_cycles: u8,
+
+    /// Cycles from a compute-tile MM2S lock BD's FINISHED_BD to the one cycle in which the
+    /// channel's next lock request is neither made nor granted (read as the BD's own lock
+    /// release on the channel's lock port): 4. Fitted, same data; only 4-word predecessors
+    /// show the slot.
+    pub mm2s_lock_release_after_finish_cycles: u8,
+
+    /// Period of the compute-tile MM2S lock grant: from its request on, a channel's acquire
+    /// can be granted in 2 of every 3 cycles: 3. Fitted, same data. What blocks one cycle in
+    /// three is not known.
+    pub mm2s_lock_grant_period_cycles: u8,
+
+    /// The blocked phase of `mm2s_lock_grant_period_cycles`, counted from the request: 2.
+    /// Fitted, same data.
+    pub mm2s_lock_grant_blocked_phase: u8,
+
+    /// Cycles from the lock arbiter's grant of a compute-tile MM2S acquire
+    /// (LOCK_SEL*_ACQ_GE) to the channel holding the lock (STALLED_LOCK falling): 1. Measured
+    /// (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` chain family): ACQ_GE fires exactly once
+    /// per acquire, one cycle before STALLED_LOCK falls, in every waiting row, and also when
+    /// the lock was free. With a release reaching the requester the cycle after it is applied
+    /// this makes release to grant at least 2 (silicon: 2 or 3, core and S2MM releasers).
+    pub mm2s_lock_grant_visible_cycles: u8,
+
+    /// STALLED_LOCK of a compute-tile MM2S lock BD rises no earlier than this many cycles
+    /// after the BD's first word is sequenced: 2. Fitted (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py`); the other two bounds are
+    /// `mm2s_lock_stall_before_request_cycles` and `mm2s_lock_stall_before_last_access_cycles`.
+    pub mm2s_lock_stall_after_sequencing_cycles: u8,
+
+    /// STALLED_LOCK rises no earlier than this many cycles before the BD's lock request: 1.
+    /// Fitted, same data (a free lock shows a one-cycle level before its grant).
+    pub mm2s_lock_stall_before_request_cycles: u8,
+
+    /// STALLED_LOCK rises no earlier than this many cycles before the previous BD's last
+    /// bank access: 1. Fitted, same data.
+    pub mm2s_lock_stall_before_last_access_cycles: u8,
+
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
     /// holds (local slave 4 + master 4).
@@ -1473,6 +1580,26 @@ pub struct DmaTiming {
     /// structure (a 64-word write buffer plus a 4-word stage, or one FIFO) is not separated,
     /// and neither is whether a running (not parked) shim S2MM uses the same depth.
     pub shim_s2mm_ingress_depth: u8,
+
+    /// Period of a **compute-tile** data-memory bank's core-versus-DMA turn: 5. Each physical
+    /// bank counts the accesses it has served since reset (core loads and stores, every DMA
+    /// channel's accesses, configuration writes once per 16-byte line); when the core and a
+    /// DMA channel want the bank in the same cycle, the DMA is served if that count is at
+    /// `bank_arbiter_dma_residue` modulo this period, otherwise the core is. Measured (NPU1,
+    /// 2026-11, `tools/gen_dma_lock_probe.py` arb and ring cases, 222 rows, every row as the
+    /// rule predicts; the producer probe's dense-store captures fit only at period 5): a core
+    /// camping on a bank lets a waiting DMA in exactly once in every 5 served cycles, and a
+    /// DMA is never refused more than 4 cycles in a row. Why 5 is not known.
+    pub bank_arbiter_period: u8,
+
+    /// The served-count residue (modulo `bank_arbiter_period`) at which a contended
+    /// compute-tile bank serves the DMA instead of the core: 2. Fitted, one constant for every
+    /// bank and channel: only the count at a probe's window minus this residue is observable,
+    /// so the value holds together with the emulator counting the same history from reset
+    /// (configuration-written lines, the core prologue's stores). Silicon (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py`): banks 0 and 1 of one design, whose histories differ by
+    /// two stores, both need the same residue, and all four DMA channels share it.
+    pub bank_arbiter_dma_residue: u8,
 }
 
 /// Stream switch timing and physical constants.
