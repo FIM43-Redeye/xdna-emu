@@ -75,7 +75,19 @@ def _frame_commands(events):
     return out
 
 
+def quiet_unit(col=1, row=2, pkt=0):
+    """A trace unit that was captured (Start frame, Stop token) and recorded no event."""
+    return dict(col=col, row=row, pkt_type=pkt, unit_only=True, ts=0, slot=0, name="", soc=0, mode=0)
+
+
+def cut_tail(events):
+    """The same events, but their unit's stream ends without the Stop token (last packet lost)."""
+    return [dict(e, no_stop=True) for e in events]
+
+
 def _tile_bytes(events):
+    stop = not any(e.get("no_stop") for e in events)
+    events = [e for e in events if not e.get("unit_only")]
     b = bytearray([0xF0]) + bytearray(7)          # Start, timer 0
     for m, cycles, rep in _frame_commands(events):
         if m is None:
@@ -87,6 +99,8 @@ def _tile_bytes(events):
         else:
             b += bytes([0xD4 | (m >> 6), ((m & 0x3F) << 2) | (cycles >> 16),
                         (cycles >> 8) & 0xFF, cycles & 0xFF])
+    if stop:
+        b += bytes([0xDC, 0, 0, 0])               # End token, zero idle cycles
     return b
 
 
@@ -143,6 +157,8 @@ def write_run(root: Path, day: str, tests: dict, raw=True, stamp=True) -> Path:
             if raw and events:
                 (sd / "trace_raw.bin").write_bytes(_raw_trace(events))
                 doc["events"] = _events_json(events)
+            else:
+                doc["events"] = [e for e in events if not e.get("unit_only")]
             (sd / "events.json").write_text(json.dumps(doc))
     return d
 
@@ -510,6 +526,98 @@ def test_a_sample_with_another_event_set_is_not_used(tmp_path):
     rep = tcr.compare_runs(b, c, hw_samples=[extra])
     assert only_row(rep, "X").hw_counts == [10, 10]
     assert any("event set" in why for *_, why in rep.dropped_samples)
+
+
+# --- absent units and cut tails -----------------------------------------------
+#
+# A unit whose whole stream fits in the one stop-flushed packet can be lost with it: no Start
+# frame, no events.  That is "absent", not "recorded zero events".  A unit with a Start but no
+# End token lost the tail of its stream ("tail not delivered").
+
+def absent_setup(tmp_path, hw_sides, emu_base, emu_cand, hw_extra=()):
+    """The baseline dir holds the silicon sample hw_sides and emu_base, the candidate dir emu_cand;
+    each of hw_extra is one more silicon day."""
+    b = write_run(tmp_path, "base", {K: {"hw": hw_sides, "emu": emu_base}})
+    c = write_run(tmp_path, "cand", {K: {"emu": emu_cand}})
+    extra = [write_run(tmp_path, f"extra{i}", {K: {"hw": e}}) for i, e in enumerate(hw_extra)]
+    return b, c, extra
+
+
+def test_a_sample_without_the_unit_does_not_widen_the_band(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    only_core = edge("INSTR_VECTOR", periodic(5, 50))           # the memory unit never arrived
+    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[only_core])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    r = only_row(rep, "X")
+    # the zero of the absent sample used to open the band to [-10, 20] and hide 14
+    assert r.hw_counts == [10] and (r.hw_carrying, r.hw_total) == (1, 2)
+    assert r.gate_fail and rep.exit_code == 1
+    assert "carried by 1 of 2 HW samples" in tcr.format_text(rep)
+
+
+def test_a_unit_that_recorded_zero_events_is_a_measured_zero(tmp_path):
+    hw = [quiet_unit(pkt=1)]
+    b, c, x = absent_setup(tmp_path, hw, [quiet_unit(pkt=1)], edge("X", periodic(3, 50), pkt=1))
+    r = only_row(tcr.compare_runs(b, c), "X")
+    assert r.hw_counts == [0] and (r.hw_carrying, r.hw_total) == (1, 1) and r.gate_fail
+
+
+def test_a_row_no_sample_measured_is_listed_not_scored(tmp_path):
+    only_core = edge("INSTR_VECTOR", periodic(5, 50))
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    b, c, x = absent_setup(tmp_path, only_core, mem(10) + only_core, mem(14) + only_core,
+                           hw_extra=[only_core])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    assert not [r for r in rep.rows if r.key.event == "X"]
+    (nm,) = rep.not_measured
+    assert (nm.key.event, nm.key.module, nm.hw_total, nm.emu_before, nm.emu_after) == ("X", 1, 3, 10, 14)
+    assert rep.exit_code == 0
+    assert "not measured on silicon (1)" in tcr.format_text(rep)
+    assert tcr.to_json(rep)["not_measured"][0]["emu_after"] == 14
+
+
+def test_an_absent_emulator_unit_that_silicon_carries_fails(tmp_path):
+    core = edge("INSTR_VECTOR", periodic(5, 50))
+    b, c, x = absent_setup(tmp_path, core + [quiet_unit(pkt=1)], core + [quiet_unit(pkt=1)], core)
+    rep = tcr.compare_runs(b, c)
+    (u,) = rep.emu_absent
+    assert (u.module, u.hw_carrying) == (1, 1) and rep.exit_code == 1
+    assert "absent from the candidate emulator trace" in tcr.format_text(rep)
+
+
+def test_an_emulator_unit_absent_where_silicon_lacks_it_too_is_not_a_failure(tmp_path):
+    core = edge("INSTR_VECTOR", periodic(5, 50))
+    b, c, x = absent_setup(tmp_path, core, core + [quiet_unit(pkt=1)], core)
+    rep = tcr.compare_runs(b, c)
+    assert rep.emu_absent == [] and rep.exit_code == 0
+
+
+def test_a_stream_without_its_end_token_is_reported_as_cut(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    b, c, x = absent_setup(tmp_path, cut_tail(mem(10)), mem(10), mem(14), hw_extra=[mem(10)])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    r = only_row(rep, "X")
+    assert (r.hw_carrying, r.hw_total, r.hw_tail_cut) == (2, 2, 1)
+    assert "tail not delivered in 1" in tcr.format_text(rep)
+    (u,) = [u for u in rep.units if u.module == 1]
+    assert (u.hw_total, u.hw_carrying, u.hw_tail_cut) == (2, 2, 1)
+
+
+def test_a_capture_without_a_raw_trace_cannot_show_absence(tmp_path):
+    hw = edge("X", periodic(10, 50), pkt=1)
+    b = write_run(tmp_path, "base", {K: {"hw": hw, "emu": hw}}, raw=False)
+    c = write_run(tmp_path, "cand", {K: {"emu": edge("X", periodic(14, 50), pkt=1)}}, raw=False)
+    r = only_row(tcr.compare_runs(b, c), "X")
+    assert (r.hw_carrying, r.hw_total, r.hw_tail_cut) == (1, 1, 0)
+
+
+def test_the_offset_section_skips_a_sample_whose_unit_is_absent(tmp_path):
+    b, c, x = offset_run(tmp_path, 1, 1)
+    only_core = edge("INSTR_VECTOR", periodic(3, 20))
+    extra = write_run(tmp_path, "gone", {K: {"hw": only_core}})
+    rep = tcr.compare_runs(b, c, hw_samples=x + [extra])
+    row = offset_row(rep)
+    assert row.spread == 0 and row.baseline == 1      # the unit-less sample added no offset
 
 
 # --- CLI ------------------------------------------------------------------
