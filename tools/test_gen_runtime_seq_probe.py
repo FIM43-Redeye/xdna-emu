@@ -394,3 +394,215 @@ def test_a_build_stops_when_the_runner_sizes_the_buffer_differently(monkeypatch,
     monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: Out(2, "", "opcode 0x02 is not decoded"))
     with pytest.raises(SystemExit, match="cannot size"):
         g.check_runner_sizing(case, tmp_path / "insts.bin", tmp_path / "runner")
+
+
+# -- probe 9d: bracketed syncs, fill sweep, dummy pair, no-sync variants -------------------------------------
+
+def case9(name):
+    return g.plan_9d()[name]
+
+
+MARKED = ("w1_late_L300", "w1_L300", "w1_L3000", "w1_L30000", "w2_L30000")
+
+
+def test_plan_9d_names_are_unique_validate_and_leave_the_base_plan_alone():
+    p9 = g.plan_9d()
+    assert len(p9) == 25
+    for c in p9.values():
+        g.validate(c)
+    base = g.plan()
+    assert len(base) == 30          # probe 9c's plan is unchanged
+    for name in ("w1_late_L300", "w1_L300", "w1_L3000", "w1_late_L3000"):   # shared cases are the same plan
+        assert p9[name].steps == base[name].steps and p9[name].events == g.DEFAULT_EVENTS
+
+
+def test_plan_9d_has_every_requested_case():
+    names = set(g.plan_9d())
+    for base in MARKED:
+        assert {f"{base}_br", f"{base}_tw"} <= names
+    assert {"w1_L300", "w1_L3000", "w1_L1000", "w1_L10000", "w1_L20000", "w1_late_L30000"} <= names
+    assert {"w1_f16_L3000", "w1_f32_L3000", "w1_late_L3000", "w1_f128_L3000"} <= names
+    assert {"w1_latenosync_L300", "w1_latenosync_L3000", "w2_dummy_L3000", "w2_nosync_L300"} <= names
+
+
+def test_default_events_are_the_eight_channel_events_of_probe_9c():
+    assert len(g.DEFAULT_EVENTS) == 8
+    assert g.DEFAULT_EVENTS[0] == "DMA_MM2S_0_START_TASK" and g.DEFAULT_EVENTS[-1] == "DMA_S2MM_1_FINISHED_TASK"
+    assert case("w2_L300").events == g.DEFAULT_EVENTS
+
+
+def test_bracket_events_trade_the_two_mm2s_finishes_for_the_two_user_events():
+    ev9 = g.BRACKET_EVENTS
+    assert len(ev9) == 8 and len(set(ev9)) == 8
+    assert set(g.DEFAULT_EVENTS) - set(ev9) == {"DMA_MM2S_0_FINISHED_TASK", "DMA_MM2S_1_FINISHED_TASK"}
+    assert set(ev9) - set(g.DEFAULT_EVENTS) == {"USER_EVENT_0", "USER_EVENT_1"}
+
+
+def test_marks_surround_every_measured_sync_and_nothing_else():
+    for base in MARKED:
+        c = case9(f"{base}_br")
+        steps = c.steps
+        assert c.events == g.BRACKET_EVENTS
+        n_meas_syncs = 0
+        for i, s in enumerate(steps):
+            if isinstance(s, g.Mark):
+                nxt, prv = steps[i + 1], steps[i - 1]
+                assert (s.which == "A" and isinstance(nxt, g.Sync)) or (s.which == "B" and isinstance(prv, g.Sync))
+        first_tail = next(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.tail)
+        assert not any(isinstance(s, g.Mark) for s in steps[first_tail:])
+        measured_syncs = [i for i, s in enumerate(steps[:first_tail]) if isinstance(s, g.Sync)]
+        assert measured_syncs and all(isinstance(steps[i - 1], g.Mark) and steps[i - 1].which == "A" and
+                                      isinstance(steps[i + 1], g.Mark) and steps[i + 1].which == "B"
+                                      for i in measured_syncs)
+
+
+def test_a_twin_is_its_bracketed_case_without_the_marks_and_traces_the_same_events():
+    for base in MARKED:
+        br, tw = case9(f"{base}_br"), case9(f"{base}_tw")
+        assert tw.events == br.events
+        assert tw.steps == tuple(s for s in br.steps if not isinstance(s, g.Mark))
+        assert not any(isinstance(s, g.Mark) for s in tw.steps)
+
+
+def test_bracketed_streams_are_shaped_like_their_unbracketed_cases():
+    for base in MARKED:
+        plain = case9(base) if base in g.plan_9d() else g.plan()[base]
+        tw = case9(f"{base}_tw")
+        assert tw.steps == plain.steps
+
+
+def test_marks_are_event_generate_writes_to_the_traced_shim_not_the_carrier():
+    text = g.design_mlir(case9("w1_L300_br"))
+    n_marks = sum(isinstance(s, g.Mark) for s in case9("w1_L300_br").steps)
+    assert n_marks == 4
+    writes = [l for l in text.splitlines() if "aiex.npu.write32" in l and "column = 0 : i32" in l]
+    assert len(writes) == n_marks
+    assert f"%c_evgen = arith.constant {g.EVENT_GENERATE} : i32" in text
+    assert "%c_mark_A = arith.constant 126 : i32" in text and "%c_mark_B = arith.constant 127 : i32" in text
+    assert g.EVENT_GENERATE == 0x34008 and g.MARK_EVENTS == {"A": ("USER_EVENT_0", 126), "B": ("USER_EVENT_1", 127)}
+    assert text.count('aie.trace.event <"USER_EVENT_0">') == 1 and text.count('aie.trace.event <"USER_EVENT_1">') == 1
+    assert "DMA_MM2S_0_FINISHED_TASK" not in text and "DMA_S2MM_0_FINISHED_TASK" in text
+    twin = g.design_mlir(case9("w1_L300_tw"))
+    assert "column = 0 : i32" not in twin and 'aie.trace.event <"USER_EVENT_0">' in twin
+
+
+def test_unmarked_default_cases_keep_the_nine_c_trace_config():
+    text = g.design_mlir(case("w1_L300"))
+    assert text.count("aie.trace.event") == 8 and "USER_EVENT" not in text
+
+
+def test_validate_rejects_a_mark_that_does_not_touch_a_sync():
+    base = case9("w1_L300_br").steps
+    i = next(i for i, s in enumerate(base) if isinstance(s, g.Mark))
+    bad = g.Case("bad", "W", base[:i + 1] + (g.Fill(3),) + base[i + 1:], g.BRACKET_EVENTS)
+    with pytest.raises(ValueError, match="mark"):
+        g.validate(bad)
+
+
+def test_validate_rejects_marks_without_their_trace_events():
+    c = case9("w1_L300_br")
+    with pytest.raises(ValueError, match="USER_EVENT"):
+        g.validate(g.Case(c.name, c.family, c.steps, g.DEFAULT_EVENTS))
+
+
+def test_fill_sweep_is_the_independent_variable_before_the_sync():
+    for name, n in (("w1_L3000", 0), ("w1_f16_L3000", 16), ("w1_f32_L3000", 32),
+                    ("w1_late_L3000", 64), ("w1_f128_L3000", 128)):
+        c = case9(name)
+        i = next(i for i, s in enumerate(c.steps) if isinstance(s, g.Sync))
+        if n:
+            assert isinstance(c.steps[i - 1], g.Fill) and c.steps[i - 1].count == n
+        else:
+            assert isinstance(c.steps[i - 1], g.Push)
+        assert [s.words for s in g.measured_pushes(c) if s.ch == "S0"] == [3000]
+
+
+def test_late_flag_still_means_the_sixty_four_fillers():
+    assert g._w_case("x", 1, 300, late=True).steps == g._w_case("x", 1, 300, fill=g.LATE_FILL).steps
+
+
+def test_transfer_length_sweep():
+    for name, words in (("w1_L1000", 1000), ("w1_L10000", 10000), ("w1_L20000", 20000), ("w1_late_L30000", 30000)):
+        assert [s.words for s in g.measured_pushes(case9(name)) if s.ch == "S0"] == [words]
+    assert any(isinstance(s, g.Fill) and s.count == g.LATE_FILL for s in case9("w1_late_L30000").steps)
+
+
+def test_late_nosync_pushes_the_marker_after_the_fillers_with_no_sync_before_it():
+    for name in ("w1_latenosync_L300", "w1_latenosync_L3000"):
+        c = case9(name)
+        kinds = [type(s).__name__ + (":" + s.ch if hasattr(s, "ch") else "") for s in c.steps]
+        i_m1 = kinds.index("Push:M1")
+        assert kinds[i_m1 - 2:i_m1] == ["Push:S0", "Fill"]
+        assert c.steps[i_m1 - 1].count == g.LATE_FILL
+        assert "Sync:S0" not in kinds[:i_m1] and kinds[i_m1 + 1:i_m1 + 3] == ["Sync:S0", "Sync:S1"]
+
+
+def test_two_pair_no_sync_case_pushes_both_pairs_before_any_sync():
+    c = case9("w2_nosync_L300")
+    first_sync = next(i for i, s in enumerate(c.steps) if isinstance(s, g.Sync))
+    head = [s.ch for s in c.steps[:first_sync] if isinstance(s, g.Push)]
+    assert head == ["S1", "M0", "S0", "M1", "M0", "S0", "M1"]
+    after = [s.ch for s in c.steps[first_sync:first_sync + 3]]
+    assert after == ["S0", "S0", "S1"]
+
+
+def test_dummy_pair_is_an_eight_word_task_and_its_sync_before_the_real_pairs():
+    c = case9("w2_dummy_L3000")
+    head = c.steps[:4]
+    assert [type(s).__name__ for s in head] == ["Push", "Push", "Push", "Sync"]
+    assert head[0].ch == "S1" and not head[0].dummy
+    assert (head[1].ch, head[1].words, head[1].token, head[1].dummy) == ("M0", 8, False, True)
+    assert (head[2].ch, head[2].words, head[2].token, head[2].dummy) == ("S0", 8, True, True)
+    assert head[3].ch == "S0"
+    real_s0 = [s for s in g.measured_pushes(c) if s.ch == "S0" and not s.dummy]
+    assert [s.words for s in real_s0] == [3000, 3000]
+    assert [s.words for s in g.measured_pushes(c) if s.ch == "S1"] == [2 * g.MARKER_WORDS]
+
+
+def test_sync_rows_skip_the_dummy_pair():
+    c = case9("w2_dummy_L3000")
+    events = [ev("DMA_S2MM_0_START_TASK", 50), ev("DMA_S2MM_0_FINISHED_TASK", 80),
+              ev("DMA_S2MM_0_START_TASK", 1000), ev("DMA_S2MM_0_FINISHED_TASK", 4000),
+              ev("DMA_MM2S_1_START_TASK", 9000),
+              ev("DMA_S2MM_0_START_TASK", 9500), ev("DMA_S2MM_0_FINISHED_TASK", 12500),
+              ev("DMA_MM2S_1_START_TASK", 17000)]
+    rows = g.sync_rows(c, events, trace_start=0)
+    assert [r["latency"] for r in rows] == [5000, 4500] and [r["s0_start"] for r in rows] == [1000, 9500]
+
+
+def uev(n, ts):
+    return {"name": f"USER_EVENT_{n}", "ts": ts, "pkt_type": 2, "col": 0, "row": 0}
+
+
+def test_bracket_rows_split_a_sync_into_issue_finish_resume_next_push():
+    c = case9("w1_L3000_br")
+    events = [ev("DMA_MM2S_0_START_TASK", 50), ev("DMA_S2MM_0_START_TASK", 100), uev(0, 700), ev("DMA_S2MM_0_FINISHED_TASK", 3300), uev(1, 8000),
+              ev("DMA_MM2S_1_START_TASK", 8700),
+              uev(0, 9000), ev("DMA_S2MM_1_FINISHED_TASK", 9500), uev(1, 14000), ev("DMA_MM2S_0_START_TASK", 15000)]
+    rows = g.bracket_rows(c, events, trace_start=0)
+    assert [r["sync"] for r in rows] == ["S0", "S1"]
+    r = rows[0]
+    assert (r["mark_a"], r["mark_b"], r["fin"], r["next"]) == (700, 8000, 3300, 8700)
+    assert (r["a_to_fin"], r["fin_to_b"], r["a_to_b"], r["b_to_next"]) == (2600, 4700, 7300, 700)
+    assert rows[1]["next_ch"] == "M0" and rows[1]["b_to_next"] == 1000
+
+
+def test_bracket_rows_use_the_dummy_aware_task_index():
+    c = case9("w2_dummy_L3000")
+    assert g.bracket_rows(c, [], trace_start=0) == []      # unmarked case: nothing to bracket
+
+
+def test_finish_check_of_a_bracketed_case_wants_marks_not_the_mm2s_finishes():
+    c = case9("w1_L300_br")
+    full = [ev("DMA_MM2S_0_START_TASK", 5), ev("DMA_MM2S_1_START_TASK", 60), ev("DMA_S2MM_0_START_TASK", 10),
+            ev("DMA_S2MM_0_FINISHED_TASK", 50), ev("DMA_S2MM_1_START_TASK", 1), ev("DMA_S2MM_1_FINISHED_TASK", 90),
+            uev(0, 20), uev(1, 55), uev(0, 70), uev(1, 80)]
+    tail = [ev("DMA_MM2S_0_START_TASK", 900)]
+    assert g.finish_check(c, full + tail, trace_stop=None)[0] == "finish ok"
+    assert "USER_EVENT_1" in g.finish_check(c, [e for e in full + tail if e != full[-1]], trace_stop=None)[0]
+
+
+def test_marks_in_ops_counts_event_generate_writes_at_the_traced_shim():
+    ops = [g.Op("write32", 0, 0, 0x34008), g.Op("write32", 1, 0, 0x34008), g.Op("write32", 0, 0, 0x340F0),
+           g.Op("write32", 0, 0, 0x34008)]
+    assert g.marks_in_ops(ops) == 2
