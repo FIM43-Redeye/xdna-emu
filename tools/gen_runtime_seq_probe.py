@@ -523,7 +523,8 @@ def case_table(case: Case, case_dir: Path, runs: list[str]) -> str:
             loaded[run] = load_run(case_dir, run)
         except (FileNotFoundError, StopIteration, KeyError) as e:
             loaded[run] = None
-    lines = [f"== {case.name}  ({case.family}; {len(pushes(case))} pushes; "
+    n_tail = len(pushes(case)) - len(measured_pushes(case))
+    lines = [f"== {case.name}  ({case.family}; {len(measured_pushes(case))} pushes + {n_tail} tail; "
              f"{sum(isinstance(s, Sync) for s in case.steps)} syncs; host buffer {buffer_words(case)} words)"]
     ok = {run: finish_check(case, v[0], v[2])[0] if v else "no data" for run, v in loaded.items()}
     lines.append("finish: " + "; ".join(f"{run}: {t}" for run, t in ok.items()))
@@ -532,7 +533,7 @@ def case_table(case: Case, case_dir: Path, runs: list[str]) -> str:
         lines.append("  push  ch  ops between this push's queue write and the previous one's   " +
                      "  ".join(f"{r:>13}" for r in runs) + "   median")
         pr = {run: push_rows(case, v[0], v[1]) for run, v in loaded.items() if v}
-        for i, p in enumerate(pushes(case)):
+        for i, p in enumerate(measured_pushes(case)):
             vals = [pr[run][i]["gap"] if run in pr else None for run in runs]
             starts = [pr[run][i]["start"] if run in pr else None for run in runs]
             ops = op_summary(between[i - 1]) if i and i - 1 < len(between) else "(first push)"

@@ -326,3 +326,21 @@ def test_sync_rows_ignore_the_tail_tasks_of_s0():
               ev("DMA_S2MM_0_START_TASK", 9000), ev("DMA_S2MM_0_FINISHED_TASK", 9100)]
     rows = g.sync_rows(c, events, trace_start=0)
     assert len(rows) == 1 and rows[0]["latency"] == 4000
+
+
+def test_case_table_lists_only_the_measured_pushes(tmp_path):
+    import json
+    c = case("p2_mm")
+    d = tmp_path / c.name
+    (d / "r").mkdir(parents=True)
+    (d / "case.json").write_text(json.dumps({"between": [{} for _ in g.pushes(c)]}))
+    events = [ev("DMA_MM2S_0_START_TASK", 10), ev("DMA_S2MM_0_START_TASK", 20)] + \
+             [ev("DMA_MM2S_0_START_TASK", 100 * i) for i in range(1, 4)]
+    real_load = g.load_run
+    g.load_run = lambda case_dir, run: (events, 0, None)
+    try:
+        text = g.case_table(c, d, ["r"])
+    finally:
+        g.load_run = real_load
+    rows = [l for l in text.splitlines() if l.strip().startswith(("0  ", "1  ", "2  "))]
+    assert len(rows) == 2 and "2 pushes + 12 tail" in text
