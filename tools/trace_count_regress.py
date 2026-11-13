@@ -92,6 +92,32 @@ not better" include equal and undefined.
 * count equal: pattern better -> improved, pattern worse -> regressed (soft,
   does not fail the gate), else neutral.
 
+Absent units and cut tails
+--------------------------
+A trace unit (tile, module) streams to the host in packets; on silicon the last, partial packet
+is flushed by the stop event and is often not delivered.  A unit whose whole stream fits in that
+one packet is then *absent* from the capture: no Start frame, no events.  That is not "recorded
+zero events", and the gate keeps the two apart using the raw trace (a unit is carried when its
+packets hold a Start frame; ``Side.units``):
+
+* A silicon sample that lacks a row's unit contributes no count to that row's band.  Each row
+  line says how many of the usable samples carry the unit ("unit carried by 2 of 3 HW samples").
+  A unit that is carried and recorded zero events is a measured zero, as before.
+* A row whose unit no usable silicon sample carries is *not measured on silicon*: listed with the
+  emulator's counts, neither pass nor fail (a gap that stays visible, not a row that vanishes).
+* A carried unit whose stream has no End token lost its tail (the events after the last full
+  packet): "tail not delivered".  Reported per row and in the summary; counts of such samples
+  are lower bounds and bias a band low.  They stay in the band unless ``--exclude-cut-tails`` is
+  given, which leaves them out (a row with none left is then not measured).  Excluding is
+  opt-in: on the banked suite it moved 43 bands (mostly the free-running PERF_CNT_2 of the core
+  unit) but no gate verdict, and it would leave single-sample bands and unmeasured rows.
+* The emulator side is not excused: a unit the candidate emulator trace lacks while silicon
+  carries it fails the gate when the baseline emulator trace carried it; when both emulator
+  traces lack it, it is listed as standing (a gap, not a regression).
+  Without a usable ``trace_raw.bin`` a side's units cannot be told: all count as carried.
+* The cross-module offset section already skips a sample that lacks either unit (no rows, no
+  offset); it is unchanged.
+
 Cross-module offset
 -------------------
 The compute tile's memory and core trace units are timed from different broadcast paths, so
@@ -443,6 +469,7 @@ class NotMeasured:
     hw_total: int
     emu_before: int
     emu_after: int
+    reason: str = "unit absent from every HW sample"
 
 
 @dataclass
@@ -489,9 +516,15 @@ class Report:
 
     @property
     def emu_absent(self) -> list:
-        """Units the candidate emulator trace lacks although silicon carries them: gate failures,
-        since an emulator that stops tracing a unit would otherwise read as a silent zero."""
+        """Units the candidate emulator trace lacks although silicon carries them."""
         return [u for u in self.units if u.emu_candidate is False and u.hw_carrying > 0]
+
+    @property
+    def emu_lost(self) -> list:
+        """The emu_absent units the baseline emulator trace did carry (or could not be told): gate
+        failures, since an emulator that stops tracing a unit would otherwise read as a silent
+        zero.  A unit both emulator traces lack is a standing gap: listed, not a regression."""
+        return [u for u in self.emu_absent if u.emu_baseline is not False]
 
     @property
     def changed(self):
@@ -500,7 +533,7 @@ class Report:
     @property
     def exit_code(self) -> int:
         return 1 if (any(r.gate_fail for r in self.rows) or any(o.gate_fail for o in self.offsets)
-                     or self.emu_absent) else 0
+                     or self.emu_lost) else 0
 
     def of(self, verdict):
         return sorted((r for r in self.rows if r.verdict == verdict),
@@ -520,6 +553,7 @@ class Report:
             "hw_samples_without_unit": sum(u.hw_total - u.hw_carrying for u in self.units),
             "hw_samples_tail_cut": sum(u.hw_tail_cut for u in self.units),
             "emu_units_absent": len(self.emu_absent),
+            "emu_units_lost": len(self.emu_lost),
             "improved": len(self.of("improved")),
             "regressed": len(self.of("regressed")),
             "neutral": len(self.of("neutral")),
@@ -631,7 +665,8 @@ def _usable_hw_samples(tc, b, c, extra, rep):
 
 
 def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
-                 hw_samples: list[Path] | None = None, offsets: bool = True) -> Report:
+                 hw_samples: list[Path] | None = None, offsets: bool = True,
+                 exclude_cut_tails: bool = False) -> Report:
     base, cand = load_run(baseline), load_run(candidate)
     extra = [(d, load_run(d)) for d in (hw_samples or [])]
     rep = Report()
@@ -678,7 +713,14 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
                 rep.not_measured.append(NotMeasured(
                     rk, len(hw_sides), len(eb_side.series.get(k, [])), len(ec_side.series.get(k, []))))
                 continue
-            hw_sides_all, hw_sides = hw_sides, carrying
+            hw_sides_all = hw_sides
+            hw_sides = [(lbl, side) for lbl, side in carrying
+                        if not (exclude_cut_tails and side.tail_cut(k[:3]) is True)]
+            if not hw_sides:
+                rep.not_measured.append(NotMeasured(
+                    rk, len(hw_sides_all), len(eb_side.series.get(k, [])), len(ec_side.series.get(k, [])),
+                    "tail not delivered in every sample that carries the unit"))
+                continue
             if is_level_name(k[3]):
                 bad = [f"{lbl}: {side.level_problem}"
                        for lbl, side in [("baseline emu", eb_side), ("candidate emu", ec_side)]
@@ -708,8 +750,8 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
                 pattern_before=pb, pattern_after=pa,
                 exact_match_broken=exact,
                 verdict=verdict, label=label, gate_fail=gate,
-                hw_carrying=len(hw_sides), hw_total=len(hw_sides_all),
-                hw_tail_cut=sum(side.tail_cut(k[:3]) is True for _, side in hw_sides)))
+                hw_carrying=len(carrying), hw_total=len(hw_sides_all),
+                hw_tail_cut=sum(side.tail_cut(k[:3]) is True for _, side in carrying)))
     return rep
 
 
@@ -736,13 +778,15 @@ def _fmt_p(p):
     return "n/a" if p is None else f"{p:.1f}"
 
 
-def _unit_note(carrying: int, total: int, cut: int) -> str:
+def _unit_note(carrying: int, total: int, cut: int, used: int) -> str:
     """The suffix of a row line when its unit is missing from some samples or lost a tail."""
     if carrying == total and not cut:
         return ""
     bits = [f"carried by {carrying} of {total} HW samples"]
     if cut:
         bits.append(f"tail not delivered in {cut}")
+    if used < carrying:
+        bits.append(f"{carrying - used} of them left out of the band")
     return "; unit " + ", ".join(bits)
 
 
@@ -754,7 +798,7 @@ def _line(r: RowResult) -> str:
             f"EMU {r.emu_count_before}->{r.emu_count_after} vs HW {r.hw_counts} ({rep}); "
             f"count dist {r.count_before}->{r.count_after}, "
             f"pattern W1 {_fmt_p(r.pattern_before)}->{_fmt_p(r.pattern_after)}; {r.label}"
-            + _unit_note(r.hw_carrying, r.hw_total, r.hw_tail_cut)
+            + _unit_note(r.hw_carrying, r.hw_total, r.hw_tail_cut, len(r.hw_counts))
             + ("  [GATE]" if r.gate_fail else ""))
 
 
@@ -792,7 +836,7 @@ def format_text(rep: Report) -> str:
         f"trace units: {len(rep.units)}; absent from some HW samples: {s['units_absent_from_hw_samples']} "
         f"({s['hw_samples_without_unit']} unit-samples); HW streams with the tail not delivered: "
         f"{s['hw_samples_tail_cut']}; absent from the candidate emulator but carried by silicon: "
-        f"{s['emu_units_absent']}",
+        f"{s['emu_units_absent']} ({s['emu_units_lost']} newly, gated)",
         f"count distance (sum):   {s['count_distance_before']} -> {s['count_distance_after']}",
         f"pattern distance (sum, {s['pattern_rows']} rows, cycles): "
         f"{s['pattern_distance_before']} -> {s['pattern_distance_after']}",
@@ -815,13 +859,14 @@ def format_text(rep: Report) -> str:
                     f"them ({len(rep.emu_absent)}):"] + [
             f"  {u.test}.{u.compiler} {u.tile()}: silicon carries it in {u.hw_carrying} of "
             f"{u.hw_total} samples; baseline emulator "
-            f"{'carries it' if u.emu_baseline else 'lacks it' if u.emu_baseline is False else '?'}  [GATE]"
+            f"{'carries it' if u.emu_baseline else 'lacks it' if u.emu_baseline is False else '?'}"
+            + ("  [GATE]" if u in rep.emu_lost else "  (standing, not gated)")
             for u in rep.emu_absent]
     if rep.not_measured:
         out += ["", f"Rows not measured on silicon ({len(rep.not_measured)}): no HW sample carries "
                     f"the unit; neither pass nor fail"] + [
             f"  {n.key.test}.{n.key.compiler} {n.key.tile()} {n.key.event}: EMU "
-            f"{n.emu_before}->{n.emu_after}, unit absent from all {n.hw_total} HW samples"
+            f"{n.emu_before}->{n.emu_after}, {n.reason} ({n.hw_total} HW samples)"
             for n in rep.not_measured]
     if rep.unscored:
         out += ["", f"Unscored rows ({len(rep.unscored)}):"] + [
@@ -853,6 +898,7 @@ def to_json(rep: Report) -> dict:
         "not_measured": [dict(asdict(n), key=asdict(n.key)) for n in rep.not_measured],
         "units": [asdict(u) for u in rep.units],
         "emu_absent": [asdict(u) for u in rep.emu_absent],
+        "emu_lost": [asdict(u) for u in rep.emu_lost],
     }
 
 
@@ -866,6 +912,9 @@ def main(argv=None) -> int:
                          "(identical captures and other event sets are dropped)")
     ap.add_argument("--no-offset", action="store_true",
                     help="leave out the cross-module (memory minus core) offset section")
+    ap.add_argument("--exclude-cut-tails", action="store_true",
+                    help="leave HW samples whose stream lost its tail out of the count band "
+                         "(see 'Absent units and cut tails' in the module docstring)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     for d in (args.baseline, args.candidate, *args.hw_samples):
@@ -874,7 +923,7 @@ def main(argv=None) -> int:
             return 2
     rep = compare_runs(Path(args.baseline), Path(args.candidate), only=args.only,
                        hw_samples=[Path(d) for d in args.hw_samples],
-                       offsets=not args.no_offset)
+                       offsets=not args.no_offset, exclude_cut_tails=args.exclude_cut_tails)
     print(json.dumps(to_json(rep), indent=1) if args.json else format_text(rep))
     return rep.exit_code
 

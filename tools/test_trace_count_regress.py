@@ -592,6 +592,14 @@ def test_an_emulator_unit_absent_where_silicon_lacks_it_too_is_not_a_failure(tmp
     assert rep.emu_absent == [] and rep.exit_code == 0
 
 
+def test_a_unit_both_emulator_traces_lack_is_listed_as_standing_not_gated(tmp_path):
+    core = edge("INSTR_VECTOR", periodic(5, 50))
+    b, c, x = absent_setup(tmp_path, core + [quiet_unit(pkt=1)], core, core)
+    rep = tcr.compare_runs(b, c)
+    assert len(rep.emu_absent) == 1 and rep.emu_lost == [] and rep.exit_code == 0
+    assert "standing, not gated" in tcr.format_text(rep)
+
+
 def test_a_stream_without_its_end_token_is_reported_as_cut(tmp_path):
     mem = lambda n: edge("X", periodic(n, 50), pkt=1)
     b, c, x = absent_setup(tmp_path, cut_tail(mem(10)), mem(10), mem(14), hw_extra=[mem(10)])
@@ -601,6 +609,26 @@ def test_a_stream_without_its_end_token_is_reported_as_cut(tmp_path):
     assert "tail not delivered in 1" in tcr.format_text(rep)
     (u,) = [u for u in rep.units if u.module == 1]
     assert (u.hw_total, u.hw_carrying, u.hw_tail_cut) == (2, 2, 1)
+
+
+def test_cut_tail_samples_stay_in_the_band_unless_excluded(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[cut_tail(mem(6)), mem(10)])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    assert only_row(rep, "X").hw_counts == [10, 6, 10]
+    rep = tcr.compare_runs(b, c, hw_samples=x, exclude_cut_tails=True)
+    r = only_row(rep, "X")
+    assert r.hw_counts == [10, 10] and r.hw_tail_cut == 1 and r.hw_carrying == 3
+    assert "1 of them left out of the band" in tcr.format_text(rep)
+
+
+def test_excluding_cut_tails_with_none_left_is_not_measured(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    b, c, x = absent_setup(tmp_path, cut_tail(mem(6)), mem(10), mem(14))
+    rep = tcr.compare_runs(b, c, exclude_cut_tails=True)
+    assert not rep.rows and len(rep.not_measured) == 1 and rep.exit_code == 0
+    assert "tail not delivered in every sample" in tcr.format_text(rep)
+    assert only_row(tcr.compare_runs(b, c), "X").hw_counts == [6]
 
 
 def test_a_capture_without_a_raw_trace_cannot_show_absence(tmp_path):

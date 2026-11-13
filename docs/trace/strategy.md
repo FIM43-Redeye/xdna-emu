@@ -297,6 +297,26 @@ candidate's offset is farther from the band its silicon samples span than the ba
 half a cycle; tiles measurable on one side only are "unmeasured", and tiles whose offset exceeds 16
 cycles (workload-dominated, not a timer quantity) are reported but not gated.
 
+**Absent units and cut tails.** On silicon the last, partial packet of a trace unit (flushed by
+the stop event) is often not delivered. A unit whose whole stream fits in that one packet is then
+*absent* from the capture: no Start frame and no events, which `events.json` cannot tell from a
+unit that recorded zero events. Longer streams lose only their tail (the events after the last
+full packet), and the decoder shows it as a Start without the End token. The gate reads both from
+`trace_raw.bin`:
+
+- A silicon sample without the row's unit adds nothing to that row's count band; each row line
+  reports how many of the usable samples carry the unit.
+- A row no usable silicon sample carries is listed under "not measured on silicon" with the
+  emulator's counts; it is neither pass nor fail.
+- A carried unit with no End token is reported as "tail not delivered" (its counts are lower
+  bounds). Such samples stay in the band by default; `--exclude-cut-tails` leaves them out. It is
+  opt-in because on the banked suite excluding them moved bands (mostly the core unit's
+  free-running `PERF_CNT_2`) but no gate verdict, and it leaves single-sample bands.
+- The emulator gets no such allowance: a unit the candidate emulator trace lacks while silicon
+  carries it fails the gate if the baseline emulator trace had it (a gap both emulator traces
+  share is listed as standing).
+- A side without `trace_raw.bin` cannot show absence; all its units count as carried.
+
 **Event overrides for one test** (environment, read by `emu-bridge-test.sh`; each applies to every compute tile of the
 tests it runs, so run it on one test): `XDNA_TRACE_MEMMOD_EVENTS` replaces the memory-module event list,
 `XDNA_TRACE_CORE_EVENTS`, `XDNA_TRACE_MEMTILE_EVENTS`, `XDNA_TRACE_SHIM_EVENTS` the others. A memory-module
