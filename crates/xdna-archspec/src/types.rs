@@ -1537,6 +1537,20 @@ pub struct DmaTiming {
     /// this makes release to grant at least 2 (silicon: 2 or 3, core and S2MM releasers).
     pub mm2s_lock_grant_visible_cycles: u8,
 
+    /// STALLED_LOCK of a compute-tile MM2S lock BD rises no earlier than this many cycles
+    /// after the BD's first word is sequenced: 2. Fitted (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py`); the other two bounds are
+    /// `mm2s_lock_stall_before_request_cycles` and `mm2s_lock_stall_before_last_access_cycles`.
+    pub mm2s_lock_stall_after_sequencing_cycles: u8,
+
+    /// STALLED_LOCK rises no earlier than this many cycles before the BD's lock request: 1.
+    /// Fitted, same data (a free lock shows a one-cycle level before its grant).
+    pub mm2s_lock_stall_before_request_cycles: u8,
+
+    /// STALLED_LOCK rises no earlier than this many cycles before the previous BD's last
+    /// bank access: 1. Fitted, same data.
+    pub mm2s_lock_stall_before_last_access_cycles: u8,
+
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
     /// holds (local slave 4 + master 4).

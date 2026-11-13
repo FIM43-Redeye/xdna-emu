@@ -261,6 +261,9 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             mm2s_lock_grant_period_cycles: 3,
             mm2s_lock_grant_blocked_phase: 2,
             mm2s_lock_grant_visible_cycles: 1,
+            mm2s_lock_stall_after_sequencing_cycles: 2,
+            mm2s_lock_stall_before_request_cycles: 1,
+            mm2s_lock_stall_before_last_access_cycles: 1,
             // Measured (shim-queue absorb probes, 2026-11-09): a parked shim S2MM absorbs 76
             // words, 68 beyond the stream path. 66 in the emulator's accounting, whose
             // task-holding S2MM takes two more than the master-port FIFO alone and whose

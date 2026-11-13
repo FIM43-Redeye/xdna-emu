@@ -209,6 +209,12 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             when the lock was free; release to grant is 2 or 3 for core and S2MM releasers",
             "Compute MM2S. The split of release + 2 into a release reaching the requester a cycle late and this cycle is \
             the emulator's; only the sum and ACQ_GE at grant - 1 are observed."),
+        unit("dma.mm2s_lock_stall_after_sequencing_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the BD's first sequenced word + 2. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_stall_before_request_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the request - 1 (a free lock shows one cycle). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_stall_before_last_access_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). STALLED_LOCK rises no earlier than the previous BD's last access - 1. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
         measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
             every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
             5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \

@@ -4,7 +4,8 @@ use super::word_clock::WordClock;
 use xdna_archspec::aie2::timing::{
     DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE, DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES, DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES,
     DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES, DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES,
-    DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES,
+    DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES, DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES,
+    DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES, DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES,
 };
 
 /// The lock request of the next lock-acquiring BD, and when it may be granted.
@@ -38,14 +39,13 @@ struct Target {
 /// with (G - Q) mod 3 != 2 and G != DEAD, R the release that made the lock available;
 /// LOCK_SEL*_ACQ_GE fires at G - 1 (the arbiter grants then, `DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES`
 /// before the channel holds it), and a release reaches this requester one step after the
-/// arbiter applied it. The request is made while the channel is still on the BDs before (a
-/// free lock behind a 4-word lock BD and a 13-word lock-free BD is granted at g + 3, 5 cycles
-/// before the 13-word BD finishes), so it is channel state, not BD state. What blocks one
-/// cycle in three is not known.
+/// arbiter applied it. STALLED_LOCK shows on [P, G - 1] with P = max(S + 2, Q - 1, the
+/// previous BD's last access - 1), S the step the BD's first word was sequenced.
 ///
 /// Not measured, chosen here: a run's first BD (no previous BD, no previous grant) is
 /// requested every cycle from the cycle it becomes the target, with Q its earliest grant;
-/// a BD whose run has no previous lock grant but has a previous BD takes Q = T + 3.
+/// a BD whose run has no previous lock grant but has a previous BD takes Q = T + 3; the
+/// predicted last-access term of P assumes the access is not refused by the bank.
 #[derive(Debug, Clone, Default)]
 pub struct LockPort {
     /// Grant step of the run's latest granted lock BD, its seq, and its FINISHED_BD step.
@@ -152,6 +152,48 @@ impl LockPort {
             };
             self.target = Some(t);
         }
+    }
+
+    /// Whether STALLED_LOCK rises at (or stays up through) `now`: the target's lock is not held
+    /// yet and `now` >= P. `prev_last_access_next` says the previous BD's last access will be
+    /// presented at `now + 1` (its accesses still running).
+    pub fn stall_level(&self, wc: &WordClock, now: u64, prev_last_access_next: bool) -> bool {
+        let Some(t) = self.target else { return false };
+        let Some(bd) = wc.bd(t.seq) else { return false };
+        if bd.granted_at.is_some_and(|g| g <= now) {
+            return false;
+        }
+        let Some(start) = bd.start_at else { return false };
+        if start + (DMA_MM2S_LOCK_STALL_AFTER_SEQUENCING_CYCLES as u64) > now {
+            return false;
+        }
+        let q = match t.request {
+            None => return false,
+            Some(Request::Ungated { first_grant }) => first_grant,
+            Some(Request::Gridded { q }) => self.effective_q(q),
+        };
+        if q > now + DMA_MM2S_LOCK_STALL_BEFORE_REQUEST_CYCLES as u64 {
+            return false;
+        }
+        // P >= the previous BD's last access - 1: that access is done, or comes next step.
+        debug_assert_eq!(DMA_MM2S_LOCK_STALL_BEFORE_LAST_ACCESS_CYCLES, 1, "the look-ahead is one step");
+        match wc.predecessor(t.seq) {
+            None | Some((_, _, true)) => true,
+            Some(_) => prev_last_access_next,
+        }
+    }
+
+    /// Whether the target's lock is held by `now` (or there is no target): the level falls.
+    pub fn target_held(&self, wc: &WordClock, now: u64) -> bool {
+        self.target
+            .and_then(|t| wc.bd(t.seq))
+            .is_none_or(|b| b.granted_at.is_some_and(|g| g <= now))
+    }
+
+    /// The BD before the target, when it is the channel's current BD with accesses left.
+    pub fn predecessor_is_current(&self, wc: &WordClock) -> bool {
+        let Some(t) = self.target else { return false };
+        wc.current().is_some_and(|c| c.seq + 1 == t.seq && !c.fully_accessed())
     }
 
     /// The BD whose lock is being requested, if any.

@@ -427,10 +427,11 @@ fn the_sync_designs_grant_lands_on_silicons_cycle() {
         (32, 43, Some(45), &[(25, 44)], &[3, 24, 97]), // lt28 s1.hw
         (32, 54, Some(56), &[(25, 55)], &[3, 24, 108]), // lt40 s1.hw
     ];
-    for &(n, r, grant, _stalls, finishes) in rows {
+    for &(n, r, grant, stalls, finishes) in rows {
         let mids = if n == 0 { vec![] } else { vec![Mid::Plain(n)] };
         let obs = run_chain(4, &mids, 64, Releaser::Free, Releaser::Core(r));
         assert_eq!(obs.finishes, finishes, "N = {n}, R = {r}: finishes");
+        assert_eq!(obs.stalls, stalls, "N = {n}, R = {r}: STALLED_LOCK");
         if let Some(g) = grant {
             assert_eq!((obs.held, obs.grant), (g, g), "N = {n}, R = {r}: grant (held, ACQ_GE + 1)");
         }
@@ -529,7 +530,7 @@ fn the_chain_designs_grants_land_on_silicons_cycle() {
         (4, "32", 64, 14, 54, true, 56, &[(25, 55)], &[3, 24, 108]), // s1n32 qs t2.hw
         (4, "32", 64, 15, 54, true, 56, &[(25, 55)], &[3, 24, 108]), // s1n32 qs t1.hw
     ];
-    for &(head, spec, big, rb, ra, s2mm, grant, _stalls, finishes) in rows {
+    for &(head, spec, big, rb, ra, s2mm, grant, stalls, finishes) in rows {
         let a = if s2mm {
             Releaser::S2mm(ra)
         } else {
@@ -537,9 +538,28 @@ fn the_chain_designs_grants_land_on_silicons_cycle() {
         };
         let obs = run_chain(head, &mids(spec), big, Releaser::Core(rb), a);
         assert_eq!(
-            (obs.held, obs.grant, obs.finishes.as_slice()),
-            (grant, grant, finishes),
+            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+            (grant, grant, stalls, finishes),
             "head {head}, {spec}, waiting {big}, RB {rb}, RA {ra}"
         );
     }
+}
+
+/// STALLED_LOCK of a compute MM2S lock BD (`LockPort::stall_level`): shown on [P, G - 1] with
+/// P = max(S + 2, Q - 1, the previous BD's last access - 1), so it can rise before the channel
+/// leaves the BD before, and a lock free on request shows one cycle. LOCK_SEL0_ACQ_GE fires
+/// once per acquire at G - 1, a free lock's included. Silicon (NPU1, 2026-11,
+/// `tools/gen_dma_lock_probe.py` sync and chain families, g0 frame): T5 (lsfree: one cycle at
+/// g0 + 2, grant g0 + 3), T1 (pre2 32, A released at g0 + 23: one cycle at g0 + 25, grant
+/// g0 + 26; at g0 + 22: no level), T12 (pre1 on a free lock: one cycle at g0 + 2).
+#[test]
+fn stalled_lock_rises_at_p_and_acq_ge_fires_the_cycle_before_the_grant() {
+    let obs = run_chain(4, &[], 64, Releaser::Free, Releaser::Free);
+    assert_eq!((obs.stalls.as_slice(), obs.grant, obs.held), (&[(2, 2)][..], 3, 3), "lsfree");
+    let obs = run_chain(4, &[Mid::Plain(32)], 64, Releaser::Free, Releaser::Core(23));
+    assert_eq!((obs.stalls.as_slice(), obs.grant, obs.held), (&[(25, 25)][..], 26, 26), "pre2 32, R 23");
+    let obs = run_chain(4, &[Mid::Plain(32)], 64, Releaser::Free, Releaser::Core(22));
+    assert_eq!(obs.stalls, [], "pre2 32, R 22");
+    let obs = run_chain(4, &mids("4f 16"), 64, Releaser::Free, Releaser::Core(15));
+    assert_eq!((obs.stalls.as_slice(), obs.grant), (&[(2, 2), (13, 16)][..], 17), "b2n16, R 15");
 }

@@ -625,8 +625,10 @@ impl DmaEngine {
                 any_active = true;
             }
 
-            // The lock port picks the chain's next lock BD and times its request.
+            // The lock port drives the channel's STALLED_LOCK, then picks the chain's next lock
+            // BD and times its request.
             if self.channels[ch_idx].word_clock.is_running() {
+                self.drive_lock_port_stall(ch_idx);
                 let now = self.read_clock;
                 let ch = &mut self.channels[ch_idx];
                 ch.lock_port.update(&ch.word_clock, now);
@@ -1625,7 +1627,7 @@ impl DmaEngine {
             self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_starving = false;
         }
-        if self.channels[ch_idx].prev_lock_stalled {
+        if self.channels[ch_idx].prev_lock_stalled && !self.channels[ch_idx].word_clock.is_running() {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_lock_stalled = false;
         }
@@ -2160,7 +2162,8 @@ impl DmaEngine {
     /// BD slot this acquire RECYCLES has its deferred release-trace scheduled --
     /// HW's LOCK_SEL*_REL trace fires at the BD-ring recycle, not at completion.
     fn on_acquire_granted(&mut self, ch_idx: usize, lock_id: u8, bd_index: u8) {
-        if self.channels[ch_idx].prev_lock_stalled {
+        // A compute MM2S's level belongs to its lock port (`drive_lock_port_stall`).
+        if self.channels[ch_idx].prev_lock_stalled && !self.channels[ch_idx].word_clock.is_running() {
             self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: false });
             self.channels[ch_idx].prev_lock_stalled = false;
         }
@@ -2720,13 +2723,36 @@ impl DmaEngine {
     ) -> ChannelFsm {
         let Some(granted_at) = self.word_clock_grant(ch_idx) else {
             self.channels[ch_idx].stats.lock_wait_cycles += 1;
-            if !self.channels[ch_idx].prev_lock_stalled {
-                self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: true });
-                self.channels[ch_idx].prev_lock_stalled = true;
-            }
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         };
         self.take_word_clock_grant(ch_idx, lock_id, transfer, granted_at)
+    }
+
+    /// A compute MM2S's STALLED_LOCK level (`LockPort::stall_level`): up from P until the lock
+    /// is held, whatever BD the FSM is on (silicon: the waiting BD's level rises up to two
+    /// cycles before the BD before it finishes).
+    fn drive_lock_port_stall(&mut self, ch_idx: usize) {
+        let now = self.read_clock;
+        let ch = &self.channels[ch_idx];
+        let up = if ch.prev_lock_stalled {
+            !ch.lock_port.target_held(&ch.word_clock, now)
+        } else {
+            // P's last-access bound looks one step ahead: the BD before's last access is
+            // presented next step if it is the current BD's last granule and nothing but the bank
+            // arbitration can hold it (a refused access is not foreseen).
+            let next = ch.lock_port.predecessor_is_current(&ch.word_clock)
+                && ch.fsm.transfer().is_some_and(|t| {
+                    let layout = self.bank_layout();
+                    t.remaining_bytes() > 0
+                        && self.granule_at_cursor(t, layout).words as u64 * 4 >= t.remaining_bytes() as u64
+                        && self.next_granule_fetch(t, layout, now + 1).is_some()
+                });
+            ch.lock_port.stall_level(&ch.word_clock, now, next)
+        };
+        if up != self.channels[ch_idx].prev_lock_stalled {
+            self.channels[ch_idx].prev_lock_stalled = up;
+            self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: up });
+        }
     }
 
     /// The step from which a compute MM2S holds its current BD's lock, if its lock port has
