@@ -1074,3 +1074,216 @@ def test_ring_opposite_parity_variant():
     assert phys_bank(g.FETCH_SRC_ADDR + 16) == 1                               # MM2S 1 starts on bank 1
     ev = g.ring_memmod_events(ring("mx"))
     assert len(ev) == 8 and "DMA_MM2S_1_STALLED_LOCK" in ev and "DMA_MM2S_0_STALLED_LOCK" in ev
+
+
+# -- DMA-side stamp cases (fetch-build --start-task) ------------------------------------
+
+def test_start_task_names_pre_nops_and_event_list():
+    assert [g.fetch_case_name(p, False, "none", True) for p in (0, 5)] == ["lfs00", "lfs05"]
+    assert [g.fetch_case_name(p, True, "none", True) for p in (0, 5)] == ["lfq00", "lfq05"]
+    assert g.FETCH_PRE_NOPS == (0, 1, 2, 3, 4, 5)
+    others = {g.fetch_case_name(k, c, b) for k in g.FETCH_KS for c, b in g.FETCH_PREFIX}
+    assert not others & {g.fetch_case_name(p, c, "none", True) for p in g.FETCH_PRE_NOPS for c in (False, True)}
+    args = g.fetch_inject_args(True)
+    events = args[args.index("--memmod-sweep-events") + 1].split(",")
+    assert events == g.FETCH_MEMMOD_EVENTS + ["DMA_MM2S_0_START_TASK"] and len(events) == 8
+    assert "DMA_MM2S_0_START_TASK" not in g.fetch_inject_args()                  # the plain cases are unchanged
+
+
+@pytest.mark.parametrize("pre", [0, 1, 5])
+def test_start_task_core_has_pre_nops_before_the_marker_and_no_loads(pre):
+    body = bundles_of(g.fetch_core_asm(0, "none", pre=pre))
+    i = body.index("event #0")
+    base = bundles_of(g.fetch_core_asm(0, "none"))
+    assert i == base.index("event #0") + pre                                     # only the pre nops are added
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    assert not [b for b in body if b.startswith(("lda r26", "lda r28"))]
+    assert sum(b.startswith("acq ") for b in body) == 2 and sum(b.startswith("rel ") for b in body) == 1
+
+
+def test_start_task_core_rejects_out_of_range_pre():
+    for pre in (-1, g.FETCH_MAX_PRE + 1):
+        with pytest.raises(ValueError):
+            g.fetch_core_asm(0, "none", pre=pre)
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_start_task_design_starts_the_task_from_the_sequence_after_the_go_lock_is_still_unset(chained):
+    t = g.fetch_design_mlir(chained, task=True)
+    assert "aie.dma_start(MM2S" not in t and "aie.dma_start(S2MM, 0, ^recv, ^end)" in t
+    seq = t.split("aie.runtime_sequence")[1]
+    assert seq.index("aiex.dma_configure_task(%t02, MM2S, 0)") < seq.index("aiex.dma_start_task(%task)") \
+        < seq.index("aiex.set_lock(%lGo")                                       # the go lock comes after the start
+    task = seq.split("aiex.dma_configure_task")[1].split("aiex.dma_start_task")[0]
+    assert task.index("use_lock(%lA, AcquireGreaterEqual") < task.index("dma_bd(%src") < task.index("use_lock(%lB, Release")
+    assert ("dma_bd(%pre" in task) == chained
+    assert ("aie.next_bd ^send" in task) == chained
+    for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "npu.sync"):
+        assert forbidden not in seq                                              # still nothing in it blocks
+
+
+def test_start_task_false_leaves_the_boot_design_alone():
+    for chained in (False, True):
+        assert g.fetch_design_mlir(chained, task=False) == g.fetch_design_mlir(chained)
+
+
+def test_start_task_row_and_finish_check():
+    rel = 1000
+    e = held("DMA_MM2S_0_STALLED_LOCK", 600, rel + 1) + [ev("LOCK_0_REL", rel), ev("DMA_MM2S_0_START_TASK", rel - 400)]
+    e += [ev("DMA_MM2S_0_FINISHED_BD", rel + 54), ev("DMA_S2MM_0_FINISHED_BD", rel + 76)]
+    r = g.fetch_row(e)
+    assert r["mm2s_start"] == [-400] and r["grant"] == 2
+    assert g.start_missing(r) == []
+    assert g.start_missing(r, chained=True) == ["MM2S FINISHED_BD x1 (want 2)"]   # the pre BD's finish is absent
+    r2 = g.fetch_row([x for x in e if x.name != "DMA_MM2S_0_START_TASK"])
+    assert g.start_missing(r2) == ["DMA_MM2S_0_START_TASK"]
+    assert "start_task [-400]" in g.format_fetch_table([(0, "e1.emu", dict(r, check=[]))])
+    assert "finish ok" in g.format_fetch_table([(0, "e1.emu", dict(r, check=[]))])
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+def test_start_task_core_assembles(tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.fetch_core_asm(0, "none", pre=5))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+# -- refused-access probe (refuse-*) ----------------------------------------------------
+
+def rcase(r=2, pos="e", s=35):
+    return g.RefuseCase(r, pos, s)
+
+
+def test_refuse_plan_is_48_distinct_valid_cases_clear_of_other_variants():
+    plan = g.refuse_plan()
+    names = [c.name for c in plan]
+    assert len(names) == len(set(names)) == 48
+    assert {(c.r, c.pos) for c in plan} == {(r, p) for r in (0, 1, 2, 3) for p in "el"}
+    for c in plan:
+        g.refuse_validate(c)
+    for r in (0, 1, 2, 3):
+        for pos in "el":
+            ss = sorted(c.s for c in plan if (c.r, c.pos) == (r, pos))
+            assert ss == list(range(g.REFUSE_S0[pos], g.REFUSE_S0[pos] + 6))      # six consecutive: each residue mod 3 twice
+    assert all(n.startswith("rf") and not n.startswith(("rg", "lf", "ls", "lt", "ar")) for n in names)
+    assert rcase(3, "l", 8).name == "rfl3s08"
+    others = {g.fetch_case_name(k, c, b) for k in g.FETCH_KS for c, b in g.FETCH_PREFIX}
+    assert not others & set(names)
+
+
+def test_refuse_rejects_out_of_range():
+    for c in (rcase(r=4), rcase(pos="x"), rcase(s=-1), rcase(s=g.REFUSE_MAX_S + 1)):
+        with pytest.raises(ValueError):
+            g.refuse_core_asm(c)
+
+
+@pytest.mark.parametrize("cell", [15, 47])
+def test_refuse_rule_refuses_r_accesses_with_the_chosen_history(cell):
+    m = g.refuse_settle_loads(cell)
+    assert [g.refuse_refused(r, cell, m) for r in g.REFUSE_RS] == [0, 1, 2, 3]
+    assert m == {15: 0, 47: 1}[cell]                       # derived from the rotation rule, pinned here as a check
+
+
+@pytest.mark.parametrize("r,pos,s", [(0, "e", 35), (1, "e", 36), (3, "l", 8), (2, "l", 3)])
+def test_refuse_core_order_camp_marker_release_b_wait_end(r, pos, s):
+    c = rcase(r, pos, s)
+    body = bundles_of(g.refuse_core_asm(c))
+    i = body.index("event #0")
+    assert body[i + 1] == f"rel #{g.OWN + g.REFUSE_LOCK_A}, r2"
+    k = c.cell + 1
+    assert body[i + 2:i + 2 + k] == ["nop"] * k                          # first load `cell` cycles after a grant at +2
+    camp = body[i + 2 + k:i + 2 + k + g.REFUSE_CAMP_SLOTS]
+    assert [b.startswith("lda") for b in camp] == [True] * r + [False] * (g.REFUSE_CAMP_SLOTS - r)
+    assert camp[r:] == ["nop"] * (g.REFUSE_CAMP_SLOTS - r)               # every r has the same camp length
+    offs = [int(b.split("#")[1].rstrip("]")) for b in camp[:r]]
+    assert [phys_bank(g.FETCH_LD_ADDR + o) for o in offs] == [0] * r      # all on physical bank 0
+    j = i + 2 + k + g.REFUSE_CAMP_SLOTS
+    assert body[j] == "event #1" and body[j + 1:j + 1 + s] == ["nop"] * s
+    assert body[j + 1 + s] == f"rel #{g.OWN + g.REFUSE_LOCK_B}, r2"
+    assert body.index(f"acq #{g.OWN + g.REFUSE_LOCK_END}, r3") > j + 1 + s
+    assert body.index(f"acq #{g.OWN + g.REFUSE_LOCK_GO}, r3") < i
+    assert sum(b.startswith("acq ") for b in body) == 2                  # go and END: nothing host-fed
+    assert sum(b.startswith("rel ") for b in body) == 2                  # A, then B
+    history = [b for b in body[:i] if b.startswith("lda r25,")]
+    assert len(history) == g.refuse_settle_loads(c.cell)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [rcase(0, "e", 35), rcase(3, "l", 8)])
+def test_refuse_core_assembles(c, tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.refuse_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_refuse_design_chain_locks_words_and_safety():
+    t = g.refuse_design_mlir()
+    mm2s = t.split("aie.dma_start(MM2S, 0, ^pre")[1].split("^recv_start:")[0]
+    assert mm2s.index("^pre:") < mm2s.index("^send:") < mm2s.index("^second:")
+    pre, send, second = (mm2s.split(f"^{n}:")[1].split("\n    ^")[0] for n in ("pre", "send", "second"))
+    assert "use_lock" not in pre and "memref<4xi32>" in pre and "aie.next_bd ^send" in pre
+    assert send.index("use_lock(%lA, AcquireGreaterEqual") < send.index("dma_bd(%src") < send.index("use_lock(%lDone, Release")
+    assert second.index("use_lock(%lB, AcquireGreaterEqual") < second.index("dma_bd(%tail") < second.index("use_lock(%lEnd, Release")
+    assert "aie.next_bd ^second" in send and "aie.next_bd ^end" in second
+    assert 'aie.lock(%t02, 0) {init = 0 : i32, sym_name = "lB"}' in t           # B is lock 0: the reset selector follows it
+    assert "memref<84xi32>" in t.split("^recv:")[1].split("^end:")[0]          # the S2MM takes 4 + 64 + 16 words
+    assert "use_lock" not in t.split("^recv:")[1].split("^end:")[0]
+    seq = t.split("aie.runtime_sequence")[1]
+    assert "aiex.set_lock(%lGo" in seq
+    for forbidden in ("dma_await", "dma_wait", "dma_memcpy_nd", "dma_start_task", "npu.sync"):
+        assert forbidden not in seq
+    assert phys_bank(g.FETCH_PRE_ADDR) // 2 == 1 and phys_bank(g.REFUSE_TAIL_ADDR) // 2 == 1   # logical bank 1
+    assert g.REFUSE_TAIL_ADDR % 32 == 0 and g.REFUSE_TAIL_ADDR >= g.FETCH_PRE_ADDR + 4 * g.FETCH_PRE_WORDS
+
+
+def test_refuse_event_lists():
+    assert g.REFUSE_MEMMOD_EVENTS == [
+        "LOCK_0_REL", "LOCK_SEL0_ACQ_GE", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD",
+        "DMA_S2MM_0_FINISHED_BD", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "DMA_MM2S_0_FINISHED_TASK"]
+    args = g.refuse_inject_args()
+    assert args[args.index("--memmod-sweep-events") + 1] == ",".join(g.REFUSE_MEMMOD_EVENTS)
+    assert args[args.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,MEMORY_STALL"
+
+
+def refuse_synthetic(rb_after_fk=8, grant_after=3, camp=(15, 16, 17), stalls=0, drop=()):
+    g_k = 1000
+    fk = g_k + 52
+    rb = fk + rb_after_fk
+    e = held("DMA_MM2S_0_STALLED_LOCK", 400, g_k - 1) + held("DMA_MM2S_0_STALLED_LOCK", fk + 1, rb + grant_after - 1)
+    e += [ev("LOCK_0_REL", rb), ev("LOCK_SEL0_ACQ_GE", rb + grant_after - 1)]
+    e += [ev("DMA_MM2S_0_FINISHED_BD", fk), ev("DMA_MM2S_0_FINISHED_BD", rb + grant_after + 16),
+          ev("DMA_MM2S_0_FINISHED_TASK", rb + grant_after + 16), ev("DMA_S2MM_0_FINISHED_BD", rb + grant_after + 40)]
+    e += [ev("CONFLICT_DM_BANK_0", g_k + t) for t in camp]
+    e += [ev("INSTR_EVENT_0", g_k - 3, pkt=0), ev("INSTR_EVENT_1", g_k + 25, pkt=0)]
+    e += [ev("MEMORY_STALL", g_k + 16 + i, pkt=0) for i in range(stalls)]
+    return [x for x in e if x.name not in drop]
+
+
+def test_refuse_row_numbers_and_finish_check():
+    r = g.refuse_row(refuse_synthetic())
+    assert r["g_k"] == 1000 and r["fins"][0] == 52 and r["r_b"] - r["fins"][0] == 8
+    assert r["grant_b"] == 3 and r["acq_b"] == [2]                       # STALLED_LOCK falls one cycle after ACQ_GE
+    assert r["refused"] == 3 and r["memory_stalls"] == 0
+    assert g.refuse_missing(r, rcase(3)) == []
+    r2 = g.refuse_row(refuse_synthetic(camp=(15, 16, 17, 18), stalls=1))
+    assert r2["refused"] == 3 and r2["memory_stalls"] == 1               # conflicts minus the core's own stalls
+    assert "ok" in g.format_refuse_table([(rcase(3), "e1.emu", r)]).splitlines()[1]
+
+
+def test_refuse_missing_names_what_the_design_needs():
+    no_conflict = g.refuse_row(refuse_synthetic(camp=()))
+    assert g.refuse_missing(no_conflict, rcase(0)) == []                 # r = 0 has no camp, so no conflict
+    assert g.refuse_missing(no_conflict, rcase(2)) == ["CONFLICT_DM_BANK_0"]
+    r = g.refuse_row(refuse_synthetic(drop=("DMA_MM2S_0_FINISHED_TASK", "LOCK_SEL0_ACQ_GE")))
+    assert set(g.refuse_missing(r, rcase(3))) == {"DMA_MM2S_0_FINISHED_TASK", "LOCK_SEL0_ACQ_GE",
+                                                  "MM2S FINISHED_TASK x0 (want 1)"}
+    assert g.refuse_missing({"g_k": None}, rcase()) == ["no STALLED_LOCK run or no LOCK_0_REL"]
+
+
+def test_refuse_row_b_free_when_asked_has_no_grant():
+    e = [x for x in refuse_synthetic() if x.name != "DMA_MM2S_0_STALLED_LOCK" or x.ts < 1000]
+    assert g.refuse_row(e)["grant_b"] is None
