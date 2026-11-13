@@ -46,17 +46,15 @@ def test_median_over_silicon_samples(tmp_path):
     assert M.measure(emu, hws)[("t.chess", (0, 2))] == 1
 
 
-def test_level_rows_and_unequal_counts_are_ignored(tmp_path):
+def test_level_rows_are_ignored_and_first_occurrence_is_used(tmp_path):
     emu, hw = tmp_path / "emu", tmp_path / "hw"
     ev = rows(0, 0) + [(0, 2, M.MEM, "DMA_S2MM_1_STREAM_STARVATION", 5000 + 40 * i) for i in range(3)]
     write_side(emu, "t.chess.emu", ev)
+    # silicon: same edge rows, a different level row, and a later occurrence that drifted
     hev = rows(0, 0) + [(0, 2, M.MEM, "DMA_S2MM_1_STREAM_STARVATION", 9000 + 40 * i) for i in range(3)]
-    hev += [(0, 2, M.CORE, "INSTR_EVENT_1", 7000), (0, 2, M.CORE, "INSTR_EVENT_1", 7010)]
+    hev += [(0, 2, M.CORE, "INSTR_EVENT_0", 1000 + 77)]  # extra, later core occurrence
     write_side(hw, "t.chess.hw", hev)
-    emu_extra = [(0, 2, M.CORE, "INSTR_EVENT_1", 7000)]  # one occurrence on the emulator side only
-    write_side(tmp_path / "emu2", "t.chess.emu", rows(0, 0) + emu_extra)
     assert M.measure(emu, [hw])[("t.chess", (0, 2))] == 0
-    assert M.measure(tmp_path / "emu2", [hw])[("t.chess", (0, 2))] == 0
 
 
 def test_tile_needs_usable_rows_on_both_units(tmp_path):

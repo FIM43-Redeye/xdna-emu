@@ -6,8 +6,10 @@ The compute tile's memory trace timer is reset through a different broadcast pat
 the core's, so a tile's two trace units disagree on time by a small fixed number of
 cycles. That number cannot be read from one trace (the events of the two units are
 separated in time by the workload too), but the *difference between the emulator and
-silicon* of it can: for every event row that both sides saw the same number of times,
-pair the occurrences in order and take the median of (emulator - silicon) timestamps.
+silicon* of it can: for every event row that both sides saw at least once, take the difference of the
+first occurrences (emulator - silicon): later occurrences drift with run-to-run host
+timing and would add noise to a one-cycle question. The median over a unit's rows is
+that unit's offset.
 A tile's core rows give one median, its memory rows another; the memory median minus
 the core median is how many cycles later (positive) or earlier (negative) the
 emulator's memory unit sits relative to its core unit, compared with silicon. Zero
@@ -16,9 +18,9 @@ timestamps differ from the emulator's by the host-side start time, which both
 medians contain and the subtraction cancels.
 
 Held-condition (level) rows are left out: their timestamps are interval starts and
-move with other things (PERF_CNT, *STARVATION*, *RUNNING*, *STALL*, *BACKPRESSURE*).
-Rows with fewer than 2 occurrences, or different counts on the two sides, are left
-out too. Tiles with no usable row on either unit are not listed.
+move with other things (PERF_CNT, *STARVATION*, *RUNNING*, *STALL*, *BACKPRESSURE*;
+the core's MEMORY_STALL is a level row too). Tiles with no usable row on either
+unit are not listed.
 
 usage: mem_core_offset.py --emu TREE [TREE ...] --silicon DIR [DIR ...] [--only TEST ...]
 
@@ -55,15 +57,15 @@ def load_tiles(side_dir):
 
 
 def unit_offset(emu_rows, hw_rows, unit):
-    """Median paired (emu - hw) over the unit's usable rows, or None."""
+    """Median over the unit's usable rows of (first emulator stamp - first silicon stamp), or None."""
     diffs = []
     for (pkt, name), ts in emu_rows.items():
         if pkt != unit or any(m in name for m in LEVEL_MARKERS):
             continue
         hs = hw_rows.get((pkt, name))
-        if not hs or len(hs) != len(ts) or len(ts) < 2:
+        if not hs:
             continue
-        diffs.append(statistics.median(a - b for a, b in zip(sorted(ts), sorted(hs))))
+        diffs.append(min(ts) - min(hs))
     return statistics.median(diffs) if diffs else None
 
 
