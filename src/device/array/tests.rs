@@ -1408,3 +1408,166 @@ mod path_capacity {
         assert_eq!(array.tiles[dst].stream_input_len(0), 1);
     }
 }
+
+// -- Which stream switches charge a word the adaptive-gate wake cycle -------------------------
+//
+// Silicon (no-data trace probe, one capture per route; arrivals of trace packets 135..400 idle
+// cycles apart against packets 48 apart, at the next shim's S2MM): core (c,2) -> memtile ->
+// shim S2MM +2; core (c,2) -> memtile -> shim (c,0) -> shim (c+1,0) S2MM +2; memtile (c,1) own
+// trace -> shim S2MM +1; shim (c,0) own trace -> shim (c+1,0) S2MM +0; and the shim's own
+// packets into its own S2MM arrive at the same delay after thousands of quiet cycles as after
+// none (three bridge captures). Only one assignment fits all of them: a gated compute or memtile
+// switch costs a word one cycle, the source's own switch included, and a shim switch costs
+// nothing. A word through an awake switch is the reference.
+
+mod gate_wake {
+    use super::*;
+    use crate::device::host_memory::HostMemory;
+    use crate::device::stream_switch::{PacketHeader, PacketType};
+    use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
+
+    const COL: u8 = 1;
+    const AWAKE: u8 = 12; // 2^12 idle cycles: never engages within a test
+    const GATED: u8 = 3; // 2^3: engaged after the 16 idle warm-up steps
+
+    /// A route: the slave the word is pushed into, then (col, row, slave, master) per switch;
+    /// the word is seen arriving when the last master holds it.
+    struct Route {
+        start: (u8, u8, usize),
+        hops: Vec<(u8, u8, usize, usize)>,
+    }
+
+    fn core_to_shim() -> Route {
+        Route {
+            start: (COL, 2, compute::TRACE_SLAVE_START as usize),
+            hops: vec![
+                (COL, 2, compute::TRACE_SLAVE_START as usize, compute::SOUTH_MASTER_START as usize),
+                (COL, 1, mem_tile::NORTH_SLAVE_START as usize, mem_tile::SOUTH_MASTER_START as usize),
+                (COL, 0, shim::NORTH_SLAVE_START as usize, shim::SOUTH_MASTER_START as usize),
+            ],
+        }
+    }
+
+    fn core_to_next_shim() -> Route {
+        Route {
+            start: (COL, 2, compute::TRACE_SLAVE_START as usize),
+            hops: vec![
+                (COL, 2, compute::TRACE_SLAVE_START as usize, compute::SOUTH_MASTER_START as usize),
+                (COL, 1, mem_tile::NORTH_SLAVE_START as usize, mem_tile::SOUTH_MASTER_START as usize),
+                (COL, 0, shim::NORTH_SLAVE_START as usize, shim::EAST_MASTER_START as usize),
+                (COL + 1, 0, shim::WEST_SLAVE_START as usize, shim::SOUTH_MASTER_START as usize),
+            ],
+        }
+    }
+
+    fn memtile_to_shim() -> Route {
+        Route {
+            start: (COL, 1, mem_tile::TRACE_SLAVE_START as usize),
+            hops: vec![
+                (COL, 1, mem_tile::TRACE_SLAVE_START as usize, mem_tile::SOUTH_MASTER_START as usize),
+                (COL, 0, shim::NORTH_SLAVE_START as usize, shim::SOUTH_MASTER_START as usize),
+            ],
+        }
+    }
+
+    fn shim_to_next_shim() -> Route {
+        Route {
+            start: (COL, 0, shim::TRACE_SLAVE_START as usize),
+            hops: vec![
+                (COL, 0, shim::TRACE_SLAVE_START as usize, shim::EAST_MASTER_START as usize),
+                (COL + 1, 0, shim::WEST_SLAVE_START as usize, shim::SOUTH_MASTER_START as usize),
+            ],
+        }
+    }
+
+    fn shim_own() -> Route {
+        Route {
+            start: (COL, 0, shim::TRACE_SLAVE_START as usize),
+            hops: vec![(COL, 0, shim::TRACE_SLAVE_START as usize, shim::SOUTH_MASTER_START as usize)],
+        }
+    }
+
+    /// Steps from the push until the packet's first word is in the route's last master, with the switches in
+    /// `gated` idle long enough to have engaged their adaptive gate and every other switch awake.
+    fn steps_to_arrive(route: &Route, gated: &[(u8, u8)]) -> u32 {
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        for &(col, row, slave, master) in &route.hops {
+            let period = if gated.contains(&(col, row)) { GATED } else { AWAKE };
+            array.clock_mut().set_adaptive_abort_period(col, row, period);
+            // Packet-switched, as the trace flows are: slot 0 of the slave takes id 1 to
+            // arbiter 0 / msel 0, which the master accepts.
+            let switch = &mut array.tile_mut(col, row).stream_switch;
+            switch.slaves[slave].packet_enable = true;
+            switch.configure_slave_slot(slave, 0, 1 << 24 | 0x1f << 16 | 1 << 8);
+            switch.configure_master_packet(master, 1 << 31 | 1 << 30 | 1 << 3);
+        }
+        for _ in 0..16 {
+            array.step_data_movement(&mut host);
+        }
+        for &(col, row, _, _) in &route.hops {
+            assert_eq!(
+                array.clock().is_adaptive_ss_engaged(col, row),
+                gated.contains(&(col, row)),
+                "idle counter of ({col},{row}) before the push"
+            );
+        }
+        let (scol, srow, sport) = route.start;
+        let sidx = array.tile_index(scol, srow);
+        let header = PacketHeader::new(1, scol, srow).with_type(PacketType::Trace).encode();
+        array.tiles[sidx].stream_switch.slaves[sport].push_with_tlast(header, false);
+        array.tiles[sidx].stream_switch.slaves[sport].push_with_tlast(0xDEAD_BEEF, true);
+        let &(lcol, lrow, _, lmaster) = route.hops.last().unwrap();
+        let lidx = array.tile_index(lcol, lrow);
+        for step in 1..=40 {
+            array.step_data_movement(&mut host);
+            if array.tiles[lidx].stream_switch.masters[lmaster].has_data() {
+                return step;
+            }
+        }
+        panic!("the word never reached the last master");
+    }
+
+    /// Extra steps the route takes with `gated` engaged, against every switch awake.
+    fn wake_cost(route: &Route, gated: &[(u8, u8)]) -> i64 {
+        steps_to_arrive(route, gated) as i64 - steps_to_arrive(route, &[]) as i64
+    }
+
+    #[test]
+    fn a_gated_core_switch_costs_its_own_trace_word_one_cycle() {
+        assert_eq!(wake_cost(&core_to_shim(), &[(COL, 2)]), 1);
+    }
+
+    #[test]
+    fn a_gated_memtile_costs_a_crossing_word_one_cycle() {
+        assert_eq!(wake_cost(&core_to_shim(), &[(COL, 1)]), 1);
+    }
+
+    #[test]
+    fn a_gated_shim_switch_costs_a_crossing_word_nothing() {
+        assert_eq!(wake_cost(&core_to_shim(), &[(COL, 0)]), 0);
+        assert_eq!(wake_cost(&core_to_next_shim(), &[(COL, 0)]), 0);
+        assert_eq!(wake_cost(&core_to_next_shim(), &[(COL + 1, 0)]), 0);
+    }
+
+    /// Silicon: core trace to its own column's shim S2MM +2, to the next column's +2.
+    #[test]
+    fn the_core_trace_routes_pay_two_cycles_when_every_switch_is_gated() {
+        assert_eq!(wake_cost(&core_to_shim(), &[(COL, 2), (COL, 1), (COL, 0)]), 2);
+        assert_eq!(wake_cost(&core_to_next_shim(), &[(COL, 2), (COL, 1), (COL, 0), (COL + 1, 0)]), 2);
+    }
+
+    /// Silicon: a memtile's own trace packets into the shim S2MM +1.
+    #[test]
+    fn a_memtile_trace_word_pays_one_cycle_for_its_own_gated_switch() {
+        assert_eq!(wake_cost(&memtile_to_shim(), &[(COL, 1), (COL, 0)]), 1);
+    }
+
+    /// Silicon: a shim's own trace packets +0, into its own S2MM or the next shim's.
+    #[test]
+    fn a_shim_trace_word_pays_nothing() {
+        assert_eq!(wake_cost(&shim_own(), &[(COL, 0)]), 0);
+        assert_eq!(wake_cost(&shim_to_next_shim(), &[(COL, 0), (COL + 1, 0)]), 0);
+    }
+}

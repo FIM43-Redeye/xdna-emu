@@ -74,13 +74,36 @@ impl TileArray {
             if !self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
                 continue;
             }
-            // Adaptive gate (bottom tier): skip if the SS has been idle long
-            // enough for the adaptive counter to engage.  Wake 2 (stream
-            // beat -> cycle_active -> Phase 5 tick) clears the counter on
-            // the cycle that brought the beat in, so this skip lasts at
-            // most one cycle past the wake event.
-            if self.clock.is_adaptive_ss_engaged(col, row) {
-                continue;
+            // Adaptive gate (bottom tier). A compute or memtile switch idle long enough for
+            // its adaptive counter to engage costs the first word into it one cycle: it is
+            // stepped, at the pass that would have moved the word, one cycle late. A word
+            // pushed in before the first pass (the tile's own DMA, core or trace unit) waits
+            // for the next cycle's first pass: the beat resets the idle counter at the end of
+            // the cycle (Wake 2, Phase 5 below). A word that crosses in after the first pass
+            // waits for the next cycle's second pass, so the switch also sits out that
+            // cycle's first pass (`ss_late_wake`).
+            //
+            // A shim switch costs nothing. Silicon (no-data trace probe, packets 135..400
+            // idle cycles apart against packets 48 apart): core trace -> memtile -> shim S2MM
+            // +2, the same route on through the next column's shim +2, memtile trace -> shim
+            // +1, shim trace -> next shim +0; and the shim's own trace packets reach its S2MM
+            // at the same delay after thousands of quiet cycles as after none. Measured for
+            // trace words; that a data word into a quiet shim switch is not held either is
+            // INFERRED (the same switch).
+            let shim = matches!(self.tiles[i].tile_kind, TileKind::ShimNoc | TileKind::ShimPl);
+            if !shim {
+                if advance && std::mem::take(&mut self.ss_late_wake[i]) {
+                    continue;
+                }
+                if self.clock.is_adaptive_ss_engaged(col, row) {
+                    let has_word = self.tiles[i].stream_switch.slaves.iter().any(|p| p.has_data());
+                    if advance {
+                        self.ss_gated_idle_first_pass[i] = !has_word;
+                    } else if has_word && self.ss_gated_idle_first_pass[i] {
+                        self.ss_late_wake[i] = true;
+                    }
+                    continue;
+                }
             }
 
             let forwarded = if advance {
