@@ -1456,7 +1456,26 @@ size_t async_ctx_depth() {
 struct CtxBundle {
     xrt::hw_context ctx;
     xrt::kernel kernel;
+    // The buffers the bundle's run used. The destroyer releases them only after
+    // the context is gone: see release_context_then_buffers.
+    std::vector<xrt::bo> bos;
 };
+
+// Teardown order: the hardware context first, then the buffer objects.
+// Destroying the context is what stops the partition's DMAs (the driver's
+// context teardown waits for the firmware to destroy the context). A DMA task
+// may outlive the command that started it -- the trace S2MM task, whose BD
+// spans the whole trace buffer, normally never finishes -- so a buffer must
+// stay allocated until the context that can still write it is gone. Clearing
+// the handles in this order is not enough on its own when another reference
+// keeps the context alive, so every caller drops the run and kernel first.
+void release_context_then_buffers(xrt::kernel& kernel, xrt::hw_context& ctx,
+                                  std::vector<xrt::bo>& bos)
+{
+    kernel = xrt::kernel{};
+    ctx = xrt::hw_context{};
+    bos.clear();
+}
 
 // Per-(xclbin,kernel) pipeline. Owns a builder thread that produces
 // ready CtxBundles and a destroyer thread that consumes retired ones.
@@ -1584,8 +1603,7 @@ private:
             // Explicit reset outside the lock -- kernel first (holds a
             // reference to ctx), then ctx.
             try {
-                b->kernel = xrt::kernel{};
-                b->ctx = xrt::hw_context{};
+                release_context_then_buffers(b->kernel, b->ctx, b->bos);
             } catch (const std::exception& e) {
                 if (verbose_) {
                     std::fprintf(stderr,
@@ -1666,6 +1684,19 @@ struct PreparedKernel {
     // run because BOs are bound to the retiring kernel's group_ids.
     // Constructed lazily on the first async run.
     std::unique_ptr<CtxPipeline> pipeline;
+
+    // Member destruction would release pool_bos before context (reverse
+    // declaration order); tear down explicitly instead. The pipeline goes
+    // first: its destroyer drains retired bundles, each releasing its own
+    // buffers after its context.
+    ~PreparedKernel() {
+        try {
+            pipeline.reset();
+            release_context_then_buffers(kernel, context, pool_bos);
+        } catch (...) {
+            // A destructor must not throw; the process is ending anyway.
+        }
+    }
 };
 
 std::unique_ptr<PreparedKernel> prepare_kernel(
@@ -2093,8 +2124,8 @@ RunOutcome execute_run(
                 prep.context = active_bundle->ctx;
                 prep.kernel = active_bundle->kernel;
             } else {
-                prep.kernel = xrt::kernel{};
-                prep.context = xrt::hw_context{};
+                // The previous run's buffers go with its context, after it.
+                release_context_then_buffers(prep.kernel, prep.context, prep.pool_bos);
                 prep.context = make_hw_context(
                     device, prep.xclbin.get_uuid(), prep.qos);
                 prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
@@ -2180,6 +2211,13 @@ RunOutcome execute_run(
                 std::fprintf(stderr,
                     "bridge-trace-runner: %s BO pool\n",
                     prep.pool_ready ? "rebuilding" : "allocating");
+            }
+            if (prep.pool_ready) {
+                // A reused context is still live and may still write the old
+                // buffers: replace it before releasing them.
+                release_context_then_buffers(prep.kernel, prep.context, prep.pool_bos);
+                prep.context = make_hw_context(device, prep.xclbin.get_uuid(), prep.qos);
+                prep.kernel = xrt::kernel(prep.context, prep.kernel_name);
             }
             prep.pool_bos.clear();
             prep.pool_bo_sizes.clear();
@@ -2518,7 +2556,10 @@ RunOutcome execute_run(
     // Clear prep's copies first so the destroyer thread holds the last
     // reference and can tear down off the main thread's critical path.
     // BO pool is bound to this kernel's group_ids, so it has to go too.
+    // The buffers travel with the bundle: the destroyer releases them after
+    // the bundle's context (release_context_then_buffers).
     if (active_bundle) {
+        active_bundle->bos = std::move(prep.pool_bos);
         prep.pool_bos.clear();
         prep.pool_bo_sizes.clear();
         prep.pool_arg_to_bo_idx.clear();
