@@ -784,3 +784,293 @@ def test_chain_build_refuses_a_directory_built_for_another_design(tmp_path):
     with pytest.raises(ValueError):
         g.chain_check_design_dir(tmp_path, chain("4c 8"))
     g.chain_check_design_dir(tmp_path, chain("8"))
+
+
+# -- bank arbitration probe (arb-*) ---------------------------------------------------
+
+def arb(bank=0, op="l", n=1, k=16, m=0):
+    return g.ArbCase(bank, op, n, k, m)
+
+
+@pytest.mark.parametrize("bank,op,n,k,m", [(0, "l", 1, 8, 0), (0, "l", 4, 16, 2), (1, "s", 6, 28, 0),
+                                           (0, "s", 3, 0, 4)])
+def test_arb_core_order_settle_loads_marker_release_nops_accesses_marker(bank, op, n, k, m):
+    body = bundles_of(g.arb_core_asm(arb(bank, op, n, k, m)))
+    i = body.index("event #0")
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"
+    assert body[i + 2:i + 2 + k] == ["nop"] * k
+    acc = body[i + 2 + k:i + 2 + k + n]
+    verb = "lda" if op == "l" else "st r2,"
+    assert all(a.startswith(verb) for a in acc) and len(acc) == n
+    offs = [int(a.split("#")[1].rstrip("]")) for a in acc]
+    assert [phys_bank(g.FETCH_LD_ADDR + o) for o in offs] == [bank] * n      # all on the one physical bank
+    j = i + 2 + k + n
+    assert body[j:j + g.ARB_EVENT1_NOPS] == ["nop"] * g.ARB_EVENT1_NOPS and body[j + g.ARB_EVENT1_NOPS] == "event #1"
+    settle = [b for b in body[:i] if b.startswith("lda r25,")]
+    assert len(settle) == m
+    assert all(phys_bank(g.FETCH_LD_ADDR + int(s.split("#")[1].rstrip("]"))) == bank for s in settle)
+    assert body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3") < i                # settle loads after the go lock
+    assert sum(b.startswith("acq ") for b in body) == 2                         # go and B only
+    assert sum(b.startswith("rel ") for b in body) == 1
+    # nothing else touches data memory between the go lock and the wait for B
+    go, done = body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3"), body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    mem = [b for b in body[go:done] if b.startswith(("lda", "st "))]
+    assert len(mem) == m + n
+
+
+def test_arb_rejects_out_of_range():
+    for c in (arb(bank=2), arb(op="x"), arb(n=0), arb(n=g.ARB_MAX_N + 1), arb(k=65), arb(m=g.ARB_MAX_M + 1)):
+        with pytest.raises(ValueError):
+            g.arb_core_asm(c)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+@pytest.mark.parametrize("c", [arb(0, "l", 6, 16, 4), arb(1, "s", 6, 28, 0)])
+def test_arb_core_assembles(c, tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.arb_core_asm(c))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_arb_plan_names_are_distinct_valid_and_clear_of_other_variants():
+    plan = g.arb_plan()
+    names = [c.name for c in plan]
+    assert len(names) == len(set(names)) == 56
+    for c in plan:
+        g.arb_validate(c)
+    assert all(n.startswith("ar") and not n.startswith(("lf", "ls", "lt")) for n in names)
+    assert arb(1, "s", 3, 28, 2).name == "ar1s3k28m2"
+
+
+def test_arb_inject_args_trace_both_core_markers_and_memory_stall():
+    args = g.arb_inject_args()
+    assert args[args.index("--core-sweep-events") + 1] == "INSTR_EVENT_0,INSTR_EVENT_1,MEMORY_STALL"
+    assert args[args.index("--memmod-sweep-events") + 1] == ",".join(g.FETCH_MEMMOD_EVENTS)
+
+
+# The rotation rule against the silicon rows it was read from (lock-fetch, single core loads).
+@pytest.mark.parametrize("bank,cell,lost", [
+    (0, 2, False), (0, 4, False), (0, 7, True), (0, 15, False), (0, 23, False), (0, 31, False), (0, 39, False),
+    (1, 3, False), (1, 5, False), (1, 11, False), (1, 19, False), (1, 27, True), (1, 35, False), (1, 43, False),
+    (1, 51, False)])
+def test_rotation_rule_reproduces_the_lock_fetch_rows(bank, cell, lost):
+    p = g.rotation_prediction(arb(bank=bank), cell)
+    assert p["contended"] == [cell]
+    assert p["core_lost"] == ([cell] if lost else [])
+
+
+def test_rotation_rule_predicts_a_bank0_loss_at_g47():
+    assert g.rotation_prediction(arb(bank=0), 47)["core_lost"] == [47]
+
+
+def test_rotation_rule_bursts_against_g15_the_dma_waits_at_most_four_cycles():
+    for n in range(1, 5):
+        p = g.rotation_prediction(arb(n=n), 15)
+        assert p["contended"] == list(range(15, 15 + n)) and p["core_lost"] == []
+        assert (15, 15 + n) in p["served"]                       # the DMA gets the bank when the core is done
+    p = g.rotation_prediction(arb(n=5), 15)
+    assert p["contended"] == [15, 16, 17, 18, 19] and p["core_lost"] == [19]
+    p = g.rotation_prediction(arb(n=6), 15)
+    assert p["core_lost"] == [19] and p["contended"] == [15, 16, 17, 18, 19]   # sixth access runs alone at 20
+
+
+def test_rotation_rule_history_moves_the_losing_access():
+    assert g.rotation_prediction(arb(m=4), 15)["core_lost"] == [15]
+    assert all(g.rotation_prediction(arb(m=m), 15)["core_lost"] == [] for m in range(4))
+    assert all(g.rotation_prediction(arb(m=m), 7)["core_lost"] == [] for m in range(1, 5))
+
+
+def test_rotation_rule_uncontended_core_accesses_count():
+    # starting one cycle before the DMA's g+15 access: the first load runs alone and advances the count
+    p = g.rotation_prediction(arb(n=5), 14)
+    assert p["contended"] == [15, 16, 17, 18] and p["core_lost"] == [18]
+
+
+def test_arb_row_reads_the_core_window_and_memory_stalls():
+    e = synthetic(rel=1000, grant_after=2, conflict_bank="CONFLICT_DM_BANK_0", conflict_at=16)
+    e += [ev("INSTR_EVENT_1", 1000 + 4 + 24, pkt=0), ev("MEMORY_STALL", 1000 + 4 + 17, pkt=0)]
+    r = g.arb_row(e)
+    assert r["grant"] == 2 and r["window"] == 24 and r["memory_stalls"] == [17]
+    c = arb(n=1, k=16)
+    body = bundles_of(g.arb_core_asm(c))
+    assert g.arb_clean_window(c) == body.index("event #1") - body.index("event #0")
+    assert g.arb_start(c, 2) == 15 and g.arb_start(c, 3) == 14
+    text = g.format_arb_table([(c, "a1.hw", r)])
+    assert "ar0l1k16m0" in text and "b0@14" in text and "(+1)" in text
+
+
+def test_arb_matches_compares_contended_cycles_and_core_stall_count():
+    r = {"grant": 2, "conflicts": [("CONFLICT_DM_BANK_0", 9)], "memory_stalls": [15]}
+    assert g.arb_matches(r, {"contended": [7], "core_lost": [7]})
+    assert not g.arb_matches(r, {"contended": [7], "core_lost": []})
+    assert not g.arb_matches(r, {"contended": [7, 8], "core_lost": [7]})
+
+
+def test_rotation_rule_bank1_phases_in_the_plan():
+    assert g.rotation_prediction(arb(bank=1, n=1, k=20), 19)["core_lost"] == []
+    assert g.rotation_prediction(arb(bank=1, n=2, k=20), 19)["core_lost"] == [20]
+    assert g.rotation_prediction(arb(bank=1, n=4, k=36), 35)["core_lost"] == []
+    assert g.rotation_prediction(arb(bank=1, n=5, k=36), 35)["core_lost"] == [39]
+
+
+# -- ring-order probe (ring-*) ----------------------------------------------------------
+
+def ring(variant="m0", **kw):
+    return g.RingCase(variant, **kw)
+
+
+def test_ring_core_camps_on_one_bank_from_the_release_then_fills_the_trace():
+    c = ring(n=10, k=0)
+    body = bundles_of(g.ring_core_asm(c))
+    i = body.index("event #0")
+    assert body[i + 1] == f"rel #{g.OWN + g.FETCH_LOCK_A}, r4" and "mov r4, #1" in body
+    camp = body[i + 2:i + 12]
+    assert all(b.startswith("lda ") for b in camp)
+    assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in camp} == {0}
+    assert body[i + 12:i + 12 + g.ARB_EVENT1_NOPS] == ["nop"] * g.ARB_EVENT1_NOPS
+    done = body.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    assert sum(b == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2" for b in body[done:]) == g.RING_FILL_RELEASES
+    assert sum(b.startswith("acq ") for b in body) == 2
+    go = body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3")
+    assert not [b for b in body[go:i] if b.startswith(("lda", "st "))]       # no history access before the camp
+
+
+def test_ring_bank1_camp_offsets():
+    body = bundles_of(g.ring_core_asm(ring(bank=1, n=9)))
+    loads = [b for b in body if b.startswith("lda r2") or b.startswith("lda r3")]
+    assert {phys_bank(g.FETCH_LD_ADDR + int(b.split("#")[1].rstrip("]"))) for b in loads} == {1}
+
+
+def test_ring_rejects_out_of_range():
+    for c in (ring("x"), ring(bank=2), ring(n=0), ring(n=g.RING_MAX_N + 1), ring(pad=g.RING_MAX_PAD + 1)):
+        with pytest.raises(ValueError):
+            g.ring_core_asm(c)
+
+
+@pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
+def test_ring_core_assembles(tmp_path):
+    s = tmp_path / "core.s"
+    s.write_text(g.ring_core_asm(ring(n=g.RING_MAX_N)))
+    r = subprocess.run([peano_mc(), "--triple=aie2", "--filetype=obj", "-o", str(tmp_path / "core.o"), str(s)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_ring_geometry():
+    assert {phys_bank(g.RING_SDST_ADDR + 16 * i) for i in range(16)} == {0, 1}      # S2MM target: banks 0/1
+    assert {phys_bank(g.RING_FEED_ADDR + 16 * i) for i in range(16)} == {2, 3}      # feed: clear of 0/1
+    assert all(phys_bank(a + 4 * j) == 0 for a in g.RING_PAD_ADDRS for j in range(4))
+    assert g.FETCH_LD_ADDR + 64 <= g.RING_PAD_ADDRS[0] and g.RING_PAD_ADDRS[1] + 16 <= g.RING_SDST_ADDR
+
+
+@pytest.mark.parametrize("variant,mm2s,s2mm,source,sdst", [("m0", 0, 0, "%src", False), ("m1", 1, 0, "%src", False),
+                                                           ("s0", 0, 0, "%feed", True), ("s1", 0, 1, "%feed", True)])
+def test_ring_design_puts_one_channel_on_banks_0_1(variant, mm2s, s2mm, source, sdst):
+    t = g.ring_design_mlir(ring(variant))
+    assert f"aie.flow(%t02, DMA : {mm2s}, %t02, DMA : {s2mm})" in t
+    assert f"aie.dma_start(MM2S, {mm2s}, ^pre" in t and f"aie.dma_start(S2MM, {s2mm}, ^recv" in t
+    send = t.split("^send:")[1].split("^recv_start:")[0]
+    assert f"aie.dma_bd({source} :" in send
+    recv = t.split("^recv:")[1].split("^end:")[0]
+    assert ("dma_bd(%sdst" in recv) == sdst
+    assert "use_lock" not in recv                                               # the S2MM never waits
+    # the S2MM takes exactly what the MM2S sends: 4 + 64 words
+    import re
+    sizes = [int(x) for x in re.findall(r"dma_bd\(%\w+ : memref<\d+xi32> offset = \d+ len = (\d+)\)", recv)]
+    assert sizes
+    assert sum(sizes) == g.FETCH_PRE_WORDS + g.FETCH_WORDS
+    seq = t.split("aie.runtime_sequence")[1]
+    for forbidden in ("dma_wait", "dma_memcpy_nd", "npu.sync"):
+        assert forbidden not in seq
+
+
+def test_ring_variants_share_buffers_and_initial_data():
+    def bufs(t):
+        return [ln.strip() for ln in t.splitlines() if "aie.buffer" in ln]
+    base = bufs(g.ring_design_mlir(ring("m0")))
+    for v in ("m1", "s0", "s1"):
+        assert bufs(g.ring_design_mlir(ring(v))) == base
+    addrs = [int(ln.split("address = ")[1].split(" ")[0]) for ln in base]
+    assert addrs == sorted(addrs)                                               # ascending for the allocator
+
+
+@pytest.mark.parametrize("pad,words", [(0, []), (3, [3]), (4, [4]), (5, [4, 1]), (8, [4, 4])])
+def test_ring_pad_words_in_bank0(pad, words):
+    t = g.ring_design_mlir(ring(pad=pad))
+    found = [int(ln.split("memref<")[1].split("x")[0]) for ln in t.splitlines() if 'sym_name = "pad' in ln]
+    assert found == words
+
+
+def test_ring_event_lists():
+    assert g.ring_memmod_events(ring("m1")) == ["LOCK_0_REL", "DMA_MM2S_1_STALLED_LOCK", "DMA_MM2S_1_FINISHED_BD",
+                                                "DMA_S2MM_0_FINISHED_BD", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                                                "DMA_MM2S_1_MEMORY_STARVATION"]
+    s1 = g.ring_memmod_events(ring("s1"))
+    assert "DMA_S2MM_1_MEMORY_BACKPRESSURE" in s1 and "DMA_S2MM_1_FINISHED_BD" in s1 and len(s1) == 8
+    assert all(len(g.ring_memmod_events(ring(v))) <= 8 for v in g.RING_VARIANTS)
+
+
+def test_ring_row_and_residues():
+    rel = 1000
+    e = held("DMA_MM2S_0_STALLED_LOCK", 200, rel + 1) + [ev("LOCK_0_REL", rel), ev("LOCK_0_REL", rel + 500)]
+    # camp starts at rel + 1; runs on bank 0 at camp+3..+5 (DMA let in at +5) and +10..+11 (in at +11)
+    e += held("CONFLICT_DM_BANK_0", rel + 4, rel + 6) + held("CONFLICT_DM_BANK_0", rel + 11, rel + 12)
+    e += [ev("MEMORY_STALL", rel + 1 + 5 + 1, pkt=0), ev("MEMORY_STALL", rel + 1 + 11 + 1, pkt=0)]
+    e += [ev("INSTR_EVENT_0", rel - 1, pkt=0), ev("INSTR_EVENT_1", rel + 40, pkt=0)]
+    c = ring(n=20)
+    r = g.ring_row(e, c)
+    assert r["grant"] == 2 and r["lost"] == [5, 11] and r["runs"][0] == [(3, 5), (10, 11)]
+    res = g.ring_residues(r, c)
+    assert res["dma_wins"] == [0, 1] and res["dma_refused"] == [0, 3, 4] and res["withdrew"] == []
+    assert "rgm0b0n020k00p0" in g.format_ring_table([(c, "r1.hw", r)])
+
+
+def test_ring_plan():
+    names = [c.name for c in g.ring_plan()]
+    assert len(names) == len(set(names)) == 15 and all(n.startswith("rg") for n in names)
+
+
+def test_ring_two_channel_variant():
+    c = ring("ms")
+    t = g.ring_design_mlir(c)
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" in t and "aie.flow(%t02, DMA : 1, %t02, DMA : 1)" in t
+    assert t.count("aie.use_lock(%lA, AcquireGreaterEqual") == 2                 # both MM2S wait on A
+    assert "aie.dma_start(MM2S, 1, ^send1" in t and "aie.dma_bd(%feed" in t.split("^send1:")[1].split("^s1_start")[0]
+    assert "dma_bd(%sdst" in t.split("^recv1:")[1] and "dma_bd(%sdst" not in t.split("^recv:")[1].split("^m1_start")[0]
+    body = bundles_of(g.ring_core_asm(c))
+    assert "mov r4, #2" in body                                                # A released by 2: one grant each
+    assert len(g.ring_memmod_events(c)) == 8 and "DMA_S2MM_1_FINISHED_BD" in g.ring_memmod_events(c)
+
+
+def test_ring_pad_one_buffer_spans_banks():
+    c = ring(pad=12, pad_one=True)
+    t = g.ring_design_mlir(c)
+    pads = [ln for ln in t.splitlines() if 'sym_name = "pad' in ln]
+    assert len(pads) == 1 and "memref<12xi32>" in pads[0]
+    assert [phys_bank(g.RING_PAD_ADDRS[0] + 16 * i) for i in range(3)] == [0, 1, 0]
+    assert c.name.endswith("p12o")
+    with pytest.raises(ValueError):
+        g.ring_validate(ring(pad=13, pad_one=True))
+
+
+def test_ring_two_mm2s_on_one_schedule():
+    t = g.ring_design_mlir(ring("mm", n=120))
+    assert "aie.dma_start(MM2S, 1, ^pre1" in t and t.count("aie.dma_bd(%src : memref<64xi32>)") == 2
+    assert t.count("aie.dma_bd(%pre : memref<4xi32>)") == 2                     # same chained path for both
+    assert "dma_bd(%dst2 : memref<68xi32> offset = 0 len = 68)" in t           # S2MM 1 takes all 68 words
+    assert phys_bank(g.RING_DST2_ADDR) in (6, 7) and g.RING_DST2_ADDR > g.FETCH_SCRATCH_ADDR
+    assert "mov r4, #2" in bundles_of(g.ring_core_asm(ring("mm", n=120)))
+    ev = g.ring_memmod_events(ring("mm"))
+    assert len(ev) == 8 and "DMA_MM2S_1_MEMORY_STARVATION" in ev
+
+
+def test_ring_opposite_parity_variant():
+    t = g.ring_design_mlir(ring("mx", n=1))
+    send1 = t.split("^send1:")[1].split("^s1_start")[0]
+    assert "aie.dma_bd(%src : memref<64xi32> offset = 4 len = 60)" in send1
+    assert "dma_bd(%dst2 : memref<68xi32> offset = 0 len = 64)" in t          # 4 pre words + 60
+    assert phys_bank(g.FETCH_SRC_ADDR + 16) == 1                               # MM2S 1 starts on bank 1
+    ev = g.ring_memmod_events(ring("mx"))
+    assert len(ev) == 8 and "DMA_MM2S_1_STALLED_LOCK" in ev and "DMA_MM2S_0_STALLED_LOCK" in ev
