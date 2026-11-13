@@ -661,24 +661,93 @@ def test_a_stream_without_its_end_token_is_reported_as_cut(tmp_path):
     assert (u.hw_total, u.hw_carrying, u.hw_tail_cut) == (2, 2, 1)
 
 
-def test_cut_tail_samples_stay_in_the_band_unless_excluded(tmp_path):
+def test_a_cut_sample_below_the_uncut_ones_does_not_open_the_band(tmp_path):
+    # Silicon 10, 10 and a cut stream that shows 6: the cut stream's true count is >= 6, which 10
+    # satisfies, so it says nothing against the exact 10.  Taken at face value the 6 would widen
+    # the band to [2, 14] and let a move to 14 pass.
     mem = lambda n: edge("X", periodic(n, 50), pkt=1)
     b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[cut_tail(mem(6)), mem(10)])
     rep = tcr.compare_runs(b, c, hw_samples=x)
-    assert only_row(rep, "X").hw_counts == [10, 6, 10]
-    rep = tcr.compare_runs(b, c, hw_samples=x, exclude_cut_tails=True)
     r = only_row(rep, "X")
-    assert r.hw_counts == [10, 10] and r.hw_tail_cut == 1 and r.hw_carrying == 3
-    assert "1 of them left out of the band" in tcr.format_text(rep)
+    assert r.hw_counts == [10, 6, 10] and r.hw_cut == [False, True, False]
+    assert r.hw_tail_cut == 1 and r.hw_carrying == 3 and not r.hw_lower_bounded
+    assert (r.count_before, r.count_after) == (0, 4) and r.gate_fail
+    text = tcr.format_text(rep)
+    assert "HW [10, >=6, 10]" in text and "tail not delivered in 1" in text
 
 
-def test_excluding_cut_tails_with_none_left_is_not_measured(tmp_path):
+def test_an_emulator_below_a_cut_sample_and_the_uncut_ones_still_scores(tmp_path):
     mem = lambda n: edge("X", periodic(n, 50), pkt=1)
-    b, c, x = absent_setup(tmp_path, cut_tail(mem(6)), mem(10), mem(14))
-    rep = tcr.compare_runs(b, c, exclude_cut_tails=True)
-    assert not rep.rows and len(rep.not_measured) == 1 and rep.exit_code == 0
-    assert "tail not delivered in every sample" in tcr.format_text(rep)
-    assert only_row(tcr.compare_runs(b, c), "X").hw_counts == [6]
+    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(8), hw_extra=[cut_tail(mem(6)), mem(10)])
+    r = only_row(tcr.compare_runs(b, c, hw_samples=x), "X")
+    assert (r.count_before, r.count_after) == (0, 2)
+
+
+def test_a_cut_sample_above_the_uncut_ones_raises_the_top_of_the_band(tmp_path):
+    # true count >= 12 in one run, 10 in another: the band is [10, 12] widened by its spread 2
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[cut_tail(mem(12))])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    r = only_row(rep, "X")      # 10 -> 14 moved the count; both ends sit inside [8, 14]
+    assert (r.count_before, r.count_after) == (0, 0) and not r.gate_fail
+    d = tmp_path / "far"
+    d.mkdir()
+    b, c, x = absent_setup(d, mem(10), mem(10), mem(15), hw_extra=[cut_tail(mem(12))])
+    assert only_row(tcr.compare_runs(b, c, hw_samples=x), "X").count_after == 1
+
+
+def test_an_all_cut_row_is_bounded_from_below_only(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    # emulator far above the bound: consistent, never a failure
+    b, c, x = absent_setup(tmp_path, cut_tail(mem(6)), mem(8), mem(40))
+    rep = tcr.compare_runs(b, c)
+    r = only_row(rep, "X")
+    assert r.hw_lower_bounded and r.count_after == 0 and not r.gate_fail and rep.exit_code == 0
+    text = tcr.format_text(rep)
+    assert "HW [>=6]" in text and "lower bound only" in text
+    assert tcr.to_json(rep)["neutral"][0]["hw_lower_bounded"] is True
+
+
+def test_an_all_cut_row_fails_by_falling_below_the_bound(tmp_path):
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    # the usual rules then apply: an unchanged pattern is a soft regression, a farther one gates
+    b, c, x = absent_setup(tmp_path, cut_tail(mem(6)), mem(8), mem(2))
+    rep = tcr.compare_runs(b, c)
+    r = only_row(rep, "X")
+    assert (r.count_before, r.count_after) == (0, 4) and r.verdict == "regressed"
+    assert r.hw_lower_bounded and rep.exit_code == 0
+    d = tmp_path / "gated"
+    d.mkdir()
+    b, c, x = absent_setup(d, cut_tail(mem(6)), mem(8), edge("X", periodic(3, 400), pkt=1))
+    rep = tcr.compare_runs(b, c)
+    assert only_row(rep, "X").gate_fail and rep.exit_code == 1
+
+
+def test_a_cut_zero_does_not_fail_an_emulator_that_has_events(tmp_path):
+    # a unit that was started but whose stream was cut cannot show events that came later
+    b, c, x = absent_setup(tmp_path, cut_tail([quiet_unit(pkt=1)]), edge("X", periodic(2, 50), pkt=1),
+                           edge("X", periodic(3, 50), pkt=1))
+    rep = tcr.compare_runs(b, c)
+    r = only_row(rep, "X")
+    assert r.hw_counts == [0] and r.hw_lower_bounded and not r.gate_fail and rep.exit_code == 0
+
+
+def test_two_cut_samples_bound_by_the_smaller_with_slack(tmp_path):
+    # bounds 6 and 10: spread 4, so the lower edge is 6 - 4 = 2; 8 is inside, 1 is one below
+    mem = lambda n: edge("X", periodic(n, 50), pkt=1)
+    for n, dist in ((8, 0), (1, 1)):
+        d = tmp_path / str(n)
+        d.mkdir()
+        b, c, x = absent_setup(d, cut_tail(mem(6)), mem(20), mem(n), hw_extra=[cut_tail(mem(10))])
+        r = only_row(tcr.compare_runs(b, c, hw_samples=x), "X")
+        assert r.count_after == dist and r.hw_lower_bounded
+
+
+def test_exclude_cut_tails_is_retired(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        tcr.main(["--exclude-cut-tails", str(tmp_path), str(tmp_path)])
+    with pytest.raises(TypeError):
+        tcr.compare_runs(tmp_path, tmp_path, exclude_cut_tails=True)
 
 
 def test_a_capture_without_a_raw_trace_cannot_show_absence(tmp_path):
@@ -898,3 +967,29 @@ def test_standing_misses_never_change_the_exit_status(tmp_path):
     b, c, x = standing_setup(tmp_path, hw, edge("X", periodic(3, 50)))
     assert tcr.compare_runs(b, c).exit_code == 0
     assert tcr.main([str(b), str(c)]) == 0
+
+
+def test_a_standing_miss_below_an_all_cut_bound_is_listed_with_its_flags(tmp_path):
+    cut = cut_tail(edge("X", periodic(6, 50)))
+    b, c, x = standing_setup(tmp_path, cut, edge("X", periodic(2, 50)))
+    rep = tcr.compare_runs(b, c)
+    (m,) = rep.standing
+    assert (m.emu_count, m.hw_counts, m.hw_cut, m.hw_lower_bounded) == (2, [6, 6], [True, True], True)
+    (j,) = tcr.to_json(rep)["standing_misses"]
+    assert j["hw_cut"] == [True, True] and j["hw_lower_bounded"] is True
+    assert "Standing misses (1)" in tcr.format_text(rep)
+
+
+def test_an_emulator_above_an_all_cut_bound_is_not_a_standing_miss(tmp_path):
+    cut = cut_tail(edge("X", periodic(6, 50)))
+    b, c, x = standing_setup(tmp_path, cut, edge("X", periodic(40, 50)))
+    assert tcr.compare_runs(b, c).standing == []
+
+
+def test_a_cut_sample_does_not_hide_a_standing_miss_above_uncut_silicon(tmp_path):
+    hw = edge("X", periodic(10, 50))
+    b, c, x = standing_setup(tmp_path, hw, edge("X", periodic(14, 50)),
+                             hw_extra=[cut_tail(edge("X", periodic(6, 50)))])
+    rep = tcr.compare_runs(b, c, hw_samples=x)
+    (m,) = rep.standing
+    assert m.hw_counts == [10, 10, 6] and m.hw_cut == [False, False, True] and not m.hw_lower_bounded

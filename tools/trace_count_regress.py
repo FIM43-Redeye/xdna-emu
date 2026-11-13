@@ -268,9 +268,32 @@ def silicon_band(counts: list[int]) -> tuple[int, int]:
     return lo - d, hi + d
 
 
-def band_distance(count: int, counts: list[int]) -> int:
-    lo, hi = silicon_band(counts)
-    return lo - count if count < lo else count - hi if count > hi else 0
+def count_band(counts: list[int], cut: list[bool] | None = None) -> tuple[int, int | None]:
+    """The count band of one row, (lo, hi); hi is None when the row is bounded from below only.
+
+    A sample whose stream lost its tail (``cut``) is a lower bound on the true count, not a
+    measurement: the events after the cut are missing.  So it can only say "the emulator must not
+    be below me":
+
+    * Uncut samples form the band exactly as ``silicon_band`` does.  A cut sample at or below the
+      uncut minimum is consistent with that band and adds nothing (taken at face value it would
+      widen the band downward and hide an emulator that is too high).  A cut sample above the
+      uncut maximum says silicon's true counts reach at least that far, so it raises the top.
+    * A row whose samples are all cut has no upper edge.  Its lower edge is the smallest bound,
+      widened downward by the spread of the bounds, as the exact band is.
+    """
+    cut = cut or [False] * len(counts)
+    exact = [n for n, c in zip(counts, cut) if not c]
+    bounds = [n for n, c in zip(counts, cut) if c]
+    if not exact:
+        lo, hi = min(bounds), max(bounds)
+        return lo - (hi - lo), None
+    return silicon_band(exact + [b for b in bounds if b > max(exact)])
+
+
+def band_distance(count: int, counts: list[int], cut: list[bool] | None = None) -> int:
+    lo, hi = count_band(counts, cut)
+    return lo - count if count < lo else count - hi if hi is not None and count > hi else 0
 
 
 def pattern_distance(emu: list[int], hw_samples: list[list[int]]) -> float | None:
@@ -468,6 +491,10 @@ class RowResult:
     hw_carrying: int        # silicon samples that carry the row's trace unit (the band's samples)
     hw_total: int           # usable silicon samples (same event set), carrying the unit or not
     hw_tail_cut: int        # of the carrying ones, those whose stream lost its tail
+    # per sample in ``hw_counts``: True when that stream lost its tail, so the count is a lower bound
+    hw_cut: list[bool] = field(default_factory=list)
+    # every sample is cut: the row is bounded from below only (it can fail only by falling short)
+    hw_lower_bounded: bool = False
 
     @property
     def severity(self) -> tuple:
@@ -498,6 +525,8 @@ class StandingMiss:
     hw_counts: list[int]
     hw_carrying: int
     hw_total: int
+    hw_cut: list[bool] = field(default_factory=list)
+    hw_lower_bounded: bool = False
 
 
 @dataclass
@@ -697,7 +726,7 @@ def _usable_hw_samples(tc, b, c, extra, rep):
 
 def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
                  hw_samples: list[Path] | None = None, offsets: bool = True,
-                 exclude_cut_tails: bool = False) -> Report:
+                 ) -> Report:
     base, cand = load_run(baseline), load_run(candidate)
     extra = [(d, load_run(d)) for d in (hw_samples or [])]
     rep = Report()
@@ -745,13 +774,7 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
                     rk, len(hw_sides), len(eb_side.series.get(k, [])), len(ec_side.series.get(k, []))))
                 continue
             hw_sides_all = hw_sides
-            hw_sides = [(lbl, side) for lbl, side in carrying
-                        if not (exclude_cut_tails and side.tail_cut(k[:3]) is True)]
-            if not hw_sides:
-                rep.not_measured.append(NotMeasured(
-                    rk, len(hw_sides_all), len(eb_side.series.get(k, [])), len(ec_side.series.get(k, [])),
-                    "tail not delivered in every sample that carries the unit"))
-                continue
+            hw_sides = carrying
             if is_level_name(k[3]):
                 bad = [f"{lbl}: {side.level_problem}"
                        for lbl, side in [("baseline emu", eb_side), ("candidate emu", ec_side)]
@@ -762,30 +785,36 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
             hw = [side.series.get(k, []) for _, side in hw_sides]
             eb, ec = eb_side.series.get(k, []), ec_side.series.get(k, [])
             hw_counts = [len(s) for s in hw]
+            hw_cut = [side.tail_cut(k[:3]) is True for _, side in hw_sides]
+            lower_only = all(hw_cut)
+            exact_counts = [n for n, c in zip(hw_counts, hw_cut) if not c]
             rep.rows_compared += 1
-            cb = band_distance(len(eb), hw_counts)
-            ca = band_distance(len(ec), hw_counts)
+            cb = band_distance(len(eb), hw_counts, hw_cut)
+            ca = band_distance(len(ec), hw_counts, hw_cut)
             pb, pa = pattern_distance(eb, hw), pattern_distance(ec, hw)
             moved = (len(eb) != len(ec)
                      or (pb is not None and pa is not None and abs(pa - pb) > PATTERN_EPS))
             if not moved:
                 if ca > 0:
                     rep.standing.append(StandingMiss(
-                        rk, len(ec), hw_counts, len(carrying), len(hw_sides_all)))
+                        rk, len(ec), hw_counts, len(carrying), len(hw_sides_all),
+                        hw_cut, lower_only))
                 continue
-            exact = len(set(hw_counts)) == 1 and len(hw_counts) > 1 and cb == 0 and ca > 0
+            # a repeatable exact match is two or more uncut samples that agree
+            exact = (len(set(exact_counts)) == 1 and len(exact_counts) > 1
+                     and cb == 0 and ca > 0)
             verdict, label, gate = _classify(cb, ca, pb, pa, max(hw_counts), exact)
             rep.rows.append(RowResult(
                 key=rk,
                 hw_counts=hw_counts,
-                hw_repeatable=len(set(hw_counts)) == 1 and len(hw_counts) > 1,
+                hw_repeatable=len(set(exact_counts)) == 1 and len(exact_counts) > 1,
                 emu_count_before=len(eb), emu_count_after=len(ec),
                 count_before=cb, count_after=ca,
                 pattern_before=pb, pattern_after=pa,
                 exact_match_broken=exact,
                 verdict=verdict, label=label, gate_fail=gate,
                 hw_carrying=len(carrying), hw_total=len(hw_sides_all),
-                hw_tail_cut=sum(side.tail_cut(k[:3]) is True for _, side in carrying)))
+                hw_tail_cut=sum(hw_cut), hw_cut=hw_cut, hw_lower_bounded=lower_only))
     return rep
 
 
@@ -812,27 +841,32 @@ def _fmt_p(p):
     return "n/a" if p is None else f"{p:.1f}"
 
 
-def _unit_note(carrying: int, total: int, cut: int, used: int) -> str:
+def _hw_text(counts: list[int], cut: list[bool]) -> str:
+    """The silicon counts of a row, a cut stream's count marked as the bound it is (``>=7``)."""
+    cut = cut or [False] * len(counts)
+    return "[" + ", ".join(f">={n}" if c else str(n) for n, c in zip(counts, cut)) + "]"
+
+
+def _unit_note(carrying: int, total: int, cut: int) -> str:
     """The suffix of a row line when its unit is missing from some samples or lost a tail."""
     if carrying == total and not cut:
         return ""
     bits = [f"carried by {carrying} of {total} HW samples"]
     if cut:
         bits.append(f"tail not delivered in {cut}")
-    if used < carrying:
-        bits.append(f"{carrying - used} of them left out of the band")
     return "; unit " + ", ".join(bits)
 
 
 def _line(r: RowResult) -> str:
     n = len(r.hw_counts)
-    rep = (f"{n} HW samples, repeatable" if r.hw_repeatable
+    rep = ("lower bound only" if r.hw_lower_bounded
+           else f"{n} HW samples, repeatable" if r.hw_repeatable
            else f"{n} HW samples, HW varies" if n > 1 else "1 HW sample")
     return (f"  {r.key.test}.{r.key.compiler} {r.key.tile()} {r.key.event}: "
-            f"EMU {r.emu_count_before}->{r.emu_count_after} vs HW {r.hw_counts} ({rep}); "
+            f"EMU {r.emu_count_before}->{r.emu_count_after} vs HW {_hw_text(r.hw_counts, r.hw_cut)} ({rep}); "
             f"count dist {r.count_before}->{r.count_after}, "
             f"pattern W1 {_fmt_p(r.pattern_before)}->{_fmt_p(r.pattern_after)}; {r.label}"
-            + _unit_note(r.hw_carrying, r.hw_total, r.hw_tail_cut, len(r.hw_counts))
+            + _unit_note(r.hw_carrying, r.hw_total, r.hw_tail_cut)
             + ("  [GATE]" if r.gate_fail else ""))
 
 
@@ -872,8 +906,10 @@ def standing_section(rows: list[StandingMiss], limit: int = 12) -> list[str]:
     family = collections.Counter(re.sub(r"\.\d+_\d+$", "", r.key.test) for r in rows)
     kind = {0: "core", 1: "mem", 2: "shim", 3: "memtile"}
     event = collections.Counter(f"{kind.get(r.key.module, r.key.module)} {r.key.event}" for r in rows)
+    bounded = sum(r.hw_lower_bounded for r in rows)
     return (["", f"Standing misses ({len(rows)}): measured on silicon, emulator count outside the "
-                 f"band in baseline and candidate, unchanged between them; not gated (JSON lists them)",
+                 f"band in baseline and candidate, unchanged between them; not gated (JSON lists them)"
+             + (f"; {bounded} of them below a lower bound from cut streams" if bounded else ""),
              " by test family:"] + top(family, "families")
             + [" by module and event:"] + top(event, "events"))
 
@@ -967,9 +1003,6 @@ def main(argv=None) -> int:
                          "(identical captures and other event sets are dropped)")
     ap.add_argument("--no-offset", action="store_true",
                     help="leave out the cross-module (memory minus core) offset section")
-    ap.add_argument("--exclude-cut-tails", action="store_true",
-                    help="leave HW samples whose stream lost its tail out of the count band "
-                         "(see 'Absent units and cut tails' in the module docstring)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     for d in (args.baseline, args.candidate, *args.hw_samples):
@@ -978,7 +1011,7 @@ def main(argv=None) -> int:
             return 2
     rep = compare_runs(Path(args.baseline), Path(args.candidate), only=args.only,
                        hw_samples=[Path(d) for d in args.hw_samples],
-                       offsets=not args.no_offset, exclude_cut_tails=args.exclude_cut_tails)
+                       offsets=not args.no_offset)
     print(json.dumps(to_json(rep), indent=1) if args.json else format_text(rep))
     return rep.exit_code
 
