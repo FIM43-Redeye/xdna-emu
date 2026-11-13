@@ -134,7 +134,10 @@ fn dma_read_only_stall_reason_prioritizes_mm2s_memory_starvation() {
     for _ in 0..40 {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
     }
-    assert!(engine.channels[2].words_sequenced >= 4, "the next granule is sequenced");
+    assert!(
+        engine.channels[2].word_clock.accessible_words(engine.read_clock + 1) >= 4,
+        "the next granule is sequenced"
+    );
     while engine.pop_stream_out_for_channel(2).is_some() {}
     engine.channels[2].egress_staging.clear();
     engine.reset_cycle_drain_counters();
@@ -739,7 +742,8 @@ fn test_staged_mm2s_idle_start_skips_channel_start() {
     let mut sequenced_at = None;
     for step in 4..20 {
         engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
-        if sequenced_at.is_none() && engine.channels[2].words_sequenced > 0 {
+        if sequenced_at.is_none() && engine.channels[2].word_clock.accessible_words(engine.read_clock + 1) > 0
+        {
             sequenced_at = Some(step);
         }
     }

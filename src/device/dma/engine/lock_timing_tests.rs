@@ -172,3 +172,204 @@ fn compute_s2mm_lock_grant_is_unchanged_by_the_compute_lock_law() {
         assert_eq!(got, expected, "compute S2MM, lock free = {free}");
     }
 }
+// --------------------------------------------------------------------------------------------
+// Compute-tile MM2S BD chains: the probe designs of `tools/gen_dma_lock_probe.py` (sync and
+// chain families) on the emulator's own channel. Every expected number is a silicon
+// measurement (NPU1, 2026-11), in the frame of the head BD's grant g0 (the cycle its
+// STALLED_LOCK falls).
+// --------------------------------------------------------------------------------------------
+
+/// Lock ids of the rig: the head waits on START, the waiting (last) BD on A, a core-released
+/// mid BD on B, free-lock mids on FREE + i.
+const LOCK_A: u8 = 0;
+const LOCK_START: u8 = 1;
+const LOCK_B: u8 = 2;
+const LOCK_FREE: u8 = 3;
+/// The head's lock is set this long after the channel starts: the channel is long parked.
+const HEAD_RELEASE: u64 = 100;
+
+/// A BD between the head and the waiting BD.
+#[derive(Debug, Clone, Copy)]
+enum Mid {
+    /// No lock.
+    Plain(u32),
+    /// Acquires B, which the core releases at the row's RB.
+    Core(u32),
+    /// Acquires its own lock, free from the start.
+    Free(u32),
+}
+
+/// Parse the probe tool's mid notation: "4c 16" = a 4-word BD on a core-released lock, then a
+/// lock-free 16-word BD; "4f" = a lock that is free.
+fn mids(spec: &str) -> Vec<Mid> {
+    spec.split_whitespace()
+        .map(|m| match m.strip_suffix('c') {
+            Some(n) => Mid::Core(n.parse().unwrap()),
+            None => match m.strip_suffix('f') {
+                Some(n) => Mid::Free(n.parse().unwrap()),
+                None => Mid::Plain(m.parse().unwrap()),
+            },
+        })
+        .collect()
+}
+
+/// Who makes a lock available, and how the rig applies it.
+#[derive(Debug, Clone, Copy)]
+enum Releaser {
+    /// The core: a release through the tile's lock arbiter in cycle g0 + r (LOCK_0_REL at g0 + r).
+    Core(i64),
+    /// An S2MM BD's release in cycle g0 + r: applied after that cycle's arbitration, as the
+    /// DMA's inline release is.
+    S2mm(i64),
+    /// Free from the start.
+    Free,
+    /// Set by a register write in cycle g0 + g, before that cycle's arbitration.
+    WriteAt(i64),
+}
+
+impl Releaser {
+    /// Apply the release to `lock` if it happens in cycle `cycle` (g0-relative): before the
+    /// arbitration when `before_resolve`, after the engine's step otherwise.
+    fn apply(self, tile: &mut Tile, lock: u8, cycle: i64, before_resolve: bool) {
+        match self {
+            Releaser::Core(r) if before_resolve && r == cycle => {
+                tile.defer_core_lock_release(lock as usize, 1)
+            }
+            Releaser::WriteAt(r) if before_resolve && r == cycle => tile.locks[lock as usize].value = 1,
+            Releaser::S2mm(r) if !before_resolve && r == cycle => {
+                let _ = tile.locks[lock as usize].release_with_value(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What the waiting BD's channel showed, g0-relative.
+#[derive(Debug, PartialEq, Eq)]
+struct ChainObs {
+    /// The waiting BD's grant: its LOCK_0_ACQ_GE + 1.
+    grant: i64,
+    /// Every STALLED_LOCK interval after the head's.
+    stalls: Vec<(i64, i64)>,
+    /// Every FINISHED_BD, the head's included.
+    finishes: Vec<i64>,
+}
+
+/// Run head (`head` words on START) -> `mids` -> the waiting BD (`big` words on A), with B
+/// made available by `b` (`Mid::Core`), on the emulator's compute MM2S 0.
+fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> ChainObs {
+    let mut eng = DmaEngine::new_compute_tile(1, 2);
+    let mut tile = Tile::compute(1, 2);
+    let mut addr = 0x400u64;
+    let mut bds = vec![BdConfig::simple_1d(addr, head * 4).with_acquire(LOCK_START, -1)];
+    addr += 0x400;
+    for (i, m) in mids.iter().enumerate() {
+        let bd = match *m {
+            Mid::Plain(n) => BdConfig::simple_1d(addr, n * 4),
+            Mid::Core(n) => BdConfig::simple_1d(addr, n * 4).with_acquire(LOCK_B, -1),
+            Mid::Free(n) => {
+                let lock = LOCK_FREE + i as u8;
+                tile.locks[lock as usize].value = 1;
+                BdConfig::simple_1d(addr, n * 4).with_acquire(lock, -1)
+            }
+        };
+        bds.push(bd);
+        addr += 0x400;
+    }
+    bds.push(BdConfig::simple_1d(addr, big * 4).with_acquire(LOCK_A, -1));
+    for (releaser, lock) in [(a, LOCK_A), (b, LOCK_B)] {
+        if matches!(releaser, Releaser::Free) {
+            tile.locks[lock as usize].value = 1;
+        }
+    }
+    let last = bds.len() - 1;
+    for (i, bd) in bds.into_iter().enumerate() {
+        let bd = if i < last { bd.with_next(i as u8 + 1) } else { bd };
+        eng.configure_bd(i as u8, bd).unwrap();
+    }
+    eng.start_channel(2, 0).unwrap();
+    let mut rig = Rig::new(eng, tile, 2);
+    rig.run_until(HEAD_RELEASE - 1);
+    rig.tile.locks[LOCK_START as usize].value = 1;
+    // The head's grant: its STALLED_LOCK falls.
+    while rig.trace.stalls.is_empty() {
+        rig.step();
+        assert!(rig.cycle < 1000, "the head was never granted");
+    }
+    let g0 = rig.trace.stalls[0].1 as i64 + 1;
+    for _ in 0..400 {
+        let next = (rig.cycle + 1) as i64 - g0;
+        rig.step_with(
+            |t| {
+                a.apply(t, LOCK_A, next, true);
+                b.apply(t, LOCK_B, next, true);
+            },
+            |t| {
+                a.apply(t, LOCK_A, next, false);
+                b.apply(t, LOCK_B, next, false);
+            },
+        );
+    }
+    let rel = |c: u64| c as i64 - g0;
+    let grant = rig
+        .trace
+        .acquires
+        .iter()
+        .find(|&&(_, l)| l == LOCK_A)
+        .map(|&(c, _)| rel(c) + 1)
+        .expect("A granted");
+    ChainObs {
+        grant,
+        stalls: rig.trace.stalls[1..].iter().map(|&(a, b)| (rel(a), rel(b))).collect(),
+        finishes: rig.trace.finishes.iter().map(|&c| rel(c)).collect(),
+    }
+}
+
+/// The compute MM2S word clock (`WordClock`) on the sync design: a 4-word head parked on its
+/// lock, a lock-free BD of N words, a 64-word BD on lock A. With the waiting BD's grant G
+/// placed where silicon measured it (the lock written in that cycle), every FINISHED_BD lands
+/// on silicon's cycle (NPU1, 2026-11, `tools/gen_dma_lock_probe.py` sync family; g0 frame):
+/// the 4-granule park whatever the granule sizes (N = 13: 64-word finish g0 + 70, a 16-word
+/// lead gives + 69), the BD-switch access gap (N = 5..8: the N-word BD finishes 3 after the
+/// head), and max(clock, G + 52) for the 64-word BD.
+#[test]
+fn the_word_clock_puts_every_sync_design_finish_on_silicons_cycle() {
+    #[rustfmt::skip]
+    let rows: &[(u32, i64, &[i64])] = &[
+        // N, grant (silicon), FINISHED_BD of head / N-word BD / 64-word BD (silicon)
+        (0, 16, &[3, 68]), (0, 25, &[3, 77]), (0, 34, &[3, 86]), (0, 42, &[3, 94]), (0, 57, &[3, 109]),
+        (5, 16, &[3, 6, 68]), (5, 21, &[3, 6, 73]), (5, 24, &[3, 6, 76]), (5, 27, &[3, 6, 79]),
+        (8, 16, &[3, 6, 68]), (8, 21, &[3, 6, 73]), (8, 27, &[3, 6, 79]), (8, 36, &[3, 6, 88]),
+        (13, 16, &[3, 8, 70]), (13, 19, &[3, 8, 71]), (13, 22, &[3, 8, 74]), (13, 27, &[3, 8, 79]),
+        (14, 16, &[3, 8, 70]), (14, 18, &[3, 8, 70]), (14, 22, &[3, 8, 74]), (14, 30, &[3, 8, 82]),
+        (16, 17, &[3, 8, 72]), (16, 21, &[3, 8, 73]), (16, 24, &[3, 8, 76]), (16, 38, &[3, 8, 90]),
+        (17, 17, &[3, 9, 73]), (17, 20, &[3, 9, 73]), (17, 23, &[3, 9, 75]), (17, 30, &[3, 9, 82]),
+        (20, 17, &[3, 12, 76]), (20, 20, &[3, 12, 76]), (20, 24, &[3, 12, 76]), (20, 36, &[3, 12, 88]),
+        (32, 35, &[3, 24, 88]), (32, 45, &[3, 24, 97]), (32, 56, &[3, 24, 108]),
+    ];
+    for &(n, grant, finishes) in rows {
+        let mids = if n == 0 { vec![] } else { vec![Mid::Plain(n)] };
+        let obs = run_chain(4, &mids, 64, Releaser::Free, Releaser::WriteAt(grant));
+        assert_eq!(obs.finishes, finishes, "N = {n}, grant g0 + {grant}");
+    }
+}
+
+/// The same with a longer head or a short waiting BD (silicon, chain family h08n16, h16n08,
+/// w16n16; g0 frame): an 8- or 16-word head parks 2 or 4 of its granules.
+#[test]
+fn the_word_clock_puts_long_head_and_short_tail_finishes_on_silicons_cycle() {
+    #[rustfmt::skip]
+    let rows: &[(u32, u32, u32, i64, &[i64])] = &[
+        // head, mid, waiting BD words, grant, finishes (silicon)
+        (8, 16, 64, 18, &[4, 12, 76]), (8, 16, 64, 23, &[4, 12, 76]), (8, 16, 64, 27, &[4, 12, 79]),
+        (8, 16, 64, 32, &[4, 12, 84]),
+        (16, 8, 64, 20, &[6, 12, 76]), (16, 8, 64, 24, &[6, 12, 76]), (16, 8, 64, 29, &[6, 12, 81]),
+        (16, 8, 64, 33, &[6, 12, 85]),
+        (4, 16, 16, 17, &[3, 8, 24]), (4, 16, 16, 23, &[3, 8, 29]), (4, 16, 16, 26, &[3, 8, 32]),
+        (4, 16, 16, 30, &[3, 8, 36]),
+    ];
+    for &(head, mid, big, grant, finishes) in rows {
+        let obs = run_chain(head, &[Mid::Plain(mid)], big, Releaser::Free, Releaser::WriteAt(grant));
+        assert_eq!(obs.finishes, finishes, "head {head}, mid {mid}, waiting {big}, grant g0 + {grant}");
+    }
+}

@@ -370,7 +370,9 @@ impl DmaEngine {
         // of it, in an earlier cycle, and -- for a lock-started BD -- once the lock has been
         // held `mm2s_lock_to_access_cycles` (`word_clock_mm2s_cycle`).
         if self.uses_word_clock(transfer)
-            && (fetch.words > ch.words_sequenced || (transfer.acquire_lock.is_some() && at < ch.access_from))
+            && (fetch.words as u32 > ch.word_clock.accessible_words(at)
+                || (transfer.acquire_lock.is_some() && at < ch.access_from)
+                || !ch.word_clock.switch_gap_allows(at))
         {
             return None;
         }
@@ -543,6 +545,9 @@ impl DmaEngine {
                 self.drain_read_ahead(ch_idx);
                 any_active = true;
             }
+
+            // The compute MM2S word clock sequences before anything else of the step reads it.
+            self.tick_word_clock(ch_idx);
 
             // Snapshot the egress backlog BEFORE the step pushes this cycle's
             // word, so `complete_or_drain` can tell a lagging sink from a
@@ -982,16 +987,16 @@ impl DmaEngine {
                 if cycles_remaining <= 1 {
                     if self.uses_word_clock(&transfer) {
                         // The word clock starts on the BD itself, lock or no lock.
+                        let first = self.chain_bd_spec(transfer.bd_index, &transfer);
+                        let from = self.read_clock
+                            + 1
+                            + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
                         let ch = &mut self.channels[ch_idx];
-                        ch.words_sequenced = 0;
-                        ch.word_clock_resume_at = u64::MAX;
+                        ch.word_clock.start(from, first);
                         // No access yet, so nothing to settle: a BD with no words (silicon: not
                         // measured; this is the emulator's own timing, the end of BD setup) must
                         // finish on its own state, not on an earlier BD's.
                         ch.access_settles_at = 0;
-                        ch.word_clock_from = self.read_clock
-                            + 1
-                            + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
                     }
                     // BD setup done. Check if lock acquisition is needed.
                     // Packet header insertion is deferred until AFTER lock
@@ -1405,13 +1410,16 @@ impl DmaEngine {
             }
         };
         self.channels[ch_idx].current_bd = Some(next_bd);
-        // The words the word clock sequenced past the previous BD belong to this one.
-        let words = (transfer.remaining_bytes() as usize).div_ceil(4);
-        let ch = &mut self.channels[ch_idx];
-        ch.words_sequenced = ch.words_sequenced.min(words);
-        ch.word_clock_resume_at = u64::MAX;
+        if self.uses_word_clock(&transfer) {
+            // The granules the word clock sequenced past the previous BD belong to this one. A
+            // chain rewritten under the clock (not the BD it ran ahead into) starts it afresh.
+            if !self.channels[ch_idx].word_clock.advance(next_bd) {
+                let first = self.chain_bd_spec(next_bd, &transfer);
+                self.channels[ch_idx].word_clock.start(self.read_clock + 1, first);
+            }
+        }
         // As at the end of BD setup: this BD has not accessed memory, so nothing is settling.
-        ch.access_settles_at = 0;
+        self.channels[ch_idx].access_settles_at = 0;
 
         // (Recv-side BD-switch accept deassert is driven by the *accept* cursor
         // in `push_stream_in`/`note_stream_accepted`, NOT here: the memory-write
@@ -2613,14 +2621,18 @@ impl DmaEngine {
         use xdna_archspec::aie2::timing::{DMA_MM2S_ACCESS_TO_FINISH_CYCLES, DMA_MM2S_ACCESS_TO_OFFER_CYCLES};
         let now = self.read_clock;
         let layout = self.bank_layout();
-        let sequenced = self.channels[ch_idx].words_sequenced;
-        let sequences = self.word_clock_sequences(ch_idx, transfer);
+        let sequenced = self.channels[ch_idx].word_clock.accessible_words(now) as usize;
         let granule_words = if transfer.remaining_bytes() > 0 {
             self.granule_at_cursor(transfer, layout).words
         } else {
             0
         };
-        if !mem_denied {
+        if mem_denied {
+            // The access was presented and lost: it still frees its lead slot.
+            if self.next_granule_fetch(transfer, layout, now).is_some() {
+                self.channels[ch_idx].word_clock.note_presented(now);
+            }
+        } else {
             if let Some(fetch) = self.next_granule_fetch(transfer, layout, now) {
                 self.cycle_dma_banks |= fetch.bank_mask;
                 let channel = transfer.channel;
@@ -2638,14 +2650,11 @@ impl DmaEngine {
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                 }
-                self.channels[ch_idx].words_sequenced -= fetch.words;
+                self.channels[ch_idx].word_clock.note_access(now, fetch.words as u32);
                 if transfer.remaining_bytes() == 0 {
                     self.channels[ch_idx].access_settles_at = now + DMA_MM2S_ACCESS_TO_FINISH_CYCLES as u64;
                 }
             }
-        }
-        if sequences {
-            self.channels[ch_idx].words_sequenced += 1;
         }
         // The BD's last access has not settled yet: not done.
         if transfer.remaining_bytes() == 0 && now < self.channels[ch_idx].access_settles_at {
@@ -2686,9 +2695,6 @@ impl DmaEngine {
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
-        if self.word_clock_sequences(ch_idx, &transfer) {
-            self.channels[ch_idx].words_sequenced += 1;
-        }
         if !self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
             self.channels[ch_idx].stats.lock_wait_cycles += 1;
             if !self.channels[ch_idx].prev_lock_stalled {
@@ -2699,10 +2705,9 @@ impl DmaEngine {
         }
         self.on_acquire_granted(ch_idx, lock_id, transfer.bd_index);
         {
-            use xdna_archspec::aie2::timing::{DMA_MM2S_LOCK_TO_ACCESS_CYCLES, DMA_MM2S_WORD_CLOCK_RESUME_CYCLES};
+            use xdna_archspec::aie2::timing::DMA_MM2S_LOCK_TO_ACCESS_CYCLES;
             let ch = &mut self.channels[ch_idx];
             ch.access_from = self.read_clock + DMA_MM2S_LOCK_TO_ACCESS_CYCLES as u64;
-            ch.word_clock_resume_at = self.read_clock + DMA_MM2S_WORD_CLOCK_RESUME_CYCLES as u64;
         }
         self.maybe_insert_packet_header_from_transfer(&mut transfer);
         if self.channels[ch_idx].is_first_bd {
@@ -2714,38 +2719,31 @@ impl DmaEngine {
         ChannelFsm::Transferring { transfer }
     }
 
-    /// Whether a compute MM2S's word clock sequences a word this cycle: it has started
-    /// (`ChannelContext::word_clock_from`) and a word is left to sequence in the current BD or
-    /// its chained next BD. While the current BD waits for its lock -- until its clock resumes
-    /// (`ChannelContext::word_clock_resume_at`, grant + `mm2s_word_clock_resume_cycles`) -- the
-    /// clock holds at `mm2s_word_clock_lead_words` sequenced words in all, the chained next
-    /// BD's included (start-of-cycle count; silicon: a parked 4-word BD's lead takes 12 words of
-    /// its lock-free next BD, `a_parked_bds_lead_carries_into_its_lock_free_next_bd`). Words of
-    /// a chained next BD that acquires a lock are held at the same lead. The clock resumes on the
-    /// grant's timing, not on the first access: on silicon a core access that wins the bank at
-    /// grant + 2 delays granules 0..3 and leaves granule 4 at + 7 and FINISHED_BD at + 52
-    /// (lock-fetch probe). Past the resume nothing bounds the lead but the BDs themselves.
-    fn word_clock_sequences(&self, ch_idx: usize, transfer: &Transfer) -> bool {
-        use xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_LEAD_WORDS;
-        let lead = DMA_MM2S_WORD_CLOCK_LEAD_WORDS as usize;
-        let ch = &self.channels[ch_idx];
-        if self.read_clock < ch.word_clock_from {
-            return false;
+    /// The word clock's view of BD `bd_index` as `transfer` loads it (its word count from the
+    /// transfer, the chain link and acquire from the BD).
+    pub(super) fn chain_bd_spec(&self, bd_index: u8, transfer: &Transfer) -> ChainBdSpec {
+        ChainBdSpec {
+            bd_index,
+            words: (transfer.total_bytes as u32).div_ceil(4),
+            acquire: transfer.acquire_lock.map(|l| (l, transfer.acquire_value)),
+            next_bd: transfer.next_bd,
         }
-        let ahead = ch.words_sequenced;
-        let parked = transfer.acquire_lock.is_some() && self.read_clock < ch.word_clock_resume_at;
-        if parked && ahead >= lead {
-            return false;
-        }
-        let current = (transfer.remaining_bytes() as usize).div_ceil(4);
-        if ahead < current {
-            return true;
-        }
-        let Some(next) = transfer.next_bd.and_then(|n| self.bd_configs.get(n as usize)) else {
-            return false;
-        };
-        let carried = ahead - current;
-        carried < (next.length as usize).div_ceil(4) && !(next.acquire_lock.is_some() && carried >= lead)
+    }
+
+    /// One step of a compute MM2S channel's word clock (`WordClock::tick`), before the
+    /// channel's FSM step: the clock runs whatever the FSM is doing. The chained BDs it reaches
+    /// are read from the BD registers as they are now.
+    fn tick_word_clock(&mut self, ch_idx: usize) {
+        let now = self.read_clock;
+        let configs = &self.bd_configs;
+        self.channels[ch_idx].word_clock.tick(now, |i| {
+            configs.get(i as usize).map(|c| ChainBdSpec {
+                bd_index: i,
+                words: c.length.div_ceil(4),
+                acquire: c.acquire_lock.map(|l| (l, c.acquire_value)),
+                next_bd: c.next_bd,
+            })
+        });
     }
 
     /// Read one word of a staged MM2S granule from tile memory, at fetch time:

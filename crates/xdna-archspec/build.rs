@@ -525,11 +525,11 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         for (name, value) in [
             ("DMA_MM2S_WORD_CLOCK_START_CYCLES", t.dma.mm2s_word_clock_start_cycles),
-            ("DMA_MM2S_WORD_CLOCK_LEAD_WORDS", t.dma.mm2s_word_clock_lead_words),
+            ("DMA_MM2S_WORD_CLOCK_LEAD_GRANULES", t.dma.mm2s_word_clock_lead_granules),
+            ("DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES", t.dma.mm2s_bd_switch_access_gap_cycles),
             ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
             ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
             ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),
-            ("DMA_MM2S_WORD_CLOCK_RESUME_CYCLES", t.dma.mm2s_word_clock_resume_cycles),
             ("BANK_ARBITER_PERIOD", t.dma.bank_arbiter_period),
             ("BANK_ARBITER_DMA_RESIDUE", t.dma.bank_arbiter_dma_residue),
         ] {

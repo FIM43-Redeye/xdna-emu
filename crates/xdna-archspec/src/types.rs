@@ -1457,14 +1457,24 @@ pub struct DmaTiming {
     /// keeps the older read-cursor rule (its access position is not measured).
     pub mm2s_word_clock_start_cycles: u8,
 
-    /// Words a compute-tile MM2S word clock may sequence of a BD whose lock is not held: 16.
-    /// While the BD waits for its lock the clock keeps sequencing up to this lead, so it
-    /// resumes with four granules ready (`mm2s_word_clock_resume_cycles`). Silicon (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`, 64-word lock-started BD):
-    /// granules 0..3 accessed back to back at grant + 2..5, granule 4 at + 7, then one per 4
-    /// cycles from + 11. A lead of 16 with the clock resuming at grant + 3 and a lead of 14
-    /// resuming at grant + 1 give the same map: the exact value is not yet separated by
-    /// measurement.
-    pub mm2s_word_clock_lead_words: u8,
+    /// Granules a compute-tile MM2S word clock may have started ahead of the channel's
+    /// presented bank accesses: 4. The clock sequences one word per cycle, granule by granule
+    /// (4 words; a BD's short tail is a granule of its own and takes a whole slot), in chain
+    /// order across BD boundaries and lock waits; a granule starts only while fewer than this
+    /// many started granules wait for their access to be presented. Fitted (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py` sync and chain families): a long-parked channel holds 4
+    /// granules at its grant whatever their size (a 2-word BD before a 14..17-word BD puts the
+    /// lock-request step at 14/15, as with a 4-word one; a 16-word lead would put it at
+    /// 16/17), granules 0..3 of a 64-word BD go out at grant + 2..5, granule 4 at + 7, then
+    /// one per 4 cycles. A slot frees when the access is presented: a core access that wins
+    /// the bank at grant + 2 leaves granule 4 at + 7 (lock-fetch probe).
+    pub mm2s_word_clock_lead_granules: u8,
+
+    /// Cycles between the last bank access of a compute-tile MM2S BD and the first access of
+    /// the next BD on the channel: at least 2. Fitted (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`
+    /// sync family): a 4-word parked BD finishes at grant + 3 and a lock-free 5..8-word BD
+    /// behind it 3 cycles later, not 2.
+    pub mm2s_bd_switch_access_gap_cycles: u8,
 
     /// Cycles from a compute-tile MM2S granule's bank access until its words can be offered
     /// to the stream: 4. Silicon (NPU1, 2026-11): host-started first offer at START_TASK +
@@ -1488,15 +1498,6 @@ pub struct DmaTiming {
     /// latency, no channel start). The 1-word dummy BD of `tools/gen_path_onset_probe.py`
     /// `prewake-run` finishes at grant + 3 the same way.
     pub mm2s_lock_to_access_cycles: u8,
-
-    /// Cycles from the lock grant of a lock-started **compute-tile** MM2S BD until its word
-    /// clock, held at `mm2s_word_clock_lead_words` while the BD waited, sequences again: 3.
-    /// Fitted with the lead (NPU1, 2026-11, `tools/gen_dma_lock_probe.py`): word i >= 16 of a
-    /// 64-word BD sequenced at grant - 13 + i puts granule 4 at grant + 7 and granule 5 at
-    /// + 11. Timed by the grant, not by the first access: a core access that wins the bank at
-    /// grant + 2 leaves granule 4 and FINISHED_BD where they were. A lead of 14 resuming at
-    /// grant + 1 gives the same cells; the pair is not yet separated by measurement.
-    pub mm2s_word_clock_resume_cycles: u8,
 
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself

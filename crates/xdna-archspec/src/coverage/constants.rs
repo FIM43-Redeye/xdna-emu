@@ -172,10 +172,14 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             "Fitted. NPU1 2026-11 (tools/gen_path_onset_probe.py prod_own_nN, two runs identical): FINISHED_BD = \
             START_TASK + N + 8; word 0 at + 7 follows from placing the access after the last word and the finish \
             one cycle later, a placement that is not measured on the host path. Compute tiles, one value for every N."),
-        unit("dma.mm2s_word_clock_lead_words", HardwareObserved, Verification::Unverified,
-            "Fitted: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 \
-            (tools/gen_dma_lock_probe.py, 64-word lock-started BD): granules 0..3 at grant + 2..5, granule 4 at + 7, \
-            then every 4 from + 11; both pairs give that map."),
+        unit("dma.mm2s_word_clock_lead_granules", HardwareObserved, Verification::Unverified,
+            "Fitted (model M1g: 4 granules, a partial granule takes a slot, a slot frees when the access is \
+            presented). NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families): a long-parked channel \
+            holds 4 granules at its grant whatever their size (a 2-word BD before a 14..17-word BD puts the lock \
+            request step where a 4-word one does); granules 0..3 at grant + 2..5, granule 4 at + 7, then every 4."),
+        unit("dma.mm2s_bd_switch_access_gap_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync family): a lock-free 5..8-word BD behind a parked \
+            4-word BD finishes 3 cycles after it, not 2. Compute tiles."),
         unit("dma.mm2s_access_to_offer_cycles", HardwareObserved, Verification::Unverified,
             "Inferred. Neither side is a direct observation: the host-path access (7 + min(N, 4)) is the model's \
             placement, and the lock-path offer (grant + 6) is the first word at the receiving DMA (grant + 9, \
@@ -188,10 +192,6 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3",
             "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency. Assumes a conflict \
             event is stamped on the access cycle."),
-        unit("dma.mm2s_word_clock_resume_cycles", HardwareObserved, Verification::Unverified,
-            "Fitted with the lead: 16 words resuming at grant + 3, or 14 at grant + 1, not separated. NPU1 2026-11 \
-            (tools/gen_dma_lock_probe.py): granule 4 at grant + 7, granule 5 at + 11, unchanged (with FINISHED_BD + \
-            52) when a core access wins the bank at + 2."),
         measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
             every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
             5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \

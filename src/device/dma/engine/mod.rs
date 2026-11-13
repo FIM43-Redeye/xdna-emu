@@ -60,6 +60,7 @@ use super::channel::{ChannelContext, ChannelFsm, CompletionInfo, StagedWord};
 use super::compression;
 use super::timing::DmaTimingConfig;
 use super::transfer::{PadAction, Transfer, TransferDirection, TransferEndpoint};
+use super::word_clock::ChainBdSpec;
 use super::{BdConfig, ChannelType, DmaError, DmaResult};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileKind};
@@ -618,12 +619,11 @@ impl DmaEngine {
         });
 
         // Determine initial FSM state based on whether lock acquisition is needed
-        let ch = &mut self.channels[ch_idx];
         if let Some(from) = word_clock_from {
-            ch.words_sequenced = 0;
-            ch.word_clock_from = from;
-            ch.word_clock_resume_at = u64::MAX;
+            let first = self.chain_bd_spec(bd_index, &transfer);
+            self.channels[ch_idx].word_clock.start(from, first);
         }
+        let ch = &mut self.channels[ch_idx];
         ch.error_event_reported = false;
         ch.current_bd = Some(bd_index);
         ch.repeat_count = repeat_count as u32;
@@ -694,11 +694,9 @@ impl DmaEngine {
         ch.egress_staging.clear();
         ch.egress_gap = 0;
         ch.read_tail = 0;
-        ch.words_sequenced = 0;
-        ch.word_clock_from = 0;
+        ch.word_clock.clear();
         ch.access_settles_at = 0;
         ch.access_from = 0;
-        ch.word_clock_resume_at = 0;
         ch.egress_backpressure = false;
         ch.fsm = ChannelFsm::Idle;
         ch.error_event_reported = false;
