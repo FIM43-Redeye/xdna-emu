@@ -85,6 +85,21 @@ after that finish, grant minus release, MM2S and S2MM finish minus grant, and co
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu --sync [same selection]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] --sync [same selection]
 
+DMA-side stamp cases (`fetch-build --start-task`, cases lfsNN first-BD / lfqNN with `--chained`; NN = nops before the
+release, `--pre-nops`, default 0..5). The runtime sequence configures and starts MM2S 0's task
+(`aiex.dma_configure_task` / `dma_start_task`) before it sets the go lock, so DMA_MM2S_0_START_TASK (the 8th
+memory-module slot) falls in the trace window; with a boot-started task it fires before the trace is armed. The core
+makes no loads. The table adds the start stamp (cycles from the release) and a finish check.
+
+Refused-access probe (`refuse-build`, `refuse-run`, `refuse-table`; cases rf{e|l}{r}sSS, 48 in all): a core camp
+refuses r = 0..3 accesses of a chained BD, EARLY or LATE in its read, and a second lock BD follows it, whose lock the
+core releases s nops after the camp (s swept over six values). See the section comment above `refuse_design_mlir`.
+
+    python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR --start-task [--chained] [--pre-nops 0 1 2 3 4 5]
+    python3 tools/gen_dma_lock_probe.py refuse-build OUT_DIR [--names rfe3s35 ...]
+    python3 tools/gen_dma_lock_probe.py refuse-run OUT_DIR TAG --backend hw|emu [--names ...]
+    python3 tools/gen_dma_lock_probe.py refuse-table OUT_DIR RUN [RUN ...] [--names ...]
+
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained] [--banks both 0 1]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...] [--chained] [--banks ...]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...] [--chained] [--banks ...]
@@ -341,6 +356,12 @@ FETCH_BANKS = ("both", "0", "1")   # both = a bank-0 load then a bank-1 load one
 # case-name prefix per (chained, bank): lfk / lfc are the two-load cases; the single-bank cases get their own
 FETCH_PREFIX = {(False, "both"): "lfk", (True, "both"): "lfc", (True, "0"): "lfa", (True, "1"): "lfb",
                 (False, "0"): "lfd", (False, "1"): "lfe"}
+# --start-task cases: the DMA-side stamp of the task start, then a release `pre` nops later against it; no core loads.
+# The NN of the name is the pre-release nop count. First-BD (lfsNN) and chained (lfqNN) forms.
+FETCH_START_PREFIX = {False: "lfs", True: "lfq"}
+FETCH_START_EVENT = "DMA_MM2S_0_START_TASK"        # the 8th memory-module slot
+FETCH_PRE_NOPS = tuple(range(6))                   # default pre-release nop sweep: every residue mod 3 twice
+FETCH_MAX_PRE = 64
 FETCH_WORDS = 64
 FETCH_SRC_ADDR = 0x0400            # logical bank 0; granule g (16 bytes) in physical bank g & 1
 FETCH_LD_ADDR = 0x0800             # logical bank 0; the core's two loads, offsets 0 and 16
@@ -360,29 +381,36 @@ FETCH_CORE_GROUNDING = "PERF_CNT_2"
 FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
 
 
-def fetch_case_name(k: int, chained: bool = False, bank: str = "both") -> str:
+def fetch_case_name(k: int, chained: bool = False, bank: str = "both", start: bool = False) -> str:
+    """lfkNN / lfcNN / ... by k; with `start`, lfsNN / lfqNN where NN is the pre-release nop count (k is 0)."""
+    if start:
+        return f"{FETCH_START_PREFIX[chained]}{k:02d}"
     return f"{FETCH_PREFIX[(chained, bank)]}{k:02d}"
 
 
 FETCH_LOADS = {"0": ["  lda r26, [p0, #0]"], "1": ["  lda r28, [p0, #16]"],
-               "both": ["  lda r26, [p0, #0]", "  lda r28, [p0, #16]"]}
+               "both": ["  lda r26, [p0, #0]", "  lda r28, [p0, #16]"], "none": []}
 
 
-def fetch_core_asm(k: int, bank: str = "both") -> str:
+def fetch_core_asm(k: int, bank: str = "both", pre: int = 0) -> str:
     """The core of case k: go, settle, `event #0`, release A, k nops, then the load(s).
 
     bank "both": a bank-0 load and, one bundle later, a bank-1 load. "0" / "1": that one load alone,
     at the same place (k nops after the release), so the other bank is not touched and a bank-0
-    conflict cannot disturb a bank-1 access. r2 = +1 releases, r3 = -1 acquires (as
-    gen_lock_pulse_probe). p0 = `ldbuf`."""
+    conflict cannot disturb a bank-1 access. bank "none": no load (the --start-task cases). `pre` extra
+    nops go before `event #0`, which moves the release by single cycles against everything the DMA
+    started before it (the settle loop's length is fixed; k only moves what follows the release).
+    r2 = +1 releases, r3 = -1 acquires (as gen_lock_pulse_probe). p0 = `ldbuf`."""
     if k not in FETCH_KS:
         raise ValueError(f"k must be 0..{FETCH_KS[-1]}")
     if bank not in FETCH_LOADS:
-        raise ValueError(f"bank must be one of {FETCH_BANKS}")
+        raise ValueError(f"bank must be one of {FETCH_BANKS} or none")
+    if not 0 <= pre <= FETCH_MAX_PRE:
+        raise ValueError(f"pre must be 0..{FETCH_MAX_PRE}")
     n = lp.nops
     body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
             f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
-            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8), *n(pre),
             "  event #0", f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(k),
             *FETCH_LOADS[bank], *n(8),
             f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8),
@@ -390,10 +418,13 @@ def fetch_core_asm(k: int, bank: str = "both") -> str:
     return lp.frame(body)
 
 
-def fetch_design_mlir(chained: bool = False) -> str:
+def fetch_design_mlir(chained: bool = False, task: bool = False) -> str:
     """Case-independent design: the k lives in the core program only.
 
-    chained: MM2S 0's task starts with a lock-free BD of `pre` that chains to the lock-waiting BD."""
+    chained: MM2S 0's task starts with a lock-free BD of `pre` that chains to the lock-waiting BD.
+    task: MM2S 0's task is configured and started by the runtime sequence (`aiex.dma_configure_task` and
+    `dma_start_task`, after the trace is armed) instead of at boot, so its DMA_MM2S_0_START_TASK falls in the
+    trace window; the BDs and locks are the same, and the S2MM stays in `aie.mem`."""
     w = FETCH_WORDS
     dw = w + (FETCH_PRE_WORDS if chained else 0)
     p = FETCH_PRE_WORDS
@@ -406,6 +437,31 @@ def fetch_design_mlir(chained: bool = False) -> str:
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
                     for _ in range(FETCH_PAD_WRITES))
+    if task:
+        # the task's BDs are in the sequence: `pre` (when chained) and the lock-A BD, one task
+        pre_task = (f"        aie.dma_bd(%pre : memref<{p}xi32>)\n        aie.next_bd ^send\n      ^send:\n") if chained else ""
+        seq_task = f"""      %c1 = arith.constant 1 : i32
+      %task = aiex.dma_configure_task(%t02, MM2S, 0) {{
+{pre_task}        aie.use_lock(%lA, AcquireGreaterEqual, %c1)
+        aie.dma_bd(%src : memref<{w}xi32>)
+        aie.use_lock(%lB, Release, %c1)
+        aie.end
+      }}
+      aiex.dma_start_task(%task)
+"""
+        mem_head = ""
+    else:
+        seq_task = ""
+        mem_head = f"""      %s0 = aie.dma_start(MM2S, 0, {first}, ^recv_start)
+{pre_bd}    ^send:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%src : memref<{w}xi32>)
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lB, Release, %cb)
+      aie.next_bd ^end
+    ^recv_start:
+"""
     return f"""module {{
   aie.device(npu1_1col) {{
     %t00 = aie.tile(0, 0)
@@ -424,16 +480,7 @@ def fetch_design_mlir(chained: bool = False) -> str:
       aie.end
     }}
     %mem = aie.mem(%t02) {{
-      %s0 = aie.dma_start(MM2S, 0, {first}, ^recv_start)
-{pre_bd}    ^send:
-      %ca = arith.constant 1 : i32
-      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
-      aie.dma_bd(%src : memref<{w}xi32>)
-      %cb = arith.constant 1 : i32
-      aie.use_lock(%lB, Release, %cb)
-      aie.next_bd ^end
-    ^recv_start:
-      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
+{mem_head}      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
     ^recv:
       aie.dma_bd(%dst : memref<{dw}xi32>)
       aie.next_bd ^end
@@ -443,7 +490,7 @@ def fetch_design_mlir(chained: bool = False) -> str:
     aie.runtime_sequence(%dummy: memref<4xi32>) {{
       %c_zero = arith.constant 0 : i32
       %c_one = arith.constant 1 : i32
-      aiex.set_lock(%lGo, %c_one)
+{seq_task}      aiex.set_lock(%lGo, %c_one)
 {pad}
     }}
   }}
@@ -451,8 +498,9 @@ def fetch_design_mlir(chained: bool = False) -> str:
 """
 
 
-def fetch_inject_args() -> list[str]:
-    return ["--memmod-sweep-events", ",".join(FETCH_MEMMOD_EVENTS),
+def fetch_inject_args(start: bool = False) -> list[str]:
+    events = FETCH_MEMMOD_EVENTS + ([FETCH_START_EVENT] if start else [])
+    return ["--memmod-sweep-events", ",".join(events),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
 
@@ -498,12 +546,34 @@ def fetch_row(events) -> dict:
         conflicts += [(bank, t - rel) for t in sorted(set(mem.get(bank, [])))]
     row["conflicts"] = sorted(conflicts, key=lambda c: (c[1], c[0]))
     row["mm2s_finished"] = [t - rel for t in sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", []))) if t >= rel]
+    row["mm2s_finished_all"] = [t - rel for t in sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", [])))]
     row["s2mm_finished"] = [t - rel for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t >= rel]
+    row["mm2s_start"] = [t - rel for t in sorted(set(mem.get(FETCH_START_EVENT, [])))]
     ev0 = sorted(core.get("INSTR_EVENT_0", []))
     row["core_event0"] = ev0[0] - rel if ev0 else None
     row["core_stalls"] = ([(a - ev0[0], b - ev0[0]) for a, b in _runs(core.get("LOCK_STALL", []))
                            if a >= ev0[0] - 2 and a - ev0[0] <= 64] if ev0 else [])
     return row
+
+
+def start_missing(r: dict, chained: bool = False) -> list[str]:
+    """What a --start-task run (fetch_row dict) lacks: the release, the task-start stamp before the grant, the
+    grant, and every DMA task finished (the lock BD's FINISHED_BD, plus the pre BD's when chained, and the
+    S2MM's)."""
+    if r.get("release") is None:
+        return ["no LOCK_0_REL"]
+    out = []
+    if not r.get("mm2s_start"):
+        out.append(FETCH_START_EVENT)
+    if r.get("grant") is None:
+        out.append("grant")
+    want = 2 if chained else 1
+    fins = len(r.get("mm2s_finished_all", r["mm2s_finished"]))
+    if fins != want:
+        out.append(f"MM2S FINISHED_BD x{fins} (want {want})")
+    if len(r["s2mm_finished"]) != 1:
+        out.append(f"S2MM FINISHED_BD x{len(r['s2mm_finished'])} (want 1)")
+    return out
 
 
 def _interval(a: int, b: int) -> str:
@@ -525,7 +595,10 @@ def format_fetch_table(rows) -> str:
         stalls = "core stall(from ev0) [" + ", ".join(_interval(a, b) for a, b in r["core_stalls"][:6]) + "]"
         fin = (f"mm2s_fin [{', '.join(f'+{t}' for t in r['mm2s_finished'])}] "
                f"s2mm_fin [{', '.join(f'+{t}' for t in r['s2mm_finished'])}]")
-        lines.append(f"{k:>2} {run:<8} {r['release']:>9}  {grant}  {starv}  {conf}  {fin}  {ev0}  {stalls}")
+        start = (f"  start_task [{', '.join(f'{t:+d}' for t in r['mm2s_start'])}]" if r.get("mm2s_start") else "")
+        if r.get("check") is not None:
+            start += "  finish " + ("ok" if not r["check"] else "MISSING " + "; ".join(r["check"]))
+        lines.append(f"{k:>2} {run:<8} {r['release']:>9}  {grant}{start}  {starv}  {conf}  {fin}  {ev0}  {stalls}")
     return "\n".join(lines)
 
 
@@ -698,42 +771,62 @@ def load_level_events(run_dir: Path):
 
 # -- lock-to-fetch: build / run / table ---------------------------------------------
 
-def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both") -> None:
-    name = fetch_case_name(k, chained, bank)
+def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both", start: bool = False) -> None:
+    """Case k of a lock-to-fetch variant. With `start` (the --start-task cases) the number is the pre-release
+    nop count, there is no core load, and the task-start event joins the memory-module list."""
+    name = fetch_case_name(k, chained, bank, start)
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
-    lp.assemble(fetch_core_asm(k, bank), d / "core.o", "k_core")
-    (d / "base.mlir").write_text(fetch_design_mlir(chained))
+    asm = fetch_core_asm(0, "none", pre=k) if start else fetch_core_asm(k, bank)
+    lp.assemble(asm, d / "core.o", "k_core")
+    (d / "base.mlir").write_text(fetch_design_mlir(chained, task=start))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(),
+           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(start),
            "--trace-config-out", "trace_config.json", "--config-test-name", name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
     lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
-    (d / "case.json").write_text(json.dumps({"case": name, "k": k, "chained": chained, "bank": bank}) + "\n")
+    meta = {"case": name, "k": k, "chained": chained, "bank": bank}
+    if start:
+        meta.update({"start_task": True, "pre_nops": k, "k": 0, "bank": "none"})
+    (d / "case.json").write_text(json.dumps(meta) + "\n")
 
 
-def fetch_cases_in(out: Path, ks, chained: bool = False, bank: str = "both") -> list[int]:
-    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k, chained, bank)).is_dir()]
+def fetch_values(args) -> tuple:
+    """The case numbers of a fetch selection: the pre-release nop counts with --start-task, else the ks."""
+    if getattr(args, "start_task", False):
+        return tuple(args.pre_nops or FETCH_PRE_NOPS)
+    return tuple(args.ks or FETCH_DEFAULT_KS)
+
+
+def fetch_cases_in(out: Path, ks, chained: bool = False, bank: str = "both", start: bool = False) -> list[int]:
+    return [k for k in (ks or FETCH_KS) if (out / fetch_case_name(k, chained, bank, start)).is_dir()]
+
+
+def fetch_banks(args) -> list[str]:
+    """--start-task cases have no core loads: one pseudo bank, none."""
+    return ["none"] if getattr(args, "start_task", False) else args.banks
 
 
 def cmd_fetch_build(args) -> int:
     out = Path(args.out_dir).resolve()
-    for bank in args.banks:
-        for k in args.ks or FETCH_DEFAULT_KS:
-            fetch_build_case(k, out, args.chained, bank)
-            print("built", fetch_case_name(k, args.chained, bank))
+    start = getattr(args, "start_task", False)
+    for bank in fetch_banks(args):
+        for k in fetch_values(args):
+            fetch_build_case(k, out, args.chained, bank, start)
+            print("built", fetch_case_name(k, args.chained, bank, start))
     return 0
 
 
 def cmd_fetch_run(args) -> int:
     out = Path(args.out_dir).resolve()
+    start = getattr(args, "start_task", False)
     ok = True
-    for bank in args.banks:
-        for k in fetch_cases_in(out, args.ks, args.chained, bank):
-            name = fetch_case_name(k, args.chained, bank)
+    for bank in fetch_banks(args):
+        for k in fetch_cases_in(out, fetch_values(args) if start else args.ks, args.chained, bank, start):
+            name = fetch_case_name(k, args.chained, bank, start)
             ok = lp.run_case(out, name, args.tag, args.backend, output=False) and ok
             if not ok:
                 print(f"{name}: run did not complete; stop")
@@ -743,11 +836,12 @@ def cmd_fetch_run(args) -> int:
 
 def cmd_fetch_table(args) -> int:
     out = Path(args.out_dir).resolve()
+    start = getattr(args, "start_task", False)
     entries = []
-    for bank in args.banks:
+    for bank in fetch_banks(args):
         rows = []
-        for k in fetch_cases_in(out, args.ks, args.chained, bank):
-            name = fetch_case_name(k, args.chained, bank)
+        for k in fetch_cases_in(out, fetch_values(args) if start else args.ks, args.chained, bank, start):
+            name = fetch_case_name(k, args.chained, bank, start)
             for run in args.runs:
                 run_dir = out / name / run
                 if not run_dir.is_dir():
@@ -756,12 +850,17 @@ def cmd_fetch_table(args) -> int:
                     rows.append((k, run, {"release": None}))
                     continue
                 r = fetch_row(load_level_events(run_dir))
+                if start:
+                    r["check"] = start_missing(r, args.chained)
                 rows.append((k, run, r))
                 entries.append((name, k, bank, run, r))
-        print(f"== bank {bank} ({FETCH_PREFIX[(args.chained, bank)]}NN) ==")
+        label = f"{FETCH_START_PREFIX[args.chained]}NN, NN = pre-release nops" if start else \
+            f"{FETCH_PREFIX[(args.chained, bank)]}NN"
+        print(f"== bank {bank} ({label}) ==")
         print(format_fetch_table(rows))
         print()
-    print(format_fetch_map(entries))
+    if not start:
+        print(format_fetch_map(entries))
     return 0
 
 
@@ -2061,6 +2160,304 @@ def cmd_ring_table(args) -> int:
     return 0
 
 
+# -- refused-access probe (refuse-*): a lock BD after a BD whose accesses a core camp refused -------------
+#
+# Does the grant phase of a lock BD depend on what happened to the BD before it? Chained task on MM2S 0:
+# pre (lock-free, 4 words) -> BD k (acquire A, 64 words of `src`, release DONE) -> BD k+1 (acquire B, 16 words
+# of `tail`, release END). The core releases A, then camps on physical bank 0 with `r` loads (r = 0..3) placed
+# at a bank-0 granule of BD k's read (EARLY: the 7th granule, grant + 15; LATE: the last bank-0 granule,
+# grant + 47), so r of BD k's accesses are refused (the rotation rule fixes how many cycles the DMA waits;
+# `refuse_settle_loads` adds the bank-0 history that puts the camp at the phase where r loads refuse r
+# accesses). Then `event #1`, s nops and the release of B, and the core waits for END. The sweep of s moves the
+# release of B against the end of BD k, so BD k+1 asks for B at a swept phase; its grant (STALLED_LOCK falling,
+# one cycle after LOCK_SEL0_ACQ_GE) minus the release of B is the number the open fidelity row is about.
+#
+# B is lock 0 so the memory module's lock events (selector 0 at reset) follow it: LOCK_0_REL and
+# LOCK_SEL0_ACQ_GE stamp B. The release of A is stamped by the core's INSTR_EVENT_0 (a constant before it).
+# Hang safety: the core waits only on the go lock (set by the sequence) and on END, which BD k+1 releases
+# after the core released B; the S2MM takes exactly the 84 words the MM2S sends (4 + 64 + 16), lock-free.
+
+REFUSE_LOCK_B, REFUSE_LOCK_A, REFUSE_LOCK_GO, REFUSE_LOCK_DONE, REFUSE_LOCK_END = 0, 1, 2, 3, 4
+REFUSE_TAIL_ADDR = 0x4040          # BD k+1's 16 words, logical bank 1 beside `pre`
+REFUSE_TAIL_WORDS = 16
+REFUSE_RS = (0, 1, 2, 3)           # refused accesses of BD k
+REFUSE_CELLS = {"e": 15, "l": 47}  # EARLY / LATE: grant-relative cycle of the camp's first load
+REFUSE_CAMP_SLOTS = 3              # bundles of the camp: r loads and nops, so every r has the same length
+REFUSE_S_WIDTH = 6                 # consecutive s per (r, position): every residue mod 3 twice
+REFUSE_S0 = {"e": 35, "l": 3}      # first s of the sweep per position (calibrated on the emulator)
+REFUSE_MAX_S = 80
+REFUSE_MEMMOD_EVENTS = ["LOCK_0_REL", "LOCK_SEL0_ACQ_GE", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD",
+                        "DMA_S2MM_0_FINISHED_BD", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                        "DMA_MM2S_0_FINISHED_TASK"]
+REFUSE_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "MEMORY_STALL"]
+REFUSE_MM2S_BDS = 2                # FINISHED_BD in the trace window: BD k, BD k+1 (the pre BD ends at boot, untraced)
+
+
+def refuse_refused(r: int, cell: int, m: int) -> int:
+    """DMA cycles the rotation rule refuses when r camp loads start at `cell` after the grant with m earlier
+    bank-0 loads in the history: contended cycles in which the core, not the DMA, was served."""
+    p = rotation_prediction(ArbCase(0, "l", max(r, 1), cell + 1, m), cell) if r else \
+        {"contended": [], "core_lost": []}
+    return len(p["contended"]) - len(p["core_lost"])
+
+
+def refuse_settle_loads(cell: int) -> int:
+    """The smallest number of bank-0 loads before the release for which camps of r = 1, 2, 3 loads at `cell`
+    refuse exactly r DMA accesses under the rotation rule (the bank's served-access count picks who wins)."""
+    for m in range(ARB_MAX_M + 1):
+        if all(refuse_refused(r, cell, m) == r for r in REFUSE_RS):
+            return m
+    raise ValueError(f"no history of up to {ARB_MAX_M} loads makes the camps at g+{cell} refuse 1..3")
+
+
+@dataclass(frozen=True)
+class RefuseCase:
+    r: int                         # camp loads (accesses of BD k the camp is placed to refuse)
+    pos: str                       # "e" early or "l" late
+    s: int                         # nops between `event #1` (after the camp) and the release of B
+
+    @property
+    def cell(self) -> int:
+        return REFUSE_CELLS[self.pos]
+
+    @property
+    def name(self) -> str:
+        return f"rf{self.pos}{self.r}s{self.s:02d}"
+
+
+def refuse_validate(c: RefuseCase) -> None:
+    if c.r not in REFUSE_RS:
+        raise ValueError(f"r must be one of {REFUSE_RS}")
+    if c.pos not in REFUSE_CELLS:
+        raise ValueError(f"pos must be one of {tuple(REFUSE_CELLS)}")
+    if not 0 <= c.s <= REFUSE_MAX_S:
+        raise ValueError(f"s must be 0..{REFUSE_MAX_S}")
+
+
+def refuse_plan() -> list[RefuseCase]:
+    """The grid: r x position x six consecutive s from the position's first s (48 cases)."""
+    return [RefuseCase(r, pos, REFUSE_S0[pos] + i) for pos in REFUSE_CELLS for r in REFUSE_RS
+            for i in range(REFUSE_S_WIDTH)]
+
+
+def refuse_core_asm(c: RefuseCase) -> str:
+    """go, settle, the history loads, `event #0`, release A, k nops, the camp (r bank-0 loads then nops to
+    REFUSE_CAMP_SLOTS bundles), `event #1`, s nops, release B, wait END. r2 = +1 releases, r3 = -1 acquires,
+    p0 = `ldbuf`. k = cell + 1 puts the first load `cell` cycles after a grant of release + 2."""
+    refuse_validate(c)
+    n = lp.nops
+    history = [f"  lda r25, [p0, #{ARB_OFFSETS[0][0]}]"] * refuse_settle_loads(c.cell)
+    camp = [f"  lda {ARB_LOAD_REGS[i]}, [p0, #{ARB_OFFSETS[0][i]}]" for i in range(c.r)]
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + REFUSE_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *history, *n(8),
+            "  event #0", f"  rel #{OWN + REFUSE_LOCK_A}, r2", *n(c.cell + 1),
+            *camp, *n(REFUSE_CAMP_SLOTS - c.r), "  event #1", *n(c.s),
+            f"  rel #{OWN + REFUSE_LOCK_B}, r2", *n(8),
+            f"  acq #{OWN + REFUSE_LOCK_END}, r3", *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def refuse_design_mlir() -> str:
+    """Case-independent design (see the section comment)."""
+    w, p, t = FETCH_WORDS, FETCH_PRE_WORDS, REFUSE_TAIL_WORDS
+    dw = p + w + t
+    ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    pre_init = ", ".join(str(0x0C000000 | j) for j in range(p))
+    tail_init = ", ".join(str(0x0E000000 | j) for j in range(t))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t02 = aie.tile(0, 2)
+    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+    %pre = aie.buffer(%t02) {{address = {FETCH_PRE_ADDR} : i32, sym_name = "pre", initial_value = dense<[{pre_init}]> : tensor<{p}xi32>}} : memref<{p}xi32>
+    %tail = aie.buffer(%t02) {{address = {REFUSE_TAIL_ADDR} : i32, sym_name = "tail", initial_value = dense<[{tail_init}]> : tensor<{t}xi32>}} : memref<{t}xi32>
+    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = "dst"}} : memref<{dw}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lB = aie.lock(%t02, {REFUSE_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
+    %lA = aie.lock(%t02, {REFUSE_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
+    %lGo = aie.lock(%t02, {REFUSE_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    %lDone = aie.lock(%t02, {REFUSE_LOCK_DONE}) {{init = 0 : i32, sym_name = "lDone"}}
+    %lEnd = aie.lock(%t02, {REFUSE_LOCK_END}) {{init = 0 : i32, sym_name = "lEnd"}}
+    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(MM2S, 0, ^pre, ^recv_start)
+    ^pre:
+      aie.dma_bd(%pre : memref<{p}xi32>)
+      aie.next_bd ^send
+    ^send:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%src : memref<{w}xi32>)
+      %cd = arith.constant 1 : i32
+      aie.use_lock(%lDone, Release, %cd)
+      aie.next_bd ^second
+    ^second:
+      %cb = arith.constant 1 : i32
+      aie.use_lock(%lB, AcquireGreaterEqual, %cb)
+      aie.dma_bd(%tail : memref<{t}xi32>)
+      %ce = arith.constant 1 : i32
+      aie.use_lock(%lEnd, Release, %ce)
+      aie.next_bd ^end
+    ^recv_start:
+      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
+    ^recv:
+      aie.dma_bd(%dst : memref<{dw}xi32>)
+      aie.next_bd ^end
+    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+      aiex.set_lock(%lGo, %c_one)
+{pad}
+    }}
+  }}
+}}
+"""
+
+
+def refuse_inject_args() -> list[str]:
+    return ["--memmod-sweep-events", ",".join(REFUSE_MEMMOD_EVENTS),
+            "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(REFUSE_CORE_EVENTS)]
+
+
+def refuse_row(events) -> dict:
+    """One run of tile (0,2). Memory-module stamps: g_k = the cycle after the first MM2S STALLED_LOCK run
+    (BD k's wait on A) falls; R_B = the LOCK_0_REL (B's release); G_B = the cycle after the STALLED_LOCK run
+    holding R_B falls, minus R_B (None when B was free when BD k+1 asked). `fins` / `s2mm_fins` / `tasks` are
+    the FINISHED_BD / FINISHED_TASK stamps, `conflicts` the bank-0 and bank-1 conflict cycles, all relative to
+    g_k; `refused` = bank-0 conflict cycles minus the core's MEMORY_STALL cycles (core clock, in the camp)."""
+    mem, core = {}, {}
+    for e in events:
+        if e.row == FETCH_ROW:
+            (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+    runs = _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", []))
+    rels = sorted(set(mem.get("LOCK_0_REL", [])))
+    if not runs or not rels:
+        return {"g_k": None}
+    g = runs[0][1] + 1
+    rb = rels[0]
+
+    def rel(name, src=mem):
+        return [t - g for t in sorted(set(src.get(name, [])))]
+    waiting = [run for run in runs[1:] if run[0] <= rb <= run[1] + 1]
+    ev0 = sorted(core.get("INSTR_EVENT_0", []))
+    stalls = [t for t in sorted(set(core.get("MEMORY_STALL", []))) if ev0 and t >= ev0[0]]
+    conflicts = sorted((t - g, b[-1]) for b in ("CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1")
+                       for t in set(mem.get(b, [])))
+    fins = rel("DMA_MM2S_0_FINISHED_BD")
+    b0 = [t for t, b in conflicts if b == "0"]
+    return {"g_k": g, "r_b": rb - g, "grant_b": (waiting[0][1] + 1 - rb) if waiting else None,
+            "acq_b": [t - rb for t in sorted(set(mem.get("LOCK_SEL0_ACQ_GE", [])))],
+            "fins": fins, "s2mm_fins": rel("DMA_S2MM_0_FINISHED_BD"), "tasks": rel("DMA_MM2S_0_FINISHED_TASK"),
+            "conflicts": conflicts, "memory_stalls": len(stalls),
+            "refused": len(b0) - len(stalls), "present": sorted(mem), "core_present": sorted(core)}
+
+
+def refuse_missing(r: dict, c: RefuseCase) -> list[str]:
+    """What the design needs from a run and did not get: every event of the memory-module list, the core
+    markers, and every DMA task finished (BD k and BD k+1 and the MM2S task, the S2MM's one BD). A bank
+    conflict is needed only with a camp (r > 0), and only on bank 0: the camp never touches bank 1."""
+    if r.get("g_k") is None:
+        return ["no STALLED_LOCK run or no LOCK_0_REL"]
+    optional = {"CONFLICT_DM_BANK_1"} | ({"CONFLICT_DM_BANK_0"} if c.r == 0 else set())
+    out = [e for e in REFUSE_MEMMOD_EVENTS if e not in r["present"] and e not in optional]
+    out += [e for e in ("INSTR_EVENT_0", "INSTR_EVENT_1") if e not in r["core_present"]]
+    if len(r["fins"]) != REFUSE_MM2S_BDS:
+        out.append(f"MM2S FINISHED_BD x{len(r['fins'])} (want {REFUSE_MM2S_BDS})")
+    if len(r["s2mm_fins"]) != 1:
+        out.append(f"S2MM FINISHED_BD x{len(r['s2mm_fins'])} (want 1)")
+    if len(r["tasks"]) != 1:
+        out.append(f"MM2S FINISHED_TASK x{len(r['tasks'])} (want 1)")
+    return out
+
+
+def format_refuse_table(rows) -> str:
+    """rows: (RefuseCase, run, refuse_row dict). Cycles after g_k (BD k's grant) except grant_b (after R_B)."""
+    lines = ["case      run      g_k(abs)  F_k  R_B-F_k  grant_b  refused  mstall  conflicts(b0 cycles after g_k)  "
+             "finish check"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        miss = refuse_missing(r, c)
+        if r.get("g_k") is None:
+            lines.append(f"{c.name:<9} {run:<8} {'; '.join(miss)}")
+            continue
+        fk = r["fins"][0] if r["fins"] else None
+        conf = ",".join(str(t) for t, b in r["conflicts"] if b == "0") or "-"
+        lines.append(f"{c.name:<9} {run:<8} {r['g_k']:>8} {_num(fk, 'd'):>4} "
+                     f"{_num(None if fk is None else r['r_b'] - fk):>7}  {_num(r['grant_b']):>7}  "
+                     f"{r['refused']:>7}  {r['memory_stalls']:>6}  {conf:<30}  " + ("ok" if not miss else "MISSING " + "; ".join(miss)))
+    return "\n".join(lines)
+
+
+def refuse_selection(args) -> list[RefuseCase]:
+    return [c for c in refuse_plan() if not args.names or c.name in args.names]
+
+
+def refuse_build_case(c: RefuseCase, out: Path) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(refuse_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(refuse_design_mlir())
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *refuse_inject_args(),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "r": c.r, "pos": c.pos, "s": c.s,
+                                             "refuse": True}) + "\n")
+
+
+def cmd_refuse_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in refuse_selection(args):
+        refuse_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_refuse_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in refuse_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_refuse_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in refuse_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"g_k": None}))
+                continue
+            rows.append((c, run, refuse_row(load_level_events(run_dir))))
+    print(format_refuse_table(rows))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2097,6 +2494,11 @@ def main(argv=None) -> int:
     ft.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
     ft.add_argument("--banks", nargs="+", choices=FETCH_BANKS + ("none",), default=None, help="as for fetch-build")
     for sp in (fb, fr, ft):
+        sp.add_argument("--start-task", action="store_true",
+                        help="DMA-side stamp cases (lfsNN first-BD, lfqNN with --chained): DMA_MM2S_0_START_TASK joins "
+                             "the memory-module events and --pre-nops nops precede the release; no core loads")
+        sp.add_argument("--pre-nops", nargs="*", type=int, default=[],
+                        help="--start-task: nops before `event #0` and the release (default 0..5)")
         sp.add_argument("--sync", action="store_true",
                         help="the lock-synchronised variant (cases lsDD, lsfree, lsaDDkKK/lsbDDkKK): --ds are core delays, "
                              "--banks none|0|1 (default none), --ks the load offsets of the bank cases")
@@ -2123,16 +2525,30 @@ def main(argv=None) -> int:
     rt = sub.add_parser("ring-table", help="ring-order probe: per-run camp table with count residues")
     rt.add_argument("out_dir")
     rt.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt):
+    xb = sub.add_parser("refuse-build", help="refused-access probe: build the plan's cases (or --names)")
+    xb.add_argument("out_dir")
+    xr = sub.add_parser("refuse-run", help="refused-access probe: run the built cases to TAG.BACKEND/")
+    xr.add_argument("out_dir")
+    xr.add_argument("tag")
+    xr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    xt = sub.add_parser("refuse-table", help="refused-access probe: per-run grant offsets and the finish check")
+    xt.add_argument("out_dir")
+    xt.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     args = ap.parse_args(argv)
     if args.cmd in CHAIN_COMMANDS:
         return CHAIN_COMMANDS[args.cmd](args)
+    if args.cmd.startswith("refuse-"):
+        return {"refuse-build": cmd_refuse_build, "refuse-run": cmd_refuse_run,
+                "refuse-table": cmd_refuse_table}[args.cmd](args)
     if args.cmd.startswith("ring-"):
         return {"ring-build": cmd_ring_build, "ring-run": cmd_ring_run, "ring-table": cmd_ring_table}[args.cmd](args)
     if args.cmd.startswith("arb-"):
         return {"arb-build": cmd_arb_build, "arb-run": cmd_arb_run, "arb-table": cmd_arb_table}[args.cmd](args)
     if args.cmd.startswith("fetch-"):
+        if args.start_task and args.sync:
+            ap.error("--start-task and --sync are separate variants")
         if args.sync:
             return {"fetch-build": cmd_sync_build, "fetch-run": cmd_sync_run, "fetch-table": cmd_sync_table}[args.cmd](args)
         args.banks = args.banks or ["both"]
