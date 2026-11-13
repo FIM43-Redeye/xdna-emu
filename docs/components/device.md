@@ -32,7 +32,7 @@ matches reality.
 | `state/` | `DeviceState` -- applies `DeviceOp` to the array; per-tile compute/memtile dispatch and effects |
 | `array/` | `TileArray` -- the device tile grid, with control + DMA + routing helpers |
 | `tile/` | `Tile` state: memory, locks, registers, edge config, per-tile streams, core state |
-| `dma/` | DMA engine: BDs, transfer state machine, addressing, timing, stream I/O, FIFO, token, compression |
+| `dma/` | DMA engine: BDs, transfer state machine, addressing, timing, stream I/O, FIFO, token, compression; the compute MM2S word clock (`word_clock.rs`) and lock port (`lock_port.rs`), channel-level state that sequences the BD chain and requests its locks ahead of the FSM |
 | `stream_switch/` | Per-tile and global stream routing |
 | `regdb/` | Register database glue (consumes the AM025 JSON via xdna-archspec) |
 | `events/` | Event tracking (broadcasts, timer-triggered events, port events) |
