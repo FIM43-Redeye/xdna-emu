@@ -549,7 +549,8 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   transfers colliding, stalls per transfer 2 1 0 3 0 repeating): before the lock law 1077 conflicts (another
   count), 18 stalls; with the lock law 0 / 0 / none; with the core-side placement 603 / 24 / 12, 2 2 2 2 0;
   with the late-granule gap (next section) 1095 conflicts, 18 stalls, 9 of 15 transfers colliding,
-  2 1 0 3 0 repeating, 12 of 15 transfers identical to silicon contact for contact and finish. `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls (with the lock law, same
+  2 1 0 3 0 repeating, 12 of 15 transfers identical to silicon contact for contact and finish (`collide` is a
+  FITTED row since then: the gap's form was set by it). Held out: `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls, unchanged by the gap (with the lock law, same
   count: 545 / 157); no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
