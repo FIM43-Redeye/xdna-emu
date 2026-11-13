@@ -760,8 +760,32 @@ def test_chain_core_without_a_core_bd_releases_only_a_and_s2mm_releaser_none():
     assert not any(x.startswith("rel #") for x in s) and "event #0" in s
 
 
+def test_chain_fill_releases_a_after_the_tail_and_leaves_the_default_unchanged():
+    rel_a = f"rel #{g.OWN + g.SYNC_LOCK_A}, r2"
+    plain = [ln.strip() for ln in g.chain_core_asm(chain("1 1", d2=3)).splitlines()]
+    filled = [ln.strip() for ln in g.chain_core_asm(chain("1 1", d2=3, fill=5)).splitlines()]
+    assert plain.count(rel_a) == 1 and filled.count(rel_a) == 6
+    rels = [i for i, x in enumerate(filled) if x == rel_a]
+    tail, tail2 = filled.index(".Ltail:"), filled.index(".Ltail2:")
+    assert rels[0] < tail and all(tail < i < tail2 for i in rels[1:])
+    assert ".Ltail2:" not in plain
+    assert g.chain_design_mlir(chain("1 1")) == g.chain_design_mlir(chain("1 1", fill=5))
+    assert "fill" not in chain("1 1").design() and chain("1 1", fill=5).design()["fill"] == 5
+
+
+def test_chain_fill_limits_and_command_line():
+    with pytest.raises(ValueError):
+        g.chain_validate(chain("1", fill=g.CHAIN_MAX_FILL + 1))
+    with pytest.raises(ValueError):
+        g.chain_validate(chain("1", releaser="s2mm", fill=1))
+    args = type("A", (), {"mids": ["1"], "head": 8, "big": 64, "d1s": [], "d2s": [0], "releaser": "core",
+                          "bd_ids": [], "fill": 24})()
+    assert [(c.fill, c.head) for c in g.chain_selection(args)] == [(24, 8)]
+
+
 @pytest.mark.skipif(peano_mc() is None, reason="Peano llvm-mc not available")
-@pytest.mark.parametrize("c", [chain("4c 8", d1=0, d2=0), chain("4c", d1=40, d2=40), chain("8", releaser="s2mm")])
+@pytest.mark.parametrize("c", [chain("4c 8", d1=0, d2=0), chain("4c", d1=40, d2=40), chain("8", releaser="s2mm"),
+                               chain("1 1 1 1 1 1 1 1", fill=g.CHAIN_MAX_FILL)])
 def test_chain_core_assembles(c, tmp_path):
     s = tmp_path / "c.s"
     s.write_text(g.chain_core_asm(c))

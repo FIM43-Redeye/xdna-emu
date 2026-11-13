@@ -1341,6 +1341,11 @@ def cmd_sync_table(args) -> int:
 # sequence (START), or released by a party whose own waits are earlier in the same chain: the core waits only on SYNC
 # (the head's release) and then releases B and A unconditionally; the S2MM's first BD needs only the words the MM2S
 # sends before the waiting BD. Nothing waits on the host.
+# With `fill` > 0 the core, after its tail (long after every DMA task of the chain has finished), releases lock A
+# `fill` more times, CHAIN_FILL_LOOP_ITERS delay-loop iterations apart, then runs the tail again: the memory-module
+# LOCK_0_REL frames fill the stream's last packets, so no measured frame sits in a packet silicon may not deliver
+# (silicon does not write a stream's final partial packet). Nothing acquires A then; its count stays far below the
+# 6-bit limit (CHAIN_MAX_FILL).
 
 CHAIN_LOCK_B, CHAIN_LOCK_RX, CHAIN_LOCK_FREE0 = 4, 5, 6   # B: the core-released mid BD's lock; RX: the S2MM's
 CHAIN_MAX_FREE = 16 - CHAIN_LOCK_FREE0                     # free locks 6..15
@@ -1348,6 +1353,8 @@ CHAIN_MAX_BDS = 16                                         # BD descriptors of a
 CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffers: logical bank 1
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
+CHAIN_MAX_FILL = 32                # fill releases of A: its count stays below the 6-bit limit
+CHAIN_FILL_LOOP_ITERS = 4          # delay between two fill releases (about 40 cycles)
 CHAIN_LOCK_KINDS = {"": "none", "f": "free", "c": "core"}
 CHAIN_MEM_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD",
                     "LOCK_SEL0_ACQ_GE"]
@@ -1369,6 +1376,7 @@ class ChainCase:
     d2: int = 0                    # nops between `event #1` and the core's release of A
     releaser: str = "core"         # who releases A: "core" or "s2mm"
     bd_ids: tuple = ()             # bd_id of every MM2S BD (head, mids, waiting BD); () = aiecc assigns
+    fill: int = 0                  # core releases of A after the tail (trace packet fillers; core releaser only)
 
     @property
     def name(self) -> str:
@@ -1379,6 +1387,8 @@ class ChainCase:
         d = {"head": self.head, "mids": format_chain_mids(self.mids), "big": self.big, "releaser": self.releaser}
         if self.bd_ids:
             d["bd_ids"] = list(self.bd_ids)
+        if self.fill:
+            d["fill"] = self.fill
         return d
 
 
@@ -1425,21 +1435,29 @@ def chain_validate(c: ChainCase) -> None:
     if c.bd_ids and (len(c.bd_ids) != len(c.mids) + 2 or len(set(c.bd_ids)) != len(c.bd_ids)
                      or not all(0 <= i < CHAIN_MAX_BDS for i in c.bd_ids)):
         raise ValueError(f"bd_ids: one distinct id in 0..{CHAIN_MAX_BDS - 1} per MM2S BD (head, mids, waiting BD)")
+    if not 0 <= c.fill <= CHAIN_MAX_FILL or (c.fill and c.releaser != "core"):
+        raise ValueError(f"fill in 0..{CHAIN_MAX_FILL}, and only with the core releaser")
     a, w = chain_buffers(c)[-1]
     if a + 4 * w > CHAIN_BUF_END:
         raise ValueError("head and mid buffers exceed logical bank 1")
 
 
 def chain_core_asm(c: ChainCase) -> str:
-    """Block on SYNC, `event #0`, [d1 nops, release B], `event #1`, d2 nops, release A (core releaser only)."""
+    """Block on SYNC, `event #0`, [d1 nops, release B], `event #1`, d2 nops, release A (core releaser only), the
+    tail, then `fill` spaced releases of A and the tail again (trace packet fillers, only with `fill`)."""
     chain_validate(c)
     n = lp.nops
+    fill = []
+    for i in range(c.fill):
+        fill += [*lp.delay_loop(CHAIN_FILL_LOOP_ITERS, f".Lfill{i}"), f"  rel #{OWN + SYNC_LOCK_A}, r2"]
+    if fill:
+        fill += lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail2")
     rel_b = [*n(c.d1), f"  rel #{OWN + CHAIN_LOCK_B}, r2"] if any(m.lock == "core" for m in c.mids) else []
     rel_a = [*n(c.d2), f"  rel #{OWN + SYNC_LOCK_A}, r2"] if c.releaser == "core" else []
     body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
             f"  acq #{OWN + SYNC_LOCK_SYNC}, r3", *n(LOCK_SETTLE_BUNDLES),
             "  event #0", *rel_b, "  event #1", *rel_a, *n(8),
-            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail"), *fill]
     return lp.frame(body)
 
 
@@ -1590,7 +1608,8 @@ def chain_selection(args) -> list:
     mids = parse_chain_mids(args.mids)
     pairs = [(0, 0)] if args.releaser == "s2mm" else [(a, b) for a in (args.d1s or [0]) for b in (args.d2s or [0])]
     ids = tuple(getattr(args, "bd_ids", None) or ())
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids) for a, b in pairs]
+    fill = getattr(args, "fill", 0) or 0
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill) for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1673,6 +1692,8 @@ def add_chain_parsers(sub) -> None:
         sp.add_argument("--releaser", choices=("core", "s2mm"), default="core")
         sp.add_argument("--bd-ids", nargs="*", type=int, default=[],
                         help="bd_id of every MM2S BD in chain order (head, mids, waiting BD); default: aiecc assigns")
+        sp.add_argument("--fill", type=int, default=0,
+                        help="core releases of A after the tail: memory-module trace packet fillers (core releaser)")
 
 
 CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table}
