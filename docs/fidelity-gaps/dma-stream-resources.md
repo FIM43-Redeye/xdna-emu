@@ -495,10 +495,10 @@ BD's grant g0 (its STALLED_LOCK falls).
   rule 554 / 554 (the core's release of B is not traced; the emulator's own core path, event + nops + 3 or 4,
   gives the same score either way). Model-free, each silicon row against the emulator run whose release lands
   on the same cycle after g0: 889 / 889 sync rows and 163 / 163 chain rows identical (grant, every STALLED_LOCK
-  interval, every FINISHED_BD). After g0 the emulator's release comes 2 or 3 cycles earlier than silicon's for
-  the same case, and its event 0 with it (the core reaches event 0 early against the DMA's first grant,
-  upstream of this model), so a same-case comparison does not match: the model is exercised in the release
-  frame. On the short-chain designs (c, kn, k4f; 110 runs) the emulator follows the short-chain rule below on 108
+  interval, every FINISHED_BD). Same case (no frame mapping), since the head BD's release reaches the lock unit
+  at FINISHED_BD + 3 (2026-11-13, below): 26 / 34 sync rows identical (before 1 / 34), LOCK_0_REL and event 0
+  equal to silicon's on 22 rows and one cycle early on 12, which are silicon's other resume phase of the held
+  core (the same binary gives either run to run; the emulator's run is deterministic). On the short-chain designs (c, kn, k4f; 110 runs) the emulator follows the short-chain rule below on 108
   (before 2026-11-13: 32); the other two (six 1-word lock-free mid BDs, c1n / kn1x6) are where the parked lead and
   the always-bounded fit part (grant release + 2 against + 3).
 - **Still different (open gaps).**
@@ -543,11 +543,24 @@ BD's grant g0 (its STALLED_LOCK falls).
     BD's accesses and sweeps the core's release of the next BD's lock over six or more cycles.
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
-  - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). Still open: in
-    the sync designs the core reaches event 0, and so its release of A, 2 or 3 cycles earlier against the DMA's
-    first grant g0 than silicon (22 and 12 of 34 rows); it is upstream of event 0 (core start or the go lock's
-    wake), not measured apart. (The ring probe's "release one cycle earlier at k = 0" was a build difference:
-    the k >= 1 cases carry one more bundle before event 0.)
+  - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). (The ring
+    probe's "release one cycle earlier at k = 0" was a build difference: the k >= 1 cases carry one more bundle
+    before event 0.)
+  - *A compute BD's lock release* (**fixed** 2026-11-13). In the sync designs the core waits on lock 1, which
+    the head BD releases (the runtime sequence only sets the head's start lock), and reached event 0 2 or 3
+    cycles early against g0. MEASURED, one trace unit: an S2MM BD's LOCK_0_REL lands at its FINISHED_BD + 3 in
+    18 of 18 runs of the chain family's S2MM-releaser designs (s1n08..s1n32), where the emulator applied the
+    release in the BD's last data cycle (+ 0). Across units (the core's timer read 1 ahead, as the arb rows
+    show): event 0 at the head's FINISHED_BD + 5 in 1132 runs and + 6 in 567 (one in three; 483 cases with
+    repeated runs show both), which is a held core arbitrating in the cycle the release arrives, issuing the
+    held bundle the cycle after, and one later off its 3-cycle resume phase (the stall's start predates the
+    trace, so the phase is INFERRED, not seen). That the MM2S release takes the S2MM's + 3 is INFERRED from this
+    fit (no capture traces lock 1; a sync build with LOCK_1_REL in the memory unit's event list would show it).
+    Now the release reaches the target tile's lock unit at FINISHED_BD + 3 (`dma.bd_lock_release_after_finish_cycles`,
+    `Tile::send_dma_lock_release`), compute tiles only. Tests `a_core_held_on_a_dma_release_issues_on_silicons_cycle`,
+    `a_compute_s2mm_release_reaches_the_lock_unit_three_cycles_after_its_finish`. Every compute DMA-to-core
+    and DMA-to-DMA lock hand-off is 3 cycles later than before. Memtile and shim releases are unchanged
+    (unmeasured).
   - *Not measured, unchanged.* Memtile and shim DMA lock timing (request, grant, STALLED_LOCK) and every S2MM
     acquire keep the FSM's path and the arbiter's same-cycle order (pinned by tests); so do the core's acquires.
     A channel with two locked BDs waiting at once, and a BD releasing its own successor's lock on one channel, are
