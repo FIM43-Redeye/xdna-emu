@@ -84,7 +84,7 @@
 //! each single-bank rival keeps winning its own.
 //! `multi_bank_requester_starves_without_per_bank_stickiness` pins that
 //! counter-example. The core honours the per-bank contract
-//! (`CoreInterpreter::bank_served_banks`).
+//! (`CycleAccurateExecutor::settle_bank_arbitration` keeps only the refused banks of an access).
 //!
 //! A denied DMA channel does NOT: it re-presents its whole mask, because
 //! `DmaEngine::step_with_denied` skips its FSM step entirely and it therefore

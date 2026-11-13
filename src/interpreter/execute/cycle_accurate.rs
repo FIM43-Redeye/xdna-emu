@@ -3672,7 +3672,7 @@ mod tests {
 
     #[test]
     fn peek_bank_demand_does_not_mutate_context_and_reports_banks() {
-        let (exec, bundle, ctx) = fixture_scalar_load_at(0x70410);
+        let (_, bundle, ctx) = fixture_scalar_load_at(0x70410);
         let before_pc = ctx.pc();
         let before_cycles = ctx.cycles;
 
@@ -3693,7 +3693,6 @@ mod tests {
     #[test]
     fn peek_bank_demand_returns_empty_for_bundle_with_no_memory_ops() {
         // A bundle with only scalar ALU work touches no banks and can always issue.
-        let executor = CycleAccurateExecutor::new();
         let ctx = ExecutionContext::new();
         let bundle = make_bundle(vec![SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(2))
@@ -3712,7 +3711,6 @@ mod tests {
         // (every 128-bit word hits its own bank arbiter), so unlike the old
         // scalar-only stall counter in `record_memory_access`, the peek must
         // NOT skip vector ops.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400);
 
@@ -3739,7 +3737,6 @@ mod tests {
         // 0x50100 decodes to the West neighbour quadrant (CardDir 5), not
         // Local. Non-local accesses are out of scope for this task -- the
         // peek must report no demand for them, not the local-offset bank.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x50100);
 
@@ -3754,7 +3751,6 @@ mod tests {
 
     #[test]
     fn peek_bank_demand_covers_store_ops() {
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(1, 0x70410);
         ctx.scalar.write(0, 0xDEADBEEF);
@@ -3790,7 +3786,6 @@ mod tests {
     fn core_self_collision_on_shared_physical_bank_is_detected() {
         // LoadA at 0x400, Store at 0x404: both addresses fall in the same
         // 16-byte word (0x400..0x40F) -> physical bank 0 for both.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400); // load address
         ctx.pointer.write(1, 0x70404); // store address -- same physical bank
@@ -3835,7 +3830,6 @@ mod tests {
         // -- the paired interleave puts them on different physical banks
         // (0 and 1), so they must NOT contend even though both are core
         // ports issuing in the same cycle.
-        let executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         ctx.pointer.write(0, 0x70400); // load address -> physical bank 0
         ctx.pointer.write(1, 0x70410); // store address -> physical bank 1

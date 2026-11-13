@@ -3147,7 +3147,7 @@ mod tests {
     /// (the probe's own encodings), MM2S 0 waits on lock 0 with a 64-word BD reading 0x400
     /// (granule g in physical bank g & 1), and the banks start from the probe design's
     /// served-access history (`lock_fetch_history`: image lines, crt0 and frame stores).
-    fn run_arb_probe(k: usize, n: usize, store: bool, bank: usize) -> ArbProbeRun {
+    fn run_arb_probe(settle: usize, k: usize, n: usize, store: bool, bank: usize) -> ArbProbeRun {
         use crate::device::bank_arbiter::test_support::lock_fetch_history;
         use crate::device::dma::BdConfig;
         use crate::interpreter::engine::bank_census;
@@ -3163,7 +3163,7 @@ mod tests {
         let mut prog: Vec<u8> = Vec::new();
         prog.extend(MOV_R2_1);
         // Settle, as the probe's delay loop does: the MM2S parks on lock 0 long before the release.
-        for _ in 0..200 {
+        for _ in 0..settle {
             prog.extend(NOP);
         }
         let ev0_pc = prog.len() as u32;
@@ -3279,14 +3279,20 @@ mod tests {
             ("ar1l1k28m0", 28, 1, false, 1, (&[29], &[35], 37), (&[], &[], 36)),
             ("ar1l3k20m0", 20, 3, false, 1, (&[21, 22], &[28], 31), (&[22], &[28], 31)),
         ];
-        for &(case, k, n, store, bank, plus2, plus3) in cases {
-            let r = run_arb_probe(k, n, store, bank);
+        let mut phases = std::collections::BTreeSet::new();
+        // Three settle lengths move the release across the lock port's 3-cycle grant grid, so both
+        // grant phases (and silicon's row for each) are exercised.
+        for (settle, &(case, k, n, store, bank, plus2, plus3)) in
+            [200, 201, 202].into_iter().flat_map(|s| cases.iter().map(move |c| (s, c)))
+        {
+            let r = run_arb_probe(settle, k, n, store, bank);
+            phases.insert(r.grant - r.release);
             let (contended, lost, window) = match r.grant - r.release {
                 2 => plus2,
                 3 => plus3,
                 other => panic!("{case}: grant at release + {other} ({r:?})"),
             };
-            let row = format!("{case} (grant + {})", r.grant - r.release);
+            let row = format!("{case} settle {settle} (grant + {})", r.grant - r.release);
             assert_eq!(r.release - r.event0, 6, "{row}: LOCK_0_REL at the rel's issue + 5 ({r:?})");
             let c: Vec<u64> = r.contended.iter().map(|c| c - r.release).collect();
             assert_eq!(c, contended, "{row}: contended cycles after LOCK_0_REL ({r:?})");
@@ -3296,6 +3302,7 @@ mod tests {
             assert_eq!(s, lost, "{row}: MEMORY_STALL in the lost cycle ({r:?})");
             assert_eq!(r.event1 - r.event0, window, "{row}: event #1 - event #0 ({r:?})");
         }
+        assert_eq!(phases, [2, 3].into(), "both grant phases exercised");
     }
 
     #[test]

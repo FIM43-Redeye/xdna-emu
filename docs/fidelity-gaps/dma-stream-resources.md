@@ -560,9 +560,12 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     step with the core's store dwells: silicon keeps meeting the march every 4 cycles for the rest of the BD
     (runs of 2, core winning), the emulator meets it once or twice more and then not at all, so it has about
     half the conflict cycles (603 against 1098) and the wrong per-transfer pattern (2 2 2 2 0 against
-    2 1 0 3 0). Inferred: the MM2S's request lattice after a delayed access (silicon keeps its 4-cycle lattice,
-    next request no earlier than service + 2) and the missing MM2S stream backpressure (silicon one cycle at
-    grant + 6 and + 15, none in the emulator), both DMA side.
+    2 1 0 3 0). The first divergence: after the second transfer's `19b1x4` (the MM2S refused three times on
+    bank 1) silicon's next contact is at grant + 25, the emulator's at + 24. Silicon's MM2S keeps its request
+    lattice after a delayed access (next request no earlier than service + 2, fitted from the producer
+    captures); the emulator has no such rule (its fetches are paced by the word clock and the staging), so the
+    likely cause is DMA side, not shown. Also seen: silicon's MM2S stream backpressure at grant + 6 and + 15,
+    none in the emulator.
   - *Where the core's access sits* (**fixed** 2026-11-13). Silicon, one trace unit at a time: in the core
     module a load or store that loses its bank raises MEMORY_STALL at its issue + 4 (82 of 82 loss rows), the
     stamp a gather's frozen memory cycle has (counter reads put that freeze at issue + 4); llvm-aie gives loads,
@@ -574,9 +577,10 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     the core in that cycle, MEMORY_STALL stamped there) and a core release reaches the lock unit the next
     cycle (`Tile::send_core_lock_release`; cores see it when they did, the DMA from that stamp + 2). The "release 2
     early / access 3 early against event 0" figures mixed the two units' timers: across units the emulator now
-    reads LOCK_0_REL - `event #0` = 4 (silicon 5) and MEMORY_STALL - conflict = 2 (silicon 1), one residual of
-    1 both ways, i.e. the intra-tile timer offset (`BROADCAST_INTRA_TILE_MEM_OFFSET`, 2, calibrated on add_one)
-    reads 1 on these probes. Not changed here. Unmeasured: a vst.srs / vst.conv (E7) or part-word store
+    reads LOCK_0_REL - `event #0` = 4 (silicon 5) and MEMORY_STALL - conflict = 2 (silicon 1). The split itself
+    rests on the gather's stamp (MEMORY_STALL in the frozen cycle) and the toolchain's E5, not on these: any split
+    that fits the same-unit rows leaves equal residuals. Inferred from them: the intra-tile timer offset
+    (`BROADCAST_INTRA_TILE_MEM_OFFSET`, 2, calibrated on add_one) would read 1 on these probes. Not changed here. Unmeasured: a vst.srs / vst.conv (E7) or part-word store
     (E5, E11) arbitrates at E5 like the rest; an access lost while the core is held on a lock costs no extra
     cycle; the data itself still moves at issue.
   - *Rows outside the probes' shape.* An access in flight reaches its bank whatever the core does meanwhile
