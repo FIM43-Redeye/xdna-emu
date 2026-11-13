@@ -80,6 +80,9 @@ the channel left the pre BD: d sweeps from "lock free when the BD asks" up to a 
 prints per case and run: d (measured: release minus the pre BD's FINISHED_BD), the channel's STALLED_LOCK rise
 after that finish, grant minus release, MM2S and S2MM finish minus grant, and conflicts relative to the grant.
 `--free` adds lsfree (lock A starts at 1). Bank cases (lsa/lsb) add one core load k nops after the release.
+`--memmod-event-swap OLD=NEW` (fetch-build and chain-build too) exchanges one traced memory-module event for another in
+the same slot, e.g. DMA_S2MM_0_FINISHED_BD=DMA_MM2S_0_MEMORY_STARVATION. Lock events other than lock 0's only follow
+another lock once Locks_Event_Selection_n is programmed (every selector resets to lock 0); the swap does not do that.
 
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR --sync [--ds 0 4 8] [--banks none|0|1] [--ks ..] [--free]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu --sync [same selection]
@@ -376,6 +379,39 @@ FETCH_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINI
                        "DMA_MM2S_0_MEMORY_STARVATION", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
                        "DMA_S2MM_0_FINISHED_BD"]
 FETCH_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
+
+
+MEMMOD_SWAP_HELP = ("replace one memory-module trace event by another (OLD=NEW, e.g. "
+                    "DMA_S2MM_0_FINISHED_BD=DMA_MM2S_0_MEMORY_STARVATION); the trace unit has a fixed number of slots, "
+                    "so it is a swap, in the same slot. LOCK_n_REL / LOCK_SELn_* events follow "
+                    "Locks_Event_Selection_n, which resets to lock 0 for every n. Default: the variant's own list")
+
+
+def parse_event_swap(text: str) -> tuple[str, str]:
+    """`OLD=NEW` -> (OLD, NEW); the argparse type of --memmod-event-swap."""
+    old, sep, new = text.partition("=")
+    if not sep or not old.strip() or not new.strip() or "=" in new:
+        raise ValueError(f"expected OLD=NEW, got {text!r}")
+    return old.strip(), new.strip()
+
+
+def apply_event_swap(events: list[str], swap: tuple[str, str] | None) -> list[str]:
+    """The memory-module event list with OLD replaced in place by NEW (None: unchanged).
+
+    The trace unit has eight slots and a list is capped there, so an event can only be exchanged for
+    another, never added past a full list. NEW must be a real memory-module event of the target
+    (checked against mlir-aie's AIE2 table) and not already traced."""
+    if swap is None:
+        return list(events)
+    old, new = swap
+    if old not in events:
+        raise ValueError(f"{old} is not in the memory-module list ({', '.join(events)})")
+    if new in events:
+        raise ValueError(f"{new} is already in the memory-module list")
+    from aie.utils.trace.events import MemEventAIE2
+    if new not in MemEventAIE2.__members__:
+        raise ValueError(f"unknown memory-module event {new}")
+    return [new if e == old else e for e in events]
 FETCH_CORE_GROUNDING = "PERF_CNT_2"
 # tile (0,2) is physical column 1; trace pkt_type 0 = core module, 1 = memory module
 FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
@@ -498,8 +534,8 @@ def fetch_design_mlir(chained: bool = False, task: bool = False) -> str:
 """
 
 
-def fetch_inject_args(start: bool = False) -> list[str]:
-    events = FETCH_MEMMOD_EVENTS + ([FETCH_START_EVENT] if start else [])
+def fetch_inject_args(start: bool = False, swap: tuple[str, str] | None = None) -> list[str]:
+    events = apply_event_swap(FETCH_MEMMOD_EVENTS + ([FETCH_START_EVENT] if start else []), swap)
     return ["--memmod-sweep-events", ",".join(events),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
@@ -771,7 +807,8 @@ def load_level_events(run_dir: Path):
 
 # -- lock-to-fetch: build / run / table ---------------------------------------------
 
-def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both", start: bool = False) -> None:
+def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both", start: bool = False,
+                     swap: tuple[str, str] | None = None) -> None:
     """Case k of a lock-to-fetch variant. With `start` (the --start-task cases) the number is the pre-release
     nop count, there is no core load, and the task-start event joins the memory-module list."""
     name = fetch_case_name(k, chained, bank, start)
@@ -781,7 +818,7 @@ def fetch_build_case(k: int, out: Path, chained: bool = False, bank: str = "both
     lp.assemble(asm, d / "core.o", "k_core")
     (d / "base.mlir").write_text(fetch_design_mlir(chained, task=start))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(start),
+           "--out", "aie.mlir", "--trace-mode", "event_time", *fetch_inject_args(start, swap),
            "--trace-config-out", "trace_config.json", "--config-test-name", name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
@@ -815,7 +852,7 @@ def cmd_fetch_build(args) -> int:
     start = getattr(args, "start_task", False)
     for bank in fetch_banks(args):
         for k in fetch_values(args):
-            fetch_build_case(k, out, args.chained, bank, start)
+            fetch_build_case(k, out, args.chained, bank, start, getattr(args, "memmod_event_swap", None))
             print("built", fetch_case_name(k, args.chained, bank, start))
     return 0
 
@@ -1014,8 +1051,8 @@ def sync_design_mlir(c: SyncCase) -> str:
 """
 
 
-def sync_inject_args(bank: str) -> list[str]:
-    events = SYNC_MAIN_EVENTS + (SYNC_CONFLICT_EVENTS if bank != "none" else [])
+def sync_inject_args(bank: str, swap: tuple[str, str] | None = None) -> list[str]:
+    events = apply_event_swap(SYNC_MAIN_EVENTS + (SYNC_CONFLICT_EVENTS if bank != "none" else []), swap)
     return ["--memmod-sweep-events", ",".join(events),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(FETCH_CORE_EVENTS)]
@@ -1122,13 +1159,13 @@ def format_sync_summary(rows) -> str:
     return "\n".join(lines)
 
 
-def sync_build_case(c: SyncCase, out: Path) -> None:
+def sync_build_case(c: SyncCase, out: Path, swap: tuple[str, str] | None = None) -> None:
     d = out / c.name
     d.mkdir(parents=True, exist_ok=True)
     lp.assemble(sync_core_asm(c), d / "core.o", "k_core")
     (d / "base.mlir").write_text(sync_design_mlir(c))
     lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-           "--out", "aie.mlir", "--trace-mode", "event_time", *sync_inject_args(c.bank),
+           "--out", "aie.mlir", "--trace-mode", "event_time", *sync_inject_args(c.bank, swap),
            "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
            "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
           cwd=d, log=d / "inject.log")
@@ -1136,7 +1173,8 @@ def sync_build_case(c: SyncCase, out: Path) -> None:
            "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
           cwd=d, log=d / "aiecc.log")
     (d / "case.json").write_text(json.dumps({"case": c.name, "d": c.d, "bank": c.bank, "k": c.k,
-                                             "free": c.free, "pre2": c.pre2, "sync": True}) + "\n")
+                                             "free": c.free, "pre2": c.pre2, "sync": True,
+                                             **({"memmod_event_swap": list(swap)} if swap else {})}) + "\n")
 
 
 def sync_selection(args) -> list[SyncCase]:
@@ -1148,7 +1186,7 @@ def sync_selection(args) -> list[SyncCase]:
 def cmd_sync_build(args) -> int:
     out = Path(args.out_dir).resolve()
     for c in sync_selection(args):
-        sync_build_case(c, out)
+        sync_build_case(c, out, getattr(args, "memmod_event_swap", None))
         print("built", c.name)
     return 0
 
@@ -1391,8 +1429,8 @@ def chain_design_mlir(c: ChainCase) -> str:
 """
 
 
-def chain_inject_args() -> list[str]:
-    return ["--memmod-sweep-events", ",".join(CHAIN_MEM_EVENTS),
+def chain_inject_args(swap: tuple[str, str] | None = None) -> list[str]:
+    return ["--memmod-sweep-events", ",".join(apply_event_swap(CHAIN_MEM_EVENTS, swap)),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
 
@@ -1462,7 +1500,7 @@ def cmd_chain_build(args) -> int:
         lp.assemble(chain_core_asm(c), d / "core.o", "k_core")
         (d / "base.mlir").write_text(chain_design_mlir(c))
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(),
+               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None)),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
               cwd=d, log=d / "inject.log")
@@ -1515,6 +1553,8 @@ def add_chain_parsers(sub) -> None:
     cr.add_argument("tag")
     cr.add_argument("--backend", choices=("hw", "emu"), required=True)
     ct.add_argument("runs", nargs="+")
+    cb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
+                    help=MEMMOD_SWAP_HELP)
     for sp in (cb, cr, ct):
         sp.add_argument("--mids", nargs="*", default=[], help="mid BDs: words, then c (core lock) or f (free lock)")
         sp.add_argument("--head", type=int, default=4, help="head BD words")
@@ -2470,7 +2510,7 @@ def cmd_refuse_table(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("generate")
@@ -2492,6 +2532,8 @@ def main(argv=None) -> int:
     fb.add_argument("--chained", action="store_true", help="the chained variant (cases lfcNN)")
     fb.add_argument("--banks", nargs="+", choices=FETCH_BANKS + ("none",), default=None,
                     help="both = two loads (lfk/lfc); 0 or 1 = one load on that bank (lfa/lfb chained, lfd/lfe first-BD)")
+    fb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
+                    help=MEMMOD_SWAP_HELP)
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
     fr.add_argument("out_dir")
     fr.add_argument("tag")
@@ -2548,6 +2590,11 @@ def main(argv=None) -> int:
     xt.add_argument("runs", nargs="+")
     for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
+    return ap
+
+
+def main(argv=None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
     if args.cmd in CHAIN_COMMANDS:
         return CHAIN_COMMANDS[args.cmd](args)

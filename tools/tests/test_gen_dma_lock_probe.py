@@ -1312,3 +1312,63 @@ def test_refuse_missing_names_what_the_design_needs():
 def test_refuse_row_b_free_when_asked_has_no_grant():
     e = [x for x in refuse_synthetic() if x.name != "DMA_MM2S_0_STALLED_LOCK" or x.ts < 1000]
     assert g.refuse_row(e)["grant_b"] is None
+
+
+# -- memory-module event swap (--memmod-event-swap) ---------------------------------------------
+
+def test_parse_event_swap_splits_old_and_new():
+    assert g.parse_event_swap("DMA_S2MM_0_FINISHED_BD=LOCK_1_REL") == ("DMA_S2MM_0_FINISHED_BD", "LOCK_1_REL")
+
+
+@pytest.mark.parametrize("bad", ["", "LOCK_1_REL", "A=B=C", "=LOCK_1_REL", "LOCK_0_REL="])
+def test_parse_event_swap_rejects_malformed_text(bad):
+    with pytest.raises(ValueError, match="OLD=NEW"):
+        g.parse_event_swap(bad)
+
+
+def test_swap_replaces_in_place_so_the_slot_count_is_unchanged():
+    out = g.apply_event_swap(g.SYNC_MAIN_EVENTS, ("DMA_S2MM_0_FINISHED_BD", "LOCK_1_REL"))
+    assert out == ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "LOCK_1_REL"]
+    assert len(out) == len(g.SYNC_MAIN_EVENTS)
+    assert g.SYNC_MAIN_EVENTS[-1] == "DMA_S2MM_0_FINISHED_BD"           # the module constant is untouched
+
+
+def test_swap_none_is_the_identity():
+    assert g.apply_event_swap(g.SYNC_MAIN_EVENTS, None) == g.SYNC_MAIN_EVENTS
+
+
+def test_swap_rejects_an_old_event_that_is_not_in_the_list():
+    with pytest.raises(ValueError, match="not in the memory-module list"):
+        g.apply_event_swap(g.SYNC_MAIN_EVENTS, ("DMA_MM2S_0_MEMORY_STARVATION", "LOCK_1_REL"))
+
+
+def test_swap_rejects_an_unknown_new_event_name():
+    with pytest.raises(ValueError, match="unknown memory-module event"):
+        g.apply_event_swap(g.SYNC_MAIN_EVENTS, ("DMA_S2MM_0_FINISHED_BD", "LOCK_1_RELL"))
+
+
+def test_swap_rejects_a_new_event_already_in_the_list():
+    with pytest.raises(ValueError, match="already in"):
+        g.apply_event_swap(g.SYNC_MAIN_EVENTS, ("DMA_S2MM_0_FINISHED_BD", "LOCK_0_REL"))
+
+
+def test_sync_inject_args_carry_the_swap_and_default_is_unchanged():
+    swap = ("DMA_S2MM_0_FINISHED_BD", "LOCK_1_REL")
+    a = g.sync_inject_args("none", swap)
+    assert a[a.index("--memmod-sweep-events") + 1] == "LOCK_0_REL,DMA_MM2S_0_STALLED_LOCK,DMA_MM2S_0_FINISHED_BD,LOCK_1_REL"
+    assert g.sync_inject_args("none") == g.sync_inject_args("none", None)
+    b = g.sync_inject_args("0", swap)                                    # the conflict events still follow
+    assert b[b.index("--memmod-sweep-events") + 1].split(",")[-2:] == ["CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1"]
+
+
+def test_fetch_and_chain_inject_args_carry_the_swap():
+    f = g.fetch_inject_args(False, ("DMA_MM2S_0_MEMORY_STARVATION", "LOCK_1_REL"))
+    assert "LOCK_1_REL" in f[f.index("--memmod-sweep-events") + 1].split(",")
+    c = g.chain_inject_args(("LOCK_SEL0_ACQ_GE", "LOCK_1_REL"))
+    assert c[c.index("--memmod-sweep-events") + 1].split(",")[-1] == "LOCK_1_REL"
+
+
+def test_cli_option_is_on_the_sync_fetch_and_chain_builders():
+    for cmd in (["fetch-build", "d", "--sync"], ["fetch-build", "d"], ["chain-build", "d"]):
+        ns = g.build_parser().parse_args(cmd + ["--memmod-event-swap", "A=B"])
+        assert ns.memmod_event_swap == ("A", "B")
