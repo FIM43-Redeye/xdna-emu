@@ -530,6 +530,9 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
             ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
             ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),
+            ("DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES", t.dma.mm2s_lock_request_after_grant_cycles),
+            ("DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS", t.dma.mm2s_lock_request_trigger_words),
+            ("DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES", t.dma.mm2s_lock_request_trigger_latency_cycles),
             ("BANK_ARBITER_PERIOD", t.dma.bank_arbiter_period),
             ("BANK_ARBITER_DMA_RESIDUE", t.dma.bank_arbiter_dma_residue),
         ] {

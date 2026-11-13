@@ -14,7 +14,10 @@
 
 use std::collections::VecDeque;
 
-use xdna_archspec::aie2::timing::{DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_WORD_CLOCK_LEAD_GRANULES};
+use xdna_archspec::aie2::timing::{
+    DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS,
+    DMA_MM2S_WORD_CLOCK_LEAD_GRANULES,
+};
 
 /// Words per sequencer granule (one 16-byte bank access of 32-bit words).
 const GRANULE_WORDS: u32 = 4;
@@ -41,11 +44,16 @@ pub struct ChainBd {
     started_words: u32,
     /// Step the BD's first word was sequenced.
     pub start_at: Option<u64>,
+    /// Step its lock-request trigger word (`DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS` before its
+    /// end, its first word if it is shorter) was sequenced.
+    pub trigger_at: Option<u64>,
     /// Words accessed so far, and the step of the latest access.
     accessed_words: u32,
     pub last_access: Option<u64>,
     /// Step the BD's first access was presented to the bank arbiter (won or lost).
     first_presented: Option<u64>,
+    /// Step from which the channel holds the BD's lock, once granted (`LockPort`).
+    pub granted_at: Option<u64>,
 }
 
 impl ChainBd {
@@ -58,7 +66,14 @@ impl ChainBd {
             accessed_words: 0,
             last_access: None,
             first_presented: None,
+            trigger_at: None,
+            granted_at: None,
         }
+    }
+
+    /// Index of the word whose sequencing triggers the next BD's lock request.
+    fn trigger_word(&self) -> u32 {
+        self.spec.words.saturating_sub(DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS as u32)
     }
 
     /// Whether the BD holds the clock to its lead at `now`: it acquires a lock and has not
@@ -124,8 +139,11 @@ pub struct WordClock {
     bds: VecDeque<ChainBd>,
     granules: VecDeque<SeqGranule>,
     next_seq: u64,
-    /// The last access of the BD before the current one (the BD-switch gap).
+    /// The BD before the current one, once the current BD took over: its last access (the
+    /// BD-switch gap) and its trigger step (the current BD's lock request).
     prev_last_access: Option<u64>,
+    prev_trigger_at: Option<u64>,
+    prev_seq: Option<u64>,
 }
 
 impl WordClock {
@@ -146,12 +164,38 @@ impl WordClock {
         self.bds.push_back(ChainBd::new(seq, spec));
     }
 
+    /// Whether the clock has been started (a compute MM2S channel with work).
+    pub fn is_running(&self) -> bool {
+        !self.bds.is_empty()
+    }
+
     pub fn current(&self) -> Option<&ChainBd> {
         self.bds.front()
     }
 
     pub fn bd(&self, seq: u64) -> Option<&ChainBd> {
         self.bds.iter().find(|b| b.seq == seq)
+    }
+
+    fn bd_mut(&mut self, seq: u64) -> Option<&mut ChainBd> {
+        self.bds.iter_mut().find(|b| b.seq == seq)
+    }
+
+    /// The BD before `seq` in the chain: (its trigger step, its last access, whether it has
+    /// been fully accessed). `None` if `seq` is the first BD of the run.
+    pub fn predecessor(&self, seq: u64) -> Option<(Option<u64>, Option<u64>, bool)> {
+        let prev = seq.checked_sub(1)?;
+        if let Some(b) = self.bd(prev) {
+            return Some((b.trigger_at, b.last_access, b.fully_accessed()));
+        }
+        (self.prev_seq == Some(prev)).then_some((self.prev_trigger_at, self.prev_last_access, true))
+    }
+
+    /// Record the grant of BD `seq` (held from step `at`).
+    pub fn set_granted(&mut self, seq: u64, at: u64) {
+        if let Some(b) = self.bd_mut(seq) {
+            b.granted_at = Some(at);
+        }
     }
 
     pub fn bds(&self) -> impl Iterator<Item = &ChainBd> {
@@ -185,6 +229,10 @@ impl WordClock {
         bd.started_words += words;
         if bd.start_at.is_none() {
             bd.start_at = Some(now);
+        }
+        let trigger = bd.trigger_word();
+        if (first_word..first_word + words).contains(&trigger) {
+            bd.trigger_at = Some(now + (trigger - first_word) as u64);
         }
         let (seq, next_bd) = (bd.seq, bd.spec.next_bd);
         self.granules.push_back(SeqGranule {
@@ -262,6 +310,8 @@ impl WordClock {
         };
         self.granules.retain(|g| g.bd_seq != done.seq);
         self.prev_last_access = done.last_access;
+        self.prev_trigger_at = done.trigger_at;
+        self.prev_seq = Some(done.seq);
         self.bds.front().is_some_and(|b| b.spec.bd_index == next_bd)
     }
 }

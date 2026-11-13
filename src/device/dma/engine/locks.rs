@@ -3,6 +3,22 @@
 use super::*;
 
 impl DmaEngine {
+    /// A compute MM2S lock port's presentation of this step (made in `submit_lock_requests`)
+    /// was granted by the arbiter: record it. Runs at the start of the channel's step.
+    pub(super) fn absorb_lock_port_grant(&mut self, ch_idx: usize, tile: &Tile) {
+        let now = self.read_clock;
+        let Some((lock_id, _)) = self.channels[ch_idx].lock_port.presentation(now) else {
+            return;
+        };
+        let Some(LockTarget::Own(local)) = self.resolve_lock_id(lock_id) else {
+            return;
+        };
+        if tile.lock_was_granted(self.channel_requestor(ch_idx as u8), local as usize) {
+            let ch = &mut self.channels[ch_idx];
+            ch.lock_port.granted(&mut ch.word_clock, now);
+        }
+    }
+
     /// Map a channel index to a LockRequestor for arbiter submission.
     pub fn channel_requestor(&self, ch_idx: u8) -> crate::device::tile::LockRequestor {
         use crate::device::tile::LockRequestor;
@@ -23,12 +39,29 @@ impl DmaEngine {
     /// arbiter results to determine which operations succeeded.
     pub fn submit_lock_requests(&self, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         for ch_idx in 0..self.channels.len() {
+            // A compute MM2S's acquires come from its lock port, whatever BD the FSM is on.
+            if self.channels[ch_idx].word_clock.is_running() {
+                if let Some((lock_id, value)) =
+                    self.channels[ch_idx].lock_port.presentation(self.read_clock + 1)
+                {
+                    self.submit_acquire_request(lock_id, value, tile, neighbors, ch_idx as u8);
+                }
+                if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { .. }) {
+                    continue;
+                }
+            }
             match &self.channels[ch_idx].fsm {
                 ChannelFsm::AcquiringLock { lock_id, acquired: false, transfer, .. } => {
                     if self.acquire_blocked_by_parked_releases(ch_idx) {
                         continue;
                     }
-                    self.submit_acquire_request(*lock_id, transfer, tile, neighbors, ch_idx as u8);
+                    self.submit_acquire_request(
+                        *lock_id,
+                        transfer.acquire_value,
+                        tile,
+                        neighbors,
+                        ch_idx as u8,
+                    );
                 }
                 ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. }
                     if *cycles_remaining <= 1 =>
@@ -56,7 +89,7 @@ impl DmaEngine {
     fn submit_acquire_request(
         &self,
         lock_id: u8,
-        transfer: &Transfer,
+        acquire_value: i8,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         ch_idx: u8,
@@ -82,7 +115,6 @@ impl DmaEngine {
 
         // Lock::acquire_change's rule (silicon, gen_dma_lock_probe.py): a change >= 0
         // is an equal acquire that leaves the count alone.
-        let acquire_value = transfer.acquire_value;
         let (expected, delta, equal_mode) = if acquire_value < 0 {
             (acquire_value.unsigned_abs(), acquire_value, false)
         } else {

@@ -622,6 +622,7 @@ impl DmaEngine {
         if let Some(from) = word_clock_from {
             let first = self.chain_bd_spec(bd_index, &transfer);
             self.channels[ch_idx].word_clock.start(from, first);
+            self.channels[ch_idx].lock_port.clear();
         }
         let ch = &mut self.channels[ch_idx];
         ch.error_event_reported = false;
@@ -695,6 +696,7 @@ impl DmaEngine {
         ch.egress_gap = 0;
         ch.read_tail = 0;
         ch.word_clock.clear();
+        ch.lock_port.clear();
         ch.access_settles_at = 0;
         ch.access_from = 0;
         ch.egress_backpressure = false;

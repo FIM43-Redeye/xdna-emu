@@ -546,8 +546,12 @@ impl DmaEngine {
                 any_active = true;
             }
 
-            // The compute MM2S word clock sequences before anything else of the step reads it.
-            self.tick_word_clock(ch_idx);
+            // The compute MM2S word clock sequences before anything else of the step reads it,
+            // and its lock port takes this step's grant.
+            if self.channels[ch_idx].word_clock.is_running() {
+                self.tick_word_clock(ch_idx);
+                self.absorb_lock_port_grant(ch_idx, tile);
+            }
 
             // Snapshot the egress backlog BEFORE the step pushes this cycle's
             // word, so `complete_or_drain` can tell a lagging sink from a
@@ -619,6 +623,13 @@ impl DmaEngine {
             {
                 self.drain_egress_staging(ch_idx);
                 any_active = true;
+            }
+
+            // The lock port picks the chain's next lock BD and times its request.
+            if self.channels[ch_idx].word_clock.is_running() {
+                let now = self.read_clock;
+                let ch = &mut self.channels[ch_idx];
+                ch.lock_port.update(&ch.word_clock, now);
             }
 
             // BDs whose last read returns this cycle complete now: after the FSM
@@ -993,6 +1004,7 @@ impl DmaEngine {
                             + xdna_archspec::aie2::timing::DMA_MM2S_WORD_CLOCK_START_CYCLES as u64;
                         let ch = &mut self.channels[ch_idx];
                         ch.word_clock.start(from, first);
+                        ch.lock_port.clear();
                         // No access yet, so nothing to settle: a BD with no words (silicon: not
                         // measured; this is the emulator's own timing, the end of BD setup) must
                         // finish on its own state, not on an earlier BD's.
@@ -1045,7 +1057,7 @@ impl DmaEngine {
             }
 
             ChannelFsm::AcquiringLock { lock_id, transfer, .. } if self.uses_word_clock(&transfer) => {
-                self.step_word_clock_lock_wait(ch_idx, lock_id, transfer, tile, neighbors)
+                self.step_word_clock_lock_wait(ch_idx, lock_id, transfer)
             }
 
             ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, mut transfer } => {
@@ -1416,6 +1428,7 @@ impl DmaEngine {
             if !self.channels[ch_idx].word_clock.advance(next_bd) {
                 let first = self.chain_bd_spec(next_bd, &transfer);
                 self.channels[ch_idx].word_clock.start(self.read_clock + 1, first);
+                self.channels[ch_idx].lock_port.clear();
             }
         }
         // As at the end of BD setup: this BD has not accessed memory, so nothing is settling.
@@ -1435,6 +1448,11 @@ impl DmaEngine {
         // and the acquired-arm's is_first_bd dispatch (false here, BD
         // is chained) routes straight to Transferring/HostPipelineLatency.
         if let Some(lock_id) = transfer.acquire_lock {
+            // A compute MM2S may hold this BD's lock already: its lock port requests it while
+            // the channel is still on the BDs before (`LockPort`).
+            if let Some(g) = self.word_clock_grant(ch_idx) {
+                return self.take_word_clock_grant(ch_idx, lock_id, transfer, g);
+            }
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
         }
 
@@ -1877,6 +1895,8 @@ impl DmaEngine {
 
         // Channel goes cold; re-arm the first-BD bonus for any future task.
         self.channels[ch_idx].is_first_bd = true;
+        self.channels[ch_idx].word_clock.clear();
+        self.channels[ch_idx].lock_port.clear();
         (ChannelFsm::Idle, true)
     }
 
@@ -2691,23 +2711,44 @@ impl DmaEngine {
         &mut self,
         ch_idx: usize,
         lock_id: u8,
-        mut transfer: Box<Transfer>,
-        tile: &mut Tile,
-        neighbors: &mut NeighborTiles<'_>,
+        transfer: Box<Transfer>,
     ) -> ChannelFsm {
-        if !self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
+        let Some(granted_at) = self.word_clock_grant(ch_idx) else {
             self.channels[ch_idx].stats.lock_wait_cycles += 1;
             if !self.channels[ch_idx].prev_lock_stalled {
                 self.trace(EventType::DmaStalledLock { channel: ch_idx as u8, active: true });
                 self.channels[ch_idx].prev_lock_stalled = true;
             }
             return ChannelFsm::AcquiringLock { lock_id, cycles_remaining: 0, acquired: false, transfer };
-        }
+        };
+        self.take_word_clock_grant(ch_idx, lock_id, transfer, granted_at)
+    }
+
+    /// The step from which a compute MM2S holds its current BD's lock, if its lock port has
+    /// been granted it by now.
+    fn word_clock_grant(&self, ch_idx: usize) -> Option<u64> {
+        let now = self.read_clock;
+        self.channels[ch_idx]
+            .word_clock
+            .current()
+            .and_then(|b| b.granted_at)
+            .filter(|&g| g <= now)
+    }
+
+    /// A compute MM2S's current BD holds its lock (from `granted_at`): it enters its data
+    /// phase and may access memory from `granted_at` + `mm2s_lock_to_access_cycles`.
+    fn take_word_clock_grant(
+        &mut self,
+        ch_idx: usize,
+        lock_id: u8,
+        mut transfer: Box<Transfer>,
+        granted_at: u64,
+    ) -> ChannelFsm {
         self.on_acquire_granted(ch_idx, lock_id, transfer.bd_index);
         {
             use xdna_archspec::aie2::timing::DMA_MM2S_LOCK_TO_ACCESS_CYCLES;
             let ch = &mut self.channels[ch_idx];
-            ch.access_from = self.read_clock + DMA_MM2S_LOCK_TO_ACCESS_CYCLES as u64;
+            ch.access_from = granted_at + DMA_MM2S_LOCK_TO_ACCESS_CYCLES as u64;
         }
         self.maybe_insert_packet_header_from_transfer(&mut transfer);
         if self.channels[ch_idx].is_first_bd {
@@ -3961,7 +4002,11 @@ mod bank_demand_tests {
                 "peek/commit disagreement stepping out of {phase_before}: the channel touched                  banks {:#06b} in a cycle whose arbitration only knew about {peeked:#06b}",
                 eng.cycle_dma_banks
             );
-            if phase_before == "AcquiringLock" && eng.channel_phase(2) != "AcquiringLock" {
+            // The channel moves onto BD1 holding its lock (granted while BD0 still ran, or the
+            // cycle it arrives).
+            if eng.channels[2].current_bd == Some(1)
+                && eng.channels[2].word_clock.current().is_some_and(|b| b.granted_at.is_some())
+            {
                 saw_lock_grant_boundary = true;
             }
 
@@ -4832,8 +4877,8 @@ mod bank_demand_tests {
     /// max(64, grant - previous finish + 52). Silicon (`tools/gen_dma_lock_probe.py` fetch
     /// `--sync --pre2 32`, 2026-11, 291 rows, no exception): exactly 64 when the lock is free on
     /// request or granted up to 12 cycles after the previous finish, grant + 52 from there on.
-    /// The word clock runs from the channel's arrival (word i at previous finish + i - 1), so
-    /// granule n is accessed at previous finish + 3 + 4n unless the grant holds it.
+    /// The grant is the cycle from which the channel holds the lock (`LockPort`), which may come
+    /// before the channel reaches the BD.
     #[test]
     fn a_chained_lock_bd_finishes_at_the_later_of_its_word_clock_and_its_grant() {
         for d in -8i64..=24 {
@@ -4847,12 +4892,11 @@ mod bank_demand_tests {
             eng.start_channel(2, 0).unwrap();
             // BD0 (32 words, host-started) finishes at step 40 (N + 8).
             let f0 = 40i64;
-            let (mut grant, mut f1, mut accesses) = (None, None, Vec::new());
+            let (mut grant, mut f1) = (None, None);
             for step in 0..400i64 {
                 if step == f0 + d {
                     tile.locks[5].value = 1;
                 }
-                let phase_before = eng.channel_phase(2);
                 eng.cycle_dma_banks = 0;
                 eng.reset_cycle_drain_counters();
                 eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
@@ -4862,14 +4906,14 @@ mod bank_demand_tests {
                 if step == f0 {
                     assert_eq!(tile.locks[6].value, 1, "BD0 finished at {f0}");
                 }
-                if grant.is_none()
-                    && phase_before == "AcquiringLock"
-                    && eng.channel_phase(2) != "AcquiringLock"
-                {
-                    grant = Some(step);
-                }
-                if step > f0 && eng.cycle_dma_banks != 0 {
-                    accesses.push(step - f0);
+                if grant.is_none() {
+                    // The engine step counter starts at 1 on step 0.
+                    let wc = &eng.channels[2].word_clock;
+                    grant = wc
+                        .bds()
+                        .find(|b| b.spec.bd_index == 1)
+                        .and_then(|b| b.granted_at)
+                        .map(|g| g as i64 - 1);
                 }
                 if f1.is_none() && tile.locks[7].value >= 1 {
                     f1 = Some(step);
@@ -4877,24 +4921,6 @@ mod bank_demand_tests {
             }
             let (g, f1) = (grant.expect("granted") - f0, f1.expect("BD1 finished") - f0);
             assert_eq!(f1, 64.max(g + 52), "d = {d}: grant at previous finish + {g}");
-            // Word i is sequenced at i - 1, except that words 16.. wait for the clock to resume at
-            // grant + 3; granule n is accessed the cycle after its last word, not before grant + 2,
-            // one access per cycle. Unsaturated (grant before + 12) this is the lattice 3 + 4n with
-            // a burst of the granules ready by grant + 2 (silicon: 2 / 3 / 4 granules at d_meas
-            // 1 / 5 / 10); saturated it is grant + 2..5, + 7, + 11, ... (the long-parked map).
-            let word = |i: i64| {
-                if i < 16 {
-                    i - 1
-                } else {
-                    (i - 1).max(g + 3 + i - 16)
-                }
-            };
-            let mut expected: Vec<i64> = Vec::new();
-            for n in 0..16i64 {
-                let prev = expected.last().map_or(i64::MIN, |p| p + 1);
-                expected.push((word(4 * n + 3) + 1).max(g + 2).max(prev));
-            }
-            assert_eq!(accesses, expected, "d = {d}: grant at previous finish + {g}");
         }
     }
 

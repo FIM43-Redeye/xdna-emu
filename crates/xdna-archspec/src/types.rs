@@ -1499,6 +1499,21 @@ pub struct DmaTiming {
     /// `prewake-run` finishes at grant + 3 the same way.
     pub mm2s_lock_to_access_cycles: u8,
 
+    /// Compute-tile MM2S lock request: cycles after the grant of the channel's previous
+    /// lock-acquiring BD before the next lock BD is requested (Q >= g + 3): 3. Fitted (NPU1,
+    /// 2026-11, `tools/gen_dma_lock_probe.py` sync and chain families, see `LockPort` in the
+    /// emulator): a free lock behind a 4-word lock BD is granted 3 cycles after that BD's grant.
+    pub mm2s_lock_request_after_grant_cycles: u8,
+
+    /// Compute-tile MM2S lock request trigger: the next BD's lock is requested
+    /// `mm2s_lock_request_trigger_latency_cycles` after the clock sequences this many words
+    /// before the end of the BD before it (its third-to-last word; its first if it is
+    /// shorter): 3. Fitted, same data.
+    pub mm2s_lock_request_trigger_words: u8,
+
+    /// Cycles from the trigger word's sequencing to the lock request: 3. Fitted, same data.
+    pub mm2s_lock_request_trigger_latency_cycles: u8,
+
     /// Words a **shim** S2MM channel holds in front of its parked or running BD: the ingress
     /// the channel opens once it has a task, on top of the 8 words the stream path itself
     /// holds (local slave 4 + master 4).

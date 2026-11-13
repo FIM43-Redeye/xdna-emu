@@ -597,6 +597,9 @@ pub struct ChannelContext {
     /// Compute-tile MM2S word clock (`DmaEngine::word_clock_mm2s_cycle`): the granules it has
     /// sequenced ahead of the bank accesses, across the BD chain. Empty on every other channel.
     pub word_clock: super::word_clock::WordClock,
+    /// Compute-tile MM2S lock port (`LockPort`): when the chain's next lock BD is requested and
+    /// granted. Idle on every other channel.
+    pub lock_port: super::lock_port::LockPort,
     /// Engine step at which the current BD's last bank access has settled and FINISHED_BD may
     /// be stamped (last access + `mm2s_access_to_finish_cycles`).
     pub access_settles_at: u64,
@@ -648,6 +651,7 @@ impl ChannelContext {
             egress_gap: 0,
             read_tail: 0,
             word_clock: Default::default(),
+            lock_port: Default::default(),
             access_settles_at: 0,
             access_from: 0,
             egress_backpressure: false,
@@ -798,6 +802,7 @@ impl ChannelContext {
         self.egress_gap = 0;
         self.read_tail = 0;
         self.word_clock.clear();
+        self.lock_port.clear();
         self.access_settles_at = 0;
         self.access_from = 0;
         self.egress_backpressure = false;

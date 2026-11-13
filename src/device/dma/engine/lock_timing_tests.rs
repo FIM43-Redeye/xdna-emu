@@ -249,6 +249,9 @@ impl Releaser {
 struct ChainObs {
     /// The waiting BD's grant: its LOCK_0_ACQ_GE + 1.
     grant: i64,
+    /// The cycle from which the channel holds the waiting BD's lock (silicon: STALLED_LOCK
+    /// falls, or ACQ_GE + 1 when it never rose).
+    held: i64,
     /// Every STALLED_LOCK interval after the head's.
     stalls: Vec<(i64, i64)>,
     /// Every FINISHED_BD, the head's included.
@@ -297,6 +300,7 @@ fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> Cha
         assert!(rig.cycle < 1000, "the head was never granted");
     }
     let g0 = rig.trace.stalls[0].1 as i64 + 1;
+    let mut held = None;
     for _ in 0..400 {
         let next = (rig.cycle + 1) as i64 - g0;
         rig.step_with(
@@ -309,6 +313,14 @@ fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> Cha
                 b.apply(t, LOCK_B, next, false);
             },
         );
+        let wc = &rig.eng.channels[2].word_clock;
+        if let Some(g) = wc
+            .bds()
+            .find(|bd| bd.spec.acquire.is_some_and(|(l, _)| l == LOCK_A))
+            .and_then(|bd| bd.granted_at)
+        {
+            held.get_or_insert(g as i64 - g0);
+        }
     }
     let rel = |c: u64| c as i64 - g0;
     let grant = rig
@@ -320,6 +332,7 @@ fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> Cha
         .expect("A granted");
     ChainObs {
         grant,
+        held: held.expect("A held"),
         stalls: rig.trace.stalls[1..].iter().map(|&(a, b)| (rel(a), rel(b))).collect(),
         finishes: rig.trace.finishes.iter().map(|&c| rel(c)).collect(),
     }
@@ -372,4 +385,37 @@ fn the_word_clock_puts_long_head_and_short_tail_finishes_on_silicons_cycle() {
         let obs = run_chain(head, &[Mid::Plain(mid)], big, Releaser::Free, Releaser::WriteAt(grant));
         assert_eq!(obs.finishes, finishes, "head {head}, mid {mid}, waiting {big}, grant g0 + {grant}");
     }
+}
+/// The lock request law (`LockPort`): a BD's lock is requested at Q = max(g + 3, T + 3), g the
+/// grant of the channel's previous lock BD, T the cycle the BD before it has its third-to-last
+/// word sequenced -- while the channel is still on the BDs before. Silicon (NPU1, 2026-11,
+/// `tools/gen_dma_lock_probe.py` chain family b1 / b3 / b4 and the sync family; g0 frame) with
+/// the waiting BD's lock free on request: it is granted at Q, and every FINISHED_BD follows.
+/// The mid lock B is set where silicon granted it (g1 = g0 + 16). Rows: a 4-, 2- or 16-word
+/// lock BD, then a lock-free BD of N words (b1n13: the grant at g1 + 3 comes 5 cycles before
+/// the 13-word BD finishes; N = 15: g1 + 6; N = 20: g1 + 11; N = 32: g1 + 23).
+#[test]
+fn a_free_lock_is_granted_at_its_request_while_the_channel_is_on_the_bds_before() {
+    #[rustfmt::skip]
+    let rows: &[(&str, i64, &[i64])] = &[
+        // mids, grant of A (silicon), FINISHED_BD (silicon)
+        ("4c", 19, &[3, 19, 72]),               // b1n00 q00_00 p2
+        ("4c 13", 19, &[3, 19, 24, 86]),        // b1n13 q00_00 p1
+        ("4c 15", 22, &[3, 19, 24, 87]),        // b1n15 q00_00 p1
+        ("4c 20", 27, &[3, 19, 28, 92]),        // b1n20 q00_01 p1
+        ("4c 32", 39, &[3, 19, 40, 104]),       // b1n32 q00_00 p1
+        ("2c 11", 19, &[3, 19, 23, 84]),        // b4p02n11 q00_00 p1
+        ("2c 14", 19, &[3, 19, 24, 86]),        // b4p02n14 q00_00 p2
+        ("16c 8", 27, &[3, 22, 28, 92]),        // b3p16n08 q00_00 p2
+    ];
+    for &(spec, grant, finishes) in rows {
+        let obs = run_chain(4, &mids(spec), 64, Releaser::WriteAt(16), Releaser::Free);
+        assert_eq!((obs.held, obs.finishes.as_slice()), (grant, finishes), "{spec}");
+    }
+    // Sync family, the lock free long before: lsfree is granted at g0 + 3 (its one-cycle
+    // STALLED_LOCK at g0 + 2); ltfree (N = 32) shows no stall, its grant is not observed.
+    let obs = run_chain(4, &[], 64, Releaser::Free, Releaser::Free);
+    assert_eq!((obs.held, obs.finishes.as_slice()), (3, &[3i64, 56][..]), "lsfree");
+    let obs = run_chain(4, &[Mid::Plain(32)], 64, Releaser::Free, Releaser::Free);
+    assert_eq!(obs.finishes, [3, 24, 88], "ltfree");
 }

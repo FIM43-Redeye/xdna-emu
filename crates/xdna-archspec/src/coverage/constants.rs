@@ -192,6 +192,12 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             first access grant + 2, none at + 0 / + 1; prewake dummy BD FINISHED grant + 3",
             "Compute tiles; the grant itself (release + 2 or + 3 on silicon) is a separate latency. Assumes a conflict \
             event is stamped on the access cycle."),
+        unit("dma.mm2s_lock_request_after_grant_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). Q >= the previous lock BD's grant + 3; each value off by one breaks most chain rows. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_request_trigger_words", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). The request follows the sequencing of the previous BD's third-to-last word; 2 or 4 differ on about 50 rows only, the weakest-pinned constant with the release slot. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
+        unit("dma.mm2s_lock_request_trigger_latency_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted (lock request and grant law). Q >= trigger word + 3. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync and chain families, every design with at most four MM2S BDs: 2348 of 2348 rows, about 2102 of them the rows the rule was fitted to and 246 predicted before they were measured)."),
         measured("dma.bank_arbiter_period", "NPU1 2026-11 (tools/gen_dma_lock_probe.py arb and ring cases, 222 rows, \
             every row as predicted before the run): a core camping on a bank lets a waiting DMA channel in once in every \
             5 served cycles, never after more than 4 refusals; the producer probe's dense-store captures (45 transfers) \
