@@ -2739,6 +2739,482 @@ def cmd_sl_table(args) -> int:
     return 0
 
 
+# -- memtile-fed lock-held S2MM probe (mq-*): the parked memtile feed's restart after a quiet stretch -------
+#
+# objectfifo_turns_walkers' S2MM finishes one cycle later (grant + 56 instead of + 55) exactly in the iterations
+# whose memtile had been quiet for hundreds of cycles before the parked memtile MM2S resumed, and its bank stamps
+# put granule 6 (words 24..27, parked in the switch before the release) one cycle later there too. Two causes are
+# left: a charge in the memtile stream switch (its adaptive gate: held words not keeping it awake), or a
+# compute-side one whose echo is the memtile's late restart. This probe separates them on one design whose only
+# difference between variants is memtile activity at the release.
+#
+#   memtile MM2S 0: lock-free 64-word BDs (`feed`, then MQ_TRAILING_BDS of `trail`, initialised) into compute S2MM 0,
+#           started at boot: it parks about 30 words in the path and waits.
+#   compute S2MM 0: a 64-word BD into `sdst` (banks 0/1: granule g in physical bank g & 1) acquiring lock A (lock 0,
+#           init 0) and releasing B, then MQ_TRAILING_BDS 64-word BDs into `tdst`, each acquiring A and releasing C.
+#   core:   wait on go, settle MQ_SETTLE_ITERS loop iterations, `event #0`, MQ_D nops, release A; in the k cases one
+#           load from `ldbuf` (bank 0, granule 6's bank) k nops later; wait on B; release A RING_FILL_RELEASES times
+#           (the first MQ_TRAILING_BDS grant the trailing BDs) and run a long tail, so every trace unit fills packets well past
+#           the measured BD.
+#   fill:   none (q); or shim MM2S 0 -> memtile S2MM 1, one lock-free task of L words into `fbuf`, pushed by the
+#           runtime sequence just before it sets go: m runs MQ_M_FILL_WORDS words, through the release and the
+#           restart; t ends T cycles before the feed's restart (L = MQ_FILL_END_AT_RESUME - T, calibrated on the
+#           emulator; on silicon the realised quiet stretch is read from the memtile trace per run).
+#   sequence: (the fill push,) set go, FETCH_PAD_WRITES pad writes, (the wait on the fill task).
+# Traced: the compute memory module (release, S2MM stall / finish / starvation / memory backpressure, banks 0 and 1,
+# the S2MM's release of B), the core (event #0, lock stall), the memtile (the feed's DMA slave and North master
+# running / stalled, the fill's DMA master, the trace route's South master, MM2S 0 backpressure and finishes, the
+# fill channel's finish). Quantities are read within one timer: the finish, granule contacts and starvation on the
+# compute memory module's, the quiet stretch (the fill's / any other traced port's last beat to the feed's first
+# memtile beat) on the memtile's. The feed's restart against the grant needs both timers (reported, not decisive).
+# Why it cannot hang: the MM2S is lock-free and sends exactly the words the S2MM BDs take (64 each); the core waits only
+# on go (set by the sequence) and on B (released after the measured BD's 64 words); the fill is lock-free on both ends
+# and the sequence waits for it after the go lock, so it is always drained.
+
+MQ_D = 12                          # nops between `event #0` and the release of A
+MQ_SETTLE_ITERS = 330              # loop iterations (about 9 cycles each) between go and `event #0`: the fill has
+                                   # started by the release (emulator: about 1570 cycles after go)
+MQ_KS = (19, 20, 21)               # granule 6's write (bank 0) at grant + 18 / + 19, at either grant phase
+MQ_TS = (8, 64, 112, 120, 128, 136, 144, 192, 256)
+MQ_M_FILL_WORDS = 16384            # m: flows through the release and the restart, whenever it starts within
+                                   # about 13000 cycles before the release
+MQ_FILL_END_AT_RESUME = 1438       # emulator calibration (L = 888 left 550 quiet cycles): a fill of this many
+                                   # words ends at the feed's first memtile beat
+MQ_MAX_K = 64
+MQ_SDST_ADDR = RING_SDST_ADDR      # banks 0/1
+MQ_TDST_ADDR = 0x8000              # bank 2: the trailing BD meets nothing the core touches
+MQ_LOCK_C = 3
+MQ_TRAILING_BDS = 4                # 64-word transfers after the measured BD, one per fill release: they keep the
+                                   # memtile and memory-module units writing packets past the measured frames
+MQ_VARIANTS = ("q", "m", "t")
+MQ_MEMMOD_EVENTS = ["LOCK_0_REL", "LOCK_1_REL", "DMA_S2MM_0_STALLED_LOCK", "DMA_S2MM_0_FINISHED_BD",
+                    "DMA_S2MM_0_STREAM_STARVATION", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
+                    "DMA_S2MM_0_MEMORY_BACKPRESSURE"]
+MQ_MEMTILE_EVENTS = ["PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_STALLED_1", "PORT_RUNNING_2", "PORT_RUNNING_3",
+                     "DMA_MM2S_SEL0_STREAM_BACKPRESSURE", "DMA_MM2S_SEL0_FINISHED_BD", "DMA_S2MM_SEL0_FINISHED_BD"]
+MQ_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
+MQ_DIM_MAX = 1023                  # a task dimension's size field
+
+
+@dataclass(frozen=True)
+class MqCase:
+    kind: str                      # "q" quiet, "m" fill through the restart, "t" fill ending T before it
+    t: int = 0                     # t only: nominal quiet cycles between the fill's end and the restart
+    k: int | None = None           # q / m only: nops between the release and one bank-0 load
+
+    @property
+    def name(self) -> str:
+        if self.kind == "t":
+            return f"mqt{self.t:03d}"
+        return f"mq{self.kind}" + (f"k{self.k}" if self.k is not None else "")
+
+
+def mq_validate(c: MqCase) -> None:
+    if c.kind not in MQ_VARIANTS:
+        raise ValueError(f"kind must be one of {MQ_VARIANTS}")
+    if c.kind == "t":
+        if not 0 < c.t < MQ_FILL_END_AT_RESUME:
+            raise ValueError(f"t must be 1..{MQ_FILL_END_AT_RESUME - 1}")
+        if c.k is not None:
+            raise ValueError("the t cases carry no load")
+    elif c.t:
+        raise ValueError("t belongs to the t cases")
+    if c.k is not None and not 0 <= c.k <= MQ_MAX_K:
+        raise ValueError(f"k must be 0..{MQ_MAX_K}")
+
+
+def mq_fill_words(c: MqCase) -> int:
+    return {"q": 0, "m": MQ_M_FILL_WORDS}.get(c.kind, MQ_FILL_END_AT_RESUME - c.t)
+
+
+def mq_fill_dims(words: int) -> tuple[int, int]:
+    """(outer, inner) with outer * inner == words, both within a task dimension's size field."""
+    for inner in range(min(words, MQ_DIM_MAX), 0, -1):
+        if words % inner == 0 and words // inner <= MQ_DIM_MAX:
+            return words // inner, inner
+    raise ValueError(f"{words} words do not fit two task dimensions")
+
+
+def mq_plan() -> list[MqCase]:
+    """17 cases: q and m without a load (the finish and the starvation level), q and m with one bank-0 load at each
+    of MQ_KS (granule 6's write cycle at either grant phase), and the fill ending T cycles before the restart over
+    MQ_TS (the threshold: the decade, then 8-cycle steps around the emulator's 128)."""
+    cases = [MqCase("q"), MqCase("m")]
+    cases += [MqCase(v, k=k) for v in ("q", "m") for k in MQ_KS]
+    cases += [MqCase("t", t) for t in MQ_TS]
+    return cases
+
+
+def mq_core_asm(c: MqCase) -> str:
+    mq_validate(c)
+    n = lp.nops
+    after = [*n(c.k), "  lda r26, [p0, #0]"] if c.k is not None else []
+    fill = []
+    for i in range(RING_FILL_RELEASES):
+        fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(MQ_SETTLE_ITERS, ".Lsettle"), *n(8),
+            "  event #0", *n(MQ_D), f"  rel #{OWN + FETCH_LOCK_A}, r2", *after, *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8), *fill,
+            *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def mq_design_mlir(c: MqCase) -> str:
+    mq_validate(c)
+    w = FETCH_WORDS
+    L = mq_fill_words(c)
+    ld = ", ".join(str(0x0B000000 | j) for j in range(16))
+    feed = ", ".join(str(0x0E000000 | j) for j in range(w))
+    trail = ", ".join(str(0x0D000000 | j) for j in range(w))
+    pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
+                    for _ in range(FETCH_PAD_WRITES))
+    if L:
+        outer, inner = mq_fill_dims(L)
+        fill_decl = (f"    %fbuf = aie.buffer(%t01) {{sym_name = \"fbuf\"}} : memref<{L}xi32>\n"
+                     f"    aie.flow(%t00, DMA : 0, %t01, DMA : 1)\n"
+                     f"    aie.shim_dma_allocation @fill (%t00, MM2S, 0)\n")
+        fill_dma = (f"    ^s1:\n      %m1 = aie.dma_start(S2MM, 1, ^w, ^end)\n"
+                    f"    ^w:\n      aie.dma_bd(%fbuf : memref<{L}xi32>)\n      aie.next_bd ^end\n")
+        seq_arg = f"%fill: memref<{L}xi32>"
+        push = (f"      aiex.npu.dma_memcpy_nd(%fill[0, 0, 0, 0][1, 1, {outer}, {inner}][0, 0, {inner}, 1]) "
+                f"{{id = 0 : i64, metadata = @fill, issue_token = true}} : memref<{L}xi32>\n")
+        wait = "      aiex.npu.dma_wait {symbol = @fill}\n"
+        mm2s_next = "^s1"
+    else:
+        fill_decl = fill_dma = push = wait = ""
+        seq_arg = "%dummy: memref<4xi32>"
+        mm2s_next = "^end"
+    nt = MQ_TRAILING_BDS
+    s2mm_trailing = "".join(
+        f"    ^trailing{i}:\n      %cb{i} = arith.constant 1 : i32\n"
+        f"      aie.use_lock(%lA, AcquireGreaterEqual, %cb{i})\n      aie.dma_bd(%tdst : memref<{w}xi32>)\n"
+        f"      aie.use_lock(%lC, Release, %cb{i})\n      aie.next_bd {f'^trailing{i + 1}' if i + 1 < nt else '^end'}\n"
+        for i in range(nt))
+    mm2s_trailing = "".join(
+        f"    ^t{i}:\n      aie.dma_bd(%trail : memref<{w}xi32>)\n      aie.next_bd {f'^t{i + 1}' if i + 1 < nt else '^end'}\n"
+        for i in range(nt))
+    return f"""module {{
+  aie.device(npu1_1col) {{
+    %t00 = aie.tile(0, 0)
+    %t01 = aie.tile(0, 1)
+    %t02 = aie.tile(0, 2)
+    %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
+    %sdst = aie.buffer(%t02) {{address = {MQ_SDST_ADDR} : i32, sym_name = "sdst"}} : memref<{w}xi32>
+    %tdst = aie.buffer(%t02) {{address = {MQ_TDST_ADDR} : i32, sym_name = "tdst"}} : memref<{w}xi32>
+    %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
+    %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
+    %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
+    %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
+    %lC = aie.lock(%t02, {MQ_LOCK_C}) {{init = 0 : i32, sym_name = "lC"}}
+    %feed = aie.buffer(%t01) {{sym_name = "feed", initial_value = dense<[{feed}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+    %trail = aie.buffer(%t01) {{sym_name = "trail", initial_value = dense<[{trail}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+{fill_decl}    aie.flow(%t01, DMA : 0, %t02, DMA : 0)
+    func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
+    aie.core(%t02) {{
+      func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
+      aie.end
+    }}
+    %mem = aie.mem(%t02) {{
+      %s0 = aie.dma_start(S2MM, 0, ^recv, ^end)
+    ^recv:
+      %ca = arith.constant 1 : i32
+      aie.use_lock(%lA, AcquireGreaterEqual, %ca)
+      aie.dma_bd(%sdst : memref<{w}xi32>)
+      aie.use_lock(%lB, Release, %ca)
+      aie.next_bd ^trailing0
+{s2mm_trailing}    ^end:
+      aie.end
+    }}
+    %mt = aie.memtile_dma(%t01) {{
+      %m0 = aie.dma_start(MM2S, 0, ^f1, {mm2s_next})
+    ^f1:
+      aie.dma_bd(%feed : memref<{w}xi32>)
+      aie.next_bd ^t0
+{mm2s_trailing}{fill_dma}    ^end:
+      aie.end
+    }}
+    aie.runtime_sequence({seq_arg}) {{
+      %c_zero = arith.constant 0 : i32
+      %c_one = arith.constant 1 : i32
+{push}      aiex.set_lock(%lGo, %c_one)
+{pad}
+{wait}    }}
+  }}
+}}
+"""
+
+
+def mq_routes(text: str) -> dict:
+    """The memtile ports the probe traces, from the routed design (input_with_addresses.mlir): the North master
+    carrying the feed (DMA 0 -> North n), the South slave the fill enters by (South s -> DMA 1; None without a
+    fill), and the South master carrying the compute tile's trace packets through the memtile (the masterset its
+    North packet rule selects; the memtile's own trace has its own masterset and is quiet while the memtile is)."""
+    import re
+    m = re.search(r"aie\.switchbox\(%mem_tile_\d+_1\)\s*\{(.*?)\n\s*\}\s*(?:loc\([^)]*\)\s*)?\n", text, re.S)
+    body = m.group(1) if m else ""
+    feed = re.search(r"connect<DMA : 0, North : (\d+)>", body)
+    fill = re.search(r"connect<South : (\d+), DMA : 1>", body)
+    # the compute tile's trace packets: packet_rules(North : n) { rule(.., .., %amsel) } -> masterset(South : m, %amsel)
+    sets = {name: int(port) for port, name in re.findall(r"masterset\(South : (\d+), (%\w+)\)", body)}
+    north = re.search(r"packet_rules\(North : \d+\)\s*\{\s*aie\.rule\(\d+, \d+, (%\w+)\)", body)
+    trace = sets.get(north.group(1)) if north else None
+    if not feed or trace is None:
+        raise ValueError("the memtile switchbox has no feed route (DMA 0 -> North) or no South master for the "
+                         "compute tile's trace packets")
+    return {"feed_north": int(feed.group(1)), "fill_south": int(fill.group(1)) if fill else None,
+            "trace_south": trace}
+
+
+def mq_inject_args(routes: dict | None) -> list[str]:
+    a = ["--memmod-sweep-events", ",".join(MQ_MEMMOD_EVENTS), "--memmod-sel-locks", f"LOCK_SEL1:{FETCH_LOCK_B}",
+         "--memtile-sweep-events", ",".join(MQ_MEMTILE_EVENTS),
+         "--memtile-sel-channels", "S2MM_SEL0:1,MM2S_SEL0:0",
+         "--core-grounding", FETCH_CORE_GROUNDING, "--core-sweep-events", ",".join(MQ_CORE_EVENTS)]
+    if routes:
+        a += ["--port-slots", f"0=DMA:0:slave,1=North:{routes['feed_north']}:master,2=DMA:1:master,"
+                              f"3=South:{routes['trace_south']}:master"]
+    return a
+
+
+def mq_row(events) -> dict:
+    """One run as numbers. Compute memory module (its own timer): grant after the first LOCK_0_REL, then relative to
+    the grant G the first S2MM FINISHED_BD after the release, STREAM_STARVATION runs (and those starting after
+    G + 2), conflict stamps per bank. Memtile (its own timer): the feed's first beat on its North master and on its
+    DMA slave, and the quiet stretch before the North master's first beat: since the fill's last beat (quiet_fill)
+    and since the last beat of the fill or the trace route (quiet_any)."""
+    mem: dict = {}
+    mt: dict = {}
+    for e in events:
+        if e.row == FETCH_ROW and e.pkt_type == PT_MEM:
+            mem.setdefault(e.name, []).append(e.ts)
+        elif e.row == 1 and e.pkt_type == 3:
+            mt.setdefault(e.name, []).append(e.ts)
+    rels = sorted(set(mem.get("LOCK_0_REL", [])))
+    if not rels:
+        return {"release": None}
+    rel = rels[0]
+    r: dict = {"release": rel, "grant": None, "releases": len(rels), "fin": None, "trail_fin": False,
+               "mm2s_fins": 0, "fill_fins": 0, "starvation": [], "starv_after_g2": [], "conflicts": {0: [], 1: []},
+               "resume": None, "north_first": None, "quiet_fill": None, "quiet_any": None, "quiet_lb": None}
+    for first, last in _runs(mem.get("DMA_S2MM_0_STALLED_LOCK", [])):
+        if first <= rel <= last + 1:
+            r["grant"] = last + 1 - rel
+    if r["grant"] is None:
+        return r
+    G = rel + r["grant"]
+    fins = [t - G for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t > rel]
+    r["fin"] = fins[0] if fins else None
+    r["trail_fin"] = len(fins) == 1 + MQ_TRAILING_BDS
+    r["mm2s_fins"] = len(set(mt.get("DMA_MM2S_SEL0_FINISHED_BD", [])))
+    r["fill_fins"] = len(set(mt.get("DMA_S2MM_SEL0_FINISHED_BD", [])))
+    r["starvation"] = [(a - G, z - G) for a, z in _runs(mem.get("DMA_S2MM_0_STREAM_STARVATION", [])) if z >= rel]
+    r["starv_after_g2"] = [(a, z) for a, z in r["starvation"] if 2 < a <= (r["fin"] if r["fin"] is not None else a)]
+    for bank in (0, 1):
+        r["conflicts"][bank] = [t - G for t in sorted(set(mem.get(f"CONFLICT_DM_BANK_{bank}", []))) if t >= rel]
+    pr0 = sorted(set(mt.get("PORT_RUNNING_0", [])))
+    pr1 = sorted(set(mt.get("PORT_RUNNING_1", [])))
+    if pr0 and pr1:
+        r["resume"], r["north_first"] = pr0[0], pr1[0]
+        f0 = r["north_first"]
+        fill = [t for t in mt.get("PORT_RUNNING_2", []) if t < f0]
+        other = fill + [t for t in mt.get("PORT_RUNNING_3", []) if t < f0]
+        r["quiet_fill"] = f0 - max(fill) - 1 if fill else None
+        r["quiet_any"] = f0 - max(other) - 1 if other else None
+        # with no other beat in the window, the stretch is at least as long as the memtile unit has been tracing
+        r["quiet_lb"] = r["quiet_any"] if other else f0 - min(t for v in mt.values() for t in v)
+    return r
+
+
+def mq_missing(r: dict, fill: bool = False) -> list[str]:
+    """What a run lacks: the release, the grant, the measured BD's finish, every trailing BD's finish (the S2MM task
+    ended), the memtile MM2S's BD finishes (its task ended), the fill's finish when there is one, the core's fill
+    releases (it ended), the memtile feed's beats."""
+    if r.get("release") is None:
+        return ["no LOCK_0_REL"]
+    if r["grant"] is None:
+        return ["grant"]
+    out = []
+    if r["fin"] is None:
+        out.append("no S2MM FINISHED_BD after the release")
+    elif not r["trail_fin"]:
+        out.append("trailing BDs did not all finish")
+    if r.get("mm2s_fins") != 1 + MQ_TRAILING_BDS:
+        out.append(f"memtile MM2S 0 FINISHED_BD x{r.get('mm2s_fins')} (want {1 + MQ_TRAILING_BDS})")
+    if fill and r.get("fill_fins") != 1:
+        out.append(f"fill (memtile S2MM 1) FINISHED_BD x{r.get('fill_fins')} (want 1)")
+    if r["releases"] != 1 + RING_FILL_RELEASES:
+        out.append(f"core did not reach its end (LOCK_0_REL x{r['releases']}, want {1 + RING_FILL_RELEASES})")
+    if r["resume"] is None:
+        out.append("memtile feed beats not traced")
+    return out
+
+
+def format_mq_table(rows) -> str:
+    """rows: (MqCase, run name, mq_row dict). Compute columns relative to the grant (memory-module timer); memtile
+    columns on the memtile timer."""
+    lines = ["case      run      release  grant    S2MM fin  starv after G+2   B0 / B1 conflicts       "
+             "memtile: North first, DMA slave first, quiet fill, quiet any    finish"]
+    for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
+        if r["release"] is None:
+            lines.append(f"{c.name:<9} {run:<8} no LOCK_0_REL event")
+            continue
+        if r["grant"] is None:
+            lines.append(f"{c.name:<9} {run:<8} {r['release']:>7}  no S2MM grant")
+            continue
+        cf = {b: ",".join(f"+{t}" for t in r["conflicts"][b]) or "-" for b in (0, 1)}
+        chk = "finish ok" if not r.get("check") else "finish MISSING " + "; ".join(r["check"])
+        q = lambda v: "-" if v is None else str(v)
+        lines.append(f"{c.name:<9} {run:<8} {r['release']:>7}  grant +{r['grant']:<2} "
+                     f"fin {_num(r['fin']) if r['fin'] is not None else '?':<5} "
+                     f"starv [{_sl_runs(r['starv_after_g2'])}]  B0 [{cf[0]}] B1 [{cf[1]}]  "
+                     f"North {q(r['north_first'])} slave {q(r['resume'])} quiet fill {q(r['quiet_fill'])} "
+                     f"quiet any {q(r['quiet_any']) if r['quiet_any'] is not None else '>=' + q(r['quiet_lb'])}  {chk}")
+    return "\n".join(lines)
+
+
+def mq_selection(args) -> list[MqCase]:
+    return [c for c in mq_plan() if not args.names or c.name in args.names]
+
+
+def _mq_compile(d: Path, c: MqCase, routes: dict | None) -> None:
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *mq_inject_args(routes),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+          cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+
+
+def mq_build_case(c: MqCase, out: Path) -> None:
+    """Two compiles: the first finds the memtile ports the router chose, the second traces them; the routes must
+    come out the same (the port selection is register state, not routing)."""
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(mq_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(mq_design_mlir(c))
+    _mq_compile(d, c, None)
+    routes = mq_routes((d / "input_with_addresses.mlir").read_text())
+    _mq_compile(d, c, routes)
+    again = mq_routes((d / "input_with_addresses.mlir").read_text())
+    if again != routes:
+        raise SystemExit(f"{c.name}: routes changed between compiles: {routes} -> {again}")
+    words = mq_fill_words(c)
+    (d / "case.json").write_text(json.dumps({"case": c.name, "kind": c.kind, "t": c.t, "k": c.k, "mq": True,
+                                             "fill_words": words, "buffer_words": words or 4,
+                                             "routes": routes}) + "\n")
+
+
+def cmd_mq_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in mq_selection(args):
+        mq_build_case(c, out)
+        print("built", c.name)
+    return 0
+
+
+def cmd_mq_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in mq_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_mq_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in mq_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"release": None}))
+                continue
+            r = mq_row(load_level_events(run_dir))
+            r["check"] = mq_missing(r, mq_fill_words(c) > 0)
+            rows.append((c, run, r))
+    print(format_mq_table(rows))
+    return 0
+
+
+def mq_packet_positions(raw: bytes, r: dict, mt_events: dict) -> dict:
+    """Where the deciding frames sit in their trace unit's packet stream. Silicon never writes a buffer's final odd
+    32-byte packet, so a deciding frame is safe only in a packet that another packet of its own stream follows.
+    Per unit: the cycle of the last deciding frame, the packet holding it, how many packets of the unit follow, and
+    the cycles from that frame to the last frame of the unit's next packet (a frame moving by fewer cycles cannot
+    land in the unit's last packet). Compute memory module: the grant, the finish, the conflict stamps, the
+    starvation after the grant. Memtile: the feed's first BD (its first 64 DMA-slave beats). Also the buffer's
+    last packet (the one at risk) and its unit."""
+    from gen_trace_wake_probe import split_packets, completing_frames
+    words = list(struct.unpack(f"<{len(raw) // 4}I", raw))
+    packets = split_packets(words)
+    out: dict = {"packets": len(packets),
+                 "last_packet_unit": (packets[-1]["pkt_type"], packets[-1]["row"]) if packets else None}
+    G = r["release"] + r["grant"]
+    within = lambda t: t <= r["fin"]                         # the measured BD's frames, not the trailing BD's
+    deciding = {1: max([G + r["fin"]] + [G + t for b in (0, 1) for t in r["conflicts"][b] if within(t)]
+                       + [G + z for a, z in r["starvation"] if within(a)]),
+                3: sorted(mt_events.get("PORT_RUNNING_0", []))[63] if len(mt_events.get("PORT_RUNNING_0", [])) >= 64
+                else None}
+    for pkt_type, cyc in deciding.items():
+        done = completing_frames(packets, pkt_type)          # packet order -> cycle of its last frame
+        orders = sorted(done)
+        if cyc is None or not orders:
+            out[pkt_type] = None
+            continue
+        holding = next((o for o in orders if done[o][0] >= cyc), None)
+        if holding is None:
+            out[pkt_type] = {"cycle": cyc, "packet": None, "after": 0, "margin": None}
+            continue
+        after = [o for o in orders if o > holding]
+        out[pkt_type] = {"cycle": cyc, "packet": holding, "after": len(after),
+                         "margin": done[after[0]][0] - cyc if after else None}
+    return out
+
+
+def cmd_mq_packets(args) -> int:
+    out = Path(args.out_dir).resolve()
+    bad = 0
+    print("case      run      units: compute memory module (deciding cycle, packets after, margin) | memtile | "
+          "buffer's last packet's unit")
+    for c in mq_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not (run_dir / "trace_raw.bin").exists():
+                continue
+            ev = list(load_level_events(run_dir))
+            r = mq_row(ev)
+            if mq_missing(r, mq_fill_words(c) > 0):
+                print(f"{c.name:<9} {run:<8} incomplete run: {mq_missing(r, mq_fill_words(c) > 0)}")
+                bad += 1
+                continue
+            mt: dict = {}
+            for e in ev:
+                if e.row == 1 and e.pkt_type == 3:
+                    mt.setdefault(e.name, []).append(e.ts)
+            p = mq_packet_positions((run_dir / "trace_raw.bin").read_bytes(), r, mt)
+            cells = []
+            for u in (1, 3):
+                x = p[u]
+                ok = x is not None and x["after"] >= 1 and (x["margin"] or 0) >= MQ_PACKET_MARGIN
+                bad += not ok
+                cells.append("none" if x is None else
+                             f"{x['cycle']} after {x['after']} margin {x['margin']} {'ok' if ok else 'AT RISK'}")
+            print(f"{c.name:<9} {run:<8} mem: {cells[0]} | memtile: {cells[1]} | last packet unit {p['last_packet_unit']}")
+    return 1 if bad else 0
+
+
+MQ_PACKET_MARGIN = 20              # cycles a deciding frame may move without reaching its unit's last packet
+
+
 # -- refused-access probe (refuse-*): a lock BD after a BD whose accesses a core camp refused -------------
 #
 # Does the grant phase of a lock BD depend on what happened to the BD before it? Chained task on MM2S 0:
@@ -3127,7 +3603,19 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("sl-table", help="lock-held S2MM probe: release -> grant, finish, back-pressure, conflicts")
     st.add_argument("out_dir")
     st.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st):
+    mb = sub.add_parser("mq-build", help="memtile-fed lock-held S2MM probe: build the plan's cases (or --names)")
+    mb.add_argument("out_dir")
+    mr = sub.add_parser("mq-run", help="memtile-fed lock-held S2MM probe: run the built cases to TAG.BACKEND/")
+    mr.add_argument("out_dir")
+    mr.add_argument("tag")
+    mr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    mtb = sub.add_parser("mq-table", help="memtile-fed probe: grant, finish, starvation, conflicts, quiet stretch")
+    mtb.add_argument("out_dir")
+    mtb.add_argument("runs", nargs="+")
+    mp = sub.add_parser("mq-packets", help="memtile-fed probe: each unit's deciding frames against its last packet")
+    mp.add_argument("out_dir")
+    mp.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     return ap
 
@@ -3139,6 +3627,9 @@ def main(argv=None) -> int:
         return CHAIN_COMMANDS[args.cmd](args)
     if args.cmd.startswith("sl-"):
         return {"sl-build": cmd_sl_build, "sl-run": cmd_sl_run, "sl-table": cmd_sl_table}[args.cmd](args)
+    if args.cmd.startswith("mq-"):
+        return {"mq-build": cmd_mq_build, "mq-run": cmd_mq_run, "mq-table": cmd_mq_table,
+                "mq-packets": cmd_mq_packets}[args.cmd](args)
     if args.cmd.startswith("refuse-"):
         return {"refuse-build": cmd_refuse_build, "refuse-run": cmd_refuse_run,
                 "refuse-table": cmd_refuse_table}[args.cmd](args)

@@ -1823,3 +1823,197 @@ def test_sl_row_reads_the_channel_it_is_given_and_reports_the_trace_tail():
     assert r["tail"] > 0 and g.sl_missing(r, sl()) == []
     early = [x for x in e if not (x.name == "LOCK_0_REL" and x.ts > 1000)] + [ev("LOCK_0_REL", 1005)]
     assert any("trace ends" in m for m in g.sl_missing(g.sl_row(early), sl()))
+
+
+# -- memtile-fed lock-held S2MM probe (mq-*): the parked memtile feed's restart after a quiet stretch ------
+
+def mq(kind="q", t=0, k=None):
+    return g.MqCase(kind=kind, t=t, k=k)
+
+
+def test_mq_plan_is_the_specified_seventeen_cases_with_distinct_names():
+    plan = g.mq_plan()
+    names = [c.name for c in plan]
+    assert len(plan) == 17 and len(set(names)) == 17
+    assert {"mqq", "mqm"} <= set(names)
+    assert {f"mq{v}k{k}" for v in "qm" for k in g.MQ_KS} <= set(names)
+    assert {f"mqt{t:03d}" for t in g.MQ_TS} <= set(names)
+    assert not any(n.startswith(("sl", "rf", "rg")) for n in names)
+    assert mq("t", 8).name == "mqt008" and mq("m", k=20).name == "mqmk20"
+
+
+def test_mq_fill_lengths_follow_the_variant():
+    assert g.mq_fill_words(mq("q")) == 0
+    assert g.mq_fill_words(mq("q", k=19)) == 0
+    assert g.mq_fill_words(mq("m")) == g.MQ_M_FILL_WORDS
+    # a longer quiet stretch is a shorter fill, one word a cycle
+    assert g.mq_fill_words(mq("t", 8)) - g.mq_fill_words(mq("t", 64)) == 56
+    assert g.mq_fill_words(mq("t", 8)) == g.MQ_FILL_END_AT_RESUME - 8
+    for c in g.mq_plan():
+        assert 0 <= g.mq_fill_words(c) <= g.MQ_M_FILL_WORDS
+
+
+def test_mq_rejects_out_of_range():
+    for c in (mq("x"), mq("t", 0), mq("t", g.MQ_FILL_END_AT_RESUME), mq("q", t=8), mq("q", k=-1),
+              mq("q", k=65), mq("t", 64, k=20)):
+        with pytest.raises(ValueError):
+            g.mq_validate(c)
+    g.mq_validate(mq("m", k=21))
+
+
+def test_mq_core_waits_for_go_settles_releases_a_then_one_bank0_load_k_nops_later():
+    body = bundles_of(g.mq_core_asm(mq("m", k=20)))
+    rel = [i for i, b in enumerate(body) if b.startswith(f"rel #{g.OWN + g.FETCH_LOCK_A}")]
+    ev0 = body.index("event #0")
+    assert rel[0] == ev0 + g.MQ_D + 1                         # d nops after event #0
+    load = body.index("lda r26, [p0, #0]")                    # bank 0: granule 6's bank
+    assert load == rel[0] + 20 + 1
+    assert body.index(f"acq #{g.OWN + g.FETCH_LOCK_GO}, r3") < ev0
+    assert any(f"acq #{g.OWN + g.FETCH_LOCK_B}" in b for b in body[load:])
+    assert len(rel) == 1 + g.RING_FILL_RELEASES               # the first fill releases grant the trailing BDs
+    assert "lda r26, [p0" not in g.mq_core_asm(mq("q"))
+    assert g.mq_core_asm(mq("q")).count(".Lsettle") >= 1
+
+
+def test_mq_design_q_has_no_fill_and_m_fills_memtile_s2mm_1_from_the_shim():
+    q, m = g.mq_design_mlir(mq("q")), g.mq_design_mlir(mq("m"))
+    for t in (q, m):
+        assert "aie.flow(%t01, DMA : 0, %t02, DMA : 0)" in t                 # the feed
+        assert "aie.memtile_dma(%t01)" in t and "aie.dma_start(MM2S, 0, ^f1" in t
+        assert "aie.dma_bd(%feed : memref<64xi32>)" in t
+        assert "aie.use_lock(%lA, AcquireGreaterEqual" in t and "aiex.set_lock(%lGo" in t
+        assert t.count("aie.dma_bd(%sdst : memref<64xi32>)") == 1
+        # every trailing BD the S2MM takes, the MM2S sends: no word left over, no BD left waiting for one
+        nt = g.MQ_TRAILING_BDS
+        assert t.count("aie.dma_bd(%tdst : memref<64xi32>)") == nt == t.count("aie.dma_bd(%trail : memref<64xi32>)")
+        assert t.count("aie.use_lock(%lA, AcquireGreaterEqual") == 1 + nt <= g.RING_FILL_RELEASES + 1
+    assert "DMA : 1)" not in q and "shim_dma_allocation" not in q and "memref<4xi32>" in q
+    n = g.MQ_M_FILL_WORDS
+    assert "aie.flow(%t00, DMA : 0, %t01, DMA : 1)" in m
+    assert "aie.shim_dma_allocation @fill (%t00, MM2S, 0)" in m
+    assert f"aie.dma_bd(%fbuf : memref<{n}xi32>)" in m and "aie.dma_start(S2MM, 1, ^w" in m
+    assert f"runtime_sequence(%fill: memref<{n}xi32>)" in m
+    assert "issue_token = true" in m and "aiex.npu.dma_wait {symbol = @fill}" in m
+    # the fill is pushed before the go lock, and waited for after the pad writes
+    assert m.index("dma_memcpy_nd") < m.index("aiex.set_lock(%lGo") < m.index("dma_wait")
+
+
+def test_mq_fill_task_dims_cover_exactly_its_words():
+    for c in g.mq_plan():
+        w = g.mq_fill_words(c)
+        if not w:
+            continue
+        outer, inner = g.mq_fill_dims(w)
+        assert outer * inner == w and inner <= 1023 and outer <= 1023
+        assert f"[1, 1, {outer}, {inner}][0, 0, {inner}, 1]" in g.mq_design_mlir(c)
+
+
+def test_mq_routes_read_the_feed_and_trace_ports_from_the_routed_design():
+    text = """
+    %switchbox_0_1 = aie.switchbox(%mem_tile_0_1) {
+      aie.connect<DMA : 0, North : 1> loc(#loc42)
+      aie.connect<South : 4, DMA : 1> loc(#loc43)
+      %0 = aie.amsel<0> (0)
+      %1 = aie.amsel<1> (0)
+      %2 = aie.masterset(South : 0, %1) loc(#loc5)
+      %3 = aie.masterset(South : 3, %0) loc(#loc5)
+      aie.packet_rules(North : 3) {
+        aie.rule(29, 1, %0) loc(#loc5)
+      }
+      aie.packet_rules(Trace : 0) {
+        aie.rule(31, 2, %1) loc(#loc5)
+      }
+    }
+    %switchbox_0_2 = aie.switchbox(%tile_0_2) {
+      aie.connect<South : 1, DMA : 0> loc(#loc42)
+    }"""
+    assert g.mq_routes(text) == {"feed_north": 1, "fill_south": 4, "trace_south": 3}    # not the memtile's own
+    with pytest.raises(ValueError):
+        g.mq_routes("%switchbox_0_1 = aie.switchbox(%mem_tile_0_1) {\n}")
+
+
+def test_mq_inject_args_name_the_ports_and_fit_the_slots():
+    routes = {"feed_north": 1, "fill_south": 4, "trace_south": 0}
+    a = g.mq_inject_args(routes)
+    mt = a[a.index("--memtile-sweep-events") + 1].split(",")
+    assert len(mt) == 8 and mt[:5] == ["PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_STALLED_1", "PORT_RUNNING_2",
+                                       "PORT_RUNNING_3"]
+    assert a[a.index("--port-slots") + 1] == "0=DMA:0:slave,1=North:1:master,2=DMA:1:master,3=South:0:master"
+    assert "S2MM_SEL0:1" in a[a.index("--memtile-sel-channels") + 1]
+    mm = a[a.index("--memmod-sweep-events") + 1].split(",")
+    assert len(mm) == g.MEMMOD_TRACE_SLOTS and mm[0] == "LOCK_0_REL"
+    assert {"DMA_S2MM_0_STREAM_STARVATION", "CONFLICT_DM_BANK_0", "DMA_S2MM_0_FINISHED_BD"} <= set(mm)
+    assert a[a.index("--memmod-sel-locks") + 1] == "LOCK_SEL1:1"
+    pytest.importorskip("aie.utils.trace.events")
+    for name in mm:
+        g._check_memmod_event_name(name)
+
+
+def mq_synthetic(rel=5000, grant_after=3, fin=55, starv=((0, 0),), conflicts=(), resume=200, fill_end=None,
+                 fills=g.RING_FILL_RELEASES):
+    """Compute-tile events on one timer (rel..), memtile events on another (resume.. on the memtile timer)."""
+    G = rel + grant_after
+    e = held("DMA_S2MM_0_STALLED_LOCK", 100, G - 1)
+    e += [ev("LOCK_0_REL", rel)] + [ev("LOCK_0_REL", rel + 600 + 40 * i) for i in range(fills)]
+    e += [ev("DMA_S2MM_0_FINISHED_BD", G + fin)]
+    e += [ev("DMA_S2MM_0_FINISHED_BD", G + 1500 + 200 * i) for i in range(g.MQ_TRAILING_BDS)]
+    for a, z in starv:
+        e += held("DMA_S2MM_0_STREAM_STARVATION", G + a, G + z)
+    for bank, at in conflicts:
+        e.append(ev(f"CONFLICT_DM_BANK_{bank}", G + at))
+    mt = dict(pkt=3, row=1)
+    e += held("PORT_RUNNING_1", resume - 1, resume + 62, **mt) + held("PORT_RUNNING_0", resume, resume + 33, **mt)
+    e += held("PORT_RUNNING_0", resume + 35, resume + 63, **mt)
+    e += held("PORT_RUNNING_0", resume + 900, resume + 963, **mt)          # the trailing BD, much later
+    e += held("PORT_RUNNING_3", resume - 400, resume - 393, **mt)         # a trace packet crossing
+    e += [ev("DMA_MM2S_SEL0_FINISHED_BD", resume + 70 + 200 * i, **mt) for i in range(1 + g.MQ_TRAILING_BDS)]
+    if fill_end is not None:
+        e += held("PORT_RUNNING_2", fill_end - 300, fill_end, **mt)
+        e += [ev("DMA_S2MM_SEL0_FINISHED_BD", fill_end + 1, **mt)]
+    return e
+
+
+def test_mq_row_compute_numbers_relative_to_the_grant_and_memtile_numbers_on_their_own_timer():
+    r = g.mq_row(mq_synthetic(fin=56, starv=((0, 0), (20, 21)), conflicts=[(0, 19)], fill_end=150))
+    assert r["release"] == 5000 and r["grant"] == 3 and r["fin"] == 56
+    assert r["starvation"] == [(0, 0), (20, 21)] and r["starv_after_g2"] == [(20, 21)]
+    assert r["conflicts"] == {0: [19], 1: []}
+    assert r["resume"] == 200 and r["north_first"] == 199
+    # quiet stretches end at the feed's first memtile beat (North master, 199): fill beats 151..198 absent
+    assert r["quiet_fill"] == 48 and r["quiet_any"] == 48           # the trace packet ended long before
+    assert g.mq_missing(r, fill=True) == []
+    q = g.mq_row(mq_synthetic())
+    assert q["quiet_fill"] is None and q["quiet_any"] == 199 - (200 - 393) - 1 == q["quiet_lb"]
+    lone = g.mq_row([x for x in mq_synthetic() if x.name != "PORT_RUNNING_3"])
+    assert lone["quiet_any"] is None and lone["quiet_lb"] == 0      # the North master's own first beat starts it
+
+
+def test_mq_missing_flags_an_absent_grant_an_unfinished_bd_and_an_unfinished_core():
+    assert g.mq_missing(g.mq_row([])) == ["no LOCK_0_REL"]
+    e = [x for x in mq_synthetic() if x.name != "DMA_S2MM_0_STALLED_LOCK"]
+    assert "grant" in g.mq_missing(g.mq_row(e))
+    e = [x for x in mq_synthetic() if not (x.name == "DMA_S2MM_0_FINISHED_BD" and x.ts > 6400)]
+    assert any("trailing" in m for m in g.mq_missing(g.mq_row(e)))
+    assert any("core" in m for m in g.mq_missing(g.mq_row(mq_synthetic(fills=3))))
+    e = [x for x in mq_synthetic() if x.name != "PORT_RUNNING_0"]
+    assert any("memtile feed" in m for m in g.mq_missing(g.mq_row(e)))
+    e = [x for x in mq_synthetic() if not (x.name == "DMA_MM2S_SEL0_FINISHED_BD" and x.ts > 500)]
+    assert any("memtile MM2S 0" in m for m in g.mq_missing(g.mq_row(e)))
+    assert g.mq_missing(g.mq_row(mq_synthetic(fill_end=150)), fill=True) == []
+    assert any("fill" in m for m in g.mq_missing(g.mq_row(mq_synthetic()), fill=True))
+
+
+def test_format_mq_table_has_the_decided_columns():
+    r = g.mq_row(mq_synthetic(fin=56, conflicts=[(0, 19)], fill_end=150))
+    r["check"] = g.mq_missing(r)
+    line = [ln for ln in g.format_mq_table([(mq("t", 64), "e1.emu", r)]).splitlines() if ln.startswith("mqt064")][0]
+    for want in ("e1.emu", "grant +3", "fin +56", "B0 [+19]", "quiet fill 48", "finish ok"):
+        assert want in line
+
+
+def test_cli_has_the_mq_subcommands():
+    p = g.build_parser()
+    assert p.parse_args(["mq-build", "d", "--names", "mqq"]).names == ["mqq"]
+    assert p.parse_args(["mq-run", "d", "e1", "--backend", "emu"]).backend == "emu"
+    assert p.parse_args(["mq-table", "d", "e1.emu"]).runs == ["e1.emu"]
+    assert p.parse_args(["mq-packets", "d", "e1.emu"]).runs == ["e1.emu"]
