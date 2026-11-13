@@ -142,6 +142,7 @@ from gen_lock_stall_probe import LOCK_SETTLE_BUNDLES, TS_PAIRS, _frame, _ts  # n
 
 LOCK_A, LOCK_F, LOCK_C, LOCK_D, LOCK_E = 14, 13, 12, 11, 10
 OWN = 48                           # raw ID base of the core's own memory module
+NORTH = 32                         # raw ID base of the memory module of the tile above (mlir-aie getLockLocalBaseIndex)
 WORDS = 16
 N = "  nop"
 
@@ -1365,7 +1366,9 @@ def cmd_sync_table(args) -> int:
 # are equal: the trace encoder folds a run of equal (event, delta) frames into one frame and a Repeat. Nothing acquires A then; its count stays far below the
 # 6-bit limit (at most CHAIN_MAX_FILL = 48).
 # With `receiver = "north"` the stream goes to the S2MM of tile (0,3) (one hop north, its own memory module traced)
-# instead of (0,2)'s loopback S2MM; the MM2S side, its locks and the core program are unchanged.
+# instead of (0,2)'s loopback S2MM; the MM2S side, its locks and the core program are unchanged, except that each
+# fill release of A is followed by a release of lock CHAIN_LOCK_NORTH_FILL of tile (0,3) (declared there at 0, no
+# BD uses it), which fills (0,3)'s memory-module stream the same way.
 
 CHAIN_LOCK_B, CHAIN_LOCK_RX, CHAIN_LOCK_FREE0 = 4, 5, 6   # B: the core-released mid BD's lock; RX: the S2MM's
 CHAIN_MAX_FREE = 16 - CHAIN_LOCK_FREE0                     # free locks 6..15
@@ -1373,6 +1376,7 @@ CHAIN_MAX_BDS = 16                                         # BD descriptors of a
 CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffers: logical bank 1
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
+CHAIN_LOCK_NORTH_FILL = 0          # lock of tile (0,3) that a north-receiver fill releases: its LOCK_0_REL frames
 CHAIN_RECEIVERS = ("own", "north")  # who takes the MM2S's stream: (0,2)'s own S2MM, or (0,3)'s (one hop north)
 CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) stays below the 6-bit limit 63
 CHAIN_FILL_GAP_NOPS = 16           # nops before the first fill release; each later one waits one nop more
@@ -1477,6 +1481,8 @@ def chain_core_asm(c: ChainCase) -> str:
     fill = []
     for i in range(c.fill):
         fill += [*n(CHAIN_FILL_GAP_NOPS + i), f"  rel #{OWN + SYNC_LOCK_A}, r2"]
+        if c.receiver == "north":
+            fill.append(f"  rel #{NORTH + CHAIN_LOCK_NORTH_FILL}, r2")
     if fill:
         fill += lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail2")
     rel_b = [*n(c.d1), f"  rel #{OWN + CHAIN_LOCK_B}, r2"] if any(m.lock == "core" for m in c.mids) else []
@@ -1507,6 +1513,8 @@ def chain_design_mlir(c: ChainCase) -> str:
         locks.append(f'    %lB = aie.lock(%t02, {CHAIN_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}')
     if c.releaser == "s2mm":
         locks.append(f'    %lRx = aie.lock(%t02, {CHAIN_LOCK_RX}) {{init = 1 : i32, sym_name = "lRx"}}')
+    if c.receiver == "north" and c.fill:
+        locks.append(f'    %lN = aie.lock(%t03, {CHAIN_LOCK_NORTH_FILL}) {{init = 0 : i32, sym_name = "lN"}}')
     bds, free_i = [], 0
     names = ["head", *(f"m{i}" for i in range(len(c.mids))), "send"]
 

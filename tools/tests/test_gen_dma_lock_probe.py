@@ -871,6 +871,19 @@ def test_chain_remote_receiver_moves_only_the_s2mm_to_the_tile_above():
     assert [c.receiver for c in g.chain_selection(args)] == ["north"]
 
 
+def test_chain_remote_receiver_fill_also_releases_a_lock_of_the_tile_above():
+    rel_a, rel_n = f"rel #{g.OWN + g.SYNC_LOCK_A}, r2", f"rel #{g.NORTH + g.CHAIN_LOCK_NORTH_FILL}, r2"
+    own = [ln.strip() for ln in g.chain_core_asm(chain("1 1", fill=3)).splitlines()]
+    north = [ln.strip() for ln in g.chain_core_asm(chain("1 1", fill=3, receiver="north")).splitlines()]
+    assert rel_n not in own and own.count(rel_a) == 4
+    assert north.count(rel_a) == 4 and north.count(rel_n) == 3
+    assert all(north[i + 1] == rel_n for i, x in enumerate(north) if x == rel_a and i > north.index(".Ltail:"))
+    m = g.chain_design_mlir(chain("1 1", fill=3, receiver="north"))
+    assert f"aie.lock(%t03, {g.CHAIN_LOCK_NORTH_FILL})" in m and "aie.lock(%t03" not in g.chain_design_mlir(
+        chain("1 1", fill=3))
+    assert "aie.lock(%t03" not in g.chain_design_mlir(chain("1 1", receiver="north"))      # no fill, no lock
+
+
 def test_chain_row_takes_a_remote_s2mm_and_the_starvation_levels():
     e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499)
     e += [ev("DMA_MM2S_0_FINISHED_BD", 503), ev("LOCK_0_REL", 515), ev("LOCK_SEL0_ACQ_GE", 516)]
