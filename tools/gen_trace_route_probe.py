@@ -27,6 +27,14 @@ before a frame are written as Sync tokens):
   se  the 27-byte packet, then nothing until the trace stops (SYNC_PAD_WRITES writes later): a Sync
       written at the wrap shows as an arrival before the stop; one written at the stop does not.
 
+Shim data-word cases (a host-fed transfer from the shim's own DMA MM2S). Shim (0,0) MM2S 0 reads
+DATA_WORDS words from the host into S2MM 0 of the same shim (d1q) or of memtile (0,1) (d2q); the trace
+goes to the next column's shim, so shim (0,0) has both S2MM channels free. Every task finishes before
+the sequence ends: each sink BD takes exactly the words its source sends, the memtile BD has no
+successor, and the sequence waits for the shim tasks' completion tokens; every BD starts at offset 0
+of the one host buffer. Measured in the shim's own trace: MM2S 0 START_TASK and STREAM_BACKPRESSURE
+and the destination S2MM's STREAM_STARVATION fall (the first word in; for d2q the memtile's).
+
     python3 tools/gen_trace_route_probe.py build OUT_DIR [CASE ...]
     python3 tools/gen_trace_route_probe.py run OUT_DIR CASE TAG --backend hw|emu
     python3 tools/gen_trace_route_probe.py table OUT_DIR CASE RUN [RUN ...]
@@ -59,6 +67,7 @@ SYNC_FIELD = 1 << 18
 SYNC_SHORT = 3000
 SYNC_LONG = SYNC_FIELD + 3000
 SYNC_PAD_WRITES = 3500                  # outlasts the 2^18 wait (about 103 cycles per write)
+SCRATCH_REG = 0x000340F0                # Timer_Trig_Event_Low_Value of the carrier shim, nothing uses it here
 DENSE_LEAD = 3                          # dense packets before the 27-byte packet (timer offset)
 PT = {"core": 0, "shim": 2, "memtile": 3}
 
@@ -73,6 +82,7 @@ class Case:
     sync_end: bool = False              # se: no closing frame
     pad_writes: int = tw.PAD_WRITES
     notes: str = ""
+    data_dest: str | None = None        # data cases: "shim" (S2MM 0 of shim (0,0)) or "memtile"
 
     @property
     def broadcast(self) -> bool:
@@ -87,7 +97,14 @@ CASES = {c.name: c for c in [
     Case("sc", "npu1_1col", ("core", 0, 2), 0, sync_wait=SYNC_SHORT, pad_writes=SYNC_PAD_WRITES),
     Case("si", "npu1_1col", ("core", 0, 2), 0, sync_wait=SYNC_LONG, pad_writes=SYNC_PAD_WRITES),
     Case("se", "npu1_1col", ("core", 0, 2), 0, sync_end=True, pad_writes=SYNC_PAD_WRITES),
+    Case("d1q", "npu1_2col", ("shim", 0, 0), 1, data_dest="shim"),
+    Case("d2q", "npu1_2col", ("shim", 0, 0), 1, data_dest="memtile"),
 ]}
+DATA_WORDS = 16
+HOST_WORDS = 16384                       # as in the runs that finished cleanly
+SHIM_DATA_EVENTS = ["DMA_MM2S_0_START_TASK", "DMA_MM2S_0_STREAM_BACKPRESSURE", "DMA_S2MM_0_STREAM_STARVATION",
+                    "DMA_MM2S_0_FINISHED_TASK", "DMA_S2MM_0_FINISHED_TASK"]
+MEMTILE_DATA_EVENTS = ["DMA_S2MM_SEL0_STREAM_STARVATION", "DMA_S2MM_SEL0_FINISHED_TASK"]
 
 
 # -- core programs ----------------------------------------------------------------------------
@@ -186,6 +203,104 @@ def design_mlir(case: Case) -> str:
   }}
 }}
 """
+
+
+def data_design_mlir(case: Case) -> str:
+    """Shim (0,0) MM2S 0 -> S2MM 0 of shim (0,0) (d1q) or memtile (0,1) (d2q). Every task finishes:
+    the sink takes exactly the source's words, the memtile BD has no successor, and the sequence
+    waits for the shim tasks' completion tokens. Every BD starts at offset 0 of the host buffer."""
+    mt = case.data_dest == "memtile"
+    nl = "\n"
+    tiles = ["    %t00 = aie.tile(0, 0)", "    %t10 = aie.tile(1, 0)"] + (["    %t01 = aie.tile(0, 1)"] if mt else [])
+    flows = [f"    aie.flow(%t00, DMA : 0, {'%t01' if mt else '%t00'}, DMA : 0)"]
+    allocs = ["    aie.shim_dma_allocation @in0 (%t00, MM2S, 0)"]
+    if not mt:
+        allocs.append("    aie.shim_dma_allocation @out0 (%t00, S2MM, 0)")
+    mem = []
+    if mt:
+        mem = ["    %mbuf = aie.buffer(%t01) {sym_name = \"mbuf\"} : memref<16xi32>",
+               "    %mdma = aie.memtile_dma(%t01) {",
+               "      %s0 = aie.dma_start(S2MM, 0, ^bb1, ^bb99)",
+               "    ^bb1:",
+               f"      aie.dma_bd(%mbuf : memref<16xi32> offset = 0 len = {DATA_WORDS})",
+               "      aie.next_bd ^bb99",
+               "    ^bb99:",
+               "      aie.end",
+               "    }"]
+    decl = ["    aie.trace @trace_src(%t00) {", "      aie.trace.packet id = 1 type = shimtile",
+            *[f'      aie.trace.event <"{ev}">' for ev in SHIM_DATA_EVENTS],
+            "      aie.trace.start broadcast = 15", "      aie.trace.stop broadcast = 14", "    }"]
+    starts = ["      aie.trace.start_config @trace_src"]
+    if mt:
+        decl += ["    aie.trace @trace_mt(%t01) {", "      aie.trace.packet id = 2 type = memtile",
+                 *[f'      aie.trace.event <"{ev}">' for ev in MEMTILE_DATA_EVENTS],
+                 "      aie.trace.start broadcast = 15", "      aie.trace.stop broadcast = 14", "    }"]
+        starts.append("      aie.trace.start_config @trace_mt")
+    m = f"memref<{HOST_WORDS}xi32>"
+
+    def memcpy(n: int, meta: str, ident: int, token: bool) -> str:
+        tok = ", issue_token = true" if token else ""
+        return (f"      aiex.npu.dma_memcpy_nd(%buf[%c0, %c0, %c0, %c0] [%c1, %c1, %c1, %c{n}] [%c0, %c0, %c0, %c1]) "
+                f"{{id = {ident} : i64, metadata = @{meta}{tok}}} : {m}")
+    seq, waits = [], []
+    if not mt:
+        seq.append(memcpy(DATA_WORDS, "out0", 1, True))
+        waits.append("      aiex.npu.dma_wait {symbol = @out0}")
+    seq.append(memcpy(DATA_WORDS, "in0", 0, mt))
+    if mt:
+        waits.append("      aiex.npu.dma_wait {symbol = @in0}")
+    pad = nl.join("      aiex.npu.write32(%c_zero, %c_one) {column = 1 : i32, row = 0 : i32} : i32, i32"
+                  for _ in range(case.pad_writes))
+    return f"""module {{
+  aie.device({case.device}) {{
+{nl.join(tiles)}
+{nl.join(flows)}
+{nl.join(allocs)}
+{nl.join(mem)}
+{nl.join(decl)}
+    aie.runtime_sequence(%buf: {m}) {{
+      aie.trace.host_config {{buffer_size = 65536 : i32, egress_shim_col = {case.carrier_col} : i32}}
+{nl.join(starts)}
+      %c0 = arith.constant 0 : i64
+      %c1 = arith.constant 1 : i64
+      %c{DATA_WORDS} = arith.constant {DATA_WORDS} : i64
+      %c_zero = arith.constant {SCRATCH_REG} : i32
+      %c_one = arith.constant 0 : i32
+{nl.join(seq)}
+{pad}
+{nl.join(waits)}
+    }}
+  }}
+}}
+"""
+
+
+def data_rows(case: Case, run_dir: Path) -> dict:
+    """Cycles of the measured first word: the MM2S 0 MEMORY_STARVATION fall, any MM2S 0
+    STREAM_BACKPRESSURE cycles, the destination's STREAM_STARVATION fall (first word in)."""
+    import gen_dma_lock_probe as dl
+    ev = dl.load_level_events(run_dir)
+    def cycles(pkt, name):
+        return sorted({e.ts for e in ev if e.pkt_type == pkt and e.name == name})
+    def first_fall(cs, after=0):
+        """The cycle after the end of the first asserted run that reaches past `after`."""
+        cs = [c for c in cs if c >= after]
+        if not cs:
+            return None
+        for a, b in zip(cs, cs[1:]):
+            if b != a + 1:
+                return a + 1
+        return cs[-1] + 1
+    start = cycles(PT["shim"], "DMA_MM2S_0_START_TASK")
+    t0 = start[0] if start else 0
+    bp = [c for c in cycles(PT["shim"], "DMA_MM2S_0_STREAM_BACKPRESSURE") if c >= t0]
+    if case.data_dest == "memtile":
+        arr = first_fall(cycles(PT["memtile"], "DMA_S2MM_SEL0_STREAM_STARVATION"))
+    else:
+        arr = first_fall(cycles(PT["shim"], "DMA_S2MM_0_STREAM_STARVATION"), t0)
+    out = {"start": t0, "backpressure": bp[:8], "arrival": arr,
+           "arr_minus_offer": None if arr is None or not bp else arr - bp[0]}
+    return out
 
 
 # -- decoding ---------------------------------------------------------------------------------
@@ -350,13 +465,17 @@ def cmd_build(args) -> int:
         case = CASES[name]
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
-        lp.assemble(core_program(case), d / "core.o", "k_core")
-        (d / "aie.mlir").write_text(design_mlir(case))
+        if case.data_dest is None:
+            lp.assemble(core_program(case), d / "core.o", "k_core")
+        (d / "aie.mlir").write_text(data_design_mlir(case) if case.data_dest else design_mlir(case))
         lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
                "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
               cwd=d, log=d / "aiecc.log")
-        ops = tw.check_sequence_is_plain_writes((d / "insts.bin").read_bytes())
-        print(f"{name}: sequence ops (opcode: count): {ops}")
+        if case.data_dest:
+            print(f"{name}: built (the sequence waits for its DMA completion tokens)")
+        else:
+            ops = tw.check_sequence_is_plain_writes((d / "insts.bin").read_bytes())
+            print(f"{name}: sequence ops (opcode: count): {ops}")
     return 0
 
 
@@ -376,6 +495,9 @@ def cmd_table(args) -> int:
         print(f"== {args.case} {run}")
         if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
             print("no trace_raw.bin / events.json")
+            continue
+        if case.data_dest:
+            print(json.dumps(data_rows(case, run_dir)))
             continue
         rows, packets = source_rows(case, run_dir)
         print(f"{len(packets)} packets in the buffer, {len(rows)} from the source")

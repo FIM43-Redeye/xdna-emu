@@ -5,7 +5,7 @@ import gen_trace_route_probe as g
 
 
 def test_every_case_names_its_carrier_and_device():
-    assert set(g.CASES) == {"w0", "w1", "w2", "w3", "sc", "si", "se"}
+    assert set(g.CASES) == {"w0", "w1", "w2", "w3", "sc", "si", "se", "d1q", "d2q"}
     for c in g.CASES.values():
         assert c.device in ("npu1_1col", "npu1_2col")
         assert c.carrier_col < (2 if c.device == "npu1_2col" else 1)
@@ -60,3 +60,14 @@ def test_timeline_repeats_a_frame_after_a_frame():
     start = [0xF0, 0, 0, 0, 0, 0, 0, 0]
     pkts = [_packet(0, start + [0x00, 0xE3] + [0xFE] * 18)]
     assert g.stream_timeline(pkts, (0, 2, 0))[0]["frames"] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("name", ["d1q", "d2q"])
+def test_data_cases_finish_every_task_inside_the_buffer(name):
+    text = g.design_mlir(g.CASES[name]) if g.CASES[name].data_dest is None else g.data_design_mlir(g.CASES[name])
+    # every BD starts at offset 0 and moves DATA_WORDS words
+    assert text.count(f"[%c0, %c0, %c0, %c0] [%c1, %c1, %c1, %c{g.DATA_WORDS}]") == text.count("dma_memcpy_nd")
+    # the sequence ends waiting for the shim task it can wait on
+    assert text.rstrip().splitlines()[-4].strip().startswith("aiex.npu.dma_wait")
+    if name == "d2q":
+        assert "aie.next_bd ^bb99" in text and "len = 16" in text   # one memtile BD, no successor
