@@ -39,6 +39,29 @@ The runner discovers kernargs in the xclbin and classifies them by type:
 before syncing the trace BO. It is a measurement aid for observing autonomous
 post-command activity, defaults to zero, and is capped at one second.
 
+## Host-buffer bounds
+
+XRT's kernarg metadata gives an NPU buffer argument only its 8-byte pointer
+size, so the runner sizes each data buffer from the instruction stream
+itself (`insts_bounds.h`): it decodes the stream completely, evaluates every
+shim DMA task the stream pushes (Task_Queue write, BD chain, the BD's length,
+dimensions and iteration, and the DdrPatch that binds the BD to a buffer) to
+the byte range it reaches, and allocates each buffer up to the largest end.
+
+Before the hardware context is set up, the runner then checks every task
+against the buffers it actually allocates (including the trace buffer's
+`--trace-size` and buffers sized from `--input` files) and refuses the run,
+exit 1 with each offending task named, if any task leaves its buffer. A
+stream it cannot decode completely (an opcode it does not know, an op that
+does not fit, a task on a BD with no host-buffer patch) is refused outright,
+before the device is opened (exit 2): its tasks' reach is unknown.
+
+Two device-free modes expose the same computation:
+
+    bridge-trace-runner --print-arg-sizes insts.bin          # "IDX BYTES" per data buffer
+    bridge-trace-runner --check-bounds insts.bin 0=4096 1=65536
+        # every task's range; exit 0 inside, 3 outside, 2 undecodable
+
 ## Trace buffer naming
 
 The installed mlir-aie tags the trace slot with a generic name like `bo4`

@@ -376,3 +376,21 @@ def test_decode_ops_reads_a_maskpoll():
     mp = struct.pack("<2I", g.TXN_MASKPOLL, 0) + struct.pack("<IIIII", 0x1D228, 0, 0, 0x400000, 28)
     ops = g.decode_ops(blob([w32(0x1D204), mp, sync()]))
     assert [o.kind for o in ops] == ["write32", "maskpoll", "sync"] and ops[1].offset == 0x1D228
+
+
+def test_a_build_stops_when_the_runner_sizes_the_buffer_differently(monkeypatch, tmp_path):
+    case = g.plan()["w2_L300"]
+    need = 4 * g.buffer_words(case)
+
+    class Out:
+        def __init__(self, rc, out, err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: Out(0, f"0 {need}\n1 65536\n"))
+    g.check_runner_sizing(case, tmp_path / "insts.bin", tmp_path / "runner")
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: Out(0, f"0 {need - 1200}\n1 65536\n"))
+    with pytest.raises(SystemExit, match="layout needs"):
+        g.check_runner_sizing(case, tmp_path / "insts.bin", tmp_path / "runner")
+    monkeypatch.setattr(g.subprocess, "run", lambda *a, **k: Out(2, "", "opcode 0x02 is not decoded"))
+    with pytest.raises(SystemExit, match="cannot size"):
+        g.check_runner_sizing(case, tmp_path / "insts.bin", tmp_path / "runner")

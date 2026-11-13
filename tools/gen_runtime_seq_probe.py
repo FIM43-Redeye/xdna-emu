@@ -55,6 +55,7 @@ import argparse
 import json
 import statistics
 import struct
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -591,6 +592,18 @@ def _selected(args) -> list[Case]:
     return [table[n] for n in names]
 
 
+def check_runner_sizing(case: Case, insts: Path, runner: Path) -> None:
+    """The runner sizes the host buffer from the compiled stream; it must arrive at this generator's own layout.
+    Two derivations of one number: a disagreement is a bug in one of them, found before any run."""
+    p = subprocess.run([str(runner), "--print-arg-sizes", str(insts)], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit(f"{case.name}: the runner cannot size {insts}: {p.stderr.strip()}")
+    sizes = {int(a): int(b) for a, b in (ln.split() for ln in p.stdout.splitlines() if ln.strip())}
+    if sizes.get(0) != 4 * buffer_words(case):
+        raise SystemExit(f"{case.name}: the runner sizes the data buffer at {sizes.get(0)} bytes, the layout needs "
+                         f"{4 * buffer_words(case)}")
+
+
 def cmd_build(args) -> int:
     import gen_lock_pulse_probe as lp
     out = Path(args.out_dir).resolve()
@@ -609,6 +622,7 @@ def cmd_build(args) -> int:
         if got != want:
             raise SystemExit(f"{case.name}: instruction stream pushes {got}, plan {want}")
         between = between_pushes(ops, pushes_)
+        check_runner_sizing(case, d / "insts.bin", lp.RUNNER)
         (d / "case.json").write_text(json.dumps(
             {"case": case.name, "family": case.family, "pushes": want, "between": between,
              "ops_total": len(ops), "buffer_words": buffer_words(case)}, indent=1) + "\n")
