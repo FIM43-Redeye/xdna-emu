@@ -396,8 +396,8 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   core that conflict as silicon does, next section);
   every host-path guard of the previous section is unchanged; producer probe `collide`: conflicts in same-bank
   pairs, 116 per colliding transfer (silicon 115-116; before 58). With the urgency override every transfer
-  collided (1740 conflicts against 1069-1074); with the bank arbitration of the next section 9 of 15 do, as on
-  silicon. Lock-synchronised variant (`fetch --sync --pre2
+  collided (1740 conflicts against 1069-1074); with the bank arbitration of the next section 9 of 15 did, as on
+  silicon, until the lock grant law (2026-11-12, next sections) moved the grant and none collides. Lock-synchronised variant (`fetch --sync --pre2
   32`, 34 cases): FINISHED_BD minus the previous BD's = max(64, grant - previous finish + 52) on every row, as on
   silicon (291 rows; the emulator was flat grant + 64), and a parked 4-word BD's lock-free next BD of 32 words
   finishes 21 after it (silicon 21, emulator was 32).
@@ -461,7 +461,8 @@ BD's grant g0 (its STALLED_LOCK falls).
   a parked 4-word one puts the 64-word BD's FINISHED_BD at g0 + 70, where the 16-word lead gave + 69), and a
   lock-free 5..8-word BD finishes 3 cycles after a parked 4-word one, not 2. The fitted model bounds the lead
   always; the ring camp (a core camping on the bank, previous section's tests) needs the clock free once the
-  parked BD has presented its access, and in every uncontended row the two readings agree.
+  parked BD has presented its access; on every row inside the lock law's scope the two readings agree (they part
+  on six 1-word lock-free BDs, outside it).
 - **Result (emulator).** Unit tests assert silicon cycles from the captures: every row of the measured table, 45 sync rows
   (pre-BD lengths 0..32), rows of 29 chain designs and the pins of the unmeasured tiles. Integrated runs of the
   probe designs (`--backend emu`, every case once), scored with the silicon rows' scoring on the emulator's own
@@ -486,13 +487,19 @@ BD's grant g0 (its STALLED_LOCK falls).
     there, so it differs from silicon on these chains.
   - *A run's first lock BD.* The law needs a previous BD or grant. A BD with neither (a task's first BD) is
     requested every cycle from when it becomes the request target; one with a previous BD but no earlier grant in
-    the run takes Q = T + 3. Neither is measured (the arbitration probe's waiting BD is of the second kind, see
-    the next section).
+    the run takes Q = T + 3. Both are measured but not reproduced in phase: silicon grants a task's first BD at
+    release + 2 in 39 rows and + 3 in 12 (first-BD lock-fetch probe; the emulator always + 2), and the second
+    kind (the chained lock-fetch and arbitration probes' waiting BD) at + 2 or + 3 run to run for the same case
+    (lock-fetch 24 / 8 rows, arb m = 0 99 / 51), where the emulator's phase is fixed per case. The anchor of
+    silicon's phase there is not known.
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
   - *Core-side offsets, not this model's.* Relative to the core's own event 0 a core lock release is 2 cycles
     earlier in the emulator than on silicon and a core memory access about 3 earlier, and MEMORY_STALL is stamped 3
-    cycles after its conflict (silicon 1). In the probe frame (g0) the emulator's release of A therefore lands
+    cycles after its conflict (silicon 1). Measured in the release frame (memory timer, arbitration probes) a core
+    access k bundles after a release sits 3 cycles earlier (release + k - 2 against + k + 1), not the 1 those two
+    offsets net to; and in the ring probe a camp starting with the release's next bundle moves the emulator's
+    release one cycle earlier than a camp starting later (k = 0 against k >= 1). In the probe frame (g0) the emulator's release of A therefore lands
     earlier than silicon's for the same case; the lock law itself is applied from the emulator's own release.
   - *Not measured, unchanged.* Memtile and shim DMA lock timing (request, grant, STALLED_LOCK) and every S2MM
     acquire keep the FSM's path and the arbiter's same-cycle order (pinned by tests); so do the core's acquires.
@@ -550,18 +557,16 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
     In the two-channel camps the emulator splits the turns differently (MM2S 0 finishes at g + 52, silicon
     g + 58; with an S2MM, MM2S 0 at g + 82 against g + 62), though the 16 core losses fall where silicon's do.
-  - *Producer collisions.* Since the lock grant law the producer's MM2S is granted 2 cycles later than before,
-    at the core's own LOCK_STALL stamp + 0 every transfer; silicon grants at that stamp + 2 on every transfer, and
-    before the law the emulator granted at - 2. With the core's stores where the emulator
-    puts them, the DMA's bank-0 accesses now miss them on every transfer: no conflict and no MEMORY_STALL against
-    silicon's 1069 to 1074 and 18 to 20. The grant itself follows the measured law; what moved the collisions
-    is the core side, whose release reaches the lock 2 cycles earlier relative to the core's own stamps than on
-    silicon (next bullet and the lock-law section), an offset the old release + 0 grant hid. Before the law the
-    per-transfer pattern also differed (stalls 3 + 0 + 0 + 3 + 0 per 5 transfers against silicon's 2 + 1 + 0 + 3
-    + 0). `sticky32` has 330 conflicts and 157 stalls against 443 and 136 (before the law 499 and 150).
-  - *S2MM camps.* The ring S2MM rows win on the same residue as silicon, but the S2MM's writes reach bank 0 six
-    cycles earlier relative to the MM2S grant than on silicon (its feed path; the S2MM also finishes 4 to 6
-    cycles early), so the contact runs differ.
+  - *Producer collisions.* Since the lock grant law the producer's MM2S (a self-chained lock BD) is granted 2
+    cycles later than before: at its release + 2, the law's minimum (no blocked-phase cycle involved), where the
+    old emulator granted at release + 0. Before, the first conflict of a colliding transfer sat at grant + 15, as on
+    silicon (memory-module timer); now the DMA's bank-0 accesses miss the core's stores on every transfer: no
+    conflict and no MEMORY_STALL against silicon's 1069 to 1074 and 18 to 20. Inferred cause: the core side
+    places its stores relative to the release differently from silicon (a core access k bundles after a release
+    lands 3 cycles earlier than on silicon in the arbitration probes), which the release + 0 grant had cancelled.
+    Before the law the per-transfer pattern also differed (stalls 3 + 0 + 0 + 3 + 0 per 5 transfers against
+    silicon's 2 + 1 + 0 + 3 + 0). `sticky32` has 330 conflicts and 157 stalls against 443 and 136 (before the law
+    499 and 150).
   - *Where the core's access sits.* A core access k bundles after a lock release lands 3 cycles earlier
     relative to the release in the emulator than on silicon (release + k - 2 against + k + 1); the grant phase
     itself (+ 2 or + 3) now follows the lock law, but silicon's varies run to run where the emulator's is fixed
