@@ -240,6 +240,11 @@ impl<'a> AieElf<'a> {
                     let dm = tile.data_memory_mut();
                     if dm_offset + seg.data.len() <= dm.len() {
                         dm[dm_offset..dm_offset + seg.data.len()].copy_from_slice(seg.data);
+                        if tile.is_compute() {
+                            // The image load, as through the CDO: one served bank access per
+                            // initialised 16-byte line (`BankAccessCounts::record_config_write`).
+                            tile.bank_access_counts.record_config_write(dm_offset, seg.data.len());
+                        }
                     }
                 }
                 MemoryRegion::Stack | MemoryRegion::Unknown => {}
