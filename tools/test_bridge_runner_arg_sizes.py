@@ -15,14 +15,21 @@ R1 gate: output BO 8 B, drain 8192 B). This test guards the extraction algorithm
 against both regressions in our parser and drift in mlir-aie's NPU lowering (the
 BLOCKWRITE-then-DdrPatch emission order + BD-word-0 = length layout).
 """
-import struct
 import os
+import struct
+import subprocess
+
+import pytest
 
 INSTS_MAGIC = 0x06030100
 OP_WRITE32 = 0x00
 OP_BLOCKWRITE = 0x01
 OP_MASKWRITE = 0x03
 OP_DDR_PATCH = 0x81
+# mlir-aie include/aie/Runtime/TxnEncoding.h: patches of args at index >= 5 may carry the DDR
+# aperture offset folded into arg_plus.
+DDR_AIE_ADDR_OFFSET = 0x80000000
+NUM_FIRMWARE_TRANSLATED_ARGS = 5
 
 
 def discover_arg_sizes(data: bytes) -> dict:
@@ -51,10 +58,14 @@ def discover_arg_sizes(data: bytes) -> dict:
             op_size = 28
         elif opcode == OP_DDR_PATCH:
             op_size = 48
-            if off + 8 + 24 < end:
+            if off + 48 <= end:
                 arg_idx = data[off + 8 + 24]
+                arg_plus = struct.unpack_from("<Q", data, off + 40)[0]
+                if arg_idx >= NUM_FIRMWARE_TRANSLATED_ARGS and arg_plus >= DDR_AIE_ADDR_OFFSET:
+                    arg_plus -= DDR_AIE_ADDR_OFFSET
                 if have_len and last_len_words > 0:
-                    sizes[arg_idx] = last_len_words * 4
+                    need = arg_plus + last_len_words * 4
+                    sizes[arg_idx] = max(sizes.get(arg_idx, 0), need)
             have_len = False
         else:
             break
@@ -69,15 +80,17 @@ def _blockwrite(len_words: int) -> bytes:
     return hdr + payload
 
 
-def _ddr_patch(arg_idx: int) -> bytes:
+def _ddr_patch(arg_idx: int, arg_plus: int = 0) -> bytes:
     op = bytearray(48)
     op[0] = OP_DDR_PATCH
-    op[8 + 24] = arg_idx  # arg_idx at payload[24]
+    op[8 + 24] = arg_idx  # arg_idx at payload[24] (word 8)
+    struct.pack_into("<Q", op, 40, arg_plus)  # words 10..11: byte offset into the buffer
     return bytes(op)
 
 
 def _synthetic_insts(pairs) -> bytes:
-    body = b"".join(_blockwrite(w) + _ddr_patch(a) for (a, w) in pairs)
+    """pairs: (arg_idx, length in words) or (arg_idx, length in words, byte offset)."""
+    body = b"".join(_blockwrite(p[1]) + _ddr_patch(p[0], p[2] if len(p) > 2 else 0) for p in pairs)
     total = 16 + len(body)
     header = struct.pack("<IIII", INSTS_MAGIC, 0, 0, total)
     return header + body
@@ -88,6 +101,50 @@ def test_synthetic_two_buffers():
     # matching sp5_skew_r1's real layout.
     data = _synthetic_insts([(0, 2048), (1, 4096)])
     assert discover_arg_sizes(data) == {0: 8192, 1: 16384}
+
+
+def test_a_transfer_at_an_offset_needs_offset_plus_length():
+    # 16 words written 4096 bytes into the buffer: the buffer must reach 4096 + 64 bytes.
+    data = _synthetic_insts([(0, 16, 4096)])
+    assert discover_arg_sizes(data) == {0: 4096 + 64}
+
+
+def test_the_largest_transfer_of_a_buffer_sizes_it_whatever_the_order():
+    # three BDs on one buffer: 8192 words at 0, then 16 at 0, then 16 at 64 bytes
+    data = _synthetic_insts([(0, 8192), (0, 16), (0, 16, 64)])
+    assert discover_arg_sizes(data) == {0: 8192 * 4}
+    data = _synthetic_insts([(0, 16), (0, 8192)])
+    assert discover_arg_sizes(data) == {0: 8192 * 4}
+
+
+def test_a_folded_aperture_offset_is_not_counted_as_extent():
+    data = _synthetic_insts([(5, 16, DDR_AIE_ADDR_OFFSET + 128)])
+    assert discover_arg_sizes(data) == {5: 128 + 64}
+
+
+def _runner():
+    path = os.environ.get("BRIDGE_TRACE_RUNNER", os.path.join(
+        os.path.dirname(__file__), "..", "bridge-runner", "build", "bridge-trace-runner"))
+    return path if os.path.exists(path) else None
+
+
+@pytest.mark.parametrize("pairs", [
+    [(0, 2048), (1, 4096)],
+    [(0, 16, 4096)],
+    [(0, 8192), (0, 16), (0, 16, 64)],
+    [(0, 16), (0, 8192), (1, 16, 32768)],
+    [(5, 16, DDR_AIE_ADDR_OFFSET + 128)],
+])
+def test_the_runner_sizes_buffers_as_the_mirror_does(pairs, tmp_path):
+    exe = _runner()
+    if exe is None:
+        pytest.skip("bridge-trace-runner not built (set BRIDGE_TRACE_RUNNER)")
+    data = _synthetic_insts(pairs)
+    f = tmp_path / "insts.bin"
+    f.write_bytes(data)
+    out = subprocess.run([exe, "--print-arg-sizes", str(f)], capture_output=True, text=True, check=True).stdout
+    got = {int(a): int(b) for a, b in (ln.split() for ln in out.splitlines() if ln.strip())}
+    assert got == discover_arg_sizes(data)
 
 
 def test_empty_on_bad_magic():
