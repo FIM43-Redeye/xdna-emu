@@ -180,6 +180,11 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         unit("dma.mm2s_bd_switch_access_gap_cycles", HardwareObserved, Verification::Unverified,
             "Fitted. NPU1 2026-11 (tools/gen_dma_lock_probe.py sync family): a lock-free 5..8-word BD behind a parked \
             4-word BD finishes 3 cycles after it, not 2. Compute tiles."),
+        unit("dma.mm2s_late_granule_access_gap_cycles", HardwareObserved, Verification::Unverified,
+            "Fitted. NPU1 2026-11 (producer probe collide, 3 runs): after a refused MM2S access the next request comes \
+            no earlier than its service + 2 (with the 4-cycle request lattice, every conflict, stall and finish of 45 \
+            transfers); the ring camps' refused accesses are followed the next cycle by granules sequenced long before. \
+            Compute tiles."),
         unit("dma.mm2s_access_to_offer_cycles", HardwareObserved, Verification::Unverified,
             "Inferred. Neither side is a direct observation: the host-path access (7 + min(N, 4)) is the model's \
             placement, and the lock-path offer (grant + 6) is the first word at the receiving DMA (grant + 9, \

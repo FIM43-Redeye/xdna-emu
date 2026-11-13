@@ -251,6 +251,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             mm2s_word_clock_start_cycles: 3,
             mm2s_word_clock_lead_granules: 4,
             mm2s_bd_switch_access_gap_cycles: 2,
+            mm2s_late_granule_access_gap_cycles: 2,
             mm2s_access_to_offer_cycles: 4,
             mm2s_access_to_finish_cycles: 1,
             mm2s_lock_to_access_cycles: 2,

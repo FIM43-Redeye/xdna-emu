@@ -1479,6 +1479,15 @@ pub struct DmaTiming {
     /// behind it 3 cycles later, not 2.
     pub mm2s_bd_switch_access_gap_cycles: u8,
 
+    /// Cycles between a compute-tile MM2S bank access that the bank refused at least once and
+    /// the channel's next access when the next granule was not accessible (sequenced) before the
+    /// cycle the refused one was served: at least 2. A granule accessible earlier follows the
+    /// next cycle. Fitted (NPU1, 2026-11,
+    /// producer probe `collide`: after a refused access the next request is no earlier than
+    /// its service + 2, every conflict and stall of 45 transfers), consistent with the ring
+    /// camps (a refused access followed the next cycle by a granule sequenced long before).
+    pub mm2s_late_granule_access_gap_cycles: u8,
+
     /// Cycles from a compute-tile MM2S granule's bank access until its words can be offered
     /// to the stream: 4. Silicon (NPU1, 2026-11): host-started first offer at START_TASK +
     /// 11 + min(N, 4) against the first access at + 7 + min(N, 4) (`gen_path_onset_probe.py`),
