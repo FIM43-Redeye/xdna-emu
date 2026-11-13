@@ -470,9 +470,10 @@ BD's grant g0 (its STALLED_LOCK falls).
   rule 554 / 554 (the core's release of B is not traced; the emulator's own core path, event + nops + 3 or 4,
   gives the same score either way). Model-free, each silicon row against the emulator run whose release lands
   on the same cycle after g0: 889 / 889 sync rows and 163 / 163 chain rows identical (grant, every STALLED_LOCK
-  interval, every FINISHED_BD). Relative to the core's event 0 the emulator's release comes 3 to 4 cycles
-  earlier after g0 than silicon's for the same case (the core-side offsets below), so a same-case comparison
-  does not match: the model is exercised in the release frame. Outside the rule (c, kn, k4f) the emulator
+  interval, every FINISHED_BD). After g0 the emulator's release comes 2 or 3 cycles earlier than silicon's for
+  the same case, and its event 0 with it (the core reaches event 0 early against the DMA's first grant,
+  upstream of this model), so a same-case comparison does not match: the model is exercised in the release
+  frame. Outside the rule (c, kn, k4f) the emulator
   follows the rule on 108 of 110 runs; the other two (six 1-word lock-free mid BDs) are where the parked lead
   and the always-bounded fit part (grant release + 2 against + 3); against silicon k4f1 matches 31 / 31 and
   k4f2..5 match none, as the rule does not.
@@ -494,13 +495,11 @@ BD's grant g0 (its STALLED_LOCK falls).
     silicon's phase there is not known.
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
-  - *Core-side offsets, not this model's.* Relative to the core's own event 0 a core lock release is 2 cycles
-    earlier in the emulator than on silicon and a core memory access about 3 earlier, and MEMORY_STALL is stamped 3
-    cycles after its conflict (silicon 1). Measured in the release frame (memory timer, arbitration probes) a core
-    access k bundles after a release sits 3 cycles earlier (release + k - 2 against + k + 1), not the 1 those two
-    offsets net to; and in the ring probe a camp starting with the release's next bundle moves the emulator's
-    release one cycle earlier than a camp starting later (k = 0 against k >= 1). In the probe frame (g0) the emulator's release of A therefore lands
-    earlier than silicon's for the same case; the lock law itself is applied from the emulator's own release.
+  - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). Still open: in
+    the sync designs the core reaches event 0, and so its release of A, 2 or 3 cycles earlier against the DMA's
+    first grant g0 than silicon (22 and 12 of 34 rows); it is upstream of event 0 (core start or the go lock's
+    wake), not measured apart. (The ring probe's "release one cycle earlier at k = 0" was a build difference:
+    the k >= 1 cases carry one more bundle before event 0.)
   - *Not measured, unchanged.* Memtile and shim DMA lock timing (request, grant, STALLED_LOCK) and every S2MM
     acquire keep the FSM's path and the arbiter's same-cycle order (pinned by tests); so do the core's acquires.
     A channel with two locked BDs waiting at once, and a BD releasing its own successor's lock on one channel, are
@@ -532,52 +531,57 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   loaded directly) once per 16-byte line written; the
   core-versus-DMA decision reads it against `BANK_ARBITER_PERIOD` 5 (measured) and `BANK_ARBITER_DMA_RESIDUE` 2
   (fitted once; banks 0 and 1, whose histories differ by two stores, need the same value). The count is counted,
-  not offset: the emulator's own image load and prologue give 20 and 18 at the probe's window. A lost bank cycle
-  raises MEMORY_STALL one cycle later. A core bundle held in its cycle (the lock request's frozen arbitration
-  cycle in front of the fourth bundle after an `acq` / `rel`, a gather's memory cycle, a refused acquire) asks
-  for no bank (`CycleAccurateExecutor::holds_bundle`): with the held bundle's load counted, a camp of loads
-  right after a release reached the grant one served access ahead of silicon. The urgency override
+  not offset: the emulator's own image load and prologue give 20 and 18 at the probe's window. A core access
+  asks for its bank in its memory stage, issue + 4 (since 2026-11-13; below), and a lost bank cycle is a frozen
+  core cycle with MEMORY_STALL in it. A bundle held in its cycle (the lock request's frozen arbitration cycle,
+  a refused acquire) has issued no access for that cycle, so a camp of loads right after a release has one
+  cycle without a core access (the bundle that would have issued in the arbitration cycle). The urgency override
   (`URGENT_WATERMARK`) is removed.
 - **Result (emulator).** Arb and ring probes 208 of 222 rows. Since the lock grant law (previous section) the
   emulator's grant is release + 2 or + 3 as on silicon, but a row still has to be compared with a shifted case:
   silicon's phase varies run to run for the same case (m = 0: 99 rows + 2, 51 rows + 3) while the emulator's is
-  fixed per case (+ 3 at m = 0), and a core access k bundles after the release lands at release + k + 1 on
-  silicon and release + k - 2 in the emulator (core-side offset, not the arbiter). Each silicon row (k, phase gh)
-  is compared with the emulator case k + 3 + ge - gh, ge that case's phase, which puts the core access on the same
-  grant-relative cycle. A row matches when its conflict cycles relative to the grant and its MEMORY_STALL count
-  are silicon's (and, arb rows, the window). Arb 174 of 174; ring 34 of 48 (the four single-channel camps' MM2S
-  rows, every pad row, the silent two-channel rows; the losses of every row at the same residue and spacing as
-  silicon); the same case, unshifted, matches 24 of 174 and 10 of 48. Producer probe `collide`, before the
-  lock law: 1077 conflicts (silicon 1069 / 1071 / 1074), 18 MEMORY_STALL (silicon 18 / 18 / 20), 9 of 15
-  transfers colliding; since the lock law **0 conflicts, 0 MEMORY_STALL, no transfer colliding** (see the
-  producer bullet below). `sticky32`: 330 conflicts and 157 stalls (silicon 443 / 136; before the law 499 / 150);
-  no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall (as silicon).
+  fixed per case. Since the core-side placement (2026-11-13: a core access k bundles after the release meets
+  its bank at release + k + 1, as on silicon) the same case, unshifted, matches 113 of 174 arb rows: every row
+  whose silicon grant phase is the emulator's (113 of 113), none of the 61 with the other phase; ring 23 of 48
+  (21 of the 28 at the emulator's phase; the others are the S2MM-fed and two-channel camps below). Before it:
+  24 of 174 and 10 of 48 (with a shifted-case mapping 174 of 174 and 34 of 48). Producer probe `collide`
+  (conflict cycles counted level-expanded, silicon 1098 / 1098 / 1103; MEMORY_STALL 18 / 18 / 20; 9 of 15
+  transfers colliding, stalls per transfer 2 1 0 3 0 repeating): before the lock law 1077 conflicts (another
+  count), 18 stalls; with the lock law 0 / 0 / none; now 603 conflicts, 24 stalls, 12 of 15 transfers
+  colliding, 2 2 2 2 0. `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls (with the lock law, same
+  count: 545 / 157); no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
     In the two-channel camps the emulator splits the turns differently (MM2S 0 finishes at g + 52, silicon
     g + 58; with an S2MM, MM2S 0 at g + 82 against g + 62), though the 16 core losses fall where silicon's do.
-  - *Producer collisions.* Since the lock grant law the producer's MM2S (a self-chained lock BD) is granted 2
-    cycles later than before: at its release + 2, the law's minimum (no blocked-phase cycle involved), where the
-    old emulator granted at release + 0. Before, the first conflict of a colliding transfer sat at grant + 15, as on
-    silicon (memory-module timer); now the DMA's bank-0 accesses miss the core's stores on every transfer: no
-    conflict and no MEMORY_STALL against silicon's 1069 to 1074 and 18 to 20. Inferred cause: the core side
-    places its stores relative to the release differently from silicon (a core access k bundles after a release
-    lands 3 cycles earlier than on silicon in the arbitration probes), which the release + 0 grant had cancelled.
-    Before the law the per-transfer pattern also differed (stalls 3 + 0 + 0 + 3 + 0 per 5 transfers against
-    silicon's 2 + 1 + 0 + 3 + 0). `sticky32` has 330 conflicts and 157 stalls against 443 and 136 (before the law
-    499 and 150).
-  - *Where the core's access sits.* A core access k bundles after a lock release lands 3 cycles earlier
-    relative to the release in the emulator than on silicon (release + k - 2 against + k + 1); the grant phase
-    itself (+ 2 or + 3) now follows the lock law, but silicon's varies run to run where the emulator's is fixed
-    per case (the grant row above). In the core's own timer
-    MEMORY_STALL sits 3 cycles earlier after `event #0` than on silicon, and a MEMORY_STALL core stamp is 3
-    cycles after its conflict's memory stamp (silicon 1): the core and memory module stamps differ by 2 more
-    than on silicon (`event #0` minus LOCK_0_REL: -3, silicon -5). The window between the two core events is
-    silicon's on every arb row.
-  - *Rows outside the probes' shape.* Whether a held bundle presents its load to the bank was settled only for
-    the lock request's frozen cycle (ring rows). A gather's memory cycle is treated the same way without a
-    measurement, and a cascade or stream hold still presents the held bundle's demand.
+  - *Producer collisions.* Each transfer's first contacts now land as on silicon (first transfer
+    15b0x3* 19b1x3*, the second 15b0x1* 19b1x4, grant-relative), but after them the emulator's MM2S falls out of
+    step with the core's store dwells: silicon keeps meeting the march every 4 cycles for the rest of the BD
+    (runs of 2, core winning), the emulator meets it once or twice more and then not at all, so it has about
+    half the conflict cycles (603 against 1098) and the wrong per-transfer pattern (2 2 2 2 0 against
+    2 1 0 3 0). Inferred: the MM2S's request lattice after a delayed access (silicon keeps its 4-cycle lattice,
+    next request no earlier than service + 2) and the missing MM2S stream backpressure (silicon one cycle at
+    grant + 6 and + 15, none in the emulator), both DMA side.
+  - *Where the core's access sits* (**fixed** 2026-11-13). Silicon, one trace unit at a time: in the core
+    module a load or store that loses its bank raises MEMORY_STALL at its issue + 4 (82 of 82 loss rows), the
+    stamp a gather's frozen memory cycle has (counter reads put that freeze at issue + 4); llvm-aie gives loads,
+    full-word stores and gathers MemoryCycles<[5]>. In the memory module every conflict lies on a core access
+    cycle LOCK_0_REL + k + 1 + i (147 of 147 rows), which with the access at issue + 4 puts the release one
+    cycle after the core's arbitration cycle. The emulator presented the access at issue (4 early), stamped
+    MEMORY_STALL a cycle after the loss, and released at the arbitration cycle (1 early): 4 - 1 = the 3 seen.
+    Now an issued bundle's accesses ask for their banks at issue + 4 on the cycle clock (a lost one freezes
+    the core in that cycle, MEMORY_STALL stamped there) and a core release reaches the lock unit the next
+    cycle (`Tile::send_core_lock_release`; cores see it when they did, the DMA from that stamp + 2). The "release 2
+    early / access 3 early against event 0" figures mixed the two units' timers: across units the emulator now
+    reads LOCK_0_REL - `event #0` = 4 (silicon 5) and MEMORY_STALL - conflict = 2 (silicon 1), one residual of
+    1 both ways, i.e. the intra-tile timer offset (`BROADCAST_INTRA_TILE_MEM_OFFSET`, 2, calibrated on add_one)
+    reads 1 on these probes. Not changed here. Unmeasured: a vst.srs / vst.conv (E7) or part-word store
+    (E5, E11) arbitrates at E5 like the rest; an access lost while the core is held on a lock costs no extra
+    cycle; the data itself still moves at issue.
+  - *Rows outside the probes' shape.* An access in flight reaches its bank whatever the core does meanwhile
+    (lock arbitration cycle, held acquire, cascade or stream hold), as the gather's memory cycle does on silicon;
+    measured for the gather only.
   - *Not measured.* Neighbouring cores accessing this tile's memory, vector accesses spanning two banks, both core
     load ports at once against a DMA, a configuration write by a single-word register write (counted as one
     access, like a line), whether a run that does not reset the array keeps counting, memory-tile banks (never
