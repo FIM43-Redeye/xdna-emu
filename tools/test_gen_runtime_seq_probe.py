@@ -370,3 +370,9 @@ def test_validate_rejects_a_surplus_token():
                               g.Push("S0", 8, True), g.Sync("S0"), g.Sync("S0"), g.Sync("M0"), *g.closing_tail()))
     with pytest.raises(ValueError, match="surplus|tokens"):
         g.validate(bad)
+
+
+def test_decode_ops_reads_a_maskpoll():
+    mp = struct.pack("<2I", g.TXN_MASKPOLL, 0) + struct.pack("<IIIII", 0x1D228, 0, 0, 0x400000, 28)
+    ops = g.decode_ops(blob([w32(0x1D204), mp, sync()]))
+    assert [o.kind for o in ops] == ["write32", "maskpoll", "sync"] and ops[1].offset == 0x1D228

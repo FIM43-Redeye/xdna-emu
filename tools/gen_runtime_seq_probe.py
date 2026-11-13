@@ -79,9 +79,12 @@ CHANNELS = {"M0": ("MM2S", 0, "in0"), "M1": ("MM2S", 1, "in1"),
 PATH_OF = {"M0": 0, "S0": 0, "M1": 1, "S1": 1}
 # Task_Queue (Start_Queue) registers of a shim tile, AM025.
 QUEUE_OFFSETS = {0x1D204: "S0", 0x1D20C: "S1", 0x1D214: "M0", 0x1D21C: "M1"}
-TXN_WRITE, TXN_BLOCKWRITE, TXN_MASKWRITE, TXN_PATCH, TXN_SYNC = 0, 1, 3, 0x81, 0x80
-KIND = {TXN_WRITE: "write32", TXN_BLOCKWRITE: "blockwrite", TXN_MASKWRITE: "maskwrite32",
+TXN_WRITE, TXN_BLOCKWRITE, TXN_MASKWRITE, TXN_MASKPOLL, TXN_PATCH, TXN_SYNC = 0, 1, 3, 4, 0x81, 0x80
+KIND = {TXN_WRITE: "write32", TXN_BLOCKWRITE: "blockwrite", TXN_MASKWRITE: "maskwrite32", TXN_MASKPOLL: "maskpoll",
         TXN_PATCH: "patch", TXN_SYNC: "sync"}
+# The lowering inserts a maskpoll on a channel's status before a fifth task is queued on a channel the sequence has
+# not synced (Task_Queue depth 4): it waits for queue space. It appears only in the closing tail of w4 cases, after
+# the measured section.
 EVENT_ORDER = ("M0", "M1", "S0", "S1")
 
 
@@ -359,7 +362,7 @@ def decode_ops(insts: bytes) -> list[Op]:
         if off + 8 > len(insts):
             raise ValueError("stream ends inside an op")
         opcode = insts[off]
-        if opcode in (TXN_WRITE, TXN_MASKWRITE):
+        if opcode in (TXN_WRITE, TXN_MASKWRITE, TXN_MASKPOLL):
             size = 24 if opcode == TXN_WRITE else 28
             addr = struct.unpack_from("<I", insts, off + 8)[0]
             out.append(Op(KIND[opcode], (addr >> 25) & 0x7F, (addr >> 20) & 0x1F, addr & 0xFFFFF))
