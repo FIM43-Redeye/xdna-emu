@@ -830,6 +830,68 @@ def test_format_chain_table_one_line_per_case_and_run():
     assert "relA [+27]" in lines[2] and "ev0 +9 ev1 +14" in lines[2]
 
 
+def test_memmod_event_add_repeats_in_order_and_keeps_the_single_form():
+    ns = g.build_parser().parse_args(["chain-build", "d", "--memmod-event-add", "DMA_S2MM_0_STREAM_STARVATION",
+                                      "--memmod-event-add", "DMA_MM2S_0_MEMORY_STARVATION"])
+    assert ns.memmod_event_add == ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION"]
+    ns = g.build_parser().parse_args(["fetch-build", "d", "--memmod-event-add", "LOCK_1_REL"])
+    assert ns.memmod_event_add == "LOCK_1_REL"
+    base = list(g.CHAIN_MEM_EVENTS)
+    two = g.edit_memmod_events(base, None, ns2 := ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION"])
+    assert two == [*base, *ns2]
+    assert g.edit_memmod_events(base, None, "LOCK_1_REL") == [*base, "LOCK_1_REL"]
+    with pytest.raises(ValueError):
+        g.edit_memmod_events(base, None, ["LOCK_1_REL", "LOCK_1_REL"])
+    with pytest.raises(ValueError):
+        g.edit_memmod_events(base, None, ["LOCK_1_REL", "LOCK_2_REL", "LOCK_3_REL", "LOCK_4_REL"])   # 9 > 8 slots
+    a = g.chain_inject_args(None, ns2)
+    assert a[a.index("--memmod-sweep-events") + 1].split(",") == [*base, *ns2]
+
+
+def test_chain_remote_receiver_moves_only_the_s2mm_to_the_tile_above():
+    own, north = chain("1 1"), chain("1 1", receiver="north")
+    assert own.design() == chain("1 1").design() and "receiver" not in own.design()
+    assert north.design()["receiver"] == "north" and north.name == own.name
+    m = g.chain_design_mlir(north)
+    assert "%t03 = aie.tile(0, 3)" in m
+    assert "aie.flow(%t02, DMA : 0, %t03, DMA : 0)" in m and "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" not in m
+    mem02 = m.split("%mem = aie.mem(%t02)")[1].split("aie.end")[0]
+    mem03 = m.split("aie.mem(%t03)")[1].split("aie.end")[0]
+    assert "S2MM" not in mem02 and "MM2S" in mem02
+    assert "aie.dma_start(S2MM, 0" in mem03 and "%dst : memref<70xi32>" in mem03     # head 4 + two 1-word mids + 64
+    assert 'aie.buffer(%t03) {address = ' in m and 'sym_name = "dst"' in m
+    # the MM2S side is the same program
+    assert g.chain_core_asm(north) == g.chain_core_asm(own)
+    with pytest.raises(ValueError):
+        g.chain_validate(chain("1", receiver="north", releaser="s2mm"))
+    with pytest.raises(ValueError):
+        g.chain_validate(chain("1", receiver="east"))
+    args = type("A", (), {"mids": ["1"], "head": 4, "big": 64, "d1s": [], "d2s": [0], "releaser": "core",
+                          "bd_ids": [], "fill": 0, "receiver": "north"})()
+    assert [c.receiver for c in g.chain_selection(args)] == ["north"]
+
+
+def test_chain_row_takes_a_remote_s2mm_and_the_starvation_levels():
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499)
+    e += [ev("DMA_MM2S_0_FINISHED_BD", 503), ev("LOCK_0_REL", 515), ev("LOCK_SEL0_ACQ_GE", 516)]
+    e += held("DMA_S2MM_0_STREAM_STARVATION", 505, 507) + held("DMA_S2MM_0_STREAM_STARVATION", 512, 512)
+    e += held("DMA_MM2S_0_MEMORY_STARVATION", 509, 510)
+    r = g.chain_row(e)
+    assert r["s2mm_starv"] == [(5, 7), (12, 12)] and r["mm2s_mstarv"] == [(9, 10)] and r["s2mm_fins"] == []
+    remote = e + [ev("DMA_S2MM_0_FINISHED_BD", 640, row=3)] + held("DMA_S2MM_0_STREAM_STARVATION", 620, 621, row=3)
+    r = g.chain_row(remote)
+    assert r["s2mm_fins"] == [140] and r["s2mm_starv_remote"] == [(120, 121)]
+    plain = held("DMA_MM2S_0_STALLED_LOCK", 100, 499) + [ev("DMA_MM2S_0_FINISHED_BD", 503)]
+    assert "s2mm_starv" not in g.chain_row(plain)
+
+
+def test_format_chain_table_shows_the_starvation_levels_when_traced():
+    r = {"g0": 500, "stalls": [], "fins": [3], "rel_a": [27], "acq_a": [], "s2mm_fins": [120], "ev0": 9, "ev1": 14,
+         "s2mm_starv": [(5, 7)], "mm2s_mstarv": [(9, 10)]}
+    line = g.format_chain_table([(chain("1"), "e1.emu", r)]).splitlines()[1]
+    assert "s2starv [+5..+7]" in line and "mstarv [+9..+10]" in line
+
+
 def test_chain_build_refuses_a_directory_built_for_another_design(tmp_path):
     (tmp_path / "design.json").write_text('{"head": 4, "mids": "8", "big": 64, "releaser": "core"}\n')
     with pytest.raises(ValueError):

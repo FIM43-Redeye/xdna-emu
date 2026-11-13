@@ -397,8 +397,20 @@ FETCH_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINI
 FETCH_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
 
 
-MEMMOD_ADD_HELP = ("append one memory-module trace event to the list (NAME, e.g. LOCK_1_REL); errors when the "
-                   "trace unit's eight slots are full or NAME is already traced. Applied after --memmod-event-swap")
+MEMMOD_ADD_HELP = ("append a memory-module trace event to the list (NAME, e.g. LOCK_1_REL; repeatable, in order); "
+                   "errors when the trace unit's eight slots are full or NAME is already traced. Applied after "
+                   "--memmod-event-swap")
+
+
+class AddEventAction(argparse.Action):
+    """--memmod-event-add: one occurrence keeps the single NAME, several give the list of names in order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        prev = getattr(namespace, self.dest, None)
+        if prev is None:
+            setattr(namespace, self.dest, values)
+        else:
+            setattr(namespace, self.dest, [*(prev if isinstance(prev, list) else [prev]), values])
 LOCK_SELECT_HELP = ("--sync: program lock event selector N to watch lock LOCK_ID (repeatable): a runtime-sequence "
                     "register write placed before the start lock is set. LOCK_n_REL / LOCK_SELn_* events follow "
                     "selector n, which resets to lock 0; selector 0 is left at its reset (LOCK_0_REL is lock 0)")
@@ -478,9 +490,14 @@ def _check_memmod_event_name(name: str) -> None:
         raise ValueError(f"unknown memory-module event {name}")
 
 
-def apply_event_add(events: list[str], name: str | None) -> list[str]:
-    """The memory-module event list with NAME appended (None: unchanged); the list must have a free slot."""
+def apply_event_add(events: list[str], name) -> list[str]:
+    """The memory-module event list with NAME appended (None: unchanged; a list: each in order); the list must
+    have a free slot for each."""
     if name is None:
+        return list(events)
+    if isinstance(name, (list, tuple)):
+        for n in name:
+            events = apply_event_add(events, n)
         return list(events)
     if name in events:
         raise ValueError(f"{name} is already in the memory-module list")
@@ -1347,6 +1364,8 @@ def cmd_sync_table(args) -> int:
 # not deliver (silicon does not write a stream's final partial packet). The spacing grows so that no two fill frames
 # are equal: the trace encoder folds a run of equal (event, delta) frames into one frame and a Repeat. Nothing acquires A then; its count stays far below the
 # 6-bit limit (at most CHAIN_MAX_FILL = 48).
+# With `receiver = "north"` the stream goes to the S2MM of tile (0,3) (one hop north, its own memory module traced)
+# instead of (0,2)'s loopback S2MM; the MM2S side, its locks and the core program are unchanged.
 
 CHAIN_LOCK_B, CHAIN_LOCK_RX, CHAIN_LOCK_FREE0 = 4, 5, 6   # B: the core-released mid BD's lock; RX: the S2MM's
 CHAIN_MAX_FREE = 16 - CHAIN_LOCK_FREE0                     # free locks 6..15
@@ -1354,6 +1373,7 @@ CHAIN_MAX_BDS = 16                                         # BD descriptors of a
 CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffers: logical bank 1
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
+CHAIN_RECEIVERS = ("own", "north")  # who takes the MM2S's stream: (0,2)'s own S2MM, or (0,3)'s (one hop north)
 CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) stays below the 6-bit limit 63
 CHAIN_FILL_GAP_NOPS = 16           # nops before the first fill release; each later one waits one nop more
                                    # (48 fills span about 2000 cycles: inside the ring family's silicon fill span)
@@ -1379,6 +1399,7 @@ class ChainCase:
     releaser: str = "core"         # who releases A: "core" or "s2mm"
     bd_ids: tuple = ()             # bd_id of every MM2S BD (head, mids, waiting BD); () = aiecc assigns
     fill: int = 0                  # core releases of A after the tail (trace packet fillers; core releaser only)
+    receiver: str = "own"          # "own": the loopback S2MM of tile (0,2); "north": the S2MM of tile (0,3)
 
     @property
     def name(self) -> str:
@@ -1391,6 +1412,8 @@ class ChainCase:
             d["bd_ids"] = list(self.bd_ids)
         if self.fill:
             d["fill"] = self.fill
+        if self.receiver != "own":
+            d["receiver"] = self.receiver
         return d
 
 
@@ -1437,6 +1460,8 @@ def chain_validate(c: ChainCase) -> None:
     if c.bd_ids and (len(c.bd_ids) != len(c.mids) + 2 or len(set(c.bd_ids)) != len(c.bd_ids)
                      or not all(0 <= i < CHAIN_MAX_BDS for i in c.bd_ids)):
         raise ValueError(f"bd_ids: one distinct id in 0..{CHAIN_MAX_BDS - 1} per MM2S BD (head, mids, waiting BD)")
+    if c.receiver not in CHAIN_RECEIVERS or (c.receiver != "own" and c.releaser != "core"):
+        raise ValueError(f"receiver in {CHAIN_RECEIVERS}; a remote receiver only with the core releaser")
     if not 0 <= c.fill <= CHAIN_MAX_FILL or (c.fill and c.releaser != "core"):
         raise ValueError(f"fill in 0..{CHAIN_MAX_FILL}, and only with the core releaser")
     a, w = chain_buffers(c)[-1]
@@ -1496,6 +1521,7 @@ def chain_design_mlir(c: ChainCase) -> str:
         return s + f"      aie.next_bd ^{nxt}\n"
 
     ids = list(c.bd_ids) or [None] * (len(c.mids) + 2)
+    rx = "%t03" if c.receiver == "north" else "%t02"
     bds.append(bd("head", "%head_buf", c.head, "%lStart", "%lSync", names[1], ids[0]))
     for i, m in enumerate(c.mids):
         lock = None
@@ -1515,8 +1541,13 @@ def chain_design_mlir(c: ChainCase) -> str:
                f": memref<{w}xi32>")
     else:
         recv = bd("recv", "%dst", pre_words + w, None, None, "end")
-        dst = (f"    %dst = aie.buffer(%t02) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} "
+        dst = (f"    %dst = aie.buffer({rx}) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} "
                f": memref<{pre_words + w}xi32>")
+    remote = c.receiver == "north"
+    s2mm_block = f"    ^recv_start:\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n{recv}"
+    t03 = "    %t03 = aie.tile(0, 3)\n" if remote else ""
+    remote_mem = ("    %mem03 = aie.mem(%t03) {\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
+                  f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
@@ -1526,13 +1557,13 @@ def chain_design_mlir(c: ChainCase) -> str:
   aie.device(npu1_1col) {{
     %t00 = aie.tile(0, 0)
     %t02 = aie.tile(0, 2)
-    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
+{t03}    %src = aie.buffer(%t02) {{address = {FETCH_SRC_ADDR} : i32, sym_name = "src", initial_value = dense<[{ramp}]> : tensor<{w}xi32>}} : memref<{w}xi32>
     %ldbuf = aie.buffer(%t02) {{address = {FETCH_LD_ADDR} : i32, sym_name = "ldbuf", initial_value = dense<[{ld}]> : tensor<16xi32>}} : memref<16xi32>
 {nl.join(lines)}
 {dst}
     %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
 {nl.join(locks)}
-    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    aie.flow(%t02, DMA : 0, {rx}, DMA : 0)
     func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
     aie.core(%t02) {{
       func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
@@ -1540,13 +1571,11 @@ def chain_design_mlir(c: ChainCase) -> str:
     }}
     %mem = aie.mem(%t02) {{
       %c1 = arith.constant 1 : i32
-      %s0 = aie.dma_start(MM2S, 0, ^head, ^recv_start)
-{"".join(bds)}    ^recv_start:
-      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)
-{recv}    ^end:
+      %s0 = aie.dma_start(MM2S, 0, ^head, {"^end" if remote else "^recv_start"})
+{"".join(bds)}{"" if remote else s2mm_block}    ^end:
       aie.end
     }}
-    aie.runtime_sequence(%dummy: memref<4xi32>) {{
+{remote_mem}    aie.runtime_sequence(%dummy: memref<4xi32>) {{
       %c_zero = arith.constant 0 : i32
       %c_one = arith.constant 1 : i32
       aiex.set_lock(%lStart, %c_one)
@@ -1567,10 +1596,12 @@ def chain_row(events) -> dict:
     """One run relative to g0, the head BD's grant (the cycle after its START wait, the first MM2S STALLED_LOCK
     run, falls). Every later STALLED_LOCK run, every MM2S/S2MM FINISHED_BD, the lock-A releases and ACQ_GE events
     (memory-module timer) and the first INSTR_EVENT_0/1 (core timer; one time base on this tile) are kept."""
-    mem, core = {}, {}
+    mem, core, north = {}, {}, {}
     for e in events:
         if e.row == FETCH_ROW:
             (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
+        elif e.row == FETCH_ROW + 1 and e.pkt_type == PT_MEM:      # a remote receiver's memory module
+            north.setdefault(e.name, []).append(e.ts)
     runs = _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", []))
     if not runs:
         return {"g0": None}
@@ -1579,9 +1610,18 @@ def chain_row(events) -> dict:
     def rel(name, src=mem):
         return [t - g0 for t in sorted(set(src.get(name, [])))]
     ev0, ev1 = rel("INSTR_EVENT_0", core), rel("INSTR_EVENT_1", core)
-    return {"g0": g0, "stalls": [(a - g0, b - g0) for a, b in runs[1:]], "fins": rel("DMA_MM2S_0_FINISHED_BD"),
-            "rel_a": rel("LOCK_0_REL"), "acq_a": rel("LOCK_SEL0_ACQ_GE"), "s2mm_fins": rel("DMA_S2MM_0_FINISHED_BD"),
-            "ev0": ev0[0] if ev0 else None, "ev1": ev1[0] if ev1 else None}
+    s2mm = rel("DMA_S2MM_0_FINISHED_BD", north) if "DMA_S2MM_0_FINISHED_BD" in north else rel("DMA_S2MM_0_FINISHED_BD")
+    out = {"g0": g0, "stalls": [(a - g0, b - g0) for a, b in runs[1:]], "fins": rel("DMA_MM2S_0_FINISHED_BD"),
+           "rel_a": rel("LOCK_0_REL"), "acq_a": rel("LOCK_SEL0_ACQ_GE"), "s2mm_fins": s2mm,
+           "ev0": ev0[0] if ev0 else None, "ev1": ev1[0] if ev1 else None}
+    # optional level events (traced with --memmod-event-add): runs relative to g0; a remote receiver's on its own
+    # memory-module timer, which is not aligned with (0,2)'s
+    for key, name, src in (("s2mm_starv", "DMA_S2MM_0_STREAM_STARVATION", mem),
+                           ("mm2s_mstarv", "DMA_MM2S_0_MEMORY_STARVATION", mem),
+                           ("s2mm_starv_remote", "DMA_S2MM_0_STREAM_STARVATION", north)):
+        if name in src:
+            out[key] = [(a - g0, b - g0) for a, b in _runs(src[name])]
+    return out
 
 
 def format_chain_table(rows) -> str:
@@ -1594,8 +1634,11 @@ def format_chain_table(rows) -> str:
             lines.append(f"{c.name} {run} no head wait (no STALLED_LOCK run)")
             continue
         st = "[" + " ".join(_interval(a, b) for a, b in r["stalls"]) + "]"
+        extra = "".join(f" {label} [" + " ".join(_interval(a, b) for a, b in r[key]) + "]"
+                        for key, label in (("s2mm_starv", "s2starv"), ("mm2s_mstarv", "mstarv"),
+                                           ("s2mm_starv_remote", "s2starv-north")) if key in r)
         lines.append(f"{c.name} {run} stalls {st} fins {ts(r['fins'])} relA {ts(r['rel_a'])} acqA {ts(r['acq_a'])} "
-                     f"s2mm {ts(r['s2mm_fins'])} ev0 {_num(r['ev0'])} ev1 {_num(r['ev1'])}")
+                     f"s2mm {ts(r['s2mm_fins'])} ev0 {_num(r['ev0'])} ev1 {_num(r['ev1'])}{extra}")
     return "\n".join(lines)
 
 
@@ -1611,7 +1654,8 @@ def chain_selection(args) -> list:
     pairs = [(0, 0)] if args.releaser == "s2mm" else [(a, b) for a in (args.d1s or [0]) for b in (args.d2s or [0])]
     ids = tuple(getattr(args, "bd_ids", None) or ())
     fill = getattr(args, "fill", 0) or 0
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill) for a, b in pairs]
+    receiver = getattr(args, "receiver", None) or "own"
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver) for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1684,7 +1728,7 @@ def add_chain_parsers(sub) -> None:
     ct.add_argument("runs", nargs="+")
     cb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                     help=MEMMOD_SWAP_HELP)
-    cb.add_argument("--memmod-event-add", default=None, metavar="NAME", help=MEMMOD_ADD_HELP)
+    cb.add_argument("--memmod-event-add", default=None, metavar="NAME", action=AddEventAction, help=MEMMOD_ADD_HELP)
     for sp in (cb, cr, ct):
         sp.add_argument("--mids", nargs="*", default=[], help="mid BDs: words, then c (core lock) or f (free lock)")
         sp.add_argument("--head", type=int, default=4, help="head BD words")
@@ -1694,6 +1738,8 @@ def add_chain_parsers(sub) -> None:
         sp.add_argument("--releaser", choices=("core", "s2mm"), default="core")
         sp.add_argument("--bd-ids", nargs="*", type=int, default=[],
                         help="bd_id of every MM2S BD in chain order (head, mids, waiting BD); default: aiecc assigns")
+        sp.add_argument("--receiver", choices=CHAIN_RECEIVERS, default="own",
+                        help="who takes the MM2S's stream: own (the loopback S2MM) or north (tile (0,3)'s S2MM)")
         sp.add_argument("--fill", type=int, default=0,
                         help="core releases of A after the tail: memory-module trace packet fillers (core releaser)")
 
@@ -2995,7 +3041,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="both = two loads (lfk/lfc); 0 or 1 = one load on that bank (lfa/lfb chained, lfd/lfe first-BD)")
     fb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                     help=MEMMOD_SWAP_HELP)
-    fb.add_argument("--memmod-event-add", default=None, metavar="NAME", help=MEMMOD_ADD_HELP)
+    fb.add_argument("--memmod-event-add", default=None, metavar="NAME", action=AddEventAction, help=MEMMOD_ADD_HELP)
     fb.add_argument("--lock-event-select", type=parse_lock_event_select, action="append", default=None,
                     metavar="N=LOCK_ID", help=LOCK_SELECT_HELP)
     fr = sub.add_parser("fetch-run", help="lock-to-fetch probe: run the built cases to TAG.BACKEND/")
