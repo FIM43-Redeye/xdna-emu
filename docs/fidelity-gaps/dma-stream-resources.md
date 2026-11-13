@@ -412,7 +412,9 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
     its payload (4 words: g + 0, then g + 6..9); on silicon header and payload are contiguous.
   - *First word at the receiving DMA.* The first word reaches the own-tile S2MM at g + 10 (silicon g + 9; the
     offer / route split is not separated), one cycle late.
-  - *S2MM finish.* The S2MM finishes at g + 74 against silicon's g + 78, 4 cycles early.
+  - *S2MM finish.* The S2MM finished at g + 74 against silicon's g + 78, 4 cycles early; the S2MM granule writer
+    (2026-11-13, "Compute S2MM after a lock grant") moves it 4 cycles later (the sync family's S2MM finish + 73 -> + 77,
+    silicon + 77); this probe was not re-scored.
   - *Choice, not measurement.* Unparked, nothing bounds the word clock's lead but the BDs and the staging
     (silicon: the ring camp needs the clock free once the parked BD presented its access; a stream-backpressured
     channel was not probed for a bound). A lock-started first BD's clock starting at START_TASK + 7 is also a
@@ -517,42 +519,30 @@ BD's grant g0 (its STALLED_LOCK falls).
     the waiting BD's bd_id pinned low against 7, and bd_id 7 at a shallow depth (`gen_dma_lock_probe.py chain-build
     --bd-ids`), A released early (the clock-limited finish shows the sequencing start) and late over three
     consecutive cycles (Q mod 3).
-  - *A run's first lock BD.* The law needs a previous BD or grant. A BD with neither (a task's first BD) is
-    requested every cycle from when it becomes the request target; one with a previous BD but no earlier grant in
-    the run takes Q = T + 3. Both are measured but not reproduced in phase: silicon grants a task's first BD at
-    release + 2 in 39 rows and + 3 in 12 (first-BD lock-fetch probe; the emulator always + 2), and the second
-    kind (the chained lock-fetch and arbitration probes' waiting BD) at + 2 or + 3 run to run for the same case
-    (lock-fetch 24 / 8 rows, arb m = 0 99 / 51), where the emulator's phase is fixed per case. The anchor of
-    silicon's phase there is not known, and it is not observable in the existing captures (2026-11-13): their
-    memory-module trace starts with the channel already parked (494 to 499 cycles before the release) and holds no
-    DMA-side stamp before the first grant; of the trace start, the absolute timer, the core's periodic counter
-    event and its first LOCK_STALL, none predicts the 51 first-BD rows (or the 174 arb and 324 chained lock-fetch
-    rows): no residue of any of them is + 3 only. Open; needs a DMA-side stamp before the first grant (START_TASK
-    in the memory-module trace, or a lock-free one-word head BD) with the release swept over at least six cycles.
-    Further evidence that the phase varies run to run (2026-11-13): four sibling bridge kernels whose out MM2S
-    starts at boot on its first lock BD and meets a core load after the release (`vec_nan_fp32_dense_add`,
-    `vec_nan_bf16_dense_add`, `vec_nan_fp32_dense_sub`, `vec_nan_bf16_dense_sub`, Peano, three silicon samples
-    each): silicon stamps CONFLICT_DM_BANK_0 at the last release pulse + 4, the emulator's slot, in 2 of 12
-    samples and at + 10 in 3 (where a + 3 grant's access at grant + 7 falls); the other 7 captures carry no
-    memory-module packet from the compute tile at all and so show nothing either way. The emulator stamps + 4
-    in all four kernels. Among the 5 captures that carry the packet the phase varies run to run; a 0 / 0 / 0
-    kernel (`vec_nan_bf16_dense_sub`) is three captures without the packet, not three samples without a
-    conflict.
-  - *Grant phase of a lock BD whose previous BD had refused accesses* (open, 2026-11-13). Silicon grants the
-    producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
-    `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
-    282, 283) and (release - previous grant) mod 3 taking all three values in `collide`. The emulator lands on the
-    lock port's blocked phase (release + 3) in 3 of the 14 scored `collide` transfers (the fifteenth has no
-    release pulse to score). It did so in 8 of 14 `sticky32` transfers too until the compute BD release moved to
-    FINISHED_BD + 3 (2026-11-13); since then all 14 are at release + 2, so the gap is `collide`'s three. Its
-    request Q = max(previous grant + 3, previous BD's third-to-last word sequenced + 3) sits at the previous grant
-    + 243 in every transfer, because the word clock runs at the access rate a granule or two ahead and never
-    reaches its cap. Tried and rejected: a grant-tied anchor (refuted by `collide`), a request anchored on the
-    previous BD's last access (refuted by the lock-timing rows: a free lock behind a 4-word head is granted at g + 3,
-    six 2-word free-lock BDs finish every 3 cycles, a free lock is granted five cycles before a 13-word lock-free
-    BD finishes), and a word-clock lead capped always (the parked rows fix the cap at 4 granules with latency 1,
-    which never binds mid-BD; it also breaks the ring camp). Needs a probe that refuses a controlled number of a
-    BD's accesses and sweeps the core's release of the next BD's lock over six or more cycles.
+  - *A run's first lock BD* (**modelled** 2026-11-13). Probe: the first-BD lock-fetch design with START_TASK in
+    the memory-module trace and the release moved one cycle at a time (`fetch-build --start-task`, 6 cases, 5 runs
+    each). Silicon grants it at release + 3 exactly when (release - START_TASK) mod 3 = 1, at + 2 on the other two
+    residues (30 / 30 runs); the run-to-run phase of the earlier rows is the release's jitter against the task
+    start. Now the run's first lock BD is gridded from the channel's first sequenced word (START_TASK + 7, the word
+    clock's start): grantable at no earlier cycle than before, blocked when (grant - that word) mod 3 = 2; the
+    emulator's six cases give + 3 exactly at residue 1. The chained form (a lock-free head before the lock BD) already
+    followed silicon's residue (+ 3 at residue 2, 14 / 14 rows with the release; emulator 6 / 6).
+    Four sibling bridge kernels whose out MM2S starts at boot on its first lock BD and meets a core load after
+    the release (`vec_nan_fp32_dense_add`, `vec_nan_bf16_dense_add`, `vec_nan_fp32_dense_sub`,
+    `vec_nan_bf16_dense_sub`, Peano, three silicon samples each) show both phases on silicon: CONFLICT_DM_BANK_0
+    at the last release pulse + 4 in 2 of 12 samples and at + 10 in 3; the other 7 captures carry no
+    memory-module packet from the compute tile and show nothing either way.
+  - *Grant phase of a lock BD whose previous BD had refused accesses* (**modelled** 2026-11-13). Probe: a 64-word
+    lock BD k, a core camp refusing r = 0..3 of its accesses early (granule 6) or late (its last bank-0 granule),
+    then BD k + 1 on a second core-released lock swept over six cycles (`refuse-build`, 48 cases, 3 runs). Silicon
+    grants BD k + 1 at release + 3 exactly when (release - BD k's FINISHED_BD) mod 3 = 2, 144 / 144 runs; anchored on
+    BD k's grant it fails 11 runs (the late r = 3 rows, whose FINISHED_BD moved by one). For a predecessor served as
+    presented the law's request already has that residue; now a lock BD whose predecessor had a refused access
+    counts its grid from that FINISHED_BD - 1 (`LockPort::note_finished`). Emulator: 48 / 48 cases on silicon's rule
+    (before 45, not rfl3s05 / s06 / s08); 102 of the 103 silicon runs whose release lands where the emulator's does
+    are identical in FINISHED_BD, grant, refusals and conflicts (the other is a silicon run that refused one access
+    fewer). Producer `collide`: 1098 conflicts, 18 stalls, 9 of 15 transfers colliding (silicon 1098 / 18 / 9 and
+    1103 / 20); `sticky32` 442 / 135 (silicon 443 / 136).
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
   - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). (The ring
@@ -629,6 +619,8 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   15 transfers identical to silicon r3, as before to r1, the same three transfers one cycle off. Held out:
   `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls, unchanged by the gap (with the lock law, same
   count: 545 / 157); 443 / 136 with the release at FINISHED_BD + 3; no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
+  With the grid anchored on a refused predecessor's FINISHED_BD (2026-11-13, lock-grant section): `collide` 1098 / 18 / 9
+  (silicon r1 and r2 exactly), `sticky32` 442 / 135.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
@@ -672,42 +664,62 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     load ports at once against a DMA, a configuration write by a single-word register write (counted as one
     access, like a line), whether a run that does not reset the array keeps counting, memory-tile banks (never
     arbitrated), and why the period is 5.
-## Compute S2MM timing (open, 2026-11-13)
+## Compute S2MM after a lock grant (modelled 2026-11-13, NPU1 silicon)
 
-The compute S2MM never got the treatment the MM2S got (word clock, lock request and grant law): most of its
-timing is still the model from before the lock law. What is known, by row:
+Probes: `tools/gen_dma_lock_probe.py` sl family (an own-tile MM2S feeds S2MM 0, whose 64-word BD is parked on a lock the
+core releases at R; chained after a lock-free 4-word head or the task's first BD; release swept over six cycles; held
+word count N = 4..20; one core load k cycles after the release on either bank; a core camping on bank 0, also routed to
+S2MM 1; 71 cases, 3 runs each) and `objectfifo_turns_walkers` re-traced with lock selectors (both channels' grants and
+finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterations). G is the cycle STALLED_LOCK falls.
 
-| S2MM timing | Status | Rows |
-|---|---|---|
-| BD lock release reaches the lock unit at FINISHED_BD + 3 | measured, modelled | chain family S2MM releasers s1n08..s1n32, 18 / 18 |
-| A refused write retries the next cycle and raises CONFLICT_DM_BANK, not MEMORY_BACKPRESSURE | measured, modelled | ring probe camps |
-| Grant of a chained S2MM BD after a core release | **old model**: granted in the cycle the release lands, first write the cycle after; never measured | none |
-| Where a granule's bank access falls among its words | **old model**: in the cycle its first word is written. Silicon, lock-free S2MM0 fed by an own-tile MM2S (ring `rgs0`, 3 runs): every bank-0 write 6 cycles later than the emulator's relative to the MM2S grant (8 of 8 writes per run); FINISHED_BD g + 78 / 79 against 74. `rgs1` (S2MM1, route DMA:0 -> DMA:1): + 8 on both, so the two channels disagree on finish after the last write | ring `rgs0` / `rgs1` |
-| First BD of a task, held on a lock with a full path, after its grant (G = its STALLED_LOCK fall, which in the emulator is the grant cycle) | **measured, not modelled**. Silicon: N <= 4 words finish at G + 4 (emulator G + 10); 21 <= N <= 50 at G + N - 8 (emulator G + N - 5); the source's STREAM_BACKPRESSURE falls at G + 6 (emulator G + 13); a 1-cycle STREAM_STARVATION at G + 3 (emulator none). The emulator pays lock_acquire_cycles 1 + memory_latency_cycles 5 + the first-BD start bonus 2 before its first write, none isolated on silicon for an S2MM. 5 <= N <= 20 has no row | onset probe `prod_own_nN`, 20 cases, 2 runs each, identical |
-| Lock-free first BD in a stream | measured: FINISHED_BD 5 cycles after the emulator's for 12..36 words | chain family s1n08..s1n32, 3 runs each |
-| S2MM STALLED_LOCK rise, STREAM_STARVATION until the first word | measured, open rows below | onset probes |
-
-One decomposition fits every S2MM0 row above (a word usable 4 cycles after it enters the ingress, a granule written
-the cycle after its last word is popped, FINISHED_BD 2 after the last write, a held first BD popping from grant + 1),
-but only by construction: five unknowns against five sums, with `rgs1`, one `rgs0` run's finish and the G + 3
-starvation pulse outside it and the backpressure fall needing a second propagation constant. Not modelled.
-
-**Two-channel conflicts in the object-FIFO turn designs.** `objectfifo_turns_walkers` and `objectfifo_channel_turns`
-(Peano), tile (0,2): the emulator raises CONFLICT_DM_BANK_2 / _3 20 / 14 and 2 / 3 times, silicon none in three
-samples. Every one is DMA against DMA: S2MM0 writing the next `a` row into its logical-bank-1 buffer at stream rate
-meets MM2S0's first accesses to the out row in the same logical bank (REL(out) + 4 and + 8); the core is parked in
-its acquire and presents no access. The core's own timeline is identical to silicon's (526 cycles from release to
-release, release pulses 5 apart), but silicon's iteration is 6 to 8 cycles longer on the DMA side: the a(2) acquire
-stalls 171 / 172 cycles in the first iterations and 173 from the fourth (all samples), the emulator 165 on every
-iteration. The count is a phase residue of period 8: holding the S2MM's chained BD k cycles after its grant
-(emulator-only sensitivity) gives the same counts at k = 8 as at k = 0, and zero or other counts at other residues,
-so these rows must not be used to fit a constant. Who wins the meeting sets the emulator's count, not its
-existence (B3 14 rather than 20: the rotor refuses S2MM0 at six first meetings). Three terms set the residue: the
-chained S2MM grant after a core release, the write placement among its words, and MM2S0's grant phase in that
-design (not traced). Rows the deciding probe needs: the turn design re-traced with both lock releases, both
-channels' STALLED_LOCK and FINISHED_BD and the bank conflicts on one memory-module timer; then a ring variant with a
-chained S2MM BD held on a core-released lock, the release swept, core loads k cycles after it on the S2MM's banks,
-the held word count swept 4..20, STREAM_STARVATION traced, on both S2MM channels.
+- **Silicon.** G = R + 2 or R + 3, never earlier (213 / 213 runs). The parked channel holds 16 words; it writes them a
+  granule per cycle at G + 2..5, alternating banks, and the streamed granules every 4 cycles from G + 10 (a core load
+  meets them there and nowhere else the sweep covers); FINISHED_BD one cycle after the last write (N = 4, 8, 12, 16, 20:
+  G + 3, 4, 5, 6, 11; 64 words G + 55, chained and first BD alike); the feeding MM2S's backpressure falls at G + 6; one
+  STREAM_STARVATION cycle at G + 2 when the BD wants more than it holds (N >= 20), none for N <= 16. With the camp the
+  writes of bank 0 are refused up to 4 cycles, but the ingress side does not change (backpressure fall + 6, starvation
+  + 2), and the finish moves to G + 57 (G + 56 in the other grant phase). The grant's phase: in walkers the grant is
+  R + 3 exactly when (R - the channel's previous grant) mod 3 = 2, 119 / 119 iterations (anchored on the previous
+  FINISHED_BD it fails); in sl the channel is parked before the trace starts and the anchor is not visible.
+- **Model.** `S2mmPort` (`src/device/dma/s2mm_port.rs`): the S2MM acquire sees a release from the cycle after it
+  arrived and holds the grant one cycle after the arbiter gives it, as the MM2S lock port, on the same 3-cycle grid
+  counted from the previous grant + 2 (`dma.s2mm_lock_grid_after_grant_cycles`, fitted on walkers) or, for the task's
+  first lock BD, from where a compute MM2S's word clock would start (a choice). First write at G + 2
+  (`dma.s2mm_lock_to_write_cycles`), with no lock-acquire countdown, memory latency or start bonus. The granule writer
+  (`DmaEngine::compute_s2mm_cycle`): a granule leaves the ingress once each of its words has been there 4 cycles
+  (`dma.s2mm_ingress_to_write_cycles`, fitted: only entry-to-write is constrained), one per cycle, into a write queue of
+  4 granules (`dma.s2mm_write_queue_granules`; at least 3 needed by the camp, 4 a choice) written from its head one
+  per cycle, a refused write retried while the ingress side runs on; after a refused write a granule not ready before
+  it comes 2 cycles later (the MM2S late-granule gap); FINISHED_BD one cycle after the last write
+  (`dma.s2mm_write_to_finish_cycles`). STREAM_STARVATION while the writer runs: the BD wants words its ingress does not
+  hold, the ingress has room and no word entered; one level with the lock-wait starvation (inferred: the G + 2 pulse
+  is the first write freeing room the registered ready shows a cycle later). The one-BD-lookahead accept gate stays
+  open while the previous BD's words are being written. Applies to every plain compute S2MM BD (lock or not);
+  decompression, finish-on-TLAST and out-of-order keep the word path.
+- **Result (emulator).** sl, each silicon run against the emulator run of its case at the same grant phase: release
+  sweep 14 / 14, N sweep 9 / 9, k sweep 91 / 91 identical in finish, backpressure fall, starvation and both banks'
+  conflict stamps (before: no run at silicon's phase, the grant was R + 0; finish 50 / 58, backpressure 5 / 13, no
+  starvation); with the task anchor shifted (a local debug build, not committed) the emulator gives the other phase,
+  and every one of the 213 silicon runs has an identical emulator run at its phase: fit 201 / 201, camp on S2MM 0
+  6 / 6 (held out until its finish missed by one; the late-granule gap closed it).
+  Walkers: S2MM grant equal on 36 / 38 / 36 of 40 iterations (before 0), FINISHED_BD + 55 / 120 / 185 against
+  silicon's + 56 / 121 / 186 (before + 50 / 115 / 180), iteration 718 cycles against 719 (before 711), conflict stamps
+  19 at silicon's slot (REL(out) + 6) against 0 / 1 / 1 (before 34 at + 4 / + 8). Sync family S2MM finish after the
+  waiting BD's grant + 77 (22 cases), + 78, + 79 (before + 73..75). The ring rows `rgs0` / `rgs1` now match at the
+  emulator's phase (ring 30 / 48, before 23).
+- **Still different (open gaps).**
+  - *S2MM 1 route.* The camp routed MM2S 0 -> S2MM 1: silicon's backpressure falls at G + 15, a second starvation cycle
+    at G + 9, and the streamed writes one cycle later from granule 6; the emulator gives the S2MM 0 numbers (+ 8,
+    + 2 only). The finish matches. Route-side, not modelled.
+  - *Walkers' last cycle.* Silicon's first FINISHED_BD per grant is + 56 from the fourth iteration, + 55 before it at
+    the same grant phase: one cycle of the feed (the memtile MM2S restart), upstream of the S2MM; the emulator stays at
+    + 55, so its iteration is one cycle short and its write grid meets MM2S 0 at REL(out) + 6 every second iteration.
+  - *The task's first lock BD's grid* is a choice (no row shows its anchor).
+  - *Lock-free first BD.* The start costs before the first write of a lock-free first BD (memory latency and start
+    bonus) are unchanged; the S2MM finish of the START_TASK probe is + 79 / 80 after the release against silicon's
+    + 80 / 81 (before + 75 / 76).
+  - *Not measured.* Where the 4 cycles from ingress to write sit, why silicon pulses STREAM_STARVATION at G + 2, a
+    write queue deeper refusal, the memtile and shim S2MM.
 
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
