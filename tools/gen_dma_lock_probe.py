@@ -119,6 +119,16 @@ backpressure fall, STREAM_STARVATION and the conflict stamps, all relative to th
     python3 tools/gen_dma_lock_probe.py sl-run OUT_DIR TAG --backend hw|emu [--names ...]
     python3 tools/gen_dma_lock_probe.py sl-table OUT_DIR RUN [RUN ...] [--names ...]
 
+Memtile-fed lock-held S2MM probe (`mq-build`, `mq-run`, `mq-table`, `mq-packets`; cases mqq / mqm, mq{q|m}kKK,
+mqtTTT, 17 in all): a parked memtile MM2S feeds the lock-held compute S2MM; the memtile is quiet (q), filled from the
+shim through the release (m) or until T cycles before the feed's restart (t). Does a quiet memtile delay the restart?
+See the section comment above `MqCase`.
+
+    python3 tools/gen_dma_lock_probe.py mq-build OUT_DIR [--names mqq ...]
+    python3 tools/gen_dma_lock_probe.py mq-run OUT_DIR TAG --backend hw|emu [--names ...]
+    python3 tools/gen_dma_lock_probe.py mq-table OUT_DIR RUN [RUN ...] [--names ...]
+    python3 tools/gen_dma_lock_probe.py mq-packets OUT_DIR RUN [RUN ...] [--names ...]
+
     python3 tools/gen_dma_lock_probe.py fetch-build OUT_DIR [--ks 0 3 7] [--chained] [--banks both 0 1]
     python3 tools/gen_dma_lock_probe.py fetch-run OUT_DIR TAG --backend hw|emu [--ks ...] [--chained] [--banks ...]
     python3 tools/gen_dma_lock_probe.py fetch-table OUT_DIR RUN [RUN ...] [--ks ...] [--chained] [--banks ...]
