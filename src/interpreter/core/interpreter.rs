@@ -723,12 +723,9 @@ where
                 } else {
                     log::info!("Lock {} available, resuming execution", raw_lock_id);
                     self.status = CoreStatus::Ready;
-                    // Falling edge of the lock stall (held level), pairing with the
-                    // rising edge recorded when the executor held the bundle; one B..E
-                    // span of the real stall duration.
-                    let cycle = ctx.cycles;
-                    ctx.timing_context_mut()
-                        .record_event(cycle, EventType::LockStallLevel { active: false });
+                    // The LOCK_STALL level stays up through the grant's arbitration cycle
+                    // (and any resume-phase cycle): the executor lowers it when the held
+                    // bundle issues.
                     None
                 }
             }
@@ -1315,6 +1312,48 @@ mod tests {
             })
             .collect();
         assert_eq!(levels, vec![true, false], "one LOCK_STALL span over the whole wait");
+    }
+
+    /// LOCK_STALL stays up through the grant's arbitration cycle and falls when the held bundle
+    /// issues. Silicon (every sync / chain / lock-fetch probe run, 2625 of 2625, both resume
+    /// phases): INSTR_EVENT_0, the bundle after the held one, lands 2 cycles after the last
+    /// LOCK_STALL cycle.
+    #[test]
+    fn a_held_acquires_lock_stall_falls_when_the_held_bundle_issues() {
+        let mut interp = make_interpreter();
+        let mut ctx = ExecutionContext::new();
+        ctx.timing_context_mut().enable_tracing();
+        let mut tile = make_tile_with_program(&ACQ_GE2_PROGRAM);
+        tile.locks[15].value = 0;
+        for _ in 0..6 {
+            assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::Continue));
+        }
+        for _ in 0..4 {
+            assert!(matches!(interp.step(&mut ctx, &mut tile), StepResult::WaitLock { raw_lock_id: 63 }));
+        }
+        tile.locks[15].value = 2;
+        // The arbitration cycle, then any resume-phase cycle, then the held bundle.
+        let mut issue_cycle = None;
+        for _ in 0..3 {
+            let cycle = ctx.cycles;
+            if matches!(interp.step(&mut ctx, &mut tile), StepResult::Continue) {
+                issue_cycle = Some(cycle);
+                break;
+            }
+        }
+        let issue_cycle = issue_cycle.expect("the held bundle issued");
+        let edges: Vec<(u64, bool)> = ctx
+            .timing_context()
+            .events
+            .events()
+            .iter()
+            .filter_map(|e| match e.event {
+                EventType::LockStallLevel { active } => Some((e.cycle, active)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edges.len(), 2, "{edges:?}");
+        assert_eq!(edges[1], (issue_cycle, false), "falls at the held bundle's issue: {edges:?}");
     }
 
     // The core's cycle counter is its tile's timer: every engine step is one cycle,

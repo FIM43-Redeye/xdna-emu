@@ -87,6 +87,12 @@ pub struct CycleAccurateExecutor {
     /// resume phase of a held acquire), each one an engine step of its own.
     frozen_cycles: u8,
 
+    /// A held acquire was granted and its LOCK_STALL level is still up: it falls when the held
+    /// bundle issues, after the grant's arbitration cycle and any resume-phase cycle. Silicon
+    /// (every sync / chain / lock-fetch probe run, 2625 of 2625): INSTR_EVENT_0, the bundle after
+    /// the held one, lands 2 cycles after the last LOCK_STALL cycle, in both resume phases.
+    lock_stall_level_up: bool,
+
     /// The cycle each `vldb.4x` gather in flight freezes the core for its memory cycle
     /// (see `take_due_gather`).
     gather_freezes: smallvec::SmallVec<[u64; 2]>,
@@ -142,6 +148,7 @@ impl CycleAccurateExecutor {
             pending_lock: None,
             req_events_due: smallvec::SmallVec::new(),
             frozen_cycles: 0,
+            lock_stall_level_up: false,
             gather_freezes: smallvec::SmallVec::new(),
             bank_accesses: smallvec::SmallVec::new(),
             bank_freeze_at: None,
@@ -455,6 +462,7 @@ impl CycleAccurateExecutor {
         self.pending_lock = None;
         self.req_events_due.clear();
         self.frozen_cycles = 0;
+        self.lock_stall_level_up = false;
         self.gather_freezes.clear();
         self.bank_accesses.clear();
         self.bank_freeze_at = None;
@@ -895,6 +903,8 @@ impl CycleAccurateExecutor {
                     });
                     if p.held_since.is_none() {
                         ControlUnit::record_arbitration_pulse(ctx, last_pc);
+                    } else {
+                        self.lock_stall_level_up = true;
                     }
                     self.pending_lock = None;
                     ctx.record_stall(1);
@@ -921,6 +931,15 @@ impl CycleAccurateExecutor {
         // cycle after the request in a free pipeline, a cycle later when that one is frozen
         // by the requests' own arbitration cycle (silicon, acqacq_d3: REQ at c+1 and, for the
         // second request issued at c+3, at c+5 behind the LOCK_STALL pulse of c+4).
+        // The held bundle issues now: the LOCK_STALL level held over the wait, the grant's
+        // arbitration cycle and any resume-phase cycle falls here.
+        if self.lock_stall_level_up {
+            self.lock_stall_level_up = false;
+            let cycle = ctx.cycles;
+            ctx.timing_context_mut()
+                .record_event(cycle, EventType::LockStallLevel { active: false });
+        }
+
         self.report_lock_requests(ctx);
 
         // A cascade read issued five bundles ago holds this bundle until its word
