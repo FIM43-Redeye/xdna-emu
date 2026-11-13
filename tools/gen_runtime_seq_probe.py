@@ -27,6 +27,16 @@ START_TASK stamps when the controller resumed: S0 FINISHED_TASK -> marker START_
   w1_late_L<L>            the sync follows 64 plain writes, so the task has finished before the sync is reached
   w1_nosync_L<L>          control: the marker is pushed with no sync before it
 
+Closing tail (every case). After the measured section the sequence runs TAIL_ROUNDS rounds of one short
+loopback task per channel (M0, S0, M1, S1, each with a token) followed by a sync on all four channels, then the
+trailing writes. Every channel's last task is thus awaited by the sequence itself, so no data task can still be
+running when the sequence ends, whatever the controller's latencies. The tail's events also carry the measured
+events out of the trace's last packets: the trace S2MM writes the host buffer in 64-byte bursts and leaves a
+final sub-burst packet unwritten, so without a tail the last measured events (and the stop frame) can be
+missing on silicon. The tail does not change the measured section: its pushes come after the measured section's
+own syncs, its buffer slices lie above the measured ones, and its BDs reuse ids whose tasks the measured syncs
+have already seen finish.
+
 Reading the tables. A push's START_TASK stamps the push only while its channel is idle or prefetching
 a queued BD; a second task pushed to a busy channel can start later (same-channel cases). The `ops`
 column lists the opcodes strictly between a push's Task_Queue write32 and the previous one's: a push
@@ -56,6 +66,11 @@ PUSH_WORDS = 8
 MARKER_WORDS = 8
 LATE_FILL = 64
 TAIL_FILL = 32                       # plain writes after the last sync: every task is long done
+TAIL_ROUNDS = 3                      # closing rounds of one task per channel, each round synced on all four
+TAIL_WORDS = 8
+TAIL_ORDER = ("M0", "S0", "M1", "S1")
+TAIL_BD_IDS = (0, 1, 2, 3)           # free again: the measured syncs cover every measured task
+TAIL_MIN_EVENTS = 2 * 4 * TAIL_ROUNDS  # START + FINISHED per tail task: well over one trace packet of frames
 SCRATCH_REG = 0x000340F0             # Timer_Trig_Event_Low_Value of the carrier shim: writing 0 changes nothing
 DIM_LIMIT = 1000                     # inner dimension of a long BD stays under the hardware size field
 
@@ -77,6 +92,7 @@ class Push:
     ch: str
     words: int
     token: bool = True
+    tail: bool = False               # a closing-tail task, not part of the measured section
 
 
 @dataclass(frozen=True)
@@ -107,7 +123,7 @@ def _p_case(name: str, order: list[str], k: int = 0, tokens: str = "last") -> Ca
                  "s2mm": ch[0] == "S" and last[ch] == i}[tokens]
         steps.append(Push(ch, PUSH_WORDS, token))
     awaited = [ch for ch in EVENT_ORDER if ch in last and (tokens != "s2mm" or ch[0] == "S")]
-    steps += [Sync(ch) for ch in awaited] + [Fill(TAIL_FILL)]
+    steps += [Sync(ch) for ch in awaited] + closing_tail() + [Fill(TAIL_FILL)]
     return Case(name, "P", tuple(steps))
 
 
@@ -123,8 +139,18 @@ def _w_case(name: str, pairs: int, words: int, late: bool = False, nosync: bool 
         steps += [Sync("S0"), Push("M1", MARKER_WORDS, False)]
     if nosync:
         steps.append(Sync("S0"))
-    steps += [Sync("S1"), Fill(TAIL_FILL)]
+    steps += [Sync("S1"), *closing_tail(), Fill(TAIL_FILL)]
     return Case(name, "W", tuple(steps))
+
+
+def closing_tail() -> list:
+    """TAIL_ROUNDS rounds of one token-carrying task per channel, each round followed by a sync on every
+    channel: the sequence cannot end before every channel's last task has finished."""
+    steps: list = []
+    for _ in range(TAIL_ROUNDS):
+        steps += [Push(ch, TAIL_WORDS, True, tail=True) for ch in TAIL_ORDER]
+        steps += [Sync(ch) for ch in EVENT_ORDER]
+    return steps
 
 
 def plan() -> dict[str, Case]:
@@ -157,15 +183,23 @@ def pushes(case: Case) -> list[Push]:
     return [s for s in case.steps if isinstance(s, Push)]
 
 
+def measured_pushes(case: Case) -> list[Push]:
+    return [p for p in pushes(case) if not p.tail]
+
+
 def layout(case: Case) -> list[tuple[Push, int]]:
-    """(push, word offset in the host buffer): MM2S sources first, S2MM destinations after."""
-    src_total = sum(p.words for p in pushes(case) if p.ch[0] == "M")
-    nxt = {"M": 0, "S": src_total}
-    out = []
-    for p in pushes(case):
-        out.append((p, nxt[p.ch[0]]))
-        nxt[p.ch[0]] += p.words
-    return out
+    """(push, word offset in the host buffer), in push order: the measured section's MM2S sources first and its
+    S2MM destinations after (the offsets set 9 ran with), then the tail's sources and destinations above them."""
+    out = {}
+    base = 0
+    for group in (measured_pushes(case), [p for p in pushes(case) if p.tail]):
+        src_total = sum(p.words for p in group if p.ch[0] == "M")
+        nxt = {"M": base, "S": base + src_total}
+        for p in group:
+            out[id(p)] = nxt[p.ch[0]]
+            nxt[p.ch[0]] += p.words
+        base = nxt["S"]
+    return [(p, out[id(p)]) for p in pushes(case)]
 
 
 def buffer_words(case: Case) -> int:
@@ -201,8 +235,19 @@ def validate(case: Case) -> None:
             raise ValueError(f"{case.name}: path {path} sink {sunk[path]} words but source {fed[path]}: "
                              f"a task is never fed or never drained")
     for ch, i in last_push.items():
-        if ch[0] == "S" and awaited_after.get(ch, -1) < i:
+        if awaited_after.get(ch, -1) < i:
             raise ValueError(f"{case.name}: the last task of {ch} is never awaited (no sync after it)")
+        if not case.steps[i].token:
+            raise ValueError(f"{case.name}: the last task of {ch} carries no token, so no sync can cover it")
+    syncs_at = [i for i, s in enumerate(case.steps) if isinstance(s, Sync)]
+    if syncs_at and any(isinstance(s, Push) for s in case.steps[syncs_at[-1]:]):
+        raise ValueError(f"{case.name}: a push after the last sync")
+    tail = [s for s in case.steps if isinstance(s, Push) and s.tail]
+    if 2 * len(tail) < TAIL_MIN_EVENTS:
+        raise ValueError(f"{case.name}: closing tail of {len(tail)} tasks is too short to carry the trace out")
+    first_tail = next((i for i, s in enumerate(case.steps) if isinstance(s, Push) and s.tail), len(case.steps))
+    if any(isinstance(s, Push) and not s.tail for s in case.steps[first_tail:]):
+        raise ValueError(f"{case.name}: a measured push after the closing tail began")
 
 
 # -- MLIR -----------------------------------------------------------------------------------------------
@@ -228,6 +273,7 @@ def design_mlir(case: Case) -> str:
     lay = iter(layout(case))
     ident = {"S": 0, "M": 0}
     next_bd = iter(range(0, 16))
+    tail_bd = iter(TAIL_BD_IDS * TAIL_ROUNDS)
     for s in case.steps:
         if isinstance(s, Fill):
             body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count
@@ -238,7 +284,7 @@ def design_mlir(case: Case) -> str:
             tok = ", issue_token = true" if s.token else ""
             body.append(f"      aiex.npu.dma_memcpy_nd(%buf[{c(0)}, {c(0)}, {c(0)}, {c(off)}] "
                         f"[{c(1)}, {c(1)}, {c(outer)}, {c(inner)}] [{c(0)}, {c(0)}, {c(inner)}, {c(1)}]) "
-                        f"{{id = {next(next_bd)} : i64, metadata = @{sym}{tok}}} : {m}")
+                        f"{{id = {next(tail_bd) if s.tail else next(next_bd)} : i64, metadata = @{sym}{tok}}} : {m}")
         else:
             body.append(f"      aiex.npu.dma_wait {{symbol = @{CHANNELS[s.ch][2]}}}")
     events = [f"DMA_{CHANNELS[ch][0]}_{CHANNELS[ch][1]}_{what}_TASK" for ch in EVENT_ORDER
@@ -354,7 +400,7 @@ def push_rows(case: Case, events: list[dict], trace_start: int) -> list[dict]:
     that channel, and `gap` is the difference to the previous push's START."""
     seen: dict[str, int] = {}
     rows, prev = [], None
-    for p in pushes(case):
+    for p in measured_pushes(case):
         n = seen.get(p.ch, 0)
         seen[p.ch] = n + 1
         st = _stamps(events, p.ch, "START", trace_start)
@@ -372,7 +418,8 @@ def sync_rows(case: Case, events: list[dict], trace_start: int) -> list[dict]:
     s0_fin = _stamps(events, "S0", "FINISHED", trace_start)
     m1_start = _stamps(events, "M1", "START", trace_start)
     rows = []
-    for i, (a, b) in enumerate(zip(s0_start, s0_fin)):
+    n_pairs = sum(1 for p in measured_pushes(case) if p.ch == "S0")
+    for i, (a, b) in enumerate(list(zip(s0_start, s0_fin))[:n_pairs]):
         marker = m1_start[i] if i < len(m1_start) else None
         rows.append({"pair": i, "s0_start": a, "s0_fin": b, "transfer": b - a,
                      "marker": marker, "latency": None if marker is None else marker - b})
@@ -380,18 +427,35 @@ def sync_rows(case: Case, events: list[dict], trace_start: int) -> list[dict]:
 
 
 def finish_check(case: Case, events: list[dict], trace_stop: int | None) -> tuple[str, list[str]]:
-    """ok when every pushed task has its START and FINISHED event and the trace runs on past the last."""
+    """ok when every measured task has its START and FINISHED event and the trace runs on past the last of them.
+
+    With a closing tail the measured section ends before the tail's first push (M0) starts: the measured
+    section's own syncs cover every measured task. So each channel must show exactly its measured count of
+    START and FINISHED before that first tail START, and something must be traced after the last of them. The
+    tail's own events may be cut short on silicon (the trace's final sub-burst packet is left unwritten, which
+    is what the tail is for); the tail tasks' finish is proven by the sequence's syncs, not by the trace."""
     problems = []
+    has_tail = any(p.tail for p in pushes(case))
+    boundary = None
+    if has_tail:
+        first = TAIL_ORDER[0]
+        n_first = sum(1 for p in measured_pushes(case) if p.ch == first)
+        st = _stamps(events, first, "START", 0)
+        boundary = st[n_first] if len(st) > n_first else None
     last = 0
     for ch in EVENT_ORDER:
-        n = sum(1 for p in pushes(case) if p.ch == ch)
+        n = sum(1 for p in measured_pushes(case) if p.ch == ch)
         for what in ("START", "FINISHED"):
-            st = _stamps(events, ch, what, 0)
+            st = [t for t in _stamps(events, ch, what, 0) if boundary is None or t < boundary]
             if len(st) != n:
                 problems.append(f"missing {ch} {what}: {len(st)} of {n}")
             last = max([last, *st])
-    if not problems and (trace_stop is None or trace_stop <= last):
-        problems.append(f"tail: trace stop {trace_stop} not after the last FINISHED_TASK {last}")
+    if not problems:
+        if has_tail:
+            if boundary is None and (trace_stop is None or trace_stop <= last):
+                problems.append(f"tail: nothing traced after the last measured event {last}")
+        elif trace_stop is None or trace_stop <= last:
+            problems.append(f"tail: trace stop {trace_stop} not after the last FINISHED_TASK {last}")
     return ("finish ok" if not problems else "; ".join(problems)), problems
 
 

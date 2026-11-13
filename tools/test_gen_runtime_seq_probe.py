@@ -41,14 +41,14 @@ def test_plan_covers_the_requested_variables():
 def test_filler_count_is_the_independent_variable():
     c = case("p4_mm_k16")
     fills = [s for s in c.steps if isinstance(s, g.Fill)]
-    pushes = [s for s in c.steps if isinstance(s, g.Push)]
+    pushes = g.measured_pushes(c)
     assert len(pushes) == 4 and all(f.count == 16 for f in fills[:4])
     assert not [s for s in case("p4_mm").steps[:8] if isinstance(s, g.Fill)]
 
 
 def test_push_orders():
     def order(name):
-        return [s.ch for s in case(name).steps if isinstance(s, g.Push)]
+        return [s.ch for s in g.measured_pushes(case(name))]
     assert order("p2_mm") == ["M0", "S0"] and order("p2_ss") == ["S0", "M0"]
     assert order("p4_mm") == ["M0", "M1", "S0", "S1"]
     assert order("p4_il") == ["M0", "S0", "M1", "S1"]
@@ -90,8 +90,8 @@ def test_validate_requires_the_last_task_of_a_sink_to_be_awaited():
 
 def test_marker_sink_takes_every_marker():
     c = case("w4_L300")
-    s1 = [s for s in c.steps if isinstance(s, g.Push) and s.ch == "S1"]
-    m1 = [s for s in c.steps if isinstance(s, g.Push) and s.ch == "M1"]
+    s1 = [s for s in g.measured_pushes(c) if s.ch == "S1"]
+    m1 = [s for s in g.measured_pushes(c) if s.ch == "M1"]
     assert len(s1) == 1 and s1[0].words == sum(s.words for s in m1) == 4 * g.MARKER_WORDS
 
 
@@ -113,7 +113,7 @@ def test_buffer_is_sized_from_offset_plus_length():
 
 def test_sources_and_destinations_do_not_overlap():
     c = case("p8_mm")
-    lay = g.layout(c)
+    lay = [(p, o) for p, o in g.layout(c) if not p.tail]
     src = [(o, o + s.words) for s, o in lay if s.ch[0] == "M"]
     dst = [(o, o + s.words) for s, o in lay if s.ch[0] == "S"]
     assert max(e for _, e in src) <= min(b for b, _ in dst)
@@ -125,7 +125,7 @@ def test_sources_and_destinations_do_not_overlap():
 def test_mlir_has_one_memcpy_per_push_one_wait_per_sync_and_the_fillers():
     c = case("p4_mm_k4")
     text = g.design_mlir(c)
-    assert text.count("aiex.npu.dma_memcpy_nd") == 4
+    assert text.count("aiex.npu.dma_memcpy_nd") == len(g.pushes(c)) == 4 + 4 * g.TAIL_ROUNDS
     assert text.count("aiex.npu.dma_wait") == sum(isinstance(s, g.Sync) for s in c.steps)
     assert text.count("aiex.npu.write32") >= 16
     assert "aie.flow(%t00, DMA : 0, %t00, DMA : 0)" in text
@@ -245,3 +245,84 @@ def test_finish_check_needs_every_start_and_finish_and_a_tail():
     assert g.finish_check(c, full, trace_stop=9000)[0] == "finish ok"
     assert "missing" in g.finish_check(c, full[:-1], trace_stop=9000)[0]
     assert "tail" in g.finish_check(c, full, trace_stop=30)[0]
+
+
+# -- closing tail: every channel awaited, measured section unchanged ------------------------------------
+
+def test_every_channel_ends_on_an_awaited_token_task_before_the_trailing_writes():
+    for c in g.plan().values():
+        steps = c.steps
+        assert isinstance(steps[-1], g.Fill) and steps[-1].count == g.TAIL_FILL
+        last_sync = max(i for i, s in enumerate(steps) if isinstance(s, g.Sync))
+        assert not any(isinstance(s, g.Push) for s in steps[last_sync:])
+        assert {s.ch for s in steps[last_sync - 3:last_sync + 1]} == set(g.EVENT_ORDER)
+        for ch in g.EVENT_ORDER:
+            last = max(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.ch == ch)
+            assert steps[last].token and steps[last].tail
+            assert any(isinstance(s, g.Sync) and s.ch == ch for s in steps[last:])
+
+
+def test_validate_rejects_an_unawaited_mm2s_task():
+    bad = g.Case("bad", "P", (g.Push("M0", 8, False), g.Push("S0", 8, True), g.Sync("S0"), *g.closing_tail()[:-4]))
+    with pytest.raises(ValueError, match="await|token"):
+        g.validate(bad)
+
+
+def test_validate_rejects_a_case_without_the_closing_tail():
+    bad = g.Case("bad", "P", (g.Push("M0", 8, True), g.Push("S0", 8, True), g.Sync("M0"), g.Sync("S0")))
+    with pytest.raises(ValueError, match="tail"):
+        g.validate(bad)
+
+
+def legacy_layout(c):
+    """Set 9's layout of the measured pushes: sources first, destinations after."""
+    m = g.measured_pushes(c)
+    nxt = {"M": 0, "S": sum(p.words for p in m if p.ch[0] == "M")}
+    out = []
+    for p in m:
+        out.append(nxt[p.ch[0]])
+        nxt[p.ch[0]] += p.words
+    return out
+
+
+def test_measured_offsets_are_the_ones_set_9_ran_with_and_the_tail_lies_above():
+    for c in g.plan().values():
+        lay = g.layout(c)
+        measured = [o for p, o in lay if not p.tail]
+        assert measured == legacy_layout(c)
+        top = max(o + p.words for p, o in lay if not p.tail)
+        tail = sorted((o, o + p.words) for p, o in lay if p.tail)
+        assert tail[0][0] >= top
+        assert all(a[1] <= b[0] for a, b in zip(tail, tail[1:]))
+
+
+def test_tail_reuses_the_low_bd_ids_and_measured_ids_are_unchanged():
+    import re
+    c = case("w4_L300")
+    ids = [int(x) for x in re.findall(r"id = (\d+) : i64", g.design_mlir(c))]
+    n = len(g.measured_pushes(c))
+    assert ids[:n] == list(range(n))
+    assert ids[n:] == list(g.TAIL_BD_IDS) * g.TAIL_ROUNDS
+    assert max(ids) < 16
+
+
+def test_finish_check_accepts_a_tail_cut_short_but_not_a_measured_event_missing():
+    c = case("p2_mm")
+    measured = [ev("DMA_MM2S_0_START_TASK", 10), ev("DMA_MM2S_0_FINISHED_TASK", 40),
+                ev("DMA_S2MM_0_START_TASK", 20), ev("DMA_S2MM_0_FINISHED_TASK", 50)]
+    tail_part = [ev("DMA_MM2S_0_START_TASK", 900), ev("DMA_MM2S_1_START_TASK", 1900)]
+    assert g.finish_check(c, measured + tail_part, trace_stop=None)[0] == "finish ok"
+    assert "missing" in g.finish_check(c, measured[1:] + tail_part, trace_stop=None)[0]
+    assert "tail" in g.finish_check(c, measured, trace_stop=None)[0]
+    no_fin = [e for e in measured if e["name"] != "DMA_S2MM_0_FINISHED_TASK"]
+    tail_fin = tail_part + [ev("DMA_S2MM_0_START_TASK", 1000), ev("DMA_S2MM_0_FINISHED_TASK", 1100)]
+    assert "missing S0 FINISHED" in g.finish_check(c, no_fin + tail_fin, trace_stop=None)[0]
+
+
+def test_sync_rows_ignore_the_tail_tasks_of_s0():
+    c = case("w1_L300")
+    events = [ev("DMA_S2MM_0_START_TASK", 100), ev("DMA_S2MM_0_FINISHED_TASK", 500),
+              ev("DMA_MM2S_1_START_TASK", 4500),
+              ev("DMA_S2MM_0_START_TASK", 9000), ev("DMA_S2MM_0_FINISHED_TASK", 9100)]
+    rows = g.sync_rows(c, events, trace_start=0)
+    assert len(rows) == 1 and rows[0]["latency"] == 4000
