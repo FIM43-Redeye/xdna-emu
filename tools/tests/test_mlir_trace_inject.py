@@ -777,3 +777,83 @@ def test_routing_omits_egress_until_trace_prepare_reads_it_back(tmp_path):
     routing = json.loads(cfg_path.read_text())["routing"]
     assert "shim_col" not in routing
     assert "shim_dma_channel" not in routing
+
+
+# ---------------------------------------------------------------------------
+# Compute-tile memory-module lock selectors (--memmod-sel-locks)
+# ---------------------------------------------------------------------------
+
+
+def _inject_memmod_selection(tmp_path, spec, *extra):
+    import json
+
+    out = tmp_path / "out.mlir"
+    cfg_path = tmp_path / "trace_config.json"
+    args = ["--input", str(UNTRACED), "--out", str(out), "--trace-config-out", str(cfg_path),
+            "--memmod-sweep-events", "LOCK_0_REL,LOCK_1_REL,LOCK_2_REL,DMA_S2MM_0_STALLED_LOCK",
+            *extra]
+    if spec is not None:
+        args += ["--memmod-sel-locks", spec]
+    r = _run(args, check=False)
+    return r, out, cfg_path
+
+
+def test_memmod_sel_locks_default_off(tmp_path):
+    """Without --memmod-sel-locks the memory module's Locks_Event_Selection_<n> stay at reset
+    (lock 0 for every n) and the trace config carries no selection record."""
+    r, out, cfg_path = _inject_memmod_selection(tmp_path, None)
+    assert r.returncode == 0, r.stderr
+    import json
+    assert "sel_mem" not in out.read_text() and "Locks_Event_Selection" not in out.read_text()
+    assert all("selection" not in t for t in json.loads(cfg_path.read_text())["tiles_traced"])
+
+
+def test_memmod_sel_locks_is_a_memory_module_trace_config_started_first(tmp_path):
+    r, out, _ = _inject_memmod_selection(tmp_path, "LOCK_SEL1:1,LOCK_SEL2:3@2")
+    assert r.returncode == 0, r.stderr
+    text = out.read_text()
+    assert "aie.trace.config @sel_mem_0_2" in text
+    assert "aie.trace.config @sel_mem_0_2(%tile_0_2) packet_type = mem {" in text   # memory-module registers
+    assert 'register = "Locks_Event_Selection_1" field = "Lock_Select" value = 1' in text
+    assert 'register = "Locks_Event_Selection_2" field = "Lock_Select" value = 3' in text
+    assert 'register = "Locks_Event_Selection_2" field = "Lock_Value" value = 2' in text
+    starts = [ln.strip() for ln in text.splitlines() if "aie.trace.start_config" in ln]
+    assert starts[0] == "aie.trace.start_config @sel_mem_0_2", starts
+
+
+def test_memmod_sel_locks_lowers_to_the_memory_module_register_offsets(tmp_path):
+    """Locks_Event_Selection_<n> of the memory module is 0x1F100 + 4n: Lock_Select in bits 19:16,
+    Lock_Value in 5:0 (reset 0x3F)."""
+    r, out, _ = _inject_memmod_selection(tmp_path, "LOCK_SEL1:1,LOCK_SEL2:3@2")
+    assert r.returncode == 0, r.stderr
+    writes = _lower_selection_writes(out.read_text())
+    assert writes[:2] == [(0x1F104, (1 << 16) | 0x3F, 0, 2), (0x1F108, (3 << 16) | 2, 0, 2)], writes[:3]
+    assert all(w[0] not in (0x1F104, 0x1F108) for w in writes[2:])      # before any trace-unit write
+
+
+def test_memmod_sel_locks_recorded_in_trace_config(tmp_path):
+    import json
+    import trace_config
+
+    r, out, cfg_path = _inject_memmod_selection(tmp_path, "LOCK_SEL1:1")
+    assert r.returncode == 0, r.stderr
+    cfg = json.loads(cfg_path.read_text())
+    trace_config.validate(cfg)
+    (mem,) = [t for t in cfg["tiles_traced"] if t.get("module") == "mem"]
+    assert mem["selection"] == {"locks": {"LOCK_SEL1": {"lock": 1, "value": 63}}}
+    assert all("selection" not in t for t in cfg["tiles_traced"] if t.get("module") != "mem")
+
+
+def test_memmod_sel_locks_without_memmod_trace_is_ignored_with_warning(tmp_path):
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(UNTRACED), "--out", str(out), "--memmod-sel-locks", "LOCK_SEL1:1"], check=False)
+    assert r.returncode == 0
+    assert "ignored" in r.stderr and "sel_mem" not in out.read_text()
+
+
+@pytest.mark.parametrize("spec,message", [("LOCK_SEL1:16", "out of range"), ("LOCK_SEL8:1", "unknown slot"),
+                                          ("S2MM_SEL0:1", "no DMA"), ("LOCK_SEL1", "':'")])
+def test_memmod_sel_locks_rejects_bad_specs(tmp_path, spec, message):
+    r, _, _ = _inject_memmod_selection(tmp_path, spec)
+    assert r.returncode != 0
+    assert message in r.stderr.lower() or message in r.stderr

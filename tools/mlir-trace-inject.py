@@ -407,6 +407,15 @@ def parse_args():
                         "Register names and widths come from the AM025 "
                         "database; the choice is recorded in trace_config.json "
                         "(tiles_traced[].selection).")
+    p.add_argument("--memmod-sel-locks", default=None,
+                   help="compute-tile memory-module lock event selection: LOCK_n_REL / LOCK_SELn_* events "
+                        "follow Locks_Event_Selection_<n> (n = 0..7), which resets to lock 0 for every n, so "
+                        "a trace of the release of any other lock needs it programmed. Format: comma-separated "
+                        "'LOCK_SEL<n>:LOCK[@VALUE]' (VALUE is the Lock_Value trigger, default its reset value). "
+                        "Applied to every compute tile whose memory module is traced "
+                        "(--memmod-sweep-events); selector 0 may be programmed too, but leave it for lock 0. "
+                        "Example: 'LOCK_SEL1:3,LOCK_SEL2:5'. The choice is recorded in trace_config.json "
+                        "(the module=mem entries' selection).")
     p.add_argument("--shim-sweep-events", default=None,
                    help="comma-separated event names to sweep on shim. "
                         "Default (None): don't inject shim trace at all. "
@@ -597,6 +606,7 @@ def _build_trace_config(
     memmod_sweep: list[str],
     tiles: list[tuple[int, int, list[str], str | None]],
     memtile_selection: dict | None = None,
+    memmod_selection: dict | None = None,
 ) -> dict:
     """Construct the trace_config.json payload for the schema.
 
@@ -656,6 +666,9 @@ def _build_trace_config(
         # selection was programmed, i.e. every selector at its reset value.
         if kind == "memtile" and memtile_selection:
             entry["selection"] = memtile_selection
+        # The same for a compute tile's memory module (lock selectors only).
+        if kind == "core" and entry["module"] == "mem" and memmod_selection:
+            entry["selection"] = memmod_selection
         tiles_traced.append(entry)
 
     # MLIR-declared placement origin -- the smallest (col, row) corner of
@@ -708,8 +721,10 @@ def _build_trace_config(
     }
 
 
-def _emit_selection_config(aied, tile_val, selection, col: int, row: int) -> str:
-    """Emit an aie.trace.config that programs the memtile event selectors.
+def _emit_selection_config(aied, tile_val, selection, col: int, row: int, module: str = "memtile") -> str:
+    """Emit an aie.trace.config that programs the memtile event selectors (module "memtile") or the compute
+    tile's memory-module lock selectors (module "mem", whose registers mlir-aie looks up in the memory
+    module, so the config says packet type Mem).
 
     Uses mlir-aie's own register mechanism (aie.trace.reg with a register and
     field name): aie-trace-pack-reg-writes folds the fields of one register
@@ -718,9 +733,10 @@ def _emit_selection_config(aied, tile_val, selection, col: int, row: int) -> str
     """
     from aie.ir import InsertionPoint, IntegerAttr, IntegerType
 
-    sym = f"sel_memtile_{col}_{row}"
+    sym = f"sel_{module}_{col}_{row}"
     i32 = IntegerType.get_signless(32)
-    cfg = aied.trace_config(tile_val, sym)
+    cfg = (aied.trace_config(tile_val, sym, packet_type=aied.TracePacketType.Mem) if module == "mem"
+           else aied.trace_config(tile_val, sym))
     block = cfg.operation.regions[0].blocks.append()
     with InsertionPoint.at_block_begin(block):
         for w in selection.writes:
@@ -960,6 +976,20 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         args.memmod_sweep_events,
         _TRACE_DEFAULT_MEMMOD_EVENTS,
     ) if inject_memmod else []
+
+    # Lock selectors of the memory module (LOCK_n_REL follows Locks_Event_Selection_n): None leaves them at
+    # reset, i.e. every LOCK_n_REL watches lock 0. One aie.trace.config per traced compute tile, started ahead
+    # of the trace units like the memtile's.
+    try:
+        memmod_selection = trace_selectors.parse_lock_selection(
+            args.memmod_sel_locks, trace_selectors.load_compute_memory_registers())
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if memmod_selection is not None and not inject_memmod:
+        print("warning: --memmod-sel-locks given without --memmod-sweep-events; "
+              "no memory module is traced, so the selection is ignored", file=sys.stderr)
+        memmod_selection = None
 
     # Track every traced tile across all target devices for trace_config.json.
     # Tuple shape: (col, row, events, module). `module` is "core" or "mem"
@@ -1229,6 +1259,10 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
             #     but the perfcnt config emit path is core-only today.
             if inject_memmod:
                 for col, row, tile_val in memmod_tiles:
+                    if memmod_selection is not None:
+                        selection_syms.append(
+                            _emit_selection_config(aied, tile_val, memmod_selection, col, row, "mem"))
+
                     pkt_id = packet_id_counter
                     packet_id_counter += 1
 
@@ -1312,6 +1346,8 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         tiles=all_traced_tiles,
         memtile_selection=(memtile_selection.as_json()
                            if memtile_selection is not None else None),
+        memmod_selection=(memmod_selection.as_json()
+                          if memmod_selection is not None else None),
     )
     trace_config_dump(cfg, args.trace_config_out)
 

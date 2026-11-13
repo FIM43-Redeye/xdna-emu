@@ -290,6 +290,15 @@ the gap pattern gets closer is a "phase shift", not a regression
 scores or a broken exact match; rules are in the module docstring. Flags:
 `--only TEST ...`, `--hw-samples DIR ...`, `--json`.
 
+**Event overrides for one test** (environment, read by `emu-bridge-test.sh`; each applies to every compute tile of the
+tests it runs, so run it on one test): `XDNA_TRACE_MEMMOD_EVENTS` replaces the memory-module event list,
+`XDNA_TRACE_CORE_EVENTS`, `XDNA_TRACE_MEMTILE_EVENTS`, `XDNA_TRACE_SHIM_EVENTS` the others. A memory-module
+`LOCK_n_REL` follows `Locks_Event_Selection_n`, which resets to lock 0 for every n, so a release of any other lock
+needs `XDNA_TRACE_MEMMOD_SEL_LOCKS` (`trace-prepare.py --memmod-sel-locks`, `mlir-trace-inject.py --memmod-sel-locks`):
+`LOCK_SEL<n>:LOCK[@VALUE]` pairs, e.g. `LOCK_SEL1:4,LOCK_SEL2:5` with
+`XDNA_TRACE_MEMMOD_EVENTS=LOCK_1_REL,LOCK_2_REL,...`, recorded in `trace_config.json` as the `module: mem` entry's
+`selection`.
+
 Known limits (genuine, not harness bugs):
 
 - **Hardware trace budget**: packet ids are 5 bits, so at most 31 trace sources

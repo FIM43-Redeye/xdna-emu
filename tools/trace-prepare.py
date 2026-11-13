@@ -123,6 +123,7 @@ def inject_trace_declarative(
     memtile_sweep_events: str | None = None,
     memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
+    memmod_sel_locks: str | None = None,
     core_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> tuple[str, dict]:
@@ -182,6 +183,10 @@ def inject_trace_declarative(
         # alongside the core decl.
         if memmod_sweep_events is not None:
             cmd += ["--memmod-sweep-events", memmod_sweep_events]
+        # Opt-in lock selector programming for the memory module's LOCK_n_REL
+        # events (they follow Locks_Event_Selection_n, which resets to lock 0).
+        if memmod_sel_locks is not None:
+            cmd += ["--memmod-sel-locks", memmod_sel_locks]
         # Opt-in core sweep-event override. Default (None) keeps the injector's
         # own hard-coded core defaults (stall + lock-req events). Forwarding an
         # explicit list lets a caller trace core PORT_RUNNING_<N> (the S2MM/MM2S
@@ -330,6 +335,7 @@ def prepare_trace(
     memtile_sweep_events: str | None = None,
     memtile_sel_channels: str | None = None,
     memmod_sweep_events: str | None = None,
+    memmod_sel_locks: str | None = None,
     core_sweep_events: str | None = None,
     trace_mode: str | None = None,
 ) -> int:
@@ -425,6 +431,7 @@ def prepare_trace(
                 memtile_sweep_events=memtile_sweep_events,
                 memtile_sel_channels=memtile_sel_channels,
                 memmod_sweep_events=memmod_sweep_events,
+                memmod_sel_locks=memmod_sel_locks,
                 core_sweep_events=core_sweep_events,
                 trace_mode=trace_mode,
             )
@@ -593,6 +600,15 @@ def main():
              "alongside its core trace.",
     )
     parser.add_argument(
+        "--memmod-sel-locks",
+        default=None,
+        help="forward through to mlir-trace-inject's --memmod-sel-locks: "
+             "'LOCK_SEL<n>:LOCK[@VALUE]' pairs that program the compute-tile "
+             "memory module's Locks_Event_Selection_<n>, so LOCK_n_REL / "
+             "LOCK_SELn_* events can follow a lock other than lock 0. "
+             "Needs --memmod-sweep-events.",
+    )
+    parser.add_argument(
         "--core-sweep-events",
         default=None,
         help="forward through to mlir-trace-inject's --core-sweep-events. "
@@ -642,6 +658,7 @@ def main():
         memtile_sweep_events=args.memtile_sweep_events,
         memtile_sel_channels=args.memtile_sel_channels,
         memmod_sweep_events=args.memmod_sweep_events,
+        memmod_sel_locks=args.memmod_sel_locks,
         core_sweep_events=args.core_sweep_events,
         trace_mode=args.trace_mode,
     )

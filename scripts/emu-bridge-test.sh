@@ -1899,6 +1899,15 @@ compile_one() {
     if [[ -n "${XDNA_TRACE_MEMMOD_EVENTS:-}" ]]; then
       _memmod_args=("--memmod-sweep-events" "$XDNA_TRACE_MEMMOD_EVENTS")
     fi
+    # Optional override: program the compute tile memory module's lock event
+    # selectors, 'LOCK_SEL<n>:LOCK[@VALUE]' pairs. LOCK_n_REL / LOCK_SELn_*
+    # events follow Locks_Event_Selection_n, which resets to lock 0 for every
+    # n; without this a memmod trace can only see lock 0. Pair it with
+    # XDNA_TRACE_MEMMOD_EVENTS, e.g. LOCK_1_REL with LOCK_SEL1:4.
+    local _memmod_sel_args=()
+    if [[ -n "${XDNA_TRACE_MEMMOD_SEL_LOCKS:-}" ]]; then
+      _memmod_sel_args=("--memmod-sel-locks" "$XDNA_TRACE_MEMMOD_SEL_LOCKS")
+    fi
     # Optional override: explicit core (compute-tile) event slot list,
     # replacing the injector's hard-coded core defaults. Used to trace a
     # compute tile's PORT_RUNNING_<N> (S2MM/MM2S switch-port cadence) for
@@ -1915,6 +1924,7 @@ compile_one() {
         "${_memtile_args[@]}" \
         "${_memtile_sel_args[@]}" \
         "${_memmod_args[@]}" \
+        "${_memmod_sel_args[@]}" \
         "${_core_args[@]}" \
         "${_trace_mode_args[@]}" \
         > "$trace_log" 2>&1; then

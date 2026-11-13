@@ -76,6 +76,14 @@ def load_memtile_registers(regdb_path: str | Path | None = None) -> dict:
     return {r["name"]: r for r in data["modules"]["memory_tile"]["registers"]}
 
 
+def load_compute_memory_registers(regdb_path: str | Path | None = None) -> dict:
+    """The compute-tile memory module of the AM025 database as {register name: entry}."""
+    path = Path(regdb_path) if regdb_path else (
+        toolchain_paths.resolve_mlir_aie() / _REGDB_REL)
+    data = json.loads(path.read_text())
+    return {r["name"]: r for r in data["modules"]["memory"]["registers"]}
+
+
 def _field(regdb: dict, register: str, field: str) -> dict:
     reg = regdb.get(register)
     if reg is None:
@@ -181,3 +189,17 @@ def parse_selection(spec: str | None, regdb: dict) -> Selection | None:
         writes.append(RegWrite(reg, "Lock_Value", value))
     locks = {s: locks[s] for s in sorted(locks, key=lambda s: int(s[len("LOCK_SEL"):]))}
     return Selection(dma=dma, locks=locks, writes=tuple(writes))
+
+
+def parse_lock_selection(spec: str | None, regdb: dict) -> Selection | None:
+    """Parse a lock-only selection spec ('LOCK_SEL<n>:LOCK[@VALUE]', comma separated) against the compute-tile
+    memory module's register database. A compute tile's memory module raises LOCK_n_REL / LOCK_SELn_* events
+    that follow Locks_Event_Selection_<n> (n = 0..7) exactly as the memtile's do, but it has no DMA event
+    channel selection, so a DMA slot is an error rather than a write to a register that is not there."""
+    if spec:
+        for tok in spec.split(","):
+            slot = tok.split(":", 1)[0].strip().upper()
+            if slot in _DMA_SLOTS:
+                raise ValueError(f"selection: {slot} is a DMA slot; the compute tile memory module has no DMA "
+                                 "event channel selection (lock selectors only)")
+    return parse_selection(spec, regdb)

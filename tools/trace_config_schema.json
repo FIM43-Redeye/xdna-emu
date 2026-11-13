@@ -202,7 +202,7 @@
           "selection": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Memtile only, present only when the selector registers were programmed: what the SELn events watched in this run. Without it every selector sat at its reset value (DMA channel 0, lock 0). A DMA_S2MM_SEL0_* event means channel dma_channels.S2MM_SEL0; a LOCK_SEL0_* event means lock locks.LOCK_SEL0.lock.",
+            "description": "Memtile and compute-tile memory-module (module mem) entries only, present only when the selector registers were programmed: what the SELn events watched in this run. Without it every selector sat at its reset value (DMA channel 0, lock 0). A DMA_S2MM_SEL0_* event means channel dma_channels.S2MM_SEL0 (memtile only); a LOCK_SEL0_* event, or a memory module LOCK_0_REL, means lock locks.LOCK_SEL0.lock (LOCK_n_REL follows selector n).",
             "properties": {
               "dma_channels": {
                 "type": "object",
