@@ -6,7 +6,7 @@ Every `TimingModel` field with its provenance and verification verdict
 (`coverage/constants.rs`). The backlog lists what silicon contradicts or
 nothing has verified yet; settled values are toolchain-derived or measured.
 
-## Backlog (35)
+## Backlog (36)
 
 | Constant | Value | Provenance | Verification | Note |
 |----------|-------|------------|--------------|------|
@@ -43,6 +43,7 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `stream_switch.local_to_external_latency` | 4 | doc-specified | unverified | AM020 ch.2 '4-cycle, 8-deep'. Also used as the neighbour-tile data-memory latency (interpreter/timing/memory.rs), which AM020 gives no basis for. |
 | `stream_switch.external_to_local_latency` | 3 | doc-specified | unverified | AM020 ch.2. UNREAD: the ext->local path uses the local->local latency (equal value, 3, hides it). |
 | `stream_switch.packet_arbitration_overhead` | 1 | unspecified | unverified | Original estimate; AM020 ch.2 excludes it from the latency table and no capture exists. |
+| `broadcast.intra_tile_memtile_offset` | 2 | unspecified | unverified | The value the memory-module offset carried before it was re-measured (2). A memtile has no core module: nothing measures it against a core, so it is held, not calibrated. |
 | `instruction.data_memory_latency` | 5 | doc-specified | unverified | AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie AIE2Schedule.td LoadLatency 5 (marked FIXME there). |
 | `instruction.branch_penalty` | 3 | unspecified | unverified | Original estimate (~3 fetch stages); llvm-aie MispredictPenalty is 4 (FIXME). The executor deliberately adds no branch penalty (the delay slots are the flush), so its live effect is unclear. |
 
@@ -79,5 +80,5 @@ nothing has verified yet; settled values are toolchain-derived or measured.
 | `broadcast.per_hop_horizontal` | 4 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Horizontal isotropy assumed. |
 | `broadcast.per_hop_vertical` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Vertical isotropy assumed (blocked on the cold-start fill gap). |
 | `broadcast.intra_tile_core_offset` | 0 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Gauge-fixed at 0: only the core-memory contrast is observable. |
-| `broadcast.intra_tile_mem_offset` | 2 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- The add_one core-vs-memory-module signature contrast. |
+| `broadcast.intra_tile_mem_offset` | 1 | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Compute memory module against the core. Started at 2 as the raw add_one core-vs-memory event offset (which also held that pair's wall-clock separation); 1 since the core memory-access and lock-release placement was corrected, when two same-tile cross-unit pairs (lock release vs core event, core memory stall vs bank conflict) each read one cycle off silicon the same way. |
 | `broadcast.calibrated` | true | hardware-observed | silicon-verified | NPU1 R3b perf-counter skew sweep, N=20, drift range 0 (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, 2026-07-02-sp5c-phase0-identifiability.md) -- Flag: the constants above are a silicon calibration (SP-5c, reversible). |

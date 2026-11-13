@@ -319,7 +319,8 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         // intra-tile values on Phoenix silicon and the Phase-6 flip becomes
         // a reviewable JSON+regen diff. See the add_one signature
         // (core-memtile=+2, memmod-memtile=+4, core-memmod=-2) -- only the
-        // -2 intra-tile term lives here. `.expect()` is the build-fails-loud
+        // intra-tile term lives here (compute memory module 1 since the core
+        // placement fix, memtile 2; see skew_constants.json). `.expect()` is the build-fails-loud
         // guard: a future calibrated-with-null file panics the build here.
         broadcast: crate::skew_ingest::broadcast_timing_from_json(
             &serde_json::from_str::<serde_json::Value>(include_str!("../data/skew_constants.json"))
@@ -415,7 +416,10 @@ mod tests {
         assert_eq!(t.per_hop_horizontal, 4);
         assert_eq!(t.per_hop_vertical, 2);
         assert_eq!(t.intra_tile_core_offset, 0);
-        assert_eq!(t.intra_tile_mem_offset, 2);
+        // Compute memory module 1 (raw add_one offset 2, corrected one cycle after the core
+        // memory-access and lock-release placement fix, 2026-11-13); memtile keeps 2.
+        assert_eq!(t.intra_tile_mem_offset, 1);
+        assert_eq!(t.intra_tile_memtile_offset, 2);
     }
 
     /// Build a minimal ArchModel with one tile type, one module, and one

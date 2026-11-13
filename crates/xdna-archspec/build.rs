@@ -653,6 +653,12 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
+            "    pub const BROADCAST_INTRA_TILE_MEMTILE_OFFSET: u8 = {};",
+            t.broadcast.intra_tile_memtile_offset
+        )
+        .unwrap();
+        writeln!(
+            out,
             "    /// True once SP-5 has measured the per-hop/intra-tile constants\n    \
              /// above on silicon (BroadcastTiming::calibrated). EXPLICIT, not\n    \
              /// inferred from \"constants != 0\".",

@@ -624,6 +624,7 @@ impl DeviceState {
         d_v: u32,
         core_off: u32,
         mem_off: u32,
+        memtile_off: u32,
     ) -> Vec<(u8, u8, &'static str, u32)> {
         let mut out = Vec::new();
         for (c, r, origin_d) in self.broadcast_origin_d(col, source_row, channel, d_h, d_v) {
@@ -632,7 +633,7 @@ impl DeviceState {
                     out.push((c, r, "core", origin_d + core_off));
                     out.push((c, r, "mem", origin_d + mem_off));
                 }
-                Some(TileKind::Mem) => out.push((c, r, "memtile", origin_d + mem_off)),
+                Some(TileKind::Mem) => out.push((c, r, "memtile", origin_d + memtile_off)),
                 Some(TileKind::ShimNoc) | Some(TileKind::ShimPl) => {
                     out.push((c, r, "shim", origin_d + core_off))
                 }
@@ -642,15 +643,17 @@ impl DeviceState {
         out
     }
 
-    /// Effective broadcast-timing 4-tuple + calibrated: the runtime override if
-    /// set, else the compile-time archspec constants. (SP-5b, #140.)
-    pub(crate) fn effective_broadcast_timing(&self) -> (u32, u32, u32, u32, bool) {
+    /// Effective broadcast timing (d_h, d_v, core, compute-memory, memtile offsets) +
+    /// calibrated: the runtime override if set, else the compile-time archspec
+    /// constants. (SP-5b, #140.)
+    pub(crate) fn effective_broadcast_timing(&self) -> (u32, u32, u32, u32, u32, bool) {
         if let Some(o) = &self.broadcast_timing_override {
             (
                 o.per_hop_horizontal as u32,
                 o.per_hop_vertical as u32,
                 o.intra_tile_core_offset as u32,
                 o.intra_tile_mem_offset as u32,
+                o.intra_tile_memtile_offset as u32,
                 o.calibrated,
             )
         } else {
@@ -660,6 +663,7 @@ impl DeviceState {
                 bt::BROADCAST_PER_HOP_VERTICAL as u32,
                 bt::BROADCAST_INTRA_TILE_CORE_OFFSET as u32,
                 bt::BROADCAST_INTRA_TILE_MEM_OFFSET as u32,
+                bt::BROADCAST_INTRA_TILE_MEMTILE_OFFSET as u32,
                 bt::BROADCAST_CALIBRATED,
             )
         }
@@ -698,8 +702,8 @@ impl DeviceState {
     /// the runtime override if set (SP-5b measurement apparatus), else the
     /// compile-time archspec constants.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
-        let (d_h, d_v, core_off, mem_off, _cal) = self.effective_broadcast_timing();
-        self.propagate_broadcasts_with_timing(col, source_row, d_h, d_v, core_off, mem_off);
+        let (d_h, d_v, core_off, mem_off, memtile_off, _cal) = self.effective_broadcast_timing();
+        self.propagate_broadcasts_with_timing(col, source_row, d_h, d_v, core_off, mem_off, memtile_off);
     }
 
     pub(crate) fn propagate_broadcasts_with_timing(
@@ -710,6 +714,7 @@ impl DeviceState {
         d_v: u32,
         core_off: u32,
         mem_off: u32,
+        memtile_off: u32,
     ) {
         let current_cycle = self.array.current_cycle;
 
@@ -750,15 +755,29 @@ impl DeviceState {
             let reached = self.broadcast_origin_d(col, source_row, pb.channel, d_h, d_v);
 
             // max_delay over all reached modules: for each tile the worst-case
-            // intra-tile offset is core_off.max(mem_off), so both
-            // (max_delay - core_delay) and (max_delay - mem_delay) stay >= 0.
+            // intra-tile offset is the largest of the three, so every
+            // (max_delay - module_delay) stays >= 0. It is taken over all three
+            // offsets, whichever module kind a tile has, so that changing one
+            // module kind's offset moves only that kind's timers: max_delay is
+            // the common reference of every target, and shifting it would move
+            // every core, shim and memtile timer too.
             // At zero consts max_delay = 0 and every target = 0, byte-identical
             // to the pre-SP-1 behavior.
-            let max_delay = reached.iter().map(|&(_, _, o)| o + core_off.max(mem_off)).max().unwrap_or(0);
+            let max_delay = reached
+                .iter()
+                .map(|&(_, _, o)| o + core_off.max(mem_off).max(memtile_off))
+                .max()
+                .unwrap_or(0);
 
             for (c, r, origin_d) in reached {
                 let core_delay = origin_d + core_off;
-                let mem_delay = origin_d + mem_off;
+                // A memtile's single module carries its own offset; a compute tile's
+                // memory module carries `mem_off`.
+                let module_mem_off = match self.array.get(c, r).map(|t| t.tile_kind) {
+                    Some(TileKind::Mem) => memtile_off,
+                    _ => mem_off,
+                };
+                let mem_delay = origin_d + module_mem_off;
                 let core_target = (max_delay - core_delay) as u64;
                 let mem_target = (max_delay - mem_delay) as u64;
                 let tile = match self.array.get_mut(c, r) {
@@ -1512,7 +1531,7 @@ mod broadcast_wavefront_tests {
         // Single-source flood with nonzero synthetic constants so the table is
         // not all-zero. d_h=d_v=1, core_off=0, mem_off=2 (the -2 intra signature).
         let st = DeviceState::new_npu1();
-        let rows = st.origin_d_table(1, 0, /*channel*/ 15, 1, 1, 0, 2);
+        let rows = st.origin_d_table(1, 0, /*channel*/ 15, 1, 1, 0, 2, 2);
         // The shim source (1,0) has origin_D 0 -> shim delay 0.
         assert!(rows.iter().any(|&(c, r, k, d)| c == 1 && r == 0 && k == "shim" && d == 0));
         // A compute tile at Manhattan distance N has core_delay = N*1 + 0,
@@ -1563,7 +1582,7 @@ mod broadcast_flood_timing_tests {
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
         // d_v = 4: one vertical hop = 4 cy of skew. d_h, offsets = 0.
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0, 0);
         // One tick each consumes the latch -> value = target.
         dev.array.get_mut(src.0, src.1).unwrap().core_timer.tick();
         dev.array.get_mut(hop.0, hop.1).unwrap().core_timer.tick();
@@ -1586,6 +1605,7 @@ mod broadcast_flood_timing_tests {
             per_hop_vertical: 0,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            intra_tile_memtile_offset: 0,
             calibrated: false,
         }));
         let channel = 5u8;
@@ -1629,7 +1649,7 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([src]));
     }
 
@@ -1644,7 +1664,7 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(5));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0, 0);
         assert!(dev.flood_sources().is_empty(), "channel 5 must not be recorded as a flood source");
     }
 
@@ -1660,13 +1680,13 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(a.0, a.1, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(a.0, a.1, 0, 0, 0, 0, 0);
         dev.array
             .get_mut(b.0, b.1)
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(b.0, b.1, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(b.0, b.1, 0, 0, 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([a, b]));
     }
 
@@ -1733,16 +1753,76 @@ mod broadcast_timing_consts_tests {
     #[test]
     fn broadcast_timing_consts_are_calibrated() {
         use xdna_archspec::aie2::timing::{
-            BROADCAST_INTRA_TILE_CORE_OFFSET, BROADCAST_INTRA_TILE_MEM_OFFSET, BROADCAST_PER_HOP_HORIZONTAL,
-            BROADCAST_PER_HOP_VERTICAL,
+            BROADCAST_INTRA_TILE_CORE_OFFSET, BROADCAST_INTRA_TILE_MEMTILE_OFFSET,
+            BROADCAST_INTRA_TILE_MEM_OFFSET, BROADCAST_PER_HOP_HORIZONTAL, BROADCAST_PER_HOP_VERTICAL,
         };
         // SP-5c calibrated flip (2026-07-02): d_h=4/d_v=2 measured on Phoenix
-        // (free-flood R3b), intra core=0/mem=2 (add_one signature). Guards against
-        // an accidental revert to the uncalibrated zeros.
+        // (free-flood R3b). Guards against an accidental revert to the uncalibrated
+        // zeros. Intra-tile offsets: core 0 is the gauge. The compute memory module
+        // started at 2 (the raw add_one core-vs-memory event offset, which also held
+        // that pair's wall-clock separation as then placed) and is 1 since the core
+        // memory-access and lock-release placement was corrected (2026-11-13): lock
+        // release vs core event and core memory stall vs bank conflict then each read
+        // one cycle off silicon the same way, and per-tile paired offsets moved to
+        // silicon (tools/mem_core_offset.py). The memtile keeps 2: no core there to
+        // measure it against.
         assert_eq!(BROADCAST_PER_HOP_HORIZONTAL, 4);
         assert_eq!(BROADCAST_PER_HOP_VERTICAL, 2);
         assert_eq!(BROADCAST_INTRA_TILE_CORE_OFFSET, 0);
-        assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 2);
+        assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 1);
+        assert_eq!(BROADCAST_INTRA_TILE_MEMTILE_OFFSET, 2);
+    }
+
+    /// Changing the compute memory module's offset moves that module's timer and
+    /// nothing else: core, shim and memtile timers keep their reset targets, because
+    /// the reference every target is measured from does not depend on which module
+    /// kind the offset belongs to.
+    #[test]
+    fn compute_memory_offset_moves_only_that_module() {
+        use crate::device::tile::PendingBroadcast;
+        let origin_offsets = |mem_off: u32| {
+            let mut dev = crate::device::state::DeviceState::new_npu1();
+            dev.array
+                .get_mut(1, 0)
+                .unwrap()
+                .pending_broadcasts
+                .push(PendingBroadcast::originated(15));
+            // d_h 4, d_v 2, core 0, memtile 2 (as shipped); only the compute memory offset varies.
+            dev.propagate_broadcasts_with_timing(1, 0, 4, 2, 0, mem_off, 2);
+            // (core-side timer, memory-side timer); a shim and a memtile have only one real unit,
+            // and the unused one is not compared.
+            let at = |c, r| {
+                let t = dev.array.get(c, r).unwrap();
+                (t.core_trace.origin_offset(), t.mem_trace.origin_offset())
+            };
+            (at(1, 0), at(1, 1), at(1, 2), at(4, 5))
+        };
+        let (shim2, memtile2, compute2, far2) = origin_offsets(2);
+        let (shim1, memtile1, compute1, far1) = origin_offsets(1);
+        assert_eq!(shim1.0, shim2.0, "shim timer unchanged");
+        assert_eq!(memtile1.1, memtile2.1, "memtile timer unchanged");
+        assert_eq!(compute1.0, compute2.0, "compute core timer unchanged");
+        assert_eq!(compute1.1, compute2.1 + 1, "compute memory timer starts one cycle later");
+        assert_eq!(far1.0, far2.0);
+        assert_eq!(far1.1, far2.1 + 1);
+    }
+
+    /// A memtile timer follows `memtile_off`, not the compute memory module's `mem_off`.
+    #[test]
+    fn memtile_offset_is_independent_of_compute_memory_offset() {
+        use crate::device::tile::PendingBroadcast;
+        let memtile_origin = |mem_off: u32| {
+            let mut dev = crate::device::state::DeviceState::new_npu1();
+            dev.array
+                .get_mut(1, 0)
+                .unwrap()
+                .pending_broadcasts
+                .push(PendingBroadcast::originated(15));
+            dev.propagate_broadcasts_with_timing(1, 0, 4, 2, 0, mem_off, 2);
+            dev.array.get(1, 1).unwrap().mem_trace.origin_offset()
+        };
+        assert_eq!(memtile_origin(0), memtile_origin(2));
+        assert_eq!(memtile_origin(1), memtile_origin(2));
     }
 }
 
@@ -1765,7 +1845,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0); // d_v=4
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0, 0); // d_v=4
         let off_src = dev.array.get(src.0, src.1).unwrap().core_trace.origin_offset();
         let off_hop = dev.array.get(hop.0, hop.1).unwrap().core_trace.origin_offset();
         assert_eq!(off_src - off_hop, 4, "cross-tile origin offset diff == d_v");
@@ -1783,7 +1863,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2, mem_off=4
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4, 4); // core_off=2, mem_off=4
         let tile = dev.array.get(src.0, src.1).unwrap();
         let core = tile.core_trace.origin_offset();
         let mem = tile.mem_trace.origin_offset();
@@ -1811,7 +1891,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4); // core_off=2 -> nonzero offset
+        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4, 4); // core_off=2 -> nonzero offset
         let tile = dev.array.get(src.0, src.1).unwrap();
         let off = tile.core_trace.origin_offset();
         assert!(off > 0, "source core trace must receive a nonzero offset");
@@ -1848,6 +1928,7 @@ mod broadcast_origin_offset_tests {
             per_hop_vertical: 4,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
+            intra_tile_memtile_offset: 0,
             calibrated: false,
         }));
         dev.propagate_broadcasts(src.0, src.1);
@@ -1860,9 +1941,13 @@ mod broadcast_origin_offset_tests {
 
     #[test]
     fn effective_timing_reflects_calibrated_consts() {
-        // SP-5c flip: the shipped compile-time consts are now calibrated.
+        // SP-5c flip: the shipped compile-time consts are calibrated. Provenance of the
+        // intra-tile terms: core 0 is the gauge; the compute memory module is 1, from the
+        // raw add_one core-vs-memory offset (2) corrected by one cycle once the core
+        // memory-access and lock-release placement was fixed (2026-11-13, two same-tile
+        // cross-unit pairs one cycle off silicon the same way); the memtile keeps the old 2.
         let dev = DeviceState::new_npu1();
-        assert_eq!(dev.effective_broadcast_timing(), (4, 2, 0, 2, true));
+        assert_eq!(dev.effective_broadcast_timing(), (4, 2, 0, 1, 2, true));
     }
 
     #[test]
@@ -1903,6 +1988,7 @@ mod broadcast_origin_offset_tests {
             per_hop_vertical: 0,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 2,
+            intra_tile_memtile_offset: 2,
             calibrated: false,
         }));
         dev.propagate_broadcasts(src.0, src.1); // seam path (const-reading entry point)

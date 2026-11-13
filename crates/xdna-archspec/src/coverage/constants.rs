@@ -252,7 +252,8 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("broadcast.per_hop_horizontal", SKEW, "Horizontal isotropy assumed."),
         measured("broadcast.per_hop_vertical", SKEW, "Vertical isotropy assumed (blocked on the cold-start fill gap)."),
         measured("broadcast.intra_tile_core_offset", SKEW, "Gauge-fixed at 0: only the core-memory contrast is observable."),
-        measured("broadcast.intra_tile_mem_offset", SKEW, "The add_one core-vs-memory-module signature contrast."),
+        measured("broadcast.intra_tile_mem_offset", SKEW, "Compute memory module against the core. Started at 2 as the raw add_one core-vs-memory event offset (which also held that pair's wall-clock separation); 1 since the core memory-access and lock-release placement was corrected, when two same-tile cross-unit pairs (lock release vs core event, core memory stall vs bank conflict) each read one cycle off silicon the same way."),
+        unsourced("broadcast.intra_tile_memtile_offset", "The value the memory-module offset carried before it was re-measured (2). A memtile has no core module: nothing measures it against a core, so it is held, not calibrated."),
         measured("broadcast.calibrated", SKEW, "Flag: the constants above are a silicon calibration (SP-5c, reversible)."),
         // -- instruction --
         manual("instruction.data_memory_latency", "AM020 ch.4 '5-cycle latency of data memory'; agrees with llvm-aie \
