@@ -288,7 +288,14 @@ silicon's jitter does not gate; a repeatable row stays exact), and the
 the gap pattern gets closer is a "phase shift", not a regression
 (objectfifo_turns_walkers LOCK_STALL). Exit 1 on a row regressing on both
 scores or a broken exact match; rules are in the module docstring. Flags:
-`--only TEST ...`, `--hw-samples DIR ...`, `--json`.
+`--only TEST ...`, `--hw-samples DIR ...`, `--json`, `--no-offset`.
+
+The gate also reports, per (test, compiler, compute tile), the cross-module offset of
+`tools/mem_core_offset.py` (memory-module minus core-module trace timestamps, emulator relative to
+silicon), because a uniform shift of one module's timer moves no per-row score. A tile fails when the
+candidate's offset is farther from the band its silicon samples span than the baseline's by more than
+half a cycle; tiles measurable on one side only are "unmeasured", and tiles whose offset exceeds 16
+cycles (workload-dominated, not a timer quantity) are reported but not gated.
 
 **Event overrides for one test** (environment, read by `emu-bridge-test.sh`; each applies to every compute tile of the
 tests it runs, so run it on one test): `XDNA_TRACE_MEMMOD_EVENTS` replaces the memory-module event list,
