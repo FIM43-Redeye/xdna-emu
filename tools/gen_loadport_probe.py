@@ -12,9 +12,9 @@ store does raise it. One captured cycle cannot tell these readings apart:
 
 Every case is core-only: no DMA channel of the compute tile is configured, the core is started by the
 runtime sequence's go lock (as the lock-fetch probes), and ONE bundle holds the two accesses, so they reach
-their banks (issue + 4) in the same cycle. `event #0` / `event #1` bracket the meeting; `event #2` follows
-it; a `rel` of lock 0 right after `event #0` gives the memory module a LOCK_0_REL anchor (its timer is not
-the core's). Memory-module CONFLICT_DM_BANK_0..3 and the core's MEMORY_STALL are traced.
+their banks (issue + 4) in the same cycle. `event #0` / `event #1` bracket the meeting; a `rel` of lock 0
+right after `event #0` gives the memory module a LOCK_0_REL anchor (its timer is not the core's), and a
+second `rel` after the tail loop shows the core ran to its end (LOCK_0_REL x2). Memory-module CONFLICT_DM_BANK_0..3 and the core's MEMORY_STALL are traced.
 
 Data memory is eight physical 16-byte-interleaved banks in four 16 KB logical banks; `ldbuf` (0x800) is
 physical banks 0 / 1 and `far` (0x4800) 2 / 3. A 256-bit access is rounded down to 32 bytes, so its first
@@ -60,7 +60,7 @@ AFTER_NOPS = 4             # nops between the meeting and `event #1`
 PRIME_GAP = 8              # nops after each priming bundle
 CONFLICT_EVENTS = [f"CONFLICT_DM_BANK_{b}" for b in range(4)]
 MEM_EVENTS = ["LOCK_0_REL", *CONFLICT_EVENTS]
-CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "INSTR_EVENT_2", "INSTR_EVENT_3", "MEMORY_STALL"]
+CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "MEMORY_STALL"]   # `event` reaches only INSTR_EVENT_0 / _1
 CORE_GROUNDING = "PERF_CNT_2"
 # A conflict this far before the release (memory-module timer) belongs to the priming meetings.
 PRIME_SPLIT = -8
@@ -203,13 +203,12 @@ def prime_bundle(c: LoadPortCase) -> str:
 
 
 def core_asm(c: LoadPortCase) -> str:
-    """go, settle, [event #3, `prime` load+store bundles on the meeting bank], event #0, release lock A,
-    K_NOPS nops, the meeting bundle, event #1, event #2, tail. p0 = ldbuf, p1 = far, p2 = p0 + 32, dj0 = 0,
+    """go, settle, [`prime` load+store bundles on the meeting bank], event #0, release lock A,
+    K_NOPS nops, the meeting bundle, event #1, tail, a second release of lock A. p0 = ldbuf, p1 = far, p2 = p0 + 32, dj0 = 0,
     r2 = +1 (the stored value and the release), r3 = -1."""
     n = lp.nops
     prime = []
     if c.prime:
-        prime = ["  event #3"]
         for _ in range(c.prime):
             prime += [prime_bundle(c), *n(PRIME_GAP)]
     body = ["  mov r2, #1", "  mov r3, #-1", "  mov p2, p0", N, "  padda [p2], #32", N,
@@ -218,8 +217,8 @@ def core_asm(c: LoadPortCase) -> str:
             *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8),
             *prime,
             "  event #0", f"  rel #{OWN + LOCK_A}, r2", *n(K_NOPS),
-            meeting_bundle(c), *n(AFTER_NOPS), "  event #1", *n(4), "  event #2", *n(8),
-            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail")]
+            meeting_bundle(c), *n(AFTER_NOPS), "  event #1", *n(8),
+            *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail"), f"  rel #{OWN + LOCK_A}, r2", *n(4)]
     return lp.frame(body)
 
 
@@ -307,7 +306,7 @@ def _runs(stamps) -> list[tuple[int, int]]:
 def row(events) -> dict:
     """One run of tile (0,2). Core numbers are cycles after INSTR_EVENT_0 (core timer); conflicts are cycles
     after the first LOCK_0_REL (memory-module timer, another unit: the release follows `event #0` by about
-    4 to 5 cycles). Conflicts before the release (PRIME_SPLIT) and stalls before event #0 are the priming's."""
+    4 to 5 cycles). Conflicts before the release (PRIME_SPLIT) and stalls before INSTR_EVENT_0 are the priming's."""
     core: dict = {}
     mem: dict = {}
     for e in events:
@@ -318,8 +317,7 @@ def row(events) -> dict:
     ev0 = sorted(core.get("INSTR_EVENT_0", []))
     ev1 = sorted(core.get("INSTR_EVENT_1", []))
     r: dict = {"release": rel_stamps[0] if rel_stamps else None, "ev0": bool(ev0), "ev1": bool(ev1),
-               "ev2": bool(core.get("INSTR_EVENT_2")), "ev3": bool(core.get("INSTR_EVENT_3")),
-               "window": ev1[0] - ev0[0] if ev0 and ev1 else None,
+                              "window": ev1[0] - ev0[0] if ev0 and ev1 else None,
                "releases": len(rel_stamps), "memory_stalls": [], "prime_stalls": [], "conflicts": [],
                "prime_conflicts": []}
     if ev0:
@@ -338,16 +336,17 @@ def row(events) -> dict:
 
 def finish_missing(r: dict, c: LoadPortCase, halt: str | None) -> list[str]:
     """What a run lacks to count as finished: the emulator's halt reason (when known), the release anchor,
-    the core's markers (event #3 only in primed cases)."""
+    the core's markers and its release after the tail loop (LOCK_0_REL x2)."""
     out = []
     if halt is not None and halt != "completed":
         out.append(f"halt_reason={halt}")
     if r.get("release") is None:
         out.append("LOCK_0_REL")
-    for key, name, wanted in (("ev0", "INSTR_EVENT_0", True), ("ev1", "INSTR_EVENT_1", True),
-                              ("ev2", "INSTR_EVENT_2", True), ("ev3", "INSTR_EVENT_3", c.prime > 0)):
-        if wanted and not r.get(key):
+    for key, name in (("ev0", "INSTR_EVENT_0"), ("ev1", "INSTR_EVENT_1")):
+        if not r.get(key):
             out.append(name)
+    if r.get("release") is not None and r.get("releases") != 2:
+        out.append(f"core end: LOCK_0_REL x{r.get('releases')} (want 2)")
     return out
 
 

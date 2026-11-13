@@ -91,20 +91,20 @@ def test_the_kernel_marks_the_window_and_primes_only_when_asked():
     plain = g.core_asm(next(c for c in g.plan() if c.name == "la0"))
     primed = g.core_asm(next(c for c in g.plan() if c.name == "la1"))
     for text in (plain, primed):
-        assert text.count("event #0") == 1 and text.count("event #1") == 1 and text.count("event #2") == 1
+        assert text.count("event #0") == 1 and text.count("event #1") == 1
+        assert "event #2" not in text and "event #3" not in text      # `event` reaches only 0 and 1
         assert f"acq #{g.OWN + g.LOCK_GO}" in text
-        assert f"rel #{g.OWN + g.LOCK_A}" in text
-    assert "event #3" not in plain
-    assert primed.count("event #3") == 1
+        assert text.count(f"rel #{g.OWN + g.LOCK_A}") == 2       # the anchor, and the one that ends the kernel
     # the prime is a load and a store of one bank in one bundle, before event #0
-    assert primed.index("event #3") < primed.index("event #0")
+    assert "lda r27, [p0" not in plain
+    assert primed.index("lda r27, [p0") < primed.index("event #0")
     assert primed.count("lda r27, [p0") == 1 and primed.count("st r2, [p0, #0]") >= 1
 
 
 def test_the_meeting_bundle_sits_k_nops_after_the_release():
     c = next(c for c in g.plan() if c.name == "lb0")
     lines = g.core_asm(c).splitlines()
-    rel = next(i for i, l in enumerate(lines) if f"rel #{g.OWN + g.LOCK_A}" in l)
+    rel = next(i for i, l in enumerate(lines) if f"rel #{g.OWN + g.LOCK_A}" in l)   # the first
     bundle = next(i for i, l in enumerate(lines) if l == g.meeting_bundle(c))
     assert lines[rel + 1:bundle] == [g.N] * g.K_NOPS
 
@@ -178,18 +178,16 @@ def synth(core, mem):
 
 
 def test_a_row_reads_stalls_from_event_0_and_conflicts_from_the_release():
-    ev = synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020], "INSTR_EVENT_2": [1030],
-                "MEMORY_STALL": [1013]},
-               {"LOCK_0_REL": [500], "CONFLICT_DM_BANK_0": [511]})
+    ev = synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020], "MEMORY_STALL": [1013]},
+               {"LOCK_0_REL": [500, 1900], "CONFLICT_DM_BANK_0": [511]})
     r = g.row(ev)
     assert r["memory_stalls"] == [13]
     assert r["conflicts"] == [("CONFLICT_DM_BANK_0", 11)]
-    assert r["window"] == 20 and r["release"] == 500 and r["ev2"] is True
+    assert r["window"] == 20 and r["release"] == 500 and r["releases"] == 2
 
 
 def test_a_primed_run_keeps_the_prime_stamps_apart_from_the_measured_ones():
-    ev = synth({"INSTR_EVENT_3": [900], "INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020],
-                "INSTR_EVENT_2": [1030], "MEMORY_STALL": [920, 1013]},
+    ev = synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020], "MEMORY_STALL": [920, 1013]},
                {"LOCK_0_REL": [500], "CONFLICT_DM_BANK_0": [431, 511]})
     r = g.row(ev)
     assert r["memory_stalls"] == [13] and r["prime_stalls"] == [-80]
@@ -199,20 +197,18 @@ def test_a_primed_run_keeps_the_prime_stamps_apart_from_the_measured_ones():
 
 def test_the_finish_check_names_what_is_missing():
     c = next(c for c in g.plan() if c.name == "la1")
-    ok = g.row(synth({"INSTR_EVENT_3": [900], "INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020],
-                      "INSTR_EVENT_2": [1030]}, {"LOCK_0_REL": [500]}))
+    ok = g.row(synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020]}, {"LOCK_0_REL": [500, 1900]}))
     assert g.finish_missing(ok, c, halt="completed") == []
     bad = g.row(synth({"INSTR_EVENT_0": [1000]}, {"LOCK_0_REL": [500]}))
     missing = g.finish_missing(bad, c, halt="completed")
-    assert any("INSTR_EVENT_1" in m for m in missing) and any("INSTR_EVENT_2" in m for m in missing)
-    assert any("INSTR_EVENT_3" in m for m in missing)
+    assert any("INSTR_EVENT_1" in m for m in missing) and any("LOCK_0_REL x1" in m for m in missing)
     assert g.finish_missing(ok, c, halt="max_cycles")[0].startswith("halt_reason")
 
 
 def test_the_table_line_carries_stall_conflicts_loser_and_finish():
     c = next(c for c in g.plan() if c.name == "la0")
-    r = g.row(synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020], "INSTR_EVENT_2": [1030],
-                     "MEMORY_STALL": [1010]}, {"LOCK_0_REL": [500], "CONFLICT_DM_BANK_0": [510]}))
+    r = g.row(synth({"INSTR_EVENT_0": [1000], "INSTR_EVENT_1": [1020], "MEMORY_STALL": [1010]},
+                    {"LOCK_0_REL": [500, 1900], "CONFLICT_DM_BANK_0": [510]}))
     r["check"] = []
     text = g.format_table([(c, "e1.emu", r)])
     line = [l for l in text.splitlines() if l.startswith("la0")][0]
