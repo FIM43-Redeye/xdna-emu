@@ -683,7 +683,7 @@ def fetch_row(events) -> dict:
     row["conflicts"] = sorted(conflicts, key=lambda c: (c[1], c[0]))
     row["mm2s_finished"] = [t - rel for t in sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", []))) if t >= rel]
     row["mm2s_finished_all"] = [t - rel for t in sorted(set(mem.get("DMA_MM2S_0_FINISHED_BD", [])))]
-    row["s2mm_finished"] = [t - rel for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t >= rel]
+    row["s2mm_finished"] = [t - rel for t in sorted(set(mem.get(f"DMA_S2MM_0_FINISHED_BD", []))) if t >= rel]
     row["mm2s_start"] = [t - rel for t in sorted(set(mem.get(FETCH_START_EVENT, [])))]
     ev0 = sorted(core.get("INSTR_EVENT_0", []))
     row["core_event0"] = ev0[0] - rel if ev0 else None
@@ -2338,6 +2338,14 @@ def cmd_ring_table(args) -> int:
 #           release A; then nothing (`none`), one load from `ldbuf` k nops later at granule parity p (`load`: offset
 #           16 * p, physical bank p), or the 90-load camp on bank 0 (`camp`); then wait on B (the S2MM's release) and
 #           release A RING_FILL_RELEASES more times plus a tail, which fill the last trace packets (as the ring family).
+# Variants of the lock BD: `n` = its word count (first-BD variant swept over 4..20; the MM2S then sends exactly the
+# BDs' words, so there is no surplus word and no unfinished task), `ch` = the S2MM channel (the loopback routes
+# MM2S 0 to it; the camp is also run on S2MM 1, whose events replace S2MM 0's in the memory-module list).
+# The trace stops when the runtime sequence ends (the stop broadcast), FETCH_PAD_WRITES command-processor writes after
+# the go lock; the core's fill releases and tail run longer than the S2MM's finish, and the table's `tail` column is
+# the last LOCK_0_REL minus the S2MM FINISHED_BD (positive = the trace reaches past the finish and the core's
+# follow-up). The S2MM BD's own release of lock B is not a traced event (all eight slots are taken, selector 1 is
+# unprogrammed); the core getting past its wait on B and running its fill releases proves it happened.
 # Why it cannot hang: the core waits only on go (set by the sequence, which always reaches it) and on B, released by the
 # S2MM BD after the 64 words the MM2S sends; the MM2S is lock-free and the S2MM takes exactly its words; the sequence
 # waits on nothing in the tile.
@@ -2355,6 +2363,7 @@ SL_MEMMOD_EVENTS = ["LOCK_0_REL", "DMA_S2MM_0_STALLED_LOCK", "DMA_S2MM_0_FINISHE
                     "DMA_MM2S_0_STREAM_BACKPRESSURE", "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1",
                     "DMA_S2MM_0_STREAM_STARVATION", "DMA_S2MM_0_MEMORY_BACKPRESSURE"]
 SL_CORE_EVENTS = ["INSTR_EVENT_0", "LOCK_STALL"]
+SL_NS = (4, 8, 12, 16, 20)        # the first-BD variant's held word counts: no banked silicon row has 5..20
 
 
 @dataclass(frozen=True)
@@ -2364,23 +2373,32 @@ class SlCase:
     kind: str = "none"             # "none", "load" (one load k nops after the release) or "camp"
     k: int = 0
     p: int = 0                     # the load's granule parity = its physical bank (offset 16 * p)
+    n: int = FETCH_WORDS           # words of the lock-held BD
+    ch: int = 0                    # the S2MM channel (the loopback routes MM2S 0 to it)
 
     @property
     def name(self) -> str:
         stem = f"sl{'h' if self.head else 'f'}{self.d:02d}"
         if self.kind == "load":
-            return f"{stem}k{self.k:02d}p{self.p}"
-        return stem + ("camp" if self.kind == "camp" else "")
+            stem += f"k{self.k:02d}p{self.p}"
+        elif self.kind == "camp":
+            stem += "camp"
+        return stem + (f"n{self.n:02d}" if self.n != FETCH_WORDS else "") + (f"s{self.ch}" if self.ch else "")
 
     @property
     def words(self) -> int:
-        """What the MM2S sends and the S2MM takes in all."""
-        return FETCH_WORDS + (SL_HEAD_WORDS if self.head else 0)
+        """What the MM2S sends and the S2MM takes in all: exactly the BDs' words, so no DMA task is left
+        unfinished and no surplus word is sent."""
+        return self.n + (SL_HEAD_WORDS if self.head else 0)
 
 
 def sl_validate(c: SlCase) -> None:
     if not 0 <= c.d <= SYNC_MAX_D:
         raise ValueError(f"d must be 0..{SYNC_MAX_D}")
+    if not 1 <= c.n <= FETCH_WORDS:
+        raise ValueError(f"n must be 1..{FETCH_WORDS}")
+    if c.ch not in (0, 1):
+        raise ValueError("ch must be 0 or 1")
     if c.kind not in SL_KINDS:
         raise ValueError(f"kind must be one of {SL_KINDS}")
     if c.kind == "load":
@@ -2433,7 +2451,7 @@ def sl_design_mlir(c: SlCase) -> str:
     %lA = aie.lock(%t02, {FETCH_LOCK_A}) {{init = 0 : i32, sym_name = "lA"}}
     %lB = aie.lock(%t02, {FETCH_LOCK_B}) {{init = 0 : i32, sym_name = "lB"}}
     %lGo = aie.lock(%t02, {FETCH_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo"}}
-    aie.flow(%t02, DMA : 0, %t02, DMA : 0)
+    aie.flow(%t02, DMA : 0, %t02, DMA : {c.ch})
     func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
     aie.core(%t02) {{
       func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
@@ -2445,11 +2463,11 @@ def sl_design_mlir(c: SlCase) -> str:
       aie.dma_bd(%feed : memref<{c.words}xi32>)
       aie.next_bd ^end
     ^recv_start:
-      %s1 = aie.dma_start(S2MM, 0, {"^head" if c.head else "^recv"}, ^end)
+      %s1 = aie.dma_start(S2MM, {c.ch}, {"^head" if c.head else "^recv"}, ^end)
 {head_bd}    ^recv:
       %ca = arith.constant 1 : i32
       aie.use_lock(%lA, AcquireGreaterEqual, %ca)
-      aie.dma_bd(%sdst : memref<{w}xi32>)
+      aie.dma_bd(%sdst : memref<{w}xi32>{"" if c.n == w else f" offset = 0 len = {c.n}"})
       %cb = arith.constant 1 : i32
       aie.use_lock(%lB, Release, %cb)
       aie.next_bd ^end
@@ -2467,22 +2485,31 @@ def sl_design_mlir(c: SlCase) -> str:
 """
 
 
+def sl_memmod_events(c: SlCase) -> list[str]:
+    """The memory-module list: SL_MEMMOD_EVENTS with the S2MM events of the case's channel. STREAM_STARVATION
+    stays in every case (its fall dates the first word's entry)."""
+    return [e.replace("DMA_S2MM_0_", f"DMA_S2MM_{c.ch}_") for e in SL_MEMMOD_EVENTS]
+
+
 def sl_inject_args(c: SlCase) -> list[str]:
-    return ["--memmod-sweep-events", ",".join(SL_MEMMOD_EVENTS),
+    return ["--memmod-sweep-events", ",".join(sl_memmod_events(c)),
             "--core-grounding", FETCH_CORE_GROUNDING,
             "--core-sweep-events", ",".join(SL_CORE_EVENTS)]
 
 
 def sl_plan() -> list[SlCase]:
-    """64 cases: the release sweep (six d, no core access) on both variants, the k x parity sweep at one d on the
-    chained variant, and the camp at that d on both variants."""
+    """71 cases: the release sweep (six d, no core access) on both variants, the k x parity sweep at one d on the
+    chained variant, the camp at that d on both variants, the held word count N on the first-BD variant, and the
+    camp on S2MM 1 on both variants."""
     cases = [SlCase(head, d) for head in (True, False) for d in SL_DS]
     cases += [SlCase(True, SL_LOAD_D, "load", k, p) for k in SL_KS for p in SL_PARITIES]
     cases += [SlCase(head, SL_LOAD_D, "camp") for head in (True, False)]
+    cases += [SlCase(False, SL_LOAD_D, n=n) for n in SL_NS]              # held word count, first-BD variant
+    cases += [SlCase(head, SL_LOAD_D, "camp", ch=1) for head in (True, False)]    # the camp on S2MM 1
     return cases
 
 
-def sl_row(events) -> dict:
+def sl_row(events, ch: int = 0) -> dict:
     """One run as numbers relative to the release and the S2MM grant, memory-module timer only.
 
     grant = cycles from the first LOCK_0_REL to the cycle after the S2MM STALLED_LOCK interval holding it ends.
@@ -2502,26 +2529,30 @@ def sl_row(events) -> dict:
     rel = rels[0]
     r: dict = {"release": rel, "grant": None, "releases": len(rels), "s2mm_fin": [],
                "bp_fall": None, "starvation": [], "membp": [], "conflicts": {0: [], 1: []}}
-    for first, last in _runs(mem.get("DMA_S2MM_0_STALLED_LOCK", [])):
+    for first, last in _runs(mem.get(f"DMA_S2MM_{ch}_STALLED_LOCK", [])):
         if first <= rel <= last + 1:
             r["grant"] = last + 1 - rel
     if r["grant"] is None:
         return r
     G = rel + r["grant"]
-    r["s2mm_fin"] = [t - G for t in sorted(set(mem.get("DMA_S2MM_0_FINISHED_BD", []))) if t > rel]
+    r["s2mm_fin"] = [t - G for t in sorted(set(mem.get(f"DMA_S2MM_{ch}_FINISHED_BD", []))) if t > rel]
     bp = [(a, z) for a, z in _runs(mem.get("DMA_MM2S_0_STREAM_BACKPRESSURE", [])) if z + 1 > rel]
     r["bp_fall"] = bp[0][1] + 1 - G if bp else None
-    r["starvation"] = [(a - G, z - G) for a, z in _runs(mem.get("DMA_S2MM_0_STREAM_STARVATION", [])) if z >= rel]
-    r["membp"] = [(a - G, z - G) for a, z in _runs(mem.get("DMA_S2MM_0_MEMORY_BACKPRESSURE", [])) if z >= rel]
+    r["starvation"] = [(a - G, z - G) for a, z in _runs(mem.get(f"DMA_S2MM_{ch}_STREAM_STARVATION", [])) if z >= rel]
+    r["membp"] = [(a - G, z - G) for a, z in _runs(mem.get(f"DMA_S2MM_{ch}_MEMORY_BACKPRESSURE", [])) if z >= rel]
     for bank in (0, 1):
         r["conflicts"][bank] = [t - G for t in sorted(set(mem.get(f"CONFLICT_DM_BANK_{bank}", []))) if t >= rel]
+    # the trace's reach past the S2MM's finish: the core's last release of A (the trace stops when the runtime
+    # sequence ends, long after the core's fill releases) minus the finish
+    r["tail"] = rels[-1] - (G + r["s2mm_fin"][0]) if r["s2mm_fin"] else None
     return r
 
 
 def sl_missing(r: dict, c: SlCase) -> list[str]:
     """What a run lacks of the finish check: the release, the grant, the S2MM lock BD's one FINISHED_BD after the
-    release, the MM2S's backpressure falling (its words went into the S2MM) and the core's fill releases (it got
-    past the wait on B, so it ended)."""
+    release, and the core's fill releases (it got past the wait on B, so it ended). The MM2S needs no check of
+    its own: the S2MM takes exactly the words it sends, so the S2MM's finish means the MM2S's task finished (its
+    backpressure only falls when the words outnumber what the path absorbs, so it is a column, not a check)."""
     if r.get("release") is None:
         return ["no LOCK_0_REL"]
     out = []
@@ -2529,8 +2560,8 @@ def sl_missing(r: dict, c: SlCase) -> list[str]:
         return ["grant"]
     if len(r["s2mm_fin"]) != 1:
         out.append(f"S2MM FINISHED_BD x{len(r['s2mm_fin'])} (want 1)")
-    if r["bp_fall"] is None:
-        out.append("MM2S STREAM_BACKPRESSURE never fell")
+    if r["tail"] is not None and r["tail"] <= 0:
+        out.append("trace ends before the S2MM's lock release was followed by the core")
     if r["releases"] != 1 + RING_FILL_RELEASES:
         out.append(f"core did not reach its end (LOCK_0_REL x{r['releases']}, want {1 + RING_FILL_RELEASES})")
     return out
@@ -2544,7 +2575,7 @@ def format_sl_table(rows) -> str:
     """rows: (SlCase, run name, sl_row dict). Every cycle count is relative to the S2MM grant except `grant` (after
     the release); the release is the memory-module timer stamp."""
     lines = ["case          run      release  grant     S2MM fin  bp fall  starv           B0 conflicts"
-             "                B1 conflicts                finish"]
+             "                B1 conflicts                tail (trace past the finish)  finish"]
     for c, run, r in sorted(rows, key=lambda x: (x[0].name, x[1])):
         if r["release"] is None:
             lines.append(f"{c.name:<13} {run:<8} no LOCK_0_REL event")
@@ -2557,7 +2588,7 @@ def format_sl_table(rows) -> str:
         lines.append(f"{c.name:<13} {run:<8} {r['release']:>7}  grant +{r['grant']:<2} "
                      f"fin {','.join(f'{t:+d}' for t in r['s2mm_fin']) or '?':<5} "
                      f"bp {_num(r['bp_fall']) if r['bp_fall'] is not None else '?':<4} "
-                     f"starv [{_sl_runs(r['starvation'])}]  B0 [{cf[0]}]  B1 [{cf[1]}]  {chk}")
+                     f"starv [{_sl_runs(r['starvation'])}]  B0 [{cf[0]}]  B1 [{cf[1]}]  tail {_num(r['tail']) if r['tail'] is not None else '?'}  {chk}")
     return "\n".join(lines)
 
 
@@ -2612,7 +2643,7 @@ def cmd_sl_table(args) -> int:
             if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
                 rows.append((c, run, {"release": None}))
                 continue
-            r = sl_row(load_level_events(run_dir))
+            r = sl_row(load_level_events(run_dir), c.ch)
             r["check"] = sl_missing(r, c)
             rows.append((c, run, r))
     print(format_sl_table(rows))

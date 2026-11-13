@@ -1459,8 +1459,8 @@ def test_cli_has_the_add_and_select_options_on_fetch_build():
 
 # -- lock-held S2MM probe (sl-*): release -> S2MM grant, and what follows it ----------------------------
 
-def sl(head=True, d=12, kind="none", k=0, p=0):
-    return g.SlCase(head=head, d=d, kind=kind, k=k, p=p)
+def sl(head=True, d=12, kind="none", k=0, p=0, n=g.FETCH_WORDS):
+    return g.SlCase(head=head, d=d, kind=kind, k=k, p=p, n=n)
 
 
 def test_sl_case_names_are_distinct_and_clear_of_the_other_variants():
@@ -1476,15 +1476,20 @@ def test_sl_case_names_are_distinct_and_clear_of_the_other_variants():
 
 def test_sl_plan_covers_the_specified_sweeps():
     plan = g.sl_plan()
-    assert len(plan) == 64
+    assert len(plan) == 71
     ds = tuple(range(g.SL_FIRST_D, g.SL_FIRST_D + 6))
     for head in (True, False):                              # the release sweep: six consecutive d, both variants
-        assert [c.d for c in plan if c.head == head and c.kind == "none"] == list(ds)
-        assert sum(c.kind == "camp" and c.head == head for c in plan) == 1
+        assert [c.d for c in plan if c.head == head and c.kind == "none" and c.n == g.FETCH_WORDS] == list(ds)
+        assert sum(c.kind == "camp" and c.head == head and c.ch == 0 for c in plan) == 1
     loads = [c for c in plan if c.kind == "load"]
     assert {c.d for c in loads} == {g.SL_LOAD_D} and all(c.head for c in loads)   # one d, the chained variant
     assert {(c.k, c.p) for c in loads} == {(k, p) for k in range(25) for p in (0, 1)}
     assert g.SL_LOAD_D in ds
+    ns = [c for c in plan if c.n != g.FETCH_WORDS]                  # the held word count, first-BD variant only
+    assert [(c.head, c.n, c.kind) for c in ns] == [(False, n, "none") for n in (4, 8, 12, 16, 20)]
+    assert all(c.d == g.SL_LOAD_D for c in ns)
+    ch1 = [c for c in plan if c.ch == 1]                            # the camp on S2MM 1, both variants
+    assert sorted((c.head, c.kind) for c in ch1) == [(False, "camp"), (True, "camp")]
 
 
 def test_sl_rejects_out_of_range():
@@ -1629,7 +1634,7 @@ def test_sl_row_no_release_or_no_grant_says_so():
 def test_sl_missing_flags_an_unfinished_task_and_a_core_that_never_ended():
     r = g.sl_row(sl_synthetic(s2mm_fins=0, bp=False, fills=3))
     miss = g.sl_missing(r, sl())
-    assert any("S2MM FINISHED_BD" in m for m in miss) and any("BACKPRESSURE never fell" in m for m in miss)
+    assert any("S2MM FINISHED_BD" in m for m in miss)
     assert any("core" in m for m in miss)
 
 
@@ -1650,3 +1655,38 @@ def test_cli_has_the_sl_subcommands():
     assert ns.runs == ["e1.emu"]
     ns = g.build_parser().parse_args(["sl-run", "d", "e1", "--backend", "emu"])
     assert ns.backend == "emu"
+
+
+def test_sl_held_word_count_means_the_mm2s_sends_exactly_what_the_s2mm_takes():
+    c = sl(False, 12, n=8)
+    assert c.name == "slf12n08" and c.words == 8
+    t = g.sl_design_mlir(c)
+    assert "dma_bd(%feed : memref<8xi32>)" in t                                 # no surplus word
+    assert "dma_bd(%sdst : memref<64xi32> offset = 0 len = 8)" in t
+    assert sl(True, 12, n=8).words == 12
+    for bad in (0, 65):
+        with pytest.raises(ValueError):
+            g.sl_validate(sl(n=bad))
+
+
+def test_sl_channel_1_routes_the_loopback_to_s2mm_1_and_traces_its_events():
+    c = g.SlCase(head=False, d=12, kind="camp", ch=1)
+    assert c.name == "slf12camps1"
+    t = g.sl_design_mlir(c)
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 1)" in t and "aie.dma_start(S2MM, 1, ^recv, ^end)" in t
+    ev = g.sl_memmod_events(c)
+    assert ev == [e.replace("S2MM_0", "S2MM_1") for e in g.SL_MEMMOD_EVENTS] and len(ev) == 8
+    assert "DMA_S2MM_1_STREAM_STARVATION" in ev and "DMA_MM2S_0_STREAM_BACKPRESSURE" in ev
+    assert all("DMA_S2MM_0_STREAM_STARVATION" in g.sl_memmod_events(c0) for c0 in g.sl_plan() if c0.ch == 0)
+    with pytest.raises(ValueError):
+        g.sl_validate(g.SlCase(True, 12, ch=2))
+
+
+def test_sl_row_reads_the_channel_it_is_given_and_reports_the_trace_tail():
+    e = [x for x in sl_synthetic()]
+    swapped = [ev(x.name.replace("S2MM_0", "S2MM_1"), x.ts) for x in e]
+    assert g.sl_row(swapped, 1)["grant"] == 4 and g.sl_row(swapped, 0)["grant"] is None
+    r = g.sl_row(e)
+    assert r["tail"] > 0 and g.sl_missing(r, sl()) == []
+    early = [x for x in e if not (x.name == "LOCK_0_REL" and x.ts > 1000)] + [ev("LOCK_0_REL", 1005)]
+    assert any("trace ends" in m for m in g.sl_missing(g.sl_row(early), sl()))
