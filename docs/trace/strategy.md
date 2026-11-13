@@ -297,6 +297,15 @@ candidate's offset is farther from the band its silicon samples span than the ba
 half a cycle; tiles measurable on one side only are "unmeasured", and tiles whose offset exceeds 16
 cycles (workload-dominated, not a timer quantity) are reported but not gated.
 
+**Placement.** Rows are physical and never shift: row 0 is the shim, 1 the memtile, 2 and up compute
+tiles. Only the column is shifted, by the capture's `placement.origin_col` (the lowest traced
+column), because a run may be placed at a different start column. The capture's `origin_row` is the
+lowest traced *row*; it moves with the set of traced tiles, so it is not used: two captures of one
+test that trace different tiles (one carries a shim unit the other lacks) would otherwise put the
+same compute tile on different rows and report it as absent on one side. The column origin has the
+same weakness in principle (a capture lacking its leftmost traced column); in the corpus every
+test's captures, silicon and emulator alike, agree on their lowest traced column, so it is kept.
+
 **Absent units and cut tails.** On silicon the last, partial packet of a trace unit (flushed by
 the stop event) is often not delivered. A unit whose whole stream fits in that one packet is then
 *absent* from the capture: no Start frame and no events, which `events.json` cannot tell from a
