@@ -186,6 +186,10 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
     ///     that bundle never touches memory),
     ///   * stalled on a lock / DMA / stream (AM020: a stalled core is not
     ///     issuing a memory request),
+    ///   * holding its bundle this cycle (a lock request's frozen arbitration
+    ///     cycle, a gather's memory cycle, a refused acquire:
+    ///     `CycleAccurateExecutor::holds_bundle`), so the bank neither serves
+    ///     nor counts an access that does not happen,
     ///   * or simply issuing a bundle with no local data-memory access.
     ///
     /// `CoreStatus::WaitBank` DOES declare: a bank-stalled core re-presents
@@ -237,7 +241,14 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
             return Vec::new();
         };
 
-        let demand = self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_banks());
+        // A bundle the step will hold this cycle (frozen, or a refused acquire) makes no memory
+        // access, so it asks for no bank (silicon, ring probe: a camp of loads right after a
+        // lock release reaches the MM2S grant with one access fewer than one per cycle).
+        let demand = if self.executor.holds_bundle(ctx, tile) {
+            Vec::new()
+        } else {
+            self.executor.peek_bank_demand(&bundle, ctx, layout, self.bank_served_banks())
+        };
         self.peeked_bundle = Some(bundle);
         demand
     }

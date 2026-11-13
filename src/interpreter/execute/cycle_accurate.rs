@@ -147,6 +147,32 @@ impl CycleAccurateExecutor {
         true
     }
 
+    /// Whether this cycle's step holds the bundle instead of issuing it: a frozen cycle (a
+    /// lock request's arbitration cycle, a gather's memory cycle, a resume phase) or a due
+    /// acquire that is refused. Mirrors the hold decisions at the top of the step, without
+    /// changing anything. A held bundle makes no memory access this cycle, so it presents no
+    /// bank demand (`peek_bank_demand`): the bank neither serves nor counts it.
+    pub fn holds_bundle(&self, ctx: &ExecutionContext, tile: &Tile) -> bool {
+        if self.frozen_cycles > 0 {
+            return true;
+        }
+        let gather_due = self.gather_freezes.contains(&ctx.cycles);
+        if let Some(p) = &self.pending_lock {
+            if ctx.bundle_seq >= p.resolve_at {
+                // Not yet arbitrated (or held, or a gather is due): this is a frozen cycle or
+                // the refusal itself. Otherwise the requests perform now, and a refused
+                // acquire holds the bundle.
+                if !(p.arbitrated && p.held_since.is_none() && !gather_due) {
+                    return true;
+                }
+                if self.held_lock_acquire(tile, None).is_some() {
+                    return true;
+                }
+            }
+        }
+        gather_due
+    }
+
     /// The raw lock ID of the in-flight acquire if it is due and cannot be granted now:
     /// the core is held on it. The core interpreter polls this while the core waits.
     pub fn held_lock_acquire(
@@ -2149,6 +2175,50 @@ mod tests {
             assert_eq!(ctx.pointer.read(2), 0x204, "wait {wait}: the pointer add commits once");
             assert_eq!(ctx.instructions, 9, "wait {wait}: every bundle retires once");
             assert_eq!(tile.locks[5].value, 0, "wait {wait}: acquired once");
+        }
+    }
+
+    /// `holds_bundle` predicts exactly the steps that do not issue their bundle: the lock
+    /// request's arbitration cycle in front of the fourth bundle after a release or a granted
+    /// acquire, and every cycle of a refused acquire. Those cycles make no memory access, so
+    /// the bundle (a load here) asks for no bank then and the bank's served count does not
+    /// advance for it.
+    #[test]
+    fn holds_bundle_predicts_every_step_that_does_not_issue() {
+        for (request, lock_value) in
+            [(release_own_lock_5(), 0u8), (acquire_own_lock_5(), 1), (acquire_own_lock_5(), 0)]
+        {
+            let mut executor = CycleAccurateExecutor::new();
+            let mut ctx = ExecutionContext::new();
+            let mut tile = Tile::compute(0, 2);
+            tile.locks[5].value = lock_value;
+            let mut held = Vec::new();
+            let mut bundles = vec![make_bundle(vec![request.clone()])];
+            bundles.extend(nops(3));
+            for _ in 0..6 {
+                bundles.push(make_bundle(vec![lda_r6_from_p0()]));
+            }
+            let mut i = 0;
+            for step in 0..12 {
+                if i == bundles.len() {
+                    break;
+                }
+                let predicted = executor.holds_bundle(&ctx, &tile);
+                let before = ctx.instructions;
+                executor.execute(&bundles[i], &mut ctx, &mut tile);
+                let issued = ctx.instructions > before;
+                assert_eq!(predicted, !issued, "step {step} (bundle {i}, lock {lock_value})");
+                if issued {
+                    i += 1;
+                } else {
+                    held.push(step);
+                }
+            }
+            if lock_value == 0 && matches!(request.semantic, Some(SemanticOp::LockAcquire)) {
+                assert!(held.len() >= 6, "a refused acquire holds every step ({held:?})");
+            } else {
+                assert_eq!(held, vec![4], "one arbitration cycle in front of the fourth bundle");
+            }
         }
     }
 

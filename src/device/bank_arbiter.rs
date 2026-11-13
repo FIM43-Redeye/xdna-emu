@@ -485,7 +485,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::banking::banks_for_access;
 
     // -- the served-access count (silicon: lock-fetch arb and ring probes, NPU1 2026-11) ------
     //
