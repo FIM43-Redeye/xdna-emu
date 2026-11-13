@@ -551,13 +551,23 @@ impl DmaEngine {
         let ch = transfer.channel as usize;
         let (take, _) = self.s2mm_writer_plan(transfer, layout, self.read_clock);
         if let Some(words) = take {
+            // The step the granule became writable: its last word settled, and for a lock-started
+            // BD the first write allowed (the late-granule gap asks whether it was ready before a
+            // refused write was served).
+            let settled = self.stream_in[ch][words - 1].entered
+                + xdna_archspec::aie2::timing::DMA_S2MM_INGRESS_TO_WRITE_CYCLES as u64;
+            let ready = if transfer.acquire_lock.is_some() {
+                settled.max(self.channels[ch].s2mm_port.write_from())
+            } else {
+                settled
+            };
             for _ in 0..words {
                 let w = self
                     .pop_stream_in_for_channel(ch as u8)
                     .expect("planned words are in the ingress");
                 self.channels[ch].s2mm_write_words.push_back(w);
             }
-            self.channels[ch].s2mm_write_queue.push_back((words, self.read_clock));
+            self.channels[ch].s2mm_write_queue.push_back((words, ready));
         }
         let now = self.read_clock;
         if self.channels[ch].s2mm_write_queue.is_empty() || now < self.channels[ch].s2mm_late_gap_until {
@@ -581,11 +591,11 @@ impl DmaEngine {
             self.channels[ch].stats.bytes_transferred += 4;
         }
         if refused {
-            // Was the next granule ready (taken from the ingress) before this cycle?
+            // Was the next granule ready before this cycle?
             let ready_before = self.channels[ch]
                 .s2mm_write_queue
                 .front()
-                .is_some_and(|&(_, taken)| taken < now);
+                .is_some_and(|&(_, ready)| ready < now);
             if !ready_before {
                 self.channels[ch].s2mm_late_gap_until =
                     now + xdna_archspec::aie2::timing::DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES as u64;

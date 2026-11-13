@@ -616,7 +616,7 @@ pub struct ChannelContext {
     /// (`DmaEngine::settle_stream_starvation`).
     pub writer_starving: bool,
     /// A compute S2MM's write queue (`DmaEngine::compute_s2mm_cycle`): granules taken from the
-    /// ingress and not yet written (word count, step taken), and their words.
+    /// ingress and not yet written (word count, step it became writable), and their words.
     pub s2mm_write_queue: VecDeque<(usize, u64)>,
     pub s2mm_write_words: VecDeque<super::engine::StreamData>,
     /// Step the queue's head write was first presented to the bank (won or lost).

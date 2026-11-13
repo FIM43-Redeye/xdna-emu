@@ -320,6 +320,10 @@ fn a_refused_compute_s2mm_write_leaves_its_ingress_side_unchanged() {
     let camp = parked_s2mm(64, 60, |c, m| m == even && (g + 2..g + 4).contains(&c));
     assert_eq!(camp.grant, g);
     assert_eq!(&rel(&camp)[..5], &[4, 5, 6, 7, 10], "granules 0..3 queue behind the refused write");
+    // A held granule was ready long before: no late-granule gap after the refused one (silicon,
+    // camp in the + 3 phase: granule 0 refused at G + 2, served at + 3, granule 2 met at + 5).
+    let once = parked_s2mm(64, 60, |c, m| m == even && c == g + 2);
+    assert_eq!(&rel(&once)[..4], &[3, 4, 5, 6]);
     assert_eq!(camp.starving, free.starving, "the ingress side does not see the refusals");
     assert_eq!(camp.finishes, free.finishes);
 }
