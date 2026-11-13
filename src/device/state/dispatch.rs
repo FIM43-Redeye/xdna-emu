@@ -56,6 +56,9 @@ impl DeviceState {
         if let Some(status) = self.array.dma_channel_status(col, row, offset) {
             return status;
         }
+        if let Some(status) = self.array.adaptive_gate_status(col, row, offset) {
+            return status;
+        }
         match self.array.get_mut(col, row) {
             Some(tile) => tile.read_register(offset),
             None => 0,
@@ -236,6 +239,14 @@ impl DeviceState {
             _ => {}
         }
 
+        // The adaptive-gate Abort_Period sits in the stream-switch address range, so
+        // it is routed by offset rather than by subsystem.
+        if self.array.clock().is_abort_period_register(tile_addr.row, tile_addr.offset) {
+            self.array
+                .clock_mut()
+                .write_register(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+        }
+
         // Tile-local register side effects: trace config, edge detection,
         // event port selection, cascade config, shim mux, lock overflow/
         // underflow clear, event broadcast, and Event_Generate.
@@ -313,6 +324,21 @@ impl DeviceState {
                 .get(tile_addr.col, tile_addr.row)
                 .and_then(|tile| tile.registers_ref().get(&tile_addr.offset).copied())
                 .unwrap_or(control.reset_value);
+            return self.write_register(address, (current & !mask) | (value & mask));
+        }
+
+        // Clock-control registers (and the adaptive-gate Abort_Period) drive the
+        // clock controller, which only `write_register` reaches: merge here, from
+        // the stored value or the register's reset value, and delegate.
+        if subsystem == SubsystemKind::ClockControl
+            || self.array.clock().is_abort_period_register(tile_addr.row, tile_addr.offset)
+        {
+            let current = self
+                .array
+                .get(tile_addr.col, tile_addr.row)
+                .and_then(|tile| tile.registers_ref().get(&tile_addr.offset).copied())
+                .or_else(|| reg_layout.reset_value(tile_kind, tile_addr.offset))
+                .unwrap_or(0);
             return self.write_register(address, (current & !mask) | (value & mask));
         }
 
@@ -429,7 +455,12 @@ impl DeviceState {
                 // Multiple MaskWrites to the same register (e.g., Shim Mux config at
                 // 0x1F000) must accumulate rather than clobber each other.
                 let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
-                let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                let current = tile
+                    .registers_ref()
+                    .get(&tile_addr.offset)
+                    .copied()
+                    .or_else(|| reg_layout.reset_value(tile_kind, tile_addr.offset))
+                    .unwrap_or(0);
                 let new_value = (current & !mask) | (value & mask);
                 log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
                     tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);

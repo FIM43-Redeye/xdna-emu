@@ -10,6 +10,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use xdna_archspec::dma::ClockControlLayout;
+use xdna_archspec::types::TileKind;
+
+use crate::device::regdb::device_reg_layout;
+
 /// Which module within a tile is being queried.  Mirrors the bit-field
 /// breakdown of Module_Clock_Control in AM025.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,21 +36,21 @@ struct TileGates {
 }
 
 /// Per-tile adaptive-gate state.  Tracks idle cycles separately for
-/// the DMA and stream switch subsystems.  Gate engages when idle
+/// the DMA and stream switch subsystems.  A gate engages when its idle
 /// cycles reach 2^abort_period (AM025 supported range 3-12).
-#[derive(Debug, Clone)]
+///
+/// An abort period of `None` means nothing has configured it, so the
+/// register database's reset value applies (7, i.e. 128 cycles).
+#[derive(Debug, Clone, Default)]
 struct AdaptiveState {
     dma_idle_cycles: u32,
     ss_idle_cycles: u32,
-    /// Engagement threshold = 2^abort_period.  Range 3-12 per AM025.
-    /// Default 7 (= 2^7 = 128 cycles, the AM025 default).
-    abort_period_2pow: u8,
-}
-
-impl Default for AdaptiveState {
-    fn default() -> Self {
-        Self { dma_idle_cycles: 0, ss_idle_cycles: 0, abort_period_2pow: 7 }
-    }
+    /// Stream-switch gate threshold exponent, from the
+    /// Stream_Switch_Adaptive_Clock_Gate_Abort_Period register.
+    ss_abort_period: Option<u8>,
+    /// DMA gate threshold exponent.  AM025 defines no register for it; only
+    /// `set_adaptive_abort_period` sets it.
+    dma_abort_period: Option<u8>,
 }
 
 /// Per-array clock-gating state.  Single source of truth for all
@@ -86,14 +91,6 @@ pub const AIE_TILE_COLUMN_RESET_OFFSET: u32 = 0x000F_FF28;
 /// to quiet traffic"), and only then re-enable the clocks.
 const REACHABLE_WHILE_GATED_SHIM_OFFSETS: [u32; 1] = [AIE_TILE_COLUMN_RESET_OFFSET];
 
-/// AM025 offset for Module_Clock_Control on compute tiles.
-const MCC_COMPUTE_OFFSET: u32 = 0x00060000;
-/// AM025 offset for Module_Clock_Control on memtile and shim (MCC_0).
-/// NOTE: MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00.  They share
-/// the same offset; the row number disambiguates (row 0 = shim, row 1 =
-/// memtile).  They must NOT appear as separate match arms -- Rust errors on
-/// duplicate patterns.
-const MCC_MEMTILE_OFFSET: u32 = 0x000FFF00;
 /// AM025 offset for Module_Clock_Control_1 (shim only, NoC enable).
 const MCC_SHIM_1_OFFSET: u32 = 0x000FFF04;
 
@@ -109,6 +106,10 @@ enum ClockTileKind {
     Shim,
 }
 
+fn tile_kind_layout(row: u8) -> &'static ClockControlLayout {
+    clock_tile_kind_from_row(row).layout()
+}
+
 fn clock_tile_kind_from_row(row: u8) -> ClockTileKind {
     if row == 0 {
         ClockTileKind::Shim
@@ -119,19 +120,66 @@ fn clock_tile_kind_from_row(row: u8) -> ClockTileKind {
     }
 }
 
-/// AM025 reset value for Module_Clock_Control (and MCC_0 for shim).
-/// Confirmed from aie_registers_aie2.json on 2026-05-24.
-fn reset_value_for_mcc(tile_kind: ClockTileKind) -> u32 {
-    match tile_kind {
-        ClockTileKind::Compute => 0x37,
-        ClockTileKind::Memtile => 0x33,
-        ClockTileKind::Shim => 0x3B,
+impl ClockTileKind {
+    fn archspec_kind(self) -> TileKind {
+        match self {
+            ClockTileKind::Compute => TileKind::Compute,
+            ClockTileKind::Memtile => TileKind::Mem,
+            ClockTileKind::Shim => TileKind::ShimNoc,
+        }
     }
+
+    /// This tile kind's clock-control registers, from the register database.
+    fn layout(self) -> &'static ClockControlLayout {
+        device_reg_layout().clock_control(self.archspec_kind())
+    }
+}
+
+/// AM025 reset value for Module_Clock_Control (and MCC_0 for shim).
+fn reset_value_for_mcc(tile_kind: ClockTileKind) -> u32 {
+    tile_kind.layout().module_clock_control_reset
 }
 
 /// AM025 reset value for shim Module_Clock_Control_1 (NoC enable bit set).
 fn reset_value_for_mcc_1() -> u32 {
-    0x01
+    device_reg_layout()
+        .reset_value(TileKind::ShimNoc, MCC_SHIM_1_OFFSET)
+        .expect("register database has no reset value for the shim Module_Clock_Control_1")
+}
+
+/// The clock-control registers a tile decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockRegister {
+    /// `Column_Clock_Control` (shim row only).
+    Column,
+    /// `Module_Clock_Control` (shim: `Module_Clock_Control_0`).
+    ModuleControl0,
+    /// `Module_Clock_Control_1` (shim only).
+    ModuleControl1,
+    /// `Stream_Switch_Adaptive_Clock_Gate_Abort_Period`.
+    AbortPeriod,
+    /// `Stream_Switch_Adaptive_Clock_Gate_Status` (read-only).
+    Status,
+}
+
+impl ClockRegister {
+    fn decode(row: u8, offset: u32) -> Option<Self> {
+        let tile_kind = clock_tile_kind_from_row(row);
+        let layout = tile_kind.layout();
+        if offset == layout.module_clock_control {
+            Some(Self::ModuleControl0)
+        } else if offset == layout.abort_period_register {
+            Some(Self::AbortPeriod)
+        } else if offset == layout.status_register {
+            Some(Self::Status)
+        } else if tile_kind == ClockTileKind::Shim && offset == COLUMN_CLOCK_CONTROL_OFFSET {
+            Some(Self::Column)
+        } else if tile_kind == ClockTileKind::Shim && offset == MCC_SHIM_1_OFFSET {
+            Some(Self::ModuleControl1)
+        } else {
+            None
+        }
+    }
 }
 
 /// Decode `kind` from a Module_Clock_Control register value.
@@ -330,13 +378,59 @@ impl ClockController {
         self.reset_ss_counters_for_column(col);
     }
 
-    /// Configure the abort_period (= 2^N idle-cycle threshold) for the
+    /// Configure the abort_period (= 2^N idle-cycle threshold) for both
     /// adaptive gates on a tile.  AM025 supported range is 3-12; values
     /// outside that produce undefined hardware behavior, but the
     /// emulator does not enforce the range.
+    ///
+    /// The register bus sets only the stream-switch threshold (see
+    /// `write_register`); this API-level setter moves both.
     pub fn set_adaptive_abort_period(&mut self, col: u8, row: u8, period_2pow: u8) {
         let entry = self.adaptive.entry((col, row)).or_default();
-        entry.abort_period_2pow = period_2pow;
+        entry.ss_abort_period = Some(period_2pow);
+        entry.dma_abort_period = Some(period_2pow);
+    }
+
+    /// The raw Module_Clock_Control value of a tile: what was written, else the reset value.
+    fn raw_mcc_0(&self, col: u8, row: u8) -> u32 {
+        match self.tiles.get(&(col, row)) {
+            Some(gates) => gates.raw_mcc_0,
+            None => reset_value_for_mcc(clock_tile_kind_from_row(row)),
+        }
+    }
+
+    /// Whether the stream-switch adaptive gate is enabled (Module_Clock_Control
+    /// `Stream_Switch_Adaptive_Clock_Gate`).  Database-derived, silicon check pending.
+    pub fn is_adaptive_ss_enabled(&self, col: u8, row: u8) -> bool {
+        clock_tile_kind_from_row(row)
+            .layout()
+            .stream_switch_adaptive_enable
+            .extract_bool(self.raw_mcc_0(col, row))
+    }
+
+    /// Whether the DMA adaptive gate is enabled (Module_Clock_Control
+    /// `DMA_Adaptive_Clock_Gate`).  Database-derived, silicon check pending.
+    pub fn is_adaptive_dma_enabled(&self, col: u8, row: u8) -> bool {
+        clock_tile_kind_from_row(row)
+            .layout()
+            .dma_adaptive_enable
+            .extract_bool(self.raw_mcc_0(col, row))
+    }
+
+    /// Idle-cycle count at which a gate with exponent `period` engages: 2^period.
+    /// Applied as written for every value the 4-bit field can hold, including
+    /// those outside AM025's documented 3-12.
+    fn threshold(period: Option<u8>, row: u8) -> u32 {
+        let exponent =
+            period.unwrap_or_else(|| clock_tile_kind_from_row(row).layout().abort_period_reset as u8);
+        1u32.checked_shl(exponent as u32).unwrap_or(u32::MAX)
+    }
+
+    /// True iff `offset` is this tile's stream-switch Abort_Period register.  The
+    /// register sits in the stream-switch address range, so the register bus
+    /// routes it by offset rather than by subsystem.
+    pub fn is_abort_period_register(&self, row: u8, offset: u32) -> bool {
+        ClockRegister::decode(row, offset) == Some(ClockRegister::AbortPeriod)
     }
 
     /// Returns true iff the DMA adaptive gate is currently engaged
@@ -364,8 +458,8 @@ impl ClockController {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;
         };
-        let threshold = 1u32.checked_shl(s.abort_period_2pow as u32).unwrap_or(u32::MAX);
-        s.dma_idle_cycles >= threshold
+        self.is_adaptive_dma_enabled(col, row)
+            && s.dma_idle_cycles >= Self::threshold(s.dma_abort_period, row)
     }
 
     /// Returns true iff the SS adaptive gate is currently engaged.
@@ -376,8 +470,7 @@ impl ClockController {
         let Some(s) = self.adaptive.get(&(col, row)) else {
             return false;
         };
-        let threshold = 1u32.checked_shl(s.abort_period_2pow as u32).unwrap_or(u32::MAX);
-        s.ss_idle_cycles >= threshold
+        self.is_adaptive_ss_enabled(col, row) && s.ss_idle_cycles >= Self::threshold(s.ss_abort_period, row)
     }
 
     /// Record a gated-tile access for warning purposes.
@@ -419,8 +512,8 @@ impl ClockController {
     ///   to 1, reset the corresponding counter for that tile.  Handles
     ///   simultaneous multi-bit transitions by comparing old vs new per module.
     pub fn write_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        match offset {
-            COLUMN_CLOCK_CONTROL_OFFSET if row == 0 => {
+        match ClockRegister::decode(row, offset) {
+            Some(ClockRegister::Column) => {
                 // Bit 0 = column-clock-enable; per AM025.
                 let was_active = self.is_column_active(col);
                 let now_active = (value & 0x1) != 0;
@@ -433,9 +526,8 @@ impl ClockController {
                     self.reset_ss_counters_for_column(col);
                 }
             }
-            // MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00; row
-            // disambiguates.  Both write into raw_mcc_0.
-            MCC_COMPUTE_OFFSET | MCC_MEMTILE_OFFSET => {
+            // Each tile kind's own Module_Clock_Control; all write raw_mcc_0.
+            Some(ClockRegister::ModuleControl0) => {
                 let tile_kind = clock_tile_kind_from_row(row);
                 // Capture old module-active state before applying the write.
                 let old_raw_mcc_0 = self
@@ -470,7 +562,7 @@ impl ClockController {
                     }
                 }
             }
-            MCC_SHIM_1_OFFSET if row == 0 => {
+            Some(ClockRegister::ModuleControl1) => {
                 let tile_kind = ClockTileKind::Shim;
                 let old_raw_mcc_0 = self
                     .tiles
@@ -500,7 +592,16 @@ impl ClockController {
                     }
                 }
             }
-            _ => {} // not a clock-control offset
+            // Database-derived, silicon check pending: the idle threshold of the
+            // stream-switch adaptive gate is 2^N for the 4-bit Abort_Period field.
+            // The DMA gate has no such register in AM025 and keeps its own threshold.
+            Some(ClockRegister::AbortPeriod) => {
+                let period = tile_kind_layout(row).abort_period.extract(value) as u8;
+                self.adaptive.entry((col, row)).or_default().ss_abort_period = Some(period);
+            }
+            // Read-only status; a write has no effect.
+            Some(ClockRegister::Status) => {}
+            None => {} // not a clock-control offset
         }
     }
 
@@ -518,12 +619,7 @@ impl ClockController {
         for col in 0..num_cols {
             self.write_register(col, 0, COLUMN_CLOCK_CONTROL_OFFSET, 0x1);
             for row in 0..rows {
-                let offset = match clock_tile_kind_from_row(row) {
-                    ClockTileKind::Shim => MCC_MEMTILE_OFFSET, // MCC_SHIM_0 == MCC_MEMTILE offset
-                    ClockTileKind::Memtile => MCC_MEMTILE_OFFSET,
-                    ClockTileKind::Compute => MCC_COMPUTE_OFFSET,
-                };
-                self.write_register(col, row, offset, 0xFFFF_FFFF);
+                self.write_register(col, row, tile_kind_layout(row).module_clock_control, 0xFFFF_FFFF);
                 if matches!(clock_tile_kind_from_row(row), ClockTileKind::Shim) {
                     self.write_register(col, row, MCC_SHIM_1_OFFSET, 0xFFFF_FFFF);
                 }
@@ -536,27 +632,36 @@ impl ClockController {
     /// Returns None if the offset is not a known clock-control register.
     pub fn read_register(&self, col: u8, row: u8, offset: u32) -> Option<u32> {
         let tile_kind = clock_tile_kind_from_row(row);
-        match offset {
-            COLUMN_CLOCK_CONTROL_OFFSET if row == 0 => {
+        let layout = tile_kind.layout();
+        match ClockRegister::decode(row, offset)? {
+            ClockRegister::Column => {
                 // Reflect current state: bit 0 = column enabled.
                 Some(if self.is_column_active(col) { 0x1 } else { 0x0 })
             }
-            // MCC_MEMTILE_OFFSET == MCC_SHIM_0_OFFSET == 0x000FFF00.
-            MCC_COMPUTE_OFFSET | MCC_MEMTILE_OFFSET => self
-                .tiles
-                .get(&(col, row))
-                .map(|g| g.raw_mcc_0)
-                .or_else(|| Some(reset_value_for_mcc(tile_kind))),
-            MCC_SHIM_1_OFFSET if row == 0 => self
-                .tiles
-                .get(&(col, row))
-                .and_then(|g| g.raw_mcc_1)
-                .or_else(|| Some(reset_value_for_mcc_1())),
-            _ => None,
+            ClockRegister::ModuleControl0 => Some(self.raw_mcc_0(col, row)),
+            ClockRegister::ModuleControl1 => Some(
+                self.tiles
+                    .get(&(col, row))
+                    .and_then(|g| g.raw_mcc_1)
+                    .unwrap_or_else(reset_value_for_mcc_1),
+            ),
+            ClockRegister::AbortPeriod => Some(
+                self.adaptive
+                    .get(&(col, row))
+                    .and_then(|s| s.ss_abort_period)
+                    .map_or(layout.abort_period_reset, u32::from),
+            ),
+            // Database-derived, silicon check pending: "1 = adaptive gating active:
+            // feature enabled and switch idle for time-out, data path not clocked".
+            ClockRegister::Status => {
+                Some(layout.status_active.insert(0, self.is_adaptive_ss_engaged(col, row) as u32))
+            }
         }
     }
 }
 
+#[cfg(test)]
+mod adaptive_register_tests;
 #[cfg(test)]
 mod integration_tests;
 

@@ -132,11 +132,13 @@ impl Tile {
             }
         }
 
-        // Fall back to register map
+        // Fall back to the register map, then to the register's power-on reset
+        // value from the database: a masked write to a register nothing has
+        // written yet starts from that value, not from zero.
         self.registers
             .get(&offset)
             .copied()
-            .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
+            .or_else(|| reg_layout.reset_value(self.tile_kind, offset))
             .unwrap_or(0)
     }
 
@@ -269,11 +271,13 @@ impl Tile {
         // enable->mask); they are intentionally NOT routed through this
         // side-effect-free path -- guest interrupt reads use read_register.
 
-        // Fall back to register map
+        // Fall back to the register map, then to the register's power-on reset
+        // value from the database: a masked write to a register nothing has
+        // written yet starts from that value, not from zero.
         self.registers
             .get(&offset)
             .copied()
-            .or_else(|| reg_layout.memory_control(self.tile_kind, offset).map(|reg| reg.reset_value))
+            .or_else(|| reg_layout.reset_value(self.tile_kind, offset))
             .unwrap_or(0)
     }
 

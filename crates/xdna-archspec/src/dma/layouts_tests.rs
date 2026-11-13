@@ -277,6 +277,45 @@ mod tests {
     }
 
     #[test]
+    fn lock_event_selection_layouts_come_from_the_register_database() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        // Compute tile memory module: 8 selectors, 4-bit lock select.
+        let mem = &layout.memory_lock_selection;
+        assert_eq!((mem.base, mem.stride, mem.count), (0x1F100, 4, 8));
+        assert_eq!((mem.lock_select.lsb, mem.lock_select.width), (16, 4));
+        assert_eq!((mem.lock_value.lsb, mem.lock_value.width), (0, 6));
+        assert_eq!(mem.reset, 0x3F);
+
+        // MemTile: 8 selectors, 6-bit lock select.
+        let mt = &layout.memtile_lock_selection;
+        assert_eq!((mt.base, mt.stride, mt.count), (0xC0400, 4, 8));
+        assert_eq!((mt.lock_select.lsb, mt.lock_select.width), (16, 6));
+
+        // Shim: only 6 selectors.
+        let shim = &layout.shim_lock_selection;
+        assert_eq!((shim.base, shim.stride, shim.count), (0x14100, 4, 6));
+        assert_eq!(shim.lock_select.width, 4);
+
+        // Offset decoding: registers map to their selector index, nothing else does.
+        assert_eq!(mt.selector_at(0xC0400), Some(0));
+        assert_eq!(mt.selector_at(0xC041C), Some(7));
+        assert_eq!(mt.selector_at(0xC0420), None);
+        assert_eq!(mt.selector_at(0xC0402), None, "unaligned offsets are not registers");
+        assert_eq!(shim.selector_at(0x14114), Some(5));
+        assert_eq!(shim.selector_at(0x14118), None);
+
+        // The reset word selects lock 0 and carries the all-ones trigger value.
+        assert_eq!(mt.selected_lock(mt.reset), 0);
+        assert_eq!(mt.selected_lock((37 << 16) | 0x3F), 37);
+        assert_eq!(mem.selected_lock((9 << 16) | 0x3F), 9);
+    }
+
+    #[test]
     fn validate_status_field_layout() {
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database JSON not found");
@@ -753,6 +792,59 @@ mod tests {
         // Core_Control has reset 0x00000002 (bit 1 = Reset set on power-on)
         let core_ctrl = core.register("Core_Control").unwrap();
         assert_eq!(core_ctrl.reset_value, 0x00000002, "Core_Control reset should be 0x02 (Reset bit set)");
+    }
+
+    #[test]
+    fn test_reset_value_lookup_per_tile_kind() {
+        use crate::types::TileKind;
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        // Module_Clock_Control: compute (core section) 0x37, memtile 0x33, shim MCC_0 0x3B.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x60000), Some(0x37));
+        assert_eq!(layout.reset_value(TileKind::Mem, 0xFFF00), Some(0x33));
+        assert_eq!(layout.reset_value(TileKind::ShimNoc, 0xFFF00), Some(0x3B));
+        assert_eq!(layout.reset_value(TileKind::ShimPl, 0xFFF00), Some(0x3B));
+        // Compute-tile registers come from both the core and memory sections.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x32000), Some(0x02));
+        // A register whose reset is zero, and an offset with no register, have no entry.
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x3FF34), None);
+        assert_eq!(layout.reset_value(TileKind::Compute, 0x0F_FFFC), None);
+    }
+
+    #[test]
+    fn test_clock_control_layout_from_database() {
+        use crate::types::TileKind;
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database JSON not found");
+            return;
+        };
+        let layout = DeviceRegLayout::from_regdb(db).unwrap();
+
+        let compute = layout.clock_control(TileKind::Compute);
+        assert_eq!(compute.module_clock_control, 0x60000);
+        assert_eq!(
+            compute.stream_switch_adaptive_enable.mask << compute.stream_switch_adaptive_enable.shift,
+            1 << 4
+        );
+        assert_eq!(compute.dma_adaptive_enable.mask << compute.dma_adaptive_enable.shift, 1 << 5);
+        assert_eq!(compute.abort_period_register, 0x3FF38);
+        assert_eq!((compute.abort_period.shift, compute.abort_period.mask), (0, 0xF));
+        assert_eq!(compute.abort_period_reset, 7);
+        assert_eq!(compute.status_register, 0x3FF34);
+
+        let memtile = layout.clock_control(TileKind::Mem);
+        assert_eq!(memtile.module_clock_control, 0xFFF00);
+        assert_eq!(memtile.abort_period_register, 0xB0F38);
+        assert_eq!(memtile.status_register, 0xB0F34);
+
+        let shim = layout.clock_control(TileKind::ShimNoc);
+        assert_eq!(shim.module_clock_control, 0xFFF00);
+        assert_eq!(shim.abort_period_register, 0x3FF38);
+        assert_eq!(layout.clock_control(TileKind::ShimPl).module_clock_control, 0xFFF00);
     }
 
     #[test]

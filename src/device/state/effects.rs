@@ -317,6 +317,17 @@ impl DeviceState {
             );
         }
 
+        // 5c. Locks_Event_Selection_<n>: which lock each LOCK_SEL<n> event
+        // selector watches. Memory module of compute tiles, memtile and shim
+        // each have their own bank (offsets, field widths and counts from
+        // the register database).
+        {
+            let bank = Tile::lock_selection_layout(tile.tile_kind);
+            if let Some(n) = bank.selector_at(offset) {
+                tile.lock_event_selected[n] = bank.selected_lock(value);
+            }
+        }
+
         // 6. Edge detection event control registers (offsets from register database).
         if tile.is_compute() {
             if offset == ce.edge_detection {
@@ -1915,5 +1926,55 @@ mod broadcast_origin_offset_tests {
         // Decode the Start's 56-bit absolute exactly as tools/trace_decoder does.
         let decoded_start = (0..7).fold(0u64, |v, i| (v << 8) | bytes[1 + i] as u64);
         assert_eq!(decoded_start, off, "injected offset must surface in the decoded Start absolute");
+    }
+}
+
+#[cfg(test)]
+mod lock_event_selection_tests {
+    use super::*;
+    use crate::interpreter::state::EventType;
+
+    fn released_ids(dev: &DeviceState, col: u8, row: u8, lock_id: u8) -> Vec<u8> {
+        let tile = dev.array.get(col, row).unwrap();
+        tile.lock_event_hw_ids(&EventType::LockRelease { lock_id })
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn memtile_selection_register_write_retargets_the_selector() {
+        let mut dev = DeviceState::new_npu1();
+        let sel = &regdb::device_reg_layout().memtile_lock_selection;
+        // Locks_Event_Selection_0 -> lock 2, Locks_Event_Selection_1 -> lock 40 (above 7).
+        dev.apply_tile_local_effects(1, 1, sel.base, (2 << 16) | 0x3F);
+        dev.apply_tile_local_effects(1, 1, sel.base + sel.stride, (40 << 16) | 0x3F);
+        assert_eq!(released_ids(&dev, 1, 1, 2), vec![48]);
+        assert_eq!(released_ids(&dev, 1, 1, 40), vec![52]);
+        // Lock 0 is still watched by selectors 2..=7.
+        assert_eq!(released_ids(&dev, 1, 1, 0), vec![56, 60, 64, 68, 72, 76]);
+    }
+
+    #[test]
+    fn compute_and_shim_selection_banks_are_independent_of_the_memtile() {
+        let mut dev = DeviceState::new_npu1();
+        let layout = regdb::device_reg_layout();
+        let mem = &layout.memory_lock_selection;
+        let shim = &layout.shim_lock_selection;
+        dev.apply_tile_local_effects(1, 2, mem.base + 3 * mem.stride, 9 << 16);
+        dev.apply_tile_local_effects(1, 0, shim.base + 5 * shim.stride, 12 << 16);
+        assert_eq!(released_ids(&dev, 1, 2, 9), vec![46 + 12]);
+        assert_eq!(released_ids(&dev, 1, 0, 12), vec![41 + 20]);
+        // The memtile and a second compute tile saw nothing.
+        assert_eq!(released_ids(&dev, 1, 1, 9), Vec::<u8>::new());
+        assert_eq!(released_ids(&dev, 2, 2, 9), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn writes_outside_the_selection_bank_leave_it_alone() {
+        let mut dev = DeviceState::new_npu1();
+        let sel = &regdb::device_reg_layout().memtile_lock_selection;
+        dev.apply_tile_local_effects(1, 1, sel.base + sel.count as u32 * sel.stride, 5 << 16);
+        assert_eq!(dev.array.get(1, 1).unwrap().lock_event_selected, [0; 8]);
     }
 }

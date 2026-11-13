@@ -10,11 +10,13 @@
 //! part of Subsystem 4. The xdna-emu wrapper struct that hosted them
 //! was deleted in the same subsystem.
 
+use crate::dma::clock_layout::ClockControlLayout;
 use crate::dma::field_layouts::{
     BdFieldLayout, ChannelFieldLayout, StatusFieldLayout, MemTileBdFieldLayout, ShimBdFieldLayout,
-    ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout,
+    ShimMuxLayout, StreamSwitchLayout, ModuleEventLayout, LockEventSelectionLayout,
 };
 use crate::regdb::{RegisterDb, RegisterDef};
+use std::collections::HashMap;
 use crate::types::TileKind;
 
 /// Pre-resolved register layouts for one device architecture.
@@ -162,8 +164,30 @@ pub struct DeviceRegLayout {
     /// MemTile event registers
     pub memtile_events: ModuleEventLayout,
 
+    // -- Lock event selection banks (which lock each LOCK_SEL<n> watches) --
+    /// Compute tile memory module
+    pub memory_lock_selection: LockEventSelectionLayout,
+    /// MemTile
+    pub memtile_lock_selection: LockEventSelectionLayout,
+    /// Shim
+    pub shim_lock_selection: LockEventSelectionLayout,
+
     /// Cascade configuration register (compute tiles, core module)
     pub cascade_config_offset: u32,
+
+    // -- Clock control --
+    /// Compute tile clock-control registers (core section of the database)
+    pub compute_clock: ClockControlLayout,
+    /// MemTile clock-control registers
+    pub memtile_clock: ClockControlLayout,
+    /// Shim clock-control registers (`Module_Clock_Control_0`)
+    pub shim_clock: ClockControlLayout,
+
+    /// Non-zero power-on reset values by tile-local offset: compute (core and
+    /// memory sections together), memtile, shim.
+    compute_resets: HashMap<u32, u32>,
+    memtile_resets: HashMap<u32, u32>,
+    shim_resets: HashMap<u32, u32>,
 }
 
 impl DeviceRegLayout {
@@ -179,6 +203,29 @@ impl DeviceRegLayout {
             }
             _ => None,
         }
+    }
+
+    /// Clock-control registers of `tile_kind`.
+    pub fn clock_control(&self, tile_kind: TileKind) -> &ClockControlLayout {
+        match tile_kind {
+            TileKind::Compute => &self.compute_clock,
+            TileKind::Mem => &self.memtile_clock,
+            TileKind::ShimNoc | TileKind::ShimPl => &self.shim_clock,
+        }
+    }
+
+    /// Power-on reset value of the register at this tile-local offset, or
+    /// `None` when the database gives no register there or its reset is zero.
+    /// A masked write to a register nothing has written yet must start from
+    /// this value, not from zero.
+    pub fn reset_value(&self, tile_kind: TileKind, offset: u32) -> Option<u32> {
+        match tile_kind {
+            TileKind::Compute => &self.compute_resets,
+            TileKind::Mem => &self.memtile_resets,
+            TileKind::ShimNoc | TileKind::ShimPl => &self.shim_resets,
+        }
+        .get(&offset)
+        .copied()
     }
 
     /// Build from a register database, resolving all field layouts.
@@ -341,11 +388,39 @@ impl DeviceRegLayout {
         let core_events = build_event_layout("core");
         let memory_events = build_event_layout("memory");
         let memtile_events = build_event_layout("memory_tile");
+        let memory_lock_selection = LockEventSelectionLayout::from_regdb(&db, "memory")?;
+        let memtile_lock_selection = LockEventSelectionLayout::from_regdb(&db, "memory_tile")?;
+        let shim_lock_selection = LockEventSelectionLayout::from_regdb(&db, "shim")?;
 
         // Cascade/accumulator control register (core module, compute tiles).
         // AM025 names this "Accumulator_Control" -- it configures cascade
         // input/output directions (bit 0 = input dir, bit 1 = output dir).
         let cascade_config_offset = reg_offset_opt("core", "Accumulator_Control");
+
+        let compute_clock = ClockControlLayout::from_regdb(&db, "core", "Module_Clock_Control")?;
+        let memtile_clock = ClockControlLayout::from_regdb(&db, "memory_tile", "Module_Clock_Control")?;
+        let shim_clock = ClockControlLayout::from_regdb(&db, "shim", "Module_Clock_Control_0")?;
+
+        let resets = |modules: &[&str]| -> Result<HashMap<u32, u32>, String> {
+            let mut map = HashMap::new();
+            for name in modules {
+                let m = db.module(name).ok_or_else(|| format!("Module '{}' not found", name))?;
+                for (offset, value) in m.non_zero_reset_values() {
+                    if let Some(prev) = map.insert(offset, value) {
+                        if prev != value {
+                            return Err(format!(
+                                "offset 0x{:05X} has conflicting reset values 0x{:X} and 0x{:X} in {:?}",
+                                offset, prev, value, modules
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(map)
+        };
+        let compute_resets = resets(&["core", "memory"])?;
+        let memtile_resets = resets(&["memory_tile"])?;
+        let shim_resets = resets(&["shim"])?;
 
         Ok(Self {
             core_memory_control,
@@ -399,7 +474,16 @@ impl DeviceRegLayout {
             core_events,
             memory_events,
             memtile_events,
+            memory_lock_selection,
+            memtile_lock_selection,
+            shim_lock_selection,
             cascade_config_offset,
+            compute_clock,
+            memtile_clock,
+            shim_clock,
+            compute_resets,
+            memtile_resets,
+            shim_resets,
             db,
         })
     }
