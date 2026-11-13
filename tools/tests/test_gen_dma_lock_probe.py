@@ -1343,6 +1343,7 @@ def test_swap_rejects_an_old_event_that_is_not_in_the_list():
 
 
 def test_swap_rejects_an_unknown_new_event_name():
+    pytest.importorskip("aie.utils.trace.events")
     with pytest.raises(ValueError, match="unknown memory-module event"):
         g.apply_event_swap(g.SYNC_MAIN_EVENTS, ("DMA_S2MM_0_FINISHED_BD", "LOCK_1_RELL"))
 

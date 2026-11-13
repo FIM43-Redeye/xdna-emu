@@ -408,8 +408,11 @@ def apply_event_swap(events: list[str], swap: tuple[str, str] | None) -> list[st
         raise ValueError(f"{old} is not in the memory-module list ({', '.join(events)})")
     if new in events:
         raise ValueError(f"{new} is already in the memory-module list")
-    from aie.utils.trace.events import MemEventAIE2
-    if new not in MemEventAIE2.__members__:
+    try:
+        from aie.utils.trace.events import MemEventAIE2
+    except ImportError:               # no mlir-aie python on the path: the injector rejects a bad name itself
+        MemEventAIE2 = None
+    if MemEventAIE2 is not None and new not in MemEventAIE2.__members__:
         raise ValueError(f"unknown memory-module event {new}")
     return [new if e == old else e for e in events]
 FETCH_CORE_GROUNDING = "PERF_CNT_2"
