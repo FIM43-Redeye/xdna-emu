@@ -250,6 +250,15 @@ ground truth, Peano informational). Six phases: discover, compile (parallel),
 run HW (parallel -j5), run EMU (parallel -j nproc), trace comparison
 (`--trace=pc-anchored`), event sweep (`--sweep`), report per-compiler matrix.
 
+The HW phase disqualifies a run after a new TDR (`aie2_tdr_work`) or
+`IO_PAGE_FAULT` in the kernel log. It reads the log through
+`scripts/lib/kernel-log.sh` (`journalctl -k -b` with a cursor taken before each
+run, `dmesg` as fallback) and fails closed: if neither reader returns lines,
+which is what happens for an unprivileged user when `kernel.dmesg_restrict=1`
+and they are not in the `adm` or `systemd-journal` group, hardware runs are
+refused rather than reported clean. `--no-hw` is unaffected.
+`scripts/test-kernel-log.sh` tests the helper against fake readers.
+
 Sweep mode (Phase 5b) is two-phase: HW arm runs serially across tests
 (NPU is single-tenant), EMU arm runs serial across tests with parallel
 events per test (-j N). The EMU arm uses `bridge-trace-runner --batch-stdin`

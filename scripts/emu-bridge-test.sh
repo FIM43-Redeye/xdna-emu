@@ -189,6 +189,9 @@ Usage: emu-bridge-test.sh [options] [test-name-regex]
 Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
+                  Hardware runs also need a readable kernel log (journalctl -k
+                  or dmesg) to catch TDRs and IO_PAGE_FAULTs; without one the
+                  script refuses to start them.
   --no-emu        Skip emulator runs (default: emulator enabled)
   --trace         Enable trace injection and comparison (default: on)
   --no-trace      Disable trace preparation (e.g., when only validating
@@ -527,22 +530,10 @@ export -f is_test_quarantined
 info() { echo ">>> $*"; }
 err()  { echo "ERROR: $*" >&2; }
 
-# Count TDR events in dmesg.  Returns the number of "aie2_tdr_work" lines.
-# Usage: before=$(tdr_count); run test; after=$(tdr_count); new=$((after-before))
-tdr_count() {
-  local n
-  n=$(dmesg 2>/dev/null | grep -c 'aie2_tdr_work') || true
-  echo "$n"
-}
-export -f tdr_count
-
-# Count IOMMU page faults in dmesg.
-iommu_fault_count() {
-  local n
-  n=$(dmesg 2>/dev/null | grep -c 'IO_PAGE_FAULT') || true
-  echo "$n"
-}
-export -f iommu_fault_count
+# Kernel-log reads (TDR / IO_PAGE_FAULT detection) go through the shared
+# helper, which fails closed when the log is unreadable (e.g. dmesg restricted).
+# shellcheck source=lib/kernel-log.sh
+source "$SCRIPT_DIR/lib/kernel-log.sh"
 
 # Current system uptime in seconds (integer), for dmesg correlation.
 uptime_sec() {
@@ -2160,13 +2151,16 @@ run_one_hardware() {
   local trace_out_dir="$RESULTS_DIR/${safe}${vsuffix}.${compiler}.hw"
   mkdir -p "$trace_out_dir"
 
-  # Snapshot TDR and IOMMU-fault counts and uptime for post-test attribution.
+  # Mark the kernel-log position (journal cursor) and uptime for post-test attribution.
   # An IO_PAGE_FAULT is just as disqualifying as a TDR: it means a BD drove a
   # DMA past its buffer, silently corrupting DDR when the overrun lands on a
   # mapped neighbour (the bridge-runner output-BO under-allocation bug, #140).
-  local tdr_before iommu_before
-  tdr_before="$(tdr_count)"
-  iommu_before="$(iommu_fault_count)"
+  local klog_mark_pos
+  if ! klog_mark_pos="$(klog_mark)"; then
+    echo "KLOG: kernel log unreadable before the run; not running on hardware" > "$log_file"
+    echo "FAIL" > "$result_file"
+    return
+  fi
   local t_start
   t_start="$(uptime_sec)"
 
@@ -2181,11 +2175,16 @@ run_one_hardware() {
     timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
-  local tdr_after iommu_after
-  tdr_after="$(tdr_count)"
-  iommu_after="$(iommu_fault_count)"
-  local tdr_new=$(( tdr_after - tdr_before ))
-  local iommu_new=$(( iommu_after - iommu_before ))
+  # New TDR / IO_PAGE_FAULT lines since the pre-run mark.  An unreadable log
+  # after the run means the guard cannot be evaluated: fail, never PASS.
+  local tdr_new iommu_new klog_new
+  if ! klog_new="$(klog_since "$klog_mark_pos")"; then
+    echo "KLOG: kernel log unreadable after the run; result untrusted" >> "$log_file"
+    echo "FAIL" > "$result_file"
+    return
+  fi
+  tdr_new="$(grep -c 'aie2_tdr_work' <<<"$klog_new" || true)"
+  iommu_new="$(grep -c 'IO_PAGE_FAULT' <<<"$klog_new" || true)"
 
   local result
   if [[ $tdr_new -gt 0 ]]; then
@@ -3505,6 +3504,12 @@ main() {
       info "HW: SKIPPED -- no NPU hardware detected"
       RUN_HW=false
     fi
+  fi
+  # Fail closed: a hardware run whose kernel log cannot be read could not
+  # notice a TDR or IO_PAGE_FAULT, so refuse it (--no-hw is unaffected).
+  if $RUN_HW && ! klog_selfcheck; then
+    err "refusing hardware runs without a readable kernel log (or pass --no-hw)"
+    exit 2
   fi
 
   # Active runtimes run the same jobs in order (HW -> EMU -> aiesim); list only
