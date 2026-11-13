@@ -546,13 +546,13 @@ def absent_setup(tmp_path, hw_sides, emu_base, emu_cand, hw_extra=()):
 def test_a_sample_without_the_unit_does_not_widen_the_band(tmp_path):
     mem = lambda n: edge("X", periodic(n, 50), pkt=1)
     only_core = edge("INSTR_VECTOR", periodic(5, 50))           # the memory unit never arrived
-    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[only_core])
+    b, c, x = absent_setup(tmp_path, mem(10), mem(10), mem(14), hw_extra=[mem(10), only_core])
     rep = tcr.compare_runs(b, c, hw_samples=x)
     r = only_row(rep, "X")
     # the zero of the absent sample used to open the band to [-10, 20] and hide 14
-    assert r.hw_counts == [10] and (r.hw_carrying, r.hw_total) == (1, 2)
+    assert r.hw_counts == [10, 10] and (r.hw_carrying, r.hw_total) == (2, 3)
     assert r.gate_fail and rep.exit_code == 1
-    assert "carried by 1 of 2 HW samples" in tcr.format_text(rep)
+    assert "carried by 2 of 3 HW samples" in tcr.format_text(rep)
 
 
 def test_a_unit_that_recorded_zero_events_is_a_measured_zero(tmp_path):
@@ -570,7 +570,7 @@ def test_a_row_no_sample_measured_is_listed_not_scored(tmp_path):
     rep = tcr.compare_runs(b, c, hw_samples=x)
     assert not [r for r in rep.rows if r.key.event == "X"]
     (nm,) = rep.not_measured
-    assert (nm.key.event, nm.key.module, nm.hw_total, nm.emu_before, nm.emu_after) == ("X", 1, 3, 10, 14)
+    assert (nm.key.event, nm.key.module, nm.hw_total, nm.emu_before, nm.emu_after) == ("X", 1, 2, 10, 14)
     assert rep.exit_code == 0
     assert "not measured on silicon (1)" in tcr.format_text(rep)
     assert tcr.to_json(rep)["not_measured"][0]["emu_after"] == 14

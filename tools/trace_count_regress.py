@@ -137,6 +137,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trace_decoder import (  # noqa: E402
+    StopCmd,
     TraceMode,
     decode_words,
     detect_per_tile_modes,
@@ -246,6 +247,17 @@ def pattern_distance(emu: list[int], hw_samples: list[list[int]]) -> float | Non
 
 # --- loading -------------------------------------------------------------
 
+@dataclass(frozen=True)
+class UnitState:
+    """A trace unit that a capture carries (its stream has a Start frame).
+
+    ``tail_cut`` is True when the stream has no End token (its last packet was not delivered, so
+    the events after the last full packet are missing), False when it ends with one, and None
+    when the unit's mode has no End token in the decoder (event-PC streams).
+    """
+    tail_cut: bool | None
+
+
 @dataclass(frozen=True, order=True)
 class RowKey:
     test: str
@@ -262,6 +274,9 @@ class RowKey:
 class Side:
     """One ``<test>.<compiler>.<hw|emu>`` result dir, decoded on first use.
 
+    ``units``: {(col, row, pkt_type): UnitState} of the units the capture carries, or None when
+    that cannot be told (no usable ``trace_raw.bin``: events.json cannot separate a unit that
+    recorded zero events from one that is missing).
     ``series``: {(col, row, pkt_type, event): [timestamps]} with level rows rebuilt from
     ``trace_raw.bin`` into one event per asserted cycle (so the series of a level is its interval
     start times).  ``level_problem`` is None when that worked, else why level rows of this side
@@ -289,9 +304,11 @@ class Side:
         self._event_sets = {pt: tuple(sn[kind]) for pt, kind in _PT_CODE_TO_NAME.items()
                             if kind in sn}
         # (col, row, pkt_type, name, ts) of every event, level rows expanded where possible.
-        rows, self._level_problem = _event_rows(self.path, doc)
-        groups: dict[tuple, list[int]] = {}
+        rows, self._level_problem, units = _event_rows(self.path, doc)
         oc, orow = self._origin
+        self._units = (None if units is None else
+                       {(max(c - oc, 0), max(r - orow, 0), pt): st for (c, r, pt), st in units.items()})
+        groups: dict[tuple, list[int]] = {}
         for col, row, pt, name, ts in rows:
             groups.setdefault((max(col - oc, 0), max(row - orow, 0), pt, name), []).append(ts)
         self._series = {k: series_from_stamps(v, k[3]) for k, v in groups.items()}
@@ -301,6 +318,20 @@ class Side:
     def series(self) -> dict[tuple, list[int]]:
         self._load()
         return self._series
+
+    @property
+    def units(self) -> dict[tuple, UnitState] | None:
+        self._load()
+        return self._units
+
+    def carries(self, unit: tuple) -> bool | None:
+        """Whether the capture carries ``unit`` (col, row, pkt_type); None when it cannot be told."""
+        units = self.units
+        return None if units is None else unit in units
+
+    def tail_cut(self, unit: tuple) -> bool | None:
+        units = self.units
+        return units[unit].tail_cut if units is not None and unit in units else None
 
     @property
     def level_problem(self) -> str | None:
@@ -313,21 +344,37 @@ class Side:
         return self._event_sets
 
 
+def _unit_states(words: list[int], modes: dict, all_cmds: dict) -> dict:
+    """{(pkt_type, row, col): UnitState} of the units with a Start frame in the raw words.
+
+    A unit with no packet at all, or whose packets carry no Start, is absent and not listed.
+    """
+    out = {}
+    for key, mode in modes.items():
+        if mode is None:
+            continue
+        cmds = all_cmds.get(key) or []
+        cut = None if not cmds else not any(isinstance(c, StopCmd) for c in cmds)
+        out[key] = UnitState(tail_cut=cut if mode == TraceMode.EVENT_TIME else None)
+    return out
+
+
 def _event_rows(path: Path, doc: dict):
-    """-> ([(col, row, pkt_type, name, ts)], level_problem) for one side.
+    """-> ([(col, row, pkt_type, name, ts)], level_problem, units) for one side.
 
     Mode-0 tiles come from ``trace_raw.bin`` with held levels expanded; every other tile (and
-    every tile, when the raw trace cannot be used) comes from events.json.
+    every tile, when the raw trace cannot be used) comes from events.json.  ``units`` is
+    {(col, row, pkt_type): UnitState} from the raw trace, None without a usable one.
     """
     original = [(e["col"], e["row"], e["pkt_type"], e["name"], e["ts"]) for e in doc["events"]]
     raw = path / "trace_raw.bin"
     if not raw.exists():
-        return original, "no trace_raw.bin"
+        return original, "no trace_raw.bin", None
     data = raw.read_bytes()
     words = list(struct.unpack(f"<{len(data) // 4}I", data[: len(data) // 4 * 4]))
     modes = detect_per_tile_modes(words)
-    cmds = {k: v for k, v in decode_words(words, mode=None).items()
-            if modes.get(k) == TraceMode.EVENT_TIME}
+    all_cmds = decode_words(words, mode=None)
+    cmds = {k: v for k, v in all_cmds.items() if modes.get(k) == TraceMode.EVENT_TIME}
     sn = doc.get("slot_names") or {}
     names = {pt: {f"{r},{c}": sn.get(_PT_CODE_TO_NAME[pt], [""] * 8) for (p, r, c) in cmds
                   if p == pt} for pt in _PT_CODE_TO_NAME}
@@ -338,11 +385,12 @@ def _event_rows(path: Path, doc: dict):
                                for e in doc["events"]
                                if (e["pkt_type"], e["row"], e["col"]) in cmds)
     if plain != want:
-        return original, "trace_raw.bin does not reproduce events.json"
+        return original, "trace_raw.bin does not reproduce events.json", None
     expanded = [(e.col, e.row, e.pkt_type, e.name, e.ts)
                 for e in rebuild_timeline_mode0_levels(cmds, names)]
     rest = [r for r in original if (r[2], r[1], r[0]) not in cmds]
-    return expanded + rest, None
+    units = {(c, r, pt): st for (pt, r, c), st in _unit_states(words, modes, all_cmds).items()}
+    return expanded + rest, None, units
 
 
 def load_run(root: Path) -> dict[tuple[str, str], dict[str, Side]]:
@@ -377,12 +425,46 @@ class RowResult:
     verdict: str            # improved | regressed | neutral
     label: str
     gate_fail: bool
+    hw_carrying: int        # silicon samples that carry the row's trace unit (the band's samples)
+    hw_total: int           # usable silicon samples (same event set), carrying the unit or not
+    hw_tail_cut: int        # of the carrying ones, those whose stream lost its tail
 
     @property
     def severity(self) -> tuple:
         pb = self.pattern_before if self.pattern_before is not None else 0
         pa = self.pattern_after if self.pattern_after is not None else 0
         return (self.gate_fail, self.count_after - self.count_before, pa - pb)
+
+
+@dataclass
+class NotMeasured:
+    """A row no silicon sample measured: none of them carries the row's trace unit."""
+    key: RowKey
+    hw_total: int
+    emu_before: int
+    emu_after: int
+
+
+@dataclass
+class UnitCoverage:
+    """One trace unit (tile, module) of a test: who carries it.
+
+    ``hw_*`` count the usable silicon samples; ``emu_baseline`` / ``emu_candidate`` say whether
+    that emulator trace carries the unit (None: cannot be told, no raw trace).
+    """
+    test: str
+    compiler: str
+    col: int
+    row: int
+    module: int
+    hw_total: int
+    hw_carrying: int
+    hw_tail_cut: int
+    emu_baseline: bool | None
+    emu_candidate: bool | None
+
+    def tile(self) -> str:
+        return f"({self.col},{self.row})/m{self.module}"
 
 
 @dataclass
@@ -400,13 +482,25 @@ class Report:
     # Cross-module offset rows, one per (test, tile); empty when switched off.
     offsets: list = field(default_factory=list)
 
+    # Rows no silicon sample measured (the unit is absent from all of them): neither pass nor fail.
+    not_measured: list = field(default_factory=list)
+    # Per trace unit: how many silicon samples carry it, and how many of those lost their tail.
+    units: list = field(default_factory=list)
+
+    @property
+    def emu_absent(self) -> list:
+        """Units the candidate emulator trace lacks although silicon carries them: gate failures,
+        since an emulator that stops tracing a unit would otherwise read as a silent zero."""
+        return [u for u in self.units if u.emu_candidate is False and u.hw_carrying > 0]
+
     @property
     def changed(self):
         return self.rows
 
     @property
     def exit_code(self) -> int:
-        return 1 if any(r.gate_fail for r in self.rows) or any(o.gate_fail for o in self.offsets) else 0
+        return 1 if (any(r.gate_fail for r in self.rows) or any(o.gate_fail for o in self.offsets)
+                     or self.emu_absent) else 0
 
     def of(self, verdict):
         return sorted((r for r in self.rows if r.verdict == verdict),
@@ -421,6 +515,11 @@ class Report:
             "rows_compared": self.rows_compared,
             "rows_changed": len(self.rows),
             "rows_unscored": len(self.unscored),
+            "rows_not_measured": len(self.not_measured),
+            "units_absent_from_hw_samples": sum(1 for u in self.units if u.hw_carrying < u.hw_total),
+            "hw_samples_without_unit": sum(u.hw_total - u.hw_carrying for u in self.units),
+            "hw_samples_tail_cut": sum(u.hw_tail_cut for u in self.units),
+            "emu_units_absent": len(self.emu_absent),
             "improved": len(self.of("improved")),
             "regressed": len(self.of("regressed")),
             "neutral": len(self.of("neutral")),
@@ -563,6 +662,7 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
         for pt, lst in usable.items():
             for _, side in lst:
                 keys |= {k for k in side.series if k[2] == pt}
+        _unit_coverage(rep, tc, usable, eb_side, ec_side, keys)
         for k in sorted(keys):
             rk = RowKey(tc[0], tc[1], k[0], k[1], k[2], k[3])
             hw_sides = usable[k[2]]
@@ -572,6 +672,13 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
             if eb_side.event_sets.get(k[2]) != ec_side.event_sets.get(k[2]):
                 rep.unscored.append((rk, "baseline and candidate EMU traced different event sets"))
                 continue
+            # Only samples that carry the unit measured anything: an absent unit is not a zero.
+            carrying = [(lbl, side) for lbl, side in hw_sides if side.carries(k[:3]) is not False]
+            if not carrying:
+                rep.not_measured.append(NotMeasured(
+                    rk, len(hw_sides), len(eb_side.series.get(k, [])), len(ec_side.series.get(k, []))))
+                continue
+            hw_sides_all, hw_sides = hw_sides, carrying
             if is_level_name(k[3]):
                 bad = [f"{lbl}: {side.level_problem}"
                        for lbl, side in [("baseline emu", eb_side), ("candidate emu", ec_side)]
@@ -600,14 +707,43 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
                 count_before=cb, count_after=ca,
                 pattern_before=pb, pattern_after=pa,
                 exact_match_broken=exact,
-                verdict=verdict, label=label, gate_fail=gate))
+                verdict=verdict, label=label, gate_fail=gate,
+                hw_carrying=len(hw_sides), hw_total=len(hw_sides_all),
+                hw_tail_cut=sum(side.tail_cut(k[:3]) is True for _, side in hw_sides)))
     return rep
+
+
+def _unit_coverage(rep: Report, tc: tuple, usable: dict, eb_side: Side, ec_side: Side, keys: set):
+    """Record, per trace unit of one (test, compiler), who carries it (see UnitCoverage)."""
+    units = {k[:3] for k in keys}
+    for side in (eb_side, ec_side, *[s for lst in usable.values() for _, s in lst]):
+        units |= set(side.units or ())
+    for unit in sorted(units):
+        samples = usable[unit[2]]
+        if not samples:
+            continue
+        carrying = [s for _, s in samples if s.carries(unit) is not False]
+        rep.units.append(UnitCoverage(
+            test=tc[0], compiler=tc[1], col=unit[0], row=unit[1], module=unit[2],
+            hw_total=len(samples), hw_carrying=len(carrying),
+            hw_tail_cut=sum(s.tail_cut(unit) is True for s in carrying),
+            emu_baseline=eb_side.carries(unit), emu_candidate=ec_side.carries(unit)))
 
 
 # --- output ----------------------------------------------------------------
 
 def _fmt_p(p):
     return "n/a" if p is None else f"{p:.1f}"
+
+
+def _unit_note(carrying: int, total: int, cut: int) -> str:
+    """The suffix of a row line when its unit is missing from some samples or lost a tail."""
+    if carrying == total and not cut:
+        return ""
+    bits = [f"carried by {carrying} of {total} HW samples"]
+    if cut:
+        bits.append(f"tail not delivered in {cut}")
+    return "; unit " + ", ".join(bits)
 
 
 def _line(r: RowResult) -> str:
@@ -618,6 +754,7 @@ def _line(r: RowResult) -> str:
             f"EMU {r.emu_count_before}->{r.emu_count_after} vs HW {r.hw_counts} ({rep}); "
             f"count dist {r.count_before}->{r.count_after}, "
             f"pattern W1 {_fmt_p(r.pattern_before)}->{_fmt_p(r.pattern_after)}; {r.label}"
+            + _unit_note(r.hw_carrying, r.hw_total, r.hw_tail_cut)
             + ("  [GATE]" if r.gate_fail else ""))
 
 
@@ -651,7 +788,11 @@ def format_text(rep: Report) -> str:
         f"rows compared: {s['rows_compared']}",
         f"rows changed: {s['rows_changed']}  improved: {s['improved']}  "
         f"regressed: {s['regressed']}  neutral: {s['neutral']}  gate failures: {s['gate_failures']}",
-        f"unscored rows: {s['rows_unscored']}",
+        f"unscored rows: {s['rows_unscored']}  not measured on silicon: {s['rows_not_measured']}",
+        f"trace units: {len(rep.units)}; absent from some HW samples: {s['units_absent_from_hw_samples']} "
+        f"({s['hw_samples_without_unit']} unit-samples); HW streams with the tail not delivered: "
+        f"{s['hw_samples_tail_cut']}; absent from the candidate emulator but carried by silicon: "
+        f"{s['emu_units_absent']}",
         f"count distance (sum):   {s['count_distance_before']} -> {s['count_distance_after']}",
         f"pattern distance (sum, {s['pattern_rows']} rows, cycles): "
         f"{s['pattern_distance_before']} -> {s['pattern_distance_after']}",
@@ -669,6 +810,19 @@ def format_text(rep: Report) -> str:
     if rep.dropped_samples:
         out += ["", f"Silicon samples not used ({len(rep.dropped_samples)}):"] + [
             f"  {t}.{c} {lbl}: {why}" for t, c, lbl, why in rep.dropped_samples]
+    if rep.emu_absent:
+        out += ["", f"Trace units absent from the candidate emulator trace although silicon carries "
+                    f"them ({len(rep.emu_absent)}):"] + [
+            f"  {u.test}.{u.compiler} {u.tile()}: silicon carries it in {u.hw_carrying} of "
+            f"{u.hw_total} samples; baseline emulator "
+            f"{'carries it' if u.emu_baseline else 'lacks it' if u.emu_baseline is False else '?'}  [GATE]"
+            for u in rep.emu_absent]
+    if rep.not_measured:
+        out += ["", f"Rows not measured on silicon ({len(rep.not_measured)}): no HW sample carries "
+                    f"the unit; neither pass nor fail"] + [
+            f"  {n.key.test}.{n.key.compiler} {n.key.tile()} {n.key.event}: EMU "
+            f"{n.emu_before}->{n.emu_after}, unit absent from all {n.hw_total} HW samples"
+            for n in rep.not_measured]
     if rep.unscored:
         out += ["", f"Unscored rows ({len(rep.unscored)}):"] + [
             f"  {k.test}.{k.compiler} {k.tile()} {k.event}: {why}" for k, why in rep.unscored]
@@ -696,6 +850,9 @@ def to_json(rep: Report) -> dict:
         "unscored": [{"key": asdict(k), "reason": why} for k, why in rep.unscored],
         "dropped_samples": [list(t) for t in rep.dropped_samples],
         "offsets": [asdict(o) for o in rep.offsets],
+        "not_measured": [dict(asdict(n), key=asdict(n.key)) for n in rep.not_measured],
+        "units": [asdict(u) for u in rep.units],
+        "emu_absent": [asdict(u) for u in rep.emu_absent],
     }
 
 
