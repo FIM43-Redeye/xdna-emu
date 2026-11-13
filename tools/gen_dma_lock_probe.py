@@ -1346,7 +1346,7 @@ def cmd_sync_table(args) -> int:
 # memory-module LOCK_0_REL frames fill the stream's last packets, so no measured frame sits in a packet silicon may
 # not deliver (silicon does not write a stream's final partial packet). The spacing grows so that no two fill frames
 # are equal: the trace encoder folds a run of equal (event, delta) frames into one frame and a Repeat. Nothing acquires A then; its count stays far below the
-# 6-bit limit (CHAIN_MAX_FILL).
+# 6-bit limit (at most CHAIN_MAX_FILL = 48).
 
 CHAIN_LOCK_B, CHAIN_LOCK_RX, CHAIN_LOCK_FREE0 = 4, 5, 6   # B: the core-released mid BD's lock; RX: the S2MM's
 CHAIN_MAX_FREE = 16 - CHAIN_LOCK_FREE0                     # free locks 6..15
@@ -1354,7 +1354,7 @@ CHAIN_MAX_BDS = 16                                         # BD descriptors of a
 CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffers: logical bank 1
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
-CHAIN_MAX_FILL = 32                # fill releases of A: its count stays below the 6-bit limit
+CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) stays below the 6-bit limit 63
 CHAIN_FILL_LOOP_ITERS = 4          # delay before the first fill release; each later one waits one iteration more
 CHAIN_LOCK_KINDS = {"": "none", "f": "free", "c": "core"}
 CHAIN_MEM_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD",
