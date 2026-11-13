@@ -668,6 +668,12 @@ impl TraceUnit {
     /// closes at the next frame / end-of-segment -- acceptable, and the same
     /// behavior HW exhibits.
     ///
+    /// Whether the level event `hw_event_id` is asserted now (`set_event_level`), whether or
+    /// not this unit is configured to trace it.
+    pub fn level_asserted(&self, hw_event_id: u8) -> bool {
+        hw_event_id < 128 && self.level_signals & (1u128 << hw_event_id) != 0
+    }
+
     /// Callers classify level vs pulse via the archspec `is_level_event`
     /// authority and route accordingly (levels here, pulses to `notify_event`).
     pub fn set_event_level(&mut self, hw_event_id: u8, cycle: u64, active: bool) {

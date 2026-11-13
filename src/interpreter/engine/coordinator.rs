@@ -127,6 +127,11 @@ struct CoreState {
     /// (`StepResult::Frozen { memory_stall: true, .. }`): a MEMORY_STALL cycle like a lost
     /// bank arbitration. Consumed by Phase E.
     memory_frozen: bool,
+    /// The core lost a bank arbitration in the previous cycle. A lost cycle's
+    /// MEMORY_STALL is stamped the cycle after it (silicon, lock-fetch arb probe:
+    /// all 82 loss rows one cycle after the losing CONFLICT_DM_BANK stamp; the
+    /// producer probe's 56 stalls likewise), so Phase E raises the level from this.
+    bank_lost_last_cycle: bool,
 }
 
 /// Held-level edge decision for a per-cycle win/loss boolean against its
@@ -169,6 +174,7 @@ impl CoreState {
             active_this_cycle: false,
             mem_stall_active: false,
             memory_frozen: false,
+            bank_lost_last_cycle: false,
         }
     }
 
@@ -187,6 +193,7 @@ impl CoreState {
         // would emit a phantom falling edge after reset.
         self.mem_stall_active = false;
         self.memory_frozen = false;
+        self.bank_lost_last_cycle = false;
     }
 }
 
@@ -1718,14 +1725,16 @@ impl InterpreterEngine {
         // Phase E: emit this cycle's bank-arbitration events.
         //
         // Both events come from the SAME arbitration that already decided who
-        // commits (Phases A-C), so they land in the cycle the contention
-        // actually happened -- not a cycle late, and not from a second,
-        // independently-scoped conflict detector (the executor's old
-        // commit-time detector is retired; see `record_memory_access`).
+        // commits (Phases A-C), not from a second, independently-scoped
+        // conflict detector (the executor's old commit-time detector is
+        // retired; see `record_memory_access`).
         //
         //   * CONFLICT_DM_BANK_N on the memory-module trace unit, once per
-        //     bank that had more than one requester this cycle.
-        //   * MEMORY_STALL on the core-module trace unit, as a held LEVEL:
+        //     bank that had more than one requester this cycle, in that cycle:
+        //     every cycle the core and a DMA (or two DMAs) wanted the bank,
+        //     whoever was served, and never a lone retry (silicon, arb probe).
+        //   * MEMORY_STALL on the core-module trace unit, one cycle after each
+        //     cycle the core lost (silicon, arb probe), as a held LEVEL:
         //     `mem_stall_edge` turns the per-cycle "core lost" boolean into
         //     rising/falling edges, so a sustained stall renders as one B..E
         //     span instead of one pulse per cycle (HW samples MEMORY_STALL as
@@ -1752,10 +1761,16 @@ impl InterpreterEngine {
                     // cycle (AM020 ch.4:69 -- a conflict on any port stalls the
                     // whole datapath). Cycle-stat counter ticks every stalled
                     // cycle, independent of the trace-edge collapsing.
-                    let stalled = arb.core_lost || std::mem::take(&mut self.cores[core_idx].memory_frozen);
-                    if stalled {
+                    let frozen = std::mem::take(&mut self.cores[core_idx].memory_frozen);
+                    if arb.core_lost || frozen {
                         self.cores[core_idx].context.timing_context_mut().memory_stalls += 1;
                     }
+                    // A lost bank arbitration is stamped one cycle late (see
+                    // `bank_lost_last_cycle`); a gather's frozen memory cycle on
+                    // its own cycle, as before.
+                    let lost_before =
+                        std::mem::replace(&mut self.cores[core_idx].bank_lost_last_cycle, arb.core_lost);
+                    let stalled = lost_before || frozen;
 
                     let Some(active) = mem_stall_edge(stalled, self.cores[core_idx].mem_stall_active) else {
                         continue;
@@ -3105,6 +3120,78 @@ mod tests {
     /// proves the core loses arbitration here -- but reads the count off a
     /// core-module perf counter configured with start_event=MEMORY_STALL(23)
     /// instead of the timing-context stat.
+    /// Event semantics (silicon, lock-fetch arb probe, NPU1 2026-11): a cycle the core loses
+    /// the bank raises MEMORY_STALL one cycle later (82 of 82 loss rows), one stall cycle per
+    /// lost cycle; CONFLICT_DM_BANK marks every cycle the core and the DMA both wanted the bank,
+    /// the one the DMA won included, and never the core's lone retry after it. Same fixture as
+    /// `core_and_dma_contending_for_one_bank_costs_the_core_cycles`: a core storing into bank 0
+    /// every cycle against an MM2S reading bank 0.
+    #[test]
+    fn a_lost_bank_cycle_raises_memory_stall_one_cycle_later() {
+        use crate::device::dma::BdConfig;
+        use crate::interpreter::engine::bank_census;
+        use crate::interpreter::state::MOD_BASE_DJ;
+        use xdna_archspec::aie2::trace_events::core_events;
+
+        const STORE_BUNDLE: [u8; 8] = [0x03, 0x40, 0x57, 0x11, 0x00, 0x20, 0xd4, 0x00];
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).expect("compute tile (1,2)");
+            let mut prog = [0u8; 256];
+            for chunk in prog.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&STORE_BUNDLE);
+            }
+            tile.write_program(0, &prog);
+        }
+        engine.set_core_pointer(1, 2, 0, 0x70400);
+        engine.set_core_modifier(1, 2, MOD_BASE_DJ, 0x7700);
+        engine.enable_core(1, 2);
+        engine
+            .device_mut()
+            .array
+            .dma_engine_mut(1, 2)
+            .unwrap()
+            .configure_bd(0, BdConfig::simple_1d(0x400, 128))
+            .unwrap();
+        {
+            let tile = engine.device_mut().tile_mut(1, 2).unwrap();
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0;
+        }
+
+        bank_census::enable();
+        let mut level = Vec::new(); // (cycle, MEMORY_STALL asserted at the end of it)
+        for _ in 0..300 {
+            let cycle = engine.total_cycles();
+            engine.step();
+            let tile = engine.device().array.tile(1, 2);
+            level.push((cycle, tile.core_trace.level_asserted(core_events::MEMORY_STALL)));
+            let dma = engine.device_mut().array.dma_engine_mut(1, 2).unwrap();
+            while dma.pop_stream_out_for_channel(2).is_some() {}
+        }
+        let records = bank_census::take();
+        let lost: Vec<u64> = records.iter().filter(|r| r.core_lost).map(|r| r.cycle).collect();
+        let contended: Vec<u64> =
+            records.iter().filter(|r| r.contended_banks & 1 != 0).map(|r| r.cycle).collect();
+        assert!(lost.len() >= 2, "the fixture must make the core lose ({lost:?})");
+        let stalled: Vec<u64> = level.iter().filter(|(_, on)| *on).map(|(c, _)| *c).collect();
+        let expected: Vec<u64> = lost.iter().map(|c| c + 1).collect();
+        assert_eq!(stalled, expected, "MEMORY_STALL one cycle after each lost cycle, one per loss");
+        for c in &lost {
+            assert!(contended.contains(c), "the cycle the DMA won is a conflict ({c})");
+            assert!(
+                !contended.contains(&(c + 1)) || lost.contains(&(c + 1)) || {
+                    // the core's retry is contended only if the DMA wants the bank again then
+                    let r = records.iter().find(|r| r.cycle == c + 1).unwrap();
+                    r.dma_demand & 1 != 0
+                },
+                "the core's lone retry at {} is not a conflict",
+                c + 1
+            );
+        }
+    }
+
     #[test]
     fn core_losing_bank_arbitration_ticks_a_core_perf_counter_armed_by_memory_stall() {
         use crate::device::dma::BdConfig;
