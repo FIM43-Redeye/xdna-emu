@@ -533,7 +533,9 @@ BD's grant g0 (its STALLED_LOCK falls).
     producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
     `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
     282, 283) and (release - previous grant) mod 3 taking all three values in `collide`. The emulator lands on the
-    lock port's blocked phase (release + 3) in 3 of 15 `collide` transfers and 8 of 14 `sticky32` transfers: its
+    lock port's blocked phase (release + 3) in 3 of the 14 scored `collide` transfers (the fifteenth has no
+    release pulse to score). It did so in 8 of 14 `sticky32` transfers too until the compute BD release moved to
+    FINISHED_BD + 3 (2026-11-13); since then all 14 are at release + 2, so the gap is `collide`'s three. Its
     request Q = max(previous grant + 3, previous BD's third-to-last word sequenced + 3) sits at the previous grant
     + 243 in every transfer, because the word clock runs at the access rate a granule or two ahead and never
     reaches its cap. Tried and rejected: a grant-tied anchor (refuted by `collide`), a request anchored on the
