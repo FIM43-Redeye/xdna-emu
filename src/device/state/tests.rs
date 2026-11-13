@@ -1285,9 +1285,8 @@ const CLOCK_TILES: [(u8, u8, u32, u32); 3] = [
     (2, 0, 0xFFF00, 0x3B), // shim (Module_Clock_Control_0)
 ];
 
-/// Stream_Switch_Adaptive_Clock_Gate (bit 4) and DMA_Adaptive_Clock_Gate (bit 5).
+/// Stream_Switch_Adaptive_Clock_Gate (bit 4).
 const SS_ADAPTIVE: u32 = 1 << 4;
-const DMA_ADAPTIVE: u32 = 1 << 5;
 
 #[test]
 fn module_clock_control_reads_its_reset_value_before_any_write() {
