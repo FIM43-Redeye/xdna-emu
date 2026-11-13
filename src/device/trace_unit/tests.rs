@@ -1881,3 +1881,76 @@ fn a_packet_finished_by_padding_before_a_run_ending_repeat_leaves_a_cycle_before
         );
     }
 }
+
+// -- When a Sync is written ---------------------------------------------------------------------
+//
+// Silicon (no-data trace probe: a core packet filled with 27 one-byte frames, last frame in cycle
+// L, then 2^18 + 3000 idle cycles before the next frame, or none until the trace stops): the
+// packet whose 28th byte is the Sync reaches the shim S2MM at L + 2^18 + 14 in both runs, about
+// 3000 cycles before the next frame (a run with 3000 idle cycles and no Sync puts the padded
+// packet at the closing frame + 12). With the 10-cycle hand-off and the 2-cycle wake of the
+// route that is the Sync written in cycle L + 2^18 + 2: the first cycle a frame would need it
+// (`split_idle`), whether or not a frame comes then. Each further wrap is one more Sync, run-
+// length coded into the Repeat written with the next token, so the bytes are unchanged.
+
+const WRAP: u64 = CYCLES_FIELD_RANGE;
+
+/// A unit with one slot (hw event 37), its first frame in cycle 5, the buffer at 27 bytes.
+fn sync_unit() -> TraceUnit {
+    let mut tu = TraceUnit::new(0, 2);
+    tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+    tu.write_register(0x10, 37);
+    tu.notify_event(28, 0, None);
+    tu.byte_buffer.clear();
+    tu.byte_buffer.resize(26, 0xFE);
+    notify_commit(&mut tu, 37, 5);
+    assert_eq!(tu.byte_buffer.len(), 27);
+    tu
+}
+
+#[test]
+fn a_sync_is_written_in_the_cycle_the_idle_count_wraps() {
+    let mut tu = sync_unit();
+    let due = 5 + WRAP + 2;
+    commit_each(&mut tu, 6..=due - 1);
+    assert_eq!(tu.byte_buffer.len(), 27, "no Sync before the wrap");
+    assert_eq!(first_handoff(&mut tu, due..=due + 100), Some(due + EMIT));
+    let p = tu.pop_packet().unwrap();
+    assert_eq!(p[7] & 0xFF, 0xFF, "the Sync is the packet's last byte");
+}
+
+#[test]
+fn a_sync_is_written_at_the_wrap_with_no_frame_after_it() {
+    // The same stretch closed by the trace stop instead of a frame: the Sync still goes in at
+    // the wrap (silicon: the packet arrives at L + 2^18 + 14, long before the stop).
+    let mut tu = sync_unit();
+    let due = 5 + WRAP + 2;
+    assert_eq!(first_handoff(&mut tu, 6..=due + 4 * WRAP), Some(due + EMIT));
+}
+
+#[test]
+fn syncs_written_as_time_passes_are_the_bytes_of_syncs_written_with_the_frame() {
+    for idle in [WRAP + 1, 2 * WRAP + 1, 3 * WRAP + 17, 1_000_000] {
+        let t = 5 + 1 + idle;
+        let mut per_cycle = sync_unit();
+        commit_each(&mut per_cycle, 6..=t - 1);
+        notify_commit(&mut per_cycle, 37, t);
+        let mut at_once = sync_unit();
+        notify_commit(&mut at_once, 37, t);
+        let bytes = |tu: &mut TraceUnit| {
+            tu.flush_repeats();
+            let mut b: Vec<u8> = Vec::new();
+            while let Some(p) = tu.pop_packet() {
+                b.extend(p[1..].iter().flat_map(|w| w.to_be_bytes()));
+            }
+            b.extend(
+                tu.staged
+                    .iter()
+                    .flat_map(|(_, w)| w[1..].iter().flat_map(|(x, _)| x.to_be_bytes())),
+            );
+            b.extend(tu.byte_buffer.iter());
+            b
+        };
+        assert_eq!(bytes(&mut per_cycle), bytes(&mut at_once), "idle {idle}");
+    }
+}

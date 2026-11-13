@@ -212,6 +212,10 @@ pub struct TraceUnit {
     /// Completed packets held in the output stage: `(cycle the first word may be handed to the
     /// stream, the 8 words)`. Packets leave in order, so the ready cycles never decrease.
     staged: VecDeque<(u64, Vec<(u32, bool)>)>,
+    /// Syncs already written for the idle stretch after the frame of `sync_base` (a stretch
+    /// writes its Syncs as its wraps pass, see `write_due_syncs`).
+    syncs_written: u64,
+    sync_base: u64,
     /// Individual words ready for emission to the stream switch.
     /// Each entry is (word, tlast). Words are pushed in order: header first,
     /// then 7 data words, with TLAST=true on the last word. This allows the
@@ -305,6 +309,8 @@ impl TraceUnit {
             token_cycle: 0,
             now: 0,
             staged: VecDeque::new(),
+            syncs_written: 0,
+            sync_base: u64::MAX,
             pending_words: VecDeque::new(),
             col,
             row,
@@ -779,6 +785,7 @@ impl TraceUnit {
             // cycle now so a Repeat1 that saturates is written in its own cycle, not when the
             // hold ends.
             self.extend_held_run(cycle);
+            self.write_due_syncs(cycle);
             return;
         }
         if self.pending_cycle > cycle {
@@ -1090,18 +1097,67 @@ impl TraceUnit {
         }
     }
 
-    /// Write `n` Sync tokens (one 0xFF and a Repeat for the rest, like any other run). They
-    /// break a run of identical frames: the frames on either side are never merged.
-    fn push_syncs(&mut self, n: u64, cycle: u64) {
-        if n == 0 {
+    /// Syncs already written for the idle stretch since `last_event_cycle`.
+    fn syncs_written_in_stretch(&self) -> u64 {
+        if self.sync_base == self.last_event_cycle {
+            self.syncs_written
+        } else {
+            0
+        }
+    }
+
+    /// Write the Syncs whose wrap has come by `cycle` in a mode-0 idle stretch. The k-th Sync
+    /// after a frame (or the Start) of cycle `L` is due in `L + k * 2^18 + 2`, the first cycle a
+    /// frame would need it (`split_idle`), and is written then whether or not a frame comes.
+    /// Silicon (no-data trace probe): a packet whose 28th byte is the Sync of a 2^18 + 3000
+    /// cycle stretch reaches the shim S2MM at `L + 2^18 + 14`, about 3000 cycles before the
+    /// frame that ends the stretch, and the same when no frame comes before the trace stops:
+    /// written in `L + 2^18 + 2`, then the 10-cycle hand-off and the route's 2-cycle wake.
+    fn write_due_syncs(&mut self, cycle: u64) {
+        if self.state != TraceState::Running || self.mode != TraceMode::EventTime || self.frame_held != 0 {
             return;
         }
+        loop {
+            let k = self.syncs_written_in_stretch() + 1;
+            let due = self.last_event_cycle + k * CYCLES_FIELD_RANGE + 2;
+            if due > cycle {
+                return;
+            }
+            self.write_sync(due);
+        }
+    }
+
+    /// One Sync of the current idle stretch, written in `cycle`: the first is a 0xFF, the rest
+    /// a run of it (the Repeat goes in with the next token, a full Repeat1 as it fills, as for
+    /// frames). They break a run of identical frames: the frames on either side are never merged.
+    fn write_sync(&mut self, cycle: u64) {
+        let written = self.syncs_written_in_stretch();
         self.token_cycle = cycle;
-        self.flush_repeats();
-        self.last_frame = None;
-        self.push_op(&[0xFF]);
-        self.repeat_pending = n - 1;
-        self.flush_repeats();
+        if written == 0 {
+            self.flush_repeats();
+            self.last_frame = None;
+            self.push_op(&[0xFF]);
+        } else {
+            if self.repeat_pending == REPEAT1_MAX {
+                self.encode_mode0_repeat1(REPEAT1_MAX as u16);
+                self.repeat_pending = 0;
+            }
+            self.repeat_pending += 1;
+        }
+        self.sync_base = self.last_event_cycle;
+        self.syncs_written = written + 1;
+    }
+
+    /// Bring the Syncs of the current idle stretch up to `n` in `cycle` (the token that ends the
+    /// stretch is written then): the ones not yet written as their wraps passed.
+    fn push_syncs(&mut self, n: u64, cycle: u64) {
+        for _ in self.syncs_written_in_stretch()..n {
+            self.write_sync(cycle);
+        }
+        self.token_cycle = cycle;
+        if self.syncs_written_in_stretch() > 0 {
+            self.flush_repeats();
+        }
     }
 
     /// Write the Repeat tokens owed to `last_frame` (silicon: 1023 per Repeat1, Repeat0 up to 15)
