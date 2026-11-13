@@ -391,25 +391,18 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   memory yet raises no MEMORY_STARVATION.
 - **Result (emulator).** The grant-relative access map, FINISHED_BD g + 52 (was g + 64 chained, g + 72 first-BD),
   the conflict at g + 51 (FINISHED_BD g + 53), and the dummy BD's start-to-finish of 3 (was 9) match silicon; a
-  denied access at g + 2 delays only the stream (unit test), but in the probe the DMA wins that conflict (below);
+  denied access at g + 2 delays only the stream (unit test; since 2026-11-12 the integrated emulator gives the
+  core that conflict as silicon does, next section);
   every host-path guard of the previous section is unchanged; producer probe `collide`: conflicts in same-bank
-  pairs, 116 per colliding transfer (silicon 115-116; before 58), but every transfer collides (silicon: about 9 of
-  15, the others 4-6), so the run total is 1740 against 1069-1074 (870 before). Lock-synchronised variant (`fetch --sync --pre2
+  pairs, 116 per colliding transfer (silicon 115-116; before 58). With the urgency override every transfer
+  collided (1740 conflicts against 1069-1074); with the bank arbitration of the next section 9 of 15 do, as on
+  silicon. Lock-synchronised variant (`fetch --sync --pre2
   32`, 34 cases): FINISHED_BD minus the previous BD's = max(64, grant - previous finish + 52) on every row, as on
   silicon (291 rows; the emulator was flat grant + 64), and a parked 4-word BD's lock-free next BD of 32 words
   finishes 21 after it (silicon 21, emulator was 32).
 - **Still different (open gaps).**
-  - *Bank arbitration.* The emulator gives the bank to a compute MM2S whose staging holds 4 words or fewer
-    (`URGENT_WATERMARK`) ahead of the core. Words enter the staging at their access, so the staging is 0 at
-    g + 2 and holds the first granule's 4 words at g + 3: the DMA wins at g + 2 and g + 3 on the lock path, and at
-    every access of a free-running host-started BD (each access finds exactly the previous granule's 4 words).
-    On silicon the core won in all but 2 of about 40 measured conflicts (a core access at g + 2 delayed the
-    stream by one cycle and the DMA lost; the core itself was delayed only at g + 7 and g + 27) and in about 98%
-    of the producer probe's conflicts. Consequences: the producer probe's core stall count stays below silicon
-    (0 against 18-20), the `bankdisc` probe's conflict count above it (15 per transfer against 6-13), and the
-    unit test that denies the g + 2 access by hand passes while the integrated emulator cannot produce that
-    case. The urgent-DMA-wins case (the 18-20 core stalls) must stay reachable, so this needs a model decision
-    and a silicon measurement, not a threshold change.
+  - *Bank arbitration.* Modelled since 2026-11-12 by the served-access count; see the next section. The
+    urgency override this bullet described (a compute MM2S with 4 words or fewer staged beat the core) is gone.
   - *Short chained locked BDs.* Chained locked BDs of 1 to 3 words with the lock already free finish once every
     4 cycles in the emulator (a lock-free chain of the same BDs: every N cycles); silicon is unmeasured for
     them. The emulator requests the next BD's lock one cycle after the previous BD's finish (grant at the
@@ -434,6 +427,66 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
   - Not measured, so not changed: the memtile MM2S (keeps the read-cursor rule), the shim MM2S, every S2MM lock
     path, and the host-path access position inside a granule.
 
+
+## Compute-tile bank arbitration (modelled 2026-11-12, NPU1 silicon)
+
+Probes: `tools/gen_dma_lock_probe.py` arb cases (the chained lock-fetch design with 1 to 6 consecutive core loads
+or stores on one physical bank, 0 to 4 extra loads on the bank before the lock release; 56 cases, 174 rows) and
+ring cases (a core camping 90 or 120 cycles on bank 0 against each of MM2S 0 / 1 and S2MM 0 / 1, two channels
+together, and extra initialised words in bank 0; 15 cases, 48 rows); the producer probe (`collide`, `sticky8` to
+`sticky32`). Cycles are counted from the MM2S lock grant g.
+
+- **Silicon.** Each physical bank counts the accesses it has served: core loads and stores, the accesses of all
+  four DMA channels, and the configuration image's writes, once per initialised 16-byte line (1 to 4 extra words
+  in one line move the count by 1, two lines by 2). Refused requests add nothing. When the core and a DMA channel
+  want the bank in the same cycle the DMA is served if the count is 2 modulo 5, the core otherwise; the loser
+  retries the next cycle, so a DMA is refused at most 4 cycles in a row. With the count started at 0 at reset,
+  the probe design reaches its window with 20 served accesses on bank 0 (8 + 2 image lines, 2 crt0 stores, 8
+  frame stores) and 18 on bank 1, which places the core's losses at g + 7 and g + 47 on bank 0 and g + 27 on bank
+  1, as measured. All four channels win on the same single residue, and serving one advances the count the
+  others see (two channels with the core camping: 16 core losses exactly 5 cycles apart). A refused S2MM write
+  retries the next cycle like an MM2S read, its refused cycles raise CONFLICT_DM_BANK, and
+  DMA_S2MM_n_MEMORY_BACKPRESSURE does not fire for it. CONFLICT_DM_BANK marks every cycle in which two requesters
+  wanted the bank (the cycle the DMA won included; two DMA channels meeting with the core silent included) and
+  never a lone retry; a core loss is one MEMORY_STALL, stamped one cycle after the losing cycle's conflict.
+- **Model.** `BankAccessCounts` on the tile, advanced by the arbiter (`bank_arbiter.rs`) for every access a bank
+  serves and by the configuration path (`DeviceState`, data-memory writes) once per 16-byte line written; the
+  core-versus-DMA decision reads it against `BANK_ARBITER_PERIOD` 5 (measured) and `BANK_ARBITER_DMA_RESIDUE` 2
+  (fitted once; banks 0 and 1, whose histories differ by two stores, need the same value). The count is counted,
+  not offset: the emulator's own image load and prologue give 20 and 18 at the probe's window. A lost bank cycle
+  raises MEMORY_STALL one cycle later. The urgency override (`URGENT_WATERMARK`) is removed.
+- **Result (emulator).** Arb probe 174 of 174 rows (conflict cycles relative to the grant, MEMORY_STALL count,
+  window): a core access k bundles after the release lands at g + k - 2 in the emulator, where silicon's grant +
+  3 phase puts it, so a silicon grant + 3 row is compared with the same case and a grant + 2 row with the case at
+  k + 1. Ring probe 34 of 48 rows (the four single-channel camps' MM2S rows and every pad row; the losses of every
+  row at the same residue and spacing). Producer probe `collide`: 1077 conflicts (silicon 1069 / 1071 / 1074),
+  18 MEMORY_STALL (silicon 18 / 18 / 20), a 5-transfer cycle, 9 of 15 transfers colliding. `sticky32`: no
+  conflict run longer than 5 cycles, every 5-cycle run ends with a core stall (as silicon).
+- **Still different (open gaps).**
+  - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
+    measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
+    In the two-channel camps the emulator splits the turns differently (MM2S 0 finishes at g + 52, silicon
+    g + 58; with an S2MM, MM2S 0 at g + 82 against g + 62), though the 16 core losses fall where silicon's do.
+  - *Producer per-transfer pattern.* The emulator's 5-transfer cycle carries its 18 stalls as 3 + 0 + 0 + 3 + 0
+    per cycle of transfers (6, 116, 116, 5, 116 conflicts); silicon's as 2 + 1 + 0 + 3 + 0 (4, 115, 116, 6, 116).
+    The first contact of a transfer differs in shape (silicon 15b0x3 20b1x2 in a clean colliding transfer, the
+    emulator 15b0x2 19b1x2): the MM2S's request timing after a refused access, not the arbiter. `sticky32` has
+    499 conflicts and 150 stalls against 443 and 136.
+  - *S2MM camps.* The ring S2MM rows win on the same residue as silicon, but the S2MM's writes reach bank 0 six
+    cycles earlier relative to the MM2S grant than on silicon (its feed path; the S2MM also finishes 4 to 6
+    cycles early), so the contact runs differ.
+  - *Where the core's access sits.* Relative to the grant the emulator's accesses match silicon's grant + 3
+    phase only; there is no grant + 2 phase (the grant row above). A camp that starts right after the release
+    starts one cycle earlier relative to the grant than silicon's grant + 3 phase (a ring row is matched by the
+    emulator's case with one more nop), while accesses after 8 or more nops match it: the release-to-grant
+    latency, the lock request's frozen fourth bundle and the LOCK_0_REL stamp are not separated. In the core's own
+    timer MEMORY_STALL sits 3 cycles earlier after `event #0` than on silicon, and a MEMORY_STALL core stamp is 3
+    cycles after its conflict's memory stamp (silicon 1): the core and memory module stamps differ by 2 more
+    than on silicon (`event #0` minus LOCK_0_REL: -3, silicon -5).
+  - *Not measured.* Neighbouring cores accessing this tile's memory, vector accesses spanning two banks, both core
+    load ports at once against a DMA, a configuration write by a single-word register write (counted as one
+    access, like a line), whether a run that does not reset the array keeps counting, memory-tile banks (never
+    arbitrated), and why the period is 5.
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
 Silicon rows are the probe runs of the read-bandwidth section above (two runs of each case) and the trace and
