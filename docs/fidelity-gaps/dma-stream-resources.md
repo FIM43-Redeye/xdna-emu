@@ -529,6 +529,13 @@ BD's grant g0 (its STALLED_LOCK falls).
     event and its first LOCK_STALL, none predicts the 51 first-BD rows (or the 174 arb and 324 chained lock-fetch
     rows): no residue of any of them is + 3 only. Open; needs a DMA-side stamp before the first grant (START_TASK
     in the memory-module trace, or a lock-free one-word head BD) with the release swept over at least six cycles.
+    Further evidence that the phase varies run to run (2026-11-13): four sibling bridge kernels whose out MM2S
+    starts at boot on its first lock BD and meets a core load after the release (`vec_nan_fp32_dense_add`,
+    `vec_nan_bf16_dense_add`, `vec_nan_fp32_dense_sub`, `vec_nan_bf16_dense_sub`, Peano, three silicon samples
+    each): silicon stamps CONFLICT_DM_BANK_0 at the last release pulse + 4, the emulator's slot, in 2 of 12
+    samples, at + 10 in 3 (where a + 3 grant's access at grant + 7 falls) and not at all in 7; the emulator
+    stamps + 4 in all four kernels. So a 0 / 0 / 0 kernel (`vec_nan_bf16_dense_sub`) is one draw, not a
+    systematic difference.
   - *Grant phase of a lock BD whose previous BD had refused accesses* (open, 2026-11-13). Silicon grants the
     producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
     `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
@@ -663,6 +670,43 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
     load ports at once against a DMA, a configuration write by a single-word register write (counted as one
     access, like a line), whether a run that does not reset the array keeps counting, memory-tile banks (never
     arbitrated), and why the period is 5.
+## Compute S2MM timing (open, 2026-11-13)
+
+The compute S2MM never got the treatment the MM2S got (word clock, lock request and grant law): most of its
+timing is still the model from before the lock law. What is known, by row:
+
+| S2MM timing | Status | Rows |
+|---|---|---|
+| BD lock release reaches the lock unit at FINISHED_BD + 3 | measured, modelled | chain family S2MM releasers s1n08..s1n32, 18 / 18 |
+| A refused write retries the next cycle and raises CONFLICT_DM_BANK, not MEMORY_BACKPRESSURE | measured, modelled | ring probe camps |
+| Grant of a chained S2MM BD after a core release | **old model**: granted in the cycle the release lands, first write the cycle after; never measured | none |
+| Where a granule's bank access falls among its words | **old model**: in the cycle its first word is written. Silicon, lock-free S2MM0 fed by an own-tile MM2S (ring `rgs0`, 3 runs): every bank-0 write 6 cycles later than the emulator's relative to the MM2S grant (8 of 8 writes per run); FINISHED_BD g + 78 / 79 against 74. `rgs1` (S2MM1, route DMA:0 -> DMA:1): + 8 on both, so the two channels disagree on finish after the last write | ring `rgs0` / `rgs1` |
+| First BD of a task, held on a lock with a full path, after its grant (G = its STALLED_LOCK fall, which in the emulator is the grant cycle) | **measured, not modelled**. Silicon: N <= 4 words finish at G + 4 (emulator G + 10); 21 <= N <= 50 at G + N - 8 (emulator G + N - 5); the source's STREAM_BACKPRESSURE falls at G + 6 (emulator G + 13); a 1-cycle STREAM_STARVATION at G + 3 (emulator none). The emulator pays lock_acquire_cycles 1 + memory_latency_cycles 5 + the first-BD start bonus 2 before its first write, none isolated on silicon for an S2MM. 5 <= N <= 20 has no row | onset probe `prod_own_nN`, 20 cases, 2 runs each, identical |
+| Lock-free first BD in a stream | measured: FINISHED_BD 5 cycles after the emulator's for 12..36 words | chain family s1n08..s1n32, 3 runs each |
+| S2MM STALLED_LOCK rise, STREAM_STARVATION until the first word | measured, open rows below | onset probes |
+
+One decomposition fits every S2MM0 row above (a word usable 4 cycles after it enters the ingress, a granule written
+the cycle after its last word is popped, FINISHED_BD 2 after the last write, a held first BD popping from grant + 1),
+but only by construction: five unknowns against five sums, with `rgs1`, one `rgs0` run's finish and the G + 3
+starvation pulse outside it and the backpressure fall needing a second propagation constant. Not modelled.
+
+**Two-channel conflicts in the object-FIFO turn designs.** `objectfifo_turns_walkers` and `objectfifo_channel_turns`
+(Peano), tile (0,2): the emulator raises CONFLICT_DM_BANK_2 / _3 20 / 14 and 2 / 3 times, silicon none in three
+samples. Every one is DMA against DMA: S2MM0 writing the next `a` row into its logical-bank-1 buffer at stream rate
+meets MM2S0's first accesses to the out row in the same logical bank (REL(out) + 4 and + 8); the core is parked in
+its acquire and presents no access. The core's own timeline is identical to silicon's (526 cycles from release to
+release, release pulses 5 apart), but silicon's iteration is 6 to 8 cycles longer on the DMA side: the a(2) acquire
+stalls 171 / 172 cycles in the first iterations and 173 from the fourth (all samples), the emulator 165 on every
+iteration. The count is a phase residue of period 8: holding the S2MM's chained BD k cycles after its grant
+(emulator-only sensitivity) gives the same counts at k = 8 as at k = 0, and zero or other counts at other residues,
+so these rows must not be used to fit a constant. Who wins the meeting sets the emulator's count, not its
+existence (B3 14 rather than 20: the rotor refuses S2MM0 at six first meetings). Three terms set the residue: the
+chained S2MM grant after a core release, the write placement among its words, and MM2S0's grant phase in that
+design (not traced). Rows the deciding probe needs: the turn design re-traced with both lock releases, both
+channels' STALLED_LOCK and FINISHED_BD and the bank conflicts on one memory-module timer; then a ring variant with a
+chained S2MM BD held on a core-released lock, the release swept, core loads k cycles after it on the S2MM's banks,
+the held word count swept 4..20, STREAM_STARVATION traced, on both S2MM channels.
+
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
 Silicon rows are the probe runs of the read-bandwidth section above (two runs of each case) and the trace and
