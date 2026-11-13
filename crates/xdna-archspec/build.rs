@@ -533,6 +533,7 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             ("DMA_MM2S_WORD_CLOCK_START_CYCLES", t.dma.mm2s_word_clock_start_cycles),
             ("DMA_MM2S_WORD_CLOCK_LEAD_GRANULES", t.dma.mm2s_word_clock_lead_granules),
             ("DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES", t.dma.mm2s_bd_switch_access_gap_cycles),
+            ("DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES", t.dma.mm2s_late_granule_access_gap_cycles),
             ("DMA_MM2S_ACCESS_TO_OFFER_CYCLES", t.dma.mm2s_access_to_offer_cycles),
             ("DMA_MM2S_ACCESS_TO_FINISH_CYCLES", t.dma.mm2s_access_to_finish_cycles),
             ("DMA_MM2S_LOCK_TO_ACCESS_CYCLES", t.dma.mm2s_lock_to_access_cycles),

@@ -372,7 +372,8 @@ impl DmaEngine {
         if self.uses_word_clock(transfer)
             && (fetch.words as u32 > ch.word_clock.accessible_words(at)
                 || (transfer.acquire_lock.is_some() && at < ch.access_from)
-                || !ch.word_clock.switch_gap_allows(at))
+                || !ch.word_clock.switch_gap_allows(at)
+                || !ch.word_clock.late_gap_allows(at))
         {
             return None;
         }
@@ -4811,6 +4812,127 @@ mod bank_demand_tests {
                 (contended, lost, finish),
                 "bank {bank} n {n} g + {start} m {m}"
             );
+        }
+    }
+
+    /// What a transfer of the producer probe's march did, grant-relative: the runs of consecutive
+    /// contended cycles on one bank (start, bank, length), the cycles the core lost (each one
+    /// MEMORY_STALL) and the MM2S's FINISHED_BD.
+    #[derive(Debug, Default)]
+    struct MarchContact {
+        runs: Vec<(usize, usize, usize)>,
+        core_lost: Vec<usize>,
+        finished: usize,
+    }
+
+    /// The producer probe's march on the emulator's own MM2S: a lock-started 256-word BD on
+    /// MM2S 0 reading 0x400 (granule g in physical bank g & 1), parked 100 steps, against a core
+    /// that stores every cycle from grant + 14 on, four stores per bank (store i in bank
+    /// (i >> 2) & 1), a refused store repeated the next cycle. The banks' served-access counts
+    /// are set at the march start so that the DMA wins a contended cycle on bank b when the bank
+    /// has served `phase[b]` (mod 5) accesses since the march started: the phase pair the
+    /// producer fit gives each transfer (its counts carry over from transfer to transfer).
+    fn run_lock_started_bd_against_march(phase: [u64; 2]) -> MarchContact {
+        use crate::device::bank_arbiter::{BankAccessCounts, BankArbiter, CorePort};
+        const MARCH: usize = 14;
+        let flat = 2;
+        let mut eng = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = Tile::compute(1, 2);
+        let mut host_mem = HostMemory::new();
+        eng.configure_bd(0, BdConfig::simple_1d(0x400, 1024).with_acquire(5, 1).with_release(6, 1))
+            .unwrap();
+        eng.start_channel(flat, 0).unwrap();
+        let mut arb = BankArbiter::new();
+        tile.bank_access_counts = BankAccessCounts::default();
+        let mut grant: Option<usize> = None;
+        let mut store = 0usize;
+        let mut out = MarchContact::default();
+        let mut last_contended: Option<(usize, usize)> = None;
+        for step in 0..800usize {
+            if step == 100 {
+                tile.locks[5].value = 1;
+            }
+            let rel = grant.map(|g| step - g);
+            if rel == Some(MARCH) {
+                for (b, p) in phase.iter().enumerate() {
+                    // win iff served % 5 == 2: served at the march start = 2 - phase (mod 5)
+                    while tile.bank_access_counts.served(b) % 5 != (7 - p) % 5 {
+                        tile.bank_access_counts.serve(b);
+                    }
+                }
+            }
+            let mut demands = eng.peek_bank_demand(BankLayout::Compute);
+            let core_bank = (store >> 2) & 1;
+            let marching = rel.is_some_and(|r| r >= MARCH);
+            if marching {
+                demands.push((Requester::Core(CorePort::Store), 1 << core_bank));
+            }
+            let a = arb.arbitrate(&demands, &mut tile.bank_access_counts);
+            let denied: Vec<Requester> =
+                a.lost.iter().copied().filter(|r| !matches!(r, Requester::Core(_))).collect();
+            if let Some(r) = rel.filter(|_| marching) {
+                if a.contended_banks != 0 {
+                    match (out.runs.last_mut(), last_contended) {
+                        (Some(run), Some((t, b))) if t + 1 == r && b == core_bank => run.2 += 1,
+                        _ => out.runs.push((r, core_bank, 1)),
+                    }
+                    last_contended = Some((r, core_bank));
+                }
+                if a.core_lost() {
+                    out.core_lost.push(r);
+                } else {
+                    store += 1;
+                }
+            }
+            let before = eng.channel_phase(flat);
+            eng.cycle_dma_banks = 0;
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            eng.step_with_denied(&denied, &mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+            if grant.is_none() && before == "AcquiringLock" && eng.channel_phase(flat) != "AcquiringLock" {
+                grant = Some(step);
+            }
+            while eng.pop_stream_out_for_channel(flat).is_some() {}
+            if let Some(r) = rel {
+                if out.finished == 0 && tile.locks[6].value >= 1 {
+                    out.finished = r;
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// The producer probe's transfers (silicon, `collide`, run 1, grant-relative; the phase pair
+    /// per transfer from the arb-winner producer fit, which reproduces every conflict and stall
+    /// of 45 transfers): type A (3, 2) contacts 15b0x3 19b1x3, the core losing the last cycle of
+    /// each; type B (1, 4) 15b0x1 (lost) 19b1x4, then a contact of 2 on alternate banks every 4
+    /// cycles from 25 for the rest of the BD, the core winning both (58 runs); type C (0, 0)
+    /// 15b0x3 20b1x2 then every 4 from 24 (58 runs, no loss); type D (2, 3) 15b0x2 19b1x4
+    /// 24b0x3, each lost on its last cycle. After a refused access the MM2S's next granule asks
+    /// two cycles after it (`DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES`), which keeps it in step
+    /// with the core's 4-store dwell.
+    #[test]
+    fn the_emulated_mm2s_against_the_producer_march_matches_silicon() {
+        let every4 = |from: usize, first_bank: usize, n: usize| -> Vec<(usize, usize, usize)> {
+            (0..n).map(|i| (from + 4 * i, (first_bank + i) & 1, 2)).collect()
+        };
+        let mut b_runs = vec![(15, 0, 1), (19, 1, 4)];
+        b_runs.extend(every4(25, 0, 56));
+        let mut c_runs = vec![(15, 0, 3), (20, 1, 2)];
+        c_runs.extend(every4(24, 0, 56));
+        #[rustfmt::skip]
+        let rows: &[(&str, [u64; 2], Vec<(usize, usize, usize)>, &[usize])] = &[
+            ("A", [3, 2], vec![(15, 0, 3), (19, 1, 3)], &[17, 21]),
+            ("B", [1, 4], b_runs, &[15]),
+            ("C", [0, 0], c_runs, &[]),
+            ("D", [2, 3], vec![(15, 0, 2), (19, 1, 4), (24, 0, 3)], &[16, 22, 26]),
+        ];
+        for (name, phase, runs, lost) in rows {
+            let c = run_lock_started_bd_against_march(*phase);
+            assert_eq!(&c.runs, runs, "type {name}: contact runs");
+            assert_eq!(&c.core_lost, lost, "type {name}: core losses");
         }
     }
 

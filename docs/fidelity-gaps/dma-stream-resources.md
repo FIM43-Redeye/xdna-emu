@@ -492,7 +492,25 @@ BD's grant g0 (its STALLED_LOCK falls).
     release + 2 in 39 rows and + 3 in 12 (first-BD lock-fetch probe; the emulator always + 2), and the second
     kind (the chained lock-fetch and arbitration probes' waiting BD) at + 2 or + 3 run to run for the same case
     (lock-fetch 24 / 8 rows, arb m = 0 99 / 51), where the emulator's phase is fixed per case. The anchor of
-    silicon's phase there is not known.
+    silicon's phase there is not known, and it is not observable in the existing captures (2026-11-13): their
+    memory-module trace starts with the channel already parked (494 to 499 cycles before the release) and holds no
+    DMA-side stamp before the first grant; of the trace start, the absolute timer, the core's periodic counter
+    event and its first LOCK_STALL, none predicts the 51 first-BD rows (or the 174 arb and 324 chained lock-fetch
+    rows): no residue of any of them is + 3 only. Open; needs a DMA-side stamp before the first grant (START_TASK
+    in the memory-module trace, or a lock-free one-word head BD) with the release swept over at least six cycles.
+  - *Grant phase of a lock BD whose previous BD had refused accesses* (open, 2026-11-13). Silicon grants the
+    producer probe's self-chained 256-word lock BD at its release + 2 in 84 of 84 transfers (`collide` and
+    `sticky32`, 3 runs each), with (release - previous FINISHED_BD) mod 3 never 2 (values 1558, 1563, 1564 and
+    282, 283) and (release - previous grant) mod 3 taking all three values in `collide`. The emulator lands on the
+    lock port's blocked phase (release + 3) in 3 of 15 `collide` transfers and 8 of 14 `sticky32` transfers: its
+    request Q = max(previous grant + 3, previous BD's third-to-last word sequenced + 3) sits at the previous grant
+    + 243 in every transfer, because the word clock runs at the access rate a granule or two ahead and never
+    reaches its cap. Tried and rejected: a grant-tied anchor (refuted by `collide`), a request anchored on the
+    previous BD's last access (refuted by the lock-timing rows: a free lock behind a 4-word head is granted at g + 3,
+    six 2-word free-lock BDs finish every 3 cycles, a free lock is granted five cycles before a 13-word lock-free
+    BD finishes), and a word-clock lead capped always (the parked rows fix the cap at 4 granules with latency 1,
+    which never binds mid-BD; it also breaks the ring camp). Needs a probe that refuses a controlled number of a
+    BD's accesses and sweeps the core's release of the next BD's lock over six or more cycles.
   - *A refused last access.* The STALLED_LOCK rise's look-ahead does not foresee a bank refusal of the previous
     BD's last access (not measured).
   - *Core-side offsets* (**fixed** 2026-11-13, next section's "Where the core's access sits"). Still open: in
@@ -547,25 +565,30 @@ together, and extra initialised words in bank 0; 15 cases, 48 rows); the produce
   24 of 174 and 10 of 48 (with a shifted-case mapping 174 of 174 and 34 of 48). Producer probe `collide`
   (conflict cycles counted level-expanded, silicon 1098 / 1098 / 1103; MEMORY_STALL 18 / 18 / 20; 9 of 15
   transfers colliding, stalls per transfer 2 1 0 3 0 repeating): before the lock law 1077 conflicts (another
-  count), 18 stalls; with the lock law 0 / 0 / none; now 603 conflicts, 24 stalls, 12 of 15 transfers
-  colliding, 2 2 2 2 0. `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls (with the lock law, same
+  count), 18 stalls; with the lock law 0 / 0 / none; with the core-side placement 603 / 24 / 12, 2 2 2 2 0;
+  with the late-granule gap (next section) 1095 conflicts, 18 stalls, 9 of 15 transfers colliding,
+  2 1 0 3 0 repeating, 12 of 15 transfers identical to silicon contact for contact and finish (`collide` is a
+  FITTED row since then: the gap's form was set by it). Held out: `sticky32` (silicon 443 / 136): 456 conflicts, 143 stalls, unchanged by the gap (with the lock law, same
   count: 545 / 157); no conflict run longer than 5 cycles, every 5-cycle run ends with a core stall.
 - **Still different (open gaps).**
   - *DMA-versus-DMA order.* Which DMA channel is served when two or more want the bank in the same cycle is not
     measured (the ring probe's meetings show the conflict, not the winner); the arbiter keeps its rotor for it.
     In the two-channel camps the emulator splits the turns differently (MM2S 0 finishes at g + 52, silicon
     g + 58; with an S2MM, MM2S 0 at g + 82 against g + 62), though the 16 core losses fall where silicon's do.
-  - *Producer collisions.* Each transfer's first contacts now land as on silicon (first transfer
-    15b0x3* 19b1x3*, the second 15b0x1* 19b1x4, grant-relative), but after them the emulator's MM2S falls out of
-    step with the core's store dwells: silicon keeps meeting the march every 4 cycles for the rest of the BD
-    (runs of 2, core winning), the emulator meets it once or twice more and then not at all, so it has about
-    half the conflict cycles (603 against 1098) and the wrong per-transfer pattern (2 2 2 2 0 against
-    2 1 0 3 0). The first divergence: after the second transfer's `19b1x4` (the MM2S refused three times on
-    bank 1) silicon's next contact is at grant + 25, the emulator's at + 24. Silicon's MM2S keeps its request
-    lattice after a delayed access (next request no earlier than service + 2, fitted from the producer
-    captures); the emulator has no such rule (its fetches are paced by the word clock and the staging), so the
-    likely cause is DMA side, not shown. Also seen: silicon's MM2S stream backpressure at grant + 6 and + 15,
-    none in the emulator.
+  - *Producer collisions* (late-granule gap **modelled** 2026-11-13). After an access the bank refused, silicon's
+    MM2S asks for its next granule no earlier than two cycles after the refused one was served when that granule
+    was not accessible before (the producer fit's max(lattice slot, service + 2); in word-clock terms the
+    lattice slot is the cycle the granule becomes accessible); a granule accessible earlier follows the next
+    cycle (ring camps), and an access served at once leaves the next one to the word clock (every uncontended
+    lock-timing row). `DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES` (2, fitted), `WordClock::late_gap_allows`; test
+    `the_emulated_mm2s_against_the_producer_march_matches_silicon` (types A to D, contact for contact). Still
+    open: the third transfer of every five (the type-C transfer after a type B: 3 of 15) is granted one cycle
+    later against the core's stores than on silicon (grant to grant 1809 then 1806 against 1808 / 1807), so
+    its first contact is 15b0x2 19b1x2 instead of 15b0x3 20b1x2 and it finishes at g + 246, not 247; a 3-cycle
+    phase (the lock port's grid or the core's resume phase on lk_empty) is the likely seat, not shown. The
+    silicon MM2S stream backpressure at grant + 6 and + 15 (the stream goes to the shim S2MM, column 0) has no
+    emulator counterpart and is not needed by the 12 matching transfers: the channel has staging slack (15 to 18
+    of 27 words), so a one-cycle hold does not move its granule requests.
   - *Where the core's access sits* (**fixed** 2026-11-13). Silicon, one trace unit at a time: in the core
     module a load or store that loses its bank raises MEMORY_STALL at its issue + 4 (82 of 82 loss rows), the
     stamp a gather's frozen memory cycle has (counter reads put that freeze at issue + 4); llvm-aie gives loads,

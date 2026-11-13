@@ -15,8 +15,8 @@
 use std::collections::VecDeque;
 
 use xdna_archspec::aie2::timing::{
-    DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS,
-    DMA_MM2S_WORD_CLOCK_LEAD_GRANULES,
+    DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES,
+    DMA_MM2S_LOCK_REQUEST_TRIGGER_WORDS, DMA_MM2S_WORD_CLOCK_LEAD_GRANULES,
 };
 
 /// Words per sequencer granule (one 16-byte bank access of 32-bit words).
@@ -144,6 +144,9 @@ pub struct WordClock {
     prev_last_access: Option<u64>,
     prev_trigger_at: Option<u64>,
     prev_seq: Option<u64>,
+    /// Step from which the next access may come, after an access whose next granule was not
+    /// sequenced yet (`late_gap_allows`).
+    late_gap_until: u64,
 }
 
 impl WordClock {
@@ -271,6 +274,19 @@ impl WordClock {
                 .is_none_or(|p| at >= p + DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES as u64)
     }
 
+    /// Whether the next access may happen at `at` as far as the access before it goes: after an
+    /// access that the bank refused at least once, a granule that was not accessible before the
+    /// cycle it was served comes `DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES` after it; one that
+    /// was follows the next cycle, and an access served when first presented leaves the next
+    /// one to the word clock. Silicon (NPU1, 2026-11): in the producer probe a refused access is served when the
+    /// core's store dwell leaves its bank, and the next granule, sequenced meanwhile, asks two
+    /// cycles later (grant + 23 -> 25, then every 4 cycles in step with the dwell, the core
+    /// winning both cycles of each contact); in the ring camps a refused access is followed the
+    /// next cycle by a granule sequenced long before (served g + 6, next at g + 7).
+    pub fn late_gap_allows(&self, at: u64) -> bool {
+        at >= self.late_gap_until
+    }
+
     /// The current BD's next access was presented to the bank arbiter at `at`.
     pub fn note_presented(&mut self, at: u64) {
         let Some(cur) = self.bds.front_mut() else {
@@ -285,6 +301,13 @@ impl WordClock {
 
     /// The current BD accessed `words` words at `at`.
     pub fn note_access(&mut self, at: u64, mut words: u32) {
+        // Refused before: the access was first presented in an earlier step.
+        let refused = self
+            .bds
+            .front()
+            .and_then(|cur| self.granules.iter().find(|g| g.bd_seq == cur.seq && g.accessed < g.words))
+            .and_then(|g| g.presented_at)
+            .is_some_and(|p| p < at);
         self.note_presented(at);
         let Some(cur) = self.bds.front_mut() else { return };
         cur.accessed_words += words;
@@ -300,6 +323,15 @@ impl WordClock {
             words -= take;
         }
         self.granules.retain(|g| g.accessed < g.words);
+        // After a refused access, a next granule (of this BD or a later one) that was not
+        // accessible before this cycle comes the gap later.
+        let next_ready = self
+            .granules
+            .front()
+            .is_some_and(|g| g.sequenced_before(at.saturating_sub(1)) >= g.words);
+        if refused && !next_ready {
+            self.late_gap_until = at + DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES as u64;
+        }
     }
 
     /// The current BD is done and the channel moves to the next one. Returns false if the
