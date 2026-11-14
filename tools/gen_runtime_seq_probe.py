@@ -104,9 +104,10 @@ EVENT_GENERATE = 0x34008
 # the trace start and stop use the ones of the egress shim (column 1), the traced shim (column 0) has them free.
 MARK_EVENTS = {"A": ("USER_EVENT_0", 126), "B": ("USER_EVENT_1", 127)}
 MARKED_COL, MARKED_ROW = 0, 0
-# Target of the write steps: the data memory of compute tile (1, 2) from its first word. The design places no core, buffer, lock or
-# transfer there, so nothing reads or writes it; the writes store zeros and the same words are the target of every case.
-WRITE_TARGET_COL, WRITE_TARGET_ROW, WRITE_TARGET_OFFSET = 1, 2, 0
+# Target of the write steps: the data memory of compute tile (0, 2) (declared in the design: same column as the shim and the loopback) from byte
+# offset 0x400, bank 0 (the address range earlier passing runtime-sequence writes used). The design places no core program, buffer, lock or
+# transfer in that tile, so nothing reads or writes those words; the writes store zeros and every case with write steps uses the same words.
+WRITE_TARGET_COL, WRITE_TARGET_ROW, WRITE_TARGET_OFFSET = 0, 2, 0x400
 DEFAULT_EVENTS = tuple(f"DMA_{CHANNELS[ch][0]}_{CHANNELS[ch][1]}_{what}_TASK" for ch in EVENT_ORDER
                        for what in ("START", "FINISHED"))
 # Eight trace slots only: a bracketed case gives up the FINISHED events of the two token-less MM2S channels (their
@@ -530,6 +531,8 @@ def design_mlir(case: Case) -> str:
     m = f"memref<{nwords}xi32>"
     consts: dict[int, str] = {}
     has_marks = any(isinstance(s, Mark) for s in case.steps)
+    has_writes = any(isinstance(s, (BlockWrite, SingleWrites)) for s in case.steps)
+    write_tile = f"    %t{WRITE_TARGET_COL}{WRITE_TARGET_ROW} = aie.tile({WRITE_TARGET_COL}, {WRITE_TARGET_ROW})\n" if has_writes else ""
 
     def c(v: int) -> str:
         consts.setdefault(v, f"%c{v}")
@@ -584,7 +587,7 @@ def design_mlir(case: Case) -> str:
   aie.device(npu1_2col) {{
     %t00 = aie.tile(0, 0)
     %t10 = aie.tile(1, 0)
-    aie.flow(%t00, DMA : 0, %t00, DMA : 0)
+{write_tile}    aie.flow(%t00, DMA : 0, %t00, DMA : 0)
     aie.flow(%t00, DMA : 1, %t00, DMA : 1)
     aie.shim_dma_allocation @in0 (%t00, MM2S, 0)
     aie.shim_dma_allocation @in1 (%t00, MM2S, 1)

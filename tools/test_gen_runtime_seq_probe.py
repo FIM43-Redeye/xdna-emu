@@ -972,6 +972,7 @@ def test_9j_write_cases_share_everything_but_the_write_step():
 
 def test_9j_the_target_is_a_tile_the_design_does_not_use_and_the_same_for_every_case():
     assert (g.WRITE_TARGET_COL, g.WRITE_TARGET_ROW) not in {(0, 0), (1, 0)} and g.WRITE_TARGET_ROW >= 2
+    assert g.WRITE_TARGET_COL == 0 and g.WRITE_TARGET_OFFSET == 0x400            # the shim's column, a precedent address range
     assert g.WRITE_TARGET_OFFSET + 4 * max(BLOCK_NS_9J) <= 0x10000
     m = g.design_mlir(case9j("wr_blk_N8"))
     assert m.count("aiex.npu.blockwrite") == 1 and "memref<8xi32>" in m
@@ -995,3 +996,13 @@ def test_9j_selectable_from_the_command_line():
     with contextlib.redirect_stdout(buf):
         assert g.main(["list", "--plan", "9j"]) == 0
     assert "wr_blk_N64" in buf.getvalue() and "wr_sep_N16" in buf.getvalue()
+
+
+def test_9j_the_target_tile_is_declared_with_nothing_in_it_only_for_cases_that_write():
+    decl = f"aie.tile({g.WRITE_TARGET_COL}, {g.WRITE_TARGET_ROW})"
+    for name, c in g.plan_9j().items():
+        m = g.design_mlir(c)
+        assert (decl in m) == (name.startswith("wr_") and name != "wr_N0"), name
+        if decl in m:
+            for banned in ("aie.core", "aie.buffer", "aie.lock", "aie.mem(", "aie.dma"):
+                assert banned not in m
