@@ -593,6 +593,7 @@ impl BufferDescriptor {
             release_value: self.lock_rel_value,
             next_bd,
             valid: self.valid,
+            burst_length: self.burst_length,
         }
     }
 }

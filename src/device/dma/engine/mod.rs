@@ -76,6 +76,13 @@ pub(super) struct IngressWord {
     pub entered: u64,
 }
 
+/// A shim S2MM's open AXI write burst: contiguous words from AIE address `start`.
+#[derive(Debug, Clone, Default)]
+pub(super) struct S2mmBurst {
+    pub(super) start: u64,
+    pub(super) words: Vec<u32>,
+}
+
 /// DMA engine for a single tile.
 #[derive(Debug)]
 pub struct DmaEngine {
@@ -172,6 +179,10 @@ pub struct DmaEngine {
     /// transfers) still records its access.
     pub(super) word_opens_granule: bool,
 
+    /// Per S2MM stream channel: the shim's open AXI write burst, words taken off
+    /// the stream but not yet written to host memory (see `stage_s2mm_word`).
+    pub(super) s2mm_bursts: Vec<S2mmBurst>,
+
     /// Per-channel count of words drained from stream_in during Phase 3 this
     /// cycle (step_all_dma). Phase 4 (route_streams) uses this to enforce the
     /// registered-FIFO ordering invariant: a slot freed in Phase 3 is NOT also
@@ -265,6 +276,7 @@ impl DmaEngine {
             num_locks,
             cycle_dma_banks: 0,
             word_opens_granule: true,
+            s2mm_bursts: vec![S2mmBurst::default(); s2mm_channels],
             stream_in_drained_this_cycle: vec![0usize; s2mm_channels],
             s2mm_ingress_full_offered: vec![false; s2mm_channels],
             s2mm_beat_offered: vec![false; s2mm_channels],
@@ -1062,6 +1074,10 @@ impl DmaEngine {
             return;
         };
         context.reset();
+        // A burst not yet issued goes with the channel's in-flight state.
+        if let Some(burst) = self.s2mm_bursts.get_mut(ch) {
+            burst.words.clear();
+        }
         if ch < self.s2mm_count {
             self.stream_in[ch].clear();
             self.stream_in_drained_this_cycle[ch] = 0;
@@ -1076,6 +1092,9 @@ impl DmaEngine {
             ch.reset();
         }
         self.task_tokens.reset();
+        for burst in &mut self.s2mm_bursts {
+            burst.words.clear();
+        }
         for q in &mut self.stream_out {
             q.clear();
         }

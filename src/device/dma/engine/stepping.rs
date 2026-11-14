@@ -2324,6 +2324,7 @@ impl DmaEngine {
                         channel,
                         is_last_word,
                         tlast_suppress,
+                        transfer.burst_bytes,
                         tile,
                         neighbors,
                         host_memory,
@@ -2394,6 +2395,7 @@ impl DmaEngine {
                     channel,
                     is_last,
                     tlast_suppress,
+                    transfer.burst_bytes,
                     tile,
                     neighbors,
                     host_memory,
@@ -2636,6 +2638,7 @@ impl DmaEngine {
         channel: u8,
         is_last: bool,
         tlast_suppress: bool,
+        burst_bytes: u32,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
@@ -2740,20 +2743,31 @@ impl DmaEngine {
                 }
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::HostMemory) => {
-                // Shim S2MM: Read from stream input, write to host DDR
-                let result = match resolve_shim_host_address(addr) {
-                    ShimHostAddress::Host(addr) => {
-                        self.transfer_stream_to_host(addr, bytes, channel, host_memory)
-                    }
-                    ShimHostAddress::OutsideAperture => {
-                        // The words leave the stream as for any write; they reach no memory.
-                        let result =
-                            self.transfer_stream_to_host(addr, bytes, channel, &mut HostMemory::new());
-                        if result.bytes_written > 0 {
-                            host_memory.record_outside_aperture(addr, result.bytes_written as u64, true);
+                // Shim S2MM: read from stream input, write to host DDR in whole bursts.
+                // Atomic beat: stall until the stream holds the words of this transfer.
+                if self.stream_in_count_for_channel(channel) < bytes.div_ceil(4) {
+                    return TransferResult::stalled();
+                }
+                let result = if self.is_decompression_enabled(channel) {
+                    match resolve_shim_host_address(addr) {
+                        ShimHostAddress::Host(addr) => {
+                            self.transfer_stream_to_host_decompressed(addr, bytes, channel, host_memory)
                         }
-                        result
+                        ShimHostAddress::OutsideAperture => {
+                            let result = self.transfer_stream_to_host_decompressed(
+                                addr,
+                                bytes,
+                                channel,
+                                &mut HostMemory::new(),
+                            );
+                            if result.bytes_written > 0 {
+                                host_memory.record_outside_aperture(addr, result.bytes_written as u64, true);
+                            }
+                            result
+                        }
                     }
+                } else {
+                    self.transfer_stream_to_host(addr, bytes, channel, burst_bytes, is_last, host_memory)
                 };
                 if result.stall {
                     // No stream data available - stall (not an error)
@@ -3851,14 +3865,21 @@ impl DmaEngine {
         true
     }
 
-    /// Shim S2MM: Read from stream input and write to host DDR.
+    /// Shim S2MM: read from stream input and write to host DDR.
+    ///
+    /// `aie_addr` is the BD's AIE address. Words are staged in the channel's open
+    /// AXI burst (`stage_s2mm_word`) and reach host memory only as whole bursts of
+    /// `burst_bytes`; the remainder is written when the BD completes (`is_last`, or a
+    /// Finish-on-TLAST). A partial burst of a BD that never completes is never written.
     ///
     /// Returns S2mmResult to properly handle stalls when no stream data is available.
     fn transfer_stream_to_host(
         &mut self,
-        addr: u64,
+        aie_addr: u64,
         bytes: usize,
         channel: u8,
+        burst_bytes: u32,
+        is_last: bool,
         host_memory: &mut HostMemory,
     ) -> S2mmResult {
         // Atomic beat: stall until stream has enough words for this transfer.
@@ -3866,11 +3887,6 @@ impl DmaEngine {
         let words_available = self.stream_in_count_for_channel(channel);
         if words_available < words_needed {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
-        }
-
-        // When decompression is enabled, consume compressed blocks from stream
-        if self.is_decompression_enabled(channel) {
-            return self.transfer_stream_to_host_decompressed(addr, bytes, channel, host_memory);
         }
 
         // On real hardware, S2MM ignores TLAST unless Finish-on-TLAST (FoT)
@@ -3881,48 +3897,106 @@ impl DmaEngine {
         // source chunks vs 4-word DMA bus width).
         let fot_enabled = self.get_channel_fot_mode(channel) != 0;
 
-        // Uncompressed path: write data to host memory in 32-bit words
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
         let mut tlast_received = false;
+        let mut fot_end = false;
 
         for i in 0..word_count {
-            let stream_data = if let Some(sd) = self.pop_stream_in_for_channel(channel) {
-                sd
-            } else {
+            let Some(stream_data) = self.pop_stream_in_for_channel(channel) else {
                 // No more stream data for this channel - transfer partial, continue next step
                 break;
             };
-
-            let word = stream_data.data;
-            let word_addr = addr + (i * 4) as u64;
-            log::debug!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
-            host_memory.write_u32(word_addr, word);
-            host_memory.shadow_s2mm_word(word_addr, word);
-
-            if crate::debug::watch::is_watched(word_addr, 4) {
-                crate::debug::watch::log_dma_write(
-                    self.current_cycle,
-                    self.col,
-                    self.row,
-                    word_addr,
-                    word,
-                    &format!("S2MM{}", channel),
-                );
-            }
-
+            let word_addr = aie_addr + (i * 4) as u64;
+            self.stage_s2mm_word(channel, word_addr, stream_data.data, burst_bytes, host_memory);
             bytes_written += 4;
 
-            // Track TLAST for FoT mode
             if stream_data.tlast {
                 tlast_received = true;
                 if fot_enabled {
+                    fot_end = true;
                     break; // FoT: stop receiving at TLAST boundary
                 }
             }
         }
 
+        if fot_end || (is_last && bytes_written == word_count * 4) {
+            self.commit_s2mm_burst(channel, host_memory);
+        }
+
         S2mmResult { success: bytes_written > 0, stall: false, tlast_received, bytes_written }
+    }
+
+    /// Stage one S2MM word at AIE address `aie_addr` in the channel's open burst.
+    ///
+    /// A burst holds contiguous words up to a `burst_bytes`-aligned boundary: a word
+    /// that does not follow the open burst closes it first, and the word that ends at a
+    /// boundary closes it. Silicon (NPU1 trace probe): extents of a never-completing BD
+    /// are whole multiples of the burst size. INFERRED: the boundary is address-aligned
+    /// (an AXI burst does not cross its own size); for burst-aligned buffers, the only
+    /// case measured, this equals counting from the BD start.
+    fn stage_s2mm_word(
+        &mut self,
+        channel: u8,
+        aie_addr: u64,
+        word: u32,
+        burst_bytes: u32,
+        host_memory: &mut HostMemory,
+    ) {
+        // The stream shadow takes every word as it leaves the stream, written or not.
+        if let ShimHostAddress::Host(host) = resolve_shim_host_address(aie_addr) {
+            host_memory.shadow_s2mm_word(host, word);
+        }
+        let ch = channel as usize;
+        if self.s2mm_bursts.len() <= ch {
+            self.s2mm_bursts.resize(ch + 1, S2mmBurst::default());
+        }
+        let open = &self.s2mm_bursts[ch];
+        if !open.words.is_empty() && open.start + 4 * open.words.len() as u64 != aie_addr {
+            self.commit_s2mm_burst(channel, host_memory);
+        }
+        let open = &mut self.s2mm_bursts[ch];
+        if open.words.is_empty() {
+            open.start = aie_addr;
+        }
+        open.words.push(word);
+        if (aie_addr + 4) % burst_bytes.max(4) as u64 == 0 {
+            self.commit_s2mm_burst(channel, host_memory);
+        }
+    }
+
+    /// Write the channel's open burst to host memory (or record it outside the aperture).
+    fn commit_s2mm_burst(&mut self, channel: u8, host_memory: &mut HostMemory) {
+        let Some(open) = self.s2mm_bursts.get_mut(channel as usize) else {
+            return;
+        };
+        if open.words.is_empty() {
+            return;
+        }
+        let start = open.start;
+        let words = std::mem::take(&mut open.words);
+        match resolve_shim_host_address(start) {
+            ShimHostAddress::Host(host) => {
+                for (i, &word) in words.iter().enumerate() {
+                    let word_addr = host + 4 * i as u64;
+                    log::debug!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
+                    host_memory.write_u32(word_addr, word);
+                    if crate::debug::watch::is_watched(word_addr, 4) {
+                        crate::debug::watch::log_dma_write(
+                            self.current_cycle,
+                            self.col,
+                            self.row,
+                            word_addr,
+                            word,
+                            &format!("S2MM{}", channel),
+                        );
+                    }
+                }
+            }
+            ShimHostAddress::OutsideAperture => {
+                host_memory.record_outside_aperture(start, 4 * words.len() as u64, true);
+            }
+        }
     }
 
     /// Shim S2MM decompressed path: read compressed blocks from stream, decompress, write to host DDR.
@@ -4227,6 +4301,136 @@ mod shim_host_address_tests {
             vec![BlockedAccess { address: 0, len: 64, write: true }]
         );
         assert_eq!(host_memory.outside_aperture_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod shim_burst_tests {
+    //! Silicon (NPU1 trace probe, 2026-11-13): a shim S2MM BD that never completes leaves
+    //! host memory holding whole bursts only: whole multiples of 256 B with Burst_Length 2,
+    //! of 64 B with Burst_Length 0, and a partial burst is never written.
+    use super::*;
+    use crate::device::dma::DDR_AIE_ADDR_OFFSET;
+    use crate::device::host_memory::BlockedAccess;
+    use crate::device::tile::Tile;
+
+    const HOST: u64 = 0x8000_4000_0000;
+
+    struct Rig {
+        engine: DmaEngine,
+        tile: Tile,
+        host: HostMemory,
+        fed: u32,
+    }
+
+    /// A guarded host buffer of 64 KiB at HOST and a shim S2MM BD 0 over `bytes` at its AIE
+    /// address with the given Burst_Length field.
+    fn rig(bytes: u32, burst_length: u8) -> Rig {
+        let mut host = HostMemory::new();
+        host.allocate_region("buffer", HOST, 0x1_0000).unwrap();
+        host.set_iommu_guard(true);
+        let mut engine = DmaEngine::new_shim_tile(1, 0);
+        let bd = BdConfig { burst_length, ..BdConfig::simple_1d(HOST + DDR_AIE_ADDR_OFFSET, bytes) };
+        engine.configure_bd(0, bd).unwrap();
+        engine.start_channel(0, 0).unwrap();
+        Rig { engine, tile: Tile::shim(1, 0), host, fed: 0 }
+    }
+
+    impl Rig {
+        /// Offer `words` more words and run until they are taken and the channel is quiet.
+        fn feed(&mut self, words: u32) {
+            let target = self.fed + words;
+            for _ in 0..20_000 {
+                if self.fed < target && self.engine.can_accept_stream_in_for_channel(0) {
+                    let data = StreamData { data: 0xB000_0000 | self.fed, tlast: false, channel: 0 };
+                    if self.engine.push_stream_in(data) {
+                        self.fed += 1;
+                    }
+                } else if !self.engine.can_accept_stream_in_for_channel(0) {
+                    self.engine.consume_bd_switch_accept_block(0);
+                }
+                self.engine.submit_lock_requests(&mut self.tile, &mut NeighborTiles::empty());
+                self.tile.resolve_lock_requests(0);
+                self.engine.step(&mut self.tile, &mut NeighborTiles::empty(), &mut self.host);
+            }
+            assert_eq!(self.fed, target, "the channel takes every word offered");
+        }
+
+        /// Number of leading words of the buffer that hold their value.
+        fn written_words(&self) -> u32 {
+            (0..0x4000u32)
+                .take_while(|&i| self.host.read_u32(HOST + 4 * i as u64) == 0xB000_0000 | i)
+                .count() as u32
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_host_memory_before_a_whole_64_byte_burst() {
+        let mut r = rig(4096, 0);
+        r.feed(15);
+        assert_eq!(r.written_words(), 0, "15 words are less than one 64-byte burst");
+        r.feed(1);
+        assert_eq!(r.written_words(), 16, "the sixteenth word completes the burst");
+        r.feed(20);
+        assert_eq!(r.written_words(), 32, "36 words: two whole bursts, the rest held");
+    }
+
+    #[test]
+    fn a_256_byte_burst_bd_writes_whole_256_byte_bursts_only() {
+        let mut r = rig(32 * 1024, 2);
+        r.feed(100);
+        assert_eq!(r.written_words(), 64, "100 words: one 256-byte burst");
+        r.feed(28);
+        assert_eq!(r.written_words(), 128);
+    }
+
+    #[test]
+    fn the_remainder_is_written_when_the_bd_completes() {
+        let mut r = rig(80, 0);
+        r.feed(20);
+        assert!(!r.engine.channel_active(0), "the 20-word BD completes");
+        assert_eq!(r.written_words(), 20, "the 16-byte remainder lands with the completion");
+    }
+
+    /// A reset (new context, or the channel's Reset field) drops the open burst: the next BD
+    /// on the channel does not flush the previous BD's partial burst into host memory.
+    #[test]
+    fn a_reset_drops_the_open_burst() {
+        for whole_engine in [true, false] {
+            let mut r = rig(4096, 0);
+            r.feed(8);
+            if whole_engine {
+                r.engine.reset();
+            } else {
+                r.engine.reset_channel(0);
+            }
+            let bd = BdConfig {
+                burst_length: 0,
+                ..BdConfig::simple_1d(HOST + 0x8000 + DDR_AIE_ADDR_OFFSET, 4096)
+            };
+            r.engine.configure_bd(1, bd).unwrap();
+            r.engine.start_channel(0, 1).unwrap();
+            r.feed(16);
+            assert_eq!(r.written_words(), 0, "the 8 staged words are gone (whole engine: {whole_engine})");
+            assert_eq!(r.host.read_u32(HOST + 0x8000), 0xB000_0008, "the new BD's burst lands");
+        }
+    }
+
+    #[test]
+    fn a_partial_burst_never_counts_as_a_host_access() {
+        let mut host = HostMemory::new();
+        host.set_iommu_guard(true);
+        let mut engine = DmaEngine::new_shim_tile(1, 0);
+        let bd = BdConfig { burst_length: 0, ..BdConfig::simple_1d(DDR_AIE_ADDR_OFFSET, 4096) };
+        engine.configure_bd(0, bd).unwrap();
+        engine.start_channel(0, 0).unwrap();
+        let mut r = Rig { engine, tile: Tile::shim(1, 0), host, fed: 0 };
+        r.feed(24);
+        assert_eq!(
+            r.host.blocked_accesses_since(0),
+            vec![BlockedAccess { address: 0, len: 64, write: true }],
+            "one whole burst faults; the 32-byte partial burst is never issued"
+        );
     }
 }
 

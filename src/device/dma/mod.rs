@@ -205,9 +205,20 @@ pub struct BdConfig {
 
     /// Enable this BD (must be true for transfers)
     pub valid: bool,
+
+    /// Shim AXI burst length, the BD's Burst_Length field (0 = 64 B, 1 = 128 B,
+    /// 2 = 256 B; 3 is undefined in the register database). A shim S2MM writes
+    /// host memory in whole bursts of this size (see `BdConfig::burst_bytes`).
+    pub burst_length: u8,
 }
 
 impl BdConfig {
+    /// Bytes per AXI write burst of a shim BD: 64 << Burst_Length. The undefined
+    /// encoding 3 is taken as the largest defined burst, 256 B.
+    pub fn burst_bytes(&self) -> u32 {
+        64 << self.burst_length.min(2)
+    }
+
     /// Create a simple 1D contiguous transfer BD.
     ///
     /// Configures d0 for a linear transfer: `length` bytes starting at `base_addr`.

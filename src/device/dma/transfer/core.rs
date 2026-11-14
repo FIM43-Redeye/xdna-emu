@@ -144,6 +144,10 @@ pub struct Transfer {
     /// Used for multi-BD transfers that should appear as a single stream.
     pub tlast_suppress: bool,
 
+    /// Shim AXI write burst in bytes (`BdConfig::burst_bytes`): a shim S2MM
+    /// commits host writes in whole bursts of this size.
+    pub burst_bytes: u32,
+
     /// Enable packet header insertion (MM2S only)
     /// When true, a 32-bit packet header is inserted before the data.
     pub enable_packet: bool,
@@ -293,6 +297,7 @@ impl Transfer {
             release_value: bd_config.release_value,
             next_bd: bd_config.next_bd,
             tlast_suppress: bd_config.tlast_suppress,
+            burst_bytes: bd_config.burst_bytes(),
             enable_packet: bd_config.enable_packet,
             packet_id: bd_config.packet_id,
             packet_type: bd_config.packet_type,
@@ -333,6 +338,7 @@ impl Transfer {
             release_value: 0,
             next_bd: None,
             tlast_suppress: false,
+            burst_bytes: 64,
             enable_packet: false,
             packet_id: 0,
             packet_type: 0,
@@ -373,6 +379,7 @@ impl Transfer {
             release_value: 0,
             next_bd: None,
             tlast_suppress: false,
+            burst_bytes: 64,
             enable_packet: false,
             packet_id: 0,
             packet_type: 0,
@@ -413,6 +420,7 @@ impl Transfer {
             release_value: 0,
             next_bd: None,
             tlast_suppress: false,
+            burst_bytes: 64,
             enable_packet: false,
             packet_id: 0,
             packet_type: 0,
