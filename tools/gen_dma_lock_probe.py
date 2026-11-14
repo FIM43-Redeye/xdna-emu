@@ -1854,7 +1854,7 @@ CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "c
 
 CW_HEAD = 32
 CW_TS = (32, 64, 96, 160)
-CW_ARMS = ("a3", "a4", "c", "n")
+CW_ARMS = ("a3", "a4", "c", "n", "c2", "c2o")
 CW_LOCK_GO, CW_LOCK_NLOOP, CW_LOCK_NLOOP_DONE = 14, 15, 13   # locks of (0,2): the sequence's go; arm n's stream, its done
 CW_LOCK_ACTOR, CW_LOCK_LOOP_DONE = 10, 11  # locks of (0,3) (and (0,4) for a4): the actor's go; arm c's done
 CW_BURST_EVENTS = 64                       # pairs of core events: one frame per cycle for 128 cycles
@@ -1867,7 +1867,17 @@ CW_MEM_ADDS = ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION", "
 # calibration at D = 64: the burst's last (fourth) core trace packet completed at g0 + 32 (a3) and g0 + 29 (a4,
 # on (0,4)), (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n); a4's relay then waited a request window
 # before its release, 9 cycles more.
-CW_SPAN = {"a3": 96, "a4": 102, "c": 137, "n": 142}
+CW_SPAN = {"a3": 96, "a4": 102, "c": 137, "n": 142, "c2": 140, "c2o": 140}   # c2 / c2o: (0,2)'s S2MM 1
+# FINISHED_BD at g0 - 66 with D = 64 + 142 (emulator)
+# v3: arm c at finer T (the crossing switch's threshold), and the same loopback on the SOURCE tile (0,2) (c2: the
+# head still goes north; c2o: the head goes to (0,2)'s own S2MM 0), MM2S 1 -> S2MM 1 of (0,2): DMA slave -> DMA
+# master of the source switch only; it dates by (0,2)'s S2MM 1 FINISHED_BD.
+CW_PLANS = {
+    "v2": tuple([("a3", t) for t in CW_TS] + [("a4", 64)] + [("c", t) for t in CW_TS] + [("n", 64)]),
+    "v3": tuple([("c", t) for t in (112, 120, 128, 136, 144)] + [("c2", t) for t in (64, 112, 144, 160)]
+                + [("c2o", t) for t in (64, 160)]),
+}
+CW_SRC2_ADDR, CW_DST2_ADDR = 0xA000, 0xE000   # the source loopback's buffers on (0,2): banks 5 and 7
 
 
 @dataclass(frozen=True)
@@ -1881,12 +1891,11 @@ class CwCase:
 
     def chain(self) -> ChainCase:
         return ChainCase(tuple(ChainBd(1) for _ in range(6)), CW_HEAD, FETCH_WORDS, fill=CHAIN_MAX_FILL,
-                         receiver="north")
+                         receiver="own" if self.arm == "c2o" else "north")
 
 
-def cw_plan() -> list:
-    return ([CwCase("a3", t) for t in CW_TS] + [CwCase("a4", 64)] + [CwCase("c", t) for t in CW_TS]
-            + [CwCase("n", 64)])
+def cw_plan(plan: str = "v2") -> list:
+    return [CwCase(arm, t) for arm, t in CW_PLANS[plan]]
 
 
 def cw_validate(c: CwCase) -> None:
@@ -1899,7 +1908,7 @@ def cw_delay_nops(c: CwCase) -> int:
 
 
 def cw_actor_lock_ref(c: CwCase) -> int:
-    return OWN + CW_LOCK_NLOOP if c.arm == "n" else NORTH + CW_LOCK_ACTOR
+    return OWN + CW_LOCK_NLOOP if c.arm in ("n", "c2", "c2o") else NORTH + CW_LOCK_ACTOR
 
 
 def cw_core_asm(c: CwCase) -> str:
@@ -1942,7 +1951,7 @@ def cw_design_mlir(c: CwCase) -> str:
     t = t.replace(seq, "      aiex.set_lock(%lGo2, %c_one)\n")
     end_lock = '{init = 0 : i32, sym_name = "lEnd"}\n'
     locks = f'    %lGo2 = aie.lock(%t02, {CW_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo2"}}\n'
-    flow = "    aie.flow(%t02, DMA : 0, %t03, DMA : 0)\n"
+    flow = f"    aie.flow(%t02, DMA : 0, %t0{CHAIN_RECEIVER_ROW[c.chain().receiver]}, DMA : 0)\n"
     lw = CW_LOOP_WORDS
     extra = ""
     if c.arm in ("a3", "a4"):
@@ -1954,6 +1963,20 @@ def cw_design_mlir(c: CwCase) -> str:
                      + f'    %lAct4 = aie.lock(%t04, {CW_LOCK_ACTOR}) {{init = 0 : i32, sym_name = "lAct4"}}\n'
                      + '    func.func private @k_core4() attributes {link_with = "core4.o"}\n'
                      + "    aie.core(%t04) {\n      func.call @k_core4() : () -> ()\n      aie.end\n    }\n")
+    elif c.arm in ("c2", "c2o"):
+        locks += (f'    %lNk = aie.lock(%t02, {CW_LOCK_NLOOP}) {{init = 0 : i32, sym_name = "lNk"}}\n'
+                  f'    %lNkd = aie.lock(%t02, {CW_LOCK_NLOOP_DONE}) {{init = 0 : i32, sym_name = "lNkd"}}\n')
+        extra += (f"    %lsrc2 = aie.buffer(%t02) {{address = {CW_SRC2_ADDR} : i32, sym_name = \"lsrc2\"}} : memref<{lw}xi32>\n"
+                  f"    %ldst2 = aie.buffer(%t02) {{address = {CW_DST2_ADDR} : i32, sym_name = \"ldst2\"}} : memref<{lw}xi32>\n"
+                  "    aie.flow(%t02, DMA : 1, %t02, DMA : 1)\n")
+        blocks = ("    ^lk_start:\n      %lk1 = aie.dma_start(MM2S, 1, ^lk0, ^lr_start)\n    ^lk0:\n"
+                  "      aie.use_lock(%lNk, AcquireGreaterEqual, %c1)\n"
+                  f"      aie.dma_bd(%lsrc2 : memref<{lw}xi32>)\n      aie.use_lock(%lNkd, Release, %c1)\n"
+                  "      aie.next_bd ^end\n"
+                  "    ^lr_start:\n      %lk2 = aie.dma_start(S2MM, 1, ^lr0, ^end)\n    ^lr0:\n"
+                  f"      aie.dma_bd(%ldst2 : memref<{lw}xi32>)\n      aie.next_bd ^end\n")
+        frm, to = ("^recv, ^end)", "^recv, ^lk_start)") if c.arm == "c2o" else ("^head, ^end)", "^head, ^lk_start)")
+        t = _cw_insert_blocks(t, "    %mem = aie.mem(%t02) {\n", frm, to, blocks)
     elif c.arm == "c":
         extra += (f"    %lsrc3 = aie.buffer(%t03) {{address = {CHAIN_WAKER_SRC} : i32, sym_name = \"lsrc3\"}} : memref<{lw}xi32>\n"
                   f"    %ldst3 = aie.buffer(%t03) {{address = {CHAIN_WAKER_DST} : i32, sym_name = \"ldst3\"}} : memref<{lw}xi32>\n"
@@ -1987,7 +2010,7 @@ def cw_design_mlir(c: CwCase) -> str:
 
 
 def cw_selection(args) -> list:
-    plan = cw_plan()
+    plan = cw_plan(getattr(args, "plan", None) or "v2")
     names = set(getattr(args, "names", None) or [])
     unknown = names - {c.name for c in plan}
     if unknown:
@@ -2050,6 +2073,8 @@ def cw_row(run_dir: Path) -> dict:
                     for row in (3, 4) for pt in (PT_CORE, PT_MEM)}
     r["s2mm1_fin_north"] = sorted({e.ts - g0 for e in ev if e.row == 3 and e.pkt_type == PT_MEM
                                    and e.name == "DMA_S2MM_1_FINISHED_BD"})
+    r["s2mm1_fin_own"] = sorted({e.ts - g0 for e in ev if e.row == FETCH_ROW and e.pkt_type == PT_MEM
+                                 and e.name == "DMA_S2MM_1_FINISHED_BD"})
     r["core_ev0"] = {row: sorted({e.ts - g0 for e in ev if e.row == row and e.pkt_type == PT_CORE
                                   and e.name == "INSTR_EVENT_0"}) for row in (3, 4)}
     r["core02_stall_runs"] = _runs([e.ts - g0 for e in ev if e.row == FETCH_ROW and e.pkt_type == PT_CORE
@@ -2060,6 +2085,7 @@ def cw_row(run_dir: Path) -> dict:
 # Outcomes: the head's MM2S finishes with and without the crossing hold at first word + 8 (slack, silicon 3 / 3).
 CW_FINS_N = (20, 22, 24, 26, 29, 33, 41, 111)
 CW_FINS_S = (20, 22, 24, 26, 30, 34, 42, 112)
+CW_FINS_A = (20, 22, 24, 26, 28, 32, 40, 110)   # v2 silicon: the source and the crossing switch both awake
 CW_BURST_PACKETS = 4                # core trace packets a burst completes before g0 (emulator, every a3 / a4 case)
 CW_GO_LEAD = 10                     # the starter's GO wait ends D + 10 (+ 1) cycles before g0 (emulator, every case)
 CW_GO_TOL = 3
@@ -2081,7 +2107,7 @@ def cw_check(c: CwCase, r: dict) -> dict:
         actor = [t for t in r["packets"][(row, PT_CORE)] if ev0 and ev0[0] <= t < 0]
         seen = bool(ev0) and len(actor) >= CW_BURST_PACKETS
     else:
-        actor = [t for t in r["s2mm1_fin_north"] if t < 0]
+        actor = [t for t in r["s2mm1_fin_own" if c.arm in ("c2", "c2o") else "s2mm1_fin_north"] if t < 0]
         seen = bool(actor)
     why = []
     if not seen:
@@ -2091,7 +2117,7 @@ def cw_check(c: CwCase, r: dict) -> dict:
     if why:
         return {"outcome": "INVALID", "t": None, "why": "; ".join(why), "go_end": go_end, "actor": actor}
     fins = tuple(r["fins"])
-    outcome = "S" if fins == CW_FINS_S else "N" if fins == CW_FINS_N else "OTHER"
+    outcome = {CW_FINS_S: "S", CW_FINS_N: "N", CW_FINS_A: "A"}.get(fins, "OTHER")
     return {"outcome": outcome, "t": -actor[-1], "why": "", "go_end": go_end, "actor": actor}
 
 
@@ -2132,6 +2158,7 @@ def add_cw_parsers(sub) -> None:
     for sp in (b, r, t):
         sp.add_argument("out_dir")
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
+        sp.add_argument("--plan", choices=tuple(CW_PLANS), default="v2", help="case set (CW_PLANS)")
     b.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                    help=MEMMOD_SWAP_HELP)
     r.add_argument("tag")

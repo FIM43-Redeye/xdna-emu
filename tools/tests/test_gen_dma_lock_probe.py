@@ -2242,7 +2242,7 @@ def test_cw_programs_keep_lock_requests_a_full_window_apart():
 
 def _cw_r(**kw):
     r = {"g0": 1000, "fins": list(g.CW_FINS_N), "packets": {(3, 0): [], (3, 1): [], (4, 0): [], (4, 1): []},
-         "s2mm1_fin_north": [], "core_ev0": {3: [], 4: []}, "core02_stall_runs": []}
+         "s2mm1_fin_north": [], "s2mm1_fin_own": [], "core_ev0": {3: [], 4: []}, "core02_stall_runs": []}
     r.update(kw)
     return r
 
@@ -2275,3 +2275,29 @@ def test_cw_check_requires_the_starter_to_have_waited_for_go():
     c = g.CwCase("c", 64)
     v = g.cw_check(c, _cw_r(s2mm1_fin_north=[-64], core02_stall_runs=[(-3, -2)]))
     assert v["outcome"] == "INVALID" and "GO" in v["why"]
+
+
+def test_cw_v3_plan_pins_the_crossing_threshold_and_adds_source_switch_loopbacks():
+    names = [c.name for c in g.cw_plan("v3")]
+    assert names == ([f"cwct{t:03d}" for t in (112, 120, 128, 136, 144)] + [f"cwc2t{t:03d}" for t in (64, 112, 144, 160)]
+                     + ["cwc2ot064", "cwc2ot160"])
+    assert [c.name for c in g.cw_plan()] == [c.name for c in g.cw_plan("v2")]
+
+
+def test_cw_source_loopback_runs_on_the_source_tile_for_both_receivers():
+    for arm, rx in (("c2", "%t03"), ("c2o", "%t02")):
+        c = g.CwCase(arm, 64)
+        t = g.cw_design_mlir(c)
+        assert "aie.flow(%t02, DMA : 1, %t02, DMA : 1)" in t and "aie.dma_start(MM2S, 1, ^lk0" in t
+        assert f"aie.flow(%t02, DMA : 0, {rx}, DMA : 0)" in t and "}}" not in t
+        assert g.cw_actor_lock_ref(c) == g.OWN + g.CW_LOCK_NLOOP
+        assert min(_lock_request_gaps(bundles_of(g.cw_core_asm(c)))) >= 4
+    assert "aie.core(%t03)" not in g.cw_design_mlir(g.CwCase("c2o", 64))
+
+
+def test_cw_check_reads_the_source_loopback_on_row_2_and_labels_all_awake():
+    c = g.CwCase("c2", 64)
+    go = [(-400, -(g.cw_delay_nops(c) + g.CW_GO_LEAD))]
+    v = g.cw_check(c, _cw_r(core02_stall_runs=go, s2mm1_fin_own=[-60], fins=list(g.CW_FINS_A)))
+    assert (v["outcome"], v["t"]) == ("A", 60)
+    assert g.cw_check(c, _cw_r(core02_stall_runs=go, s2mm1_fin_north=[-60]))["outcome"] == "INVALID"
