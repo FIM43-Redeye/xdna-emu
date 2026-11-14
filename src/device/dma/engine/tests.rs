@@ -5115,6 +5115,13 @@ fn shim_s2mm_with_only_writes_outstanding_is_not_started() {
     assert!(rig.finished_task_at.is_empty(), "the first task's cold write is still outstanding");
     assert!(rig.eng.channel_has_pending_work(0), "its completion is still due");
     assert!(!rig.eng.channel_is_started(0), "no task: the stream side is shut");
+    // The task has not finished: Channel_Running stays set until FINISHED_TASK, so a runtime
+    // sequence polling the status does not see it done before its writes are acknowledged.
+    let running = &crate::device::regdb::device_reg_layout().memory_status.channel_running;
+    assert!(running.extract_bool(rig.eng.get_channel_status(0)), "running until FINISHED_TASK");
+    rig.run(1000, |_| false);
+    assert_eq!(rig.finished_task_at.len(), 1);
+    assert!(!running.extract_bool(rig.eng.get_channel_status(0)), "idle once it has finished");
 }
 
 #[test]

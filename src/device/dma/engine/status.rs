@@ -116,6 +116,13 @@ impl DmaEngine {
             }
         }
 
+        // A shim S2MM whose words are all in but whose host writes are not yet acknowledged has
+        // not finished its task: it reads as running until its FINISHED_TASK
+        // (`retire_written_bd`). Not probed on silicon.
+        if matches!(self.channel_type(channel), ChannelType::S2MM) && !ch.host_completions.is_empty() {
+            status = layout.channel_running.set_bit(status);
+        }
+
         // Shim: three releases parked behind a flagged lock leave the channel running with
         // Stalled_Lock_Rel; up to two read as an idle channel (silicon, lock-leftovers
         // shim_*_rel_c1..c7). Memtile channels stop at the next acquire instead, which the
