@@ -679,12 +679,16 @@ impl XclbinSuite {
 
         // Populate host memory - use buffer spec if available, else defaults.
         // host_buffers maps DDR patch arg_idx to actual host memory addresses.
-        let (input_values, host_buffers) = if let Some(ref spec) = test.buffer_spec {
+        let (input_values, mut host_buffers) = if let Some(ref spec) = test.buffer_spec {
             self.setup_input_from_buffer_spec(&mut engine, spec)
         } else {
             self.setup_default_input(&mut engine);
             (None, crate::loading::default_host_buffers())
         };
+
+        // Arguments the spec defines; the harness may bind more (see
+        // allocate_buffers_for_patched_args), and the first of those is the trace buffer.
+        let spec_buffer_count = host_buffers.len();
 
         // Output address: find the first Output buffer's BO index.
         // With multiple output buffers (e.g. data + trace), we want the
@@ -736,6 +740,14 @@ impl XclbinSuite {
                         // Set up host buffers from the buffer spec layout.
                         // These addresses must match the actual host memory allocation
                         // so DDR patches write correct addresses into shim DMA BDs.
+                        // Play the host: bind a buffer to every argument the
+                        // stream patches but the spec lacks (a trace buffer added
+                        // by trace injection), as test.exe does for --trace_sz.
+                        allocate_buffers_for_patched_args(
+                            &stream,
+                            &mut host_buffers,
+                            engine.host_memory_mut(),
+                        );
                         executor.set_host_buffers(host_buffers.clone());
 
                         // Load instructions for interleaved execution.
@@ -792,20 +804,13 @@ impl XclbinSuite {
         // Capture raw output from host memory at the output buffer address
         let raw_output = self.capture_output(&engine, test, output_addr);
 
-        // Capture binary trace buffer from host memory if a trace buffer was allocated.
-        // The NPU executor allocates trace buffers for DDR patches referencing arg_idx
-        // beyond the known host buffers (see execute_ddr_patch's "beyond known buffers"
-        // auto-extend). `host_buffers.len()` is the count the harness configured
-        // BEFORE that auto-extension (3 tensors for add_one_using_dma, but only 1 for
-        // a Q=0 single-output-tensor kernel like SP-5b's R1 kernel -- #140 Task-5
-        // integration finding: this was hardcoded to the add_one_using_dma-shaped
-        // layout (index 3) and silently dropped the trace for any kernel with a
-        // different tensor-arg count).
-        let known_buffer_count = host_buffers.len();
+        // Capture binary trace buffer from host memory if a trace buffer was bound.
+        // The trace buffer is the first argument past the spec's buffers, bound by
+        // allocate_buffers_for_patched_args when the stream patches it. The spec's
+        // count varies per kernel (3 tensors for add_one_using_dma, 1 for a
+        // single-output kernel), so it is measured, not assumed.
+        let known_buffer_count = spec_buffer_count;
         let binary_trace_buf = npu_executor.as_ref().and_then(|exec| {
-            // The trace buffer is the first buffer beyond the ones the harness knew
-            // about -- auto-allocated by execute_ddr_patch when insts.bin references
-            // an arg_idx past host_buffers.len().
             let bufs = exec.host_buffers();
             if bufs.len() > known_buffer_count {
                 let tb = &bufs[known_buffer_count];
@@ -1469,9 +1474,73 @@ impl SuiteResult {
     }
 }
 
+/// Size of a buffer the harness binds to an argument the test spec does not define.
+const UNSPECIFIED_ARG_BUFFER_BYTES: usize = 1 << 20;
+
+/// Bind a host buffer to every argument `stream` patches beyond `host_buffers`.
+///
+/// The harness is the host here: on silicon an argument the host does not bind
+/// has slot value 0 and its BD points at host address 0, so the harness binds a
+/// mapped buffer (page-aligned, after every existing one) to each such argument,
+/// the way a test allocates its trace buffer. Already-bound arguments are left alone.
+fn allocate_buffers_for_patched_args(
+    stream: &NpuInstructionStream,
+    host_buffers: &mut Vec<HostBuffer>,
+    host_mem: &mut crate::device::host_memory::HostMemory,
+) {
+    use crate::npu::NpuInstruction;
+    let needed = stream
+        .instructions()
+        .iter()
+        .filter_map(|i| match i {
+            NpuInstruction::DdrPatch { arg_idx, .. } => Some(*arg_idx as usize + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    while host_buffers.len() < needed {
+        let end = host_buffers.iter().map(|b| b.address + b.size as u64).max().unwrap_or(0);
+        let address = end.next_multiple_of(crate::device::host_memory::HostMemory::PAGE_SIZE as u64);
+        let idx = host_buffers.len();
+        let _ = host_mem.allocate_region(format!("arg{idx}"), address, UNSPECIFIED_ARG_BUFFER_BYTES);
+        log::info!(
+            "harness: binding a {} KiB buffer at 0x{address:X} to argument {idx}, which the stream \
+             patches and the test spec does not define",
+            UNSPECIFIED_ARG_BUFFER_BYTES / 1024
+        );
+        host_buffers.push(HostBuffer { address, size: UNSPECIFIED_ARG_BUFFER_BYTES });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The harness plays the host: a stream that patches an argument the test spec does not
+    /// define (a trace buffer added by trace injection) gets a buffer allocated for it before the
+    /// run, as test.exe allocates one for --trace_sz; the executor itself never invents one.
+    #[test]
+    fn the_harness_allocates_a_buffer_for_every_patched_argument_it_lacks() {
+        use crate::device::host_memory::HostMemory;
+        use crate::npu::NpuInstruction;
+        let stream = NpuInstructionStream::from_instructions(vec![
+            NpuInstruction::DdrPatch { reg_addr: 0x1D004, arg_idx: 0, arg_plus: 0 },
+            NpuInstruction::DdrPatch { reg_addr: 0x1D1E4, arg_idx: 4, arg_plus: 0 },
+        ]);
+        let mut mem = HostMemory::new();
+        mem.allocate_region("in", 0x0, 4096).unwrap();
+        let mut bufs =
+            vec![HostBuffer { address: 0x0, size: 4096 }, HostBuffer { address: 0x1000, size: 4096 }];
+        allocate_buffers_for_patched_args(&stream, &mut bufs, &mut mem);
+        assert_eq!(bufs.len(), 5, "arguments 2..4 get buffers");
+        let trace = &bufs[4];
+        assert!(trace.size >= 1 << 20);
+        assert!(trace.address >= 0x2000, "after the existing buffers");
+        assert!(mem.contains_range(trace.address, trace.size), "and mapped");
+        let before = bufs.clone();
+        allocate_buffers_for_patched_args(&stream, &mut bufs, &mut mem);
+        assert_eq!(bufs, before, "idempotent");
+    }
 
     #[test]
     fn test_discover_empty_dir() {

@@ -100,10 +100,21 @@ pub const DMA_DATA_WIDTH_BITS: usize = 32;
 /// DMA data width in bytes.
 pub const DMA_DATA_WIDTH_BYTES: usize = DMA_DATA_WIDTH_BITS / 8;
 
-/// Bias XRT adds when relocating CPU DDR addresses into the AIE/NoC view.
+/// Offset between the AIE view of host memory and host addresses: a shim BD's
+/// base is an AIE address, host address = AIE address - this offset.
 ///
-/// Derived from XRT's `elf_patcher.cpp:get_ddr_aie_addr_offset()`.
+/// XRT `core/common/api/elf_patcher.cpp` (`get_ddr_aie_addr_offset()`) and the XRT
+/// AIE trace offload (`bo.address() + DDR_AIE_ADDR_OFFSET` in a shim BD) add it;
+/// mlir-aie `include/aie/Runtime/TxnEncoding.h` (`kDDRAIEAddrOffset`) records that
+/// firmware adds it in a DDR patch. Host aperture confirmed on silicon (raw BD
+/// bases fault at base - offset).
 pub const DDR_AIE_ADDR_OFFSET: u64 = 0x8000_0000;
+
+/// Host arguments whose DDR patch the firmware translates by adding
+/// [`DDR_AIE_ADDR_OFFSET`]; a patch of a later argument is written as is and must
+/// carry the offset in its arg_plus (mlir-aie `TxnEncoding.h`,
+/// `kNumFirmwareTranslatedArgs`, and the compiler's fold in `txn_append_arg_patch`).
+pub const FIRMWARE_TRANSLATED_ARGS: u8 = 5;
 
 /// Buffer descriptor configuration.
 ///

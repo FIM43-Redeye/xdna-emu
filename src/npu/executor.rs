@@ -138,7 +138,7 @@ pub(crate) enum ExecutorState {
 }
 
 /// Host buffer information for address patching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostBuffer {
     /// Base address in host memory.
     pub address: u64,
@@ -1151,20 +1151,21 @@ impl NpuExecutor {
         Ok(())
     }
 
-    /// Execute a DDR patch instruction.
+    /// Execute a DDR patch instruction, as the firmware does.
     ///
     /// Two modes of operation:
     ///
-    /// 1. **Host buffer mode** (non-ELF path): host_buffers is populated by the
-    ///    plugin from the ERT regmap.  DdrPatch looks up `host_buffers[arg_idx]`
-    ///    and writes `buffer.address + arg_plus` to the BD register.
+    /// 1. **Host buffer mode** (non-ELF path): host_buffers holds the host
+    ///    address of each bound argument, from the ERT regmap. The BD gets
+    ///    `slot + arg_plus`, plus `DDR_AIE_ADDR_OFFSET` for the first
+    ///    `FIRMWARE_TRANSLATED_ARGS` arguments (firmware translates those into
+    ///    the AIE view; a later argument's arg_plus carries the offset itself).
+    ///    An argument the host did not bind has slot value 0, so its BD points
+    ///    at host address 0 upward, which faults like silicon does.
     ///
     /// 2. **Pre-patched mode** (ELF module path): host_buffers is empty.  XRT
-    ///    already patched the block-write payloads with correct BO addresses
-    ///    plus the DDR AIE address offset.  The preceding block-write has set
-    ///    the correct hardware-visible address, so DdrPatch is already
-    ///    satisfied.  Shim DMA resolves that AIE/NoC view at the HostMemory
-    ///    boundary, matching firmware-driven execution as well as this path.
+    ///    already patched the block-write payloads with the AIE-view address
+    ///    (BO address plus the offset), so DdrPatch is already satisfied.
     fn execute_ddr_patch(
         &mut self,
         reg_addr: u32,
@@ -1172,6 +1173,7 @@ impl NpuExecutor {
         arg_plus: u32,
         device: &mut DeviceState,
     ) -> Result<(), String> {
+        use crate::device::dma::{DDR_AIE_ADDR_OFFSET, FIRMWARE_TRANSLATED_ARGS};
         if self.host_buffers.is_empty() {
             log::debug!(
                 "NPU DdrPatch (pre-patched): reg=0x{reg_addr:08X} arg_idx={arg_idx} \
@@ -1182,32 +1184,25 @@ impl NpuExecutor {
 
         let (col, row, offset) = decode_npu_address(reg_addr, device.start_col);
 
-        // Host buffer mode: look up the buffer address by arg_idx.
-        //
-        // Extend host_buffers with trace-sized entries if the xclbin
-        // references arg indices beyond what the test harness allocated.
-        // This happens with trace-injected xclbins: trace injection adds an
-        // extra DDR buffer for HW packet trace collection.
-        while self.host_buffers.len() <= arg_idx as usize {
-            let trace_addr = self.host_buffers.last().map(|b| b.address + b.size as u64).unwrap_or(0x10_0000);
-            let trace_size = 1_048_576;
-            log::info!(
-                "DDR patch references arg_idx {} beyond {} known buffers -- \
-                 allocating trace buffer at 0x{:X} ({}KB) for binary \
-                 trace packet collection.",
-                arg_idx,
-                self.host_buffers.len(),
-                trace_addr,
-                trace_size / 1024,
-            );
-            self.host_buffers.push(HostBuffer { address: trace_addr, size: trace_size });
-        }
-
-        let buffer = &self.host_buffers[arg_idx as usize];
-        let patched_addr = buffer.address + arg_plus as u64;
+        let slot = match self.host_buffers.get(arg_idx as usize) {
+            Some(buffer) => buffer.address,
+            None => {
+                log::warn!(
+                    "NPU DdrPatch: arg_idx {arg_idx} is not bound ({} host buffers); its slot value is 0",
+                    self.host_buffers.len()
+                );
+                0
+            }
+        };
+        let translation = if arg_idx < FIRMWARE_TRANSLATED_ARGS {
+            DDR_AIE_ADDR_OFFSET
+        } else {
+            0
+        };
+        let patched_addr = slot.wrapping_add(arg_plus as u64).wrapping_add(translation);
 
         log::debug!(
-            "NPU DdrPatch: reg=0x{:08X} arg_idx={} arg_plus={} -> addr=0x{:016X}",
+            "NPU DdrPatch: reg=0x{:08X} arg_idx={} arg_plus={} -> AIE addr=0x{:016X}",
             reg_addr,
             arg_idx,
             arg_plus,
@@ -1678,6 +1673,63 @@ mod tests {
             assert_eq!(device.read_tile_register(1, row as u8, offset), reset & !(1 << 4), "row {row}");
             assert!(device.array.clock().is_adaptive_dma_enabled(1, row as u8), "row {row}");
         }
+    }
+
+    /// Base address (48-bit byte address) of shim BD `bd` in physical column `col`.
+    fn shim_bd_base(device: &mut DeviceState, col: u8, bd: u32) -> u64 {
+        let lo = device.read_tile_register(col, 0, 0x1D004 + 0x20 * bd) as u64;
+        let hi = (device.read_tile_register(col, 0, 0x1D008 + 0x20 * bd) & 0xFFFF) as u64;
+        (hi << 32) | lo
+    }
+
+    fn run_patches(host_buffers: Vec<HostBuffer>, patches: &[(u32, u8, u32)]) -> (NpuExecutor, DeviceState) {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+        device.set_start_col(1);
+        executor.set_host_buffers(host_buffers);
+        executor.load_instructions(
+            patches
+                .iter()
+                .map(|&(reg_addr, arg_idx, arg_plus)| NpuInstruction::DdrPatch {
+                    reg_addr,
+                    arg_idx,
+                    arg_plus,
+                })
+                .collect(),
+        );
+        // Each call is one executor cycle; an op's firmware cost holds the next one back.
+        for _ in 0..100_000 {
+            if executor.try_advance(&mut device, &mut host_mem) == AdvanceResult::Done {
+                return (executor, device);
+            }
+        }
+        panic!("the patches did not complete");
+    }
+
+    /// Firmware adds DDR_AIE_ADDR_OFFSET to the first five host arguments of a DDR patch
+    /// (mlir-aie TxnEncoding.h, kNumFirmwareTranslatedArgs); a later argument is patched raw and
+    /// carries the offset in its arg_plus, as the compiler folds it there.
+    #[test]
+    fn a_ddr_patch_adds_the_ddr_offset_for_the_first_five_arguments_only() {
+        use crate::device::dma::DDR_AIE_ADDR_OFFSET;
+        let bufs: Vec<HostBuffer> = (0..6)
+            .map(|i| HostBuffer { address: 0x8000_4000_0000 + 0x10_0000 * i, size: 4096 })
+            .collect();
+        let (_, mut device) = run_patches(bufs, &[(0x1D004, 4, 0x40), (0x1D024, 5, 0x40)]);
+        assert_eq!(shim_bd_base(&mut device, 1, 0), 0x8000_4040_0040 + DDR_AIE_ADDR_OFFSET);
+        assert_eq!(shim_bd_base(&mut device, 1, 1), 0x8000_4050_0040);
+    }
+
+    /// An argument the host never bound has slot value 0: the patched base is the offset plus
+    /// arg_plus, host address 0 upward (silicon faults there), and no buffer is invented.
+    #[test]
+    fn a_ddr_patch_of_an_unbound_argument_points_at_host_address_zero() {
+        use crate::device::dma::DDR_AIE_ADDR_OFFSET;
+        let bufs = vec![HostBuffer { address: 0x8000_4000_0000, size: 4096 }; 2];
+        let (executor, mut device) = run_patches(bufs, &[(0x1D1E4, 3, 0x10)]);
+        assert_eq!(shim_bd_base(&mut device, 1, 15), DDR_AIE_ADDR_OFFSET + 0x10);
+        assert_eq!(executor.host_buffers().len(), 2, "no buffer invented for the unbound argument");
     }
 
     #[test]

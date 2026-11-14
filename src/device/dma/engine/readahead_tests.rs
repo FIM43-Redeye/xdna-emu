@@ -12,6 +12,11 @@ use super::*;
 const IN_A: u64 = 0x4000_0000;
 const IN_B: u64 = 0x4010_0000;
 
+/// The AIE address a shim BD holds for host address `host`.
+fn aie(host: u64) -> u64 {
+    host + crate::device::dma::DDR_AIE_ADDR_OFFSET
+}
+
 /// Host memory holding `words` distinct words at `base` (value = tag + index).
 fn host_with(regions: &[(u64, usize, u32)]) -> HostMemory {
     let mut host = HostMemory::new();
@@ -106,7 +111,9 @@ fn read_ahead_constants_carry_their_calibration() {
 fn backpressured_shim_mm2s_finishes_with_the_window_undelivered() {
     let words = 2048; // 8 KiB
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     let w = window_words(&rig.engine);
 
@@ -140,7 +147,9 @@ fn backpressured_shim_mm2s_finishes_with_the_window_undelivered() {
 fn free_stream_finishes_one_read_latency_after_the_last_issue() {
     let words = 256;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
 
     let mut first_issue = None;
@@ -189,8 +198,12 @@ fn free_stream_finishes_one_read_latency_after_the_last_issue() {
 fn next_task_issues_behind_the_previous_tasks_draining_data() {
     let words = 512;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0), (IN_B, words, 10_000)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
-    rig.engine.configure_bd(1, BdConfig::simple_1d(IN_B, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
+    rig.engine
+        .configure_bd(1, BdConfig::simple_1d(aie(IN_B), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     assert!(rig.engine.enqueue_task(rig.ch, 1, 0, false));
 
@@ -244,9 +257,11 @@ fn chained_bd_issues_without_waiting_for_the_previous_bds_return() {
     let words = 128;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0), (IN_B, words, 500)]));
     rig.engine
-        .configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4).with_next(1))
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4).with_next(1))
         .unwrap();
-    rig.engine.configure_bd(1, BdConfig::simple_1d(IN_B, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(1, BdConfig::simple_1d(aie(IN_B), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
 
     let mut issue_cycles = Vec::new();
@@ -284,7 +299,9 @@ fn chained_bd_issues_without_waiting_for_the_previous_bds_return() {
 fn blocked_stream_issues_exactly_the_window() {
     let words = 4096;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     for _ in 0..10_000 {
         rig.step(false);
@@ -307,7 +324,9 @@ fn blocked_stream_issues_exactly_the_window() {
 fn stream_backpressure_outlives_finished() {
     let words = 1024;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     // A port that takes one word in 8.
     for _ in 0..20_000 {
@@ -378,7 +397,9 @@ fn compute_tile_mm2s_still_finishes_only_when_its_data_is_in_the_stream() {
 fn channel_reset_drops_outstanding_reads() {
     let words = 2048;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     for _ in 0..2_000 {
         rig.step(false);
@@ -403,16 +424,16 @@ fn a_shim_release_on_a_frozen_lock_is_parked_and_the_chain_runs_on() {
         rig.tile.locks[gate].set(1);
     }
     let bds = [
-        BdConfig::simple_1d(IN_A, 64).with_release(5, 1).with_next(1),
-        BdConfig::simple_1d(IN_B, 64)
+        BdConfig::simple_1d(aie(IN_A), 64).with_release(5, 1).with_next(1),
+        BdConfig::simple_1d(aie(IN_B), 64)
             .with_acquire(6, -1)
             .with_release(7, 1)
             .with_next(2),
-        BdConfig::simple_1d(IN_A, 64)
+        BdConfig::simple_1d(aie(IN_A), 64)
             .with_acquire(8, -1)
             .with_release(9, 1)
             .with_next(3),
-        BdConfig::simple_1d(IN_B, 64).with_acquire(10, -1).with_release(11, 1),
+        BdConfig::simple_1d(aie(IN_B), 64).with_acquire(10, -1).with_release(11, 1),
     ];
     for (i, bd) in bds.into_iter().enumerate() {
         rig.engine.configure_bd(i as u8, bd).unwrap();
@@ -448,7 +469,9 @@ fn a_shim_release_on_a_frozen_lock_is_parked_and_the_chain_runs_on() {
 fn a_shim_mm2s_with_an_undelivered_window_reads_running_and_back_pressured() {
     let words = 2048;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     let w = window_words(&rig.engine);
     for _ in 0..20_000 {
@@ -479,7 +502,9 @@ fn a_shim_mm2s_with_an_undelivered_window_reads_running_and_back_pressured() {
 fn a_held_mm2s_hand_off_drives_no_s2mm_stream_event() {
     let words = 256;
     let mut rig = Rig::new(host_with(&[(IN_A, words, 0)]));
-    rig.engine.configure_bd(0, BdConfig::simple_1d(IN_A, words as u32 * 4)).unwrap();
+    rig.engine
+        .configure_bd(0, BdConfig::simple_1d(aie(IN_A), words as u32 * 4))
+        .unwrap();
     assert!(rig.engine.enqueue_task(rig.ch, 0, 0, false));
     for _ in 0..2_000 {
         rig.step(false);

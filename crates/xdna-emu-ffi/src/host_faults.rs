@@ -104,7 +104,7 @@ impl HostFaultTracker {
             .outside_aperture_accesses_since(self.start_aperture_records)
             .into_iter()
             .next()?;
-        let who = attribute(engine, &first);
+        let who = attribute_aie(engine, &first);
         let what = if first.write { "write" } else { "read" };
         let by = match who {
             Some(a) => {
@@ -141,8 +141,18 @@ pub fn describe(access: &BlockedAccess, who: Option<&Attribution>) -> String {
     }
 }
 
-/// The shim DMA channel whose active transfer most plausibly made `access`.
+/// The shim DMA channel whose active transfer most plausibly made the blocked host access
+/// `access` (host addresses; a BD base is the AIE address host + `DDR_AIE_ADDR_OFFSET`).
 pub fn attribute(engine: &InterpreterEngine, access: &BlockedAccess) -> Option<Attribution> {
+    let aie = BlockedAccess {
+        address: access.address + xdna_emu_core::device::dma::DDR_AIE_ADDR_OFFSET,
+        ..*access
+    };
+    attribute_aie(engine, &aie)
+}
+
+/// As [`attribute`], for an access given by its AIE address (an outside-aperture record).
+pub fn attribute_aie(engine: &InterpreterEngine, access: &BlockedAccess) -> Option<Attribution> {
     let device = engine.device();
     let want = if access.write {
         ChannelType::S2MM
