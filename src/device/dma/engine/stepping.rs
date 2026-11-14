@@ -925,7 +925,7 @@ impl DmaEngine {
             // cycle complete now: after the FSM step, so a BD whose memory side
             // ends this very cycle with zero latency completes in the same cycle.
             if !self.channels[ch_idx].host_completions.is_empty() {
-                self.fire_host_completions(ch_idx, tile, neighbors);
+                self.fire_host_completions(ch_idx, tile, neighbors, host_memory);
                 any_active = true;
             }
 
@@ -1156,10 +1156,9 @@ impl DmaEngine {
                 TransferDirection::S2MM => {
                     // A shim S2MM pays nothing before its words: its stream side takes them from
                     // START_TASK + 6 and its host write latencies come after them
-                    // (`retire_written_bd`). The task's first write is the cold one on the
-                    // channel's first task of the session.
+                    // (`retire_written_bd`); whether the task's first write is cold is decided at
+                    // that write (`note_host_write`).
                     let cold = self.channels[ch_idx].warm_task_index == 0;
-                    self.channels[ch_idx].host_write_cold = cold;
                     self.channels[ch_idx].first_write_acked_at = None;
                     // SP-4a (#140, opt-in, default off): a metered post-arrival drain for the
                     // first task. Silicon streams that task without a stall (bridge corpus
@@ -1608,7 +1607,7 @@ impl DmaEngine {
                     self.channels[ch_idx].prev_starving = false;
                 }
                 if host_write {
-                    self.note_host_write(ch_idx);
+                    self.note_host_write(ch_idx, host_memory);
                 }
                 if transfer.remaining_bytes() == 0 {
                     if read_ahead {
@@ -1652,7 +1651,7 @@ impl DmaEngine {
                 ChannelFsm::Transferring { transfer }
             }
             TransferCycleResult::FotFinish if host_write => {
-                self.note_host_write(ch_idx);
+                self.note_host_write(ch_idx, host_memory);
                 self.retire_written_bd(ch_idx, transfer, tile, neighbors)
             }
             TransferCycleResult::FotFinish => self.complete_or_hold(ch_idx, transfer, tile, neighbors),
@@ -2055,11 +2054,12 @@ impl DmaEngine {
     }
 
     /// A shim S2MM word went in this cycle (`uses_host_write_path`): the task's first one starts
-    /// its first host write's latency, cold on the channel's first task of the session.
-    fn note_host_write(&mut self, ch_idx: usize) {
+    /// its first host write's latency, cold while no shim S2MM write of the run has finished
+    /// (`HostMemory::shim_s2mm_write_finished`).
+    fn note_host_write(&mut self, ch_idx: usize, host_memory: &HostMemory) {
         let ch = &self.channels[ch_idx];
         if ch.first_write_acked_at.is_none() {
-            let latency = if ch.host_write_cold {
+            let latency = if !host_memory.shim_s2mm_write_finished() {
                 self.timing_config.shim_s2mm_first_write_cold_cycles
             } else {
                 self.timing_config.shim_s2mm_first_write_cycles
@@ -2137,13 +2137,24 @@ impl DmaEngine {
 
     /// Complete every in-flight shim BD whose memory side is done (oldest first): a read-ahead
     /// BD whose last read has returned, a host-write BD whose writes are acknowledged.
-    fn fire_host_completions(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
+    fn fire_host_completions(
+        &mut self,
+        ch_idx: usize,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+        host_memory: &mut HostMemory,
+    ) {
         while self.channels[ch_idx]
             .host_completions
             .front()
             .is_some_and(|c| c.ready_at <= self.read_clock)
         {
             let done = self.channels[ch_idx].host_completions.pop_front().expect("front checked");
+            // An S2MM channel's completions are its host writes' acknowledgements: from now on the
+            // run's first writes are warm.
+            if ch_idx < self.s2mm_count {
+                host_memory.note_shim_s2mm_write_finished();
+            }
             if let Some((lock_id, value)) = done.release {
                 if self.release_must_park(ch_idx, lock_id, tile, neighbors) {
                     self.channels[ch_idx].parked_releases.push_back((lock_id, value));

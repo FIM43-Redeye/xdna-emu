@@ -256,6 +256,11 @@ pub struct HostMemory {
 
     /// The shadow's current pass (`begin_s2mm_shadow_pass`).
     s2mm_shadow_pass: u32,
+
+    /// A shim S2MM write of this run has finished: its BD's writes were acknowledged
+    /// (`note_shim_s2mm_write_finished`). Until then every shim S2MM's first write is the cold
+    /// one (`dma.shim_s2mm_first_write_cold_cycles`), after it warm.
+    shim_s2mm_write_finished: bool,
 }
 
 impl HostMemory {
@@ -277,7 +282,30 @@ impl HostMemory {
             outside_aperture: RefCell::new(BlockedLog::default()),
             s2mm_stream_shadow: None,
             s2mm_shadow_pass: 0,
+            shim_s2mm_write_finished: false,
         }
+    }
+
+    /// Whether a shim S2MM write of this run has finished, so that a shim S2MM's first write is
+    /// warm. Silicon (bridge corpus 2026-11, 138 informative first tasks, every one fitted): a
+    /// task's first write is cold exactly when no shim S2MM data write has finished earlier in
+    /// the same run, on any channel of any column; a channel's first task that follows another
+    /// channel's finished write is warm. A trace carrier, whose oversized BD never finishes,
+    /// does not count. Whether the true selector is the run's first write or the first touch
+    /// of the destination buffer is open (the corpus writes one buffer after the first finish),
+    /// and buffers are not modelled.
+    pub fn shim_s2mm_write_finished(&self) -> bool {
+        self.shim_s2mm_write_finished
+    }
+
+    /// A shim S2MM BD's host writes were acknowledged.
+    pub fn note_shim_s2mm_write_finished(&mut self) {
+        self.shim_s2mm_write_finished = true;
+    }
+
+    /// A new run (hw_context): no shim S2MM write has finished in it yet.
+    pub fn begin_run(&mut self) {
+        self.shim_s2mm_write_finished = false;
     }
 
     /// Turn the shim S2MM stream shadow on (an empty shadow) or off (dropped).

@@ -2444,6 +2444,8 @@ impl InterpreterEngine {
     /// existing register write paths reach them.
     pub fn reset_for_new_context(&mut self) {
         self.device.async_errors.clear();
+        // The run's host write path starts cold again (`HostMemory::shim_s2mm_write_finished`).
+        self.host_memory.begin_run();
         self.reset();
         self.device.array.reset();
     }

@@ -921,8 +921,9 @@ late finished a few cycles after them instead of a write latency later.
 ingress, open at START_TASK + 6 (the S2MM arming delay, `lock_wait_starve_from`), and it takes a word every
 cycle one is on offer. Each BD retires the cycle its last word is in, with its completion (lock release,
 FINISHED_BD, FINISHED_TASK, TCT token) queued for when its writes are acknowledged, `retire_written_bd`: the
-later of the task's first word + `dma.shim_s2mm_first_write_cold_cycles` 1040 (the channel's first task of the
-session) or `dma.shim_s2mm_first_write_cycles` 165, and the BD's last word + `dma.shim_s2mm_last_write_cycles`
+later of the task's first word + `dma.shim_s2mm_first_write_cold_cycles` 1040 (no shim S2MM write of the run has
+finished yet, `HostMemory::shim_s2mm_write_finished`; until 2026-11-14 the channel's first task of the session)
+or `dma.shim_s2mm_first_write_cycles` 165, and the BD's last word + `dma.shim_s2mm_last_write_cycles`
 150. Completions leave in order; the channel takes the next BD's or task's words meanwhile, as the shim MM2S
 read side does. These three replace `dma.shim_per_task_overhead_s2mm_cycles`, `dma.shim_ddr_cold_start_s2mm_cycles`
 and `dma.shim_warmup_decay_s2mm_permille`. The start hold's starvation level (`settle_shim_start_starvation`)
@@ -936,12 +937,30 @@ emulator before the start-arm commit: rows outside silicon's band 111 -> 101 (98
 pattern distance -386 (start arm alone +4537). All 60 runs pass.
 
 **Still open.**
-- *What makes a first write cold.* Some first tasks are warm on silicon (add_one_ctrl_packet_4_cores and
-  _col_overlay channel 0, 128..162 after the first word, all samples; their channel 1 cold in half the samples).
-  The emulator takes the channel's first task of the session; a destination-page translation that an earlier
-  access warmed would fit, untested. The cold latency itself depends on the test: the median FINISHED - first
-  word of the 29 first tasks it sets spreads 547..2715 (608..748 for the 1- and 9-word tasks of
-  sync_task_complete_token, _bd_chaining and dmabd_task_queue; add_maskwrite about 1980); 1040 is that median.
+- *What makes a first write cold* (selector modelled 2026-11-14). Over the corpus's 138 informative first tasks
+  (clean, at most 300 words) one rule fits every one: a task's first write is cold exactly when no shim S2MM data
+  write has finished earlier in the same run, on any channel of any column (102 cold, 36 warm). The warm ones
+  are the channel-first tasks of add_one_ctrl_packet_4_cores and _col_overlay that follow the run's first write
+  (column 0 S2MM 1, cold in 12 of 12 samples): column 1 S2MM 0 and 1 and column 2 S2MM 0, 128..162 after their
+  first word. objectfifo_shim_packet's two channels both write before either finishes, and both are cold. No
+  idle-time variable separates warm from cold, and "the channel's first task" (the earlier model) does not. The
+  trace carrier's oversized BD never finishes and does not count. Model: `HostMemory` records that a shim S2MM
+  BD's writes were acknowledged (`note_shim_s2mm_write_finished`, from `fire_host_completions`); a task's first
+  write (`note_host_write`) is cold while none has; a new hw_context starts a new run (`begin_run`, from
+  `reset_for_new_context`), and a run's later dispatches share it (unmeasured: three corpus tests dispatch more
+  than once). Tests: `the_runs_first_shim_s2mm_write_is_cold_and_later_channel_first_tasks_on_other_columns_are_warm`,
+  `two_shim_s2mm_tasks_writing_before_any_write_has_finished_are_both_cold`,
+  `a_write_that_never_finishes_and_a_new_run_leave_the_next_first_write_cold`.
+  Open: whether the true selector is the run's first write or the first touch of the destination buffer or page
+  (every earlier-finished write in an informative multi-task run is to the same buffer, so the corpus cannot
+  tell; the one discriminating pair, add_one_ctrl_packet's S2MM 0 writing another buffer after S2MM 1 finished
+  and cold-sized, is a two-burst task and not decisive): a hardware probe will settle it, and buffers are not
+  modelled. Later one-word tasks cold on silicon at fixed sequence positions (sync_task_complete_token and
+  _bd_chaining, about a quarter of their later tasks, 182..14215 after the word, the same buffer and window
+  written 18k..160k cycles earlier) are explained by neither reading and stay warm in the emulator. The cold
+  latency itself depends on the test: the median FINISHED - first word of the 29 first tasks it sets spreads
+  547..2715 (608..748 for the 1- and 9-word tasks of sync_task_complete_token, _bd_chaining and dmabd_task_queue;
+  add_maskwrite about 1980); 1040 is that median.
 - *Long transfers* finish 6..18 cycles later after their last word than the 150 (156..169).
 - *Back-to-back tasks.* No corpus test starts a shim S2MM task within a write latency of the previous one's last
   word, so taking words while writes are outstanding, and in-order completion, are not measured for S2MM.

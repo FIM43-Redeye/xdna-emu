@@ -1228,11 +1228,17 @@ pub struct DmaTiming {
     /// first tasks this latency sets (the low end in the 1-word and 9-word tasks of
     /// sync_task_complete_token, _bd_chaining and dmabd_task_queue, 608..748; add_maskwrite
     /// 1965..1997; multi_source_packet_flow 1187 / 2715). 1040 is that median: a typical value,
-    /// not a law. Not determined: what sets the length, and what makes a first write cold at
-    /// all. Some first tasks are warm on silicon (add_one_ctrl_packet_4_cores' and
-    /// _col_overlay's channel 0, 128..162 after the first word in every sample), some samples
-    /// of one test cold and others warm; the emulator takes the channel's first task of the
-    /// session. A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words:
+    /// not a law. Not determined: what sets the length. Which first write is cold (the same
+    /// corpus, 138 informative first tasks, 0 misfits): a task's first write is cold exactly
+    /// when no shim S2MM data write has finished earlier in the same run, on any channel of any
+    /// column; channel-first tasks that follow another channel's finished write are warm
+    /// (add_one_ctrl_packet_4_cores / _col_overlay: column 1 S2MM 0 and 1 and column 2 S2MM 0,
+    /// 128..162 after the first word, after column 0 S2MM 1's cold write); a trace carrier's
+    /// BD, which never finishes, does not count. Open: whether the selector is the run's first
+    /// write or the first touch of the destination buffer (the corpus cannot tell them apart;
+    /// buffers are not modelled), and the later one-word tasks that are cold at fixed sequence
+    /// positions (sync_task_complete_token and _bd_chaining, about a quarter of them), which
+    /// neither explains. A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words:
     /// 1180..1199 after the first word, its last write's latency after the last).
     pub shim_s2mm_first_write_cold_cycles: u16,
     /// Cycles from a later (warm) shim S2MM task's first word to its FINISHED_TASK at the

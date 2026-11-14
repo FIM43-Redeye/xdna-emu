@@ -760,7 +760,6 @@ impl DmaEngine {
         ch.chain_start_bd = None;
         ch.is_first_bd = true;
         ch.warm_task_index = 0;
-        ch.host_write_cold = false;
         ch.first_write_acked_at = None;
         ch.prefetch_start_emitted = false;
         ch.controller_dispatch_index = 0;

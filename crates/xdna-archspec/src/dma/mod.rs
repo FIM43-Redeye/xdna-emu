@@ -100,8 +100,9 @@ pub struct DmaTimingConfig {
     /// `shim_ddr_cold_start_mm2s_cycles` (one-shot per channel).
     pub shim_per_task_overhead_mm2s_cycles: u16,
 
-    /// Shim S2MM: a channel's first task finishes at least this long after its first word
-    /// (the cold host write). See `DmaTiming`.
+    /// Shim S2MM: a task whose first write comes before any shim S2MM write of the run has
+    /// finished finishes at least this long after its first word (the cold host write). See
+    /// `DmaTiming`.
     pub shim_s2mm_first_write_cold_cycles: u16,
 
     /// Shim S2MM: a later task finishes at least this long after its first word. See

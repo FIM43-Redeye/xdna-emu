@@ -129,7 +129,8 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             latency (dma.shim_mm2s_read_latency_cycles); 0 so it is not counted twice."),
         measured("dma.shim_s2mm_first_write_cold_cycles", "NPU1 bridge corpus 2026-11 (three samples a test): the \
             median FINISHED - first word of the 29 first tasks it sets (547..2715 by test)", "A typical value of a \
-            test-dependent host latency; what sets it, and what makes a first write cold, is not determined."),
+            test-dependent host latency; what sets it is not determined. Cold while no shim S2MM write of the run has \
+            finished (138 first tasks, 0 misfits); run-first write against first touch of the buffer is open."),
         measured("dma.shim_s2mm_first_write_cycles", "NPU1 bridge corpus 2026-11: warm 1-word and 16-word tasks with their \
             words waiting finish at START_TASK + 171 / 172 (first word at + 6)", ""),
         measured("dma.shim_s2mm_last_write_cycles", "NPU1 bridge corpus 2026-11: runtime_cumsum's warm 16-word tasks, last \

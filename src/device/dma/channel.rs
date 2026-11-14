@@ -396,10 +396,6 @@ pub struct ChannelContext {
     /// stop_channel (channel reset == fresh boot).  Phase 2d.
     pub warm_task_index: u32,
 
-    /// Shim S2MM over host memory: the current task's first host write is the cold one (the
-    /// channel's first task of the session), set when the task starts.
-    pub host_write_cold: bool,
-
     /// Shim S2MM over host memory: the engine step at which the current task's first host write
     /// is acknowledged (its first word + `shim_s2mm_first_write_{cold_,}cycles`). `None` until
     /// the task's first word is in. A BD of the task finishes no earlier.
@@ -674,7 +670,6 @@ impl ChannelContext {
             error_event_reported: false,
             is_first_bd: true,
             warm_task_index: 0,
-            host_write_cold: false,
             first_write_acked_at: None,
             prefetch_start_emitted: false,
             controller_dispatch_index: 0,
@@ -852,7 +847,6 @@ impl ChannelContext {
         self.error_event_reported = false;
         self.is_first_bd = true;
         self.warm_task_index = 0;
-        self.host_write_cold = false;
         self.first_write_acked_at = None;
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;

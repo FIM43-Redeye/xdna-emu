@@ -72,8 +72,9 @@ pub struct DmaTimingConfig {
     pub shim_per_task_overhead_mm2s_cycles: u16,
 
     /// Shim S2MM host write latencies: a task's FINISHED_TASK comes at the later of its first
-    /// word + `shim_s2mm_first_write_cold_cycles` (the channel's first task) or
-    /// `shim_s2mm_first_write_cycles` (later tasks), and its last word +
+    /// word + `shim_s2mm_first_write_cold_cycles` (no shim S2MM write of the run finished yet,
+    /// `HostMemory::shim_s2mm_write_finished`) or `shim_s2mm_first_write_cycles` (one has), and
+    /// its last word +
     /// `shim_s2mm_last_write_cycles`. See the archspec `DmaTiming` fields.
     pub shim_s2mm_first_write_cold_cycles: u16,
     pub shim_s2mm_first_write_cycles: u16,

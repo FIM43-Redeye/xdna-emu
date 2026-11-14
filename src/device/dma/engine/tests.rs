@@ -843,9 +843,9 @@ fn test_shim_mm2s_warmup_transient_decays_geometrically() {
 
 /// A shim S2MM pays no host-memory cost before its words (they stream in from START_TASK + 6;
 /// the host write latencies follow them, `retire_written_bd`): only `channel_start` where the
-/// path pays it. The session's first task marks its first write cold, later tasks warm.
+/// path pays it, on every task.
 #[test]
-fn test_shim_s2mm_pays_no_start_cost_and_marks_only_its_first_task_cold() {
+fn test_shim_s2mm_pays_no_start_cost() {
     let mut engine = DmaEngine::new_shim_tile(0, 0);
     let bd = BdConfig::simple_1d(0x1000, 16);
     let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 0, 0, engine.tile_kind).unwrap();
@@ -854,10 +854,9 @@ fn test_shim_s2mm_pays_no_start_cost_and_marks_only_its_first_task_cold() {
     let mut seq = Vec::new();
     for _ in 0..3 {
         engine.channels[0].is_first_bd = true;
-        let bonus = engine.consume_first_bd_bonus(0, &transfer, true);
-        seq.push((bonus, engine.channels[0].host_write_cold));
+        seq.push(engine.consume_first_bd_bonus(0, &transfer, true));
     }
-    assert_eq!(seq, vec![(2, true), (2, false), (2, false)]);
+    assert_eq!(seq, vec![2, 2, 2]);
 }
 
 /// #140 layer-2: non-shim DMA channels (memtile / compute) carry a
@@ -5102,7 +5101,8 @@ fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     let taken: Vec<u64> = rig.accepted_at[16..].iter().map(|c| c - second).collect();
     let expect: Vec<u64> = (ARM - 1..ARM - 1 + 16).collect();
     assert_eq!(taken, expect);
-    // Completions leave in task order, so the warm second task waits behind the cold first.
+    // Completions leave in task order. The second task's first write is cold too: no write of
+    // the run had finished when it went (`HostMemory::shim_s2mm_write_finished`).
     assert_eq!(rig.finished_task_at.len(), 2, "both tasks finish");
     assert!(rig.finished_task_at[0] <= rig.finished_task_at[1]);
 }
@@ -5158,4 +5158,127 @@ fn stopping_a_lock_stalled_channel_closes_its_starvation_level() {
     rig.level = false; // the rig did not see the closing edge: this test drained it
     rig.run(10, |_| false);
     assert!(rig.levels[20..].iter().all(|&h| !h), "and must stay down");
+}
+
+// === Which shim S2MM first write is cold (silicon: bridge corpus 2026-11) ===
+//
+// 138 informative first tasks, every one fitted by one rule: a task's first write is cold exactly
+// when no shim S2MM data write has finished earlier in the same run, on any channel of any column.
+// add_one_ctrl_packet_4_cores / _col_overlay: the run's first write (column 0, S2MM 1) is cold in
+// 12 of 12 samples (795..1009 after its first word), the channel-first tasks of column 1 S2MM 0 and
+// S2MM 1 and column 2 S2MM 0 that follow it are warm (128..162). objectfifo_shim_packet: the
+// second channel's first word comes before the first channel's FINISHED, and both are cold. The
+// trace carrier's oversized BD never finishes and warms nothing.
+
+/// One shim S2MM task in a run: its tile, channel, start cycle and words (`words` on offer from its
+/// start), and the cycle its FINISHED_TASK fired.
+struct RunTask {
+    col: u8,
+    ch: u8,
+    start: u64,
+    words: u32,
+    bd_words: u32,
+    finished: Option<u64>,
+}
+
+/// Run `tasks` (one per shim tile and channel) over one host memory until `until`; returns each
+/// task's FINISHED_TASK - START_TASK.
+fn run_shim_tasks(host: &mut HostMemory, tasks: &mut [RunTask], until: u64) -> Vec<Option<u64>> {
+    let cols: Vec<u8> = {
+        let mut c: Vec<u8> = tasks.iter().map(|t| t.col).collect();
+        c.sort_unstable();
+        c.dedup();
+        c
+    };
+    let mut tiles: Vec<(u8, DmaEngine, Tile)> = cols
+        .iter()
+        .map(|&c| (c, DmaEngine::new_shim_tile(c, 0), Tile::shim(c, 0)))
+        .collect();
+    let mut fed = vec![0u32; tasks.len()];
+    for cycle in 1..until {
+        for (col, eng, tile) in tiles.iter_mut() {
+            eng.set_current_cycle(cycle);
+            for (i, t) in tasks.iter().enumerate() {
+                if t.col == *col && t.start == cycle {
+                    let bd = 2 * t.ch;
+                    eng.configure_bd(bd, BdConfig::simple_1d(0x10_000 * (1 + i as u64), t.bd_words * 4))
+                        .unwrap();
+                    eng.start_channel(t.ch, bd).unwrap();
+                }
+            }
+            eng.reset_cycle_drain_counters();
+            eng.submit_lock_requests(tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(cycle);
+            eng.step(tile, &mut NeighborTiles::empty(), host);
+            for (i, t) in tasks.iter().enumerate() {
+                if t.col == *col && cycle >= t.start && fed[i] < t.words {
+                    eng.note_stream_offer(t.ch, true);
+                    if eng.can_accept_stream_in_for_routing(t.ch) {
+                        let word = StreamData { data: fed[i], tlast: false, channel: t.ch };
+                        assert!(eng.push_stream_in(word));
+                        fed[i] += 1;
+                    }
+                }
+            }
+            eng.settle_stream_starvation();
+            for (c, e) in eng.drain_trace_events() {
+                if let EventType::DmaFinishedTask { channel } = e {
+                    if let Some(t) = tasks
+                        .iter_mut()
+                        .find(|t| t.col == *col && t.ch == channel && t.finished.is_none() && c >= t.start)
+                    {
+                        t.finished = Some(c);
+                    }
+                }
+            }
+        }
+    }
+    tasks.iter().map(|t| t.finished.map(|f| f - t.start)).collect()
+}
+
+fn task(col: u8, ch: u8, start: u64, words: u32) -> RunTask {
+    RunTask { col, ch, start, words, bd_words: words, finished: None }
+}
+
+/// FINISHED_TASK - START_TASK of a short task whose words wait: its first word is read at + 6.
+fn cold_finish() -> u64 {
+    6 + DmaTimingConfig::default().shim_s2mm_first_write_cold_cycles as u64
+}
+fn warm_finish() -> u64 {
+    6 + DmaTimingConfig::default().shim_s2mm_first_write_cycles as u64
+}
+
+/// add_one_ctrl_packet_4_cores: the run's first write is cold; the channel-first tasks of other
+/// columns and channels that follow its FINISHED are warm.
+#[test]
+fn the_runs_first_shim_s2mm_write_is_cold_and_later_channel_first_tasks_on_other_columns_are_warm() {
+    let mut host = make_host_memory();
+    let mut tasks = [task(1, 1, 10, 8), task(2, 0, 3000, 8), task(2, 1, 4000, 8), task(3, 0, 5000, 8)];
+    let got = run_shim_tasks(&mut host, &mut tasks, 6000);
+    assert_eq!(got, vec![Some(cold_finish()), Some(warm_finish()), Some(warm_finish()), Some(warm_finish())]);
+}
+
+/// objectfifo_shim_packet: two channels whose first words both precede the first FINISHED are both
+/// cold.
+#[test]
+fn two_shim_s2mm_tasks_writing_before_any_write_has_finished_are_both_cold() {
+    let mut host = make_host_memory();
+    let mut tasks = [task(1, 0, 10, 8), task(1, 1, 300, 8)];
+    let got = run_shim_tasks(&mut host, &mut tasks, 3000);
+    assert_eq!(got, vec![Some(cold_finish()), Some(cold_finish())]);
+}
+
+/// A trace carrier (an oversized BD that never finishes) writes but warms nothing; a new run
+/// (`HostMemory::begin_run`) starts cold again.
+#[test]
+fn a_write_that_never_finishes_and_a_new_run_leave_the_next_first_write_cold() {
+    let mut host = make_host_memory();
+    let carrier = RunTask { bd_words: 1 << 16, ..task(1, 1, 10, 64) };
+    let mut tasks = [carrier, task(2, 0, 2000, 8)];
+    let got = run_shim_tasks(&mut host, &mut tasks, 4000);
+    assert_eq!(got, vec![None, Some(cold_finish())]);
+    assert!(host.shim_s2mm_write_finished());
+    host.begin_run();
+    let mut tasks = [task(1, 0, 10, 8)];
+    assert_eq!(run_shim_tasks(&mut host, &mut tasks, 2000), vec![Some(cold_finish())]);
 }
