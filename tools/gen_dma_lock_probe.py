@@ -2050,7 +2050,49 @@ def cw_row(run_dir: Path) -> dict:
                     for row in (3, 4) for pt in (PT_CORE, PT_MEM)}
     r["s2mm1_fin_north"] = sorted({e.ts - g0 for e in ev if e.row == 3 and e.pkt_type == PT_MEM
                                    and e.name == "DMA_S2MM_1_FINISHED_BD"})
+    r["core_ev0"] = {row: sorted({e.ts - g0 for e in ev if e.row == row and e.pkt_type == PT_CORE
+                                  and e.name == "INSTR_EVENT_0"}) for row in (3, 4)}
+    r["core02_stall_runs"] = _runs([e.ts - g0 for e in ev if e.row == FETCH_ROW and e.pkt_type == PT_CORE
+                                    and e.name == "LOCK_STALL"])
     return r
+
+
+# Outcomes: the head's MM2S finishes with and without the crossing hold at first word + 8 (slack, silicon 3 / 3).
+CW_FINS_N = (20, 22, 24, 26, 29, 33, 41, 111)
+CW_FINS_S = (20, 22, 24, 26, 30, 34, 42, 112)
+CW_BURST_PACKETS = 4                # core trace packets a burst completes before g0 (emulator, every a3 / a4 case)
+CW_GO_LEAD = 10                     # the starter's GO wait ends D + 10 (+ 1) cycles before g0 (emulator, every case)
+CW_GO_TOL = 3
+
+
+def cw_check(c: CwCase, r: dict) -> dict:
+    """Score one run only if the trace shows what the case assumes: the (0,2) core held on GO (a LOCK_STALL run
+    ending D + CW_GO_LEAD cycles before g0, within CW_GO_TOL) and the actor's activity before g0 (a3 / a4: the
+    burst's INSTR_EVENT_0 and CW_BURST_PACKETS core packets of its tile from the burst on; c / n: (0,3)'s
+    S2MM 1 FINISHED_BD). Otherwise INVALID with the reason. t: g0 minus the end of the observed activity."""
+    if r.get("g0") is None:
+        return {"outcome": "INVALID", "t": None, "why": "no head wait traced", "go_end": None, "actor": []}
+    lead = cw_delay_nops(c) + CW_GO_LEAD
+    go = [b for a, b in r["core02_stall_runs"] if abs(-b - lead) <= CW_GO_TOL]
+    go_end = go[0] if go else None
+    if c.arm in ("a3", "a4"):
+        row = 3 if c.arm == "a3" else 4
+        ev0 = [t for t in r["core_ev0"][row] if t < 0]
+        actor = [t for t in r["packets"][(row, PT_CORE)] if ev0 and ev0[0] <= t < 0]
+        seen = bool(ev0) and len(actor) >= CW_BURST_PACKETS
+    else:
+        actor = [t for t in r["s2mm1_fin_north"] if t < 0]
+        seen = bool(actor)
+    why = []
+    if not seen:
+        why.append("actor activity not observed")
+    if go_end is None:
+        why.append(f"no GO wait ending g0 - {lead} +- {CW_GO_TOL}")
+    if why:
+        return {"outcome": "INVALID", "t": None, "why": "; ".join(why), "go_end": go_end, "actor": actor}
+    fins = tuple(r["fins"])
+    outcome = "S" if fins == CW_FINS_S else "N" if fins == CW_FINS_N else "OTHER"
+    return {"outcome": outcome, "t": -actor[-1], "why": "", "go_end": go_end, "actor": actor}
 
 
 def format_cw_row(name: str, run: str, r: dict, window: int = 300) -> str:
@@ -2074,7 +2116,11 @@ def cmd_cw_table(args) -> int:
                 if d.is_dir():
                     print(f"{c.name} {run} incomplete run")
                 continue
-            print(format_cw_row(c.name, run, cw_row(d)))
+            r = cw_row(d)
+            v = cw_check(c, r)
+            verdict = (f"{v['outcome']} T={v['t']}" if v["outcome"] != "INVALID" else f"INVALID ({v['why']})")
+            print(f"{format_cw_row(c.name, run, r)} | GO-wait end {_num(v['go_end'])} actor "
+                  f"[{' '.join(f'{x:+d}' for x in v['actor'])}] | {verdict}")
     return 0
 
 

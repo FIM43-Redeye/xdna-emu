@@ -2238,3 +2238,40 @@ def test_cw_programs_keep_lock_requests_a_full_window_apart():
         assert min(_lock_request_gaps(bundles_of(g.cw_core_asm(g.CwCase(arm, 32))))) >= 4
     for relay in (False, True):
         assert min(_lock_request_gaps(bundles_of(g.cw_burst_asm(relay))) or [4]) >= 4
+
+
+def _cw_r(**kw):
+    r = {"g0": 1000, "fins": list(g.CW_FINS_N), "packets": {(3, 0): [], (3, 1): [], (4, 0): [], (4, 1): []},
+         "s2mm1_fin_north": [], "core_ev0": {3: [], 4: []}, "core02_stall_runs": []}
+    r.update(kw)
+    return r
+
+
+def test_cw_check_marks_a_run_without_observed_actor_activity_invalid():
+    for arm in g.CW_ARMS:
+        c = g.CwCase(arm, 64)
+        go = [(-400, -(g.cw_delay_nops(c) + g.CW_GO_LEAD))]
+        v = g.cw_check(c, _cw_r(core02_stall_runs=go))
+        assert v["outcome"] == "INVALID" and "actor" in v["why"]
+    assert g.cw_check(g.CwCase("c", 64), {"g0": None})["outcome"] == "INVALID"
+
+
+def test_cw_check_scores_a_run_whose_actor_and_go_wait_were_observed():
+    c = g.CwCase("a3", 64)
+    go = [(-400, -(g.cw_delay_nops(c) + g.CW_GO_LEAD))]
+    burst = [-150, -122, -94, -66]
+    v = g.cw_check(c, _cw_r(core02_stall_runs=go, core_ev0={3: [-170, -100], 4: []},
+                            packets={(3, 0): [-900] + burst + [200], (3, 1): [], (4, 0): [], (4, 1): []}))
+    assert v == {"outcome": "N", "t": 66, "why": "", "go_end": go[0][1], "actor": burst}
+    s = g.cw_check(c, _cw_r(core02_stall_runs=go, fins=list(g.CW_FINS_S), core_ev0={3: [-170], 4: []},
+                            packets={(3, 0): burst, (3, 1): [], (4, 0): [], (4, 1): []}))
+    assert s["outcome"] == "S"
+    n = g.cw_check(g.CwCase("n", 64), _cw_r(core02_stall_runs=[(-400, -(g.cw_delay_nops(g.CwCase("n", 64)) + 11))],
+                                            s2mm1_fin_north=[-63]))
+    assert (n["outcome"], n["t"]) == ("N", 63)
+
+
+def test_cw_check_requires_the_starter_to_have_waited_for_go():
+    c = g.CwCase("c", 64)
+    v = g.cw_check(c, _cw_r(s2mm1_fin_north=[-64], core02_stall_runs=[(-3, -2)]))
+    assert v["outcome"] == "INVALID" and "GO" in v["why"]
