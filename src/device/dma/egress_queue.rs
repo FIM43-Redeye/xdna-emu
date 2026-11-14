@@ -21,9 +21,12 @@
 //! row. INFERRED: that the two counts are what bounds them, and that the port time is the own
 //! receiver's word time - 4. Chain position is the word clock's `seq` (the run's first BD is 0).
 //!
-//! Outward routes (the MM2S feeding a switch port toward another tile) add a one-cycle port
-//! stall that is not modelled here (docs/known-fidelity-gaps.md): it belongs to the stream
-//! switch, not to this queue.
+//! Those rows were taken with the source switch quiet, so their port times carry the switch's
+//! hold of the first word (one port cycle, `TileArray`'s `crossing_hold`): the release is 2
+//! cycles after the port, and 3 after the unheld port time the rows were first fitted against.
+//! The crossing-wake probes' awake-source cases (c2o, a3 / a4 / n at T 64) finish one cycle
+//! earlier than the own rows, as 2 gives. Holds farther out on the route reach the port the same
+//! way; none of them is modelled here.
 
 use std::collections::VecDeque;
 
@@ -152,7 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_granule_slot_frees_three_cycles_after_its_last_word_leaves_the_port() {
+    fn a_granule_slot_frees_two_cycles_after_its_last_word_leaves_the_port() {
         let mut q = EgressQueue::default();
         for _ in 0..DMA_MM2S_EGRESS_GRANULE_SLOTS {
             assert!(q.granule_slot_free(0));
@@ -162,12 +165,12 @@ mod tests {
         q.note_port_word(10, false, false);
         assert!(!q.granule_slot_free(20), "a word that does not end its granule frees nothing");
         q.note_port_word(11, true, false);
-        assert!(!q.granule_slot_free(13));
-        assert!(q.granule_slot_free(14));
+        assert!(!q.granule_slot_free(12));
+        assert!(q.granule_slot_free(13));
     }
 
     #[test]
-    fn a_bd_entry_is_held_from_its_first_access_to_its_last_word_plus_three() {
+    fn a_bd_entry_is_held_from_its_first_access_to_its_last_word_plus_two() {
         let mut q = EgressQueue::default();
         for seq in 0..DMA_MM2S_BD_QUEUE_ACCESS_LIMIT as u64 {
             assert!(q.bd_may_open(0));
@@ -175,8 +178,8 @@ mod tests {
         }
         assert!(!q.bd_may_open(0));
         q.note_port_word(20, true, true);
-        assert!(!q.bd_may_open(22));
-        assert!(q.bd_may_open(23));
+        assert!(!q.bd_may_open(21));
+        assert!(q.bd_may_open(22));
     }
 
     #[test]
@@ -186,12 +189,12 @@ mod tests {
             q.note_fetch(seq, true);
             q.note_port_word(10 + seq, true, true);
         }
-        // BD 0 released at 13: BD 7 sequences from 19, BD 7's request floor is BD 1's 14 + 4.
-        assert!(!q.sequencing_allows(7, 18));
-        assert!(q.sequencing_allows(7, 19));
+        // BD 0 released at 12: BD 7 sequences from 18, BD 7's request floor is BD 1's 13 + 4.
+        assert!(!q.sequencing_allows(7, 17));
+        assert!(q.sequencing_allows(7, 18));
         assert!(q.sequencing_allows(6, 0));
         assert_eq!(q.request_floor(6), None);
-        assert_eq!(q.request_floor(7), Some(Some(18)));
+        assert_eq!(q.request_floor(7), Some(Some(17)));
         q.new_run();
         assert!(!q.sequencing_allows(7, 100));
         assert_eq!(q.request_floor(7), Some(None));

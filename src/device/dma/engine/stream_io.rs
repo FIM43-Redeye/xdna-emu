@@ -166,18 +166,32 @@ impl DmaEngine {
     pub(super) fn drain_egress_staging(&mut self, ch_idx: usize) {
         let channel = ch_idx as u8;
         let blocked = !self.can_push_stream_out_for_channel(channel);
-        if self.channels[ch_idx].egress_gap > 0 {
-            self.channels[ch_idx].egress_gap -= 1;
-        } else if !blocked {
-            let now = self.read_clock;
-            let ready = self.channels[ch_idx].egress_staging.front().is_some_and(|w| w.ready_at <= now);
-            if let Some(word) = ready.then(|| self.channels[ch_idx].egress_staging.pop_front()).flatten() {
-                self.push_stream_out(word.data);
-                if word.ends_granule {
-                    self.channels[ch_idx].egress_queue.note_port_word(now, true, word.ends_bd);
-                }
-                if word.ends_bd {
-                    self.channels[ch_idx].egress_gap = self.timing_config.bd_switch_bubble_cycles;
+        // A word that closes its granule frees its egress slot from the cycle it left the port,
+        // the last routing pass, which is later than its hand-off when the port held it.
+        if !blocked {
+            if let Some(ends_bd) = self.channels[ch_idx].egress_port_note.take() {
+                let left = self.read_clock.saturating_sub(1);
+                self.channels[ch_idx].egress_queue.note_port_word(left, true, ends_bd);
+            }
+        }
+        // The BD boundary's idle cycle is a port cycle after the BD's last word has left the port:
+        // it does not elapse while that word is still refused (crossing-wake v3 h17n2w3 / h25n3w3,
+        // silicon: a hold on a head's last word reaches the next BD).
+        if !blocked {
+            if self.channels[ch_idx].egress_gap > 0 {
+                self.channels[ch_idx].egress_gap -= 1;
+            } else {
+                let now = self.read_clock;
+                let ready = self.channels[ch_idx].egress_staging.front().is_some_and(|w| w.ready_at <= now);
+                if let Some(word) = ready.then(|| self.channels[ch_idx].egress_staging.pop_front()).flatten()
+                {
+                    self.push_stream_out(word.data);
+                    if word.ends_granule {
+                        self.channels[ch_idx].egress_port_note = Some(word.ends_bd);
+                    }
+                    if word.ends_bd {
+                        self.channels[ch_idx].egress_gap = self.timing_config.bd_switch_bubble_cycles;
+                    }
                 }
             }
         }
@@ -692,6 +706,35 @@ impl DmaEngine {
     /// (objectfifo_turns_walkers re-trace: 64-word BDs finish 65 cycles apart).
     fn drain_gate_open(&self, ch: usize) -> bool {
         matches!(&self.channels[ch].fsm, ChannelFsm::Transferring { transfer } if self.uses_granule_writer(transfer))
+    }
+
+    /// Whether a compute or memtile S2MM channel takes a word from its switch's DMA master this
+    /// cycle: a slot this cycle's write freed takes a beat in the same cycle. The registered
+    /// ready of `can_accept_stream_in_for_routing` (the shim's form) is not applied here: on a
+    /// compute or memtile switch the one cycle a restart costs is the switch's own hold while
+    /// its adaptive gate is engaged (`TileArray::route_tile_switches_to_dma`), not a register in
+    /// the S2MM. Silicon (sw probe, NPU1, 2026-11-13): a lock-parked own-tile S2MM restart
+    /// finishes at grant + 54, its feeding MM2S's backpressure falling at + 5 and no
+    /// STREAM_STARVATION, while a compute-local transfer keeps the switch awake (9 / 9 runs);
+    /// + 55 / + 6 / starvation at + 2 when the switch is quiet (9 / 9).
+    pub fn can_accept_stream_in_same_cycle(&self, channel: u8) -> bool {
+        if self
+            .channels
+            .get(channel as usize)
+            .map_or(false, |c| c.bd_switch_accept_block > 0)
+        {
+            return false;
+        }
+        let cap = self.channel_input_capacity(channel);
+        let current = self.stream_in.get(channel as usize).map_or(0, |q| q.len());
+        let drained = self.stream_in_drained_this_cycle.get(channel as usize).copied().unwrap_or(0);
+        if self.channels.get(channel as usize).map_or(false, |c| c.accept_awaiting_drain)
+            && current + drained > 0
+            && !self.drain_gate_open(channel as usize)
+        {
+            return false;
+        }
+        current < cap
     }
 
     /// Check if a specific S2MM channel can accept a word from the routing phase.

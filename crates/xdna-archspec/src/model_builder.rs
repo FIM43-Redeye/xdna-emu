@@ -263,7 +263,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             bd_lock_release_after_finish_cycles: 3,
             mm2s_lock_bds_in_flight: 3,
             mm2s_egress_granule_slots: 7,
-            mm2s_egress_release_after_port_cycles: 3,
+            mm2s_egress_release_after_port_cycles: 2,
             mm2s_bd_queue_sequence_lookback: 7,
             mm2s_bd_queue_sequence_after_release_cycles: 6,
             mm2s_bd_queue_access_limit: 6,

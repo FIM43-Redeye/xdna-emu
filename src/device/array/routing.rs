@@ -77,8 +77,9 @@ impl TileArray {
             // Adaptive gate (bottom tier). A compute or memtile switch idle long enough for
             // its adaptive counter to engage costs the first word into it one cycle: it is
             // stepped, at the pass that would have moved the word, one cycle late. A word
-            // pushed in before the first pass (the tile's own DMA, core or trace unit) waits
-            // for the next cycle's first pass: the beat resets the idle counter at the end of
+            // pushed in before the first pass (the tile's core or trace unit; its own MM2S's first
+            // offer is refused at the port instead, `crossing_hold`) waits for the next cycle's
+            // first pass: the beat resets the idle counter at the end of
             // the cycle (Wake 2, Phase 5 below). A word that crosses in after the first pass
             // waits for the next cycle's second pass, so the switch also sits out that
             // cycle's first pass (`ss_late_wake`).
@@ -181,6 +182,7 @@ impl TileArray {
         denied: &[&[crate::device::bank_arbiter::Requester]],
     ) -> (bool, bool, usize) {
         self.maybe_sp4a_probe();
+        self.hold_clock += 1;
         // Phase 0: Port activity tracking reset.
         // Seed cycle_active flags from pre-existing FIFO state before routing.
         // Ports that receive data during routing will also be marked active.
@@ -300,12 +302,29 @@ impl TileArray {
                     // therefore an end-of-cycle reset rather than an emit-site
                     // reset -- closer to silicon's small wake-up latency than
                     // an instantaneous wake would be.
+                    //
+                    // On a compute or memtile switch only a word crossing one of its ports is activity
+                    // (`cycle_beat`, or a word arriving at a slave outside a routing pass), and so is a
+                    // hold that woke it without a crossing (`crossing_hold`): a word parked in it, waiting
+                    // for downstream room, is not. Silicon (mq / mr / sw probes, 2026-11-13): a feed parked
+                    // in a switch for 128+ cycles pays that switch's wake at its restart. The shim keeps
+                    // the earlier criterion (a held word counts): its gate is measured only for words
+                    // entering it.
                     if self.clock.is_module_active(col, row, ModuleKind::StreamSwitch) {
                         let idx = self.tile_index(col, row);
                         let ss = &self.tiles[idx].stream_switch;
-                        let ss_active = ss.masters.iter().any(|p| p.cycle_active)
-                            || ss.slaves.iter().any(|p| p.cycle_active);
+                        let ss_active = if self.holds_first_words(idx) {
+                            std::mem::take(&mut self.ss_woken_by_hold[idx])
+                                || ss.masters.iter().any(|p| p.cycle_beat)
+                                || ss.slaves.iter().any(|p| p.cycle_beat || p.arrived_since_tick)
+                        } else {
+                            ss.masters.iter().any(|p| p.cycle_active)
+                                || ss.slaves.iter().any(|p| p.cycle_active)
+                        };
                         self.clock.tick_adaptive_ss(col, row, ss_active);
+                        for p in &mut self.tiles[idx].stream_switch.slaves {
+                            p.arrived_since_tick = false;
+                        }
                     }
                 }
             }
@@ -426,6 +445,9 @@ impl TileArray {
             let r = self.build_backpressure_reach();
             self.backpressure_reach = Some(r);
         }
+
+        // Holds travelling back toward their sources reach their switches (`crossing_hold`).
+        self.step_hold_pulses();
 
         // Step 1: DMA MM2S -> StreamSwitch slave ports
         // Data from DMA output buffers enters the stream switch network
@@ -1017,6 +1039,36 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // (mode >= 2). Empty at mode 0 (default) and whenever no terminal is cold.
         let (campaign_drain, _campaign_accept) = self.sp4a_campaign_gates();
 
+        // The source switch's hold (`crossing_hold`): a quiet compute or memtile switch refuses
+        // its own MM2S's first offer, and a hold that came back from the stream's route takes the
+        // port's slot it is due in. Decided before the borrows below, from what each port offers.
+        let mut held_ports: Vec<(usize, usize)> = Vec::new();
+        let mut woken: Vec<usize> = Vec::new();
+        let mut offers: Vec<(usize, usize, bool)> = Vec::new();
+        for i in 0..self.tiles.len() {
+            if !self.tile_present[i] || !self.holds_first_words(i) {
+                continue;
+            }
+            let quiet = self.switch_is_quiet(i);
+            let s2mm = self.dma_engines[i].s2mm_channel_count() as u8;
+            for ch in 0..self.dma_engines[i].mm2s_channel_count() as u8 {
+                let slave = match self.tiles[i].tile_kind {
+                    TileKind::Mem => (mem_tile::DMA_SLAVE_START + ch) as usize,
+                    _ => (compute::DMA_SLAVE_START + ch) as usize,
+                };
+                let offered = self.dma_engines[i].has_stream_out_for_channel(s2mm + ch);
+                let would_send =
+                    offered && self.tiles[i].stream_switch.slaves.get(slave).is_some_and(|p| p.can_accept());
+                if would_send && quiet {
+                    woken.push(i);
+                    held_ports.push((i, slave));
+                } else if self.port_hold_due(i, slave, would_send) {
+                    held_ports.push((i, slave));
+                }
+                offers.push((i, slave, offered));
+            }
+        }
+
         // Split-borrow fields once so the hot loop doesn't re-index self.* per
         // word (which produced a large bounds-check / IndexMut pile in profiles).
         let tiles = &mut self.tiles;
@@ -1105,6 +1157,10 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     continue;
                 };
 
+                if !tile_kind.is_shim() && held_ports.contains(&(i, slave_idx)) {
+                    continue;
+                }
+
                 // Drain this channel's stream_out, attempting delivery for
                 // each word.  Retain blocked words for next cycle, preserving
                 // FIFO order on the channel's own queue.
@@ -1145,6 +1201,14 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         }
 
+        for i in woken {
+            self.note_hold(i);
+        }
+        for (i, slave, offered) in offers {
+            let sent = self.tiles[i].stream_switch.slaves[slave].cycle_beat;
+            self.note_port_cycle(i, slave, sent, offered);
+        }
+        self.expire_port_holds();
         words_routed
     }
 
@@ -1165,6 +1229,10 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // whenever no terminal is cold.
         let (_campaign_drain, campaign_accept) = self.sp4a_campaign_gates();
 
+        let quiet: Vec<bool> = (0..self.tiles.len())
+            .map(|i| self.tile_present[i] && self.switch_is_quiet(i))
+            .collect();
+        let mut woken: Vec<usize> = Vec::new();
         let tiles = &mut self.tiles;
         let dma_engines = &mut self.dma_engines;
         let fatal_errors = &mut self.fatal_errors;
@@ -1264,7 +1332,20 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     // on offer to it (from the skid stage or this master port). Decided on
                     // occupancy alone, before the accept, whatever else refuses the beat.
                     dma.note_ingress_offer(ch, fifo_len > 0);
-                    if !dma.can_accept_stream_in_for_routing(ch) {
+                    // A word parked in a quiet compute or memtile switch reaches its S2MM one
+                    // cycle after the S2MM could take it: the switch's hold (`crossing_hold`). An
+                    // awake one hands the S2MM a word in the cycle its write freed a slot; the
+                    // shim keeps the registered ready.
+                    let accepts = if is_shim {
+                        dma.can_accept_stream_in_for_routing(ch)
+                    } else {
+                        dma.can_accept_stream_in_same_cycle(ch)
+                    };
+                    if accepts && fifo_len > 0 && quiet[i] {
+                        woken.push(i);
+                        continue;
+                    }
+                    if !accepts {
                         // The TREADY gap still elapses on an idle cycle: it is a timed
                         // deassert, not a response to the offer.
                         dma.consume_bd_switch_accept_block(ch as usize);
@@ -1294,6 +1375,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         }
 
+        for i in woken {
+            self.note_hold(i);
+        }
         words_routed
     }
 
@@ -1332,6 +1416,10 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // Phase 2: Accept new words from source masters into the pipeline.
         // Each transfer: (src_col, src_row, src_master_idx, dst_col, dst_row, dst_slave_idx, data, tlast)
         let mut transfers: Vec<(u8, u8, usize, u8, u8, usize, u32, bool)> = Vec::new();
+        let quiet: Vec<bool> = (0..self.tiles.len())
+            .map(|i| self.tile_present[i] && self.switch_is_quiet(i))
+            .collect();
+        let mut held_src: Vec<usize> = Vec::new();
 
         // Iterate through all tiles and check North/South master ports
         for col in self.tile_col_start..self.cols {
@@ -1594,6 +1682,17 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         }
 
+        // A word parked in a quiet switch leaves one cycle after it could (`crossing_hold`).
+        transfers.retain(|t| {
+            let si = self.tile_index(t.0, t.1);
+            if quiet[si] {
+                held_src.push(si);
+                false
+            } else {
+                true
+            }
+        });
+
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
         use xdna_archspec::aie2::timing::INTER_TILE_HOP_LATENCY as ROUTE_LATENCY_PER_HOP;
@@ -1607,6 +1706,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             if let Some((data, tlast)) =
                 self.tiles[src_idx].stream_switch.masters[src_master].pop_with_tlast()
             {
+                self.crossing_feeders[dst_idx][dst_slave] = Some((src_idx, src_master));
+                // A word entering a quiet switch that moved nothing this cycle's first pass waits
+                // there one cycle (`step_tile_switches_impl`); its hold heads back to the source.
+                if quiet[dst_idx] && self.ss_gated_idle_first_pass[dst_idx] {
+                    self.launch_hold_pulse(src_idx, src_master);
+                }
                 // Record enacted hop when recorder is enabled.
                 // This branch is compiled away (zero cost) when hop_recorder is None.
                 if let Some(rec) = &mut self.hop_recorder {
@@ -1662,6 +1767,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         }
 
+        for i in held_src {
+            self.note_hold(i);
+        }
         words_transferred
     }
 

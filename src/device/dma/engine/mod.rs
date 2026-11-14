@@ -739,6 +739,7 @@ impl DmaEngine {
         ch.read_backpressure = false;
         ch.egress_staging.clear();
         ch.egress_gap = 0;
+        ch.egress_port_note = None;
         ch.egress_queue.clear();
         ch.read_tail = 0;
         ch.word_clock.clear();

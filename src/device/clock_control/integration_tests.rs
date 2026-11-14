@@ -459,3 +459,46 @@ fn write_to_clock_control_register_does_not_emit_wake() {
         "non-transitioning clock-control write must not wake gates"
     );
 }
+
+// ---- Parked words and the restart's wake (mq / mr probes, NPU1 silicon 2026-11-13) ----
+
+use xdna_archspec::aie2::stream_switch::{compute as ss_compute, mem_tile as ss_mem_tile};
+
+/// A memtile North master holding one word bound for the compute tile above, whose South slave is full: the
+/// word is parked and nothing moves. Every other switch is quiet too.
+fn park_memtile_word(state: &mut DeviceState, col: u8) {
+    let mt = state.array.tile_index(col, 1);
+    let ct = state.array.tile_index(col, 2);
+    let slave = &mut state.array.tiles[ct].stream_switch.slaves[ss_compute::SOUTH_SLAVE_START as usize];
+    while slave.push(0x5157_0000) {}
+    assert!(
+        state.array.tiles[mt].stream_switch.masters[ss_mem_tile::NORTH_MASTER_START as usize].push(0xFEED)
+    );
+}
+
+fn north_master_words(state: &DeviceState, col: u8) -> usize {
+    let mt = state.array.tile_index(col, 1);
+    state.array.tiles[mt].stream_switch.masters[ss_mem_tile::NORTH_MASTER_START as usize]
+        .fifo
+        .len()
+}
+
+#[test]
+fn a_parked_word_does_not_keep_its_switch_awake() {
+    // Silicon: a memtile or compute switch holding a parked stream for hundreds of cycles pays the wake at the
+    // restart (mq / mr probes), so a held word is not activity. Only a word moving across a port is.
+    let mut state = DeviceState::new_npu1();
+    let mut host = HostMemory::new();
+    let col = 2u8;
+    state.array.clock_mut().ungate_all();
+    state.array.clock_mut().set_adaptive_abort_period(col, 1, 3);
+    park_memtile_word(&mut state, col);
+    for _ in 0..16 {
+        state.array.step_data_movement(&mut host);
+    }
+    assert_eq!(north_master_words(&state, col), 1, "the word stays parked");
+    assert!(
+        state.array.clock().is_adaptive_ss_engaged(col, 1),
+        "a switch whose only content is parked gates"
+    );
+}

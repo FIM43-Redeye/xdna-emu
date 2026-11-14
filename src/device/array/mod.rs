@@ -24,6 +24,7 @@
 //! `step_dma(col, row, host_memory)`.
 
 mod backpressure;
+mod crossing_hold;
 mod ctrl;
 mod dma_ops;
 mod routing;
@@ -142,6 +143,27 @@ pub struct TileArray {
     /// Per tile: a word reached the gated switch after the first routing pass; the switch
     /// stays asleep through the next cycle's first pass (see `step_tile_switches_impl`).
     pub(super) ss_late_wake: Vec<bool>,
+
+    /// Per tile: this cycle its quiet switch held a stream's first word without a word crossing
+    /// one of its ports (the MM2S port's refused offer, a parked word's restart); the hold is the
+    /// switch's wake, activity for its idle detector (`crossing_hold`).
+    pub(super) ss_woken_by_hold: Vec<bool>,
+
+    /// Holds travelling back toward their streams' sources (`crossing_hold`).
+    pub(super) hold_pulses: Vec<crossing_hold::HoldPulse>,
+
+    /// Holds that reached their source MM2S port, waiting for their slot (`crossing_hold`).
+    pub(super) port_holds: Vec<crossing_hold::PortHold>,
+
+    /// Per (tile, DMA slave): the MM2S port's current stream (`crossing_hold`).
+    pub(super) port_streams: std::collections::HashMap<(usize, usize), crossing_hold::PortStream>,
+
+    /// Steps of `step_data_movement` so far: the clock holds and their pulses are timed on.
+    pub(super) hold_clock: u64,
+
+    /// Per tile, per slave: the (tile, master) whose word last crossed into it, the hop a hold
+    /// passes back over (`crossing_hold`). Filled as words cross.
+    pub(super) crossing_feeders: Vec<Vec<Option<(usize, usize)>>>,
 
     /// Fatal errors accumulated during data movement.
     ///
@@ -293,6 +315,7 @@ impl TileArray {
             .map(|tile| crate::device::control_packets::StreamReassembler::new(tile.col, tile.row))
             .collect();
 
+        let crossing_feeders = tiles.iter().map(|t| vec![None; t.stream_switch.slaves.len()]).collect();
         Self {
             arch,
             cols,
@@ -301,6 +324,12 @@ impl TileArray {
             tiles,
             ss_gated_idle_first_pass: vec![false; tile_present.len()],
             ss_late_wake: vec![false; tile_present.len()],
+            ss_woken_by_hold: vec![false; tile_present.len()],
+            hold_pulses: Vec::new(),
+            port_holds: Vec::new(),
+            port_streams: std::collections::HashMap::new(),
+            hold_clock: 0,
+            crossing_feeders,
             tile_present,
             dma_engines,
             fatal_errors: Vec::new(),
@@ -595,6 +624,14 @@ impl TileArray {
     pub fn reset(&mut self) {
         self.ss_gated_idle_first_pass.fill(false);
         self.ss_late_wake.fill(false);
+        self.ss_woken_by_hold.fill(false);
+        self.hold_pulses.clear();
+        self.port_holds.clear();
+        self.port_streams.clear();
+        self.hold_clock = 0;
+        for f in &mut self.crossing_feeders {
+            f.fill(None);
+        }
         for (tile, &present) in self.tiles.iter_mut().zip(&self.tile_present) {
             if !present {
                 continue;

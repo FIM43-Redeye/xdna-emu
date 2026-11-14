@@ -136,6 +136,10 @@ pub struct StreamPort {
     /// under backpressure). `cycle_active` conflates the two and over-marks
     /// S2MM receive ports as continuously running; `cycle_beat` does not.
     pub cycle_beat: bool,
+    /// A word has entered this (slave) port since the adaptive gate's idle detector last looked: an arrival is
+    /// activity even when it lands outside a routing pass (the detector's own beat flags are reset at each
+    /// pass's start). Cleared by the detector.
+    pub arrived_since_tick: bool,
     /// Was this port stalled during the current routing cycle?
     /// Set true when a slave has data but cannot forward it due to arbiter
     /// contention or master backpressure. Used by PORT_STALLED trace events.
@@ -187,6 +191,7 @@ impl StreamPort {
             enabled: false,
             packet_enable: false,
             cycle_active: false,
+            arrived_since_tick: false,
             cycle_beat: false,
             cycle_stalled: false,
             cycle_tlast: false,
@@ -225,6 +230,7 @@ impl StreamPort {
             self.cycle_active = true;
             if self.beats_on_push() {
                 self.cycle_beat = true;
+                self.arrived_since_tick = true;
             }
             true
         } else {
@@ -240,6 +246,7 @@ impl StreamPort {
             self.cycle_active = true;
             if self.beats_on_push() {
                 self.cycle_beat = true;
+                self.arrived_since_tick = true;
             }
             if tlast {
                 self.cycle_tlast = true;

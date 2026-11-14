@@ -599,6 +599,9 @@ pub struct ChannelContext {
     /// BD), which now sits on the port side because the next BD is already
     /// fetching behind the finished one's words.
     pub egress_gap: u16,
+    /// A word that closes its egress granule (`Some(ends_bd)`) is in the hand-off register: its
+    /// slot and BD-queue release are counted from the cycle it leaves the port.
+    pub egress_port_note: Option<bool>,
     /// Compute-tile MM2S egress granule slots and BD queue (`EgressQueue`), closed by the words
     /// of `egress_staging` as they leave the port. Empty on every other channel.
     pub egress_queue: super::egress_queue::EgressQueue,
@@ -680,6 +683,7 @@ impl ChannelContext {
             read_ahead: VecDeque::new(),
             egress_staging: VecDeque::new(),
             egress_gap: 0,
+            egress_port_note: None,
             egress_queue: Default::default(),
             read_tail: 0,
             word_clock: Default::default(),
@@ -840,6 +844,7 @@ impl ChannelContext {
         self.read_backpressure = false;
         self.egress_staging.clear();
         self.egress_gap = 0;
+        self.egress_port_note = None;
         self.egress_queue.clear();
         self.read_tail = 0;
         self.word_clock.clear();

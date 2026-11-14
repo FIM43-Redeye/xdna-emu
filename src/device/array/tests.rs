@@ -1599,3 +1599,210 @@ mod gate_wake {
         assert_eq!(wake_cost(&shim_dma_to_memtile(), &[(COL, 0), (COL, 1)]), 2);
     }
 }
+
+// -- A quiet switch on a stream's route holds its first word, and the hold reaches the source ----------------
+//
+// Silicon (NPU1, 2026-11-13, crossing-wake probes v1 / v2 / v3, slack, depth probes 9 / 10 / 11, sw): every
+// compute or memtile switch on a stream's route, the source's included, that no word has crossed for its abort
+// period holds the stream's first word one cycle. The source switch's hold is the MM2S port's own: the port
+// cannot send the first word in the cycle it offers it. The hold of the switch k hops out reaches the port as a
+// one-cycle stall at the stream's slot 8k (the port's cycle first word + 8k, later by every cycle the port has
+// stalled since), passed back hop by hop; a stall whose slot finds the port with nothing to send (the stream's
+// idle cycle) costs nothing. A word parked in a quiet switch is not activity, and the
+// parked word's restart is held the same way (sw: the own-tile S2MM restart).
+
+mod crossing_hold {
+    use super::*;
+    use crate::device::dma::BdConfig;
+    use crate::device::host_memory::HostMemory;
+    use xdna_archspec::aie2::stream_switch::compute;
+
+    const COL: u8 = 1;
+    const AWAKE: u8 = 12; // 2^12 idle cycles: never engages within a test
+    const GATED: u8 = 3; // 2^3: engaged after the warm-up
+    const GO: usize = 5; // the source MM2S waits on this lock of (COL, 2), as the probes' head does
+
+    /// A stream from (COL, 2)'s MM2S 0 straight north into the S2MM 0 of (COL, `receiver`), BDs of `bds` words
+    /// chained, held on the GO lock through a warm-up long enough to engage the switches of the rows in `quiet`.
+    /// Returns the steps, counted from the GO release, at which a word entered the source switch's DMA 0 slave
+    /// (the MM2S port's beats).
+    fn north_stream(bds: &[u32], receiver: u8, quiet: &[u8]) -> Vec<u32> {
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        for row in 2..=receiver {
+            array.clock_mut().set_adaptive_abort_period(
+                COL,
+                row,
+                if quiet.contains(&row) { GATED } else { AWAKE },
+            );
+            let switch = &mut array.tile_mut(COL, row).stream_switch;
+            let from = if row == 2 {
+                compute::DMA_SLAVE_START
+            } else {
+                compute::SOUTH_SLAVE_START
+            };
+            let to = if row == receiver {
+                compute::DMA_MASTER_START
+            } else {
+                compute::NORTH_MASTER_START
+            };
+            switch.configure_local_route(from as usize, to as usize);
+        }
+        let rx = array.tile_index(COL, receiver);
+        array.dma_engines[rx]
+            .configure_bd(0, BdConfig::simple_1d(0x4000, 4096))
+            .unwrap();
+        array.dma_engines[rx].start_channel(0, 0).unwrap();
+        let src = array.tile_index(COL, 2);
+        for (i, &words) in bds.iter().enumerate() {
+            let mut bd = BdConfig::simple_1d(0x400 + 0x200 * i as u64, words * 4);
+            if i == 0 {
+                bd = bd.with_acquire(GO as u8, 1);
+            }
+            if i + 1 < bds.len() {
+                bd = bd.with_next(2 + i as u8);
+            }
+            array.dma_engines[src].configure_bd(1 + i as u8, bd).unwrap();
+        }
+        array.dma_engines[src].start_channel(2, 1).unwrap(); // combined channel 2 = MM2S 0
+        for _ in 0..40 {
+            array.step_data_movement(&mut host);
+        }
+        for row in 2..=receiver {
+            assert_eq!(
+                array.clock().is_adaptive_ss_engaged(COL, row),
+                quiet.contains(&row),
+                "({COL},{row}) at GO"
+            );
+        }
+        array.tiles[src].locks[GO].value = 1;
+        let total: u32 = bds.iter().sum();
+        let mut beats = Vec::new();
+        for step in 0..400 {
+            array.step_data_movement(&mut host);
+            if array.tiles[src].stream_switch.slaves[compute::DMA_SLAVE_START as usize].cycle_beat {
+                beats.push(step);
+            }
+            if beats.len() == total as usize {
+                return beats;
+            }
+        }
+        panic!("the stream did not leave the port: {} of {total} words", beats.len());
+    }
+
+    /// The port's cycles without a beat between its first and its last, relative to the first.
+    fn port_stalls(beats: &[u32]) -> Vec<u32> {
+        let first = beats[0];
+        (beats[0]..*beats.last().unwrap())
+            .filter(|c| !beats.contains(c))
+            .map(|c| c - first)
+            .collect()
+    }
+
+    #[test]
+    fn a_full_rate_head_leaves_the_port_on_consecutive_cycles_when_every_switch_is_awake() {
+        let beats = north_stream(&[24], 3, &[]);
+        assert_eq!(port_stalls(&beats), Vec::<u32>::new());
+    }
+
+    /// k = 0: the source switch's hold is the port's: the first word leaves one cycle late, the rest behind it.
+    #[test]
+    fn a_quiet_source_switch_holds_the_first_word_at_the_mm2s_port() {
+        let awake = north_stream(&[24], 3, &[]);
+        let quiet = north_stream(&[24], 3, &[2]);
+        assert_eq!(quiet, awake.iter().map(|b| b + 1).collect::<Vec<_>>());
+    }
+
+    /// k = 1 (slack, depth probes 9 / 10 / 11 outward rows: the port cannot send at first word + 8).
+    #[test]
+    fn the_hold_one_hop_out_stalls_the_port_at_first_word_plus_8() {
+        let awake = north_stream(&[24], 3, &[]);
+        let quiet = north_stream(&[24], 3, &[3]);
+        assert_eq!(quiet[0], awake[0], "the source switch is awake");
+        assert_eq!(port_stalls(&quiet), vec![8]);
+        let both = north_stream(&[24], 3, &[2, 3]);
+        assert_eq!(both[0], awake[0] + 1);
+        assert_eq!(port_stalls(&both), vec![8]);
+    }
+
+    /// k = 2 and 3 with every switch quiet (slack's quiet twins): slots 16 and 24, each one cycle later for the
+    /// stall before it.
+    #[test]
+    fn the_holds_two_and_three_hops_out_stall_the_port_at_slots_16_and_24() {
+        assert_eq!(port_stalls(&north_stream(&[40], 4, &[2, 3, 4])), vec![8, 17]);
+        assert_eq!(port_stalls(&north_stream(&[40], 5, &[2, 3, 4, 5])), vec![8, 17, 26]);
+    }
+
+    /// slack h24n3w3q (silicon: two stalls, not three): with the slots shifted by the stalls at 8 and 16, the third
+    /// hold's slot 24 is the 24-word head's idle cycle.
+    #[test]
+    fn the_third_hold_is_absorbed_by_a_24_word_head_after_two_stalls() {
+        assert_eq!(port_stalls(&north_stream(&[24, 8], 5, &[2, 3, 4, 5])), vec![8, 17, 26]);
+        assert_eq!(north_stream(&[24, 8], 5, &[2, 3, 4, 5]), north_stream(&[24, 8], 4, &[2, 3, 4]));
+    }
+
+    /// Crossing-wake arm b and v3's split heads: the intermediate switch awake, the far ones quiet; the holds
+    /// still land at + 16 and + 24.
+    #[test]
+    fn an_awake_switch_between_does_not_move_a_far_hold() {
+        assert_eq!(port_stalls(&north_stream(&[40], 4, &[2, 4])), vec![16]);
+        assert_eq!(port_stalls(&north_stream(&[40], 5, &[2, 4, 5])), vec![16, 25]);
+    }
+
+    /// A stall that lands on the stream's idle cycle (the BD boundary after a 16-word head) costs nothing.
+    #[test]
+    fn a_far_hold_landing_on_the_heads_idle_cycle_is_absorbed() {
+        let source_only = north_stream(&[16, 8], 4, &[2]);
+        let far_quiet = north_stream(&[16, 8], 4, &[2, 4]);
+        assert_eq!(port_stalls(&source_only), vec![16], "the BD boundary's idle cycle");
+        assert_eq!(far_quiet, source_only);
+    }
+
+    /// v3's h17n2w3 (silicon: the 7th and 8th finishes one later): the hold's slot 16 is the 17-word head's last word,
+    /// and the BD boundary's idle cycle follows the word at the port, so the stall reaches the next BD.
+    #[test]
+    fn a_stall_on_a_heads_last_word_does_not_use_up_the_bd_boundarys_idle_cycle() {
+        assert_eq!(port_stalls(&north_stream(&[17, 8], 4, &[2, 4])), vec![16, 18]);
+    }
+
+    /// A compute tile whose MM2S 0 fills its own switch toward its S2MM 0, parked on a lock; the S2MM is released
+    /// after a long park. Returns the step after the release at which the switch's DMA 0 master first passes a
+    /// word to the S2MM.
+    fn own_restart(quiet: bool) -> u32 {
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        array
+            .clock_mut()
+            .set_adaptive_abort_period(COL, 2, if quiet { GATED } else { AWAKE });
+        let idx = array.tile_index(COL, 2);
+        array.tiles[idx]
+            .stream_switch
+            .configure_local_route(compute::DMA_SLAVE_START as usize, compute::DMA_MASTER_START as usize);
+        let dma = &mut array.dma_engines[idx];
+        dma.configure_bd(0, BdConfig::simple_1d(0x4000, 256).with_acquire(GO as u8, 1))
+            .unwrap();
+        dma.start_channel(0, 0).unwrap();
+        dma.configure_bd(1, BdConfig::simple_1d(0x400, 256)).unwrap();
+        dma.start_channel(2, 1).unwrap();
+        for _ in 0..200 {
+            array.step_data_movement(&mut host);
+        }
+        assert_eq!(array.clock().is_adaptive_ss_engaged(COL, 2), quiet, "a parked feed is not activity");
+        array.tiles[idx].locks[GO].value = 1;
+        for step in 0..100 {
+            array.step_data_movement(&mut host);
+            if array.tiles[idx].stream_switch.masters[compute::DMA_MASTER_START as usize].cycle_beat {
+                return step;
+            }
+        }
+        panic!("the parked feed never restarted");
+    }
+
+    /// sw (18 silicon runs): the own-tile restart is one cycle later when the switch was quiet.
+    #[test]
+    fn a_quiet_switch_holds_a_parked_feeds_restart_one_cycle() {
+        assert_eq!(own_restart(true), own_restart(false) + 1);
+    }
+}

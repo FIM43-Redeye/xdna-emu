@@ -32,6 +32,12 @@ struct Rig {
     cycle: u64,
     stall_from: Option<u64>,
     trace: Trace,
+    /// Words of the channel's stream (counted from its first) that the port cannot send in the
+    /// cycle it first offers them: a quiet switch's hold (`TileArray`'s `crossing_hold`); word 0
+    /// is the source switch's own.
+    port_holds: Vec<usize>,
+    words_sent: usize,
+    held_now: bool,
 }
 
 impl Rig {
@@ -44,6 +50,9 @@ impl Rig {
             cycle: 0,
             stall_from: None,
             trace: Trace::default(),
+            port_holds: Vec::new(),
+            words_sent: 0,
+            held_now: false,
         }
     }
 
@@ -60,7 +69,15 @@ impl Rig {
         self.tile.resolve_lock_requests(cycle);
         self.eng.step(&mut self.tile, &mut NeighborTiles::empty(), &mut self.host);
         after_step(&mut self.tile);
-        while self.eng.pop_stream_out_for_channel(self.channel).is_some() {}
+        let offered = self.eng.peek_stream_out_for_channel(self.channel).is_some();
+        if offered && !self.held_now && self.port_holds.contains(&self.words_sent) {
+            self.held_now = true;
+        } else {
+            self.held_now = false;
+            while self.eng.pop_stream_out_for_channel(self.channel).is_some() {
+                self.words_sent += 1;
+            }
+        }
         for (c, e) in self.tile.mem_trace_pending.drain(..) {
             match e {
                 EventType::LockAcquire { lock_id } => self.trace.acquires.push((c, lock_id)),
@@ -429,6 +446,12 @@ struct ChainObs {
 /// Run head (`head` words on START) -> `mids` -> the waiting BD (`big` words on A), with B
 /// made available by `b` (`Mid::Core`), on the emulator's compute MM2S 0.
 fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> ChainObs {
+    // The depth probes' own rows: the source switch quiet at the head (its hold is in the rows).
+    run_chain_held(head, mids, big, b, a, &[0])
+}
+
+/// `run_chain` with the port holding the stream's words `holds` one cycle each.
+fn run_chain_held(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser, holds: &[usize]) -> ChainObs {
     let mut eng = DmaEngine::new_compute_tile(1, 2);
     let mut tile = Tile::compute(1, 2);
     let mut addr = 0x400u64;
@@ -460,6 +483,7 @@ fn run_chain(head: u32, mids: &[Mid], big: u32, b: Releaser, a: Releaser) -> Cha
     }
     eng.start_channel(2, 0).unwrap();
     let mut rig = Rig::new(eng, tile, 2);
+    rig.port_holds = holds.to_vec();
     rig.run_until(HEAD_RELEASE - 1);
     rig.tile.locks[LOCK_START as usize].value = 1;
     // The head's grant: its STALLED_LOCK falls.
@@ -918,9 +942,10 @@ fn the_position_six_grant_phase_keeps_the_emulators_pinned_cycle() {
 /// Chains of six to eight short BDs behind the head, own receiver (silicon, NPU1 2026-11,
 /// `tools/gen_dma_lock_probe.py` chain family c and depth probes 8, 9 and 11, head frame; the core releases A at
 /// g0 + RA). Beyond the request and grant law the MM2S channel holds two counted resources,
-/// both released 3 cycles after a word leaves the port:
+/// both released 2 cycles after a word leaves the port; the probes' source switch was quiet, so
+/// the port also holds the head's first word one cycle (`run_chain`'s port hold on word 0):
 /// - at most 7 egress granules fetched and not yet released (a partial granule takes a slot);
-/// - one BD queue of 7 entries, an entry freed 3 cycles after its BD's last word leaves the
+/// - one BD queue of 7 entries, an entry freed 2 cycles after its BD's last word leaves the
 ///   port, with three uses: (a) a BD's first access waits until at most 6 BDs are in flight,
 ///   itself and the head included; (b) the BD at chain position p >= 7 starts sequencing no
 ///   earlier than the release of the BD at p - 7, plus 6; (c) the lock request of a lock BD at
@@ -990,4 +1015,20 @@ fn a_zero_word_bd_deep_in_a_chain_does_not_hold_the_bd_queue() {
         (42, &[(17, 41)][..], &[3, 5, 6, 9, 11, 13, 15, 17, 19, 94][..]),
         "EMULATOR cycles"
     );
+}
+
+/// A hold on a granule's last word delays that granule's release: the slot frees 2 cycles after the
+/// word leaves the port, not after it was first offered. Silicon (crossing-wake v3 h17n2w3, the
+/// switch two hops out holding the 17-word head's word 16): the 7th and 8th finishes one cycle
+/// later than the own row.
+#[test]
+fn a_hold_on_a_heads_last_word_delays_the_releases_behind_it() {
+    let m = mids("1 1 1 1 1 1");
+    let own = run_chain_held(17, &m, 64, Releaser::Free, Releaser::Free, &[0]);
+    let held = run_chain_held(17, &m, 64, Releaser::Free, Releaser::Free, &[0, 16]);
+    let f = &own.finishes;
+    let mut want = f.clone();
+    want[6] += 1;
+    want[7] += 1;
+    assert_eq!(held.finishes, want, "own row {f:?}");
 }
