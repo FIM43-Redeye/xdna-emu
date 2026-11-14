@@ -3681,6 +3681,11 @@ MR_CAL_MEMTILE_EVENTS = ["PORT_RUNNING_0", "PORT_RUNNING_1", "PORT_STALLED_1", "
                          "PORT_RUNNING_4", "DMA_MM2S_SEL0_FINISHED_BD", "DMA_S2MM_SEL0_FINISHED_BD"]
 MR_LOCK_WD = MR_LOCK_W + 1         # released by the waker MM2S 1 at its end; the core acquires it after B
 MR_LOCK_CT, MR_LOCK_CD = 6, 7      # c: compute S2MM 1 acquires CT (init 1), releases CD; the core acquires CD
+# --core-ports builds: the compute core unit also records PORT_RUNNING on the feed's two compute ports, the South
+# slave it enters by (the memtile's North master channel) and the DMA 0 master into the S2MM. Slots 5 / 6: one
+# --port-slots list binds the core's and the memtile's PORT_* events by slot, and the memtile uses 0..4.
+MR_CORE_PORT_SLOTS = (5, 6)        # (South slave, DMA 0 master)
+MR_PORTS_GAP_WINDOW = 64           # restart cycles in which the South slave's idle runs are listed
 
 
 @dataclass(frozen=True)
@@ -3789,17 +3794,28 @@ def mr_design_mlir(c: MrCase) -> str:
     return t
 
 
-def mr_inject_args(routes: dict | None, trace_waker: bool = False) -> list[str]:
+def mr_inject_args(routes: dict | None, trace_waker: bool = False, core_ports: bool = False) -> list[str]:
+    """With `core_ports` the core unit also traces the feed's compute South slave and DMA 0 master
+    (MR_CORE_PORT_SLOTS); the ports come from the routed design, so `routes` is required then."""
     mm = MR_CAL_MEMMOD_EVENTS if trace_waker else MR_MEMMOD_EVENTS
     mt = MR_CAL_MEMTILE_EVENTS if trace_waker else MR_MEMTILE_EVENTS
     sel = MR_LOCK_W if trace_waker else FETCH_LOCK_B
+    core = list(MQ_CORE_EVENTS)
+    if core_ports:
+        if not routes:
+            raise ValueError("core_ports needs the routed feed (routes)")
+        core += [f"PORT_RUNNING_{k}" for k in MR_CORE_PORT_SLOTS]
     a = ["--memmod-sweep-events", ",".join(mm), "--memmod-sel-locks", f"LOCK_SEL1:{sel}",
          "--memtile-sweep-events", ",".join(mt),
          "--memtile-sel-channels", "S2MM_SEL0:1,MM2S_SEL0:0",
-         "--core-grounding", FETCH_CORE_GROUNDING, "--core-sweep-events", ",".join(MQ_CORE_EVENTS)]
+         "--core-grounding", FETCH_CORE_GROUNDING, "--core-sweep-events", ",".join(core)]
     if routes:
-        a += ["--port-slots", f"0=DMA:0:slave,1=North:{routes['feed_north']}:master,2=DMA:1:master,"
-                              f"3=South:{routes['trace_south']}:master,4=DMA:1:slave"]
+        slots = (f"0=DMA:0:slave,1=North:{routes['feed_north']}:master,2=DMA:1:master,"
+                 f"3=South:{routes['trace_south']}:master,4=DMA:1:slave")
+        if core_ports:
+            s, d = MR_CORE_PORT_SLOTS
+            slots += f",{s}=South:{routes['feed_north']}:slave,{d}=DMA:0:master"
+        a += ["--port-slots", slots]
     return a
 
 
@@ -3839,6 +3855,80 @@ def mr_row(events, trace_waker: bool = True) -> dict:
     return r
 
 
+def mr_ports_row(events) -> dict:
+    """The parked feed's restart port by port (--core-ports builds). Compute: the first beat at or after the grant G
+    of the DMA 0 master and of the South slave (core unit: the core timer, against G on the memory-module timer of
+    the same tile), the master's beats before the slave's first one (words that were parked in the switch or behind
+    it in the S2MM path) and the slave's idle runs in its first MR_PORTS_GAP_WINDOW cycles. Memtile (its own timer):
+    the North master's first beat and the DMA slave's resume after it. `invalid` lists what the run lacks: any of
+    the four ports silent, or mq's completion checks."""
+    r = mq_row(events)
+    out = {"dma_first": None, "south_first": None, "dma_before_south": None, "south_gap": [],
+           "north_first": r.get("north_first"), "resume_minus_north": None, "invalid": []}
+    if r.get("release") is None or r.get("grant") is None:
+        out["invalid"].append("grant not traced")
+        return out
+    G = r["release"] + r["grant"]
+    s, d = MR_CORE_PORT_SLOTS
+    beats = {k: sorted({e.ts for e in events if e.row == FETCH_ROW and e.pkt_type == PT_CORE
+                        and e.name == f"PORT_RUNNING_{k}" and e.ts >= G}) for k in (s, d)}
+    if beats[d]:
+        out["dma_first"] = beats[d][0] - G
+    else:
+        out["invalid"].append("compute DMA 0 master: no beat after the grant")
+    if beats[s]:
+        out["south_first"] = beats[s][0] - G
+        sf = beats[s][0]
+        out["dma_before_south"] = sum(1 for t in beats[d] if t < sf)
+        win = [t - G for t in beats[s] if t < sf + MR_PORTS_GAP_WINDOW]
+        out["south_gap"] = [(a + 1, b - 1) for a, b in zip(win, win[1:]) if b > a + 1]
+    else:
+        out["invalid"].append("compute South slave: no beat after the grant")
+    if r.get("north_first") is None:
+        out["invalid"].append("memtile North master / DMA slave: no feed beat")
+    else:
+        out["resume_minus_north"] = r["resume"] - r["north_first"]
+    out["invalid"] += [m for m in mq_missing(r) if m != "memtile feed beats not traced"]
+    out["fin"] = r.get("fin")
+    out["starv_after_g2"] = r.get("starv_after_g2")
+    out["G"] = G
+    return out
+
+
+def format_mr_ports_table(rows) -> str:
+    lines = ["case     run       fin  starv>G+2 | compute (rel G): DMA0-master first, South-slave first, master beats "
+             "before it, South idle runs | memtile: North first (own timer, minus G), resume - North"]
+    q = lambda v: "-" if v is None else str(v)
+    for name, run, r in rows:
+        if r["invalid"]:
+            lines.append(f"{name:<8} {run:<8} INVALID: " + "; ".join(r["invalid"]))
+            continue
+        nf = r["north_first"] - r["G"]
+        lines.append(f"{name:<8} {run:<8} {q(r['fin']):>4}  [{_sl_runs(r['starv_after_g2'])}] | dma {q(r['dma_first'])} "
+                     f"south {q(r['south_first'])} before {q(r['dma_before_south'])} idle [{_sl_runs(r['south_gap'])}] | "
+                     f"North-G {nf} resume-North {q(r['resume_minus_north'])}")
+    return "\n".join(lines)
+
+
+def cmd_mr_ports(args) -> int:
+    out = Path(args.out_dir).resolve()
+    rows = []
+    for c in mr_selection(args):
+        case = out / c.name / "case.json"
+        if not case.exists() or not json.loads(case.read_text()).get("core_ports"):
+            continue
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists():
+                rows.append((c.name, run, {"invalid": ["no trace"]}))
+                continue
+            rows.append((c.name, run, mr_ports_row(load_level_events(run_dir))))
+    print(format_mr_ports_table(rows))
+    return 0
+
+
 def mr_missing(r: dict, c: MrCase, trace_waker: bool = True) -> list[str]:
     """mq's checks (the core's fill releases come after its waits on the waker's locks, so a core that ended proves
     the waker finished); the fill check is the memtile S2MM 1 finish, traced only in calibration builds."""
@@ -3872,7 +3962,7 @@ def mr_selection(args) -> list[MrCase]:
     return [c for c in mr_plan() if not args.names or c.name in args.names]
 
 
-def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False) -> None:
+def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False, core_ports: bool = False) -> None:
     d = out / c.name
     d.mkdir(parents=True, exist_ok=True)
     lp.assemble(mr_core_asm(c), d / "core.o", "k_core")
@@ -3880,7 +3970,8 @@ def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False) -> None:
 
     def compile_(routes):
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-               "--out", "aie.mlir", "--trace-mode", "event_time", *mr_inject_args(routes, trace_waker),
+               "--out", "aie.mlir", "--trace-mode", "event_time",
+               *mr_inject_args(routes, trace_waker, core_ports and routes is not None),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"], cwd=d, log=d / "inject.log")
         lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
@@ -3892,7 +3983,7 @@ def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False) -> None:
     if mq_routes((d / "input_with_addresses.mlir").read_text()) != routes:
         raise SystemExit(f"{c.name}: routes changed between compiles")
     (d / "case.json").write_text(json.dumps({"case": c.name, "waker": c.waker, "t": c.t, "mr": True,
-                                             "trace_waker": trace_waker,
+                                             "trace_waker": trace_waker, "core_ports": core_ports,
                                              "delay_nops": mr_delay_nops(c), "fill_words": 0,
                                              "buffer_words": 4, "routes": routes}) + "\n")
 
@@ -3900,7 +3991,7 @@ def mr_build_case(c: MrCase, out: Path, trace_waker: bool = False) -> None:
 def cmd_mr_build(args) -> int:
     out = Path(args.out_dir).resolve()
     for c in mr_selection(args):
-        mr_build_case(c, out, args.trace_waker)
+        mr_build_case(c, out, args.trace_waker, args.core_ports)
         print("built", c.name)
     return 0
 
@@ -4533,9 +4624,14 @@ def build_parser() -> argparse.ArgumentParser:
     rt2 = sub.add_parser("mr-table", help="mq round 2: finish, waker, memtile quiet (data / trace)")
     rt2.add_argument("out_dir")
     rt2.add_argument("runs", nargs="+")
+    rb2.add_argument("--core-ports", action="store_true",
+                     help="the compute core unit also traces the feed's South slave and DMA 0 master")
     rp2 = sub.add_parser("mr-packets", help="mq round 2: each unit's deciding frames against its last packet")
     rp2.add_argument("out_dir")
     rp2.add_argument("runs", nargs="+")
+    rq2 = sub.add_parser("mr-ports", help="mq round 2, --core-ports builds: the feed's restart port by port")
+    rq2.add_argument("out_dir")
+    rq2.add_argument("runs", nargs="+")
     wb = sub.add_parser("sw-build", help="sl plus the compute-only waker: build the plan's cases (or --names)")
     wb.add_argument("out_dir")
     wb.add_argument("--trace-waker", action="store_true", help="calibration build (emulator only)")
@@ -4546,7 +4642,7 @@ def build_parser() -> argparse.ArgumentParser:
     wt = sub.add_parser("sw-table", help="sl plus the compute-only waker: sl's table per run")
     wt.add_argument("out_dir")
     wt.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp, rb2, rr2, rt2, rp2, wb, wr, wt):
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp, rb2, rr2, rt2, rp2, rq2, wb, wr, wt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     return ap
 
@@ -4564,7 +4660,7 @@ def main(argv=None) -> int:
         return {"sw-build": cmd_sw_build, "sw-run": cmd_sw_run, "sw-table": cmd_sw_table}[args.cmd](args)
     if args.cmd.startswith("mr-"):
         return {"mr-build": cmd_mr_build, "mr-run": cmd_mr_run, "mr-table": cmd_mr_table,
-                "mr-packets": cmd_mr_packets}[args.cmd](args)
+                "mr-packets": cmd_mr_packets, "mr-ports": cmd_mr_ports}[args.cmd](args)
     if args.cmd.startswith("mq-"):
         return {"mq-build": cmd_mq_build, "mq-run": cmd_mq_run, "mq-table": cmd_mq_table,
                 "mq-packets": cmd_mq_packets}[args.cmd](args)

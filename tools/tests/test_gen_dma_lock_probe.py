@@ -2317,3 +2317,60 @@ def test_chain_memtile_trace_declares_the_memtile_and_traces_its_trace_route_por
     assert args[i + 1] == ",".join(f"PORT_RUNNING_{k}" for k in range(4))
     assert args[args.index("--port-slots") + 1] == "0=North:1:slave,1=North:3:slave,2=South:1:master,3=South:3:master"
     assert "--memtile-sweep-events" not in g.chain_inject_args(receiver="north2")
+
+
+# -- mr with the feed's compute ports traced (the parked feed's restart, port by port) -------------------------
+
+def test_mr_core_ports_trace_the_feeds_compute_south_slave_and_dma_master_and_change_nothing_else():
+    routes = {"feed_north": 1, "fill_south": None, "trace_south": 3}
+    base = g.mr_inject_args(routes)
+    ported = g.mr_inject_args(routes, core_ports=True)
+    core = ported[ported.index("--core-sweep-events") + 1].split(",")
+    assert core == g.MQ_CORE_EVENTS + [f"PORT_RUNNING_{g.MR_CORE_PORT_SLOTS[0]}", f"PORT_RUNNING_{g.MR_CORE_PORT_SLOTS[1]}"]
+    slots = ported[ported.index("--port-slots") + 1]
+    assert slots == base[base.index("--port-slots") + 1] + ",5=South:1:slave,6=DMA:0:master"
+    for flag in ("--memmod-sweep-events", "--memtile-sweep-events", "--memtile-sel-channels", "--memmod-sel-locks"):
+        assert ported[ported.index(flag) + 1] == base[base.index(flag) + 1]
+    # the core slots do not collide with the memtile's (one --port-slots list binds both units by slot)
+    assert not set(g.MR_CORE_PORT_SLOTS) & set(range(5))
+    with pytest.raises(ValueError):
+        g.mr_inject_args(None, core_ports=True)
+
+
+def test_mr_build_takes_core_ports_from_the_command_line():
+    p = g.build_parser()
+    assert p.parse_args(["mr-build", "d", "--core-ports", "--names", "mrb008"]).core_ports
+    assert not p.parse_args(["mr-build", "d"]).core_ports
+    assert p.parse_args(["mr-ports", "d", "h1.hw"]).runs == ["h1.hw"]
+
+
+def feed_ports_synthetic(dma_first=1, south_first=4, south_runs=((4, 70),)):
+    """mq_synthetic (G = 5003, memtile North first beat 199) plus the compute core unit's two feed ports."""
+    G = 5003
+    e = mq_synthetic()
+    s, d = g.MR_CORE_PORT_SLOTS
+    e += held(f"PORT_RUNNING_{d}", G + dma_first, G + dma_first + 66, pkt=0)
+    for a, z in south_runs:
+        e += held(f"PORT_RUNNING_{s}", G + a, G + z, pkt=0)
+    e += held(f"PORT_RUNNING_{s}", G + 1900, G + 1963, pkt=0)            # a trailing BD's words, much later
+    return e
+
+
+def test_mr_ports_row_dates_each_feed_port_against_the_grant_and_the_memtile_on_its_own_timer():
+    r = g.mr_ports_row(feed_ports_synthetic(dma_first=1, south_first=4, south_runs=((4, 30), (33, 70))))
+    assert r["dma_first"] == 1 and r["south_first"] == 4
+    assert r["dma_before_south"] == 3                # master beats in [G, the slave's first beat): parked words
+    assert r["south_gap"] == [(31, 32)]               # cycles the slave sat idle inside the restart's first 64
+    assert r["north_first"] == 199 and r["resume_minus_north"] == 1
+    assert r["invalid"] == []
+
+
+def test_mr_ports_row_is_invalid_when_a_port_the_case_depends_on_shows_no_beat():
+    e = [x for x in feed_ports_synthetic() if not (x.pkt_type == 0 and x.name == f"PORT_RUNNING_{g.MR_CORE_PORT_SLOTS[0]}")]
+    r = g.mr_ports_row(e)
+    assert r["south_first"] is None and any("South" in m for m in r["invalid"])
+    e = [x for x in feed_ports_synthetic() if not (x.pkt_type == 3 and x.name == "PORT_RUNNING_1")]
+    assert any("North" in m for m in g.mr_ports_row(e)["invalid"])
+    # a run whose grant is not traced cannot be dated at all
+    e = [x for x in feed_ports_synthetic() if x.name != "DMA_S2MM_0_STALLED_LOCK"]
+    assert g.mr_ports_row(e)["invalid"]
