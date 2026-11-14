@@ -857,3 +857,49 @@ def test_memmod_sel_locks_rejects_bad_specs(tmp_path, spec, message):
     r, _, _ = _inject_memmod_selection(tmp_path, spec)
     assert r.returncode != 0
     assert message in r.stderr.lower() or message in r.stderr
+
+
+TWO_COMPUTE_TILES = """module {
+  aie.device(npu1_1col) {
+    %tile_0_0 = aie.tile(0, 0)
+    %tile_0_2 = aie.tile(0, 2)
+    %tile_0_3 = aie.tile(0, 3)
+    %buf = aie.buffer(%tile_0_2) {sym_name = "buf0"} : memref<16xi32>
+    aie.core(%tile_0_2) {
+      aie.end
+    }
+    aie.core(%tile_0_3) {
+      aie.end
+    }
+    aie.runtime_sequence(%arg0: memref<16xi32>) {
+    }
+  }
+}
+"""
+
+
+def test_trace_tiles_default_traces_every_compute_tile(tmp_path):
+    src = tmp_path / "two.mlir"
+    src.write_text(TWO_COMPUTE_TILES)
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(src), "--out", str(out)])
+    assert r.returncode == 0, r.stderr
+    assert "@trace_t0_2" in out.read_text() and "@trace_t0_3" in out.read_text()
+
+
+def test_trace_tiles_restricts_tracing_to_the_named_tiles(tmp_path):
+    src = tmp_path / "two.mlir"
+    src.write_text(TWO_COMPUTE_TILES)
+    out = tmp_path / "out.mlir"
+    r = _run(["--input", str(src), "--out", str(out), "--trace-tiles", "0:2"])
+    assert r.returncode == 0, r.stderr
+    result = out.read_text()
+    assert "@trace_t0_2" in result
+    assert "@trace_t0_3" not in result
+
+
+def test_trace_tiles_rejects_a_malformed_list(tmp_path):
+    src = tmp_path / "two.mlir"
+    src.write_text(TWO_COMPUTE_TILES)
+    r = _run(["--input", str(src), "--out", str(tmp_path / "out.mlir"), "--trace-tiles", "0-2"], check=False)
+    assert r.returncode != 0 and "--trace-tiles" in r.stderr

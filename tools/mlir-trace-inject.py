@@ -389,6 +389,10 @@ def parse_args():
                         "_core_default_port_config / _memtile_default_port_config). "
                         "Example: '1=Core:0:slave' makes PORT_*_1 on a compute tile watch "
                         "the core's put_stream port.")
+    p.add_argument("--trace-tiles", default=None,
+                   help="trace only these compute tiles, as 'COL:ROW,COL:ROW'. Default: every compute tile "
+                        "(row >= 2). A tile left out gets no trace unit, so no trace packet crosses its "
+                        "stream switch; use it when the design's other compute tiles must stay quiet.")
     p.add_argument("--memtile-sel-channels", default=None,
                    help="memtile event selection: what the DMA_*_SELn and "
                         "LOCK_SELn events watch. Memtiles raise only four DMA "
@@ -902,6 +906,15 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
         cfg = _port_binding(ev_name, _core_default_port_config, port_overrides)
         if cfg is not None:
             core_port_cfgs[_port_slot(ev_name)] = cfg
+    trace_tiles = None
+    if args.trace_tiles is not None:
+        try:
+            trace_tiles = {tuple(int(v) for v in tok.split(":")) for tok in args.trace_tiles.split(",") if tok}
+            if any(len(t) != 2 for t in trace_tiles):
+                raise ValueError
+        except ValueError:
+            print(f"error: bad --trace-tiles {args.trace_tiles!r} (want COL:ROW,COL:ROW)", file=sys.stderr)
+            return 1
     # Determine trace mode attribute for core tiles.
     mode_attr = {
         "event_pc": aied.TraceMode.EventPC,
@@ -1013,7 +1026,8 @@ def _inject_trace_ops(module, input_path: str, aied, args) -> int:
                 col = int(IntegerAttr(inner.operation.attributes["col"]).value)
                 row = int(IntegerAttr(inner.operation.attributes["row"]).value)
                 if row >= 2:
-                    compute_tiles.append((col, row, inner.operation.result))
+                    if trace_tiles is None or (col, row) in trace_tiles:
+                        compute_tiles.append((col, row, inner.operation.result))
                 elif row == 1 and inject_memtile:
                     memtile_tiles.append((col, row, inner.operation.result))
                 elif row == 0 and inject_shim:
