@@ -1865,8 +1865,9 @@ CW_MEM_ADDS = ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION", "
 # Cycles from the core's release of the actor lock to the end of the actor's activity, less the cycles from its
 # release of START to the head's grant g0: D = T + CW_SPAN[arm] puts the end T cycles before g0. Emulator
 # calibration at D = 64: the burst's last (fourth) core trace packet completed at g0 + 32 (a3) and g0 + 29 (a4,
-# on (0,4)), (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n).
-CW_SPAN = {"a3": 96, "a4": 93, "c": 137, "n": 142}
+# on (0,4)), (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n); a4's relay then waited a request window
+# before its release, 9 cycles more.
+CW_SPAN = {"a3": 96, "a4": 102, "c": 137, "n": 142}
 
 
 @dataclass(frozen=True)
@@ -1906,15 +1907,19 @@ def cw_core_asm(c: CwCase) -> str:
     cw_validate(c)
     body = chain_core_body(c.chain())
     at = body.index(f"  acq #{OWN + SYNC_LOCK_SYNC}, r3")
-    pre = [f"  acq #{OWN + CW_LOCK_GO}, r3", f"  rel #{cw_actor_lock_ref(c)}, r2", *lp.nops(cw_delay_nops(c)),
-           f"  rel #{OWN + SYNC_LOCK_START}, r2"]
+    # Each acquire sits a full request window (LOCK_SETTLE_BUNDLES) from any other lock request: silicon resolves
+    # a request 1..3 bundles after another together with it, and a refused acquire in such a window is dropped,
+    # left pending or turned into a release (known-fidelity-gaps, core compute timing: back-to-back requests).
+    pre = [f"  acq #{OWN + CW_LOCK_GO}, r3", *lp.nops(LOCK_SETTLE_BUNDLES), f"  rel #{cw_actor_lock_ref(c)}, r2",
+           *lp.nops(cw_delay_nops(c)), f"  rel #{OWN + SYNC_LOCK_START}, r2", *lp.nops(LOCK_SETTLE_BUNDLES)]
     return lp.frame(body[:at] + pre + body[at:])
 
 
 def cw_burst_asm(relay: bool) -> str:
     """A (0,3) or (0,4) core: acquire its actor lock, then the event burst, or (relay) release the actor lock of the
     tile above."""
-    act = [f"  rel #{NORTH + CW_LOCK_ACTOR}, r2"] if relay else ["  event #0", "  event #1"] * CW_BURST_EVENTS
+    act = ([*lp.nops(LOCK_SETTLE_BUNDLES), f"  rel #{NORTH + CW_LOCK_ACTOR}, r2"] if relay
+           else ["  event #0", "  event #1"] * CW_BURST_EVENTS)
     return lp.frame(["  mov r2, #1", "  mov r3, #-1", *lp.nops(2), f"  acq #{OWN + CW_LOCK_ACTOR}, r3", *act,
                      *lp.nops(8)])
 

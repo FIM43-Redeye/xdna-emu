@@ -2222,3 +2222,19 @@ def test_cw_burst_cores_wait_for_their_go_and_emit_events():
     assert b3[b3.index(f"acq #{g.OWN + g.CW_LOCK_ACTOR}, r3") + 1:].count("event #0") == g.CW_BURST_EVENTS
     relay = bundles_of(g.cw_burst_asm(relay=True))
     assert f"rel #{g.NORTH + g.CW_LOCK_ACTOR}, r2" in relay and "event #0" not in relay
+
+
+def _lock_request_gaps(body):
+    """Bundle distances between consecutive lock requests where at least one is an acquire (two releases inside
+    one window both take effect on silicon)."""
+    at = [i for i, b in enumerate(body) if b.startswith(("acq ", "rel "))]
+    return [j - i for i, j in zip(at, at[1:]) if "acq " in (body[i][:4], body[j][:4])]
+
+
+def test_cw_programs_keep_lock_requests_a_full_window_apart():
+    # silicon resolves a request issued 1..3 bundles after another together with it, and a refused acquire
+    # inside such a window is dropped, left pending or turned into a release; llvm-aie never schedules one
+    for arm in g.CW_ARMS:
+        assert min(_lock_request_gaps(bundles_of(g.cw_core_asm(g.CwCase(arm, 32))))) >= 4
+    for relay in (False, True):
+        assert min(_lock_request_gaps(bundles_of(g.cw_burst_asm(relay))) or [4]) >= 4
