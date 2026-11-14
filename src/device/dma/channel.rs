@@ -75,6 +75,9 @@ pub struct StagedWord {
     /// The last word of its BD: the port idles `bd_switch_bubble_cycles` after
     /// it (`drain_egress_staging`).
     pub ends_bd: bool,
+    /// The last word of a compute MM2S fetch: leaving the port, it closes the fetch's egress
+    /// granule slot (`EgressQueue`). False on every other channel.
+    pub ends_granule: bool,
     /// Engine step (`DmaEngine::read_clock`) from which the word can leave the
     /// staging. Memtile: the read of its granule's last word (one word per cycle behind every
     /// earlier fetch, `ChannelContext::read_tail`) plus `DmaEngine::staged_word_latency`.
@@ -596,6 +599,9 @@ pub struct ChannelContext {
     /// BD), which now sits on the port side because the next BD is already
     /// fetching behind the finished one's words.
     pub egress_gap: u16,
+    /// Compute-tile MM2S egress granule slots and BD queue (`EgressQueue`), closed by the words
+    /// of `egress_staging` as they leave the port. Empty on every other channel.
+    pub egress_queue: super::egress_queue::EgressQueue,
     /// Engine step (`DmaEngine::read_clock`) at which the last word of everything fetched so
     /// far has been read. The MM2S reads one word per cycle into its staging: a granule fetched
     /// (bank access, admission) at step `t` has its words read from `max(t, read_tail + 1)` on,
@@ -674,6 +680,7 @@ impl ChannelContext {
             read_ahead: VecDeque::new(),
             egress_staging: VecDeque::new(),
             egress_gap: 0,
+            egress_queue: Default::default(),
             read_tail: 0,
             word_clock: Default::default(),
             lock_port: Default::default(),
@@ -833,6 +840,7 @@ impl ChannelContext {
         self.read_backpressure = false;
         self.egress_staging.clear();
         self.egress_gap = 0;
+        self.egress_queue.clear();
         self.read_tail = 0;
         self.word_clock.clear();
         self.lock_port.clear();

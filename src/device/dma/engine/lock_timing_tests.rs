@@ -818,9 +818,9 @@ fn the_measured_table_rows_land_on_silicons_cycles() {
 /// c2f): six lock-free 2-word BDs behind the head finish every 2 cycles (g0 + 3, 5, ..., 15);
 /// six 2-word BDs each on its own free lock every 3 (3, 6, ..., 21), each with a one-cycle
 /// STALLED_LOCK at its grant - 1 (2, 5, ..., 17). Only the mids are asserted: the waiting BD
-/// behind six lock-free mids is outside the law (its STALLED_LOCK rises at g0 + 20 on silicon;
-/// open, pinned in `lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles`); behind
-/// six free-lock ones it rises at 21 (`a_chain_of_short_lock_bds_holds_three_lock_bds_in_flight`).
+/// behind six lock-free mids is timed by the BD queue (its STALLED_LOCK rises at g0 + 20,
+/// `a_chain_of_short_bds_holds_seven_egress_granules_and_seven_bds_in_flight`); behind six
+/// free-lock ones it rises at 21 (`a_chain_of_short_lock_bds_holds_three_lock_bds_in_flight`).
 #[test]
 fn a_chain_of_short_bds_keeps_silicons_cadence_up_to_the_waiting_bd() {
     let obs = run_chain(4, &mids("2 2 2 2 2 2"), 64, Releaser::Free, Releaser::Core(45));
@@ -899,34 +899,81 @@ fn a_chain_of_up_to_five_lock_free_short_bds_keeps_the_grant_law() {
     }
 }
 
-/// PIN, NOT SILICON: lock-free chains where the request and grant law misses silicon (open, see
-/// the DMA gap doc). These are the emulator's own cycles, pinned so that a later model of these
-/// rows shows up as a deliberate change. Silicon (NPU1 2026-11, chain families c / kn, head
-/// frame) differs as follows:
-/// - six lock-free mids (the waiting BD is the chain's eighth BD and bd_id 7): STALLED_LOCK
-///   rises at 20 on silicon for 1- to 4-word mids (the emulator: the previous BD's last access
-///   - 1 = 13, or 14 / 17 with 3- / 4-word mids), and the grant phase moves with the mid
-///   length (c1n RA 45 -> 48 on silicon, 47 here; c2n RA 45 -> 47, 46 -> 49 as here);
-/// - five lock-free 4-word mids, RA 46 (kn4x5 q00_30 t2.hw): silicon grants at 49 and rises at
-///   13, FINISHED_BD 101; the emulator grants at 48.
+/// PIN, NOT SILICON: the one lock-free chain row the model still misses (open, see the DMA gap
+/// doc): five lock-free 4-word mids, RA 46 (kn4x5 q00_30 t2.hw). Silicon grants at 49 (STALLED_LOCK
+/// from 13, FINISHED_BD 101); the emulator grants at 48, the grid phase of a waiting BD at chain
+/// position 6, which no rule here times. The same design at RA 45 lands
+/// (`a_chain_of_up_to_five_lock_free_short_bds_keeps_the_grant_law`). Pinned so that a later model
+/// of the position-6 phase shows up as a deliberate change.
 #[test]
-fn lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles() {
+fn the_position_six_grant_phase_keeps_the_emulators_pinned_cycle() {
+    let obs = run_chain(4, &mids("4 4 4 4 4"), 64, Releaser::Free, Releaser::Core(46));
+    assert_eq!(
+        (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+        (48, 48, &[(13, 47)][..], &[3, 5, 7, 9, 11, 13, 100][..]),
+        "kn4x5 t2 (EMULATOR; silicon 49, [(13, 48)], .. 101)"
+    );
+}
+
+/// Chains of six to eight short BDs behind the head, own receiver (silicon, NPU1 2026-11,
+/// `tools/gen_dma_lock_probe.py` chain family c and depth probes 8, 9 and 11, head frame; the core releases A at
+/// g0 + RA). Beyond the request and grant law the MM2S channel holds two counted resources,
+/// both released 3 cycles after a word leaves the port:
+/// - at most 7 egress granules fetched and not yet released (a partial granule takes a slot);
+/// - one BD queue of 7 entries, an entry freed 3 cycles after its BD's last word leaves the
+///   port, with three uses: (a) a BD's first access waits until at most 6 BDs are in flight,
+///   itself and the head included; (b) the BD at chain position p >= 7 starts sequencing no
+///   earlier than the release of the BD at p - 7, plus 6; (c) the lock request of a lock BD at
+///   p >= 7 whose predecessor is lock-free is max(g + 3, the release of the BD at p - 6, plus 4).
+#[test]
+fn a_chain_of_short_bds_holds_seven_egress_granules_and_seven_bds_in_flight() {
     #[rustfmt::skip]
-    let rows: &[(&str, i64, i64, &[(i64, i64)], &[i64])] = &[
-        // mids, RA, grant, stalls, finishes (EMULATOR; silicon in the comment)
-        ("1 1 1 1 1 1", 45, 47, &[(13, 46)], &[3, 5, 7, 9, 11, 13, 15, 99]), // c1n t1: silicon 48, [(20, 47)], .. 100
-        ("1 1 1 1 1 1", 46, 48, &[(13, 47)], &[3, 5, 7, 9, 11, 13, 15, 100]), // c1n t2: silicon 48, [(20, 47)]
-        ("2 2 2 2 2 2", 45, 47, &[(13, 46)], &[3, 5, 7, 9, 11, 13, 15, 99]), // c2n t1: silicon 47, [(20, 46)]
-        ("2 2 2 2 2 2", 46, 49, &[(13, 48)], &[3, 5, 7, 9, 11, 13, 15, 101]), // c2n t3: silicon 49, [(20, 48)]
-        ("4 4 4 4 4 4", 45, 48, &[(17, 47)], &[3, 5, 7, 9, 11, 13, 16, 100]), // c4n t2: silicon 48, [(20, 47)]
-        ("4 4 4 4 4", 46, 48, &[(13, 47)], &[3, 5, 7, 9, 11, 13, 100]), // kn4x5 t2: silicon 49, [(13, 48)], .. 101
+    let rows: &[(u32, &str, i64, i64, &[(i64, i64)], &[i64])] = &[
+        // head, mids, RA, grant of A, STALLED_LOCK after the head, FINISHED_BD (silicon)
+        // chain family c (lock-timing probe): c1n t1 / t2, c2n t1 / t3, c4n t2
+        (4, "1 1 1 1 1 1", 45, 48, &[(20, 47)], &[3, 5, 7, 9, 11, 13, 15, 100]),
+        (4, "1 1 1 1 1 1", 46, 48, &[(20, 47)], &[3, 5, 7, 9, 11, 13, 15, 100]),
+        (4, "2 2 2 2 2 2", 45, 47, &[(20, 46)], &[3, 5, 7, 9, 11, 13, 15, 99]),
+        (4, "2 2 2 2 2 2", 46, 49, &[(20, 48)], &[3, 5, 7, 9, 11, 13, 15, 101]),
+        (4, "4 4 4 4 4 4", 45, 48, &[(20, 47)], &[3, 5, 7, 9, 11, 13, 16, 100]),
+        // depth probes 8, 9 and 11
+        (4, "1 1 1 1 1 1", 15, 18, &[], &[3, 5, 7, 9, 11, 13, 15, 83]),
+        (4, "1 1 1 1 1 1", 46, 48, &[(20, 47)], &[3, 5, 7, 9, 11, 13, 15, 100]),
+        (4, "1 1 1 1 1 1 1", 15, 20, &[], &[3, 5, 7, 9, 11, 13, 15, 20, 85]),
+        (4, "1 1 1 1 1 1 1", 45, 47, &[(22, 46)], &[3, 5, 7, 9, 11, 13, 15, 20, 99]),
+        (4, "1 1 1 1 1 1 1 1", 16, 22, &[], &[3, 5, 7, 9, 11, 13, 15, 20, 22, 87]),
+        (4, "1 1 1 1 1 1 1 1", 45, 47, &[(24, 46)], &[3, 5, 7, 9, 11, 13, 15, 20, 22, 99]),
+        (8, "1 1 1 1 1 1", 17, 22, &[], &[4, 6, 8, 10, 12, 14, 17, 87]),
+        (8, "1 1 1 1 1 1", 46, 49, &[(24, 48)], &[4, 6, 8, 10, 12, 14, 17, 101]),
+        (16, "1 1 1 1 1 1", 18, 30, &[], &[6, 8, 10, 12, 14, 17, 25, 95]),
+        (16, "1 1 1 1 1 1", 48, 51, &[(32, 50)], &[6, 8, 10, 12, 14, 17, 25, 103]),
+        (12, "5 5 5 5 5 5", 18, 30, &[], &[5, 8, 11, 17, 26, 32, 38, 94]),
+        (12, "5 5 5 5 5 5", 47, 49, &[(36, 48)], &[5, 8, 11, 17, 26, 32, 38, 101]),
+        (16, "5 5 5 5 5", 18, 28, &[], &[6, 9, 14, 21, 30, 36, 93]),
+        (16, "2 2 2 2 2 2", 18, 31, &[], &[6, 8, 10, 12, 14, 17, 25, 95]),
+        (16, "2 2 2 2 2 2", 48, 50, &[(32, 49)], &[6, 8, 10, 12, 14, 17, 25, 102]),
+        (16, "4 4 4 4 4 4", 19, 33, &[(32, 32)], &[6, 8, 12, 16, 20, 24, 28, 95]),
+        (16, "4 4 4 4 4 4", 48, 51, &[(32, 50)], &[6, 8, 12, 16, 20, 24, 28, 103]),
+        (16, "1 1 1 1 1 1 1 1", 19, 34, &[], &[6, 8, 10, 12, 14, 17, 25, 32, 34, 99]),
+        (16, "1 1 1 1 1 1 1 1", 48, 50, &[(36, 49)], &[6, 8, 10, 12, 14, 17, 25, 32, 34, 102]),
+        (24, "1 1 1 1 1 1", 24, 38, &[], &[12, 14, 16, 18, 21, 25, 33, 103]),
+        (24, "1 1 1 1 1 1", 54, 56, &[(40, 55)], &[12, 14, 16, 18, 21, 25, 33, 108]),
+        (10, "1 1 1 1 1 1 1 1", 17, 28, &[], &[5, 7, 9, 11, 13, 15, 19, 26, 28, 93]),
+        (12, "1 1 1 1 1 1", 17, 26, &[], &[5, 7, 9, 11, 13, 15, 21, 91]),
+        (20, "1 1 1 1 1 1", 20, 34, &[], &[8, 10, 12, 14, 17, 21, 29, 99]),
+        (24, "2 2 2 2 2 2", 25, 39, &[], &[12, 14, 16, 18, 21, 25, 33, 103]),
+        (24, "4 4 4 4 4 4", 24, 41, &[(40, 40)], &[12, 16, 20, 24, 28, 32, 36, 103]),
+        (32, "1 1 1 1 1 1", 33, 46, &[], &[20, 22, 24, 26, 29, 33, 41, 111]),
+        (8, "1 1 1 1 1 1 1 1", 16, 26, &[], &[4, 6, 8, 10, 12, 14, 17, 24, 26, 91]),
+        (9, "1 1 1 1 1 1 1 1", 17, 27, &[], &[5, 7, 9, 11, 13, 15, 18, 25, 27, 92]),
     ];
-    for &(spec, ra, grant, stalls, finishes) in rows {
-        let obs = run_chain(4, &mids(spec), 64, Releaser::Free, Releaser::Core(ra));
-        assert_eq!(
-            (obs.held, obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
-            (grant, grant, stalls, finishes),
-            "{spec}, RA {ra}"
-        );
+    let mut misses = Vec::new();
+    for &(head, spec, ra, grant, stalls, finishes) in rows {
+        let obs = run_chain(head, &mids(spec), 64, Releaser::Free, Releaser::Core(ra));
+        let got = (obs.held, obs.grant, obs.stalls.clone(), obs.finishes.clone());
+        if got != (grant, grant, stalls.to_vec(), finishes.to_vec()) {
+            misses.push(format!("head {head}, {spec}, RA {ra}: got {got:?}"));
+        }
     }
+    assert!(misses.is_empty(), "{} of {} rows miss:\n{}", misses.len(), rows.len(), misses.join("\n"));
 }

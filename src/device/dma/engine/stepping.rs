@@ -388,6 +388,14 @@ impl DmaEngine {
         {
             return None;
         }
+        // A compute MM2S fetch takes an egress granule slot, and a BD's first one a BD-queue
+        // entry (`EgressQueue`).
+        if self.uses_word_clock(transfer)
+            && (!ch.egress_queue.granule_slot_free(at)
+                || (transfer.bytes_transferred == 0 && !ch.egress_queue.bd_may_open(at)))
+        {
+            return None;
+        }
 
         // Every fetch reserves a whole granule of staging, a BD's short tail (or a strided
         // single-word fetch) included: silicon's longest BD that finishes into a held S2MM is
@@ -887,7 +895,7 @@ impl DmaEngine {
                 self.drive_lock_port_stall(ch_idx);
                 let now = self.read_clock;
                 let ch = &mut self.channels[ch_idx];
-                ch.lock_port.update(&ch.word_clock, now);
+                ch.lock_port.update(&ch.word_clock, &ch.egress_queue, now);
             }
 
             // BDs whose last read returns this cycle complete now: after the FSM
@@ -1263,6 +1271,7 @@ impl DmaEngine {
                         let ch = &mut self.channels[ch_idx];
                         ch.word_clock.start(from, first);
                         ch.lock_port.clear();
+                        ch.egress_queue.new_run();
                         // No access yet, so nothing to settle: a BD with no words (silicon: not
                         // measured; this is the emulator's own timing, the end of BD setup) must
                         // finish on its own state, not on an earlier BD's.
@@ -1707,6 +1716,7 @@ impl DmaEngine {
                 let first = self.chain_bd_spec(next_bd, &transfer);
                 self.channels[ch_idx].word_clock.start(self.read_clock + 1, first);
                 self.channels[ch_idx].lock_port.clear();
+                self.channels[ch_idx].egress_queue.new_run();
             }
         }
         // As at the end of BD setup: this BD has not accessed memory, so nothing is settling.
@@ -2589,6 +2599,7 @@ impl DmaEngine {
                 self.channels[transfer.channel as usize].egress_staging.push_back(StagedWord {
                     data: header,
                     ends_bd: false,
+                    ends_granule: false,
                     ready_at: self.read_clock,
                 });
             } else {
@@ -2918,9 +2929,12 @@ impl DmaEngine {
                     let ends_bd = transfer.remaining_bytes() <= 4;
                     let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
                     let ready_at = last_read + self.staged_word_latency();
-                    self.channels[ch_idx]
-                        .egress_staging
-                        .push_back(StagedWord { data, ends_bd, ready_at });
+                    self.channels[ch_idx].egress_staging.push_back(StagedWord {
+                        data,
+                        ends_bd,
+                        ends_granule: false,
+                        ready_at,
+                    });
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                 }
@@ -2988,19 +3002,27 @@ impl DmaEngine {
                 let channel = transfer.channel;
                 let tlast_suppress = transfer.effective_tlast_suppress();
                 let ready_at = now + DMA_MM2S_ACCESS_TO_OFFER_CYCLES as u64;
-                for &addr in &fetch.addrs[..fetch.words] {
+                let opens_bd = transfer.bytes_transferred == 0;
+                for (i, &addr) in fetch.addrs[..fetch.words].iter().enumerate() {
                     let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
                         return TransferCycleResult::Error;
                     };
                     let ends_bd = transfer.remaining_bytes() <= 4;
                     let data = StreamData { data, tlast: ends_bd && !tlast_suppress, channel };
-                    self.channels[ch_idx]
-                        .egress_staging
-                        .push_back(StagedWord { data, ends_bd, ready_at });
+                    self.channels[ch_idx].egress_staging.push_back(StagedWord {
+                        data,
+                        ends_bd,
+                        ends_granule: i + 1 == fetch.words,
+                        ready_at,
+                    });
                     transfer.advance(4);
                     self.channels[ch_idx].stats.bytes_transferred += 4;
                 }
-                self.channels[ch_idx].word_clock.note_access(now, fetch.words as u32);
+                let ch = &mut self.channels[ch_idx];
+                if let Some(seq) = ch.word_clock.current().map(|b| b.seq) {
+                    ch.egress_queue.note_fetch(seq, opens_bd);
+                }
+                ch.word_clock.note_access(now, fetch.words as u32);
                 if transfer.remaining_bytes() == 0 {
                     self.channels[ch_idx].access_settles_at = now + DMA_MM2S_ACCESS_TO_FINISH_CYCLES as u64;
                 }
@@ -3130,7 +3152,8 @@ impl DmaEngine {
     fn tick_word_clock(&mut self, ch_idx: usize) {
         let now = self.read_clock;
         let configs = &self.bd_configs;
-        self.channels[ch_idx].word_clock.tick(now, |i| {
+        let ch = &mut self.channels[ch_idx];
+        ch.word_clock.tick(now, &ch.egress_queue, |i| {
             configs.get(i as usize).map(|c| ChainBdSpec {
                 bd_index: i,
                 words: c.length.div_ceil(4),

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use super::egress_queue::EgressQueue;
 use super::word_clock::WordClock;
 use xdna_archspec::aie2::timing::{
     DMA_MM2S_LOCK_GRANT_BLOCKED_PHASE, DMA_MM2S_LOCK_GRANT_PERIOD_CYCLES, DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES,
@@ -147,7 +148,7 @@ impl LockPort {
 
     /// End of the channel's step at `now`: retire a target whose grant is held, pick the
     /// next lock-acquiring BD and time its request once its inputs are known.
-    pub fn update(&mut self, wc: &WordClock, now: u64) {
+    pub fn update(&mut self, wc: &WordClock, egress: &EgressQueue, now: u64) {
         if let Some(t) = self.target {
             match wc.bd(t.seq) {
                 Some(b) if b.granted_at.is_some_and(|g| g > now) => return,
@@ -170,20 +171,29 @@ impl LockPort {
         let Some(mut t) = self.target else { return };
         if t.request.is_none() {
             let from_grant = self.last_grant.map(|g| g + DMA_MM2S_LOCK_REQUEST_AFTER_GRANT_CYCLES as u64);
-            t.request = match wc.predecessor(t.seq) {
-                // Q needs the previous BD's trigger word sequenced.
-                Some((Some(trigger), _, _)) => {
-                    let q = trigger + DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES as u64;
-                    Some(Request::Gridded { q: from_grant.map_or(q, |g| g.max(q)) })
+            // Deep in a chain, behind a lock-free BD, the BD queue times the request in place
+            // of the trigger word (`EgressQueue::request_floor`).
+            let queued = egress
+                .request_floor(t.seq)
+                .filter(|_| wc.acquires_lock(t.seq.wrapping_sub(1)) == Some(false));
+            t.request = if let Some(floor) = queued {
+                floor.map(|q| Request::Gridded { q: from_grant.map_or(q, |g| g.max(q)) })
+            } else {
+                match wc.predecessor(t.seq) {
+                    // Q needs the previous BD's trigger word sequenced.
+                    Some((Some(trigger), _, _)) => {
+                        let q = trigger + DMA_MM2S_LOCK_REQUEST_TRIGGER_LATENCY_CYCLES as u64;
+                        Some(Request::Gridded { q: from_grant.map_or(q, |g| g.max(q)) })
+                    }
+                    Some((None, _, _)) => None,
+                    None => Some(match from_grant {
+                        Some(q) => Request::Gridded { q },
+                        None => Request::Ungated {
+                            first_grant: now + 1 + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64,
+                            origin: wc.from(),
+                        },
+                    }),
                 }
-                Some((None, _, _)) => None,
-                None => Some(match from_grant {
-                    Some(q) => Request::Gridded { q },
-                    None => Request::Ungated {
-                        first_grant: now + 1 + DMA_MM2S_LOCK_GRANT_VISIBLE_CYCLES as u64,
-                        origin: wc.from(),
-                    },
-                }),
             };
             self.target = Some(t);
         }

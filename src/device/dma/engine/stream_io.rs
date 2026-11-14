@@ -173,6 +173,9 @@ impl DmaEngine {
             let ready = self.channels[ch_idx].egress_staging.front().is_some_and(|w| w.ready_at <= now);
             if let Some(word) = ready.then(|| self.channels[ch_idx].egress_staging.pop_front()).flatten() {
                 self.push_stream_out(word.data);
+                if word.ends_granule {
+                    self.channels[ch_idx].egress_queue.note_port_word(now, true, word.ends_bd);
+                }
                 if word.ends_bd {
                     self.channels[ch_idx].egress_gap = self.timing_config.bd_switch_bubble_cycles;
                 }

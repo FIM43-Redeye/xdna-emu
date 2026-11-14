@@ -1556,6 +1556,47 @@ pub struct DmaTiming {
     /// them as those releases is inferred. Two or four lose fitted rows.
     pub mm2s_lock_bds_in_flight: u8,
 
+    /// Egress granule slots of a compute-tile MM2S: granules fetched (bank access) and not yet
+    /// released, at most 7; a partial granule (a BD's short tail, a strided single-word fetch)
+    /// takes a whole slot. A slot is released `mm2s_egress_release_after_port_cycles` after its
+    /// granule's last word leaves the MM2S port. Measured on silicon (NPU1, 2026-11,
+    /// `tools/gen_dma_lock_probe.py` depth probes 8, 9 and 11, own receiver): the bound the
+    /// FINISHED_BDs and grants of chains of six to eight short BDs behind 8- to 32-word heads
+    /// require; that it counts granules rather than words is inferred (a word count of 33 with
+    /// a per-BD charge is refuted by the north-receiver rows).
+    pub mm2s_egress_granule_slots: u8,
+
+    /// Cycles from a word's port time (the cycle it leaves the compute MM2S) to the release of
+    /// the egress granule slot or BD-queue entry it closes: 3. Measured, same probes; the port
+    /// time is the receiver's word time - 4 at the own receiver (inferred).
+    pub mm2s_egress_release_after_port_cycles: u8,
+
+    /// BD-queue look-back of a compute-tile MM2S's sequencing: the BD at chain position p >= 7
+    /// starts sequencing no earlier than the queue release of the BD at p - 7 (its last word's
+    /// port time + `mm2s_egress_release_after_port_cycles`) plus
+    /// `mm2s_bd_queue_sequence_after_release_cycles`. Measured, same probes (sequencing starts
+    /// implied by STALLED_LOCK rises and FINISHED_BDs).
+    pub mm2s_bd_queue_sequence_lookback: u8,
+
+    /// Cycles from a BD-queue release to the sequencing start it allows: 6. Same probes.
+    pub mm2s_bd_queue_sequence_after_release_cycles: u8,
+
+    /// BDs of a compute-tile MM2S in flight from their first bank access to their queue release,
+    /// the chain's head and the accessing BD included: at most 6. A BD's first access waits for
+    /// the count. Measured, same probes.
+    pub mm2s_bd_queue_access_limit: u8,
+
+    /// BD-queue look-back of a compute-tile MM2S's lock request: a lock BD at chain position
+    /// p >= 7 whose predecessor acquires no lock is requested at max(the previous grant +
+    /// `mm2s_lock_request_after_grant_cycles`, the queue release of the BD at p - 6 +
+    /// `mm2s_bd_queue_request_after_release_cycles`), in place of the trigger-word term.
+    /// Measured, same probes (the grant phases of the waiting BD behind six to eight lock-free
+    /// BDs).
+    pub mm2s_bd_queue_request_lookback: u8,
+
+    /// Cycles from that BD-queue release to the lock request: 4. Same probes.
+    pub mm2s_bd_queue_request_after_release_cycles: u8,
+
     /// Period of the compute-tile MM2S lock grant: from its request on, a channel's acquire
     /// can be granted in 2 of every 3 cycles: 3. Fitted, same data. What blocks one cycle in
     /// three is not known.

@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 
+use super::egress_queue::EgressQueue;
 use xdna_archspec::aie2::timing::{
     DMA_MM2S_BD_SWITCH_ACCESS_GAP_CYCLES, DMA_MM2S_LATE_GRANULE_ACCESS_GAP_CYCLES,
     DMA_MM2S_LOCK_BDS_IN_FLIGHT, DMA_MM2S_LOCK_RELEASE_AFTER_FINISH_CYCLES,
@@ -247,6 +248,20 @@ impl WordClock {
         (self.prev_seq == Some(prev)).then_some((self.prev_trigger_at, self.prev_last_access, true))
     }
 
+    /// Whether BD `seq` of this run acquires a lock, if the clock still knows it.
+    pub fn acquires_lock(&self, seq: u64) -> Option<bool> {
+        if let Some(b) = self.bd(seq) {
+            return Some(b.spec.acquire.is_some());
+        }
+        if self.lock_bds.iter().any(|e| e.0 == seq) {
+            return Some(true);
+        }
+        // Passed and not among the latest lock BDs: lock-free, unless it is so far back that
+        // its entry was trimmed.
+        let oldest_lock = self.lock_bds.front().map_or(0, |e| e.0);
+        (seq < self.next_seq && seq > oldest_lock).then_some(false)
+    }
+
     /// Record the grant of BD `seq` (held from step `at`).
     pub fn set_granted(&mut self, seq: u64, at: u64) {
         if let Some(b) = self.bd_mut(seq) {
@@ -259,8 +274,9 @@ impl WordClock {
     }
 
     /// One step of the sequencer at `now`, run before anything else of the channel's step.
-    /// `next_of` looks up a BD by index (the chain's next BD).
-    pub fn tick(&mut self, now: u64, next_of: impl Fn(u8) -> Option<ChainBdSpec>) {
+    /// `next_of` looks up a BD by index (the chain's next BD). A BD starts sequencing only once
+    /// the channel's BD queue allows it (`EgressQueue::sequencing_allows`).
+    pub fn tick(&mut self, now: u64, egress: &EgressQueue, next_of: impl Fn(u8) -> Option<ChainBdSpec>) {
         if self.bds.is_empty() || now < self.from {
             return;
         }
@@ -276,6 +292,9 @@ impl WordClock {
             && self.bds[pos].spec.acquire.is_some()
             && !self.lock_bd_may_start(self.bds[pos].seq, now)
         {
+            return;
+        }
+        if self.bds[pos].started_words == 0 && !egress.sequencing_allows(self.bds[pos].seq, now) {
             return;
         }
         let head = self.granules.front().and_then(|g| self.bd(g.bd_seq)).unwrap_or(&self.bds[pos]);

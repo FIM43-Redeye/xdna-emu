@@ -70,6 +70,7 @@ pub mod timing;
 pub mod compression;
 pub mod fifo;
 pub mod token;
+pub mod egress_queue;
 pub mod lock_port;
 pub mod s2mm_port;
 pub mod word_clock;
