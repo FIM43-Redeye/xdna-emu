@@ -38,6 +38,15 @@ Probe 9d additions (plan_9d). Same W stream, with one more controlled variable e
                                The twin is the same stream without the marks (the marks cost time; the twin shows
                                how much). The two user events take the slots of the MM2S FINISHED events.
 
+Probe 9k additions (plan_9k). Same W stream and marks, with these variables:
+  wd_*                 between the two marks, with no sync: one block write of N words to a buffer descriptor of a memory tile (N = 1..8) or of a compute
+                       tile (N = 1..6) that the design never starts, or 1 / 4 masked writes to a tile's DMA control register; the tiles are declared in the
+                       design and left empty (BLOCK_TARGETS, MASK_TARGETS give each target and the upstream test it follows)
+  pf_N<n>              the control with n single-word writes (LeadFill) ahead of everything, so ahead of the trace start
+  w1_late_L<L>_br      the sync follows 64 writes: the awaited task has finished before the sync is issued
+  lead_P<kk>           no marks: a pad block write (LeadPad) of 4 + 4 kk words ahead of the trace start, then a token-less 8-word task: the lead from
+                       the trace start to the first push at 16 stream positions 16 bytes apart
+
 Closing tail (every case). After the measured section the sequence runs TAIL_ROUNDS rounds of one short
 loopback task per channel (M0, S0, M1, S1, each with a token) followed by a sync on all four channels, then the
 trailing writes. Every channel's last task is thus awaited by the sequence itself, so no data task can still be
@@ -68,7 +77,7 @@ import statistics
 import struct
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -108,6 +117,19 @@ MARKED_COL, MARKED_ROW = 0, 0
 # offset 0x400, bank 0 (the address range earlier passing runtime-sequence writes used). The design places no core program, buffer, lock or
 # transfer in that tile, so nothing reads or writes those words; the writes store zeros and every case with write steps uses the same words.
 WRITE_TARGET_COL, WRITE_TARGET_ROW, WRITE_TARGET_OFFSET = 0, 2, 0x400
+# Probe 9k's further targets, all in tiles the design declares and leaves empty (no core program, buffer, lock or transfer):
+#   ct_bd: buffer descriptor 15 of the compute tile (0, 2), six registers from 0x1D1E0; mt_bd: buffer descriptor 47 of the memory tile (0, 1),
+#   eight registers from 0xA05E0. The design starts no transfer in either tile, so these descriptors are never started; zeros are written
+#   (an invalid descriptor). The tile BD registers have passing runtime-sequence block writes in upstream mlir-aie tests
+#   test/npu-xrt/tile_dmas/blockwrite_using_locks and test/npu-xrt/memtile_dmas/blockwrite_using_locks.
+BLOCK_TARGETS = {"data": (WRITE_TARGET_COL, WRITE_TARGET_ROW, WRITE_TARGET_OFFSET, 64),
+                 "ct_bd": (0, 2, 0x1D1E0, 6),
+                 "mt_bd": (0, 1, 0xA05E0, 8)}          # name -> (column, row, byte offset, most words a block may hold)
+# Masked-write targets: the S2MM channel 0 control register of the tile's DMA with the value and mask the upstream tests
+# test/npu-xrt/tile_dmas/writebd_tokens and test/npu-xrt/memtile_dmas/writebd_tokens write (controller id field, 0x100 under mask 0xF00).
+# The channel never runs in these designs.
+MASK_TARGETS = {"ct_ctrl": (0, 2, 0x1DE00, 0x100, 0xF00),
+                "mt_ctrl": (0, 1, 0xA0600, 0x100, 0xF00)}  # name -> (column, row, byte offset, value, mask)
 DEFAULT_EVENTS = tuple(f"DMA_{CHANNELS[ch][0]}_{CHANNELS[ch][1]}_{what}_TASK" for ch in EVENT_ORDER
                        for what in ("START", "FINISHED"))
 # Eight trace slots only: a bracketed case gives up the FINISHED events of the two token-less MM2S channels (their
@@ -145,11 +167,34 @@ class Mark:
 @dataclass(frozen=True)
 class BlockWrite:
     words: int                       # one block-write op of `words` words to the write target (between the marks)
+    target: str = "data"             # a key of BLOCK_TARGETS
 
 
 @dataclass(frozen=True)
 class SingleWrites:
     count: int                       # `count` separate single-word write ops to consecutive words of the write target
+
+
+@dataclass(frozen=True)
+class MaskWrite:
+    target: str                      # a key of MASK_TARGETS
+    count: int = 1                   # `count` separate masked-write ops to the same register
+
+
+@dataclass(frozen=True)
+class LeadFill:
+    count: int                       # `count` single-word writes of zero to the first word of the data target at the very start of the sequence,
+                                     # before the trace is configured and started
+
+
+@dataclass(frozen=True)
+class LeadPad:
+    words: int                       # one block write of `words` words to the data target at the very start of the sequence (moves the trace
+                                     # start through the stream in 4-byte steps per word)
+
+
+LEAD_STEPS = (LeadFill, LeadPad)
+WRITE_STEPS = (BlockWrite, SingleWrites, MaskWrite)
 
 
 @dataclass(frozen=True)
@@ -423,6 +468,45 @@ def plan_9j() -> dict[str, Case]:
     return out
 
 
+# Probe 9k's grids. Part d: block writes of 1 .. (the descriptor's register count) words and masked writes to a memory tile and a compute tile.
+# Part a: plain writes before the trace start. Part b: the late wait. Part c: the trace start at 16 positions 16 bytes apart.
+FRONT_FILLS_9K = (0, 8, 16, 24, 32, 48, 64, 96, 128)
+LEAD_POSITIONS_9K = 16
+LEAD_PAD_FIRST_WORDS_9K = 4          # the first position's pad: 4 words = a 32-byte block write with its 16-byte header; each step adds 4 words = 16 bytes
+
+
+def _lead_case(k: int) -> Case:
+    """The trace start at stream position k: a pad block write of 4 + 4k words ahead of it, then a token-less 8-word task on M0 (BD write, address
+    patch, queue write: the first push is the lead's whole content), its loopback sink on S0, one sync, and the usual closing tail."""
+    steps: list = [LeadPad(LEAD_PAD_FIRST_WORDS_9K + 4 * k), Push("M0", PUSH_WORDS, False), Push("S0", PUSH_WORDS, True), Sync("S0")]
+    steps += drain_syncs(steps) + closing_tail() + [Fill(TAIL_FILL)]
+    return Case(f"lead_P{k:02d}", "W", tuple(steps))
+
+
+def plan_9k() -> dict[str, Case]:
+    """Probe 9k. Part d (wd_*): the time between the two marks while the sequence issues one block write of N words to a buffer descriptor of a memory
+    tile (N = 1 .. 8) or of a compute tile (N = 1 .. 6, the descriptor's length), one masked write, or four, to the DMA control register of either tile.
+    wd_ct_dm_N8 is probe 9j's eight-word data-memory block write. Part a (pf_N*): the control with N plain writes in front of the trace start. Part b:
+    the late waits (the sync follows 64 writes, so its task has finished) and the two prior-command cases of probe 9f. Part c (lead_P*): the trace start
+    at 16 stream positions. The first case is the positive control of the earlier probes (byte-identical stream)."""
+    ctrl = _w_case("w1_L3000_br", 1, 3000, marks=True, events=BRACKET_EVENTS, tail_rounds=4)
+    nine_j = plan_9j()
+    cases = [ctrl, replace(nine_j["wr_N0"], name="wd_N0"), replace(nine_j["wr_blk_N8"], name="wd_ct_dm_N8")]
+    for tile, top in (("mt", 8), ("ct", 6)):
+        cases += [_write_case(f"wd_{tile}_blk_N{n}", [BlockWrite(n, f"{tile}_bd")]) for n in range(1, top + 1)]
+    for tile in ("mt", "ct"):
+        cases += [_write_case(f"wd_{tile}_mask", [MaskWrite(f"{tile}_ctrl")]), _write_case(f"wd_{tile}_mask_x4", [MaskWrite(f"{tile}_ctrl", 4)])]
+    cases += [Case(f"pf_N{n}", ctrl.family, ((LeadFill(n),) if n else ()) + ctrl.steps, ctrl.events) for n in FRONT_FILLS_9K]
+    nine_f, nine_d = plan_9f(), plan_9d()
+    cases += [nine_f["k_a_L30000"], nine_f["k_e_L3000"], nine_d["w1_late_L300_br"],
+              _w_case("w1_late_L3000_br", 1, 3000, late=True, marks=True, events=BRACKET_EVENTS, tail_rounds=4)]
+    cases += [_lead_case(k) for k in range(LEAD_POSITIONS_9K)]
+    out = {c.name: c for c in cases}
+    if len(out) != len(cases):
+        raise ValueError("plan_9k: duplicate case names")
+    return out
+
+
 # -- layout and safety --------------------------------------------------------------------------------
 
 def pushes(case: Case) -> list[Push]:
@@ -495,9 +579,29 @@ def validate(case: Case) -> None:
     for i, s in enumerate(case.steps):
         if isinstance(s, Mark):
             want = (case.steps[i + 1:i + 2], "A") if s.which == "A" else (case.steps[i - 1:i], "B")
-            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], (Sync, BlockWrite, SingleWrites, Mark))):
+            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], (Sync, Mark) + WRITE_STEPS)):
                 raise ValueError(f"{case.name}: mark {s.which} at step {i} is not directly "
                                  f"{'before' if s.which == 'A' else 'after'} a sync or a write step")
+    lead = 0
+    while lead < len(case.steps) and isinstance(case.steps[lead], LEAD_STEPS):
+        lead += 1
+    if any(isinstance(s, LEAD_STEPS) for s in case.steps[lead:]):
+        raise ValueError(f"{case.name}: a lead step after the sequence has begun (lead steps come first)")
+    for s in case.steps:
+        if isinstance(s, LeadFill) and s.count < 1:
+            raise ValueError(f"{case.name}: a lead fill of {s.count} writes")
+        if isinstance(s, LeadPad) and not 1 <= s.words <= BLOCK_TARGETS["data"][3]:
+            raise ValueError(f"{case.name}: a lead pad of {s.words} words, the data window holds {BLOCK_TARGETS['data'][3]}")
+        if isinstance(s, BlockWrite):
+            if s.target not in BLOCK_TARGETS:
+                raise ValueError(f"{case.name}: block write to unknown target {s.target!r}")
+            if not 1 <= s.words <= BLOCK_TARGETS[s.target][3]:
+                raise ValueError(f"{case.name}: block write of {s.words} words to {s.target}, which holds {BLOCK_TARGETS[s.target][3]}")
+        if isinstance(s, MaskWrite):
+            if s.target not in MASK_TARGETS:
+                raise ValueError(f"{case.name}: masked write to unknown target {s.target!r}")
+            if not 1 <= s.count <= 8:
+                raise ValueError(f"{case.name}: {s.count} masked writes")
     marks = [s.which for s in case.steps if isinstance(s, Mark)]
     for which, (name, _) in MARK_EVENTS.items():
         if marks.count(which) and name not in case.events:
@@ -531,8 +635,19 @@ def design_mlir(case: Case) -> str:
     m = f"memref<{nwords}xi32>"
     consts: dict[int, str] = {}
     has_marks = any(isinstance(s, Mark) for s in case.steps)
-    has_writes = any(isinstance(s, (BlockWrite, SingleWrites)) for s in case.steps)
-    write_tile = f"    %t{WRITE_TARGET_COL}{WRITE_TARGET_ROW} = aie.tile({WRITE_TARGET_COL}, {WRITE_TARGET_ROW})\n" if has_writes else ""
+    tiles: set[tuple[int, int]] = set()          # tiles the write steps target: declared in the design, left empty
+    for st in case.steps:
+        if isinstance(st, BlockWrite):
+            tiles.add(BLOCK_TARGETS[st.target][:2])
+        elif isinstance(st, MaskWrite):
+            tiles.add(MASK_TARGETS[st.target][:2])
+        elif isinstance(st, SingleWrites):
+            tiles.add((WRITE_TARGET_COL, WRITE_TARGET_ROW))
+        elif isinstance(st, (LeadPad, LeadFill)):
+            tiles.add(BLOCK_TARGETS["data"][:2])
+    write_tile = "".join(f"    %t{c_}{r_} = aie.tile({c_}, {r_})\n" for c_, r_ in sorted(tiles))
+    mask_consts: set[int] = set()
+    lead: list[str] = []
 
     def c(v: int) -> str:
         consts.setdefault(v, f"%c{v}")
@@ -549,12 +664,22 @@ def design_mlir(case: Case) -> str:
     for s in case.steps:
         if isinstance(s, Fill):
             body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count
-        elif isinstance(s, BlockWrite):
+        elif isinstance(s, (BlockWrite, LeadPad)):
+            target = s.target if isinstance(s, BlockWrite) else "data"
+            col_, row_, off_, _ = BLOCK_TARGETS[target]
             globals_.setdefault(s.words, f"bw{s.words}")
-            body.append(f"      %bwd{n_bw} = memref.get_global @bw{s.words} : memref<{s.words}xi32>")
-            body.append(f"      aiex.npu.blockwrite(%bwd{n_bw}) {{address = {WRITE_TARGET_OFFSET} : ui32, "
-                        f"column = {WRITE_TARGET_COL} : i32, row = {WRITE_TARGET_ROW} : i32}} : memref<{s.words}xi32>")
+            out_ = lead if isinstance(s, LeadPad) else body
+            out_.append(f"      %bwd{n_bw} = memref.get_global @bw{s.words} : memref<{s.words}xi32>")
+            out_.append(f"      aiex.npu.blockwrite(%bwd{n_bw}) {{address = {off_} : ui32, "
+                        f"column = {col_} : i32, row = {row_} : i32}} : memref<{s.words}xi32>")
             n_bw += 1
+        elif isinstance(s, LeadFill):
+            lead += [f"      aiex.npu.write32(%c_lreg, %c_lzero) {{column = {WRITE_TARGET_COL} : i32, row = {WRITE_TARGET_ROW} : i32}} : i32, i32"] * s.count
+        elif isinstance(s, MaskWrite):
+            col_, row_, off_, val_, mask_ = MASK_TARGETS[s.target]
+            mask_consts |= {off_, val_, mask_}
+            body += [f"      aiex.npu.maskwrite32(%c_m{off_}, %c_m{val_}, %c_m{mask_}) "
+                     f"{{column = {col_} : i32, row = {row_} : i32}} : i32, i32, i32"] * s.count
         elif isinstance(s, SingleWrites):
             for k in range(s.count):
                 addr = WRITE_TARGET_OFFSET + 4 * k
@@ -580,6 +705,10 @@ def design_mlir(case: Case) -> str:
     global_lines = "".join(f'    memref.global "private" constant @bw{n} : memref<{n}xi32> = dense<[{", ".join(["0"] * n)}]>\n'
                            for n in sorted(globals_))
     wr_lines = "".join(f"      %c_wr{a} = arith.constant {a} : i32\n" for a in sorted(wr_consts))
+    wr_lines += "".join(f"      %c_m{a} = arith.constant {a} : i32\n" for a in sorted(mask_consts))
+    lead_consts = (f"      %c_lreg = arith.constant {WRITE_TARGET_OFFSET} : i32\n      %c_lzero = arith.constant 0 : i32\n"
+                   if any(isinstance(st, LeadFill) for st in case.steps) else "")
+    lead_text = (lead_consts + nl.join(lead) + "\n") if lead else ""
     mark_consts = (f"      %c_evgen = arith.constant {EVENT_GENERATE} : i32\n" +
                    "".join(f"      %c_mark_{w} = arith.constant {v} : i32\n" for w, (_, v) in MARK_EVENTS.items())
                    if has_marks else "")
@@ -600,7 +729,7 @@ def design_mlir(case: Case) -> str:
       aie.trace.stop broadcast = 14
     }}
 {global_lines}    aie.runtime_sequence(%buf: {m}) {{
-      aie.trace.host_config {{buffer_size = 65536 : i32, egress_shim_col = 1 : i32}}
+{lead_text}      aie.trace.host_config {{buffer_size = 65536 : i32, egress_shim_col = 1 : i32}}
       aie.trace.start_config @trace_shim
       %c_reg = arith.constant {SCRATCH_REG} : i32
       %c_zero = arith.constant 0 : i32
@@ -931,7 +1060,7 @@ def cmd_list(args) -> int:
 
 
 def _selected(args) -> list[Case]:
-    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i, "9j": plan_9j}.get(getattr(args, "plan", "base"), plan)()
+    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i, "9j": plan_9j, "9k": plan_9k}.get(getattr(args, "plan", "base"), plan)()
     names = args.only or list(table)
     return [table[n] for n in names]
 
@@ -1006,21 +1135,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lst = sub.add_parser("list")
-    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
+    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
     b = sub.add_parser("build")
-    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
+    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
     b.add_argument("out_dir")
     b.add_argument("--only", nargs="*", default=[])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
-    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
+    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
     r.add_argument("--backend", choices=("hw", "emu"), required=True)
     r.add_argument("--only", nargs="*", default=[])
     t = sub.add_parser("table")
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+")
-    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
+    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
     t.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
     return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)

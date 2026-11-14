@@ -1006,3 +1006,206 @@ def test_9j_the_target_tile_is_declared_with_nothing_in_it_only_for_cases_that_w
         if decl in m:
             for banned in ("aie.core", "aie.buffer", "aie.lock", "aie.mem(", "aie.dma"):
                 assert banned not in m
+
+
+# -- probe 9k: write classes between the marks (d), writes before the trace start (a, c), the late wait after a prior command (b) ----------
+
+BLOCK_CLASSES_9K = {"mt": 8, "ct": 6}
+LEAD_FILLS_9K = (0, 8, 16, 24, 32, 48, 64, 96, 128)
+
+
+def case9k(name):
+    return g.plan_9k()[name]
+
+
+def test_plan_9k_has_every_part_and_validates():
+    p = g.plan_9k()
+    want = {"w1_L3000_br", "k_a_L30000", "k_e_L3000", "w1_late_L300_br", "w1_late_L3000_br", "wd_N0", "wd_ct_dm_N8",
+            "wd_mt_mask", "wd_ct_mask", "wd_mt_mask_x4", "wd_ct_mask_x4"}
+    want |= {f"wd_{t}_blk_N{n}" for t, top in BLOCK_CLASSES_9K.items() for n in range(1, top + 1)}
+    want |= {f"pf_N{n}" for n in LEAD_FILLS_9K} | {f"lead_P{k:02d}" for k in range(16)}
+    assert set(p) == want
+    assert next(iter(p)) == "w1_L3000_br"
+    for c in p.values():
+        g.validate(c)
+
+
+def test_9k_shared_plans_are_the_earlier_probes_plans():
+    assert case9k("w1_L3000_br").steps == g.plan_9i()["w1_L3000_br"].steps
+    for n in ("k_a_L30000", "k_e_L3000"):
+        assert case9k(n) == g.plan_9f()[n]
+    assert case9k("w1_late_L300_br") == g.plan_9d()["w1_late_L300_br"]
+    assert case9k("wd_ct_dm_N8").steps == g.plan_9j()["wr_blk_N8"].steps
+    assert case9k("wd_N0").steps == g.plan_9j()["wr_N0"].steps
+
+
+def test_9k_write_class_cases_have_only_their_write_steps_between_the_marks():
+    for name, c in g.plan_9k().items():
+        if name.startswith("wd_") and name != "wd_N0":
+            mid = _between_marks(c)
+            assert len(mid) == 1 and isinstance(mid[0], (g.BlockWrite, g.MaskWrite)), name
+    for t, top in BLOCK_CLASSES_9K.items():
+        for n in range(1, top + 1):
+            assert _between_marks(case9k(f"wd_{t}_blk_N{n}")) == [g.BlockWrite(n, f"{t}_bd")]
+    assert _between_marks(case9k("wd_mt_mask")) == [g.MaskWrite("mt_ctrl")]
+    assert _between_marks(case9k("wd_ct_mask_x4")) == [g.MaskWrite("ct_ctrl", 4)]
+
+
+def test_9k_write_class_cases_share_everything_but_the_write_step():
+    base = list(case9k("wd_N0").steps)
+    for name, c in g.plan_9k().items():
+        if name.startswith("wd_"):
+            assert [s for s in c.steps if not isinstance(s, g.WRITE_STEPS)] == base
+            assert c.events == g.BRACKET_EVENTS
+
+
+def test_9k_block_targets_stay_inside_their_buffer_descriptor_slot_and_the_unused_data_window():
+    for name, (col, row, off, most) in g.BLOCK_TARGETS.items():
+        assert (col, row) in {(0, 1), (0, 2)}
+        if name != "data":
+            assert most * 4 <= 0x20 and off % 0x20 == 0, name       # a BD slot is 0x20 bytes
+    ct, mt = g.BLOCK_TARGETS["ct_bd"], g.BLOCK_TARGETS["mt_bd"]
+    assert (ct[2] - 0x1D000) // 0x20 == 15 and ct[3] == 6            # last of the 16 compute-tile descriptors, six registers
+    assert (mt[2] - 0xA0000) // 0x20 == 47 and mt[3] == 8            # last of the 48 memory-tile descriptors, eight registers
+    assert g.BLOCK_TARGETS["data"][:3] == (0, 2, 0x400)
+
+
+def test_9k_mask_targets_are_the_registers_and_values_of_the_upstream_tests():
+    assert g.MASK_TARGETS["ct_ctrl"] == (0, 2, 0x1DE00, 0x100, 0xF00)
+    assert g.MASK_TARGETS["mt_ctrl"] == (0, 1, 0xA0600, 0x100, 0xF00)
+
+
+def test_9k_design_text_of_the_write_classes():
+    m = g.design_mlir(case9k("wd_mt_blk_N8"))
+    assert m.count("aiex.npu.blockwrite") == 1 and "address = %d : ui32, column = 0 : i32, row = 1 : i32" % 0xA05E0 in m
+    assert "aie.tile(0, 1)" in m and "aie.tile(0, 2)" not in m
+    m = g.design_mlir(case9k("wd_ct_blk_N6"))
+    assert "address = %d : ui32, column = 0 : i32, row = 2 : i32" % 0x1D1E0 in m and "aie.tile(0, 2)" in m and "aie.tile(0, 1)" not in m
+    m = g.design_mlir(case9k("wd_mt_mask_x4"))
+    assert m.count("aiex.npu.maskwrite32") == 4 and "{column = 0 : i32, row = 1 : i32}" in m
+    assert f"arith.constant {0xA0600} : i32" in m and f"arith.constant {0x100} : i32" in m and f"arith.constant {0xF00} : i32" in m
+    assert "aie.tile(0, 1)" in m
+    for banned in ("aie.core", "aie.buffer", "aie.lock", "aie.mem(", "aie.memtile_dma", "aie.dma"):
+        assert banned not in m
+
+
+def test_9k_a_tile_is_declared_only_when_a_step_writes_to_it():
+    for name, c in g.plan_9k().items():
+        m = g.design_mlir(c)
+        steps = list(c.steps)
+        used = set()
+        for s in steps:
+            if isinstance(s, g.BlockWrite):
+                used.add(g.BLOCK_TARGETS[s.target][:2])
+            elif isinstance(s, g.MaskWrite):
+                used.add(g.MASK_TARGETS[s.target][:2])
+            elif isinstance(s, g.SingleWrites):
+                used.add((g.WRITE_TARGET_COL, g.WRITE_TARGET_ROW))
+            elif isinstance(s, (g.LeadPad, g.LeadFill)):
+                used.add(g.BLOCK_TARGETS["data"][:2])
+        for tile in ((0, 1), (0, 2)):
+            assert (f"aie.tile({tile[0]}, {tile[1]})" in m) == (tile in used), (name, tile)
+
+
+def test_9k_validate_rejects_a_block_that_overruns_its_descriptor_or_an_unknown_target():
+    base = list(case9k("wd_N0").steps)
+    a = next(i for i, s in enumerate(base) if s == g.Mark("A"))
+    for bad in (g.BlockWrite(7, "ct_bd"), g.BlockWrite(9, "mt_bd"), g.BlockWrite(65, "data"), g.BlockWrite(2, "nowhere"),
+                g.MaskWrite("nowhere"), g.MaskWrite("mt_ctrl", 0)):
+        steps = base[:a + 1] + [bad] + base[a + 1:]
+        with pytest.raises(ValueError):
+            g.validate(g.Case("bad", "W", tuple(steps), g.BRACKET_EVENTS))
+
+
+def test_9k_a_mark_may_sit_next_to_a_masked_write():
+    g.validate(case9k("wd_ct_mask"))
+
+
+# part a: N plain writes before the trace start
+
+def test_9k_front_cases_are_the_control_with_n_writes_in_front():
+    ctrl = case9k("w1_L3000_br")
+    assert case9k("pf_N0").steps == ctrl.steps
+    for n in LEAD_FILLS_9K[1:]:
+        c = case9k(f"pf_N{n}")
+        assert c.steps == (g.LeadFill(n),) + ctrl.steps and c.events == ctrl.events
+
+
+def test_9k_lead_steps_must_come_first_and_before_nothing_else_is_allowed_to_precede_them():
+    ctrl = case9k("w1_L3000_br")
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", ctrl.steps[:1] + (g.LeadFill(8),) + ctrl.steps[1:], ctrl.events))
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", (g.LeadFill(0),) + ctrl.steps, ctrl.events))
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", (g.LeadPad(65),) + ctrl.steps, ctrl.events))
+
+
+def _ops_of_text(text):
+    """(index of the trace host_config line, index of the trace start_config line, indices of the lead write lines)"""
+    lines = text.splitlines()
+    host = next(i for i, l in enumerate(lines) if "aie.trace.host_config" in l)
+    start = next(i for i, l in enumerate(lines) if "aie.trace.start_config" in l)
+    return lines, host, start
+
+
+def test_9k_front_writes_sit_before_the_trace_is_configured():
+    lines, host, start = _ops_of_text(g.design_mlir(case9k("pf_N24")))
+    seq = next(i for i, l in enumerate(lines) if "aie.runtime_sequence" in l)
+    lead = [i for i, l in enumerate(lines) if "aiex.npu.write32" in l and i < host]
+    assert len(lead) == 24 and all(i > seq for i in lead)
+    assert not [i for i, l in enumerate(lines) if "aiex.npu.write32" in l and host < i < start]
+    # the writes are single-word writes of zero to the first word of the data target (the footed target), and their constants are defined before use
+    assert all(f"column = {g.WRITE_TARGET_COL} : i32, row = {g.WRITE_TARGET_ROW} : i32" in lines[i] for i in lead)
+    assert f"%c_lreg = arith.constant {g.WRITE_TARGET_OFFSET} : i32" in "\n".join(lines)
+    text = "\n".join(lines)
+    for name in ("%c_lreg", "%c_lzero"):
+        assert text.index(name) == text.index(f"{name} = arith.constant")           # the first mention is the definition
+
+
+def test_9k_a_case_without_lead_steps_has_the_earlier_text():
+    assert "%c_lreg" not in g.design_mlir(case9k("w1_L3000_br"))
+    assert g.design_mlir(case9k("pf_N0")) == g.design_mlir(case9k("w1_L3000_br"))
+
+
+# part c: the trace start moved through the stream in 16-byte steps
+
+def test_9k_lead_position_cases_differ_only_in_the_pad_which_grows_by_four_words_per_step():
+    pads = []
+    first = case9k("lead_P00")
+    for k in range(16):
+        c = case9k(f"lead_P{k:02d}")
+        assert isinstance(c.steps[0], g.LeadPad)
+        pads.append(c.steps[0].words)
+        assert c.steps[1:] == first.steps[1:] and c.events == first.events
+    assert pads == [4 + 4 * k for k in range(16)]
+    assert all(4 * (b - a) == 16 for a, b in zip(pads, pads[1:]))          # 16 bytes between positions
+    assert max(pads) <= g.BLOCK_TARGETS["data"][3]
+
+
+def test_9k_the_lead_is_a_blockwrite_patch_push_with_no_token_and_no_other_write():
+    c = case9k("lead_P03")
+    body = [s for s in c.steps if not isinstance(s, g.LeadPad)]
+    first = next(s for s in body if isinstance(s, g.Push))
+    assert first.ch == "M0" and not first.token and not any(isinstance(s, g.Mark) for s in body)
+    assert body.index(first) == 0                                           # nothing between the trace start and the first push
+    assert all(not isinstance(s, (g.Fill,) + g.WRITE_STEPS) for s in body[:body.index(first)])
+
+
+def test_9k_the_pad_sizes_in_the_compiled_stream_step_by_sixteen_bytes():
+    sizes = []
+    for k in range(16):
+        text = g.design_mlir(case9k(f"lead_P{k:02d}"))
+        w = 4 + 4 * k
+        assert f"memref<{w}xi32>" in text
+        sizes.append(16 + 4 * w)
+    assert [b - a for a, b in zip(sizes, sizes[1:])] == [16] * 15
+
+
+def test_9k_selectable_from_the_command_line():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9k"]) == 0
+    out = buf.getvalue()
+    assert "wd_mt_blk_N8" in out and "pf_N128" in out and "lead_P15" in out and "k_e_L3000" in out
