@@ -2157,7 +2157,10 @@ def test_chain_waker_loopback_runs_on_its_tile_started_by_the_sequence_around_st
         assert "aie.flow(%t02, DMA : 0, %t04, DMA : 0)" in t                       # the measured route unchanged
     # awake: the waker starts just before START; quiet: after the pad writes, so it runs after the measured chain
     assert awake.index("aiex.set_lock(%lW3") < awake.index("aiex.set_lock(%lStart")
-    assert quiet.index("aiex.set_lock(%lW3") > quiet.rindex("aiex.npu.write32")
+    pads = g.FETCH_PAD_WRITES
+    assert awake.count("aiex.npu.write32") == quiet.count("aiex.npu.write32") == 2 * pads
+    w = quiet.index("aiex.set_lock(%lW3")
+    assert quiet[:w].count("aiex.npu.write32") == pads == quiet[w:].count("aiex.npu.write32")
     assert "}}" not in awake and "}}" not in quiet
     strip = lambda t: "\n".join(l for l in t.splitlines() if "set_lock" not in l)
     assert strip(awake) == strip(quiet)                                            # nothing else differs

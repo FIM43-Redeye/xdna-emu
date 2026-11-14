@@ -1399,7 +1399,8 @@ CHAIN_LOCK_KINDS = {"": "none", "f": "free", "c": "core"}
 # With `waker` = "<row>" a local loopback on tile (0, row) of a north route (MM2S 1 -> S2MM 1 of that tile,
 # CHAIN_WAKER_WORDS words, started by its lock W, which the runtime sequence sets just before START) keeps that tile's
 # stream switch beating through the head's passage; "<row>q", the quiet twin, sets W only after the pad writes, so the
-# same loopback runs after the measured chain. Nothing else differs between the two. The waker's ports (DMA 1) are not
+# same loopback runs after the measured chain. Both then run a second block of pad writes, which outlasts the
+# loopback, so it has finished before the sequence ends. Nothing else differs between the two. The waker's ports (DMA 1) are not
 # the route's (South / North), and its buffers sit in banks the receiver does not touch.
 CHAIN_WAKER_WORDS = 2048           # about 2048 cycles of beats: spans the head from just before START on
 CHAIN_WAKER_SRC = 0x0400           # banks 0 / 1 of the waker tile, before the receiver's `dst`
@@ -1652,7 +1653,7 @@ def chain_design_mlir(c: ChainCase) -> str:
       %c_one = arith.constant 1 : i32
 {"" if c.waker.endswith("q") else wk_set}      aiex.set_lock(%lStart, %c_one)
 {pad}
-{wk_set if c.waker.endswith("q") else ""}    }}
+{wk_set if c.waker.endswith("q") else ""}{(pad + nl) if c.waker else ""}    }}
   }}
 }}
 """
