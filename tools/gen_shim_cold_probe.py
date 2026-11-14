@@ -759,11 +759,12 @@ def consistent(prediction: str, observed: str) -> str:
 
 def termination(case: Case) -> str:
     """One line: why the case ends whatever silicon does."""
-    ends = ("the go lock is set by the runtime sequence, the source lock released by the core once it holds go "
-            f"(counted delays, {case.tasks} release{'s' if case.tasks != 1 else ''}), ")
+    ends = ("the go lock is set by the runtime sequence, the core writes one trigger word to the memtile once it holds go "
+            f"(counted delays, {case.tasks} trigger{'s' if case.tasks != 1 else ''}) and a one-word memtile BD per trigger "
+            "releases the source lock, ")
     if case.paced_by == "sequence":
-        ends = ("each round the runtime sequence sets the go lock, the core releases the source lock once, "
-                f"and the sequence pushes one 1-word task ({case.tasks} rounds of padding writes), ")
+        ends = ("each round the runtime sequence sets the go lock, the core writes one trigger word (a one-word memtile BD "
+                f"releases the source lock), and the sequence pushes one 1-word task ({case.tasks} rounds of padding writes), ")
     bds = f"every S2MM BD holds exactly the source's words ({', '.join(str(t.words) for t in case.transfers)}), "
     if case.fill:
         bds += ("the background source/sink BDs repeat a fixed number of times and the background core releases "
