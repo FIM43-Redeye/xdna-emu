@@ -1960,7 +1960,10 @@ fn syncs_written_as_time_passes_are_the_bytes_of_syncs_written_with_the_frame() 
 // Silicon ends each tile's stream with a 4-byte token, 0xDC and an 18-bit count of the idle
 // cycles from the last frame (Repeats included) to the stop, on a 4-byte boundary, the rest of
 // the packet 0xFE. A quiet tile's stream is `Start DC`; a long idle tail writes Syncs first;
-// when the last data fills its packet the token would need a packet of its own and is left out.
+// when no whole word of the packet being filled is free, that packet goes out and the token
+// opens a packet of its own (silicon: 153 such packets over three captures of the bridge suite;
+// the 75 streams that lack the token are each the one unit of a 64-byte-burst channel whose
+// last, odd packet is never written, never two in one channel).
 // The tails below are copied from three silicon captures (impl notes: held level to the stop
 // ends `Rep1 DC(0)`, a periodic counter tail `Sng2(1,1024) Rep0(5) DC(422)`).
 
@@ -2056,16 +2059,22 @@ fn the_token_may_end_exactly_at_the_end_of_the_packet() {
 }
 
 #[test]
-fn data_that_fills_its_packet_gets_no_token_packet() {
-    // Measured as an absence in 75 of 226 streams that need a packet of their own.
-    for frames in [20u64, 18, 19] {
-        // 28 bytes exactly (packet already emitted), 26 and 27 used (token does not fit)
+fn data_that_leaves_no_free_word_puts_the_token_in_a_packet_of_its_own() {
+    // Silicon: the token packet follows a packet with 25, 26, 27 or 28 data bytes (2 / 59 / 23
+    // / 69 of 153), and the token is never after the 24th byte of a shared packet.
+    for (frames, data) in [(20u64, 28usize), (18, 26), (19, 27)] {
+        // 28 bytes exactly (packet already emitted), 26 and 27 used (no whole word left)
         let mut tu = running_unit();
         fill_with_frames(&mut tu, frames);
         tu.notify_event(29, 100, None);
         let p = payloads(&mut tu);
-        assert_eq!(p.len(), 1, "{frames} frames");
-        assert!(!p[0].contains(&0xDC), "{frames} frames: no token");
+        assert_eq!(p.len(), 2, "{frames} frames");
+        assert!(!p[0].contains(&0xDC), "{frames} frames: the data packet carries no token");
+        assert!(p[0][data..].iter().all(|&b| b == 0xFE), "{frames} frames: data, then fill");
+        // count: stop 100, last frame in cycle `frames`
+        let count = (100 - 1 - frames) as u8;
+        assert_eq!(&p[1][..4], &[0xDC, 0x00, 0x00, count], "{frames} frames");
+        assert!(p[1][4..].iter().all(|&b| b == 0xFE), "{frames} frames: token alone");
     }
 }
 
@@ -2084,8 +2093,9 @@ fn a_pending_repeat_is_written_before_the_token() {
 /// The end of a stream with an idle tail longer than the cycles field: the Sync of the wrap
 /// goes in at the wrap and completes its packet, which leaves long before the stop. Silicon
 /// (no-data trace probe, the core stopped 27 bytes into a packet): that packet reaches the
-/// shim S2MM at L + 2^18 + 14 and is the stream's last; no end-token packet follows, as for any
-/// stream whose data fills its last packet exactly.
+/// shim S2MM at L + 2^18 + 14. It is the last packet the host sees, but the probe's channel
+/// holds an even 40 packets with 64-byte bursts, so a token packet after it would be the
+/// unwritten 41st; the token packet follows here as in every stream whose data fills its packet.
 #[test]
 fn an_idle_tail_writes_its_sync_at_the_wrap_long_before_the_stop() {
     let mut tu = sync_unit(); // last frame in cycle 5, 27 bytes
@@ -2099,7 +2109,10 @@ fn an_idle_tail_writes_its_sync_at_the_wrap_long_before_the_stop() {
     let sync_packet = tu.pop_packet().unwrap();
     assert_eq!(sync_packet[7] & 0xFF, 0xFF);
     tu.notify_event(29, stop, None);
-    assert!(payloads(&mut tu).is_empty(), "no end-token packet after a full one");
+    let p = payloads(&mut tu);
+    assert_eq!(p.len(), 1, "the token packet after the full one");
+    assert_eq!(p[0][0], 0xDC);
+    assert!(p[0][4..].iter().all(|&b| b == 0xFE));
 }
 
 /// A Sync whose wrap has not come by the stop is written at the stop, before the end token,

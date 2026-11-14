@@ -929,11 +929,13 @@ impl TraceUnit {
     /// the one start-to-stop time every tile of the test shows), the count is the remainder.
     /// The token starts on a 4-byte boundary, Skip before it.
     ///
-    /// When it does not fit in the packet being filled it is not written. Silicon shows the
-    /// token in a packet of its own after data that fills its packet in only about two thirds
-    /// of the cases (151 of 226 over three captures) and omits it in the rest (75): measured
-    /// as an absence, mechanism inferred (the packet arriving after the host's buffer is
-    /// read). The emulator takes the omission.
+    /// When no whole word of the packet being filled is free (or the data filled the previous
+    /// packet exactly), that packet goes out with Skip fill and the token opens a packet of its
+    /// own. Silicon, three captures of the bridge suite (2308 streams): the token shares a
+    /// packet only after at most 24 data bytes, and has a packet of its own after 25 to 28 (153
+    /// streams). The 75 streams without a token all needed such a packet, and each is the only
+    /// one in its channel: the channel's last, odd packet, which the shim's 64-byte bursts never
+    /// write while the trace BD runs. The token itself is always emitted.
     fn write_end_token(&mut self, stop_cycle: u64) {
         let idle = stop_cycle.saturating_sub(1).saturating_sub(self.last_event_cycle);
         let count_range = 1u64 << END_TOKEN_COUNT_BITS;
@@ -942,11 +944,12 @@ impl TraceUnit {
         self.push_syncs(idle / count_range, stop_cycle);
         self.try_emit_packet();
         let count = idle % count_range;
-        // An empty buffer after the Start marker is a packet the data filled exactly.
-        let start = self.byte_buffer.len().next_multiple_of(4);
-        if self.byte_buffer.is_empty() || start + END_TOKEN_LEN > PACKET_PAYLOAD_BYTES {
-            return;
+        // An empty buffer after the Start marker is a packet the data filled exactly; the token
+        // then starts the next packet, as it does when the partial one has no whole word left.
+        if self.byte_buffer.len().next_multiple_of(4) + END_TOKEN_LEN > PACKET_PAYLOAD_BYTES {
+            self.emit_packet_from_buffer();
         }
+        let start = self.byte_buffer.len().next_multiple_of(4);
         self.byte_buffer.resize(start, 0xFE);
         self.byte_buffer.push(END_TOKEN_OPCODE);
         self.byte_buffer.push((count >> 16) as u8);
