@@ -5382,3 +5382,64 @@ fn a_task_does_not_finish_before_the_previous_task_of_its_channel() {
     assert!(1100 + warm_finish() < 800 + cold_finish());
     assert_eq!(tasks[2].finished, Some(800 + cold_finish() + lag));
 }
+
+// === A write that queues behind an unfinished write to the same region (silicon: shim probe) ===
+//
+// 18 same-region pairs whose second task's words arrived before the first write had finished: the
+// second finished 1 cycle after the first in 14 (2 in one; 6, 555 and 629 in three, which stay open),
+// not at its own cold latency. A region with an outstanding first write is being warmed, and a later
+// write of the channel to it joins that write.
+
+/// The second task of channel (1, 0), starting at `start` with `words` words at `addr`.
+fn queued_task(start: u64, words: u32, addr: u64) -> RunTask {
+    RunTask { slot: 1, ..task_at(1, 0, start, words, addr) }
+}
+
+#[test]
+fn a_write_queued_behind_an_unfinished_write_to_its_region_finishes_one_cycle_after_it() {
+    let lag = DmaTimingConfig::default().shim_s2mm_in_order_lag_cycles as u64;
+    let mut host = host_with_buffer(REGION as usize);
+    let mut tasks = [task_at(1, 0, 10, 8, BUF), queued_task(60, 8, BUF + 0x100)];
+    let _ = run_shim_tasks(&mut host, &mut tasks, 3000);
+    assert_eq!(tasks[0].finished, Some(10 + cold_finish()));
+    assert_eq!(tasks[1].finished, Some(10 + cold_finish() + lag));
+}
+
+/// A joined write with a long burst is bound by its own last word, not by the earlier write.
+#[test]
+fn a_joined_write_whose_words_end_late_finishes_after_its_own_last_word() {
+    let cfg = DmaTimingConfig::default();
+    let (start, words) = (500u64, 600u32);
+    let mut host = host_with_buffer(REGION as usize);
+    let mut tasks = [task_at(1, 0, 10, 8, BUF), queued_task(start, words, BUF + 0x100)];
+    let _ = run_shim_tasks(&mut host, &mut tasks, 4000);
+    let own_last = start + 6 + (words as u64 - 1) + cfg.shim_s2mm_last_write_cycles as u64;
+    assert!(own_last > 10 + cold_finish() + 1, "the earlier write is not what binds it");
+    assert!(own_last < start + cold_finish(), "and its own cold latency would have");
+    assert_eq!(tasks[1].finished, Some(own_last));
+}
+
+/// Another region (or buffer) behind an outstanding write does not join it: nothing has finished,
+/// so it is cold on its own.
+#[test]
+fn a_write_to_another_region_behind_an_unfinished_write_keeps_its_own_cold_latency() {
+    let mut host = host_with_buffer(4 * REGION as usize);
+    let mut tasks = [task_at(1, 0, 10, 8, BUF), queued_task(60, 8, BUF + REGION)];
+    let _ = run_shim_tasks(&mut host, &mut tasks, 3000);
+    assert_eq!(tasks[1].finished, Some(60 + cold_finish()));
+}
+
+/// What was warmed or being warmed belongs to the run: after `begin_run` the same pair behaves as
+/// the first time (the first write cold again, the second joining it).
+#[test]
+fn a_new_run_forgets_the_regions_being_warmed() {
+    let lag = DmaTimingConfig::default().shim_s2mm_in_order_lag_cycles as u64;
+    let mut host = host_with_buffer(REGION as usize);
+    for run in 0..2 {
+        let mut tasks = [task_at(1, 0, 10, 8, BUF), queued_task(60, 8, BUF + 0x100)];
+        let _ = run_shim_tasks(&mut host, &mut tasks, 3000);
+        assert_eq!(tasks[0].finished, Some(10 + cold_finish()), "run {run}");
+        assert_eq!(tasks[1].finished, Some(10 + cold_finish() + lag), "run {run}");
+        host.begin_run();
+    }
+}

@@ -2057,22 +2057,38 @@ impl DmaEngine {
 
     /// A shim S2MM word went in this cycle (`uses_host_write_path`): the task's first one starts
     /// its first host write's latency. Silicon (bridge corpus 2026-11, shim write-completion
-    /// probe 2026-11): cold while no shim S2MM write of the run has finished
-    /// (`HostMemory::shim_s2mm_write_finished`); after one has, warm only if a finished write
-    /// touched the region of the word (`HostMemory::shim_s2mm_region_warm`), else cold with the
-    /// shorter new-region latency.
+    /// probe 2026-11):
+    /// - warm when a finished write of the run touched the region of the word
+    ///   (`HostMemory::shim_s2mm_region_warm`);
+    /// - else, when an earlier write of this channel to that region is still outstanding (the
+    ///   region is being warmed), it joins it: it finishes `shim_s2mm_in_order_lag_cycles` after
+    ///   that write (14 of 18 probe pairs; the BD still waits for its own last word);
+    /// - else cold with the shorter new-region latency once some write of the run has finished,
+    ///   and with the full cold latency while none has (`HostMemory::shim_s2mm_write_finished`).
     fn note_host_write(&mut self, ch_idx: usize, host_memory: &HostMemory) {
         let ch = &self.channels[ch_idx];
         if ch.first_write_acked_at.is_none() {
             let cfg = &self.timing_config;
-            let latency = if !host_memory.shim_s2mm_write_finished() {
-                cfg.shim_s2mm_first_write_cold_cycles
-            } else if ch.first_write_region.is_some_and(|r| host_memory.shim_s2mm_region_warm(r)) {
-                cfg.shim_s2mm_first_write_cycles
+            let region = ch.first_write_region;
+            let warm = host_memory.shim_s2mm_write_finished()
+                && region.is_some_and(|r| host_memory.shim_s2mm_region_warm(r));
+            let outstanding = region.and_then(|r| {
+                ch.host_completions
+                    .iter()
+                    .filter(|c| c.regions.contains(&r))
+                    .map(|c| c.ready_at)
+                    .max()
+            });
+            let ack = if warm {
+                self.read_clock + cfg.shim_s2mm_first_write_cycles as u64
+            } else if let Some(finish) = outstanding {
+                finish + cfg.shim_s2mm_in_order_lag_cycles as u64
+            } else if host_memory.shim_s2mm_write_finished() {
+                self.read_clock + cfg.shim_s2mm_first_write_new_region_cycles as u64
             } else {
-                cfg.shim_s2mm_first_write_new_region_cycles
+                self.read_clock + cfg.shim_s2mm_first_write_cold_cycles as u64
             };
-            self.channels[ch_idx].first_write_acked_at = Some(self.read_clock + latency as u64);
+            self.channels[ch_idx].first_write_acked_at = Some(ack);
         }
     }
 

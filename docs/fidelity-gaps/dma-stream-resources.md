@@ -974,13 +974,19 @@ pattern distance -386 (start arm alone +4537). All 60 runs pass.
   *Model.* `HostMemory` keeps, per run, whether a shim S2MM BD's writes were acknowledged and the set of regions
   those BDs wrote (`WarmRegion`: the aligned block of `dma.shim_s2mm_warm_region_bytes` of the device address,
   with the buffer it lies in; `note_shim_s2mm_write_finished`, from `fire_host_completions`). A task's first
-  write (`note_host_write`) is cold, 1040, while no write has finished; warm, 165, when a finished write touched
-  the region of its first word; else cold with `dma.shim_s2mm_first_write_new_region_cycles` 632 (the median
+  write (`note_host_write`) is warm, 165, when a finished write touched the region of its first word; else, when
+  an earlier write of the same channel to that (buffer, region) is still outstanding (the region is being
+  warmed), it joins that write and finishes `dma.shim_s2mm_in_order_lag_cycles` 1 after it, or after its own last
+  word + 150 if that is later (silicon: 14 of the 18 probe pairs whose second task's words arrived before the
+  first write had finished; 2 in one, and 6, 555 and 629 in three, stay open); else cold, 1040, while no write has
+  finished, and cold with `dma.shim_s2mm_first_write_new_region_cycles` 632 once one has (the median
   FINISHED - first word of the probe's +64 KiB and other-buffer writes after a finished one, n = 6, 622..784; the
   +2 MiB writes, 869..1078, are higher and not modelled). A BD that finishes warms every region it wrote. A task
   that ends after the channel's previous one finishes no earlier than `dma.shim_s2mm_in_order_lag_cycles` 1 after
-  it (`retire_bd_at`); a warm or new-region task whose words arrive while an earlier cold task of its channel is
-  outstanding is the case that shows it. A new hw_context starts a new run (`begin_run`, from
+  it (`retire_bd_at`); a warm or new-region task of another region whose words arrive while an earlier cold task
+  of its channel is outstanding is the case that shows it. A write to another region or buffer behind an
+  outstanding write does not join it and keeps its own latency. Cross-channel pairs are not modelled (the
+  probe's pairs are one channel). A new hw_context starts a new run (`begin_run`, from
   `reset_for_new_context`), and a run's later dispatches share it (unmeasured: three corpus tests dispatch more
   than once). Tests: `the_runs_first_shim_s2mm_write_is_cold_and_later_channel_first_tasks_on_other_columns_are_warm`,
   `two_shim_s2mm_tasks_writing_before_any_write_has_finished_are_both_cold`,
@@ -988,7 +994,11 @@ pattern distance -386 (start arm alone +4537). All 60 runs pass.
   `a_write_to_another_buffer_is_cold_even_inside_the_same_address_block`,
   `a_finished_write_warms_every_region_it_wrote`,
   `a_write_that_never_finishes_and_a_new_run_leave_the_next_first_write_cold`,
-  `a_task_does_not_finish_before_the_previous_task_of_its_channel`.
+  `a_task_does_not_finish_before_the_previous_task_of_its_channel`,
+  `a_write_queued_behind_an_unfinished_write_to_its_region_finishes_one_cycle_after_it`,
+  `a_joined_write_whose_words_end_late_finishes_after_its_own_last_word`,
+  `a_write_to_another_region_behind_an_unfinished_write_keeps_its_own_cold_latency`,
+  `a_new_run_forgets_the_regions_being_warmed`.
   Open: the run's first write is bimodal on silicon (about 900 and about 2000 over the probe's 183 first writes,
   median 1775; nothing measured picks the mode; the corpus median 1040 is the low mode and stays); the cold value
   for a write 2 MiB away; the region size between 8 and 64 KiB (probe: the same pair at +8, +16, +32 and +48

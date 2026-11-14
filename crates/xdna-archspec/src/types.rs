@@ -1279,7 +1279,9 @@ pub struct DmaTiming {
     /// channel when it would otherwise come first or together: 1. Measured (same probe): a later
     /// write to the same region whose words arrive before the earlier write has finished finishes
     /// 1 cycle after it in 14 of 18 pairs, 2 in one, 6 / 555 / 629 in three. A later write never
-    /// completes before an earlier outstanding one. Cross-channel order was not measured.
+    /// completes before an earlier outstanding one, and a write to the region an earlier write of
+    /// its channel is still warming joins it (this lag after it, or after its own last word plus
+    /// `shim_s2mm_last_write_cycles` if later). Cross-channel order was not measured.
     pub shim_s2mm_in_order_lag_cycles: u16,
 
     /// Read latency of a shim MM2S host-memory read, in cycles: from the cycle
