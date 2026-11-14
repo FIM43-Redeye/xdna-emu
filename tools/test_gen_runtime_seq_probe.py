@@ -914,3 +914,84 @@ def test_9i_selectable_from_the_command_line():
     with contextlib.redirect_stdout(buf):
         assert g.main(["list", "--plan", "9i"]) == 0
     assert "w1_L10010_br" in buf.getvalue() and "w1_L6700_br" in buf.getvalue() and "k_a_L30000" in buf.getvalue()
+
+
+# -- probe 9j: write ops of N words between the two marks, no sync and no transfer between them ---------------
+
+BLOCK_NS_9J = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
+SEPARATE_NS_9J = (4, 16, 64)
+
+
+def case9j(name):
+    return g.plan_9j()[name]
+
+
+def test_plan_9j_has_the_control_the_baseline_and_both_write_forms_and_validates():
+    p = g.plan_9j()
+    want = {"w1_L3000_br", "wr_N0"} | {f"wr_blk_N{n}" for n in BLOCK_NS_9J} | {f"wr_sep_N{n}" for n in SEPARATE_NS_9J}
+    assert set(p) == want
+    assert next(iter(p)) == "w1_L3000_br"
+    for c in p.values():
+        g.validate(c)
+
+
+def test_9j_control_is_the_bracketed_control_of_the_earlier_probes():
+    assert case9j("w1_L3000_br").steps == g.plan_9i()["w1_L3000_br"].steps
+
+
+def _between_marks(c):
+    steps = list(c.steps)
+    a = next(i for i, s in enumerate(steps) if s == g.Mark("A"))
+    b = next(i for i, s in enumerate(steps) if s == g.Mark("B"))
+    assert a < b
+    return steps[a + 1:b]
+
+
+def test_9j_nothing_but_write_ops_lies_between_the_marks():
+    for name, c in g.plan_9j().items():
+        if name.startswith("wr_"):
+            for s in _between_marks(c):
+                assert isinstance(s, (g.BlockWrite, g.SingleWrites)), (name, s)
+
+
+def test_9j_block_form_is_one_op_of_n_words_and_separate_form_is_n_ops_of_one_word():
+    for n in BLOCK_NS_9J:
+        assert _between_marks(case9j(f"wr_blk_N{n}")) == [g.BlockWrite(n)]
+    for n in SEPARATE_NS_9J:
+        assert _between_marks(case9j(f"wr_sep_N{n}")) == [g.SingleWrites(n)]
+    assert _between_marks(case9j("wr_N0")) == []
+
+
+def test_9j_write_cases_share_everything_but_the_write_step():
+    base = [s for s in case9j("wr_N0").steps]
+    for name, c in g.plan_9j().items():
+        if name.startswith("wr_"):
+            assert [s for s in c.steps if not isinstance(s, (g.BlockWrite, g.SingleWrites))] == base
+            assert c.events == g.BRACKET_EVENTS
+
+
+def test_9j_the_target_is_a_tile_the_design_does_not_use_and_the_same_for_every_case():
+    assert (g.WRITE_TARGET_COL, g.WRITE_TARGET_ROW) not in {(0, 0), (1, 0)} and g.WRITE_TARGET_ROW >= 2
+    assert g.WRITE_TARGET_OFFSET + 4 * max(BLOCK_NS_9J) <= 0x10000
+    m = g.design_mlir(case9j("wr_blk_N8"))
+    assert m.count("aiex.npu.blockwrite") == 1 and "memref<8xi32>" in m
+    assert f"row = {g.WRITE_TARGET_ROW} : i32" in m and f"address = {g.WRITE_TARGET_OFFSET} : ui32" in m
+    sep = g.design_mlir(case9j("wr_sep_N4"))
+    assert "aiex.npu.blockwrite" not in sep
+    assert sep.count(f"{{column = {g.WRITE_TARGET_COL} : i32, row = {g.WRITE_TARGET_ROW} : i32}}") == 4
+    assert "aiex.npu.blockwrite" not in g.design_mlir(case9j("wr_N0"))
+
+
+def test_9j_a_mark_next_to_a_plain_filler_is_still_rejected():
+    c = case9j("wr_blk_N8")
+    steps = [g.Fill(4) if isinstance(s, g.BlockWrite) else s for s in c.steps]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(steps), c.events))
+
+
+def test_9j_selectable_from_the_command_line():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9j"]) == 0
+    assert "wr_blk_N64" in buf.getvalue() and "wr_sep_N16" in buf.getvalue()

@@ -104,6 +104,9 @@ EVENT_GENERATE = 0x34008
 # the trace start and stop use the ones of the egress shim (column 1), the traced shim (column 0) has them free.
 MARK_EVENTS = {"A": ("USER_EVENT_0", 126), "B": ("USER_EVENT_1", 127)}
 MARKED_COL, MARKED_ROW = 0, 0
+# Target of the write steps: the data memory of compute tile (1, 2) from its first word. The design places no core, buffer, lock or
+# transfer there, so nothing reads or writes it; the writes store zeros and the same words are the target of every case.
+WRITE_TARGET_COL, WRITE_TARGET_ROW, WRITE_TARGET_OFFSET = 1, 2, 0
 DEFAULT_EVENTS = tuple(f"DMA_{CHANNELS[ch][0]}_{CHANNELS[ch][1]}_{what}_TASK" for ch in EVENT_ORDER
                        for what in ("START", "FINISHED"))
 # Eight trace slots only: a bracketed case gives up the FINISHED events of the two token-less MM2S channels (their
@@ -136,6 +139,16 @@ class Sync:
 @dataclass(frozen=True)
 class Mark:
     which: str                       # "A": written just before a sync; "B": just after it
+
+
+@dataclass(frozen=True)
+class BlockWrite:
+    words: int                       # one block-write op of `words` words to the write target (between the marks)
+
+
+@dataclass(frozen=True)
+class SingleWrites:
+    count: int                       # `count` separate single-word write ops to consecutive words of the write target
 
 
 @dataclass(frozen=True)
@@ -381,6 +394,34 @@ def plan_9i() -> dict[str, Case]:
     return out
 
 
+# Probe 9j's grids: write ops between the two marks (no sync, no transfer between them)
+BLOCK_NS_9J = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
+SEPARATE_NS_9J = (4, 16, 64)
+
+
+def _write_case(name: str, between: list) -> Case:
+    """One 8-word loopback task, awaited before anything is marked; then mark A, the `between` steps, mark B; then the
+    marker round trip and the usual closing tail. Nothing but write steps lies between the marks, so A-B is the time the
+    sequence takes to issue them."""
+    steps: list = [Push("S1", MARKER_WORDS, True), Push("M0", PUSH_WORDS, False), Push("S0", PUSH_WORDS, True), Sync("S0"),
+                   Mark("A"), *between, Mark("B"), Push("M1", MARKER_WORDS, False), Sync("S1")]
+    steps += drain_syncs(steps) + closing_tail(4) + [Fill(TAIL_FILL)]
+    return Case(name, "W", tuple(steps), BRACKET_EVENTS)
+
+
+def plan_9j() -> dict[str, Case]:
+    """Probe 9j: the time between two marks while the sequence issues N words of writes to one target, as a single block
+    write (N = 1 .. 64) or as N separate single-word writes (N = 4, 16, 64), and with nothing between the marks (N = 0).
+    The first case is the positive control of the earlier probes (byte-identical stream)."""
+    cases = [_w_case("w1_L3000_br", 1, 3000, marks=True, events=BRACKET_EVENTS, tail_rounds=4), _write_case("wr_N0", [])]
+    cases += [_write_case(f"wr_blk_N{n}", [BlockWrite(n)]) for n in BLOCK_NS_9J]
+    cases += [_write_case(f"wr_sep_N{n}", [SingleWrites(n)]) for n in SEPARATE_NS_9J]
+    out = {c.name: c for c in cases}
+    if len(out) != len(cases):
+        raise ValueError("plan_9j: duplicate case names")
+    return out
+
+
 # -- layout and safety --------------------------------------------------------------------------------
 
 def pushes(case: Case) -> list[Push]:
@@ -453,9 +494,9 @@ def validate(case: Case) -> None:
     for i, s in enumerate(case.steps):
         if isinstance(s, Mark):
             want = (case.steps[i + 1:i + 2], "A") if s.which == "A" else (case.steps[i - 1:i], "B")
-            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], Sync)):
+            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], (Sync, BlockWrite, SingleWrites, Mark))):
                 raise ValueError(f"{case.name}: mark {s.which} at step {i} is not directly "
-                                 f"{'before' if s.which == 'A' else 'after'} a sync")
+                                 f"{'before' if s.which == 'A' else 'after'} a sync or a write step")
     marks = [s.which for s in case.steps if isinstance(s, Mark)]
     for which, (name, _) in MARK_EVENTS.items():
         if marks.count(which) and name not in case.events:
@@ -495,6 +536,9 @@ def design_mlir(case: Case) -> str:
         return consts[v]
 
     body: list[str] = []
+    globals_: dict[int, str] = {}
+    wr_consts: set[int] = set()
+    n_bw = 0
     lay = iter(layout(case))
     ident = {"S": 0, "M": 0}
     next_bd = iter(range(0, 16))
@@ -502,6 +546,18 @@ def design_mlir(case: Case) -> str:
     for s in case.steps:
         if isinstance(s, Fill):
             body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count
+        elif isinstance(s, BlockWrite):
+            globals_.setdefault(s.words, f"bw{s.words}")
+            body.append(f"      %bwd{n_bw} = memref.get_global @bw{s.words} : memref<{s.words}xi32>")
+            body.append(f"      aiex.npu.blockwrite(%bwd{n_bw}) {{address = {WRITE_TARGET_OFFSET} : ui32, "
+                        f"column = {WRITE_TARGET_COL} : i32, row = {WRITE_TARGET_ROW} : i32}} : memref<{s.words}xi32>")
+            n_bw += 1
+        elif isinstance(s, SingleWrites):
+            for k in range(s.count):
+                addr = WRITE_TARGET_OFFSET + 4 * k
+                wr_consts.add(addr)
+                body.append(f"      aiex.npu.write32(%c_wr{addr}, %c_zero) "
+                            f"{{column = {WRITE_TARGET_COL} : i32, row = {WRITE_TARGET_ROW} : i32}} : i32, i32")
         elif isinstance(s, Mark):
             body.append(f"      aiex.npu.write32(%c_evgen, %c_mark_{s.which}) "
                         f"{{column = {MARKED_COL} : i32, row = {MARKED_ROW} : i32}} : i32, i32")
@@ -518,6 +574,9 @@ def design_mlir(case: Case) -> str:
     events = list(case.events)
     nl = "\n"
     const_lines = [f"      {name} = arith.constant {v} : i64" for v, name in sorted(consts.items())]
+    global_lines = "".join(f'    memref.global "private" constant @bw{n} : memref<{n}xi32> = dense<[{", ".join(["0"] * n)}]>\n'
+                           for n in sorted(globals_))
+    wr_lines = "".join(f"      %c_wr{a} = arith.constant {a} : i32\n" for a in sorted(wr_consts))
     mark_consts = (f"      %c_evgen = arith.constant {EVENT_GENERATE} : i32\n" +
                    "".join(f"      %c_mark_{w} = arith.constant {v} : i32\n" for w, (_, v) in MARK_EVENTS.items())
                    if has_marks else "")
@@ -537,12 +596,12 @@ def design_mlir(case: Case) -> str:
       aie.trace.start broadcast = 15
       aie.trace.stop broadcast = 14
     }}
-    aie.runtime_sequence(%buf: {m}) {{
+{global_lines}    aie.runtime_sequence(%buf: {m}) {{
       aie.trace.host_config {{buffer_size = 65536 : i32, egress_shim_col = 1 : i32}}
       aie.trace.start_config @trace_shim
       %c_reg = arith.constant {SCRATCH_REG} : i32
       %c_zero = arith.constant 0 : i32
-{mark_consts}{nl.join(const_lines)}
+{mark_consts}{wr_lines}{nl.join(const_lines)}
 {nl.join(body)}
     }}
   }}
@@ -869,7 +928,7 @@ def cmd_list(args) -> int:
 
 
 def _selected(args) -> list[Case]:
-    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i}.get(getattr(args, "plan", "base"), plan)()
+    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i, "9j": plan_9j}.get(getattr(args, "plan", "base"), plan)()
     names = args.only or list(table)
     return [table[n] for n in names]
 
@@ -944,21 +1003,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lst = sub.add_parser("list")
-    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i"), default="base")
+    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
     b = sub.add_parser("build")
-    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i"), default="base")
+    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
     b.add_argument("out_dir")
     b.add_argument("--only", nargs="*", default=[])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
-    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i"), default="base")
+    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
     r.add_argument("--backend", choices=("hw", "emu"), required=True)
     r.add_argument("--only", nargs="*", default=[])
     t = sub.add_parser("table")
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+")
-    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i"), default="base")
+    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j"), default="base")
     t.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
     return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)
