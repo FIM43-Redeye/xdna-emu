@@ -642,3 +642,83 @@ def test_tail_rounds_scale_the_tail_and_its_bd_ids():
     assert [s for s in c.steps if isinstance(s, g.Push) and s.tail][:4] == \
         [g.Push(ch, g.TAIL_WORDS, True, True) for ch in g.TAIL_ORDER]
     assert len(g.closing_tail(4)) == len(g.closing_tail(2)) * 2 and g.closing_tail() == g.closing_tail(g.TAIL_ROUNDS)
+
+
+# -- probe 9e: dense transfer-length sweep with marks, fill and dummy variants ---------------------------------
+
+SWEEP_9E = (600, 1000, 1500, 2000, 2500, 3500, 4000, 4500, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 15000, 20000)
+DUMMY_9E = (1000, 3000, 8000, 20000)
+TWINS_9E = (2000, 8000)
+
+
+def case9e(name):
+    return g.plan_9e()[name]
+
+
+def test_plan_9e_is_small_unique_valid_and_leaves_the_other_plans_alone():
+    p = g.plan_9e()
+    assert 20 <= len(p) <= 30
+    for c in p.values():
+        g.validate(c)
+    assert len(g.plan()) == 30 and len(g.plan_9d()) == 25
+
+
+def test_plan_9e_starts_with_the_positive_control_which_is_probe_9ds_bracketed_l3000():
+    p = g.plan_9e()
+    first = next(iter(p.values()))
+    assert first.name == "w1_L3000_br"
+    ref = g.plan_9d()["w1_L3000_br"]
+    assert first.steps == ref.steps and first.events == ref.events
+
+
+def test_plan_9e_has_every_requested_case():
+    names = set(g.plan_9e())
+    assert {f"w1_L{n}_br" for n in SWEEP_9E} <= names
+    assert {"w1_f16_L3000_br", "w1_f32_L3000_br"} <= names
+    assert {f"w2_dummy_L{n}_br" for n in DUMMY_9E} <= names
+    assert {f"w1_L{n}_tw" for n in TWINS_9E} == {n for n in names if n.endswith("_tw")}
+
+
+def test_every_9e_case_is_bracketed_or_a_twin_with_the_bracket_slots_and_four_tail_rounds():
+    for c in g.plan_9e().values():
+        assert c.events == g.BRACKET_EVENTS
+        assert sum(1 for p in g.pushes(c) if p.tail) == 16
+        assert any(isinstance(s, g.Mark) for s in c.steps) == c.name.endswith("_br")
+
+
+def test_9e_sweep_cases_are_one_pair_with_no_filler_and_the_requested_length():
+    for n in SWEEP_9E:
+        c = case9e(f"w1_L{n}_br")
+        meas = g.measured_pushes(c)
+        assert [p.words for p in meas if p.ch == "S0"] == [n]
+        assert not any(isinstance(s, g.Fill) and s.count != g.TAIL_FILL for s in c.steps)
+
+
+def test_9e_fill_cases_put_the_fillers_between_the_s0_push_and_the_first_mark():
+    for n in (16, 32):
+        steps = case9e(f"w1_f{n}_L3000_br").steps
+        i = next(k for k, s in enumerate(steps) if isinstance(s, g.Fill) and s.count == n)
+        assert isinstance(steps[i - 1], g.Push) and steps[i - 1].ch == "S0" and steps[i - 1].words == 3000
+        assert isinstance(steps[i + 1], g.Mark) and steps[i + 1].which == "A"
+
+
+def test_9e_dummy_cases_bracket_both_real_pairs_but_not_the_dummy_sync():
+    for n in DUMMY_9E:
+        c = case9e(f"w2_dummy_L{n}_br")
+        assert [p.words for p in g.measured_pushes(c) if p.ch == "S0" and not p.dummy] == [n, n]
+        syncs = [i for i, s in enumerate(c.steps) if isinstance(s, g.Sync)]
+        first_tail = next(i for i, s in enumerate(c.steps) if isinstance(s, g.Push) and s.tail)
+        meas = [i for i in syncs if i < first_tail]
+        assert not isinstance(c.steps[meas[0] - 1], g.Mark)           # the dummy's sync
+        assert all(isinstance(c.steps[i - 1], g.Mark) for i in meas[1:])
+        assert len(meas) == 4        # dummy, two pairs, final S1
+
+
+def test_9e_twins_are_their_bracketed_cases_without_the_marks():
+    for n in TWINS_9E:
+        br, tw = case9e(f"w1_L{n}_br"), case9e(f"w1_L{n}_tw")
+        assert tw.steps == tuple(s for s in br.steps if not isinstance(s, g.Mark))
+
+
+def test_9e_run_count_fits_four_calls_of_twenty():
+    assert 3 * len(g.plan_9e()) <= 80
