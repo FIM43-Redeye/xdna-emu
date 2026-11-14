@@ -312,3 +312,36 @@ def test_sequence_check_refuses_anything_else(code):
 def test_sequence_check_refuses_a_stream_that_does_not_parse_to_its_length():
     with pytest.raises(ValueError):
         g.check_sequence_is_plain_writes(txn(op(0, 24)) + bytes(4))
+
+
+def end_token(count: int) -> list[int]:
+    return [0xDC, (count >> 16) & 0x3, (count >> 8) & 0xFF, count & 0xFF]
+
+
+def test_a_packet_closed_by_the_end_token_is_dated_at_the_stop():
+    # A trace unit whose only frame is its Start sends nothing until the stop: the Start-only packet is closed
+    # by the end token (count = cycles from the last frame to the stop, minus one) and Skip padding. Its last
+    # byte is not a frame of the Start's cycle; the packet left at the stop.
+    stream = start(5000) + end_token(0x20EB3) + [0xFE] * 16
+    words = [w for p in packetize(stream, 0) for w in p]
+    done = g.completing_frames(g.split_packets(words))
+    assert done[0] == (5000 + 0x20EB3 + 1, "End")
+
+
+def test_a_data_packet_keeps_its_date_and_the_flushed_tail_takes_the_stop():
+    stream, times = synthetic_stream([56])
+    tail = single0(0, 1) * 3 + [0xFE] + end_token(40) + [0xFE] * 20      # three events, Skip to align, end
+    words = [w for p in packetize(stream + tail, 0) for w in p]
+    done = g.completing_frames(g.split_packets(words))
+    assert [done[i][0] for i in range(2)] == times
+    assert done[2] == (times[-1] + 3 * 2 + 40 + 1, "End")
+
+
+def test_alignment_skip_that_ends_a_packet_before_the_end_token_belongs_to_the_stop():
+    # The end token starts on a 4-byte boundary: the Skip bytes before it are written at the stop too, so a
+    # packet they complete left at the stop.
+    stream = start(7000) + single0(0, 1) * 19 + [0xFE] + end_token(9) + [0xFE] * 24
+    words = [w for p in packetize(stream, 0) for w in p]
+    done = g.completing_frames(g.split_packets(words))
+    assert done[0] == (7000 + 19 * 2 + 9 + 1, "End")
+    assert done[1] == (7000 + 19 * 2 + 9 + 1, "End")

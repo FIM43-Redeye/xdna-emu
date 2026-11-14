@@ -280,6 +280,10 @@ def frame_len(b: int) -> int:
     return 1                                         # Repeat0, Skip, Sync
 
 
+END_TOKEN = 0xDC                     # end-of-stream token: opcode, then an 18-bit count (trace_unit::END_TOKEN_*)
+SKIP = 0xFE
+
+
 def produces_command(b: int) -> bool:
     """False for the filler frames the decoder drops (Skip, DC)."""
     return b != 0xFE and (b & 0xFC) != 0xDC
@@ -328,7 +332,13 @@ def completing_frames(packets: list[dict], pkt_type: int = PT_CORE) -> dict[int,
     given source type, in that tile's own timeline.
 
     Walks the tile's frames in the decoder's timer convention: a Start sets the timer, an event
-    frame advances it by 1 + its cycle delta. The cycle delta is read from the frame bytes."""
+    frame advances it by 1 + its cycle delta. The cycle delta is read from the frame bytes.
+
+    The end token (0xDC + an 18-bit count: cycles from the last frame to the stop, minus one) moves
+    the timer to the stop, and the Skip padding after it keeps that date: a packet closed by the
+    end token was sent at the stop, not when its last frame happened. A trace unit's first packet
+    holding only its Start frame is such a packet (the unit sends a packet only when 28 bytes are
+    filled, or at the stop); dated by its Start it would look like traffic at trace start."""
     from trace_decoder.modes import mode0
     done: dict[int, tuple[int, str]] = {}
     stream, owner = [], []
@@ -337,7 +347,7 @@ def completing_frames(packets: list[dict], pkt_type: int = PT_CORE) -> dict[int,
             stream += p["bytes"]
             owner += [p["order"]] * len(p["bytes"])
     cmds = list(mode0.decode(stream))
-    pos, timer, ci = 0, 0, 0
+    pos, timer, ci, ended = 0, 0, 0, False
     while pos < len(stream):
         b = stream[pos]
         n = frame_len(b)
@@ -352,12 +362,25 @@ def completing_frames(packets: list[dict], pkt_type: int = PT_CORE) -> dict[int,
                 timer += 1 + cmd.cycles
             elif hasattr(cmd, "count"):
                 timer += cmd.count
+        elif (b & 0xFC) == END_TOKEN and pos + 3 < len(stream):
+            timer += (((stream[pos + 1] & 0x3) << 16) | (stream[pos + 2] << 8) | stream[pos + 3]) + 1
+            ended = True
         end = pos + n - 1
         for k in range(pos, min(end, len(stream) - 1) + 1):
             if k + 1 == len(stream) or owner[k + 1] != owner[k]:
                 # the frame holding a packet's last byte; '*' marks one that runs into the next packet
-                done[owner[k]] = (timer, frame_type(b) + ("*" if end > k else ""))
+                kind = "End" if ended and b in (SKIP, END_TOKEN) or (b & 0xFC) == END_TOKEN else frame_type(b)
+                done[owner[k]] = (timer, kind + ("*" if end > k else ""))
         pos += n
+    # Skip bytes that only align the end token are written at the stop as well: a packet they complete
+    # takes the end token's date.
+    for k in range(len(stream) - 1):
+        if stream[k] == SKIP and owner[k + 1] != owner[k]:
+            j = k + 1
+            while j < len(stream) and stream[j] == SKIP:
+                j += 1
+            if j < len(stream) and (stream[j] & 0xFC) == END_TOKEN and owner[j] in done:
+                done[owner[k]] = done[owner[j]]
     return done
 
 
