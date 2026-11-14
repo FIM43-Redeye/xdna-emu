@@ -581,10 +581,16 @@ impl DmaEngine {
     /// low, and so does a BD whose words have all arrived. It ends with the lock grant, after
     /// which the transfer's own starvation (`prev_starving`) takes over unchanged.
     ///
-    /// Not measured, so not asserted: shim channels (bridge-calibrated separately), a BD
-    /// reached after the first of a task, a BD with no lock, an idle channel.
+    /// A shim S2MM takes the same arming delay from its start hold instead
+    /// (`settle_shim_start_starvation`).
+    ///
+    /// Not measured, so not asserted: a tile S2MM's BD reached after the first of a task, a
+    /// tile BD with no lock, an idle channel.
     pub fn settle_stream_starvation(&mut self) {
         if self.tile_kind.is_shim() {
+            for ch in 0..self.s2mm_count {
+                self.settle_shim_start_starvation(ch);
+            }
             return;
         }
         for ch in 0..self.s2mm_count {
@@ -598,6 +604,55 @@ impl DmaEngine {
                 self.trace(EventType::DmaStreamStarvation { channel: ch as u8, active: high });
             }
         }
+    }
+
+    /// STREAM_STARVATION of a shim S2MM in its start hold (BD setup, lock acquire, memory
+    /// latency and the fitted host-memory start cost, `consume_first_bd_bonus`), before the
+    /// transfer runs.
+    ///
+    /// Silicon (bridge corpus, every sample of add_maskwrite, core_dmas_dma_configure_task_lock,
+    /// runtime_cumsum, objectfifo_repeat_compute_repeat and _init_values_repeat): with no word
+    /// waiting the level rises at START_TASK + 6, the arming delay of a lock-stalled tile S2MM
+    /// (`DMA_S2MM_STARVATION_ARM_CYCLES`), on the first task and on every later one. The channel's
+    /// stream side is live from then on while its memory side is still held; the level is low in
+    /// every cycle a beat is on offer, and once the BD's words have all been accepted. On its
+    /// first cycle the transfer takes the level over as its own (`prev_starving`,
+    /// `step_transferring_cycle`), so a stretch that spans the hand-over is one level.
+    fn settle_shim_start_starvation(&mut self, ch: usize) {
+        let was = self.channels[ch].lock_wait_starving;
+        match self.start_hold_wants_beat(ch) {
+            Some(wants) => {
+                let high = wants && !self.s2mm_beat_offered[ch];
+                self.channels[ch].lock_wait_starving = high;
+                if high != was {
+                    self.trace(EventType::DmaStreamStarvation { channel: ch as u8, active: high });
+                }
+            }
+            // The transfer takes a held level over in its first cycle; any other state ends it.
+            None if was && !matches!(self.channels[ch].fsm, ChannelFsm::Transferring { .. }) => {
+                self.channels[ch].lock_wait_starving = false;
+                self.trace(EventType::DmaStreamStarvation { channel: ch as u8, active: false });
+            }
+            None => {}
+        }
+    }
+
+    /// `Some(wants)` while shim S2MM channel `ch` is in a start-hold state: `wants` when the arming
+    /// delay has passed and the BD in the hold still wants words. `None` in any other state.
+    fn start_hold_wants_beat(&self, ch: usize) -> Option<bool> {
+        let c = &self.channels[ch];
+        let transfer = match &c.fsm {
+            ChannelFsm::BdSetup { transfer, .. }
+            | ChannelFsm::AcquiringLock { transfer, .. }
+            | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::HostPipelineLatency { transfer, .. } => transfer,
+            _ => return None,
+        };
+        Some(
+            self.current_cycle >= c.lock_wait_starve_from
+                && c.accept_bd == Some(transfer.bd_index)
+                && c.accept_words_remaining > 0,
+        )
     }
 
     /// A compute S2MM's granule writer runs (`compute_s2mm_cycle`) and its stream side starves

@@ -821,6 +821,55 @@ finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterati
   - *Not measured.* Where the 4 cycles from ingress to write sit, why silicon pulses STREAM_STARVATION at G + 2, a
     write queue deeper refusal, the memtile and shim S2MM.
 
+## Shim S2MM stream starvation from its start hold (modelled 2026-11-14, NPU1 silicon)
+
+Silicon (bridge corpus, three captures of each test, both compilers): a shim S2MM task started with no word
+waiting raises `DMA_S2MM_0_STREAM_STARVATION` at START_TASK + 6 in every sample of every test that shows the
+case (add_maskwrite, core_dmas/dma_configure_task_lock, runtime_cumsum, objectfifo_repeat compute_repeat and
+init_values_repeat; levels of 192 to 2374 cycles until the first word), the arming delay of a lock-stalled
+tile S2MM (`DMA_S2MM_STARVATION_ARM_CYCLES`). The trace carrier (S2MM 1) is the same case: its task is pushed
+before the trace start, so its first frame is the starved level at once.
+
+The emulator's shim S2MM only reached `Transferring` 531 cycles after START_TASK on a channel's first task
+(bd setup 4 + channel start 2 + memory latency 5 + `dma.shim_per_task_overhead_s2mm_cycles` 179 +
+`dma.shim_ddr_cold_start_s2mm_cycles` 341), 190 on later ones, and raised starvation only from there. The
+179 / 341 were fitted in May 2026 to K = 1 / K = 4 shim S2MM START-to-FINISHED durations, i.e. as one lump in
+front of the transfer. Silicon shows the stream side live from + 6 while that time has not passed, so the lump
+is not a stream-side delay. Where it does sit is not pinned: add_maskwrite's first word arrives at + 198 and
+FINISHED_TASK follows at + 1191 / + 2164 / + 2268, so most of it plausibly comes after the data (host write
+completion, with the jitter of the DDR path), but no row separates a cost before the first write from one
+after the last.
+
+**Model.** The shim S2MM's stream side follows the tile rule from START_TASK + 6 while its memory side is in the
+start hold (BdSetup, AcquiringLock, MemoryLatency, HostPipelineLatency): the level is high in every cycle in which
+the BD still wants words and no beat is on offer at the channel's master port, low when one is (taken into the
+ingress or refused by a full one). The running transfer takes the level over without an edge
+(`DmaEngine::settle_shim_start_starvation`, `step_transferring_cycle`). The ingress was already open in the
+hold, so no word moves differently and every FINISHED_TASK is unchanged.
+
+**Result** (trace gate, 17 test variants, both compilers where built, against master): add_maskwrite S2MM 0 0 -> 1 against 1 (onset
++ 6, 161 cycles against silicon's 192..195); dynamic_conditional_passthrough.8_0 carrier 0 -> 1 against 1; the
+carriers' first frame is the starved level at Start + 1 as on silicon; the onset is + 6 in core_dmas lock,
+runtime_cumsum and objectfifo_repeat too, whose counts stay outside silicon's band for the reasons below.
+
+**Still open.**
+- *Words already waiting.* Silicon then gives one 1-cycle pulse at START_TASK + 14 (memtile_dmas
+  dma_configure_task_runtime_len / _token, every later runtime_cumsum task: a memtile source, two switches on
+  the path), a second at + 23 (core_dmas/dma_configure_task_token, packet_flow_same_id_merge_3way: compute
+  sources, three switches), and a 3-cycle pulse at + 14 on multi_source_packet_flow (two packet-switched
+  sources merged). Inferred, not pinned: the words parked in each switch on the path (8, slave 4 + master 4)
+  drain from + 6 and each further switch restarts one cycle late after the backpressure releases (spacing
+  9 = 8 words + 1); the packet merge adds arbitration. The emulator drains the parked path without a bubble.
+  Settling probe: a shim S2MM task started after its source MM2S has filled the path and parked, sources one,
+  two and three switches away (memtile, compute rows 2 and 3) and source BD lengths below and above the path
+  capacity (4, 8, 12, 16, 32 words), circuit and packet routes, tracing the shim S2MM starvation and
+  `PORT_RUNNING` on every master of the path.
+- *Where the fitted start cost belongs* (above): a shim S2MM probe with the first word arriving at swept
+  offsets after START_TASK (0 .. 1000) and the FINISHED_TASK of each.
+- core_dmas/dma_configure_task_lock: the emulator's runtime sequence starts the shim task 1086 cycles after the
+  compute MM2S (silicon: a few hundred), so the data is already waiting and the level never rises: the
+  interpreter backend's sequence timing.
+
 ## Open timing rows (silicon vs emulator, 2026-11-12)
 
 Silicon rows are the probe runs of the read-bandwidth section above (two runs of each case) and the trace and

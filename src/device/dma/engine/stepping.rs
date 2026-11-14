@@ -1569,6 +1569,11 @@ impl DmaEngine {
         neighbors: &mut NeighborTiles<'_>,
         host_memory: &mut HostMemory,
     ) -> ChannelFsm {
+        // A shim S2MM's start-hold starvation (`settle_shim_start_starvation`) continues as the
+        // transfer's own level: one level across the hand-over, no edge.
+        if self.tile_kind.is_shim() && std::mem::take(&mut self.channels[ch_idx].lock_wait_starving) {
+            self.channels[ch_idx].prev_starving = true;
+        }
         let result = self.do_transfer_cycle(ch_idx, mem_denied, &mut transfer, tile, neighbors, host_memory);
         // A shim MM2S's stream-side level is driven by its read-ahead drain
         // (`drain_read_ahead`); its read side stalling on a full window is not

@@ -430,9 +430,10 @@ pub struct ChannelContext {
     /// pending.
     pub prev_lock_stalled: bool,
 
-    /// STREAM_STARVATION held level of a tile S2MM waiting on the lock of its task's first BD
-    /// (`DmaEngine::settle_stream_starvation`). Separate from `prev_starving`, which belongs to
-    /// the running transfer and gates the swap-enable release watch.
+    /// STREAM_STARVATION held level of a tile S2MM waiting on the lock of its task's first BD,
+    /// or of a shim S2MM in its start hold (`DmaEngine::settle_stream_starvation`). Separate from
+    /// `prev_starving`, which belongs to the running transfer and gates the swap-enable release
+    /// watch (a shim channel hands its level to `prev_starving` when the transfer starts).
     pub lock_wait_starving: bool,
 
     /// First cycle at which that level may rise: the cycle `start_channel` ran plus the arming

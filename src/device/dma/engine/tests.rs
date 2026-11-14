@@ -4955,14 +4955,52 @@ fn lock_wait_starvation_ends_when_the_lock_is_granted() {
     assert!(rig.levels.iter().skip(29).all(|&h| h), "one level, no dip at the hand-over");
 }
 
+/// Start shim S2MM channel 0 on a lock-free host-memory BD of `words` words in the current cycle.
+fn start_shim_host_bd(rig: &mut StarvationRig, words: u32) {
+    rig.eng.configure_bd(0, BdConfig::simple_1d(0x400, words * 4)).unwrap();
+    rig.eng.set_current_cycle(rig.cycle);
+    rig.eng.start_channel(0, 0).unwrap();
+    rig.first_cycle = rig.cycle;
+}
+
+/// Silicon (bridge corpus, every sample of add_maskwrite, core_dmas_dma_configure_task_lock,
+/// runtime_cumsum and objectfifo_repeat_*): a shim S2MM started with no word waiting raises
+/// STREAM_STARVATION at START_TASK + 6, the same arming delay as a lock-stalled tile S2MM, and
+/// holds it until the first word arrives. The channel's memory side is still in its start
+/// hold then (the fitted DDR start cost); its stream side is not.
+#[test]
+fn shim_s2mm_raises_starvation_six_cycles_after_start_while_no_word_is_waiting() {
+    let mut rig = StarvationRig::shim();
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(700, |at| at >= 30);
+    assert_eq!(rig.high_runs(), vec![(ARM, 29)], "high from +6 until the first beat, then low");
+    assert_eq!(rig.eng.channels[0].fsm.phase_name(), "Idle", "the BD completed");
+}
+
+/// Words already waiting when the task starts: no starvation from the start hold (silicon has
+/// a 1-cycle pulse at START + 14, and a second at + 23 on some routes, not modelled).
+#[test]
+fn shim_s2mm_with_words_waiting_does_not_starve_in_its_start_hold() {
+    let mut rig = StarvationRig::shim();
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(700, |_| true);
+    assert!(rig.high_runs().is_empty());
+}
+
+/// No word for longer than the start hold: one level, from + 6, across the hand-over to the
+/// running transfer's own starvation. The transfer's level falls in the cycle after the first
+/// beat is offered (it reads its ingress before the routing pass delivers the word), one cycle
+/// later than the start hold's, which sees the offer itself.
+#[test]
+fn shim_s2mm_start_starvation_hands_over_to_the_transfer_without_a_dip() {
+    let mut rig = StarvationRig::shim();
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(800, |at| at >= 700);
+    assert_eq!(rig.high_runs(), vec![(ARM, 700)]);
+}
+
 #[test]
 fn lock_wait_starvation_is_not_raised_where_silicon_is_unmeasured() {
-    // Shim S2MM: bridge-calibrated, not part of the tile probes.
-    let mut shim = StarvationRig::shim();
-    shim.start(16);
-    shim.run(40, |_| false);
-    assert!(shim.high_runs().is_empty(), "shim S2MM starvation is unchanged");
-
     // A BD with no lock to wait on is the running state, not the lock-stalled one.
     let mut rig = StarvationRig::compute();
     rig.eng.configure_bd(0, BdConfig::simple_1d(0x400, 64)).unwrap();
