@@ -13,6 +13,10 @@
 //! Each constant names the array-cycle value it was measured as at the
 //! default clocks (600 / 1028 MHz) and how it was measured.
 //!
+//! A task-complete token that arrives while the controller is executing
+//! operations (not waiting in a sync) is serviced once, at the next
+//! operation boundary, at [`TOKEN_SERVICE`].
+//!
 //! A sync's cost is not an operation-class cost: it is decided in one place,
 //! `NpuExecutor::sync_charge`, from the sync's issue time and the arrival of
 //! the token it awaits.
@@ -52,6 +56,12 @@ pub const DDR_PATCH: u64 = SHIM_BD_WITH_PATCH - BLOCK_WRITE;
 /// 125 controller cycles = 214.17 array cycles.
 pub const MASK_POLL: u64 = 125;
 
+/// Servicing one task-complete token that arrives while the controller is
+/// executing operations (not waiting in a sync): about 2300 array cycles on
+/// silicon (probe: a task's FINISHED to the next push). 1342 controller
+/// cycles = 2299.3 array cycles.
+pub const TOKEN_SERVICE: u64 = 1342;
+
 /// Operation-class costs of the runtime-sequence controller, in controller
 /// cycles, and the clock pair that converts them to array cycles.
 #[derive(Debug, Clone)]
@@ -61,6 +71,7 @@ pub struct CycleCostModel {
     pub block_write: u64,
     pub ddr_patch: u64,
     pub mask_poll: u64,
+    pub token_service: u64,
     pub clocks: ClockPair,
 }
 
@@ -73,6 +84,7 @@ impl CycleCostModel {
             block_write: BLOCK_WRITE,
             ddr_patch: DDR_PATCH,
             mask_poll: MASK_POLL,
+            token_service: TOKEN_SERVICE,
             clocks,
         }
     }
@@ -125,6 +137,7 @@ mod tests {
             ("shim BD + patch", SHIM_BD_WITH_PATCH, 584.15, 0.5),
             ("block write (provisional)", BLOCK_WRITE, 450.0, 1.0),
             ("mask-poll (provisional)", MASK_POLL, 215.0, 1.0),
+            ("token service", TOKEN_SERVICE, 2300.0, 1.0),
         ] {
             let a = mean_array_cost(c, 600);
             assert!((a - silicon).abs() < tol, "{name}: {a} array cycles against {silicon}");

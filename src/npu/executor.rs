@@ -118,8 +118,8 @@ pub(crate) enum ExecutorState {
         remaining: u32,
     },
     /// The controller is busy with an operation it has issued (its class
-    /// cost, `CycleCostModel::cost_of`); the next operation issues when
-    /// this drains.
+    /// cost, `CycleCostModel::cost_of`) or with servicing task-complete
+    /// tokens; the next operation issues when this drains.
     RetiringInstruction {
         /// Index of the NEXT instruction to issue once retire completes.
         next_index: usize,
@@ -204,6 +204,10 @@ pub struct NpuExecutor {
     /// Converts controller-cycle costs to array cycles, carrying the fraction
     /// across operations so a run of operations does not drift.
     to_array: crate::timebase::FirmwareToArray,
+    /// Task-complete tokens issued array-wide as of the last time the
+    /// controller looked (`None` until the sequence's first operation). The
+    /// tokens issued since are the ones it has not yet serviced.
+    tokens_seen: Option<u64>,
     /// Whether the firmware mailbox setup cost has been charged for this
     /// runtime sequence yet. Per-batch model: pay once on the first sync
     /// (~8000 cyc when enabled), then pipeline subsequent syncs at just
@@ -227,6 +231,7 @@ impl NpuExecutor {
             instructions: Vec::new(),
             cycle_model: super::CycleCostModel::default(),
             to_array: crate::timebase::FirmwareToArray::new(super::CycleCostModel::default().clocks),
+            tokens_seen: None,
             mailbox_charged: false,
             npu_cycle: 0,
         }
@@ -495,6 +500,7 @@ impl NpuExecutor {
         // starts fresh.
         self.npu_cycle = 0;
         self.to_array = crate::timebase::FirmwareToArray::new(self.cycle_model.clocks);
+        self.tokens_seen = None;
         // A runtime sequence waits only on its own Syncs; a runlist's
         // previous command's must not gate (or "stall") this one.
         self.pending_syncs.clear();
@@ -557,6 +563,20 @@ impl NpuExecutor {
                 if next_index >= self.instructions.len() {
                     self.state = ExecutorState::Done;
                     return AdvanceResult::Done;
+                }
+
+                // Operation boundary: tokens that arrived while the controller
+                // executed the previous operations are serviced before the next
+                // one issues.
+                let due = self.unserviced_tokens(device);
+                if due > 0 {
+                    let cycles = self.to_array.array_cycles(due * self.cycle_model.token_service);
+                    log::debug!("NPU controller services {due} task-complete token(s): {cycles} cycles");
+                    if cycles > 1 {
+                        self.state =
+                            ExecutorState::RetiringInstruction { next_index, cycles_remaining: cycles - 1 };
+                        return AdvanceResult::Blocked;
+                    }
                 }
 
                 let instr = self.instructions[next_index].clone();
@@ -649,6 +669,9 @@ impl NpuExecutor {
 
                 if satisfied {
                     log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
+                    // Tokens that arrived during the wait are covered by the
+                    // sync's own cost, not serviced one by one.
+                    self.absorb_tokens(device);
                     let charge = self.sync_charge(sync_index, issued_at, self.npu_cycle);
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: charge };
                     AdvanceResult::Progressed
@@ -685,6 +708,7 @@ impl NpuExecutor {
                 // we burn the mailbox-roundtrip cycles before the next
                 // host-side instruction can dispatch.
                 if remaining <= 1 {
+                    self.absorb_tokens(device);
                     self.state = ExecutorState::Executing { next_index };
                 } else {
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: remaining - 1 };
@@ -718,6 +742,20 @@ impl NpuExecutor {
         } else {
             ExecutorState::Executing { next_index }
         };
+    }
+
+    /// Tokens issued since the controller last looked, which it now services.
+    /// The first look of a sequence only records the count.
+    fn unserviced_tokens(&mut self, device: &DeviceState) -> u64 {
+        let total = device.array.task_tokens_issued();
+        let due = self.tokens_seen.map_or(0, |seen| total.saturating_sub(seen));
+        self.tokens_seen = Some(total);
+        due
+    }
+
+    /// Mark every token issued so far as covered (by a sync's wait).
+    fn absorb_tokens(&mut self, device: &DeviceState) {
+        self.tokens_seen = Some(device.array.task_tokens_issued());
     }
 
     /// Array cycles a resolved sync holds the controller after its awaited
@@ -2203,8 +2241,10 @@ mod tests {
         let mut host_mem = HostMemory::new();
         executor.try_advance(&mut device, &mut host_mem);
         assert_eq!(executor.npu_cycle, 1, "one array cycle per advance call");
+        executor.tokens_seen = Some(7);
         executor.load_instructions(Vec::new());
         assert_eq!(executor.npu_cycle, 0);
+        assert_eq!(executor.tokens_seen, None, "a new sequence starts with nothing to service");
     }
 
     // -----------------------------------------------------------------
@@ -2363,5 +2403,86 @@ mod tests {
             let gap = (issued[i] - issued[i - 1]) as f64;
             assert!((gap - 104.85).abs() <= 1.0, "push {i} landed {gap} cycles after push {}", i - 1);
         }
+    }
+
+    /// Issue a token on shim (1,0) S2MM 0 at executor cycle `at` while the stream
+    /// runs, and return the issue cycles.
+    fn issue_cycles_with_token_at(stream: Vec<NpuInstruction>, at: u64) -> Vec<u64> {
+        let (mut device, mut host_mem) = pacing_device();
+        let mut executor = NpuExecutor::new();
+        executor.load_instructions(stream);
+        let mut issued = Vec::new();
+        let mut last_count = 0;
+        for _ in 0..2_000_000 {
+            if executor.npu_cycle == at {
+                device.array.dma_engine_mut(1, 0).unwrap().issue_task_token(0, 0);
+            }
+            let r = executor.try_advance(&mut device, &mut host_mem);
+            if executor.executed_count() > last_count {
+                last_count = executor.executed_count();
+                issued.push(executor.npu_cycle);
+            }
+            if matches!(r, AdvanceResult::Done) {
+                return issued;
+            }
+        }
+        panic!("stream did not finish");
+    }
+
+    /// A task-complete token that arrives while the controller executes operations
+    /// costs about 2300 array cycles once, at the next operation boundary (silicon:
+    /// FINISHED to the next push).
+    #[test]
+    fn a_token_arriving_during_execution_is_serviced_once_at_the_next_boundary() {
+        let stream: Vec<NpuInstruction> = (0..12).map(|_| scratch_write()).collect();
+        let plain = issue_cycles_with_token_at(stream.clone(), u64::MAX);
+        let with = issue_cycles_with_token_at(stream, plain[3] + 10);
+        // Ops issued before the token are unaffected.
+        assert_eq!(&with[..4], &plain[..4]);
+        // The next boundary carries the service, and only it.
+        let delay = (with[4] - plain[4]) as f64;
+        assert!((delay - 2300.0).abs() <= 1.0, "token service {delay}");
+        for i in 5..12 {
+            assert_eq!(with[i] - with[i - 1], plain[i] - plain[i - 1], "op {i}: serviced once");
+        }
+    }
+
+    /// A token that arrives while the controller waits in a sync is not serviced
+    /// separately: the sync's own cost covers it.
+    #[test]
+    fn a_token_arriving_during_a_sync_wait_costs_nothing_extra() {
+        // Wait on (1,0) S2MM 0; its token arrives at cycle 500. A second token, for
+        // S2MM 1, arrives during the same wait.
+        let sync =
+            NpuInstruction::Sync { channel: 0, column: 0, direction: 0, column_num: 1, row: 0, row_num: 1 };
+        let stream = vec![scratch_write(), sync, scratch_write(), scratch_write(), scratch_write()];
+        let run = |extra: bool| {
+            let (mut device, mut host_mem) = pacing_device();
+            let mut executor = NpuExecutor::new();
+            executor.load_instructions(stream.clone());
+            // Past the one-time first-sync charge, whose size another test varies
+            // through the environment.
+            executor.mailbox_charged = true;
+            let mut issued = Vec::new();
+            let mut last_count = 0;
+            for _ in 0..200_000 {
+                if executor.npu_cycle == 400 && extra {
+                    device.array.dma_engine_mut(1, 0).unwrap().issue_task_token(1, 0);
+                }
+                if executor.npu_cycle == 500 {
+                    device.array.dma_engine_mut(1, 0).unwrap().issue_task_token(0, 0);
+                }
+                let r = executor.try_advance(&mut device, &mut host_mem);
+                if executor.executed_count() > last_count {
+                    last_count = executor.executed_count();
+                    issued.push(executor.npu_cycle);
+                }
+                if matches!(r, AdvanceResult::Done) {
+                    return issued;
+                }
+            }
+            panic!("stream did not finish");
+        };
+        assert_eq!(run(true), run(false), "a token absorbed by the wait adds no service time");
     }
 }

@@ -371,12 +371,14 @@ impl Token {
 pub struct TokenState {
     /// Tokens issued but not yet consumed, in issue order.
     pending: VecDeque<Token>,
+    /// Tokens issued since creation; not cleared by `reset`.
+    issued_total: u64,
 }
 
 impl TokenState {
     /// Create a new token state with no pending tokens.
     pub fn new() -> Self {
-        Self { pending: VecDeque::new() }
+        Self { pending: VecDeque::new(), issued_total: 0 }
     }
 
     /// Issue a completion token.
@@ -384,6 +386,12 @@ impl TokenState {
     /// Called when a task completes and its Enable_Token_Issue flag was set.
     pub fn issue(&mut self, channel_id: u8, controller_id: u8) {
         self.pending.push_back(Token::new(channel_id, controller_id));
+        self.issued_total += 1;
+    }
+
+    /// Tokens issued since creation, consumed or not (survives `reset`).
+    pub fn issued_total(&self) -> u64 {
+        self.issued_total
     }
 
     /// Consume the oldest pending token.

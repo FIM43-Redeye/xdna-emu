@@ -18,6 +18,11 @@ impl TileArray {
         }
     }
 
+    /// Task-complete tokens issued by every DMA engine of the array so far.
+    pub fn task_tokens_issued(&self) -> u64 {
+        self.dma_engines.iter().map(|e| e.task_tokens_issued()).sum()
+    }
+
     /// Get the mutable DMA engine for a tile.
     ///
     /// Returns None if coordinates are out of bounds.

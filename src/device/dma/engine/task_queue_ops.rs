@@ -295,4 +295,10 @@ impl DmaEngine {
     pub fn task_token_count(&self) -> usize {
         self.task_tokens.pending_count()
     }
+
+    /// Task-complete tokens this engine has issued over its lifetime (never
+    /// reset): the controller compares it against what it has serviced.
+    pub fn task_tokens_issued(&self) -> u64 {
+        self.task_tokens.issued_total()
+    }
 }
