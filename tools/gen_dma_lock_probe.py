@@ -3556,6 +3556,162 @@ def cmd_mr_packets(args) -> int:
     return 1 if bad else 0
 
 
+# -- sw: the sl design with mr's compute-only waker ----------------------------------------------------------
+#
+# mr found one restart cycle per quiet switch on a parked feed's path, the compute switch's included. The sl design
+# (an own-tile loopback MM2S 0 -> S2MM 0 parked on lock A) has its compute switch quiet before the release on
+# silicon too, yet the emulator matched it with no charge. Either sl's numbers contain the compute switch's cycle
+# (it sits on the S2MM's pull from its own switch), or that cycle sits on a word crossing in from a neighbour, which
+# sl has none of. This family runs sl's slf12 unchanged plus mr's compute-only waker (compute MM2S 1 -> S2MM 1, 16
+# words, started by lock W) ending T cycles before the release, which keeps the compute switch awake for T < 128:
+# pull-side charge -> sl's finish, backpressure fall and starvation one cycle earlier for T < 128; crossing-side ->
+# no change at any T. `swnone` releases W only after the measured BD (the same design and core, the waker out of
+# the window): the in-run baseline. The design is the same for every case; only the core's program differs.
+# Hardware builds trace sl's events only (the waker untraced, as mr); --trace-waker builds trace the waker's
+# S2MM 1 finish in place of the memory-backpressure slot to fix SW_D_OFFSET on the emulator.
+
+SW_TS = (16, 64, 96, 200, 400)
+SW_D_OFFSET = 14                   # emulator calibration: D = T + 14 puts the waker's S2MM 1 finish T before G
+SW_FILL_RELEASES = 48              # sl's 16 left one memory-module packet after the deciding frames; 48 leave several
+
+
+@dataclass(frozen=True)
+class SwCase:
+    t: int | None                  # None: the baseline, the waker after the measured BD
+
+    @property
+    def name(self) -> str:
+        return "swnone" if self.t is None else f"swc{self.t:03d}"
+
+
+def sw_plan() -> list[SwCase]:
+    return [SwCase(None)] + [SwCase(t) for t in SW_TS]
+
+
+def sw_delay_nops(c: SwCase) -> int:
+    return 0 if c.t is None else c.t + SW_D_OFFSET
+
+
+def sw_core_asm(c: SwCase) -> str:
+    n = lp.nops
+    rel_w = [f"  rel #{OWN + MR_LOCK_W}, r2"]
+    fill = []
+    for i in range(SW_FILL_RELEASES):
+        fill += [*lp.delay_loop(20, f".Lfill{i}"), f"  rel #{OWN + FETCH_LOCK_A}, r2"]
+    before = [*rel_w, *n(sw_delay_nops(c))] if c.t is not None else []
+    after_b = rel_w if c.t is None else []
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2),
+            f"  acq #{OWN + FETCH_LOCK_GO}, r3", *n(4),
+            *lp.delay_loop(FETCH_SETTLE_ITERS, ".Lsettle"), *n(8), *before,
+            "  event #0", *n(SL_LOAD_D), f"  rel #{OWN + FETCH_LOCK_A}, r2", *n(8),
+            f"  acq #{OWN + FETCH_LOCK_B}, r3", *n(8), *after_b,
+            f"  acq #{OWN + MR_LOCK_WD}, r3", *n(4), f"  acq #{OWN + MR_LOCK_CD}, r3", *n(4), *fill,
+            *lp.delay_loop(RING_TAIL_ITERS, ".Ltail")]
+    return lp.frame(body)
+
+
+def sw_design_mlir(c: SwCase) -> str:
+    t = sl_design_mlir(SlCase(False, SL_LOAD_D))
+    ww = MR_WAKE_WORDS
+    src = ", ".join(str(0x0A000000 | j) for j in range(ww))
+    decl = (f"    %wsrc = aie.buffer(%t02) {{address = {MR_WSRC_ADDR} : i32, sym_name = \"wsrc\", initial_value = "
+            f"dense<[{src}]> : tensor<{ww}xi32>}} : memref<{ww}xi32>\n"
+            f"    %wdst = aie.buffer(%t02) {{address = {MR_WDST_ADDR} : i32, sym_name = \"wdst\"}} : memref<{ww}xi32>\n"
+            f"    %lW = aie.lock(%t02, {MR_LOCK_W}) {{init = 0 : i32, sym_name = \"lW\"}}\n"
+            f"    %lWd = aie.lock(%t02, {MR_LOCK_WD}) {{init = 0 : i32, sym_name = \"lWd\"}}\n"
+            f"    %lCt = aie.lock(%t02, {MR_LOCK_CT}) {{init = 1 : i32, sym_name = \"lCt\"}}\n"
+            f"    %lCd = aie.lock(%t02, {MR_LOCK_CD}) {{init = 0 : i32, sym_name = \"lCd\"}}\n"
+            f"    aie.flow(%t02, DMA : 1, %t02, DMA : 1)\n")
+    waker = (f"    ^ws:\n      %w1 = aie.dma_start(MM2S, 1, ^w0, ^wr)\n    ^w0:\n      %cw = arith.constant 1 : i32\n"
+             f"      aie.use_lock(%lW, AcquireGreaterEqual, %cw)\n      aie.dma_bd(%wsrc : memref<{ww}xi32>)\n"
+             f"      aie.use_lock(%lWd, Release, %cw)\n      aie.next_bd ^end\n"
+             f"    ^wr:\n      %w2 = aie.dma_start(S2MM, 1, ^wr0, ^end)\n    ^wr0:\n      %cc = arith.constant 1 : i32\n"
+             f"      aie.use_lock(%lCt, AcquireGreaterEqual, %cc)\n      aie.dma_bd(%wdst : memref<{ww}xi32>)\n"
+             f"      aie.use_lock(%lCd, Release, %cc)\n      aie.next_bd ^end\n")
+    flow = "    aie.flow(%t02, DMA : 0, %t02, DMA : 0)\n"
+    start = "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)"
+    end = "    ^end:\n      aie.end\n    }\n    aie.runtime_sequence"
+    assert t.count(flow) == 1 and t.count(start) == 1 and t.count(end) == 1
+    t = t.replace(flow, decl + flow).replace(start, start.replace("^end)", "^ws)"))
+    return t.replace(end, waker + end)
+
+
+def sw_inject_args(trace_waker: bool) -> list[str]:
+    ev = [e if not (trace_waker and e == "DMA_S2MM_0_MEMORY_BACKPRESSURE") else "DMA_S2MM_1_FINISHED_BD"
+          for e in SL_MEMMOD_EVENTS]
+    return ["--memmod-sweep-events", ",".join(ev), "--core-grounding", FETCH_CORE_GROUNDING,
+            "--core-sweep-events", ",".join(SL_CORE_EVENTS)]
+
+
+def sw_selection(args) -> list[SwCase]:
+    return [c for c in sw_plan() if not args.names or c.name in args.names]
+
+
+def sw_build_case(c: SwCase, out: Path, trace_waker: bool = False) -> None:
+    d = out / c.name
+    d.mkdir(parents=True, exist_ok=True)
+    lp.assemble(sw_core_asm(c), d / "core.o", "k_core")
+    (d / "base.mlir").write_text(sw_design_mlir(c))
+    lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+           "--out", "aie.mlir", "--trace-mode", "event_time", *sw_inject_args(trace_waker),
+           "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+           "--config-src-mlir", "base.mlir", "--buffer-size", "65536"], cwd=d, log=d / "inject.log")
+    lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+           "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+          cwd=d, log=d / "aiecc.log")
+    (d / "case.json").write_text(json.dumps({"case": c.name, "t": c.t, "sw": True, "trace_waker": trace_waker,
+                                             "delay_nops": sw_delay_nops(c), "fill_words": 0,
+                                             "buffer_words": 4}) + "\n")
+
+
+def cmd_sw_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sw_selection(args):
+        sw_build_case(c, out, args.trace_waker)
+        print("built", c.name)
+    return 0
+
+
+def cmd_sw_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in sw_selection(args):
+        if not (out / c.name / "aie.xclbin").exists():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cmd_sw_table(args) -> int:
+    """sl's table (release, grant, finish, backpressure fall, starvation, conflicts, finish check) per run, plus
+    the waker's S2MM 1 finish relative to the grant in calibration builds."""
+    out = Path(args.out_dir).resolve()
+    rows = []
+    lines = []
+    for c in sw_selection(args):
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not (run_dir / "trace_raw.bin").exists():
+                continue
+            ev = load_level_events(run_dir)
+            r = sl_row(ev)
+            r["check"] = [m for m in sl_missing(r, SlCase(False, SL_LOAD_D)) if not m.startswith("core did not")]
+            if r.get("releases") not in (None, 1 + SW_FILL_RELEASES):
+                r["check"].append(f"core did not reach its end (LOCK_0_REL x{r['releases']}, want {1 + SW_FILL_RELEASES})")
+            rows.append((SlCase(False, SL_LOAD_D), f"{c.name}/{run}", r))
+            if r.get("grant") is not None:
+                G = r["release"] + r["grant"]
+                wf = sorted(e.ts for e in ev if e.row == FETCH_ROW and e.pkt_type == PT_MEM
+                            and e.name == "DMA_S2MM_1_FINISHED_BD")
+                if wf:
+                    lines.append(f"{c.name} {run}: waker S2MM 1 FINISHED_BD at G - {G - wf[0]}")
+    print(format_sl_table(rows).replace("slf12        ", "             "))
+    if lines:
+        print("\n".join(lines))
+    return 0
+
+
 # -- refused-access probe (refuse-*): a lock BD after a BD whose accesses a core camp refused -------------
 #
 # Does the grant phase of a lock BD depend on what happened to the BD before it? Chained task on MM2S 0:
@@ -3970,7 +4126,17 @@ def build_parser() -> argparse.ArgumentParser:
     rp2 = sub.add_parser("mr-packets", help="mq round 2: each unit's deciding frames against its last packet")
     rp2.add_argument("out_dir")
     rp2.add_argument("runs", nargs="+")
-    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp, rb2, rr2, rt2, rp2):
+    wb = sub.add_parser("sw-build", help="sl plus the compute-only waker: build the plan's cases (or --names)")
+    wb.add_argument("out_dir")
+    wb.add_argument("--trace-waker", action="store_true", help="calibration build (emulator only)")
+    wr = sub.add_parser("sw-run", help="sl plus the compute-only waker: run the built cases to TAG.BACKEND/")
+    wr.add_argument("out_dir")
+    wr.add_argument("tag")
+    wr.add_argument("--backend", choices=("hw", "emu"), required=True)
+    wt = sub.add_parser("sw-table", help="sl plus the compute-only waker: sl's table per run")
+    wt.add_argument("out_dir")
+    wt.add_argument("runs", nargs="+")
+    for sp in (ab, ar, at, rb, rr, rt, xb, xr, xt, sb, sr, st, mb, mr, mtb, mp, rb2, rr2, rt2, rp2, wb, wr, wt):
         sp.add_argument("--names", nargs="*", default=[], help="only these case names")
     return ap
 
@@ -3982,6 +4148,8 @@ def main(argv=None) -> int:
         return CHAIN_COMMANDS[args.cmd](args)
     if args.cmd.startswith("sl-"):
         return {"sl-build": cmd_sl_build, "sl-run": cmd_sl_run, "sl-table": cmd_sl_table}[args.cmd](args)
+    if args.cmd.startswith("sw-"):
+        return {"sw-build": cmd_sw_build, "sw-run": cmd_sw_run, "sw-table": cmd_sw_table}[args.cmd](args)
     if args.cmd.startswith("mr-"):
         return {"mr-build": cmd_mr_build, "mr-run": cmd_mr_run, "mr-table": cmd_mr_table,
                 "mr-packets": cmd_mr_packets}[args.cmd](args)

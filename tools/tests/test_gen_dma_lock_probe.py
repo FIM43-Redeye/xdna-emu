@@ -2099,3 +2099,35 @@ def test_mr_row_splits_the_memtile_quiet_into_data_and_trace_and_dates_the_waker
     r = g.mr_row(e)
     assert r["w_rel"] == 4000 and r["w_grant"] == 3 and r["w_fin"] == 4030 - (5000 + 3)
     assert r["quiet_data"] == 48 and r["quiet_trace"] == 199 - (200 - 393) - 1
+
+
+# -- sw: the sl design with mr's compute-only waker (where does the compute switch's restart cycle sit?) ------
+
+def test_sw_plan_is_the_baseline_and_the_five_quiet_stretches():
+    names = [c.name for c in g.sw_plan()]
+    assert names == ["swnone"] + [f"swc{t:03d}" for t in g.SW_TS] and g.SW_TS == (16, 64, 96, 200, 400)
+
+
+def test_sw_core_releases_w_d_nops_before_a_or_after_b_for_the_baseline():
+    c = g.SwCase(96)
+    body = bundles_of(g.sw_core_asm(c))
+    rw = body.index(f"rel #{g.OWN + g.MR_LOCK_W}, r2")
+    ra = [i for i, b in enumerate(body) if b == f"rel #{g.OWN + g.FETCH_LOCK_A}, r2"][0]
+    assert body.index("event #0") == rw + g.sw_delay_nops(c) + 1 and ra == body.index("event #0") + g.SL_LOAD_D + 1
+    base = bundles_of(g.sw_core_asm(g.SwCase(None)))
+    b = base.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+    assert base.index(f"rel #{g.OWN + g.MR_LOCK_W}, r2") > b                   # the waker runs after the measured BD
+    for t in (base, body):
+        assert t.index(f"acq #{g.OWN + g.MR_LOCK_CD}, r3") > t.index(f"acq #{g.OWN + g.FETCH_LOCK_B}, r3")
+        assert t.count(f"rel #{g.OWN + g.FETCH_LOCK_A}, r2") == 1 + g.SW_FILL_RELEASES
+
+
+def test_sw_design_is_sl_plus_the_compute_local_waker():
+    t = g.sw_design_mlir(g.SwCase(64))
+    sl = g.sl_design_mlir(g.SlCase(False, g.SL_LOAD_D))
+    assert "aie.flow(%t02, DMA : 0, %t02, DMA : 0)" in t and "aie.flow(%t02, DMA : 1, %t02, DMA : 1)" in t
+    assert "aie.use_lock(%lW, AcquireGreaterEqual" in t and "aie.use_lock(%lCd, Release" in t
+    for line in sl.splitlines():
+        if "aie.dma_bd" in line or "aie.use_lock" in line or "aie.flow" in line:
+            assert line in t                                              # sl's own design untouched
+    assert g.sw_design_mlir(g.SwCase(None)) == t                             # only the core differs between cases
