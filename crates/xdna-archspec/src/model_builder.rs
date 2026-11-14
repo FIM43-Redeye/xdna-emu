@@ -215,7 +215,7 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // them (bridge corpus 2026-11, see the `DmaTiming` fields). These replace the
             // 2026-05-27 per-task 179 and cold-start 341, which were charged before the first
             // word and fitted to START -> FINISHED durations of tasks whose words were waiting.
-            shim_s2mm_first_write_cold_cycles: 620,
+            shim_s2mm_first_write_cold_cycles: 1040,
             shim_s2mm_first_write_cycles: 165,
             shim_s2mm_last_write_cycles: 150,
             // Shim MM2S read-ahead (NPU1 shim-inflight probe, 2026-11-07). See

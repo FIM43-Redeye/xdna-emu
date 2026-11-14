@@ -790,7 +790,7 @@ fn test_shim_ddr_timing_decomposition() {
     // state simultaneously.
     assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 1330);
     // Shim S2MM: no start cost; the host write latencies after its words (bridge corpus 2026-11).
-    assert_eq!(cfg.shim_s2mm_first_write_cold_cycles, 620);
+    assert_eq!(cfg.shim_s2mm_first_write_cold_cycles, 1040);
     assert_eq!(cfg.shim_s2mm_first_write_cycles, 165);
     assert_eq!(cfg.shim_s2mm_last_write_cycles, 150);
     // The MM2S 325 is now the shim read latency, charged between each read
@@ -5023,15 +5023,15 @@ fn finished_rel(rig: &StarvationRig) -> Vec<u64> {
     rig.finished_task_at.iter().map(|c| c - rig.first_cycle).collect()
 }
 
-/// Cold, short, words waiting (silicon: dmabd_task_queue, runtime_cumsum's first task, the
-/// 1-word sync_task_complete_token tasks: FINISHED 526..1012 after the first word, typically
-/// about 620; the cold write dominates a short task).
+/// Cold, short, words waiting (silicon: the first tasks of dmabd_task_queue, runtime_cumsum,
+/// sync_task_complete_token and 26 more finish 547..2715 after their first word by test, median
+/// 1040; the cold write dominates a short task).
 #[test]
 fn shim_s2mm_first_task_finishes_its_cold_first_write_after_its_first_word() {
     let mut rig = StarvationRig::shim();
     let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
     start_shim_host_bd(&mut rig, 16);
-    rig.run(1000, |_| true);
+    rig.run(cold + 400, |_| true);
     assert_eq!(finished_rel(&rig), vec![ARM + cold]);
 }
 
@@ -5055,7 +5055,7 @@ fn shim_s2mm_idle_first_task_counts_its_cold_write_from_the_first_word() {
     let mut rig = StarvationRig::shim();
     let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
     start_shim_host_bd(&mut rig, 16);
-    rig.run(1200, |at| at >= 300);
+    rig.run(cold + 700, |at| at >= 300);
     // The word offered at + 300 is taken from the ingress at + 301.
     assert_eq!(finished_rel(&rig), vec![301 + cold]);
 }
@@ -5067,8 +5067,9 @@ fn shim_s2mm_idle_first_task_counts_its_cold_write_from_the_first_word() {
 fn shim_s2mm_later_task_finishes_warm_after_its_words() {
     for words in [1u32, 16] {
         let mut rig = StarvationRig::shim();
+        let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
         start_shim_host_bd(&mut rig, words);
-        rig.run(1000, |_| true);
+        rig.run(cold + 400, |_| true);
         assert_eq!(rig.finished_task_at.len(), 1, "the first, cold task finished");
         start_shim_host_bd(&mut rig, words);
         rig.finished_task_at.clear();
@@ -5093,7 +5094,8 @@ fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     rig.eng.set_current_cycle(rig.cycle);
     rig.eng.start_channel(0, 1).unwrap();
     let second = rig.cycle;
-    rig.run(1000, |_| true);
+    let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
+    rig.run(cold + 400, |_| true);
     assert_eq!(rig.accepted, 32);
     let master_fifo = rig.eng.input_fifo_capacity() as u64;
     let taken: Vec<u64> = rig.accepted_at[16..].iter().map(|c| c - second).collect();
@@ -5119,7 +5121,8 @@ fn shim_s2mm_with_only_writes_outstanding_is_not_started() {
     // sequence polling the status does not see it done before its writes are acknowledged.
     let running = &crate::device::regdb::device_reg_layout().memory_status.channel_running;
     assert!(running.extract_bool(rig.eng.get_channel_status(0)), "running until FINISHED_TASK");
-    rig.run(1000, |_| false);
+    let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
+    rig.run(cold + 400, |_| false);
     assert_eq!(rig.finished_task_at.len(), 1);
     assert!(!running.extract_bool(rig.eng.get_channel_status(0)), "idle once it has finished");
 }

@@ -123,9 +123,9 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.shim_ddr_cold_start_mm2s_cycles", SHIM_2C, "Fitted, not first-principles; the DDR read path is bimodal on silicon."),
         measured("dma.shim_per_task_overhead_mm2s_cycles", SHIM_2C, "Fitted 325, re-read 2026-11-07 as the shim read \
             latency (dma.shim_mm2s_read_latency_cycles); 0 so it is not counted twice."),
-        measured("dma.shim_s2mm_first_write_cold_cycles", "NPU1 bridge corpus 2026-11 (three samples a test): short \
-            first tasks finish 526..1012 after their first word, the most repeatable 610..640", "Representative of a \
-            jittery, test-dependent host latency; what makes a first write cold is not determined."),
+        measured("dma.shim_s2mm_first_write_cold_cycles", "NPU1 bridge corpus 2026-11 (three samples a test): the \
+            median FINISHED - first word of the 29 first tasks it sets (547..2715 by test)", "A typical value of a \
+            test-dependent host latency; what sets it, and what makes a first write cold, is not determined."),
         measured("dma.shim_s2mm_first_write_cycles", "NPU1 bridge corpus 2026-11: warm 1-word and 16-word tasks with their \
             words waiting finish at START_TASK + 171 / 172 (first word at + 6)", ""),
         measured("dma.shim_s2mm_last_write_cycles", "NPU1 bridge corpus 2026-11: runtime_cumsum's warm 16-word tasks, last \

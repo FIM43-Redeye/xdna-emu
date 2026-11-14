@@ -840,7 +840,7 @@ of broadcast skew):
   they carry 1 word (sync_task_complete_token) or 16 (runtime_cumsum). A channel's long first task finishes
   156..169 after its last word (1024 and 4096 words). A short first task finishes 526..1012 after its first
   word, however late that word comes (dmabd_task_queue: first word 916..5289 after START, FINISHED 543..1009
-  after it), the most repeatable tests about 610..640.
+  after it); how long depends on the test (median 1040 over 29 such first tasks, 547..2715).
 
 So the stream side takes words from START_TASK + 6, one a cycle, and the host write path sits after the data.
 The emulator had put it in front: a channel's first task waited 531 cycles before its transfer (bd setup 4 +
@@ -853,7 +853,7 @@ late finished a few cycles after them instead of a write latency later.
 ingress, open at START_TASK + 6 (the S2MM arming delay, `lock_wait_starve_from`), and it takes a word every
 cycle one is on offer. Each BD retires the cycle its last word is in, with its completion (lock release,
 FINISHED_BD, FINISHED_TASK, TCT token) queued for when its writes are acknowledged, `retire_written_bd`: the
-later of the task's first word + `dma.shim_s2mm_first_write_cold_cycles` 620 (the channel's first task of the
+later of the task's first word + `dma.shim_s2mm_first_write_cold_cycles` 1040 (the channel's first task of the
 session) or `dma.shim_s2mm_first_write_cycles` 165, and the BD's last word + `dma.shim_s2mm_last_write_cycles`
 150. Completions leave in order; the channel takes the next BD's or task's words meanwhile, as the shim MM2S
 read side does. These three replace `dma.shim_per_task_overhead_s2mm_cycles`, `dma.shim_ddr_cold_start_s2mm_cycles`
@@ -866,8 +866,9 @@ now only covers a lock-parked first BD.
 - *What makes a first write cold.* Some first tasks are warm on silicon (add_one_ctrl_packet_4_cores and
   _col_overlay channel 0, 128..162 after the first word, all samples; their channel 1 cold in half the samples).
   The emulator takes the channel's first task of the session; a destination-page translation that an earlier
-  access warmed would fit, untested. The cold latency itself spreads 526..1012 (and add_maskwrite 990..2358);
-  620 is representative, not a law.
+  access warmed would fit, untested. The cold latency itself depends on the test: the median FINISHED - first
+  word of the 29 first tasks it sets spreads 547..2715 (608..748 for the 1- and 9-word tasks of
+  sync_task_complete_token, _bd_chaining and dmabd_task_queue; add_maskwrite about 1980); 1040 is that median.
 - *Long transfers* finish 6..18 cycles later after their last word than the 150 (156..169).
 - *Back-to-back tasks.* No corpus test starts a shim S2MM task within a write latency of the previous one's last
   word, so taking words while writes are outstanding, and in-order completion, are not measured for S2MM.

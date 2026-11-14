@@ -1216,23 +1216,24 @@ pub struct DmaTiming {
     /// 249 cyc.  See finding 2026-05-25-shim-bd-chain-amortization.
     pub shim_per_task_overhead_mm2s_cycles: u16,
     /// Cycles from a shim S2MM task's first word to its FINISHED_TASK at the earliest, on a
-    /// channel's first task of the session (the cold host write): 620. The task finishes at
+    /// channel's first task of the session (the cold host write): 1040. The task finishes at
     /// the later of this and `shim_s2mm_last_write_cycles` after its last word; the words
     /// themselves stream in from START_TASK + 6, one a cycle, with nothing of the host write
     /// path in front of them.
     ///
     /// Measured (NPU1 bridge corpus, 2026-11-10 / 11 samples, three per test, Start-aligned trace
-    /// clocks): a short first task finishes 526..1012 cycles after its first word
-    /// (dmabd_task_queue 543 / 547 / 551 / 748 / 786 / 1009, runtime_cumsum 526 / 812 / 817), the
-    /// most repeatable tests about 610..640 (nd_memcpy_transforms, vec_chain_state_probe,
-    /// sync_task_complete_token_bd_chaining's 1-word task); 620 is taken from those. It is counted
-    /// from the first word, not from START_TASK: dmabd_task_queue's first word comes 916..5289
-    /// after its START and the task still finishes this long after the word. Not determined:
-    /// what selects a cold first write. Some first tasks are warm on silicon
-    /// (add_one_ctrl_packet_4_cores' and _col_overlay's channel 0, 128..162), some samples of
-    /// one test cold and others warm; the emulator takes the channel's first task of the session.
-    /// A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words: 1180..1199 after
-    /// the first word, its last write's latency after the last).
+    /// clocks): it is counted from the first word, not from START_TASK (dmabd_task_queue's first
+    /// word comes 916..5289 after its START, and the task finishes 543..1009 after the word). How
+    /// long it is depends on the test: 547..2715 over the median FINISHED - first word of the 29
+    /// first tasks this latency sets (the low end in the 1-word and 9-word tasks of
+    /// sync_task_complete_token, _bd_chaining and dmabd_task_queue, 608..748; add_maskwrite
+    /// 1965..1997; multi_source_packet_flow 1187 / 2715). 1040 is that median: a typical value,
+    /// not a law. Not determined: what sets the length, and what makes a first write cold at
+    /// all. Some first tasks are warm on silicon (add_one_ctrl_packet_4_cores' and
+    /// _col_overlay's channel 0, 128..162 after the first word in every sample), some samples
+    /// of one test cold and others warm; the emulator takes the channel's first task of the
+    /// session. A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words:
+    /// 1180..1199 after the first word, its last write's latency after the last).
     pub shim_s2mm_first_write_cold_cycles: u16,
     /// Cycles from a later (warm) shim S2MM task's first word to its FINISHED_TASK at the
     /// earliest: 165. Measured (NPU1 bridge corpus, 2026-11): with the words waiting, so the first
