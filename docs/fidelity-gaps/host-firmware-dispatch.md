@@ -88,6 +88,22 @@ interpreter backend's per-op costs or the cross-tile timer offset make up the re
 confirmable by reading Performance_Counter2 back over control packets. Bridge verdicts identical
 (chess 90 / peano 116 pass, 1 XFAIL each) and trace verdicts identical per test.
 
+**ACTIVE_CORE on an ended core (closed 2026-11-14).** ACTIVE_CORE is low on a core that has run to
+`done`, and on a core held in reset. Silicon: PERF_CNT_2 (started by ACTIVE_CORE) is 0 in every
+sample on the run-once cores that end before the trace is configured (multi_source_packet_flow
+(0,2) (0,3), packet_flow_same_id_merge_3way (0,3) (0,4), static_L1_init (0,3), both compilers),
+and on local_reset_core it first ticks 987 cycles after the re-run core's first lock stall, i.e. it
+arms at the reset release and re-enable, not at the configuration. aie-rt measures core utilisation
+with the same pair (start ACTIVE_CORE, stop DISABLED_CORE). The emulator asserted it for every
+enabled core, ended or not, and ticked every 1025 cycles on those cores. It now requires the core
+enabled, out of reset and not halted (`active_core_is_low_once_the_core_has_ended`,
+`active_core_is_low_while_the_core_is_held_in_reset`,
+`active_core_rises_when_an_ended_core_is_reset_and_reenabled`). Trace gate on the four tests: the
+10 run-once rows 11..14 -> 0 against silicon's 0; local_reset_core 12 -> 1 against 4, its first tick
+995 cycles after the re-run's lock stall (silicon 987); the remaining count is the traced window
+after the re-run (runtime-sequence timing). No other row of the four tests moved. MODELLED. Not
+measured: whether an error-halted or debug-halted core asserts it (the emulator keeps it high).
+
 **Management-core access ring (2026-11-07).** The firmware interpreter's MMU used to translate every
 access at ring 0. It now follows the Xtensa ISA: the access ring is CRING (`PS.EXCM ? 0 : PS.RING`),
 L32E/S32E use PS.RING, instruction fetch and the fill fast path included, and the privileged

@@ -2073,14 +2073,19 @@ impl InterpreterEngine {
                 if core_clocked {
                     tile.core_timer.tick();
 
-                    // ACTIVE_CORE is asserted while the core is enabled, whether it executes
-                    // or stalls (silicon: a counter configured from the runtime sequence arms
-                    // and counts inside a lock stall that began long before; see
-                    // `active_core_arms_a_counter_while_the_core_is_lock_stalled`).
+                    // ACTIVE_CORE is asserted while the core is enabled, out of reset and has
+                    // not ended, whether it executes or stalls (silicon: a counter configured
+                    // from the runtime sequence arms and counts inside a lock stall that began
+                    // long before, and never arms on a core that has run to `done`; see
+                    // `active_core_arms_a_counter_while_the_core_is_lock_stalled` and
+                    // `active_core_is_low_once_the_core_has_ended`). `enabled` is already
+                    // false in reset (Core_Control enable and not reset); a core reset
+                    // restarts the interpreter, so a re-enabled core is active again.
                     // handle_event() is idempotent: an already-Active counter stays Active;
                     // counters whose start event doesn't match are unaffected. Stop and reset
                     // events still take priority inside handle_event().
-                    let core_active = self.cores.get(i).map_or(false, |c| c.enabled);
+                    let core_active =
+                        self.cores.get(i).map_or(false, |c| c.enabled && !c.interpreter.is_halted());
                     tile.core_perf_counters.handle_event(TRUE_EVENT);
                     if core_active {
                         tile.core_perf_counters.handle_event(ACTIVE_CORE_EVENT);
@@ -4430,6 +4435,110 @@ mod tests {
         assert!(stalled.read_counter(0) >= 19, "counts every cycle of the stall");
         let disabled = &engine.device().array.tile(1, 3).core_perf_counters;
         assert!(!disabled.is_active(0), "a core that is not enabled is not active");
+    }
+
+    /// `done ; nop x 7`: the core ends on its first bundle.
+    const DONE_PROGRAM: [u8; 18] = [
+        0x19, 0x08, 0x00, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+        0x00,
+    ];
+
+    /// `mov r4, #-2 ; nop ; acq #63, r4 ; nop x 7`: waits on own lock 15 (count 0) forever.
+    const LOCK_WAIT_PROGRAM: [u8; 24] = [
+        0x99, 0xfe, 0x0f, 0x19, 0x01, 0x00, 0x19, 0x42, 0xe2, 0x17, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
+    ];
+
+    /// An engine with `DONE_PROGRAM` loaded on (1,2) and a lock-waiting core on (2,2) that
+    /// keeps the engine stepping once (1,2) has ended (the engine halts when every enabled
+    /// core has).
+    fn engine_with_ending_core() -> InterpreterEngine {
+        let mut engine = InterpreterEngine::new_npu1();
+        engine.ungate_all_for_test();
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &DONE_PROGRAM);
+        engine.device_mut().tile_mut(2, 2).unwrap().write_program(0, &LOCK_WAIT_PROGRAM);
+        engine.device_mut().write_tile_register(2, 2, 0x32000, 0x1);
+        engine
+    }
+
+    /// Arm-on-ACTIVE_CORE counter 0 on `(col, row)`, the way the trace's runtime sequence
+    /// configures PERF_CNT_2 (start event only, no stop).
+    fn arm_counter_on_active_core(engine: &mut InterpreterEngine, col: u8, row: u8) {
+        let tile = engine.device_mut().array.tile_mut(col, row);
+        tile.core_perf_counters.write_control_start_stop(0x1C, 0, 1, 7);
+        tile.core_perf_counters.write_event_value(0, u32::MAX);
+    }
+
+    /// A core that has ended (`done`) no longer asserts ACTIVE_CORE: on silicon a counter
+    /// started by it and configured after the core ended stays at 0 (bridge trace gate:
+    /// PERF_CNT_2 silent in every sample on the run-once cores of multi_source_packet_flow,
+    /// packet_flow_same_id_merge_3way and static_L1_init). aie-rt measures core utilisation
+    /// with exactly this pair, start ACTIVE_CORE / stop DISABLED_CORE.
+    #[test]
+    fn active_core_is_low_once_the_core_has_ended() {
+        let mut engine = engine_with_ending_core();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x1);
+        for _ in 0..30 {
+            engine.step();
+        }
+        assert_eq!(engine.core_status(1, 2), Some(CoreStatus::Halted), "the core has ended");
+        assert!(engine.is_core_enabled(1, 2), "Core_Control still reads enabled");
+        arm_counter_on_active_core(&mut engine, 1, 2);
+        arm_counter_on_active_core(&mut engine, 2, 2);
+        for _ in 0..20 {
+            engine.step();
+        }
+        assert!(engine.device().array.tile(2, 2).core_perf_counters.is_active(0), "the engine stepped");
+        let ended = &engine.device().array.tile(1, 2).core_perf_counters;
+        assert!(!ended.is_active(0), "an ended core does not arm the counter");
+        assert_eq!(ended.read_counter(0), 0);
+    }
+
+    /// A core held in reset does not assert ACTIVE_CORE, even with its enable bit set.
+    #[test]
+    fn active_core_is_low_while_the_core_is_held_in_reset() {
+        let mut engine = engine_with_ending_core();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x3); // enable + reset
+        arm_counter_on_active_core(&mut engine, 1, 2);
+        arm_counter_on_active_core(&mut engine, 2, 2);
+        for _ in 0..20 {
+            engine.step();
+        }
+        assert!(engine.device().array.tile(2, 2).core_perf_counters.is_active(0), "the engine stepped");
+        let held = &engine.device().array.tile(1, 2).core_perf_counters;
+        assert!(!held.is_active(0), "a core held in reset does not arm the counter");
+    }
+
+    /// An ended core that the runtime sequence resets, releases and re-enables runs again
+    /// and asserts ACTIVE_CORE from then on (silicon: local_reset_core's PERF_CNT_2 first
+    /// ticks one period after the reset release, not from the configuration).
+    #[test]
+    fn active_core_rises_when_an_ended_core_is_reset_and_reenabled() {
+        let mut engine = engine_with_ending_core();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x1);
+        for _ in 0..30 {
+            engine.step();
+        }
+        arm_counter_on_active_core(&mut engine, 1, 2);
+        for _ in 0..10 {
+            engine.step();
+        }
+        assert!(!engine.device().array.tile(1, 2).core_perf_counters.is_active(0));
+        // Reset (program memory survives a core reset; load the rerun's program), release,
+        // enable: the aie-rt XAie_CoreReset / XAie_CoreUnreset / XAie_CoreEnable sequence.
+        // The rerun holds on a lock, so the core stays active after the restart.
+        engine.device_mut().tile_mut(1, 2).unwrap().write_program(0, &LOCK_WAIT_PROGRAM);
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x3);
+        engine.step();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x0);
+        engine.step();
+        engine.device_mut().write_tile_register(1, 2, 0x32000, 0x1);
+        for _ in 0..20 {
+            engine.step();
+        }
+        let rerun = &engine.device().array.tile(1, 2).core_perf_counters;
+        assert!(rerun.is_active(0), "the re-enabled core arms the counter");
+        assert!(rerun.read_counter(0) >= 15);
     }
 
     /// A clock-gated module has no clock, so its performance counters must

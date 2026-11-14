@@ -18,8 +18,8 @@ Per-cycle in the coordinator
 
 1. Re-assert always-on level events at the top of each cycle:
    - `handle_event(TRUE_EVENT)` for every tile (always asserted).
-   - `handle_event(ACTIVE_CORE_EVENT)` only when the core executed an
-     instruction this cycle.
+   - `handle_event(ACTIVE_CORE_EVENT)` while the core is enabled, out of
+     reset and has not ended (`done`), executing or stalled.
 2. Call `tile.core_perf_counters.tick()` and `tile.mem_perf_counters.tick()`
    once. `tick()` advances every Active counter and returns the indices
    that crossed their threshold.
