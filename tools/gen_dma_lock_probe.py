@@ -1429,6 +1429,8 @@ class ChainCase:
     fill: int = 0                  # core releases of A after the tail (trace packet fillers; core releaser only)
     receiver: str = "own"          # "own": the loopback S2MM of tile (0,2); "north": the S2MM of tile (0,3)
     waker: str = ""                # "": none; "<row>": a loopback on (0, row) beating through the head; "<row>q": after it
+    memtile_ports: str = ""        # "": no memtile trace; else up to 4 BUNDLE:CHANNEL:master|slave ports of the memtile
+    #                                switch whose PORT_RUNNING its trace unit records (the memtile is declared for it)
 
     @property
     def name(self) -> str:
@@ -1445,6 +1447,8 @@ class ChainCase:
             d["receiver"] = self.receiver
         if self.waker:
             d["waker"] = self.waker
+        if self.memtile_ports:
+            d["memtile_ports"] = self.memtile_ports
         return d
 
     @property
@@ -1596,6 +1600,8 @@ def chain_design_mlir(c: ChainCase) -> str:
     remote = c.receiver != "own"
     s2mm_block = f"    ^recv_start:\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n{recv}"
     t03 = f"    {rx} = aie.tile(0, {rrow})\n" if remote else ""
+    if c.memtile_ports and c.receiver != "south":
+        t03 = "    %t01 = aie.tile(0, 1)\n" + t03
     wr = c.waker_row
     wk_decl = wk_set = ""
     if wr is not None:
@@ -1664,12 +1670,19 @@ def chain_design_mlir(c: ChainCase) -> str:
 """
 
 
-def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None, receiver: str = "own") -> list[str]:
+def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None, receiver: str = "own",
+                      memtile_ports: str = "") -> list[str]:
     out = ["--memmod-sweep-events", ",".join(edit_memmod_events(CHAIN_MEM_EVENTS, swap, add)),
            "--core-grounding", FETCH_CORE_GROUNDING,
            "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
     if receiver == "south":
         out += ["--memtile-sweep-events", ",".join(CHAIN_MEMTILE_EVENTS)]
+    elif memtile_ports:
+        ports = memtile_ports.split(",")
+        if not 1 <= len(ports) <= 4:
+            raise ValueError("memtile_ports: 1..4 ports")
+        out += ["--memtile-sweep-events", ",".join(f"PORT_RUNNING_{k}" for k in range(len(ports))),
+                "--port-slots", ",".join(f"{k}={p}" for k, p in enumerate(ports))]
     return out
 
 
@@ -1739,7 +1752,8 @@ def chain_selection(args) -> list:
     fill = getattr(args, "fill", 0) or 0
     receiver = getattr(args, "receiver", None) or "own"
     waker = getattr(args, "waker", None) or ""
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver, waker) for a, b in pairs]
+    mt = getattr(args, "memtile_ports", None) or ""
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver, waker, mt) for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1758,7 +1772,7 @@ def cmd_chain_build(args) -> int:
         (d / "base.mlir").write_text(chain_design_mlir(c))
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
                "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None),
-                                                                     c.receiver),
+                                                                     c.receiver, c.memtile_ports),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
               cwd=d, log=d / "inject.log")
@@ -1828,6 +1842,9 @@ def add_chain_parsers(sub) -> None:
         sp.add_argument("--waker", default="",
                         help="a loopback on tile (0, ROW) of a north route beating through the head: ROW, or ROWq "
                              "to run the same loopback after the measured chain (the quiet twin)")
+        sp.add_argument("--memtile-ports", default="",
+                        help="trace PORT_RUNNING of up to 4 memtile switch ports (BUNDLE:CH:master|slave,...); "
+                             "declares the memtile")
         sp.add_argument("--fill", type=int, default=0,
                         help="core releases of A after the tail: memory-module trace packet fillers (core releaser)")
 

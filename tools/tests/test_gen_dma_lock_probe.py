@@ -2301,3 +2301,19 @@ def test_cw_check_reads_the_source_loopback_on_row_2_and_labels_all_awake():
     v = g.cw_check(c, _cw_r(core02_stall_runs=go, s2mm1_fin_own=[-60], fins=list(g.CW_FINS_A)))
     assert (v["outcome"], v["t"]) == ("A", 60)
     assert g.cw_check(c, _cw_r(core02_stall_runs=go, s2mm1_fin_north=[-60]))["outcome"] == "INVALID"
+
+
+def test_chain_memtile_trace_declares_the_memtile_and_traces_its_trace_route_ports():
+    base = g.ChainCase(tuple(g.ChainBd(1) for _ in range(6)), 24, g.FETCH_WORDS, fill=48, receiver="north2",
+                       waker="3q")
+    traced = g.ChainCase(base.mids, 24, g.FETCH_WORDS, fill=48, receiver="north2", waker="3q",
+                         memtile_ports="North:1:slave,North:3:slave,South:1:master,South:3:master")
+    a, b = g.chain_design_mlir(base), g.chain_design_mlir(traced)
+    assert "aie.tile(0, 1)" not in a and "    %t01 = aie.tile(0, 1)\n" in b
+    assert b.replace("    %t01 = aie.tile(0, 1)\n", "") == a          # nothing else in the design changes
+    assert "memtile_ports" not in base.design() and traced.design()["memtile_ports"] == traced.memtile_ports
+    args = g.chain_inject_args(receiver="north2", memtile_ports=traced.memtile_ports)
+    i = args.index("--memtile-sweep-events")
+    assert args[i + 1] == ",".join(f"PORT_RUNNING_{k}" for k in range(4))
+    assert args[args.index("--port-slots") + 1] == "0=North:1:slave,1=North:3:slave,2=South:1:master,3=South:3:master"
+    assert "--memtile-sweep-events" not in g.chain_inject_args(receiver="north2")
