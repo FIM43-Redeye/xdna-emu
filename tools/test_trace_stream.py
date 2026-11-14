@@ -50,6 +50,14 @@ class TestBuild:
         res = ts.build(_raw((0, s[:72])), _sidecar((0x1000, SIZE, [(0, s)])))
         assert not res.ok and "whole 64-byte bursts" in res.message
 
+    def test_a_run_names_its_own_burst(self):
+        s = _stream(200)
+        side = _sidecar((0x1000, SIZE, [(0, s)]))
+        side["buffers"][0]["runs"][0]["burst"] = 128
+        assert ts.build(_raw((0, s[:128])), side).ok
+        res = ts.build(_raw((0, s[:64])), side)
+        assert not res.ok and "whole 128-byte bursts" in res.message
+
     def test_a_capture_that_is_not_a_prefix_fails(self):
         s = _stream(128)
         bad = bytearray(s[:64]); bad[8] ^= 0xFF
