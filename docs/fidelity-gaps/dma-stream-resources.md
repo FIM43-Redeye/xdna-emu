@@ -860,7 +860,12 @@ read side does. These three replace `dma.shim_per_task_overhead_s2mm_cycles`, `d
 and `dma.shim_warmup_decay_s2mm_permille`. The start hold's starvation level (`settle_shim_start_starvation`)
 now only covers a lock-parked first BD.
 
-**Result:** see the bridge comparison in this section's evidence (path-capacity/integration/shim-s2mm).
+**Result** (bridge, 60 test variants, EMU only, against silicon's three captures): FINISHED_TASK minus first word, summed error over
+72 tasks 142625 -> 123172 cycles; warm tasks within a cycle or two (sync_task_complete_token 184 -> 165
+against 166..172), long first tasks set by their last word (memtile runtime_len.8 4620 -> 4245 against
+4261..4265, core_dmas dma_configure_task_lock 1548 -> 1173 against 1180..1199). Trace gate against the
+emulator before the start-arm commit: rows outside silicon's band 111 -> 101 (98 with the start arm alone),
+pattern distance -386 (start arm alone +4537). All 60 runs pass.
 
 **Still open.**
 - *What makes a first write cold.* Some first tasks are warm on silicon (add_one_ctrl_packet_4_cores and
@@ -878,8 +883,9 @@ now only covers a lock-parked first BD.
   merge's first source), one 3-cycle pulse at + 14 on multi_source_packet_flow. The offsets are 6 + 9k - 1:
   the shim switch's 8 words drain from + 6, and each non-shim switch on the path, quiet since the path parked
   (no crossing for 195..290 cycles, more than its 128-cycle abort period), holds the first word that crosses it
-  for one cycle (the quiet-switch hold, `crossing_hold.rs`). Whether the emulator's switch model reproduces the
-  pulse cycle for cycle: see the bridge comparison.
+  for one cycle (the quiet-switch hold, `crossing_hold.rs`). The emulator does not produce them yet: it drains
+  the parked path from + 6, but never treats a switch that holds parked words as quiet (adaptive clock gating
+  row below), so 0 of the 18 bridge variants with the pulses show one.
 - core_dmas/dma_configure_task_lock: the emulator's runtime sequence starts the shim task 1086 cycles after the
   compute MM2S (silicon: a few hundred), so the data is already waiting and the level never rises: the
   interpreter backend's sequence timing.
