@@ -1778,6 +1778,17 @@ mod crossing_hold {
     /// `north_packet_stream`'s port beats, and the steps at which the receiver's DMA master passed a word to its
     /// S2MM (the packet without its header).
     fn north_packet_run(bds: &[u32], receiver: u8, quiet: &[u8], packet: &[u8]) -> (Vec<u32>, Vec<u32>) {
+        let (beats, arrivals, _) = north_packet_run_with_drain_holds(bds, receiver, quiet, packet);
+        (beats, arrivals)
+    }
+
+    /// `north_packet_run`, and the most drain holds (`parked_drain`) queued at once after the GO release.
+    fn north_packet_run_with_drain_holds(
+        bds: &[u32],
+        receiver: u8,
+        quiet: &[u8],
+        packet: &[u8],
+    ) -> (Vec<u32>, Vec<u32>, usize) {
         let mut array = TileArray::npu1();
         let mut host = HostMemory::new();
         array.clock_mut().ungate_all();
@@ -1839,9 +1850,10 @@ mod crossing_hold {
         array.tiles[src].locks[GO].value = 1;
         let total: u32 = bds.iter().map(|w| w + 1).sum();
         let payload: u32 = bds.iter().sum();
-        let (mut beats, mut arrivals) = (Vec::new(), Vec::new());
+        let (mut beats, mut arrivals, mut drain_holds) = (Vec::new(), Vec::new(), 0);
         for step in 0..400 {
             array.step_data_movement(&mut host);
+            drain_holds = drain_holds.max(array.drain_holds.len());
             if array.tiles[src].stream_switch.slaves[compute::DMA_SLAVE_START as usize].cycle_beat {
                 beats.push(step);
             }
@@ -1849,7 +1861,7 @@ mod crossing_hold {
                 arrivals.push(step);
             }
             if beats.len() == total as usize && arrivals.len() == payload as usize {
-                return (beats, arrivals);
+                return (beats, arrivals, drain_holds);
             }
         }
         panic!(
@@ -1924,6 +1936,31 @@ mod crossing_hold {
         }
     }
 
+    /// The drain hold (`parked_drain`) leaves (P) and (S) as they are, packet hops included: with quiet packet-routed
+    /// and circuit switches on the stream, the source port keeps the packet stage's and the quiet hops' stalls, no
+    /// drain hold is queued, and a receiver on a circuit route under a quiet packet hop takes the stream without a
+    /// gap, as the packet receivers above do. (A flowing stream's first word launches no drain hold anyway: no word
+    /// has crossed the hop below yet, so the walk down has no route to follow; the receiver's circuit route passes
+    /// the header on as a word.)
+    #[test]
+    fn a_circuit_receiver_below_a_quiet_packet_hop_gets_no_drain_hold() {
+        for (receiver, quiet, packet, slots) in [
+            (4, &[3u8][..], &[3u8][..], vec![8, 12]),
+            (4, &[2, 3][..], &[2, 3][..], vec![4, 8, 12]),
+            (5, &[3, 4][..], &[3][..], vec![8, 12, 16]),
+        ] {
+            let (beats, arrivals, drain_holds) =
+                north_packet_run_with_drain_holds(&[40], receiver, quiet, packet);
+            assert_eq!(drain_holds, 0, "drain holds ({quiet:?}, {packet:?})");
+            assert_eq!(stall_slots(&beats), slots, "source ({quiet:?}, {packet:?})");
+            assert_eq!(
+                port_stalls(&arrivals),
+                Vec::<u32>::new(),
+                "receiver ({quiet:?}, {packet:?}): {arrivals:?}"
+            );
+        }
+    }
+
     /// (P) acts on every packet, not on a stream's first: the second packet of a chain (compute probe same04:
     /// 16 words, the BD boundary's idle cycle, then 4 words) stalls at its own slot 4; its slot 12 is after its
     /// last word and costs nothing.
@@ -1972,5 +2009,195 @@ mod crossing_hold {
     #[test]
     fn a_quiet_switch_holds_a_parked_feeds_restart_one_cycle() {
         assert_eq!(own_restart(true), own_restart(false) + 1);
+    }
+}
+
+// -- A source parked on a full path into a shim S2MM: the drain after the shim's start ---------------------
+//
+// Silicon (bridge corpus 2026-11, three captures each, both compilers): a source parked on a full path into a
+// shim S2MM whose task starts 195..290 cycles after the source stopped. The shim switch's 8 words reach the
+// S2MM at START_TASK + 6 .. + 13, and its STREAM_STARVATION pulses for one cycle at + 6 + 9k - 1 for every switch
+// k = 1 .. S - 1 hops up the route from the shim's (S switches from source to shim, the shim's own included):
+// + 14 for a memtile source (memtile_dmas dma_configure_task_runtime_len / _token, runtime_cumsum's later
+// tasks), + 14 and + 23 for a compute source (core_dmas dma_configure_task_token, packet_flow_same_id_merge_3way,
+// objectfifo_repeat init_values_repeat.chess). Each switch holding parked words saw no crossing for longer than
+// its abort period, so it is quiet, and the first word to leave it after the drain starts is held one cycle;
+// the shim's switch does not hold.
+mod parked_drain {
+    use super::*;
+    use crate::device::dma::BdConfig;
+    use crate::device::host_memory::HostMemory;
+    use crate::interpreter::state::EventType;
+    use xdna_archspec::aie2::stream_switch::{compute, mem_tile, shim};
+
+    const COL: u8 = 1;
+    const AWAKE: u8 = 12; // 2^12 idle cycles: never engages within a test
+    const QUIET: u8 = 7; // the register database's default, 128 cycles
+    const SHIM_S2MM0_MASTER: usize = shim::SOUTH_MASTER_START as usize + 2;
+    const WORDS: u32 = 64;
+
+    /// A source MM2S on (COL, `source_row`) streams `WORDS` words south into the shim's S2MM 0, which starts its
+    /// task `park` cycles after the source's: the S2MM's STREAM_STARVATION runs (rise, length) from its start, and
+    /// the words it got.
+    fn drain(source_row: u8, period: u8, park: u64) -> (Vec<(u64, u64)>, usize) {
+        let run = drain_run(source_row, period, park, &[]);
+        (run.runs, run.words)
+    }
+
+    /// What `drain_run` saw: the S2MM's starvation runs and words, and the most drain holds queued at once.
+    struct Drain {
+        runs: Vec<(u64, u64)>,
+        words: usize,
+        drain_holds: usize,
+    }
+
+    /// `drain` with the switches of the rows in `packet` routing the stream through packet rules (the source's BD
+    /// sends one packet, id 1; slot 0 routes id 1 to arbiter 0 / msel 0; the shim's S2MM master drops the header)
+    /// and every other switch through a circuit route. A header that reaches the S2MM on a circuit route is one
+    /// more word.
+    fn drain_run(source_row: u8, period: u8, park: u64, packet: &[u8]) -> Drain {
+        let route = |array: &mut TileArray, row: u8, from: usize, to: usize, drop: bool| {
+            let switch = &mut array.tile_mut(COL, row).stream_switch;
+            if packet.contains(&row) {
+                switch.slaves[from].packet_enable = true;
+                switch.configure_slave_slot(from, 0, 1 << 24 | 0x1f << 16 | 1 << 8);
+                let drop = if drop { 1 << 7 } else { 0 };
+                switch.configure_master_packet(to, 1 << 31 | 1 << 30 | drop | 1 << 3);
+            } else {
+                switch.configure_local_route(from, to);
+            }
+        };
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        for row in 0..=source_row {
+            array.clock_mut().set_adaptive_abort_period(COL, row, period);
+        }
+        let s = array.tile_index(COL, 0);
+        route(&mut array, 0, shim::NORTH_SLAVE_START as usize, SHIM_S2MM0_MASTER, true);
+        array.tiles[s].shim_mux_s2mm_masters[0] = Some(SHIM_S2MM0_MASTER);
+        let from = if source_row == 1 {
+            mem_tile::DMA_SLAVE_START
+        } else {
+            mem_tile::NORTH_SLAVE_START
+        };
+        route(&mut array, 1, from as usize, mem_tile::SOUTH_MASTER_START as usize, false);
+        for row in 2..=source_row {
+            let from = if row == source_row {
+                compute::DMA_SLAVE_START
+            } else {
+                compute::NORTH_SLAVE_START
+            };
+            route(&mut array, row, from as usize, compute::SOUTH_MASTER_START as usize, false);
+        }
+        let header = (!packet.is_empty() && !packet.contains(&0)) as u32;
+        let src = array.tile_index(COL, source_row);
+        let mut bd = BdConfig::simple_1d(0x400, WORDS * 4);
+        if !packet.is_empty() {
+            bd.enable_packet = true;
+            bd.packet_id = 1;
+        }
+        array.dma_engines[src].configure_bd(0, bd).unwrap();
+        let mm2s0 = array.dma_engines[src].s2mm_channel_count() as u8;
+        let mut cycle = 1u64;
+        array.set_dma_cycle(cycle);
+        array.dma_engines[src].start_channel(mm2s0, 0).unwrap();
+        let mut drain_holds = 0;
+        for _ in 0..park {
+            array.set_dma_cycle(cycle);
+            array.step_data_movement(&mut host);
+            drain_holds = drain_holds.max(array.drain_holds.len());
+            cycle += 1;
+        }
+        let _ = array.dma_engines[s].drain_trace_events();
+        let start = cycle;
+        array.set_dma_cycle(cycle);
+        array.dma_engines[s]
+            .configure_bd(0, BdConfig::simple_1d(0x1000, (WORDS + header) * 4))
+            .unwrap();
+        array.dma_engines[s].start_channel(0, 0).unwrap();
+        let (mut runs, mut rise, mut words) = (Vec::new(), None, 0);
+        for _ in 0..(WORDS as u64 + 200) {
+            array.set_dma_cycle(cycle);
+            array.step_data_movement(&mut host);
+            drain_holds = drain_holds.max(array.drain_holds.len());
+            if array.tiles[s].stream_switch.masters[SHIM_S2MM0_MASTER].cycle_beat {
+                words += 1;
+            }
+            for (c, e) in array.dma_engines[s].drain_trace_events() {
+                if let EventType::DmaStreamStarvation { channel: 0, active } = e {
+                    match (active, rise) {
+                        (true, None) => rise = Some(c - start),
+                        (false, Some(r)) => {
+                            runs.push((r, c - start - r));
+                            rise = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            cycle += 1;
+        }
+        Drain { runs, words, drain_holds }
+    }
+
+    #[test]
+    fn a_parked_memtile_source_drains_with_one_starved_cycle_at_start_plus_14() {
+        assert_eq!(drain(1, QUIET, 400), (vec![(14, 1)], WORDS as usize));
+    }
+
+    #[test]
+    fn a_parked_compute_source_drains_with_starved_cycles_at_start_plus_14_and_23() {
+        assert_eq!(drain(2, QUIET, 400), (vec![(14, 1), (23, 1)], WORDS as usize));
+    }
+
+    /// Not in the corpus: the rule's prediction for four switches.
+    #[test]
+    fn a_source_four_switches_up_drains_with_starved_cycles_at_14_23_and_32() {
+        assert_eq!(drain(3, QUIET, 400), (vec![(14, 1), (23, 1), (32, 1)], WORDS as usize));
+    }
+
+    /// Switches kept awake, or parked for less than their abort period, hold nothing: the words run in from
+    /// + 6 without a gap.
+    #[test]
+    fn a_parked_path_whose_switches_are_awake_drains_without_a_gap() {
+        assert_eq!(drain(2, AWAKE, 400), (vec![], WORDS as usize));
+        assert_eq!(drain(2, QUIET, 100), (vec![], WORDS as usize));
+    }
+
+    /// The boundary with the packet routes: the drain hold follows circuit routes only. A parked path with a
+    /// packet-routed switch at or below the memtile (the memtile's, the shim's, or both) queues no drain hold:
+    /// a packet-routed switch launches none for its own parked word, and a walk down from a circuit switch ends
+    /// at the packet-routed hop. Not modelled: silicon drains such a path with gaps too
+    /// (packet_flow_same_id_merge_3way: + 14, + 23 at its shim S2MM), the emulator without.
+    #[test]
+    fn a_parked_path_through_a_packet_route_drains_without_a_drain_hold() {
+        for (source_row, packet) in [
+            (2, &[1u8][..]),
+            (2, &[0][..]),
+            (2, &[0, 1][..]),
+            (2, &[0, 1, 2][..]),
+            (1, &[0][..]),
+            (1, &[1][..]),
+        ] {
+            let run = drain_run(source_row, QUIET, 400, packet);
+            let header = !packet.contains(&0) as usize;
+            let case = format!("source row {source_row}, packet rows {packet:?}");
+            assert_eq!(run.drain_holds, 0, "{case}");
+            assert_eq!(run.words, WORDS as usize + header, "{case}");
+            assert_eq!(run.runs, vec![], "{case}");
+        }
+    }
+
+    /// Below and beside a packet-routed switch the circuit switches keep their drain holds: the hold of every
+    /// circuit switch whose circuit route leads down to the S2MM, and only those. A source four switches up
+    /// (all circuit: + 14, + 23, + 32) loses its own switch's hold when that switch routes by packet rules, and
+    /// keeps the memtile's alone when the compute switch between does.
+    #[test]
+    fn a_packet_routed_switch_drops_only_the_holds_whose_walk_it_ends() {
+        let top = drain_run(3, QUIET, 400, &[3]);
+        assert_eq!((top.runs, top.words), (vec![(14, 1), (23, 1)], WORDS as usize + 1));
+        let middle = drain_run(3, QUIET, 400, &[2]);
+        assert_eq!((middle.runs, middle.words), (vec![(14, 1)], WORDS as usize + 1));
     }
 }

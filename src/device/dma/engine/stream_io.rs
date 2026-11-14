@@ -69,16 +69,21 @@ impl DmaEngine {
     /// the task is parked on a lock acquire; see `DmaTiming::shim_s2mm_ingress_depth`).
     pub fn channel_input_capacity(&self, channel: u8) -> usize {
         let base = self.input_fifo_capacity();
-        // The channel's ingress opens with its stream side, START_TASK + 6 (the S2MM arming delay):
-        // before then only the switch's own FIFOs hold the stream's words (silicon: a parked
-        // path into a shim S2MM drains from + 6, so its STREAM_STARVATION pulses at + 14).
-        let has_task = self.channels.get(channel as usize).is_some_and(|c| {
-            !matches!(c.fsm, ChannelFsm::Idle) && self.current_cycle >= c.lock_wait_starve_from
-        });
-        if self.tile_kind.is_shim() && has_task {
-            base + xdna_archspec::aie2::timing::DMA_SHIM_S2MM_INGRESS_DEPTH as usize
+        // A shim S2MM's stream side opens at START_TASK + 6 (the S2MM arming delay): before then
+        // it takes no word, and only the switch's own FIFOs hold the stream's (silicon: a parked
+        // path into a shim S2MM drains its shim switch's 8 words at + 6 .. + 13). The ingress
+        // opens the cycle before, as its ready is registered: a word it takes in a cycle is read
+        // by the transfer in the next, so a waiting word is read at + 6.
+        let Some(c) = self.channels.get(channel as usize) else {
+            return base;
+        };
+        if !self.tile_kind.is_shim() || matches!(c.fsm, ChannelFsm::Idle) {
+            return base;
+        }
+        if self.current_cycle + 1 < c.lock_wait_starve_from {
+            0
         } else {
-            base
+            base + xdna_archspec::aie2::timing::DMA_SHIM_S2MM_INGRESS_DEPTH as usize
         }
     }
 

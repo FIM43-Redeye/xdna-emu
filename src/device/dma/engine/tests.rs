@@ -4604,8 +4604,11 @@ fn a_shim_s2mm_opens_its_ingress_once_it_holds_a_task() {
     shim.configure_bd(4, BdConfig::simple_1d(0x100, 64).with_acquire(5, -1))
         .unwrap();
     assert!(shim.enqueue_task(0, 4, 0, false));
-    assert_eq!(shim.channel_input_capacity(0), idle, "the stream side opens at START_TASK + 6");
-    shim.set_current_cycle(xdna_archspec::aie2::timing::DMA_S2MM_STARVATION_ARM_CYCLES as u64);
+    let arm = xdna_archspec::aie2::timing::DMA_S2MM_STARVATION_ARM_CYCLES as u64;
+    shim.set_current_cycle(arm - 2);
+    assert_eq!(shim.channel_input_capacity(0), 0, "the stream side takes nothing before START_TASK + 6");
+    // Its ready is registered: the ingress opens the cycle before the transfer's first read.
+    shim.set_current_cycle(arm - 1);
     assert_eq!(shim.channel_input_capacity(0), idle + depth, "a parked task opens the ingress");
 
     let mut compute = DmaEngine::new_compute_tile(1, 2);
@@ -4990,12 +4993,11 @@ fn accepted_rel(rig: &StarvationRig) -> Vec<u64> {
 #[test]
 fn shim_s2mm_takes_words_from_start_plus_six_one_a_cycle_without_a_stall() {
     let mut rig = StarvationRig::shim();
-    let master_fifo = rig.eng.input_fifo_capacity() as u64;
     start_shim_host_bd(&mut rig, 1024);
     rig.run(1200, |_| true);
-    // The switch's master-port FIFO holds its words before the start; the channel takes the
-    // rest one a cycle from + 6.
-    let expect: Vec<u64> = (0..master_fifo).chain(ARM..ARM + 1024 - master_fifo).collect();
+    // Nothing is taken before + 6; the ingress, whose ready is registered, takes a word the cycle
+    // before the transfer reads it, so the first is read at + 6 and the words run on one a cycle.
+    let expect: Vec<u64> = (ARM - 1..ARM - 1 + 1024).collect();
     assert_eq!(accepted_rel(&rig), expect);
     assert!(rig.high_runs().is_empty(), "never starved: a word was waiting in every cycle");
 }
@@ -5097,9 +5099,8 @@ fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
     rig.run(cold + 400, |_| true);
     assert_eq!(rig.accepted, 32);
-    let master_fifo = rig.eng.input_fifo_capacity() as u64;
     let taken: Vec<u64> = rig.accepted_at[16..].iter().map(|c| c - second).collect();
-    let expect: Vec<u64> = (0..master_fifo).chain(ARM..ARM + 16 - master_fifo).collect();
+    let expect: Vec<u64> = (ARM - 1..ARM - 1 + 16).collect();
     assert_eq!(taken, expect);
     // Completions leave in task order, so the warm second task waits behind the cold first.
     assert_eq!(rig.finished_task_at.len(), 2, "both tasks finish");

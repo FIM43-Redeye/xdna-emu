@@ -158,6 +158,12 @@ pub struct TileArray {
     /// Per (tile, DMA slave): the MM2S port's current stream (`crossing_hold`).
     pub(super) port_streams: std::collections::HashMap<(usize, usize), crossing_hold::PortStream>,
 
+    /// Holds of parked words on their way down to the S2MMs draining their paths (`crossing_hold`).
+    pub(super) drain_holds: Vec<crossing_hold::DrainHold>,
+
+    /// Per (tile, master feeding an S2MM): the words it passes to the S2MM (`crossing_hold`).
+    pub(super) drain_streams: std::collections::HashMap<(usize, usize), crossing_hold::DrainStream>,
+
     /// Steps of `step_data_movement` so far: the clock holds and their pulses are timed on.
     pub(super) hold_clock: u64,
 
@@ -328,6 +334,8 @@ impl TileArray {
             hold_pulses: Vec::new(),
             port_holds: Vec::new(),
             port_streams: std::collections::HashMap::new(),
+            drain_holds: Vec::new(),
+            drain_streams: std::collections::HashMap::new(),
             hold_clock: 0,
             crossing_feeders,
             tile_present,
@@ -628,6 +636,8 @@ impl TileArray {
         self.hold_pulses.clear();
         self.port_holds.clear();
         self.port_streams.clear();
+        self.drain_holds.clear();
+        self.drain_streams.clear();
         self.hold_clock = 0;
         for f in &mut self.crossing_feeders {
             f.fill(None);

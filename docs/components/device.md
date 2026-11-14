@@ -30,7 +30,7 @@ matches reality.
 | Path | Purpose |
 |------|---------|
 | `state/` | `DeviceState` -- applies `DeviceOp` to the array; per-tile compute/memtile dispatch and effects |
-| `array/` | `TileArray` -- the device tile grid, with control + DMA + routing helpers; `crossing_hold`: a quiet compute or memtile switch holds a stream's first word one cycle and sends the hold back to the source MM2S port, and every packet-routed switch holds each packet one cycle at its packet stage (both as stalls of the source MM2S port) |
+| `array/` | `TileArray` -- the device tile grid, with control + DMA + routing helpers; `crossing_hold`: a quiet compute or memtile switch holds a stream's first word one cycle and sends the hold back to the source MM2S port, and every packet-routed switch holds each packet one cycle at its packet stage (both as stalls of the source MM2S port); a parked word leaving a quiet switch sends its hold down the circuit route to the S2MM draining the path (a gap at the drain's slot 8k; not through packet routes) |
 | `tile/` | `Tile` state: memory, locks, registers, edge config, per-tile streams, core state |
 | `dma/` | DMA engine: BDs, transfer state machine, addressing, timing, stream I/O, FIFO, token, compression; the compute MM2S word clock (`word_clock.rs`) and lock port (`lock_port.rs`), channel-level state that sequences the BD chain and requests its locks ahead of the FSM |
 | `stream_switch/` | Per-tile and global stream routing |

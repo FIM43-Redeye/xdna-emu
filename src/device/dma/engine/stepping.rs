@@ -4340,6 +4340,7 @@ mod shim_host_address_tests {
         engine.start_channel(0, 0).unwrap();
         let mut fed = 0u32;
         for _ in 0..5000 {
+            engine.set_current_cycle(engine.current_cycle + 1);
             if fed < 16 && engine.can_accept_stream_in_for_channel(0) {
                 let data = StreamData { data: 0xA000_0000 | fed, tlast: fed == 15, channel: 0 };
                 if engine.push_stream_in(data) {
@@ -4450,6 +4451,7 @@ mod shim_burst_tests {
         fn feed(&mut self, words: u32) {
             let target = self.fed + words;
             for _ in 0..20_000 {
+                self.engine.set_current_cycle(self.engine.current_cycle + 1);
                 if self.fed < target && self.engine.can_accept_stream_in_for_channel(0) {
                     let data = StreamData { data: 0xB000_0000 | self.fed, tlast: false, channel: 0 };
                     if self.engine.push_stream_in(data) {

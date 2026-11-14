@@ -1247,6 +1247,31 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         let quiet: Vec<bool> = (0..self.tiles.len())
             .map(|i| self.tile_present[i] && self.switch_is_quiet(i))
             .collect();
+        // Drain holds whose slot has come (`crossing_hold`): the master passes its S2MM no word.
+        let mut drain_held: Vec<(usize, usize)> = Vec::new();
+        if !self.drain_holds.is_empty() {
+            let mut due: Vec<(usize, usize)> = self.drain_holds.iter().map(|h| (h.tile, h.master)).collect();
+            due.sort_unstable();
+            due.dedup();
+            for (i, m) in due {
+                let would_pass = self.s2mm_channel_of(i, m).is_some_and(|ch| {
+                    let dma = &self.dma_engines[i];
+                    let accepts = if self.tiles[i].tile_kind.is_shim() {
+                        dma.can_accept_stream_in_for_routing(ch)
+                    } else {
+                        dma.can_accept_stream_in_same_cycle(ch)
+                    };
+                    dma.channel_is_started(ch)
+                        && accepts
+                        && !quiet[i]
+                        && self.tiles[i].stream_switch.masters[m].has_data()
+                });
+                if self.drain_hold_due(i, m, would_pass) {
+                    drain_held.push((i, m));
+                }
+            }
+        }
+        let mut drain_cycles: Vec<(usize, usize, bool, bool)> = Vec::new();
         let mut woken: Vec<usize> = Vec::new();
         let tiles = &mut self.tiles;
         let dma_engines = &mut self.dma_engines;
@@ -1332,6 +1357,13 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     if !dma.channel_is_started(ch) {
                         continue;
                     }
+                    drain_cycles.push((i, master_port, false, fifo_len > 0));
+                    // A parked word's hold come down the route (`crossing_hold`): no word reaches
+                    // the S2MM this cycle.
+                    if drain_held.contains(&(i, master_port)) {
+                        dma.note_stream_offer(ch, false);
+                        continue;
+                    }
                     // A beat held at the master port is on offer whether or not the channel takes it
                     // (STREAM_STARVATION is low while one is).
                     dma.note_stream_offer(ch, fifo_len > 0);
@@ -1374,6 +1406,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                         let new_len = dma.stream_in_len();
                         if push_result {
                             words_routed += 1;
+                            if let Some(last) = drain_cycles.last_mut() {
+                                last.2 = true;
+                            }
                             log::info!("TileSwitch->DMA: tile ({},{}) master[{}] -> DMA ch {} = 0x{:08X} (stream_in_len={})",
                                 col, row, master_port, ch, data, new_len);
                         } else {
@@ -1393,6 +1428,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         for i in woken {
             self.note_hold(i);
         }
+        for (i, master, sent, offered) in drain_cycles {
+            if sent || offered {
+                self.note_drain_cycle(i, master, sent, offered);
+            }
+        }
+        self.expire_drain_holds();
         words_routed
     }
 
@@ -1697,16 +1738,22 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             }
         }
 
-        // A word parked in a quiet switch leaves one cycle after it could (`crossing_hold`).
+        // A word parked in a quiet switch leaves one cycle after it could, and its hold goes down
+        // the route to the S2MM draining it (`crossing_hold`).
+        let mut held_masters: Vec<(usize, usize)> = Vec::new();
         transfers.retain(|t| {
             let si = self.tile_index(t.0, t.1);
             if quiet[si] {
                 held_src.push(si);
+                held_masters.push((si, t.2));
                 false
             } else {
                 true
             }
         });
+        for (si, master) in held_masters {
+            self.launch_drain_hold(si, master);
+        }
 
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.

@@ -47,6 +47,27 @@
 //! packet_flow / fanin / fanout and the compute packet-gap probe, a quiet switch one or two hops
 //! out stalls the packet stream at slot 8k). Shim switches neither hold (the measured exemptions)
 //! nor pass a pulse on.
+//!
+//! A path drained from its far end is the mirror image (silicon, bridge corpus 2026-11: a
+//! memtile or compute MM2S parked on a full path into a shim S2MM whose task starts later; the
+//! memtile-fed lock probe into a compute S2MM). Each switch holds the words parked in it and
+//! nothing crosses it, so it goes quiet after its abort period like an empty one. When the
+//! S2MM starts to drain, the first parked word to leave a quiet switch k hops up the route from
+//! the S2MM's own switch leaves one cycle late, and the S2MM's stream has a one-cycle gap at
+//! its slot 8k: one stream cycle, counted from the drain's first word, in which no word reaches
+//! the S2MM, and which every gap before it pushes one later ([`DrainHold`], launched where the
+//! parked word is held, `propagate_inter_tile`). In silicon the switch FIFOs of a backlogged
+//! path move in lockstep and the late word is that gap; the emulator's registered hand-offs
+//! leave a word or two of slack behind a draining head, which would swallow it, so the hold
+//! is carried down the route explicitly, as the source-side hold is carried back. Measured: the
+//! shim's STREAM_STARVATION at START_TASK + 14 (memtile source, k = 1) and + 14, + 23 (compute
+//! source, k = 1, 2), its own switch not holding. The S2MM's own switch (k = 0) holding is the
+//! parked word's one-cycle late arrival at the S2MM (`route_tile_switches_to_dma`).
+//!
+//! The drain hold follows circuit routes only: a packet-routed hop on the way down ends it, and
+//! a word leaving a master the packet rules feed launches none. A parked path draining through a packet route
+//! is not modelled (silicon has its gaps there too: the 3-way same-ID packet merge into a shim
+//! S2MM); the packet stage hold and the quiet-switch hold over packet hops are unaffected by it.
 
 use super::TileArray;
 use crate::device::stream_switch::{inter_tile_dest, PacketHeader, PortType};
@@ -82,6 +103,25 @@ pub(crate) struct PortHold {
     pub slave: usize,
     pub slot: u64,
     pub stream: u64,
+}
+
+/// A parked word's hold on its way down to the S2MM draining the path: that S2MM's master
+/// `master` on `tile` passes it no word at its stream's slot `slot`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainHold {
+    pub tile: usize,
+    pub master: usize,
+    pub slot: u64,
+    pub arrived: u64,
+}
+
+/// The words an S2MM's master port passes to the S2MM: the drain's first word's cycle, its stalled
+/// cycles since, its last word. A drain has no packet heads to track, unlike a source port's stream.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DrainStream {
+    pub first: u64,
+    pub stalls: u64,
+    pub last: u64,
 }
 
 /// An MM2S port's current stream: its first word's cycle, its stalled cycles since, its last word, and
@@ -298,5 +338,119 @@ impl TileArray {
 
     fn crossing_feeder(&self, idx: usize, slave: usize) -> Option<(usize, usize)> {
         self.crossing_feeders.get(idx)?.get(slave).copied().flatten()
+    }
+
+    /// The (tile, slave) that `src`'s master `master` feeds across its tile boundary, the last
+    /// crossing a word took from it.
+    fn crossing_target(&self, src: usize, master: usize) -> Option<(usize, usize)> {
+        self.crossing_feeders.iter().enumerate().find_map(|(tile, slaves)| {
+            slaves.iter().position(|f| *f == Some((src, master))).map(|slave| (tile, slave))
+        })
+    }
+
+    /// The S2MM channel `idx`'s master `master` feeds, if any.
+    pub(super) fn s2mm_channel_of(&self, idx: usize, master: usize) -> Option<u8> {
+        let tile = &self.tiles[idx];
+        match tile.tile_kind {
+            TileKind::ShimNoc | TileKind::ShimPl => tile
+                .shim_mux_s2mm_masters
+                .iter()
+                .position(|m| *m == Some(master))
+                .map(|ch| ch as u8),
+            _ => match tile.stream_switch.masters.get(master)?.port_type {
+                PortType::Dma(ch) => Some(ch),
+                _ => None,
+            },
+        }
+    }
+
+    /// A word parked in `src`'s quiet switch leaves its master `master` one cycle late: send the
+    /// hold down the circuit route to the S2MM that drains it, as a gap at its stream's slot 8k
+    /// for the switch k hops up from the S2MM's. A packet-switched or unrouted hop, or a route
+    /// that ends anywhere but an S2MM, ends it, and a master the packet rules feed launches none:
+    /// a drain through a packet route is not modelled (module docs).
+    pub(super) fn launch_drain_hold(&mut self, src: usize, master: usize) {
+        if !self.holds_first_words(src)
+            || !self.tiles[src]
+                .stream_switch
+                .local_routes
+                .iter()
+                .any(|r| r.enabled && r.master_idx as usize == master)
+        {
+            return;
+        }
+        let mut at = (src, master);
+        for hops in 1..=self.tiles.len() as u64 {
+            let Some((tile, slave)) = self.crossing_target(at.0, at.1) else {
+                return;
+            };
+            let Some(next) = self.tiles[tile]
+                .stream_switch
+                .local_routes
+                .iter()
+                .find(|r| r.enabled && r.slave_idx as usize == slave)
+                .map(|r| r.master_idx as usize)
+            else {
+                return;
+            };
+            if self.s2mm_channel_of(tile, next).is_some() {
+                self.drain_holds.push(DrainHold {
+                    tile,
+                    master: next,
+                    slot: SLOTS_PER_HOP * hops,
+                    arrived: self.hold_clock,
+                });
+                return;
+            }
+            at = (tile, next);
+        }
+    }
+
+    /// Whether the S2MM fed by (`idx`, master `master`) gets no word this cycle for a drain hold
+    /// whose slot has come: consumes the hold, whether the master would pass a word
+    /// (`would_pass`) or not (absorbed).
+    pub(super) fn drain_hold_due(&mut self, idx: usize, master: usize, would_pass: bool) -> bool {
+        let now = self.hold_clock;
+        let Some(stream) = self.drain_streams.get(&(idx, master)).copied() else {
+            return false;
+        };
+        if now.saturating_sub(stream.last) > STREAM_GAP {
+            return false;
+        }
+        let slot = now - stream.first - stream.stalls;
+        let Some(k) = self
+            .drain_holds
+            .iter()
+            .position(|h| h.tile == idx && h.master == master && h.slot <= slot)
+        else {
+            return false;
+        };
+        self.drain_holds.swap_remove(k);
+        would_pass
+    }
+
+    /// Account an S2MM master's cycle: a word passed to the S2MM (`sent`), or one it held and
+    /// did not pass (`offered`).
+    pub(super) fn note_drain_cycle(&mut self, idx: usize, master: usize, sent: bool, offered: bool) {
+        let now = self.hold_clock;
+        let e =
+            self.drain_streams
+                .entry((idx, master))
+                .or_insert(DrainStream { first: now, stalls: 0, last: 0 });
+        if sent {
+            if e.last == 0 || now.saturating_sub(e.last) > STREAM_GAP {
+                *e = DrainStream { first: now, stalls: 0, last: now };
+            }
+            e.last = now;
+        } else if offered && now.saturating_sub(e.last) <= STREAM_GAP && e.last != 0 {
+            e.stalls += 1;
+            e.last = now;
+        }
+    }
+
+    /// Drain holds that never found their slot (the drain ended first) are dropped.
+    pub(super) fn expire_drain_holds(&mut self) {
+        let now = self.hold_clock;
+        self.drain_holds.retain(|h| now.saturating_sub(h.arrived) <= 4 * STREAM_GAP);
     }
 }
