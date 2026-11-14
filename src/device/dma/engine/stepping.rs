@@ -4267,8 +4267,8 @@ mod shim_host_address_tests {
     fn the_stream_shadow_holds_each_word_at_its_host_address() {
         let host_memory = shim_s2mm_16_words(HOST + DDR_AIE_ADDR_OFFSET, true);
         let shadow = host_memory.s2mm_stream_shadow_in(HOST, 0x1000);
-        let want: Vec<(u64, u32, u32)> =
-            (0..16u32).map(|i| (HOST + 4 * i as u64, 0xA000_0000 | i, 64)).collect();
+        let want: Vec<(u64, u32, u32, u32)> =
+            (0..16u32).map(|i| (HOST + 4 * i as u64, 0xA000_0000 | i, 64, 0)).collect();
         assert_eq!(shadow, want);
     }
 
@@ -4372,8 +4372,8 @@ mod shim_burst_tests {
         r.feed(20);
         assert_eq!(r.written_words(), 0, "20 words are less than one 128-byte burst");
         let shadow = r.host.s2mm_stream_shadow_in(HOST, 0x1_0000);
-        let want: Vec<(u64, u32, u32)> =
-            (0..20u32).map(|i| (HOST + 4 * i as u64, 0xB000_0000 | i, 128)).collect();
+        let want: Vec<(u64, u32, u32, u32)> =
+            (0..20u32).map(|i| (HOST + 4 * i as u64, 0xB000_0000 | i, 128, 0)).collect();
         assert_eq!(shadow, want, "every word taken off the stream, with its BD's burst");
     }
 

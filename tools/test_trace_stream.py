@@ -58,6 +58,24 @@ class TestBuild:
         res = ts.build(_raw((0, s[:64])), side)
         assert not res.ok and "whole 128-byte bursts" in res.message
 
+    def test_a_buffer_rewritten_by_a_later_run_keeps_the_earlier_runs_bytes(self):
+        """A traced kernel dispatched again writes its trace buffer from the start; past the
+        later run's written bursts the buffer still holds the earlier run's."""
+        early, late = _stream(128, 1), _stream(96, 2)      # late: 64 written, 32 staged
+        raw = _raw((0, late[:64]), (64, early[64:128]))
+        side = _sidecar((0x1000, SIZE, [(0, late), (96, early[96:128])]))
+        side["buffers"][0]["runs"][0]["pass"] = 1
+        side["buffers"][0]["runs"][1]["pass"] = 0
+        res = ts.build(raw, side)
+        assert res.ok, res.message
+        assert res.image[:96] == late and res.image[96:128] == early[96:128]
+
+    def test_bytes_past_the_prefix_of_a_single_run_fail(self):
+        s = _stream(128)
+        raw = _raw((0, s[:64]), (100, b"\x07"))
+        res = ts.build(raw, _sidecar((0x1000, SIZE, [(0, s)])))
+        assert not res.ok and "not a prefix" in res.message
+
     def test_a_capture_that_is_not_a_prefix_fails(self):
         s = _stream(128)
         bad = bytearray(s[:64]); bad[8] ^= 0xFF

@@ -8,10 +8,11 @@
 //! to the `trace_raw.bin` the host program writes). `tools/trace_stream.py` turns it into
 //! `trace_stream.bin`, the buffer as it would be had every word been written.
 //!
-//! Format: `{"schema": 1, "buffers": [{"base", "size", "runs": [{"offset", "bytes", "burst"}]}]}`,
-//! one entry per buffer that received any word, runs of contiguous words under one burst size in
-//! address order, `bytes` the run's memory image in hex (little-endian words, as in the buffer),
-//! `burst` the BD's write burst in bytes.
+//! Format: `{"schema": 1, "buffers": [{"base", "size", "runs": [{"offset", "bytes", "burst",
+//! "pass"}]}]}`, one entry per buffer that received any word, runs of contiguous words under one
+//! burst size and staged last by one pass (one pass per FFI run) in address order, `bytes` the
+//! run's memory image in hex (little-endian words, as in the buffer), `burst` the BD's write burst
+//! in bytes.
 
 use std::path::{Path, PathBuf};
 
@@ -36,22 +37,24 @@ pub fn sidecar_json(memory: &HostMemory) -> serde_json::Value {
         if words.is_empty() {
             continue;
         }
-        // Runs of contiguous words under one burst size.
-        let mut runs: Vec<(u64, Vec<u8>, u32)> = Vec::new();
-        for (addr, word, burst) in words {
+        // Runs of contiguous words under one burst size, staged last by one pass.
+        let mut runs: Vec<(u64, Vec<u8>, u32, u32)> = Vec::new();
+        for (addr, word, burst, pass) in words {
             let offset = addr - base;
             match runs.last_mut() {
-                Some((start, bytes, b)) if *start + bytes.len() as u64 == offset && *b == burst => {
+                Some((start, bytes, b, p))
+                    if *start + bytes.len() as u64 == offset && *b == burst && *p == pass =>
+                {
                     bytes.extend_from_slice(&word.to_le_bytes())
                 }
-                _ => runs.push((offset, word.to_le_bytes().to_vec(), burst)),
+                _ => runs.push((offset, word.to_le_bytes().to_vec(), burst, pass)),
             }
         }
         let runs: Vec<serde_json::Value> = runs
             .into_iter()
-            .map(|(offset, bytes, burst)| {
+            .map(|(offset, bytes, burst, pass)| {
                 let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-                serde_json::json!({ "offset": offset, "bytes": hex, "burst": burst })
+                serde_json::json!({ "offset": offset, "bytes": hex, "burst": burst, "pass": pass })
             })
             .collect();
         buffers.push(serde_json::json!({ "base": base, "size": size, "runs": runs }));
@@ -85,13 +88,16 @@ mod tests {
         mem.shadow_s2mm_word(0x10_0004, 0x0807_0605, 64);
         mem.shadow_s2mm_word(0x10_0008, 0x0C0B_0A09, 256); // another BD's burst: a run of its own
         mem.shadow_s2mm_word(0x10_0040, 0xDDCC_BBAA, 64);
+        mem.begin_s2mm_shadow_pass();
+        mem.shadow_s2mm_word(0x10_0044, 0x1111_1111, 64); // a later run: a run of its own
         let doc = sidecar_json(&mem);
         assert_eq!(
             doc,
             serde_json::json!({"schema": 1, "buffers": [{"base": 0x10_0000, "size": 0x1000, "runs": [
-                {"offset": 0, "bytes": "0102030405060708", "burst": 64},
-                {"offset": 8, "bytes": "090a0b0c", "burst": 256},
-                {"offset": 0x40, "bytes": "aabbccdd", "burst": 64},
+                {"offset": 0, "bytes": "0102030405060708", "burst": 64, "pass": 0},
+                {"offset": 8, "bytes": "090a0b0c", "burst": 256, "pass": 0},
+                {"offset": 0x40, "bytes": "aabbccdd", "burst": 64, "pass": 0},
+                {"offset": 0x44, "bytes": "11111111", "burst": 64, "pass": 1},
             ]}]}),
             "a buffer with no word is left out"
         );

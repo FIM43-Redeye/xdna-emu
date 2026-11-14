@@ -322,6 +322,8 @@ pub(crate) fn run_interpreter(
     max_cycles: u64,
     observer: &mut dyn RunObserver,
 ) -> RunOutcome {
+    // The S2MM stream sidecar tells this run's words from an earlier run's (stream_sidecar).
+    engine.host_memory_mut().begin_s2mm_shadow_pass();
     let mut cycles = 0u64;
     // max_cycles == 0 means "unbounded": run until a natural exit point. But a
     // genuinely unbounded loop is dangerous -- a DMA/scheduler deadlock (e.g. a

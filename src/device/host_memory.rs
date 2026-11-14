@@ -251,8 +251,11 @@ pub struct HostMemory {
     /// it has reached memory. A diagnostic beside memory, never read by the device:
     /// the trace gate scores a channel's whole stream from it while memory holds what
     /// silicon's host buffer would (see `set_s2mm_stream_shadow`).
-    /// Each word is kept with its BD's burst size in bytes.
-    s2mm_stream_shadow: Option<BTreeMap<u64, (u32, u32)>>,
+    /// Each word is kept with its BD's burst size in bytes and the pass that staged it.
+    s2mm_stream_shadow: Option<BTreeMap<u64, (u32, u32, u32)>>,
+
+    /// The shadow's current pass (`begin_s2mm_shadow_pass`).
+    s2mm_shadow_pass: u32,
 }
 
 impl HostMemory {
@@ -273,6 +276,7 @@ impl HostMemory {
             blocked: RefCell::new(BlockedLog::default()),
             outside_aperture: RefCell::new(BlockedLog::default()),
             s2mm_stream_shadow: None,
+            s2mm_shadow_pass: 0,
         }
     }
 
@@ -281,22 +285,29 @@ impl HostMemory {
         self.s2mm_stream_shadow = on.then(BTreeMap::new);
     }
 
+    /// Start a new shadow pass: words staged from now on carry the next pass number. The
+    /// FFI starts one per run, so a buffer a later dispatch writes again tells its words
+    /// from the earlier dispatch's that remain.
+    pub fn begin_s2mm_shadow_pass(&mut self) {
+        self.s2mm_shadow_pass += 1;
+    }
+
     /// Record that a shim S2MM took `word` off its stream for host address `addr`
     /// (whether or not it is written yet), under a BD with bursts of `burst_bytes`.
     /// Nothing when the shadow is off.
     pub fn shadow_s2mm_word(&mut self, addr: u64, word: u32, burst_bytes: u32) {
         if let Some(shadow) = &mut self.s2mm_stream_shadow {
-            shadow.insert(addr, (word, burst_bytes));
+            shadow.insert(addr, (word, burst_bytes, self.s2mm_shadow_pass));
         }
     }
 
-    /// The shadow's `(address, word, burst bytes)` in `[base, base + size)`, by address;
-    /// empty when off.
-    pub fn s2mm_stream_shadow_in(&self, base: u64, size: usize) -> Vec<(u64, u32, u32)> {
+    /// The shadow's `(address, word, burst bytes, pass)` in `[base, base + size)`, by
+    /// address; empty when off.
+    pub fn s2mm_stream_shadow_in(&self, base: u64, size: usize) -> Vec<(u64, u32, u32, u32)> {
         match &self.s2mm_stream_shadow {
             Some(shadow) => shadow
                 .range(base..base.saturating_add(size as u64))
-                .map(|(&a, &(w, burst))| (a, w, burst))
+                .map(|(&a, &(w, burst, pass))| (a, w, burst, pass))
                 .collect(),
             None => Vec::new(),
         }
@@ -1272,9 +1283,25 @@ mod tests {
         mem.shadow_s2mm_word(0x20_0000, 0xDD, 64); // outside the span asked for
         assert_eq!(
             mem.s2mm_stream_shadow_in(0x10_0000, 0x1000),
-            vec![(0x10_0000, 0xBB, 64), (0x10_0004, 0xCC, 64)]
+            vec![(0x10_0000, 0xBB, 64, 0), (0x10_0004, 0xCC, 64, 0)]
         );
         assert_eq!(mem.read_u32(0x10_0000), 0, "the shadow is not memory");
+    }
+
+    #[test]
+    fn each_shadow_word_names_the_pass_that_staged_it_last() {
+        // A buffer written again by a later run (a test dispatching one traced kernel many
+        // times): the later run's words carry its pass, the earlier run's remaining words theirs.
+        let mut mem = HostMemory::new();
+        mem.set_s2mm_stream_shadow(true);
+        mem.shadow_s2mm_word(0x10_0000, 1, 64);
+        mem.shadow_s2mm_word(0x10_0004, 2, 64);
+        mem.begin_s2mm_shadow_pass();
+        mem.shadow_s2mm_word(0x10_0000, 3, 64);
+        assert_eq!(
+            mem.s2mm_stream_shadow_in(0x10_0000, 0x100),
+            vec![(0x10_0000, 3, 64, 1), (0x10_0004, 2, 64, 0)]
+        );
     }
 
     #[test]

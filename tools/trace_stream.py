@@ -12,7 +12,9 @@ the trace buffer's words out as the buffer would be had every word been written,
 The trace buffer is the sidecar buffer of ``trace_raw.bin``'s size whose stream ``trace_raw.bin``
 is consistent with. The check (written to ``trace_stream.check``): in each run of the sidecar the
 host buffer holds a prefix of the run that ends on a burst boundary (or is the whole run, a BD that
-completed), the rest of the run unwritten, and nothing outside the runs.
+completed), the rest of the run unwritten (or, in a buffer several dispatches wrote, an earlier
+dispatch's bytes: each sidecar run names the pass, one per FFI run, that staged it last), and
+nothing outside the runs.
 
 usage: trace_stream.py DIR     (reads DIR/trace_raw.bin and DIR/trace_stream.json)
 exit 0: OK, trace_stream.bin written; 1: check failed; 2: inputs missing.
@@ -45,7 +47,12 @@ def _image(size: int, buffer: dict) -> bytearray:
 
 
 def _check_buffer(raw: bytes, buffer: dict) -> str | None:
-    """None when ``raw`` is consistent with ``buffer``'s stream, else why not."""
+    """None when ``raw`` is consistent with ``buffer``'s stream, else why not.
+
+    Per run: ``raw`` agrees with the run up to its first difference, which lies on a burst
+    boundary (a partial burst is never written) unless the run is whole; past it ``raw`` holds
+    zeros, or, in a buffer that several runs (dispatches) wrote, an earlier run's bytes."""
+    rewritten = len({run.get("pass", 0) for run in buffer["runs"]}) > 1
     covered = bytearray(len(raw))
     for run in buffer["runs"]:
         o = run["offset"]
@@ -56,16 +63,14 @@ def _check_buffer(raw: bytes, buffer: dict) -> str | None:
             return f"run at {o:#x} runs past the buffer"
         covered[o:end] = b"\x01" * len(b)
         held = raw[o:end]
-        # The written prefix: up to the last non-zero byte, to its word, then to the burst
-        # boundary (a stream word that happens to be zero does not end the write).
-        w0 = -(-len(held.rstrip(b"\0")) // 4) * 4
-        w = w0
-        if w < len(b) and (o + w) % burst:
-            w = min(-(-(o + w) // burst) * burst - o, len(b))
-        if held[:w0] != b[:w0]:
+        m = next((i for i in range(0, len(b), 4) if held[i:i + 4] != b[i:i + 4]), len(b))
+        if m == len(b):
+            continue
+        past = any(held[m:])
+        if past and not rewritten:
             return f"run at {o:#x}: the buffer's bytes are not a prefix of the stream"
-        if held[w0:w] != b[w0:w]:
-            return (f"run at {o:#x}: the buffer holds {w0} of {len(b)} bytes, "
+        if (o + m) % burst and not past:
+            return (f"run at {o:#x}: the buffer holds {m} of {len(b)} bytes, "
                     f"not whole {burst}-byte bursts")
     stray = next((i for i, (v, c) in enumerate(zip(raw, covered)) if v and not c), None)
     if stray is not None:
