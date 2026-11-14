@@ -66,17 +66,18 @@ pub struct DmaTimingConfig {
     /// 2026-05-25-shim-bd-chain-amortization.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
 
-    /// True one-shot cold-start latency for shim S2MM DMA.  Near-zero on
-    /// Phoenix -- pull direction never fills a DDR read pipeline.
-    pub shim_ddr_cold_start_s2mm_cycles: u16,
-
     /// Per-task overhead on shim MM2S DMA touching host memory, paid on
     /// EVERY task.  Distinct from `shim_ddr_cold_start_mm2s_cycles` which
     /// is one-shot per session.
     pub shim_per_task_overhead_mm2s_cycles: u16,
 
-    /// Per-task overhead on shim S2MM DMA touching host memory.
-    pub shim_per_task_overhead_s2mm_cycles: u16,
+    /// Shim S2MM host write latencies: a task's FINISHED_TASK comes at the later of its first
+    /// word + `shim_s2mm_first_write_cold_cycles` (the channel's first task) or
+    /// `shim_s2mm_first_write_cycles` (later tasks), and its last word +
+    /// `shim_s2mm_last_write_cycles`. See the archspec `DmaTiming` fields.
+    pub shim_s2mm_first_write_cold_cycles: u16,
+    pub shim_s2mm_first_write_cycles: u16,
+    pub shim_s2mm_last_write_cycles: u16,
 
     /// Shim MM2S host-memory read latency: a word read at cycle `t` can enter
     /// the stream at `t + latency`, and a BD finishes when its last read
@@ -94,11 +95,6 @@ pub struct DmaTimingConfig {
     /// rather than firing once on task 0.  Calibrated to ~310 (r=0.31)
     /// against 2026-05-27 N=50 K=8 HW.  Phase 2d warm-up-transient model.
     pub shim_warmup_decay_mm2s_permille: u16,
-
-    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
-    /// transient.  ~0 on Phoenix -- S2MM has no measurable tail past
-    /// task 0, so this preserves the pure one-shot cold-start.
-    pub shim_warmup_decay_s2mm_permille: u16,
 
     /// Memtile lock-release pipeline latency, in cycles, from BD completion
     /// (FINISHED_BD) to the cross-lock release landing on the semaphore.  Even
@@ -197,13 +193,13 @@ impl DmaTimingConfig {
             bd_chain_cycles: m.bd_chain_cycles,
             host_memory_latency_cycles: m.host_memory_latency_cycles,
             shim_ddr_cold_start_mm2s_cycles: m.shim_ddr_cold_start_mm2s_cycles,
-            shim_ddr_cold_start_s2mm_cycles: m.shim_ddr_cold_start_s2mm_cycles,
             shim_per_task_overhead_mm2s_cycles: m.shim_per_task_overhead_mm2s_cycles,
-            shim_per_task_overhead_s2mm_cycles: m.shim_per_task_overhead_s2mm_cycles,
+            shim_s2mm_first_write_cold_cycles: m.shim_s2mm_first_write_cold_cycles,
+            shim_s2mm_first_write_cycles: m.shim_s2mm_first_write_cycles,
+            shim_s2mm_last_write_cycles: m.shim_s2mm_last_write_cycles,
             shim_mm2s_read_latency_cycles: m.shim_mm2s_read_latency_cycles,
             shim_mm2s_read_window_bytes: m.shim_mm2s_read_window_bytes,
             shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,
-            shim_warmup_decay_s2mm_permille: m.shim_warmup_decay_s2mm_permille,
             // Non-shim first-BD pipeline-fill startup (#140).  Env-overridable
             // so the layer-2 calibration loop can sweep without rebuilding the
             // archspec crate; absent env leaves the model value (0) in place.

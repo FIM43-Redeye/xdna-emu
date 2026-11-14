@@ -206,13 +206,18 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // 2026-05-27-dispatch-overhead-multirun-structural-variance
             // and Phase 2c.3 recalibration.
             shim_ddr_cold_start_mm2s_cycles: 1330,
-            shim_ddr_cold_start_s2mm_cycles: 341,
             // MM2S per-task 325 is the shim read latency (issue -> stream,
             // `shim_mm2s_read_latency_cycles`) since the 2026-11-07 read-ahead
             // model: charged between each read and the stream, not before the
             // first read, so it is 0 here (never counted twice).
             shim_per_task_overhead_mm2s_cycles: 0,
-            shim_per_task_overhead_s2mm_cycles: 179,
+            // Shim S2MM: the words stream in from START_TASK + 6; the host write path sits after
+            // them (bridge corpus 2026-11, see the `DmaTiming` fields). These replace the
+            // 2026-05-27 per-task 179 and cold-start 341, which were charged before the first
+            // word and fitted to START -> FINISHED durations of tasks whose words were waiting.
+            shim_s2mm_first_write_cold_cycles: 620,
+            shim_s2mm_first_write_cycles: 165,
+            shim_s2mm_last_write_cycles: 150,
             // Shim MM2S read-ahead (NPU1 shim-inflight probe, 2026-11-07). See
             // the DmaTiming field docs for the bounds.
             shim_mm2s_read_latency_cycles: 325,
@@ -220,11 +225,8 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             // Warm-up transient: the MM2S cold-start cost decays
             // geometrically across a task chain rather than firing once.
             // Fit against 2026-05-27 N=50 K=8 HW (durations 1739/804/497/
-            // 422/... -> cold_start * 0.310^i over steady-state).  S2MM has
-            // no measurable tail (excess at i=1 within noise of 0), so its
-            // decay is 0 -- pure one-shot cold-start preserved.  Phase 2d.
+            // 422/... -> cold_start * 0.310^i over steady-state).  Phase 2d.
             shim_warmup_decay_mm2s_permille: 310,
-            shim_warmup_decay_s2mm_permille: 0,
             // Non-shim per-channel first-BD pipeline-fill (STARTING phase).
             // Default 0 = behavior-preserving; calibrated against #140
             // layer-2 add_one ping-pong HW data once the structural plumbing

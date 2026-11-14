@@ -773,12 +773,11 @@ fn test_first_bd_bonus_rearms_after_idle() {
 
 /// Shim DDR timing decomposes into three terms (chain-sweep calibration
 /// 2026-05-25): channel_start_cycles (every task, all tiles),
-/// shim_per_task_overhead_{mm2s,s2mm} (every task on shim+host), and
-/// shim_ddr_cold_start_{mm2s,s2mm} (once per channel session, on shim+host).
+/// shim_per_task_overhead_mm2s (every task on a shim MM2S over host memory), and
+/// shim_ddr_cold_start_mm2s (once per channel session). A shim S2MM pays none
+/// before its words; its host write latencies follow them.
 ///
 /// On compute / non-host transfers the bonus is `channel_start_cycles` only.
-/// On shim+host transfers the bonus includes the per-task overhead always,
-/// plus the cold-start on the FIRST task of the session.
 #[test]
 fn test_shim_ddr_timing_decomposition() {
     let cfg = DmaTimingConfig::default();
@@ -790,17 +789,18 @@ fn test_shim_ddr_timing_decomposition() {
     // cold-start against K=1 totals and per-task against K=4+ steady-
     // state simultaneously.
     assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, 1330);
-    assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, 341);
+    // Shim S2MM: no start cost; the host write latencies after its words (bridge corpus 2026-11).
+    assert_eq!(cfg.shim_s2mm_first_write_cold_cycles, 620);
+    assert_eq!(cfg.shim_s2mm_first_write_cycles, 165);
+    assert_eq!(cfg.shim_s2mm_last_write_cycles, 150);
     // The MM2S 325 is now the shim read latency, charged between each read
     // and the stream (readahead_tests), so it is not also a per-task cost.
     assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 0);
     assert_eq!(cfg.shim_mm2s_read_latency_cycles, 325);
-    assert_eq!(cfg.shim_per_task_overhead_s2mm_cycles, 179);
     assert_eq!(cfg.shim_words_per_cycle, 1);
-    // Phase 2d warm-up transient decay ratios (per-mille).  MM2S decays the
-    // cold-start across the chain (r~0.31); S2MM has no tail (one-shot).
+    // Phase 2d warm-up transient decay ratio (per-mille): MM2S decays the
+    // cold-start across the chain (r~0.31).
     assert_eq!(cfg.shim_warmup_decay_mm2s_permille, 310);
-    assert_eq!(cfg.shim_warmup_decay_s2mm_permille, 0);
 
     // stop_channel re-arms BOTH gates (channel reset == fresh boot).
     let mut engine = DmaEngine::new_shim_tile(0, 0);
@@ -841,11 +841,11 @@ fn test_shim_mm2s_warmup_transient_decays_geometrically() {
     assert_eq!(seq, vec![1332, 414, 129, 41, 14, 5]);
 }
 
-/// S2MM warm-up decay is 0 on Phoenix: the cold-start fires once on task 0
-/// and subsequent tasks pay only the per-task overhead.  Guards that the
-/// Phase 2d geometric model leaves the S2MM direction's behavior unchanged.
+/// A shim S2MM pays no host-memory cost before its words (they stream in from START_TASK + 6;
+/// the host write latencies follow them, `retire_written_bd`): only `channel_start` where the
+/// path pays it. The session's first task marks its first write cold, later tasks warm.
 #[test]
-fn test_shim_s2mm_warmup_has_no_tail() {
+fn test_shim_s2mm_pays_no_start_cost_and_marks_only_its_first_task_cold() {
     let mut engine = DmaEngine::new_shim_tile(0, 0);
     let bd = BdConfig::simple_1d(0x1000, 16);
     let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 0, 0, engine.tile_kind).unwrap();
@@ -854,11 +854,10 @@ fn test_shim_s2mm_warmup_has_no_tail() {
     let mut seq = Vec::new();
     for _ in 0..3 {
         engine.channels[0].is_first_bd = true;
-        seq.push(engine.consume_first_bd_bonus(0, &transfer, true));
+        let bonus = engine.consume_first_bd_bonus(0, &transfer, true);
+        seq.push((bonus, engine.channels[0].host_write_cold));
     }
-
-    // channel_start(2) + per_task_s2mm(179) + cold_start(341) only on task 0.
-    assert_eq!(seq, vec![522, 181, 181]);
+    assert_eq!(seq, vec![(2, true), (2, false), (2, false)]);
 }
 
 /// #140 layer-2: non-shim DMA channels (memtile / compute) carry a
@@ -4605,6 +4604,8 @@ fn a_shim_s2mm_opens_its_ingress_once_it_holds_a_task() {
     shim.configure_bd(4, BdConfig::simple_1d(0x100, 64).with_acquire(5, -1))
         .unwrap();
     assert!(shim.enqueue_task(0, 4, 0, false));
+    assert_eq!(shim.channel_input_capacity(0), idle, "the stream side opens at START_TASK + 6");
+    shim.set_current_cycle(xdna_archspec::aie2::timing::DMA_S2MM_STARVATION_ARM_CYCLES as u64);
     assert_eq!(shim.channel_input_capacity(0), idle + depth, "a parked task opens the ingress");
 
     let mut compute = DmaEngine::new_compute_tile(1, 2);
@@ -4777,6 +4778,10 @@ struct StarvationRig {
     levels: Vec<bool>,
     first_cycle: u64,
     accepted: usize,
+    /// Absolute cycles in which a beat entered the channel's ingress.
+    accepted_at: Vec<u64>,
+    /// Absolute cycles of channel 0's FINISHED_TASK events.
+    finished_task_at: Vec<u64>,
 }
 
 impl StarvationRig {
@@ -4803,6 +4808,8 @@ impl StarvationRig {
             levels: Vec::new(),
             first_cycle: 100,
             accepted: 0,
+            accepted_at: Vec::new(),
+            finished_task_at: Vec::new(),
         }
     }
 
@@ -4830,13 +4837,18 @@ impl StarvationRig {
             let word = StreamData { data: 0xC0DE_0000 | c as u32, tlast: false, channel: 0 };
             assert!(self.eng.push_stream_in(word));
             self.accepted += 1;
+            self.accepted_at.push(c);
         }
         self.eng.settle_stream_starvation();
 
         for (cycle, event) in self.eng.drain_trace_events() {
-            if let EventType::DmaStreamStarvation { channel: 0, active } = event {
-                assert_eq!(cycle, c, "the level edge must be stamped with the cycle that caused it");
-                self.level = active;
+            match event {
+                EventType::DmaStreamStarvation { channel: 0, active } => {
+                    assert_eq!(cycle, c, "the level edge must be stamped with the cycle that caused it");
+                    self.level = active;
+                }
+                EventType::DmaFinishedTask { channel: 0 } => self.finished_task_at.push(cycle),
+                _ => {}
             }
         }
         self.levels.push(self.level);
@@ -4963,40 +4975,133 @@ fn start_shim_host_bd(rig: &mut StarvationRig, words: u32) {
     rig.first_cycle = rig.cycle;
 }
 
+/// Words relative to the rig's task start, in the cycles they entered the channel's ingress.
+fn accepted_rel(rig: &StarvationRig) -> Vec<u64> {
+    rig.accepted_at.iter().map(|c| c - rig.first_cycle).collect()
+}
+
+/// Silicon (bridge corpus 2026-11, three samples each): a source parked on a full path into a
+/// shim S2MM restarts 13 cycles after the shim's START_TASK and then runs without a gap for the
+/// whole BD (memtile_dmas_dma_configure_task_runtime_len.1 / .3 / .8: 496 / 1520 / 4080 words
+/// after the 16 parked), and the shim's STREAM_STARVATION pulses once at START + 14, when the
+/// 8 words its own switch held have gone at one a cycle from + 6. So the stream side takes
+/// words from START_TASK + 6, one a cycle, and its host writes never hold it back: no part of
+/// the host write path sits in front of the data.
+#[test]
+fn shim_s2mm_takes_words_from_start_plus_six_one_a_cycle_without_a_stall() {
+    let mut rig = StarvationRig::shim();
+    let master_fifo = rig.eng.input_fifo_capacity() as u64;
+    start_shim_host_bd(&mut rig, 1024);
+    rig.run(1200, |_| true);
+    // The switch's master-port FIFO holds its words before the start; the channel takes the
+    // rest one a cycle from + 6.
+    let expect: Vec<u64> = (0..master_fifo).chain(ARM..ARM + 1024 - master_fifo).collect();
+    assert_eq!(accepted_rel(&rig), expect);
+    assert!(rig.high_runs().is_empty(), "never starved: a word was waiting in every cycle");
+}
+
 /// Silicon (bridge corpus, every sample of add_maskwrite, core_dmas_dma_configure_task_lock,
-/// runtime_cumsum and objectfifo_repeat_*): a shim S2MM started with no word waiting raises
-/// STREAM_STARVATION at START_TASK + 6, the same arming delay as a lock-stalled tile S2MM, and
-/// holds it until the first word arrives. The channel's memory side is still in its start
-/// hold then (the fitted DDR start cost); its stream side is not.
+/// runtime_cumsum, memtile_dmas_dma_configure_task_lock and objectfifo_repeat_*): a shim S2MM
+/// started with no word waiting raises STREAM_STARVATION at START_TASK + 6 and holds it until
+/// the first word arrives; the words then run in without a gap (a 4096-word memtile source
+/// runs contiguously from its first word).
 #[test]
-fn shim_s2mm_raises_starvation_six_cycles_after_start_while_no_word_is_waiting() {
+fn shim_s2mm_starves_from_start_plus_six_until_its_first_word() {
     let mut rig = StarvationRig::shim();
     start_shim_host_bd(&mut rig, 16);
-    rig.run(700, |at| at >= 30);
-    assert_eq!(rig.high_runs(), vec![(ARM, 29)], "high from +6 until the first beat, then low");
-    assert_eq!(rig.eng.channels[0].fsm.phase_name(), "Idle", "the BD completed");
+    rig.run(400, |at| at >= 200);
+    // The running transfer reads its ingress before the routing pass delivers the cycle's word,
+    // so its level falls the cycle after the first offer.
+    assert_eq!(rig.high_runs(), vec![(ARM, 200)]);
+    assert_eq!(accepted_rel(&rig), (200..216).collect::<Vec<u64>>());
 }
 
-/// Words already waiting when the task starts: no starvation from the start hold (silicon has
-/// a 1-cycle pulse at START + 14, and a second at + 23 on some routes, not modelled).
-#[test]
-fn shim_s2mm_with_words_waiting_does_not_starve_in_its_start_hold() {
-    let mut rig = StarvationRig::shim();
-    start_shim_host_bd(&mut rig, 16);
-    rig.run(700, |_| true);
-    assert!(rig.high_runs().is_empty());
+/// A task's FINISHED_TASK waits for its host writes (silicon, bridge corpus 2026-11): it comes
+/// `shim_s2mm_first_write_*` after the task's first word and `shim_s2mm_last_write_cycles` after
+/// its last, whichever is later. On a channel's first task the first write is the slow, cold one.
+fn finished_rel(rig: &StarvationRig) -> Vec<u64> {
+    rig.finished_task_at.iter().map(|c| c - rig.first_cycle).collect()
 }
 
-/// No word for longer than the start hold: one level, from + 6, across the hand-over to the
-/// running transfer's own starvation. The transfer's level falls in the cycle after the first
-/// beat is offered (it reads its ingress before the routing pass delivers the word), one cycle
-/// later than the start hold's, which sees the offer itself.
+/// Cold, short, words waiting (silicon: dmabd_task_queue, runtime_cumsum's first task, the
+/// 1-word sync_task_complete_token tasks: FINISHED 526..1012 after the first word, typically
+/// about 620; the cold write dominates a short task).
 #[test]
-fn shim_s2mm_start_starvation_hands_over_to_the_transfer_without_a_dip() {
+fn shim_s2mm_first_task_finishes_its_cold_first_write_after_its_first_word() {
+    let mut rig = StarvationRig::shim();
+    let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(1000, |_| true);
+    assert_eq!(finished_rel(&rig), vec![ARM + cold]);
+}
+
+/// Cold, long (silicon: core_dmas_dma_configure_task_lock 1024 words FINISHED 1180..1199 after
+/// the first word, memtile 4096-word tasks 4252..4265): the cold first write is hidden behind
+/// the data, and the task finishes its last write's latency after its last word.
+#[test]
+fn shim_s2mm_long_first_task_finishes_after_its_last_word() {
+    let mut rig = StarvationRig::shim();
+    let last = rig.eng.timing_config.shim_s2mm_last_write_cycles as u64;
+    start_shim_host_bd(&mut rig, 1024);
+    rig.run(1400, |_| true);
+    assert_eq!(finished_rel(&rig), vec![ARM + 1023 + last]);
+}
+
+/// Words that arrive late: the cold write is counted from the first word, not from the start
+/// (silicon dmabd_task_queue: first word 916..5289 after START_TASK, FINISHED 543..1012 after
+/// it).
+#[test]
+fn shim_s2mm_idle_first_task_counts_its_cold_write_from_the_first_word() {
+    let mut rig = StarvationRig::shim();
+    let cold = rig.eng.timing_config.shim_s2mm_first_write_cold_cycles as u64;
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(1200, |at| at >= 300);
+    // The word offered at + 300 is taken from the ingress at + 301.
+    assert_eq!(finished_rel(&rig), vec![301 + cold]);
+}
+
+/// A later task of the channel is warm (silicon: runtime_cumsum tasks 2..7 with 16 words and
+/// sync_task_complete_token's with 1 word waiting both FINISH at START + 171..172 in most of
+/// their samples, local_reset_core 179..180).
+#[test]
+fn shim_s2mm_later_task_finishes_warm_after_its_words() {
+    for words in [1u32, 16] {
+        let mut rig = StarvationRig::shim();
+        start_shim_host_bd(&mut rig, words);
+        rig.run(1000, |_| true);
+        assert_eq!(rig.finished_task_at.len(), 1, "the first, cold task finished");
+        start_shim_host_bd(&mut rig, words);
+        rig.finished_task_at.clear();
+        rig.run(400, |_| true);
+        assert_eq!(finished_rel(&rig), vec![171], "{words} words");
+    }
+}
+
+/// The channel moves on while its writes are outstanding: a task started once the first task's
+/// words are all in takes its own words at once, long before the first task has FINISHED.
+/// (Not measured: no corpus test starts a shim S2MM task within a write latency of the previous
+/// one's last word. The shim MM2S read side behaves this way, `retire_issued_bd`.)
+#[test]
+fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     let mut rig = StarvationRig::shim();
     start_shim_host_bd(&mut rig, 16);
-    rig.run(800, |at| at >= 700);
-    assert_eq!(rig.high_runs(), vec![(ARM, 700)]);
+    rig.run(40, |_| true);
+    assert_eq!(rig.accepted, 16);
+    assert!(rig.finished_task_at.is_empty(), "the first task's cold write is still outstanding");
+
+    rig.eng.configure_bd(1, BdConfig::simple_1d(0x800, 16 * 4)).unwrap();
+    rig.eng.set_current_cycle(rig.cycle);
+    rig.eng.start_channel(0, 1).unwrap();
+    let second = rig.cycle;
+    rig.run(1000, |_| true);
+    assert_eq!(rig.accepted, 32);
+    let master_fifo = rig.eng.input_fifo_capacity() as u64;
+    let taken: Vec<u64> = rig.accepted_at[16..].iter().map(|c| c - second).collect();
+    let expect: Vec<u64> = (0..master_fifo).chain(ARM..ARM + 16 - master_fifo).collect();
+    assert_eq!(taken, expect);
+    // Completions leave in task order, so the warm second task waits behind the cold first.
+    assert_eq!(rig.finished_task_at.len(), 2, "both tasks finish");
+    assert!(rig.finished_task_at[0] <= rig.finished_task_at[1]);
 }
 
 #[test]

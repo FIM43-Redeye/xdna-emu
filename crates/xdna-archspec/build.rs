@@ -447,20 +447,26 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
-            "    pub const DMA_SHIM_DDR_COLD_START_S2MM_CYCLES: u16 = {};",
-            t.dma.shim_ddr_cold_start_s2mm_cycles
-        )
-        .unwrap();
-        writeln!(
-            out,
             "    pub const DMA_SHIM_PER_TASK_OVERHEAD_MM2S_CYCLES: u16 = {};",
             t.dma.shim_per_task_overhead_mm2s_cycles
         )
         .unwrap();
         writeln!(
             out,
-            "    pub const DMA_SHIM_PER_TASK_OVERHEAD_S2MM_CYCLES: u16 = {};",
-            t.dma.shim_per_task_overhead_s2mm_cycles
+            "    pub const DMA_SHIM_S2MM_FIRST_WRITE_COLD_CYCLES: u16 = {};",
+            t.dma.shim_s2mm_first_write_cold_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_S2MM_FIRST_WRITE_CYCLES: u16 = {};",
+            t.dma.shim_s2mm_first_write_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_S2MM_LAST_WRITE_CYCLES: u16 = {};",
+            t.dma.shim_s2mm_last_write_cycles
         )
         .unwrap();
         writeln!(
@@ -479,12 +485,6 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             out,
             "    pub const DMA_SHIM_WARMUP_DECAY_MM2S_PERMILLE: u16 = {};",
             t.dma.shim_warmup_decay_mm2s_permille
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "    pub const DMA_SHIM_WARMUP_DECAY_S2MM_PERMILLE: u16 = {};",
-            t.dma.shim_warmup_decay_s2mm_permille
         )
         .unwrap();
         writeln!(

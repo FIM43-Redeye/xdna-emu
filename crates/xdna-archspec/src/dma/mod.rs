@@ -95,18 +95,21 @@ pub struct DmaTimingConfig {
     /// subsequent tasks even with gaps.  See `DmaTiming` docstring.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
 
-    /// True one-shot cold-start latency for shim S2MM DMA, once per
-    /// channel per session.  Near-zero on Phoenix (write side has no DDR
-    /// read pipeline to fill).  See `DmaTiming` docstring.
-    pub shim_ddr_cold_start_s2mm_cycles: u16,
-
     /// Per-task overhead on shim MM2S DMA, paid on every task.  Covers
     /// BD programming + per-task AXI burst arbitration.  Distinct from
     /// `shim_ddr_cold_start_mm2s_cycles` (one-shot per channel).
     pub shim_per_task_overhead_mm2s_cycles: u16,
 
-    /// Per-task overhead on shim S2MM DMA, paid on every task.
-    pub shim_per_task_overhead_s2mm_cycles: u16,
+    /// Shim S2MM: a channel's first task finishes at least this long after its first word
+    /// (the cold host write). See `DmaTiming`.
+    pub shim_s2mm_first_write_cold_cycles: u16,
+
+    /// Shim S2MM: a later task finishes at least this long after its first word. See
+    /// `DmaTiming`.
+    pub shim_s2mm_first_write_cycles: u16,
+
+    /// Shim S2MM: a task finishes at least this long after its last word. See `DmaTiming`.
+    pub shim_s2mm_last_write_cycles: u16,
 
     /// Shim MM2S host-memory read latency (issue to stream).  See `DmaTiming`.
     pub shim_mm2s_read_latency_cycles: u16,
@@ -119,10 +122,6 @@ pub struct DmaTimingConfig {
     /// task index `i` within a channel session, so the cold-start cost
     /// fades across the chain instead of firing once.  See `DmaTiming`.
     pub shim_warmup_decay_mm2s_permille: u16,
-
-    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
-    /// transient.  ~0 on Phoenix (no measurable tail past task 0).
-    pub shim_warmup_decay_s2mm_permille: u16,
 
     /// One-time-per-channel-session pipeline-fill (STARTING phase) for memtile
     /// DMA channels, paid on the first task only.  See `DmaTiming`.  Default 0.

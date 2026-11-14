@@ -121,10 +121,15 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         unsourced("dma.bd_chain_cycles", "No source. Read only on the repeat-count restart path; linked chains take the prefetch bypass."),
         unsourced("dma.host_memory_latency_cycles", "Placeholder 0: folded into the per-direction shim cold-start values."),
         measured("dma.shim_ddr_cold_start_mm2s_cycles", SHIM_2C, "Fitted, not first-principles; the DDR read path is bimodal on silicon."),
-        measured("dma.shim_ddr_cold_start_s2mm_cycles", SHIM_2C, "Fitted."),
         measured("dma.shim_per_task_overhead_mm2s_cycles", SHIM_2C, "Fitted 325, re-read 2026-11-07 as the shim read \
             latency (dma.shim_mm2s_read_latency_cycles); 0 so it is not counted twice."),
-        measured("dma.shim_per_task_overhead_s2mm_cycles", SHIM_2C, "Fitted."),
+        measured("dma.shim_s2mm_first_write_cold_cycles", "NPU1 bridge corpus 2026-11 (three samples a test): short \
+            first tasks finish 526..1012 after their first word, the most repeatable 610..640", "Representative of a \
+            jittery, test-dependent host latency; what makes a first write cold is not determined."),
+        measured("dma.shim_s2mm_first_write_cycles", "NPU1 bridge corpus 2026-11: warm 1-word and 16-word tasks with their \
+            words waiting finish at START_TASK + 171 / 172 (first word at + 6)", ""),
+        measured("dma.shim_s2mm_last_write_cycles", "NPU1 bridge corpus 2026-11: runtime_cumsum's warm 16-word tasks, last \
+            word at + 21, finish at + 171 / 172", "Long transfers finish 6..18 later."),
         measured("dma.shim_mm2s_read_latency_cycles", "NPU1 shim-inflight probe 2026-11-07: back-pressured shim MM2S \
             FINISHED 308-722 cycles after the release that issues its final read; 325 = the 2026-05-27 per-task MM2S \
             overhead moved between issue and stream (free-stream timings unchanged)", "Fitted, low end of the HW spread; \
@@ -134,8 +139,6 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             sharing across a shim tile's channels unprobed."),
         measured("dma.shim_warmup_decay_mm2s_permille", "NPU1 K=8 chain durations 1739/804/497/422 fit cold_start * 0.310^i \
             (xdna-emu-priv: research/findings/2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.md)", "Fitted."),
-        measured("dma.shim_warmup_decay_s2mm_permille", "Same campaign: no measurable S2MM tail (excess at i=1 within noise)",
-            "A measured zero, not a placeholder."),
         unsourced("dma.memtile_first_bd_startup_cycles", "Placeholder 0 (inert). The cold-start gap it was meant for was later \
             root-caused to the CORE_CONTROL reset, so it may never be needed."),
         unsourced("dma.compute_first_bd_startup_cycles", "Placeholder 0 (inert), as memtile_first_bd_startup_cycles."),

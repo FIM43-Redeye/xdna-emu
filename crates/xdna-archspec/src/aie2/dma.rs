@@ -74,13 +74,13 @@ impl DmaModel for Aie2DmaModel {
             bd_chain_cycles: timing::DMA_BD_CHAIN_CYCLES,
             host_memory_latency_cycles: timing::DMA_HOST_MEMORY_LATENCY_CYCLES,
             shim_ddr_cold_start_mm2s_cycles: timing::DMA_SHIM_DDR_COLD_START_MM2S_CYCLES,
-            shim_ddr_cold_start_s2mm_cycles: timing::DMA_SHIM_DDR_COLD_START_S2MM_CYCLES,
             shim_per_task_overhead_mm2s_cycles: timing::DMA_SHIM_PER_TASK_OVERHEAD_MM2S_CYCLES,
-            shim_per_task_overhead_s2mm_cycles: timing::DMA_SHIM_PER_TASK_OVERHEAD_S2MM_CYCLES,
+            shim_s2mm_first_write_cold_cycles: timing::DMA_SHIM_S2MM_FIRST_WRITE_COLD_CYCLES,
+            shim_s2mm_first_write_cycles: timing::DMA_SHIM_S2MM_FIRST_WRITE_CYCLES,
+            shim_s2mm_last_write_cycles: timing::DMA_SHIM_S2MM_LAST_WRITE_CYCLES,
             shim_mm2s_read_latency_cycles: timing::DMA_SHIM_MM2S_READ_LATENCY_CYCLES,
             shim_mm2s_read_window_bytes: timing::DMA_SHIM_MM2S_READ_WINDOW_BYTES,
             shim_warmup_decay_mm2s_permille: timing::DMA_SHIM_WARMUP_DECAY_MM2S_PERMILLE,
-            shim_warmup_decay_s2mm_permille: timing::DMA_SHIM_WARMUP_DECAY_S2MM_PERMILLE,
             memtile_first_bd_startup_cycles: timing::DMA_MEMTILE_FIRST_BD_STARTUP_CYCLES,
             compute_first_bd_startup_cycles: timing::DMA_COMPUTE_FIRST_BD_STARTUP_CYCLES,
         }
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(cfg.bd_chain_cycles, timing::DMA_BD_CHAIN_CYCLES);
         assert_eq!(cfg.host_memory_latency_cycles, timing::DMA_HOST_MEMORY_LATENCY_CYCLES);
         assert_eq!(cfg.shim_ddr_cold_start_mm2s_cycles, timing::DMA_SHIM_DDR_COLD_START_MM2S_CYCLES);
-        assert_eq!(cfg.shim_ddr_cold_start_s2mm_cycles, timing::DMA_SHIM_DDR_COLD_START_S2MM_CYCLES);
+        assert_eq!(cfg.shim_s2mm_first_write_cold_cycles, timing::DMA_SHIM_S2MM_FIRST_WRITE_COLD_CYCLES);
     }
 
     #[test]

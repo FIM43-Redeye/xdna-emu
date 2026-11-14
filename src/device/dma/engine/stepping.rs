@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::device::bank_arbiter::Requester;
-use crate::device::dma::channel::{PendingReadCompletion, PendingRelease};
+use crate::device::dma::channel::{PendingHostCompletion, PendingRelease};
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
 
@@ -315,6 +315,20 @@ impl DmaEngine {
     fn uses_read_ahead(&self, transfer: &Transfer) -> bool {
         self.tile_kind.is_shim()
             && transfer.direction == TransferDirection::MM2S
+            && transfer.involves_host_memory()
+    }
+
+    /// Does this transfer write host memory through a shim S2MM?
+    ///
+    /// Its stream side takes words from START_TASK + 6, one a cycle, and the host
+    /// write path never holds it back; each BD completes when its writes are
+    /// acknowledged, after its words (`retire_written_bd`). NPU1 silicon, bridge
+    /// corpus 2026-11: a parked source restarts at START + 13 and runs its whole BD
+    /// (up to 4096 words) without a gap, and FINISHED_TASK follows the words by the
+    /// write latencies in `DmaTiming::shim_s2mm_*_write_*`.
+    fn uses_host_write_path(&self, transfer: &Transfer) -> bool {
+        self.tile_kind.is_shim()
+            && transfer.direction == TransferDirection::S2MM
             && transfer.involves_host_memory()
     }
 
@@ -898,11 +912,11 @@ impl DmaEngine {
                 ch.lock_port.update(&ch.word_clock, &ch.egress_queue, now);
             }
 
-            // BDs whose last read returns this cycle complete now: after the FSM
-            // step, so a BD whose last read issued this very cycle with zero
-            // latency completes in the same cycle.
-            if !self.channels[ch_idx].read_completions.is_empty() {
-                self.fire_read_completions(ch_idx, tile, neighbors);
+            // BDs whose last read returns (or whose writes are acknowledged) this
+            // cycle complete now: after the FSM step, so a BD whose memory side
+            // ends this very cycle with zero latency completes in the same cycle.
+            if !self.channels[ch_idx].host_completions.is_empty() {
+                self.fire_host_completions(ch_idx, tile, neighbors);
                 any_active = true;
             }
 
@@ -1098,17 +1112,17 @@ impl DmaEngine {
     ///   so the caller passes `false` there rather than subtracting it afterwards.
     ///   A compute MM2S does not come through MemoryLatency (word clock) and pays
     ///   no bonus.
-    /// - `shim_per_task_overhead_{mm2s,s2mm}_cycles`: per-task overhead on
-    ///   shim DMA touching host memory.  Fires on every task.  0 for MM2S:
-    ///   its calibrated 325 is the read latency, charged per read between
-    ///   issue and stream (`uses_read_ahead`).
-    /// - `shim_ddr_cold_start_{mm2s,s2mm}_cycles` decayed by
-    ///   `shim_warmup_decay_{mm2s,s2mm}_permille`: the warm-up transient.
-    ///   The cold-start cost (DDR read pipeline fill on MM2S / AXI setup on
-    ///   S2MM) is charged as `cold_start * (decay/1000)^i` at task index
-    ///   `i = warm_task_index`, so it decays geometrically across the chain
-    ///   instead of firing once.  MM2S fades over ~4 tasks (r~0.31); S2MM's
-    ///   decay is 0, so only task 0 pays cold-start (pure one-shot).  Phase 2d.
+    /// - `shim_per_task_overhead_mm2s_cycles`: per-task overhead on a shim MM2S
+    ///   reading host memory.  0: its calibrated 325 is the read latency,
+    ///   charged per read between issue and stream (`uses_read_ahead`).
+    /// - `shim_ddr_cold_start_mm2s_cycles` decayed by
+    ///   `shim_warmup_decay_mm2s_permille`: the warm-up transient, charged as
+    ///   `cold_start * (decay/1000)^i` at task index `i = warm_task_index`, so
+    ///   it decays geometrically across the chain (r~0.31).  Phase 2d.
+    ///
+    /// A shim S2MM over host memory pays none of these: its words stream in from
+    /// START_TASK + 6 and its host write latencies follow them (`retire_written_bd`);
+    /// here it only notes whether the task's first write is the session's cold one.
     ///
     /// `is_first_bd` is reset to true by `after_transfer_done` (Idle re-entry)
     /// and by `stop_channel`; `warm_task_index` increments per task and is
@@ -1129,52 +1143,36 @@ impl DmaEngine {
             0
         };
         if self.tile_kind.is_shim() && transfer.involves_host_memory() {
-            // SP-4a (#140): when the shim S2MM cold-start drain THROTTLE is
-            // enabled, the FIRST host-memory S2MM task charges its ENTIRE
-            // cold-start -- both the per-task overhead AND the DDR cold-start --
-            // as a metered POST-arrival ingress->DDR drain (see
-            // `do_transfer_cycle`), NOT as a pre-transfer `MemoryLatency` hold.
-            // HW starts Transferring promptly and starves on the empty ingress
-            // (~+13); charging the overhead pre-transfer instead blocks the
-            // ingress drain and inflates first-starvation (measured +190, of
-            // which 179 is the per-task overhead residual -- FINDING.md). The
-            // metered drain (cooldown/decay) is thus the sole model of the
-            // cold-start transient for the throttled first task.
-            let throttle_s2mm_first = transfer.direction == TransferDirection::S2MM
-                && self.timing_config.shim_s2mm_cold_drain_cooldown_cycles > 0
-                && self.channels[ch_idx].warm_task_index == 0;
-            if throttle_s2mm_first {
-                self.channels[ch_idx].cold_drain_armed = true;
-                self.channels[ch_idx].cold_drain_cooldown =
-                    self.timing_config.shim_s2mm_cold_drain_cooldown_cycles;
-                self.channels[ch_idx].cold_drain_word_index = 0;
-            } else {
-                // Per-task overhead fires on every (non-throttled) task.
-                bonus += match transfer.direction {
-                    TransferDirection::MM2S => self.timing_config.shim_per_task_overhead_mm2s_cycles,
-                    TransferDirection::S2MM => self.timing_config.shim_per_task_overhead_s2mm_cycles,
-                };
-                // Warm-up transient: the cold-start cost decays geometrically
-                // across the task chain rather than firing once.  At task index
-                // `i` the channel pays cold_start * (decay/1000)^i -- i=0 is the
-                // full cold-start, and the tail fades over ~4 tasks.  MM2S has
-                // a real decay (r~0.31); S2MM's decay is 0, so it pays only the
-                // one-shot cold-start at i=0, preserving prior behavior.  Phase 2d.
-                let (cold_start, decay_permille) = match transfer.direction {
-                    TransferDirection::MM2S => (
-                        self.timing_config.shim_ddr_cold_start_mm2s_cycles,
-                        self.timing_config.shim_warmup_decay_mm2s_permille,
-                    ),
-                    TransferDirection::S2MM => (
-                        self.timing_config.shim_ddr_cold_start_s2mm_cycles,
-                        self.timing_config.shim_warmup_decay_s2mm_permille,
-                    ),
-                };
-                let mut term = cold_start as u32;
-                for _ in 0..self.channels[ch_idx].warm_task_index {
-                    term = term * decay_permille as u32 / 1000;
+            match transfer.direction {
+                TransferDirection::S2MM => {
+                    // A shim S2MM pays nothing before its words: its stream side takes them from
+                    // START_TASK + 6 and its host write latencies come after them
+                    // (`retire_written_bd`). The task's first write is the cold one on the
+                    // channel's first task of the session.
+                    let cold = self.channels[ch_idx].warm_task_index == 0;
+                    self.channels[ch_idx].host_write_cold = cold;
+                    self.channels[ch_idx].first_write_acked_at = None;
+                    // SP-4a (#140, opt-in, default off): a metered post-arrival drain for the
+                    // first task. Silicon streams that task without a stall (bridge corpus
+                    // 2026-11), so this stays an experiment knob.
+                    if cold && self.timing_config.shim_s2mm_cold_drain_cooldown_cycles > 0 {
+                        self.channels[ch_idx].cold_drain_armed = true;
+                        self.channels[ch_idx].cold_drain_cooldown =
+                            self.timing_config.shim_s2mm_cold_drain_cooldown_cycles;
+                        self.channels[ch_idx].cold_drain_word_index = 0;
+                    }
                 }
-                bonus += term as u16;
+                TransferDirection::MM2S => {
+                    bonus += self.timing_config.shim_per_task_overhead_mm2s_cycles;
+                    // Warm-up transient: the cold-start cost decays geometrically across the
+                    // task chain rather than firing once. At task index `i` the channel pays
+                    // cold_start * (decay/1000)^i; i=0 is the full cold-start. Phase 2d.
+                    let mut term = self.timing_config.shim_ddr_cold_start_mm2s_cycles as u32;
+                    for _ in 0..self.channels[ch_idx].warm_task_index {
+                        term = term * self.timing_config.shim_warmup_decay_mm2s_permille as u32 / 1000;
+                    }
+                    bonus += term as u16;
+                }
             }
             self.channels[ch_idx].warm_task_index += 1;
         } else {
@@ -1294,7 +1292,18 @@ impl DmaEngine {
                     } else {
                         // No lock needed -- insert header now, go to MemoryLatency.
                         self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                        if self.uses_word_clock(&transfer) {
+                        if self.uses_host_write_path(&transfer) {
+                            // A shim S2MM's stream side opens at START_TASK + 6
+                            // (`lock_wait_starve_from`, the S2MM arming delay); nothing of its
+                            // memory side waits in front of the words.
+                            let bonus = self.consume_first_bd_bonus(ch_idx, &transfer, false);
+                            debug_assert_eq!(bonus, 0, "a shim S2MM pays no first-BD bonus");
+                            let opens = self.channels[ch_idx].lock_wait_starve_from;
+                            match opens.saturating_sub(self.current_cycle + 1) {
+                                0 => ChannelFsm::Transferring { transfer },
+                                wait => ChannelFsm::MemoryLatency { cycles_remaining: wait as u16, transfer },
+                            }
+                        } else if self.uses_word_clock(&transfer) {
                             // A compute MM2S started from idle goes straight to its data phase:
                             // the word clock (`word_clock_mm2s_cycle`) starts at
                             // `word_clock_from`, and nothing touches memory before a granule
@@ -1579,6 +1588,7 @@ impl DmaEngine {
         // (`drain_read_ahead`); its read side stalling on a full window is not
         // a stream event.
         let read_ahead = self.uses_read_ahead(&transfer);
+        let host_write = self.uses_host_write_path(&transfer);
 
         match result {
             TransferCycleResult::Continue => {
@@ -1588,9 +1598,14 @@ impl DmaEngine {
                     self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
                     self.channels[ch_idx].prev_starving = false;
                 }
+                if host_write {
+                    self.note_host_write(ch_idx);
+                }
                 if transfer.remaining_bytes() == 0 {
                     if read_ahead {
                         self.retire_issued_bd(ch_idx, transfer, tile, neighbors)
+                    } else if host_write {
+                        self.retire_written_bd(ch_idx, transfer, tile, neighbors)
                     } else if self.uses_granule_writer(&transfer) {
                         // FINISHED_BD one cycle after the last write (silicon, sl family: a held
                         // 4-word BD written at its grant + 2 finishes at + 3).
@@ -1626,6 +1641,10 @@ impl DmaEngine {
                 // = 0 exactly, over 3 runs; see the event-semantics finding). So
                 // this must NOT touch the stream-side starvation level.
                 ChannelFsm::Transferring { transfer }
+            }
+            TransferCycleResult::FotFinish if host_write => {
+                self.note_host_write(ch_idx);
+                self.retire_written_bd(ch_idx, transfer, tile, neighbors)
             }
             TransferCycleResult::FotFinish => self.complete_or_hold(ch_idx, transfer, tile, neighbors),
             TransferCycleResult::Error => ChannelFsm::Error,
@@ -2010,7 +2029,7 @@ impl DmaEngine {
     /// A shim MM2S BD whose last read was issued this cycle (`uses_read_ahead`):
     /// queue its completion for the cycle that read returns -- lock release,
     /// FINISHED_BD, and on a task's last BD FINISHED_TASK and the TCT token
-    /// (`fire_read_completions`) -- and move the channel on now. The next BD
+    /// (`fire_host_completions`) -- and move the channel on now. The next BD
     /// or task issues behind it into the same window: silicon must, since a
     /// chained BD pays no per-BD read latency (cold start is per task) and
     /// dynamic_chain_passthrough's LIFO BD reuse is safe on HW only because
@@ -2019,6 +2038,57 @@ impl DmaEngine {
         &mut self,
         ch_idx: usize,
         transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        let ready_at = self.read_clock + self.timing_config.shim_mm2s_read_latency_cycles as u64;
+        self.retire_bd_at(ch_idx, transfer, ready_at, tile, neighbors)
+    }
+
+    /// A shim S2MM word went in this cycle (`uses_host_write_path`): the task's first one starts
+    /// its first host write's latency, cold on the channel's first task of the session.
+    fn note_host_write(&mut self, ch_idx: usize) {
+        let ch = &self.channels[ch_idx];
+        if ch.first_write_acked_at.is_none() {
+            let latency = if ch.host_write_cold {
+                self.timing_config.shim_s2mm_first_write_cold_cycles
+            } else {
+                self.timing_config.shim_s2mm_first_write_cycles
+            };
+            self.channels[ch_idx].first_write_acked_at = Some(self.read_clock + latency as u64);
+        }
+    }
+
+    /// A shim S2MM BD whose last word went in this cycle: queue its completion -- lock release,
+    /// FINISHED_BD and, on a task's last BD, FINISHED_TASK and the TCT token -- for when its
+    /// writes are acknowledged: its last word + `shim_s2mm_last_write_cycles`, and no earlier
+    /// than the task's first write (`note_host_write`). The channel moves on now, so a next BD
+    /// or task takes its words while these writes are outstanding, as the shim MM2S read side
+    /// does (`retire_issued_bd`); not measured for S2MM. Completions leave in order.
+    fn retire_written_bd(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        tile: &mut Tile,
+        neighbors: &mut NeighborTiles<'_>,
+    ) -> ChannelFsm {
+        let last = self.read_clock + self.timing_config.shim_s2mm_last_write_cycles as u64;
+        let ready_at = self.channels[ch_idx].first_write_acked_at.map_or(last, |first| first.max(last));
+        // Close a starvation level the transfer still holds (a FotFinish from a stalled state).
+        if self.channels[ch_idx].prev_starving {
+            self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8, active: false });
+            self.channels[ch_idx].prev_starving = false;
+        }
+        self.retire_bd_at(ch_idx, transfer, ready_at, tile, neighbors)
+    }
+
+    /// Move a channel on past a BD whose memory side is still in flight, queueing its completion
+    /// for engine step `ready_at` (`fire_host_completions`).
+    fn retire_bd_at(
+        &mut self,
+        ch_idx: usize,
+        transfer: Box<Transfer>,
+        ready_at: u64,
         tile: &mut Tile,
         neighbors: &mut NeighborTiles<'_>,
     ) -> ChannelFsm {
@@ -2033,7 +2103,6 @@ impl DmaEngine {
             channel: ch_idx as u8,
         };
         let release = transfer.release_lock.map(|lock| (lock, transfer.release_value));
-        let ready_at = self.read_clock + self.timing_config.shim_mm2s_read_latency_cycles as u64;
         // The token belongs to the task being retired: take it before a next
         // queued task reprograms the channel's task config, and put it back if
         // this BD did not end the task.
@@ -2047,7 +2116,7 @@ impl DmaEngine {
         if !task_end && token.is_some() {
             self.channels[ch_idx].task_config.enable_token_issue = true;
         }
-        self.channels[ch_idx].read_completions.push_back(PendingReadCompletion {
+        self.channels[ch_idx].host_completions.push_back(PendingHostCompletion {
             ready_at,
             completion,
             release,
@@ -2057,14 +2126,15 @@ impl DmaEngine {
         next
     }
 
-    /// Complete every read-ahead BD whose last read has returned (oldest first).
-    fn fire_read_completions(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
+    /// Complete every in-flight shim BD whose memory side is done (oldest first): a read-ahead
+    /// BD whose last read has returned, a host-write BD whose writes are acknowledged.
+    fn fire_host_completions(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborTiles<'_>) {
         while self.channels[ch_idx]
-            .read_completions
+            .host_completions
             .front()
             .is_some_and(|c| c.ready_at <= self.read_clock)
         {
-            let done = self.channels[ch_idx].read_completions.pop_front().expect("front checked");
+            let done = self.channels[ch_idx].host_completions.pop_front().expect("front checked");
             if let Some((lock_id, value)) = done.release {
                 if self.release_must_park(ch_idx, lock_id, tile, neighbors) {
                     self.channels[ch_idx].parked_releases.push_back((lock_id, value));

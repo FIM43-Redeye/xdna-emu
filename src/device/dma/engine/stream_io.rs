@@ -64,15 +64,17 @@ impl DmaEngine {
     }
 
     /// The ingress capacity of one S2MM channel: `input_fifo_capacity()`, plus on a shim the
-    /// channel's own ingress once it holds a task (silicon, shim-queue absorb probes: a shim MM2S
+    /// channel's own ingress once it holds a task and its stream side is open (silicon, shim-queue absorb probes: a shim MM2S
     /// into its own S2MM backpressures after 8 words while the S2MM has no task, after 76 while
     /// the task is parked on a lock acquire; see `DmaTiming::shim_s2mm_ingress_depth`).
     pub fn channel_input_capacity(&self, channel: u8) -> usize {
         let base = self.input_fifo_capacity();
-        let has_task = self
-            .channels
-            .get(channel as usize)
-            .is_some_and(|c| !matches!(c.fsm, ChannelFsm::Idle));
+        // The channel's ingress opens with its stream side, START_TASK + 6 (the S2MM arming delay):
+        // before then only the switch's own FIFOs hold the stream's words (silicon: a parked
+        // path into a shim S2MM drains from + 6, so its STREAM_STARVATION pulses at + 14).
+        let has_task = self.channels.get(channel as usize).is_some_and(|c| {
+            !matches!(c.fsm, ChannelFsm::Idle) && self.current_cycle >= c.lock_wait_starve_from
+        });
         if self.tile_kind.is_shim() && has_task {
             base + xdna_archspec::aie2::timing::DMA_SHIM_S2MM_INGRESS_DEPTH as usize
         } else {

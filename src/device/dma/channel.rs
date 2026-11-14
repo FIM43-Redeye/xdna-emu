@@ -85,11 +85,13 @@ pub struct StagedWord {
     pub ready_at: u64,
 }
 
-/// A shim MM2S BD whose reads have all been issued, waiting for its last read
-/// to return: then its lock release, FINISHED_BD and (on a task's last BD)
-/// FINISHED_TASK and TCT token happen (`ChannelContext::read_completions`).
+/// A shim BD whose memory side is still in flight: a shim MM2S BD whose reads have
+/// all been issued, waiting for its last read to return, or a shim S2MM BD whose
+/// words are all in, waiting for its writes to be acknowledged. Then its lock
+/// release, FINISHED_BD and (on a task's last BD) FINISHED_TASK and TCT token
+/// happen (`ChannelContext::host_completions`).
 #[derive(Debug, Clone)]
-pub struct PendingReadCompletion {
+pub struct PendingHostCompletion {
     /// Engine step at which the BD's last read returns.
     pub ready_at: u64,
     pub completion: CompletionInfo,
@@ -394,6 +396,15 @@ pub struct ChannelContext {
     /// stop_channel (channel reset == fresh boot).  Phase 2d.
     pub warm_task_index: u32,
 
+    /// Shim S2MM over host memory: the current task's first host write is the cold one (the
+    /// channel's first task of the session), set when the task starts.
+    pub host_write_cold: bool,
+
+    /// Shim S2MM over host memory: the engine step at which the current task's first host write
+    /// is acknowledged (its first word + `shim_s2mm_first_write_{cold_,}cycles`). `None` until
+    /// the task's first word is in. A BD of the task finishes no earlier.
+    pub first_write_acked_at: Option<u64>,
+
     /// BD-prefetch gate (Phase 2d.2): true once the channel has emitted the
     /// START_TASK event for the *next* queued task ahead of time, while still
     /// transferring the current one (HW loads the next BD into its second slot
@@ -575,9 +586,9 @@ pub struct ChannelContext {
     /// reads return, whatever the FSM is doing, so data keeps flowing after
     /// FINISHED. Empty on every other channel.
     pub read_ahead: VecDeque<ReturningRead>,
-    /// Shim MM2S BDs fully issued and waiting for their last read to return,
-    /// oldest first.
-    pub read_completions: VecDeque<PendingReadCompletion>,
+    /// Shim BDs whose memory side is still in flight (MM2S reads issued, S2MM writes
+    /// outstanding), oldest first.
+    pub host_completions: VecDeque<PendingHostCompletion>,
     /// Held level of the stream-side STREAM_BACKPRESSURE for a read-ahead
     /// channel: a returned word is waiting on a full output register.
     pub read_backpressure: bool,
@@ -659,6 +670,8 @@ impl ChannelContext {
             error_event_reported: false,
             is_first_bd: true,
             warm_task_index: 0,
+            host_write_cold: false,
+            first_write_acked_at: None,
             prefetch_start_emitted: false,
             controller_dispatch_index: 0,
             stats: ChannelStats::default(),
@@ -698,7 +711,7 @@ impl ChannelContext {
             access_settles_at: 0,
             access_from: 0,
             egress_backpressure: false,
-            read_completions: VecDeque::new(),
+            host_completions: VecDeque::new(),
             read_backpressure: false,
         }
     }
@@ -782,15 +795,15 @@ impl ChannelContext {
         self.fsm.is_active()
             || self.queued_bd.is_some()
             || !self.task_queue.is_empty()
-            || self.has_outstanding_reads()
+            || self.has_work_in_flight()
             || !self.parked_releases.is_empty()
     }
 
-    /// MM2S words still in flight after their BD: shim read-ahead words not
-    /// yet in the stream or BDs whose last read has not returned, and words in
-    /// a compute / memtile egress staging FIFO.
-    pub fn has_outstanding_reads(&self) -> bool {
-        !self.read_ahead.is_empty() || !self.read_completions.is_empty() || !self.egress_staging.is_empty()
+    /// Work still in flight after its BD: shim read-ahead words not yet in the
+    /// stream, shim BDs whose last read has not returned or whose writes are
+    /// not yet acknowledged, and words in a compute / memtile egress staging FIFO.
+    pub fn has_work_in_flight(&self) -> bool {
+        !self.read_ahead.is_empty() || !self.host_completions.is_empty() || !self.egress_staging.is_empty()
     }
 
     /// Access the in-flight Transfer, if any.
@@ -825,6 +838,8 @@ impl ChannelContext {
         self.error_event_reported = false;
         self.is_first_bd = true;
         self.warm_task_index = 0;
+        self.host_write_cold = false;
+        self.first_write_acked_at = None;
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
@@ -841,7 +856,7 @@ impl ChannelContext {
         self.accept_ooo_header = false;
         self.ooo_packets_remaining = 0;
         self.read_ahead.clear();
-        self.read_completions.clear();
+        self.host_completions.clear();
         self.read_backpressure = false;
         self.egress_staging.clear();
         self.egress_gap = 0;

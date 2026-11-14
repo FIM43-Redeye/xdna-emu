@@ -735,7 +735,7 @@ impl DmaEngine {
 
         let ch = &mut self.channels[ch_idx];
         ch.read_ahead.clear();
-        ch.read_completions.clear();
+        ch.host_completions.clear();
         ch.read_backpressure = false;
         ch.egress_staging.clear();
         ch.egress_gap = 0;
@@ -759,6 +759,8 @@ impl DmaEngine {
         ch.chain_start_bd = None;
         ch.is_first_bd = true;
         ch.warm_task_index = 0;
+        ch.host_write_cold = false;
+        ch.first_write_acked_at = None;
         ch.prefetch_start_emitted = false;
         ch.controller_dispatch_index = 0;
         ch.prev_starving = false;
@@ -857,7 +859,7 @@ impl DmaEngine {
         if ch_idx >= self.num_channels() {
             return false;
         }
-        self.channels[ch_idx].is_active() || self.channels[ch_idx].has_outstanding_reads()
+        self.channels[ch_idx].is_active() || self.channels[ch_idx].has_work_in_flight()
     }
 
     /// Whether an S2MM channel is started/live: an active FSM, a dispatched BD,
@@ -900,7 +902,7 @@ impl DmaEngine {
 
     /// Check if any channel is active.
     pub fn any_channel_active(&self) -> bool {
-        self.channels.iter().any(|ch| ch.is_active() || ch.has_outstanding_reads())
+        self.channels.iter().any(|ch| ch.is_active() || ch.has_work_in_flight())
     }
 
     /// Check if any channel has anything to do this cycle -- FSM mid-flight

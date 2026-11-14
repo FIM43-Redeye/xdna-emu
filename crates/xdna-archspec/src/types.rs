@@ -1206,16 +1206,6 @@ pub struct DmaTiming {
     /// the chain behavior right.  See finding
     /// 2026-05-25-shim-bd-chain-amortization.
     pub shim_ddr_cold_start_mm2s_cycles: u16,
-    /// True one-shot cold-start latency for shim S2MM DMA, once per
-    /// channel per session.  Near-zero on Phoenix: the write side of the
-    /// shim DMA doesn't have a DDR read pipeline to fill; the per-task
-    /// overhead is essentially all of the "cold-start" cost we previously
-    /// modeled.
-    ///
-    /// HW calibration (2026-05-25 chain-sweep delta): ~3 cyc, within noise
-    /// of 0.  Field retained for symmetry and in case future silicon has
-    /// a measurable S2MM cold-start.
-    pub shim_ddr_cold_start_s2mm_cycles: u16,
     /// Per-task overhead on shim MM2S DMA touching host memory, paid on
     /// every task (every Idle -> task transition), not just the first.
     /// Covers BD programming + AXI burst arbitration + per-task DDR
@@ -1225,13 +1215,38 @@ pub struct DmaTiming {
     /// HW calibration (chain-sweep K=8 steady-state, 2026-05-25):
     /// 249 cyc.  See finding 2026-05-25-shim-bd-chain-amortization.
     pub shim_per_task_overhead_mm2s_cycles: u16,
-    /// Per-task overhead on shim S2MM DMA touching host memory, paid on
-    /// every task.  Smaller than MM2S -- pulling out of memtile is
-    /// cheaper to set up than pushing into DDR.
+    /// Cycles from a shim S2MM task's first word to its FINISHED_TASK at the earliest, on a
+    /// channel's first task of the session (the cold host write): 620. The task finishes at
+    /// the later of this and `shim_s2mm_last_write_cycles` after its last word; the words
+    /// themselves stream in from START_TASK + 6, one a cycle, with nothing of the host write
+    /// path in front of them.
     ///
-    /// HW calibration (chain-sweep K=8 steady-state, 2026-05-25):
-    /// 168 cyc.
-    pub shim_per_task_overhead_s2mm_cycles: u16,
+    /// Measured (NPU1 bridge corpus, 2026-11-10 / 11 samples, three per test, Start-aligned trace
+    /// clocks): a short first task finishes 526..1012 cycles after its first word
+    /// (dmabd_task_queue 543 / 547 / 551 / 748 / 786 / 1009, runtime_cumsum 526 / 812 / 817), the
+    /// most repeatable tests about 610..640 (nd_memcpy_transforms, vec_chain_state_probe,
+    /// sync_task_complete_token_bd_chaining's 1-word task); 620 is taken from those. It is counted
+    /// from the first word, not from START_TASK: dmabd_task_queue's first word comes 916..5289
+    /// after its START and the task still finishes this long after the word. Not determined:
+    /// what selects a cold first write. Some first tasks are warm on silicon
+    /// (add_one_ctrl_packet_4_cores' and _col_overlay's channel 0, 128..162), some samples of
+    /// one test cold and others warm; the emulator takes the channel's first task of the session.
+    /// A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words: 1180..1199 after
+    /// the first word, its last write's latency after the last).
+    pub shim_s2mm_first_write_cold_cycles: u16,
+    /// Cycles from a later (warm) shim S2MM task's first word to its FINISHED_TASK at the
+    /// earliest: 165. Measured (NPU1 bridge corpus, 2026-11): with the words waiting, so the first
+    /// is taken at START_TASK + 6, sync_task_complete_token's 1-word tasks finish at START + 171
+    /// / 172 in 36 of 61 warm samples (177..179 in 17 more) and runtime_cumsum's 16-word tasks at
+    /// + 171 / 172 in 13 of 17; local_reset_core + 179 / 180. A 1-word task is set by this, not by
+    /// its last word.
+    pub shim_s2mm_first_write_cycles: u16,
+    /// Cycles from a shim S2MM task's last word to its FINISHED_TASK at the earliest: 150.
+    /// Measured (NPU1 bridge corpus, 2026-11): runtime_cumsum's warm 16-word tasks, last word at
+    /// START + 21 (the first at + 6, one a cycle, a one-cycle hold at + 14), finish at + 171 / 172.
+    /// Long transfers land 6..18 later (1024 words: 156..175 after the last word, 4096 words
+    /// 156..169, mostly 168; the write side of a long host stream is not modelled finer).
+    pub shim_s2mm_last_write_cycles: u16,
 
     /// Read latency of a shim MM2S host-memory read, in cycles: from the cycle
     /// a read issues to the cycle its data can enter the stream. A BD's
@@ -1278,12 +1293,6 @@ pub struct DmaTiming {
     /// excess.  See finding 2026-05-27-phase-2c-dispatch-overhead-recalibration
     /// ("Remaining gap") and the Phase 2d warm-up-transient model.
     pub shim_warmup_decay_mm2s_permille: u16,
-
-    /// Geometric decay ratio (per-mille) of the shim S2MM warm-up
-    /// transient.  ~0 on Phoenix: HW S2MM shows no measurable tail past
-    /// task 0 (excess at i=1 is within noise of zero), so S2MM keeps the
-    /// pure one-shot cold-start behavior.
-    pub shim_warmup_decay_s2mm_permille: u16,
 
     /// One-time-per-channel-session pipeline-FILL latency for memtile DMA
     /// channels, paid on the first task only.  The shim cold-start models the
