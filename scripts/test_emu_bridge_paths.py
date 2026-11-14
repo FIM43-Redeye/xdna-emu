@@ -133,6 +133,33 @@ class BridgePathTests(unittest.TestCase):
             self.assertNotIn("stamped (peano): cached", third.stdout, third.stdout)
             self.assertIn("COMPILE stamped (peano): OK", third.stdout, third.stdout)
 
+    def test_a_changed_mlir_recompiles_whatever_the_xclbins_are_called(self) -> None:
+        # A test whose build names its xclbins after the kernels (add_one_two:
+        # add_one.xclbin, add_two.xclbin) has no aie.xclbin; a changed MLIR
+        # (a changed trace preparation, say) must still force a recompile.
+        with tempfile.TemporaryDirectory() as tmp:
+            work_root = Path(tmp)
+            test_dir = work_root / "mlir-aie/test/npu-xrt/named"
+            test_dir.mkdir(parents=True)
+            (test_dir / "test.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+            (test_dir / "aie.mlir").write_text("// fixture v1\n", encoding="utf-8")
+            (test_dir / "run.lit").write_text(
+                "// RUN: touch add_one.xclbin add_two.xclbin test.exe\n", encoding="utf-8"
+            )
+            args = ("--no-trace", "--no-hw", "--no-emu", "^named$")
+
+            first = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE named (peano): OK", first.stdout, first.stdout)
+            second = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE named (peano): cached", second.stdout, second.stdout)
+
+            (test_dir / "aie.mlir").write_text("// fixture v2\n", encoding="utf-8")
+            third = self.run_bridge(work_root, *args)
+            self.assertNotIn("named (peano): cached", third.stdout, third.stdout)
+            self.assertIn("COMPILE named (peano): OK", third.stdout, third.stdout)
+            fourth = self.run_bridge(work_root, *args)
+            self.assertIn("COMPILE named (peano): cached", fourth.stdout, fourth.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

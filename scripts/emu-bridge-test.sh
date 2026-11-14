@@ -1582,12 +1582,19 @@ compile_one_compiler() {
     have_xclbin=true
   fi
 
-  # Invalidate cache if MLIR changed since last compile.
-  if $have_xclbin && [[ -f "$build_dir/aie_arch.mlir" ]] \
-      && [[ -f "$build_dir/aie.xclbin" ]]; then
-    if [[ "$build_dir/aie_arch.mlir" -nt "$build_dir/aie.xclbin" ]]; then
-      have_xclbin=false
-    fi
+  # Invalidate cache if an input MLIR changed since last compile. Every xclbin
+  # counts, whatever the RUN lines call it (add_one_two builds add_one.xclbin
+  # and add_two.xclbin and no aie.xclbin).
+  if $have_xclbin; then
+    local _mlir _xclbin
+    for _mlir in "$build_dir/aie_arch.mlir" "$build_dir/aie_arch_orig.mlir"; do
+      [[ -f "$_mlir" ]] || continue
+      for _xclbin in "$build_dir"/*.xclbin; do
+        if [[ -f "$_xclbin" ]] && [[ "$_mlir" -nt "$_xclbin" ]]; then
+          have_xclbin=false
+        fi
+      done
+    done
   fi
 
   # Invalidate cache if --aiesim requested but sim/ artifacts are missing.
