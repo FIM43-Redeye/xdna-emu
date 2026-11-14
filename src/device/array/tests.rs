@@ -2200,4 +2200,73 @@ mod parked_drain {
         let middle = drain_run(3, QUIET, 400, &[2]);
         assert_eq!((middle.runs, middle.words), (vec![(14, 1)], WORDS as usize + 1));
     }
+
+    const GO: usize = 5;
+
+    /// The memtile-fed lock probe's path: the memtile's MM2S 0 feeds (COL, 2)'s S2MM 0, whose BD waits on lock GO
+    /// while the path fills and parks (its ingress takes words before the grant). Returns the cycles, counted from
+    /// the release, in which the compute switch's DMA master passed the S2MM a word.
+    fn lock_held_compute_drain(period: u8) -> Vec<u64> {
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        for row in 1..=2 {
+            array.clock_mut().set_adaptive_abort_period(COL, row, period);
+        }
+        let m = array.tile_index(COL, 1);
+        array.tiles[m]
+            .stream_switch
+            .configure_local_route(mem_tile::DMA_SLAVE_START as usize, mem_tile::NORTH_MASTER_START as usize);
+        let c = array.tile_index(COL, 2);
+        let master = compute::DMA_MASTER_START as usize;
+        array.tiles[c]
+            .stream_switch
+            .configure_local_route(compute::SOUTH_SLAVE_START as usize, master);
+        array.dma_engines[c]
+            .configure_bd(0, BdConfig::simple_1d(0x4000, WORDS * 4).with_acquire(GO as u8, 1))
+            .unwrap();
+        array.dma_engines[c].start_channel(0, 0).unwrap();
+        array.dma_engines[m]
+            .configure_bd(0, BdConfig::simple_1d(0x400, WORDS * 4))
+            .unwrap();
+        let mm2s0 = array.dma_engines[m].s2mm_channel_count() as u8;
+        array.dma_engines[m].start_channel(mm2s0, 0).unwrap();
+        let mut cycle = 1u64;
+        for _ in 0..400 {
+            array.set_dma_cycle(cycle);
+            array.step_data_movement(&mut host);
+            cycle += 1;
+        }
+        array.tiles[c].locks[GO].value = 1;
+        let mut beats = Vec::new();
+        for at in 0..(WORDS as u64 + 100) {
+            array.set_dma_cycle(cycle);
+            array.step_data_movement(&mut host);
+            if array.tiles[c].stream_switch.masters[master].cycle_beat {
+                beats.push(at);
+            }
+            cycle += 1;
+        }
+        beats
+    }
+
+    /// Silicon (the memtile-fed lock probe, both switches quiet): the S2MM starves one cycle at the drain's slot 8
+    /// after the grant (+ 9). The S2MM took words while it was parked on its lock; the drain's slots count from its
+    /// first word after the park, not from that fill, so the memtile switch's hold lands eight words in.
+    #[test]
+    fn a_lock_held_compute_s2mm_gets_the_memtile_switch_hold_eight_words_after_its_restart() {
+        let quiet = lock_held_compute_drain(QUIET);
+        let restart: Vec<u64> = quiet.iter().copied().filter(|&b| b > 0).collect();
+        let first = restart[0];
+        let gaps: Vec<u64> = (first..*restart.last().unwrap())
+            .filter(|c| !restart.contains(c))
+            .map(|c| c - first)
+            .collect();
+        assert_eq!(gaps, vec![8], "beats after the release: {quiet:?}");
+        let awake = lock_held_compute_drain(AWAKE);
+        let first_awake = awake.iter().copied().find(|&b| b > 0).unwrap();
+        let gaps_awake: Vec<u64> =
+            (first_awake..*awake.last().unwrap()).filter(|c| !awake.contains(c)).collect();
+        assert!(gaps_awake.is_empty(), "awake: {awake:?}");
+    }
 }

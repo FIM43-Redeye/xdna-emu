@@ -430,7 +430,11 @@ impl TileArray {
     }
 
     /// Account an S2MM master's cycle: a word passed to the S2MM (`sent`), or one it held and
-    /// did not pass (`offered`).
+    /// did not pass (`offered`). Unlike a source port's stream, a refused word does not keep the
+    /// drain's stream going: a path parked behind an S2MM that took words and then stopped (a
+    /// lock-held compute S2MM fills its ingress first) drains as a new stream, its slots counted
+    /// from its first word after the park (silicon, the memtile-fed lock probe: the memtile
+    /// switch's hold at grant + 8 / + 9, not at the restart).
     pub(super) fn note_drain_cycle(&mut self, idx: usize, master: usize, sent: bool, offered: bool) {
         let now = self.hold_clock;
         let e =
@@ -444,7 +448,6 @@ impl TileArray {
             e.last = now;
         } else if offered && now.saturating_sub(e.last) <= STREAM_GAP && e.last != 0 {
             e.stalls += 1;
-            e.last = now;
         }
     }
 
