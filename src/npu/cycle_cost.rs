@@ -143,6 +143,15 @@ pub enum OpTarget {
     Compute,
 }
 
+/// From the last core start of a launch to the runtime sequence's first
+/// operation: 28.5k array cycles on silicon (dedicated launch probe: 10 of 12
+/// single-core runs 28478..28610 with nothing ahead of the first operation;
+/// each operation ahead adds its own cost). 16634 controller cycles = 28499.6
+/// array cycles. OPEN: the other two runs sit about 4.7k lower (a second mode,
+/// also seen with padding ahead), and one design's sequence starts later than
+/// this gap predicts (a dedicated probe is prepared); neither is modelled.
+pub const LAUNCH_GAP: u64 = 16634;
+
 /// Operation-class costs of the runtime-sequence controller, in controller
 /// cycles, and the clock pair that converts them to array cycles.
 #[derive(Debug, Clone)]
@@ -159,6 +168,7 @@ pub struct CycleCostModel {
     pub token_episode: u64,
     pub token_episode_after_episode: u64,
     pub token_episode_window: u64,
+    pub launch_gap: u64,
     pub clocks: ClockPair,
 }
 
@@ -178,6 +188,7 @@ impl CycleCostModel {
             token_episode: TOKEN_EPISODE,
             token_episode_after_episode: TOKEN_EPISODE_AFTER_EPISODE,
             token_episode_window: TOKEN_EPISODE_WINDOW,
+            launch_gap: LAUNCH_GAP,
             clocks,
         }
     }

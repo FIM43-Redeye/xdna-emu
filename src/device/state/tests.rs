@@ -1244,6 +1244,34 @@ fn cdo_enable_writes_start_cores_one_spacing_apart() {
     assert_eq!(state.next_core_start_slot, 0, "the next launch numbers from slot 0 again");
 }
 
+/// The runtime sequence starts the launch gap after the last core start of a
+/// launch: with three cores staged one spacing apart that is two spacings plus
+/// the gap from now; with one core, the gap; with no launch since the last
+/// sequence, at once.
+#[test]
+fn the_sequence_starts_the_launch_gap_after_the_last_core_start() {
+    use crate::device::registers::TileAddress;
+    use crate::device::state::CORE_RELEASE_SPACING_CYCLES;
+    const GAP: u64 = 28_500;
+
+    let mut state = DeviceState::new_npu1();
+    assert_eq!(state.take_sequence_start(GAP), 0, "no launch: the sequence starts at once");
+
+    let mark = state.pending_core_transitions.len();
+    for (col, row) in [(1u8, 2u8), (1, 3), (2, 2)] {
+        state.write_register(TileAddress::encode(col, row, 0x32000), 0x1).unwrap();
+    }
+    state.stagger_core_starts(mark);
+    assert_eq!(state.take_sequence_start(GAP), 2 * CORE_RELEASE_SPACING_CYCLES + GAP);
+    assert_eq!(state.take_sequence_start(GAP), 0, "a launch is taken once");
+
+    let mut one = DeviceState::new_npu1();
+    let mark = one.pending_core_transitions.len();
+    one.write_register(TileAddress::encode(1, 2, 0x32000), 0x1).unwrap();
+    one.stagger_core_starts(mark);
+    assert_eq!(one.take_sequence_start(GAP), GAP, "one core: it started at its enable write");
+}
+
 /// A memtile object FIFO deeper than 31 initialises its producer lock above
 /// 31 (mlir-aie allows up to 63). Silicon takes the Lock_value field as an
 /// unsigned count, so a DMA acquire_ge 1 on a lock written 40 is granted.

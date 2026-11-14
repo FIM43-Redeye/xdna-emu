@@ -1099,6 +1099,20 @@ impl XclbinSuite {
             self.max_cycles
         };
 
+        // Launch gap, as the plugin's run: the cores of a freshly configured design
+        // run alone until the sequence starts the measured gap after the last core
+        // start (`DeviceState::take_sequence_start`).
+        if let Some(executor) = npu_executor.as_ref() {
+            let lead = engine.device_mut().take_sequence_start(executor.launch_gap_cycles());
+            if lead > 0 && !executor.is_done() {
+                for _ in 0..lead.min(cycle_limit) {
+                    engine.force_running();
+                    engine.step();
+                }
+                cycles = engine.total_cycles();
+            }
+        }
+
         while cycles < cycle_limit {
             // Advance NPU instruction execution before engine step.
             // try_advance executes one instruction per cycle; when a DMA

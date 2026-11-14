@@ -370,31 +370,26 @@ pub(crate) fn run_interpreter(
     // Shim DMA accesses the host-memory IOMMU model blocks during this run.
     let mut host_faults = crate::host_faults::HostFaultTracker::new(engine);
 
-    // Warm-up: let cores run to their first blocking point before
-    // processing NPU instructions.  On real hardware, the core has been
-    // running for thousands of cycles (CDO enables the core well before
-    // NPU instructions arrive through firmware + NoC).  Without this,
-    // maskwrite/blockwrite instructions modify tile memory before the
-    // core's init loop has written its initial values.
+    // Launch gap: the cores of a freshly configured design run alone until the
+    // runtime sequence starts, the measured launch gap after the last core's
+    // start (`DeviceState::take_sequence_start`, `npu::cycle_cost::LAUNCH_GAP`).
+    // A sequence that follows another in the same context starts at once.
     //
-    // NOTE: warm-up cycles count against `max_cycles`. For small budgets
-    // (e.g. `max_cycles=1` for smoke tests), the warm-up alone can exhaust
-    // the budget and the run loop below won't execute a single cycle of
-    // real work -- you'll see `halt_reason=Budget` with `cycles == warm-up
-    // count`. This is acceptable for the cycle-budget use case (any real
-    // test needs a budget much larger than 100k), but documented here so
-    // a smoke-test-sized budget isn't mistaken for a "kernel did nothing"
-    // signal.
-    if engine.enabled_cores() > 0 && !executor.is_done() {
-        const MAX_WARMUP: u64 = 100_000;
-        while cycles < MAX_WARMUP {
+    // NOTE: these cycles count against `max_cycles`. For small budgets (e.g.
+    // `max_cycles=1` for smoke tests) the gap alone can exhaust the budget and
+    // the run loop below won't execute a single cycle of real work -- you'll
+    // see `halt_reason=Budget` with `cycles` = the gap. Any real test needs a
+    // budget far larger than the gap.
+    let lead = engine.device_mut().take_sequence_start(executor.launch_gap_cycles());
+    if lead > 0 && !executor.is_done() {
+        while cycles < lead.min(effective_max) {
+            // A design whose cores halt before the sequence starts still lets time
+            // pass for the DMA and stream side, as the run loop below does.
+            engine.force_running();
             engine.step();
             cycles += 1;
-            if engine.all_cores_blocked() {
-                break;
-            }
         }
-        log::info!("Core warm-up: {} cycles", cycles);
+        log::info!("Launch gap: sequence starts {} cycles into the run", cycles);
     }
 
     // Per-cycle: build snapshots, classify, dispatch on verdict.

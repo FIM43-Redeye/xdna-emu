@@ -650,9 +650,28 @@ impl DeviceState {
                 }
             }
         }
+        if !held.is_empty() {
+            self.core_launch_pending = true;
+        }
         for (col, row) in held {
             self.stage_core_start(col, row);
         }
+    }
+
+    /// Engine cycles from now until the runtime sequence's first operation, once per launch:
+    /// the last core start of the launch (the latest staged start, or now if every core has
+    /// started) plus `launch_gap`. 0 when no core was started since the last call, so a
+    /// sequence that follows another in the same context starts at once.
+    ///
+    /// Silicon (launch probe): the sequence's first operation lands a fixed gap after the
+    /// last core of the design starts; the gap's size and its provenance are with
+    /// `npu::cycle_cost::LAUNCH_GAP`.
+    pub fn take_sequence_start(&mut self, launch_gap: u64) -> u64 {
+        if !std::mem::take(&mut self.core_launch_pending) {
+            return 0;
+        }
+        let last_start = self.staged_core_releases.iter().map(|&(_, _, left)| left).max().unwrap_or(0);
+        last_start + launch_gap
     }
 
     /// Spread the core starts a CDO application produced (`Enable` transitions published since
@@ -669,6 +688,9 @@ impl DeviceState {
             }
         }
         started.retain(|&(col, row)| self.array.get(col, row).is_some_and(|t| t.core.enabled));
+        if !started.is_empty() {
+            self.core_launch_pending = true;
+        }
         for (col, row) in started {
             if self.next_core_start_slot == 0 {
                 // Slot 0: this core already started at its enable write.

@@ -409,7 +409,7 @@ where
     /// Check if the core is stalled (waiting on lock, DMA, or stream).
     ///
     /// A memory-bank loss is not a stall here: it freezes the core for one cycle (`Frozen`),
-    /// which is progress for `all_cores_blocked()` (the FFI warm-up break).
+    /// which is progress.
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,

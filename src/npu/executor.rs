@@ -245,6 +245,13 @@ impl NpuExecutor {
         self.cycle_model = model;
     }
 
+    /// Array cycles from the last core start of a launch to the sequence's
+    /// first operation (`cycle_cost::LAUNCH_GAP` at the configured clocks).
+    pub fn launch_gap_cycles(&self) -> u64 {
+        let c = self.cycle_model.clocks;
+        self.cycle_model.launch_gap * u64::from(c.array_mhz) / u64::from(c.firmware_mhz)
+    }
+
     /// Get warnings collected during execution.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -2528,6 +2535,23 @@ mod tests {
             panic!("stream did not finish");
         };
         assert_eq!(run(true), run(false), "a token absorbed by the wait adds no service time");
+    }
+
+    /// The launch gap: the sequence's first operation lands about 28.5k array
+    /// cycles after the last core starts (launch probe, 10 of 12 runs
+    /// 28478..28610), a controller-clocked constant.
+    #[test]
+    fn the_launch_gap_is_the_measured_core_start_to_first_operation_time() {
+        let executor = NpuExecutor::new();
+        let gap = executor.launch_gap_cycles() as f64;
+        assert!((gap - 28_500.0).abs() <= 2.0, "launch gap {gap}");
+        let mut dpm0 = NpuExecutor::new();
+        dpm0.set_cycle_model(super::super::CycleCostModel::npu1(crate::timebase::ClockPair::DRIVER_DPM0));
+        assert_eq!(
+            dpm0.launch_gap_cycles(),
+            2 * super::super::cycle_cost::LAUNCH_GAP,
+            "scales with the clock ratio"
+        );
     }
 
     /// Run `stream`, issuing a token on shim (1,0) S2MM 0 `x` cycles after the
