@@ -1261,6 +1261,50 @@ fn test_queued_task_start_emitted_during_prior_transfer() {
     assert_eq!(seq, vec!['S', 'S', 'F', 'F'], "prefetch: both STARTs must precede either FINISH");
 }
 
+/// A task pushed onto a shim MM2S channel whose current task is still in its
+/// pre-transfer latency starts at once: silicon's START_TASK of the second task
+/// on a busy channel follows the push by the same few tens of cycles as on an
+/// idle one (bridge traces: START to START = the push gap + 20..60 in
+/// packet_flow_fanout, dmabd_task_queue, shim_dma_bd_reuse, the dynamic_* tests),
+/// not the first task's read-path warm-up.
+#[test]
+fn test_task_pushed_during_prior_task_warm_up_starts_at_once() {
+    let mut engine = DmaEngine::new_shim_tile(0, 0);
+    let mut tile = make_tile();
+    let mut host_mem = make_host_memory();
+    engine.configure_bd(0, BdConfig::simple_1d(0x1000, 256)).unwrap();
+    engine.configure_bd(1, BdConfig::simple_1d(0x2000, 256)).unwrap();
+    let ch = (0..engine.num_channels() as u8)
+        .find(|&c| matches!(engine.channel_type(c), ChannelType::MM2S))
+        .expect("shim has an MM2S channel");
+
+    assert!(engine.enqueue_task(ch, 0, 0, false));
+    let mut starts = 0;
+    let mut step = |engine: &mut DmaEngine, starts: &mut usize| {
+        engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_mem);
+        while engine.pop_stream_out().is_some() {}
+        *starts += engine
+            .drain_trace_events()
+            .iter()
+            .filter(|(_, e)| matches!(e, EventType::DmaStartTask { .. }))
+            .count();
+    };
+    for _ in 0..20 {
+        step(&mut engine, &mut starts);
+    }
+    assert_eq!(starts, 1);
+    let warm_up = engine.channel_fsm_description(ch);
+    assert!(!warm_up.contains("Transferring"), "task 0 still warming up: {warm_up}");
+
+    assert!(engine.enqueue_task(ch, 1, 0, false));
+    for _ in 0..2 {
+        step(&mut engine, &mut starts);
+    }
+    let state = engine.channel_fsm_description(ch);
+    assert!(!state.contains("Transferring"), "task 0 still warming up: {state}");
+    assert_eq!(starts, 2, "the pushed task starts during the first task's warm-up");
+}
+
 #[test]
 fn test_task_queue_multiple_tasks_complete() {
     let mut engine = DmaEngine::new_compute_tile(1, 2);

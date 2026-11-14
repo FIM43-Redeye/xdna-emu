@@ -1221,10 +1221,11 @@ impl DmaEngine {
         bonus
     }
 
-    /// BD-prefetch overlap (Phase 2d.2): while a channel is transferring the
-    /// current task, if another task is already queued, HW loads that next BD
-    /// into its second slot and fires its START_TASK event during the current
-    /// transfer -- it does not wait for the current task to finish.  Emit that
+    /// BD-prefetch overlap (Phase 2d.2): while a channel is running the
+    /// current task (its memory warm-up or its transfer), if another task is
+    /// already queued, HW loads that next BD into its second slot and fires its
+    /// START_TASK event at once -- it does not wait for the current task to
+    /// finish, nor for its data to start moving.  Emit that
     /// START ahead of time, once per queued task, and mark the channel so
     /// start_channel suppresses the duplicate when the task actually begins.
     ///
@@ -1434,6 +1435,10 @@ impl DmaEngine {
             }
 
             ChannelFsm::MemoryLatency { cycles_remaining, transfer } => {
+                // A task already queued behind this one starts now, not when this
+                // one's data starts moving (silicon: a push onto a busy shim MM2S
+                // starts as promptly as onto an idle one).
+                self.maybe_prefetch_next_task(ch_idx);
                 if cycles_remaining <= 1 {
                     // For shim tiles accessing host DDR, add NoC+DDR pipeline
                     // latency. This is the extra time for the first word to
@@ -1451,6 +1456,7 @@ impl DmaEngine {
             }
 
             ChannelFsm::HostPipelineLatency { cycles_remaining, transfer } => {
+                self.maybe_prefetch_next_task(ch_idx);
                 if cycles_remaining <= 1 {
                     ChannelFsm::Transferring { transfer }
                 } else {
