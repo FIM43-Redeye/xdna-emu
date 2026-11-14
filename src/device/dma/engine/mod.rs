@@ -863,7 +863,7 @@ impl DmaEngine {
     }
 
     /// Whether an S2MM channel is started/live: an active FSM, a dispatched BD,
-    /// or a queued task (`has_pending_work`). An UNSTARTED channel (Idle with an
+    /// or a queued task (`holds_a_task`; a shim BD waiting only for its host writes does not count). An UNSTARTED channel (Idle with an
     /// empty task queue) asserts no stream readiness -- routing must not deliver
     /// stream data to it (an unconfigured/disabled S2MM holds TREADY low). On HW
     /// an objectfifo shim S2MM DDR drain gets NO static CDO config -- mlir-aie's
@@ -879,7 +879,7 @@ impl DmaEngine {
         if ch_idx >= self.num_channels() {
             return false;
         }
-        self.channels[ch_idx].has_pending_work()
+        self.channels[ch_idx].holds_a_task()
     }
 
     /// Get a human-readable description of a channel's FSM state.

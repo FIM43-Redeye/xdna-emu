@@ -608,17 +608,17 @@ impl DmaEngine {
         }
     }
 
-    /// STREAM_STARVATION of a shim S2MM in its start hold (BD setup, lock acquire, memory
-    /// latency and the fitted host-memory start cost, `consume_first_bd_bonus`), before the
-    /// transfer runs.
+    /// STREAM_STARVATION of a shim S2MM before its transfer runs: in practice a first BD parked on
+    /// its lock (`AcquiringLock`, and the memory latency after the grant). A lock-free BD's transfer
+    /// starts at START_TASK + 6 (`uses_host_write_path`), so its own starvation takes over from the
+    /// first cycle the level may rise.
     ///
     /// Silicon (bridge corpus, every sample of add_maskwrite, core_dmas_dma_configure_task_lock,
     /// runtime_cumsum, objectfifo_repeat_compute_repeat and _init_values_repeat): with no word
     /// waiting the level rises at START_TASK + 6, the arming delay of a lock-stalled tile S2MM
-    /// (`DMA_S2MM_STARVATION_ARM_CYCLES`), on the first task and on every later one. The channel's
-    /// stream side is live from then on while its memory side is still held; the level is low in
-    /// every cycle a beat is on offer, and once the BD's words have all been accepted. On its
-    /// first cycle the transfer takes the level over as its own (`prev_starving`,
+    /// (`DMA_S2MM_STARVATION_ARM_CYCLES`). A shim BD parked on its lock is not measured; it takes
+    /// the tile rule: low in every cycle a beat is on offer, and once the BD's words have all been
+    /// accepted. On its first cycle the transfer takes the level over as its own (`prev_starving`,
     /// `step_transferring_cycle`), so a stretch that spans the hand-over is one level.
     fn settle_shim_start_starvation(&mut self, ch: usize) {
         let was = self.channels[ch].lock_wait_starving;

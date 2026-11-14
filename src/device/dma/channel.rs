@@ -792,10 +792,19 @@ impl ChannelContext {
 
     /// Whether this channel has any pending work (active or queued).
     pub fn has_pending_work(&self) -> bool {
+        self.holds_a_task() || !self.host_completions.is_empty()
+    }
+
+    /// Whether this channel holds a task: running, queued, or with stream-side work after its
+    /// BD (read-ahead or staged words, parked releases). A shim BD waiting only for its host
+    /// memory side (`host_completions`) does not count: its completion is due, but no task is
+    /// loaded, so a shim S2MM's stream side is shut meanwhile.
+    pub fn holds_a_task(&self) -> bool {
         self.fsm.is_active()
             || self.queued_bd.is_some()
             || !self.task_queue.is_empty()
-            || self.has_work_in_flight()
+            || !self.read_ahead.is_empty()
+            || !self.egress_staging.is_empty()
             || !self.parked_releases.is_empty()
     }
 

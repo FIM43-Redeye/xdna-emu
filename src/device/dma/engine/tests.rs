@@ -5104,6 +5104,19 @@ fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     assert!(rig.finished_task_at[0] <= rig.finished_task_at[1]);
 }
 
+/// Writes still outstanding after a shim S2MM's last BD keep the channel busy (its FINISHED_TASK
+/// is still due) but load no task, so its stream side stays shut: routing delivers nothing to it,
+/// as to a channel with no task (`channel_is_started`).
+#[test]
+fn shim_s2mm_with_only_writes_outstanding_is_not_started() {
+    let mut rig = StarvationRig::shim();
+    start_shim_host_bd(&mut rig, 16);
+    rig.run(40, |_| true);
+    assert!(rig.finished_task_at.is_empty(), "the first task's cold write is still outstanding");
+    assert!(rig.eng.channel_has_pending_work(0), "its completion is still due");
+    assert!(!rig.eng.channel_is_started(0), "no task: the stream side is shut");
+}
+
 #[test]
 fn lock_wait_starvation_is_not_raised_where_silicon_is_unmeasured() {
     // A BD with no lock to wait on is the running state, not the lock-stalled one.
