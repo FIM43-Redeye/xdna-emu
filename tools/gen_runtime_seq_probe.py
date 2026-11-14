@@ -283,6 +283,47 @@ def plan_9e() -> dict[str, Case]:
     return out
 
 
+# Probe 9f's grid: wait lengths (words of the S0 task) around the levels probe 9e found, as dense edge sweeps
+EDGES_9F = (tuple(range(200, 701, 50)) + (800, 900, 1000)         # shortest waits
+            + tuple(range(1900, 2151, 50))                        # around 2000
+            + (1500, 2500, 2600, 2700, 2800, 2900, 3000)          # 1500 .. 3000
+            + tuple(range(6250, 7051, 100))                       # the end of the plateau
+            + tuple(range(8050, 8951, 100)))                      # the long waits
+
+
+def prior_command_9f(name: str, long_words: int, long_path: str, sync_order: tuple[str, ...]) -> Case:
+    """A command with no marks, run only to set up the state the next command starts from. After the opening marker
+    pair and two ordinary closing rounds comes a last round of four token-carrying tasks, `long_words` words on
+    the `long_path` channels (M0 and S0, or M1 and S1) and 8 words on the other path, awaited in `sync_order`; the command
+    ends on 32 plain writes."""
+    long_chs = (long_path, "S" + long_path[1])
+    last = [Push(ch, long_words if ch in long_chs else 8, True, tail=True) for ch in TAIL_ORDER]
+    steps = [Push("S1", 8, True), Push("M1", 8, True), Sync("M1"), Sync("S1")] + closing_tail(2) + last \
+        + [Sync(ch) for ch in sync_order] + [Fill(TAIL_FILL)]
+    return Case(name, "W", tuple(steps), BRACKET_EVENTS)
+
+
+def plan_9f() -> dict[str, Case]:
+    """Probe 9f: sampling points of the wait (bracketed length cases with dense edge sweeps), the effect of the prior
+    command's last waits on the next command, and a fill case that locates a once-per-run stall.
+    Length cases that also exist in probe 9e are the same plans (byte-identical instruction streams).
+    Prior-command cases: k_a / k_e await the long M0 -> S0 pair last, M0 then S0 (3000 words in k_e);
+    k_c awaits it S0 then M0; k_f has the long pair on the second path and awaits M0, S0, M1, S1 in order."""
+    def br(name, words, **kw):
+        return _w_case(name, 1, words, marks=True, events=BRACKET_EVENTS, tail_rounds=4, **kw)
+    cases = [br("w1_L3000_br", 3000)]
+    cases += [br(f"w1_L{n}_br", n) for n in sorted(set(EDGES_9F) - {3000})]
+    cases += [prior_command_9f("k_a_L30000", 30000, "M0", ("M1", "S1", "M0", "S0")),
+              prior_command_9f("k_c_L30000", 30000, "M0", ("M1", "S1", "S0", "M0")),
+              prior_command_9f("k_f_L30000", 30000, "M1", ("M0", "S0", "M1", "S1")),
+              prior_command_9f("k_e_L3000", 3000, "M0", ("M1", "S1", "M0", "S0")),
+              br("w1_f128_L3000_br", 3000, fill=128)]
+    out = {c.name: c for c in cases}
+    if len(out) != len(cases):
+        raise ValueError("plan_9f: duplicate case names")
+    return out
+
+
 # -- layout and safety --------------------------------------------------------------------------------
 
 def pushes(case: Case) -> list[Push]:
@@ -771,7 +812,7 @@ def cmd_list(args) -> int:
 
 
 def _selected(args) -> list[Case]:
-    table = {"9d": plan_9d, "9e": plan_9e}.get(getattr(args, "plan", "base"), plan)()
+    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f}.get(getattr(args, "plan", "base"), plan)()
     names = args.only or list(table)
     return [table[n] for n in names]
 
@@ -846,21 +887,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lst = sub.add_parser("list")
-    lst.add_argument("--plan", choices=("base", "9d", "9e"), default="base")
+    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
     b = sub.add_parser("build")
-    b.add_argument("--plan", choices=("base", "9d", "9e"), default="base")
+    b.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
     b.add_argument("out_dir")
     b.add_argument("--only", nargs="*", default=[])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
-    r.add_argument("--plan", choices=("base", "9d", "9e"), default="base")
+    r.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
     r.add_argument("--backend", choices=("hw", "emu"), required=True)
     r.add_argument("--only", nargs="*", default=[])
     t = sub.add_parser("table")
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+")
-    t.add_argument("--plan", choices=("base", "9d", "9e"), default="base")
+    t.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
     t.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
     return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)

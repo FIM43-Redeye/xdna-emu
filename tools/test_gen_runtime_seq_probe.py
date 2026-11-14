@@ -722,3 +722,94 @@ def test_9e_twins_are_their_bracketed_cases_without_the_marks():
 
 def test_9e_run_count_fits_four_calls_of_twenty():
     assert 3 * len(g.plan_9e()) <= 80
+
+
+# -- probe 9f: sampling-point edges of the wait, and prior commands that end on different waits -----------------
+
+EDGES_9F = (tuple(range(200, 701, 50)) + (800, 900, 1000) + tuple(range(1900, 2151, 50)) + (2500, 2600, 2700, 2800, 2900)
+            + tuple(range(6250, 7051, 100)) + tuple(range(8050, 8951, 100)) + (1500, 2000, 3000))
+PRIOR_9F = ("k_a_L30000", "k_c_L30000", "k_f_L30000", "k_e_L3000")
+
+
+def case9f(name):
+    return g.plan_9f()[name]
+
+
+def test_plan_9f_is_unique_valid_and_leaves_the_other_plans_alone():
+    p = g.plan_9f()
+    for c in p.values():
+        g.validate(c)
+    assert len(g.plan()) == 30 and len(g.plan_9d()) == 25 and len(g.plan_9e()) == 26
+
+
+def test_plan_9f_starts_with_the_positive_control_which_is_probe_9es():
+    first = next(iter(g.plan_9f().values()))
+    ref = g.plan_9e()["w1_L3000_br"]
+    assert first.name == "w1_L3000_br" and first.steps == ref.steps and first.events == ref.events
+
+
+def test_plan_9f_has_every_requested_case_and_no_other():
+    names = set(g.plan_9f())
+    want = {f"w1_L{n}_br" for n in EDGES_9F} | set(PRIOR_9F) | {"w1_f128_L3000_br"}
+    assert names == want
+
+
+def test_9f_length_cases_that_exist_in_probe_9e_are_the_same_plans():
+    p9e = g.plan_9e()
+    for n in (1000, 1500, 2000, 2500, 3000):
+        assert case9f(f"w1_L{n}_br").steps == p9e[f"w1_L{n}_br"].steps
+
+
+def test_9f_length_cases_are_one_bracketed_pair_of_the_requested_length():
+    for n in EDGES_9F:
+        c = case9f(f"w1_L{n}_br")
+        assert c.events == g.BRACKET_EVENTS and sum(isinstance(s, g.Mark) for s in c.steps) == 4
+        assert [p.words for p in g.measured_pushes(c) if p.ch == "S0"] == [n]
+
+
+def test_9f_fill_case_is_the_bracketed_length_case_with_128_writes_after_the_s0_push():
+    steps = case9f("w1_f128_L3000_br").steps
+    i = next(k for k, s in enumerate(steps) if isinstance(s, g.Fill) and s.count == 128)
+    assert isinstance(steps[i - 1], g.Push) and steps[i - 1].ch == "S0" and steps[i - 1].words == 3000
+    assert isinstance(steps[i + 1], g.Mark) and steps[i + 1].which == "A"
+    assert g.Fill(g.TAIL_FILL) == steps[-1]
+
+
+def test_9f_prior_command_cases_have_no_marks_and_the_bracket_event_slots():
+    for n in PRIOR_9F:
+        c = case9f(n)
+        assert c.events == g.BRACKET_EVENTS and not any(isinstance(s, g.Mark) for s in c.steps)
+
+
+def test_9f_prior_command_cases_open_with_a_marker_pair_then_two_ordinary_rounds():
+    for n in PRIOR_9F:
+        s = case9f(n).steps
+        assert list(s[:4]) == [g.Push("S1", 8, True), g.Push("M1", 8, True), g.Sync("M1"), g.Sync("S1")]
+        assert list(s[4:4 + len(g.closing_tail(2))]) == g.closing_tail(2)
+
+
+def test_9f_prior_command_last_round_is_all_tail_tasks_and_ends_with_the_trailing_fill():
+    for n in PRIOR_9F:
+        s = case9f(n).steps
+        last = s[4 + len(g.closing_tail(2)):]
+        assert [type(x) for x in last] == [g.Push] * 4 + [g.Sync] * 4 + [g.Fill]
+        assert all(x.tail and x.token for x in last[:4]) and last[-1] == g.Fill(32)
+
+
+def test_9f_prior_command_cases_differ_in_which_path_is_long_and_the_order_of_the_last_syncs():
+    def shape(n):
+        last = case9f(n).steps[4 + len(g.closing_tail(2)):]
+        return [(x.ch, x.words) for x in last[:4]], [x.ch for x in last[4:8]]
+    long_m0s0 = [("M0", 30000), ("S0", 30000), ("M1", 8), ("S1", 8)]
+    assert shape("k_a_L30000") == (long_m0s0, ["M1", "S1", "M0", "S0"])
+    assert shape("k_c_L30000") == (long_m0s0, ["M1", "S1", "S0", "M0"])
+    assert shape("k_f_L30000") == ([("M0", 8), ("S0", 8), ("M1", 30000), ("S1", 30000)], ["M0", "S0", "M1", "S1"])
+    assert shape("k_e_L3000") == ([("M0", 3000), ("S0", 3000), ("M1", 8), ("S1", 8)], ["M1", "S1", "M0", "S0"])
+
+
+def test_9f_selectable_from_the_command_line():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9f"]) == 0
+    assert "k_a_L30000" in buf.getvalue() and "w1_f128_L3000_br" in buf.getvalue()
