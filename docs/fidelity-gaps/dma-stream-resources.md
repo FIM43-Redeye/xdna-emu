@@ -750,8 +750,15 @@ finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterati
     A data beat and a trace packet count alike as the last activity, and silicon's own trace packets crossing
     the window count (they woke the switches in many runs). Not modelled yet: making a parked word not count as
     activity and charging the restart one cycle per gated switch puts the sl probe's rows one cycle late
-    (finish, backpressure fall, starvation; its compute switch is quiet before the release on silicon too), so
-    where the compute switch's cycle sits (the S2MM's pull, or the crossing into the compute switch) is open.
+    (finish, backpressure fall, starvation; its compute switch is quiet before the release on silicon too). A
+    third probe (`sw-*`: the sl case with a compute-local waker ending 16..400 cycles before the release, 18 silicon
+    runs) settles where the compute switch's cycle sits: on the S2MM's pull from its own quiet switch. With the
+    switch kept awake the sl case finishes at grant + 54 with the feeding MM2S's backpressure falling at + 5 and no
+    STREAM_STARVATION at all (9 / 9 runs); quiet, + 55, + 6 and the one starvation cycle at grant + 2 (9 / 9), which
+    are the values the S2MM model was fitted to. So the fitted sl numbers contain one wake cycle, and the starvation
+    cycle at grant + 2 is that wake. Not modelled yet: the uncharged own-tile path has to come out one cycle faster
+    in finish, backpressure fall and starvation together, and outward routes need the one-cycle port stall of the
+    row "Outward-route port stall".
   - *The task's first lock BD's grid* is a choice (no row shows its anchor).
   - *Lock-free first BD.* The start costs before the first write of a lock-free first BD (memory latency and start
     bonus) are unchanged; the S2MM finish of the START_TASK probe is + 79 / 80 after the release against silicon's
