@@ -97,20 +97,21 @@ PRE_PUSH_PADS = 12                 # case E: ops between the go and the S2MM pus
 NOP_DELAY_MAX = ps.NOP_DELAY_MAX
 LOOP_BASE = ps.LOOP_BASE
 LOOP_ITER = ps.LOOP_ITER
-CHAIN_DELTA = 10                   # extra cycles between consecutive triggers beyond gap + words: a chained source BD
-                                   # delivers its first word that much earlier than the first BD's (measured on the emulator)
+CHAIN_DELTA = 10                   # extra cycles between the first two triggers beyond gap + words: the second BD of the
+                                   # source chain delivers its first word that much sooner after its trigger than the
+                                   # first BD does (measured on the emulator); later BDs are chained like the second
 
 # The software events the flush generates: (trace name, number written to Event_Generate). The carrier shim's
 # trace unit uses the user events as its own start and stop, so the shim units flush with an event that never
 # occurs there: the carrier channel's task never finishes.
 SW_EVENT_SHIM = ("DMA_S2MM_1_FINISHED_TASK", 23)
-SW_EVENT_MEMTILE = ("USER_EVENT_0", 159)
+SW_EVENT_MEMTILE = ("PORT_RUNNING_0", 80)
 EVENT_GENERATE = {"shim": 0x34008, "memtile": 0x94008}
 
 SHIM_EVENTS = ["DMA_S2MM_0_START_TASK", "DMA_S2MM_0_FINISHED_TASK", "DMA_S2MM_0_STREAM_STARVATION",
                "DMA_S2MM_1_STREAM_STARVATION", "DMA_MM2S_0_START_TASK", "DMA_MM2S_0_FINISHED_TASK",
                SW_EVENT_SHIM[0]]
-MEMTILE_EVENTS = ["PORT_RUNNING_4", "PORT_RUNNING_0", SW_EVENT_MEMTILE[0]]
+MEMTILE_EVENTS = ["PORT_RUNNING_4", SW_EVENT_MEMTILE[0]]
 CORE_GROUNDING = "PERF_CNT_2"
 CORE_SWEEP = "INSTR_EVENT_0"
 
@@ -303,8 +304,8 @@ def release_spacings(case: Case) -> list[int]:
     """Cycles between consecutive source-lock releases by the core: the first is the delay after the go
     lock; the next adds the previous transfer's stream time."""
     out, prev = [], None
-    for t in case.transfers:
-        out.append(t.gap if prev is None else t.gap + prev.words + CHAIN_DELTA)
+    for k, t in enumerate(case.transfers):
+        out.append(t.gap if prev is None else t.gap + prev.words + (CHAIN_DELTA if k == 1 else 0))
         prev = t
     return out
 
@@ -858,9 +859,9 @@ def _v(x) -> str:
 
 
 TABLE_HEAD = (
-    "case          run      k role words   START      fw wait    FIN      F      X class  idle_w idle_f  carr  nca "
+    "case          run      k role words   START      fw   s2fw wait    FIN      F      X class  idle_w idle_f  carr  nca "
     "  window  excess fin-lw  observed   HP    HR    HI    HC    HE  verdict\n"
-    "  fw: first word (START+6 when the word was waiting); X = FIN - (fw + words - 1), F = FIN - fw; class cold when\n"
+    "  fw: first word (START+6 when the word was waiting), s2fw = fw - START; X = FIN - (fw + words - 1), F = FIN - fw; class cold when\n"
     "  X > 200 (F > 350 for one word), 'plain' = a long task that hides the cold term; idle_w: previous task's last word\n"
     "  (source port clock, +10 to the shim) to this fw; idle_f: previous FINISHED to this fw; carr: cycles from the last\n"
     "  carrier packet arrival to fw; nca: arrivals inside the idle. verdict per hypothesis: ok / CONTRADICTS / -.")
@@ -876,7 +877,7 @@ def format_table(rows) -> str:
         for r in tr["rows"]:
             last = r["k"] == case.tasks - 1
             lines.append(
-                f"{case.name:<13} {run:<8} {r['k']:>2} {r['role']:<4} {r['words']:>5} {r['start']:>7} {r['fw']:>7} "
+                f"{case.name:<13} {run:<8} {r['k']:>2} {r['role']:<4} {r['words']:>5} {r['start']:>7} {r['fw']:>7} {r['fw'] - r['start']:>6} "
                 f"{'y' if r['waiting'] else 'n':>4} {r['fin']:>6} {r['F']:>6} {r['X']:>6} {r['class']:<5} "
                 f"{_v(r['idle_word']):>7} {_v(r['idle_fin']):>6} {_v(r['carrier_since']):>5} {r['carrier_in_idle']:>4} "
                 f"{_v(r['window']):>8} {_v(r['excess']):>7} {_v(r['fin_after_last']):>6}  "

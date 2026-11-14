@@ -133,7 +133,7 @@ def test_release_spacings_add_the_previous_stream_time():
     a = g.case_from_name("a256d1000")
     assert g.release_spacings(a) == [1000]
     d = g.case_from_name("d3i30000")
-    assert g.release_spacings(d) == [0, 0 + 16 + g.CHAIN_DELTA, 30000 + 4 + g.CHAIN_DELTA]
+    assert g.release_spacings(d) == [0, 0 + 16 + g.CHAIN_DELTA, 30000 + 4]
 
 
 def test_delay_is_nops_when_short_and_a_counted_loop_when_long():
