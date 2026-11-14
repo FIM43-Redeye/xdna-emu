@@ -977,3 +977,17 @@ fn a_chain_of_short_bds_holds_seven_egress_granules_and_seven_bds_in_flight() {
     }
     assert!(misses.is_empty(), "{} of {} rows miss:\n{}", misses.len(), rows.len(), misses.join("\n"));
 }
+
+/// PIN, NOT SILICON: a zero-word BD deep in a chain never takes a BD-queue entry (it is never
+/// sequenced or fetched), so the BD-queue look-backs must not wait on it. Here the word clock
+/// restarts behind it (a new run, positions from 0), and the chain runs to its end. Unmeasured
+/// on silicon; pinned so that the chain is never held by a missing entry.
+#[test]
+fn a_zero_word_bd_deep_in_a_chain_does_not_hold_the_bd_queue() {
+    let obs = run_chain(4, &mids("1 0 1 1 1 1 1 1"), 64, Releaser::Free, Releaser::Core(40));
+    assert_eq!(
+        (obs.grant, obs.stalls.as_slice(), obs.finishes.as_slice()),
+        (42, &[(17, 41)][..], &[3, 5, 6, 9, 11, 13, 15, 17, 19, 94][..]),
+        "EMULATOR cycles"
+    );
+}

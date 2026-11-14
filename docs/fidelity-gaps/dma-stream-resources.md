@@ -540,7 +540,7 @@ BD's grant g0 (its STALLED_LOCK falls).
     0 / 30 -> 30 / 30, both controls 0 / 2 -> 2 / 2; every run whose core release lands on the emulator's cycle
     matches (80 / 80; the rest sit on silicon's other core resume phase). The short-chain set (72 runs) 19 -> 49 same
     case, 22 -> 58 at the same release (the misses: k5n4, the position-6 phase below); the banked out-of-rule chain
-    rows 192 -> 201 / 201; every in-scope set unchanged (sync 34, phase 428, chain 554, 1107 + 745 model-free); the
+    rows 192 -> 201 of the 201 with an emulator run on the same inputs (kn4x5 t2, open below, has none); every in-scope set unchanged (sync 34, phase 428, chain 554, 1107 + 745 model-free); the
     absorb row of 4-word BDs 48 -> 44 as silicon (table above), the others unchanged. Outward routes 0 / 66 -> 3 / 66
     (the 8-word head, where the stall is absorbed), each run equal to the model with the stall below on silicon and
     without it on the emulator (66 / 66 both).
@@ -550,8 +550,9 @@ BD's grant g0 (its STALLED_LOCK falls).
       row with ONE one-cycle stall of the MM2S port in the 9th port cycle after its first word (first word at
       g0 + 6, inferred; the stall at g0 + 14), every later word one cycle later. If that cycle is an idle cycle
       anyway (an 8-word head's BD-boundary cycle) nothing moves. A stall indexed by stream word (before word 8
-      .. 11) misses rows that the cycle form fits (66 / 66). Distance and direction do not change it. It belongs to
-      the stream switch's wake, not to this queue, and the emulator has no outward term: those rows miss by exactly
+      .. 11) misses rows that the cycle form fits (66 / 66). Distance and direction do not change it. It is read as
+      the stream switch's wake (inferred: no design with the outward switch kept awake has been run), not as this
+      queue, and the emulator has no outward term: those rows miss by exactly
       the stall. Not separated: whether the stall is anchored on the first port word, the grant or the task start.
     - *The position-6 grant phase* (one five-BD row, kn4x5 t2: granted at 49 against the emulator's 48, and the
       k5n4 rows of the short-chain set), pinned in `the_position_six_grant_phase_keeps_the_emulators_pinned_cycle`.
