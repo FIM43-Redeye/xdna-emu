@@ -179,7 +179,7 @@ def test_padding_covers_the_core_schedule_with_slack():
         if c.paced_by == "core":
             assert g.sequence_pads(c) * g.OPS_CYCLES >= g.core_cycles(c) + g.SEQ_SLACK_CYCLES
     e = g.case_from_name("e0s80000")
-    assert g.sequence_pads(e) == 0 and g.round_ops(e) * g.OPS_CYCLES == 80000
+    assert g.sequence_pads(e) == 0 and g.round_ops(e) == 80000 // g.OPS_CYCLES_PACED
 
 
 # -- the design ---------------------------------------------------------------------------------------------------------
@@ -385,3 +385,25 @@ def test_table_prints_one_line_per_task_with_the_verdict_on_the_last():
     text = g.format_table([(case, "h1.hw", tr)])
     line = [ln for ln in text.splitlines() if ln.startswith("a16d0")][0]
     assert "cold" in line and "HP:ok" in line and "HI:ok" in line
+
+
+# -- trace configuration N: events during long delays ----------------------------------------------------------------------
+
+def test_noisy_delays_raise_core_events_at_irregular_spacings_and_quiet_ones_do_not():
+    quiet = g.delay(100000, ".L")
+    noisy = g.delay(100000, ".L", noisy=True)
+    assert not any("event" in x for x in quiet)
+    assert sum("event #0" in x for x in noisy) == len(g.NOISE_SPACINGS)      # one block, run once per iteration
+    assert len(set(g.NOISE_SPACINGS)) == len(g.NOISE_SPACINGS)
+    iters = int(next(x for x in noisy if "movxm" in x).split("#")[1])
+    assert iters * g.NOISE_ITER + g.LOOP_BASE <= 100000 < (iters + 1) * g.NOISE_ITER + g.LOOP_BASE
+
+
+def test_short_delays_stay_plain_even_in_the_noisy_configuration():
+    assert g.delay(g.NOISE_MIN_CYCLES - 1, ".L", noisy=True) == g.delay(g.NOISE_MIN_CYCLES - 1, ".L")
+
+
+def test_only_configuration_n_cores_raise_the_event():
+    assert "event #0" in g.core_asm(g.case_from_name("fc0i100000n"))
+    assert "event #0" not in g.core_asm(g.case_from_name("fc0i100000q"))
+    assert "event #0" not in g.core_asm(g.case_from_name("c0i100000"))

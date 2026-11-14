@@ -89,6 +89,7 @@ READ_ROUNDS_E = 16
 # the launch probe); the padding is sized with the smaller 100 so that a faster command stream only
 # leaves more margin, never less.
 OPS_CYCLES = 100
+OPS_CYCLES_PACED = 108             # case E: rounds are sized with the measured cost, so S lands near its nominal value
 SEQ_SLACK_CYCLES = 40000           # after the core's last release: cold writes (up to 10k), carrier, margin
 FLUSH_PULSES = 96                  # software events per traced unit (2 bytes each: about 7 packets)
 PRE_PUSH_PADS = 12                 # case E: ops between the go and the S2MM push, so the word is waiting at START
@@ -326,25 +327,41 @@ def sequence_pads(case: Case) -> int:
 
 
 def round_ops(case: Case) -> int:
-    return case.spacing // OPS_CYCLES
+    """Writes per round of case E: the round is paced by the sequence, so it is sized with the measured cost of a
+    write on silicon (the padding elsewhere uses the smaller OPS_CYCLES)."""
+    return case.spacing // OPS_CYCLES_PACED
 
 
 # -- the core programs ---------------------------------------------------------------------------
 
-def delay(cycles: int, label: str) -> list[str]:
-    """Instructions that take `cycles` cycles: nops, or a counted loop with nops for the remainder."""
+# Trace configuration N keeps the compute core's trace unit busy through a long delay: the loop raises a traced core
+# event 8 times per iteration at irregular spacings (consecutive equal frames would be folded into a repeat count
+# and add no bytes, as the periodic counter event alone would).
+NOISE_SPACINGS = (53, 71, 97, 131, 61, 89, 113, 79)       # nops after each event
+NOISE_MIN_CYCLES = 4000
+NOISE_ITER = sum(1 + a for a in NOISE_SPACINGS) + LOOP_ITER
+
+
+def delay(cycles: int, label: str, noisy: bool = False) -> list[str]:
+    """Instructions that take `cycles` cycles: nops, or a counted loop with nops for the remainder. `noisy`: a long
+    delay raises a core event at irregular spacings (trace configuration N)."""
     if cycles < 0:
         raise ValueError("negative delay")
     if cycles <= NOP_DELAY_MAX:
         return lp.nops(cycles)
+    if noisy and cycles >= NOISE_MIN_CYCLES:
+        iters, rest = divmod(cycles - LOOP_BASE, NOISE_ITER)
+        block = [x for a in NOISE_SPACINGS for x in ("  event #0", *lp.nops(a))]
+        return ["  movxm r0, #%d" % max(iters, 1), *lp.nops(2), ".p2align 4", f"{label}:", *block, "  add r0, r0, #-1",
+                *lp.nops(2), f"  jnz r0, #{label}", *lp.nops(5), *lp.nops(rest)]
     iters, rest = divmod(cycles - LOOP_BASE, LOOP_ITER)
     return [*lp.delay_loop(max(iters, 1), label), *lp.nops(rest)]
 
 
-def release_at(spacing: int, label: str) -> list[str]:
+def release_at(spacing: int, label: str, noisy: bool = False) -> list[str]:
     """`spacing` cycles after the previous trigger (or the acquire), trigger the next source BD. The trigger
     sits on a fetch-line boundary so a loop's alignment padding never varies."""
-    return [*delay(max(spacing - 1, 0), label), ".p2align 4", TRIGGER]
+    return [*delay(max(spacing - 1, 0), label, noisy), ".p2align 4", TRIGGER]
 
 
 def core_asm(case: Case) -> str:
@@ -359,7 +376,7 @@ def core_asm(case: Case) -> str:
     else:
         body += [f"  acq #{OWN + LOCK_GO}, r3", *n(4)]
         for k, s in enumerate(release_spacings(case)):
-            body += release_at(s, f".Lgap{k}")
+            body += release_at(s, f".Lgap{k}", case.trace == "N")
     body += [*n(8)]
     if case.trace == "N":
         body += lp.delay_loop(ps.TAIL_ITERS, ".Ltail")
@@ -528,9 +545,9 @@ def design_mlir(case: Case) -> str:
             body += _dest_task(f"task{k}", t, k % 4, name, w)
             used = PRE_PUSH_PADS + 4
             if case.reads:
-                body += _pads((case.spacing // OPS_CYCLES) // 2 - used) + "\n"
+                body += _pads(round_ops(case) // 2 - used) + "\n"
                 body += _dest_task(f"read{k}", _t(BG_WORDS, 0), k % 4, "alt", alt_words, "%t10", 0, "MM2S")
-                used = (case.spacing // OPS_CYCLES) // 2 + 4
+                used = round_ops(case) // 2 + 4
             body += _pads(round_ops(case) - used) + "\n"
     else:
         for k, t in enumerate(case.transfers):
@@ -790,6 +807,11 @@ def task_rows(u: Unit, case: Case) -> dict:
     starv = runs_of(u.stamps(2, 0, 0, "DMA_S2MM_0_STREAM_STARVATION"))
     words = u.stamps(3, 1, 0, "PORT_RUNNING_4")
     arrivals = [b + 1 for _, b in runs_of(u.stamps(2, 0, CARRIER_COL, "DMA_S2MM_1_STREAM_STARVATION"))]
+    # background host accesses on the column-1 shim: a chunk reaching its S2MM 0 (fall of its starvation), and the
+    # start and end of its MM2S 0 task
+    bg_times = sorted([b + 1 for _, b in runs_of(u.stamps(2, 0, CARRIER_COL, "DMA_S2MM_0_STREAM_STARVATION"))]
+                      + u.stamps(2, 0, CARRIER_COL, "DMA_MM2S_0_START_TASK")
+                      + u.stamps(2, 0, CARRIER_COL, "DMA_MM2S_0_FINISHED_TASK"))
     notes = []
     if len(starts) != case.tasks:
         notes.append(f"{len(starts)} START_TASK, expected {case.tasks}")
@@ -816,6 +838,7 @@ def task_rows(u: Unit, case: Case) -> dict:
             notes.append(f"task {k}: starvation fall {onset} vs first word by the source port {fw}")
         before = [a for a in arrivals if a <= fw]
         in_idle = [a for a in arrivals if prev_lw is not None and prev_lw < a <= fw]
+        bg_before = [a for a in bg_times if a <= fw]
         n = t.words
         x = fin - (fw + n - 1)
         f = fin - fw
@@ -834,6 +857,7 @@ def task_rows(u: Unit, case: Case) -> dict:
             "idle_word": None if prev_lw is None or fw_mem is None else fw_mem - prev_lw - 1,
             "idle_fin": None if prev_fin is None else fw - prev_fin,
             "carrier_since": None if not before else fw - before[-1], "carrier_in_idle": len(in_idle),
+            "bg_since": None if not bg_before else fw - bg_before[-1],
         })
         prev_lw, prev_fin = lw_mem, fin
     return {"rows": rows, "notes": notes, "carrier_arrivals": len(arrivals)}
@@ -859,12 +883,12 @@ def _v(x) -> str:
 
 
 TABLE_HEAD = (
-    "case          run      k role words   START      fw   s2fw wait    FIN      F      X class  idle_w idle_f  carr  nca "
+    "case          run      k role words   START      fw   s2fw wait    FIN      F      X class  idle_w idle_f  carr  nca    bg "
     "  window  excess fin-lw  observed   HP    HR    HI    HC    HE  verdict\n"
     "  fw: first word (START+6 when the word was waiting), s2fw = fw - START; X = FIN - (fw + words - 1), F = FIN - fw; class cold when\n"
     "  X > 200 (F > 350 for one word), 'plain' = a long task that hides the cold term; idle_w: previous task's last word\n"
     "  (source port clock, +10 to the shim) to this fw; idle_f: previous FINISHED to this fw; carr: cycles from the last\n"
-    "  carrier packet arrival to fw; nca: arrivals inside the idle. verdict per hypothesis: ok / CONTRADICTS / -.")
+    "  carrier packet arrival to fw; nca: arrivals inside the idle; bg: from the last background access on the column-1 shim (a chunk reaching its S2MM 0, a read task's start or end) to fw. verdict per hypothesis: ok / CONTRADICTS / -.")
 
 
 def format_table(rows) -> str:
@@ -879,7 +903,7 @@ def format_table(rows) -> str:
             lines.append(
                 f"{case.name:<13} {run:<8} {r['k']:>2} {r['role']:<4} {r['words']:>5} {r['start']:>7} {r['fw']:>7} {r['fw'] - r['start']:>6} "
                 f"{'y' if r['waiting'] else 'n':>4} {r['fin']:>6} {r['F']:>6} {r['X']:>6} {r['class']:<5} "
-                f"{_v(r['idle_word']):>7} {_v(r['idle_fin']):>6} {_v(r['carrier_since']):>5} {r['carrier_in_idle']:>4} "
+                f"{_v(r['idle_word']):>7} {_v(r['idle_fin']):>6} {_v(r['carrier_since']):>5} {r['carrier_in_idle']:>4} {_v(r['bg_since']):>6} "
                 f"{_v(r['window']):>8} {_v(r['excess']):>7} {_v(r['fin_after_last']):>6}  "
                 + (f"{obs:<9} " + " ".join(f"{pr[h]:<5}" for h in HYPOTHESES) + f"  {verdict}" if last else ""))
         for n in tr["notes"]:
