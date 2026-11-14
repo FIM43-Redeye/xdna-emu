@@ -531,7 +531,7 @@ def apply_event_swap(events: list[str], swap: tuple[str, str] | None) -> list[st
     return [new if e == old else e for e in events]
 FETCH_CORE_GROUNDING = "PERF_CNT_2"
 # tile (0,2) is physical column 1; trace pkt_type 0 = core module, 1 = memory module
-FETCH_ROW, PT_CORE, PT_MEM = 2, 0, 1
+FETCH_ROW, PT_CORE, PT_MEM, PT_MEMTILE = 2, 0, 1, 3
 
 
 def fetch_case_name(k: int, chained: bool = False, bank: str = "both", start: bool = False) -> str:
@@ -1366,7 +1366,7 @@ def cmd_sync_table(args) -> int:
 # are equal: the trace encoder folds a run of equal (event, delta) frames into one frame and a Repeat. Nothing acquires A then; its count stays far below the
 # 6-bit limit (at most CHAIN_MAX_FILL = 48).
 # With `receiver = "north"` (or north2, north3) the stream goes to the S2MM of tile (0,3) (or (0,4), (0,5); its own
-# memory module traced)
+# memory module traced), with "south" to the memtile (0,1)'s S2MM 0 (its trace unit sweeps CHAIN_MEMTILE_EVENTS)
 # instead of (0,2)'s loopback S2MM; the MM2S side, its locks and the core program are unchanged, except that each
 # fill release of A is followed by a release of lock CHAIN_LOCK_NORTH_FILL of tile (0,3) (declared there at 0, no
 # BD uses it), which fills (0,3)'s memory-module stream the same way.
@@ -1378,9 +1378,10 @@ CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffer
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
 CHAIN_LOCK_NORTH_FILL = 0          # lock of tile (0,3) that a north-receiver fill releases: its LOCK_0_REL frames
-CHAIN_RECEIVERS = ("own", "north", "north2", "north3")  # who takes the MM2S's stream: (0,2)'s own S2MM, or the S2MM
+CHAIN_RECEIVERS = ("own", "north", "north2", "north3", "south")  # who takes the MM2S's stream: (0,2)'s own S2MM, or the S2MM
 #                                                        of the tile 1, 2, 3 rows north ((0,3), (0,4), (0,5))
-CHAIN_RECEIVER_ROW = {"own": 2, "north": 3, "north2": 4, "north3": 5}
+CHAIN_RECEIVER_ROW = {"own": 2, "north": 3, "north2": 4, "north3": 5, "south": 1}   # south: the memtile (0,1)
+CHAIN_MEMTILE_EVENTS = ["DMA_S2MM_SEL0_FINISHED_BD", "DMA_S2MM_SEL0_STREAM_STARVATION"]  # a south receiver's trace
 CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) stays below the 6-bit limit 63
 CHAIN_FILL_GAP_NOPS = 16           # nops before the first fill release; each later one waits one nop more
                                    # (48 fills span about 2000 cycles: inside the ring family's silicon fill span)
@@ -1558,7 +1559,8 @@ def chain_design_mlir(c: ChainCase) -> str:
     remote = c.receiver != "own"
     s2mm_block = f"    ^recv_start:\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n{recv}"
     t03 = f"    {rx} = aie.tile(0, {rrow})\n" if remote else ""
-    remote_mem = (f"    %mem0{rrow} = aie.mem({rx}) {{\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
+    remote_mem = (f"    %mem0{rrow} = aie.{'memtile_dma' if c.receiver == 'south' else 'mem'}({rx}) {{\n"
+                  "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
                   f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
@@ -1598,10 +1600,13 @@ def chain_design_mlir(c: ChainCase) -> str:
 """
 
 
-def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None) -> list[str]:
-    return ["--memmod-sweep-events", ",".join(edit_memmod_events(CHAIN_MEM_EVENTS, swap, add)),
-            "--core-grounding", FETCH_CORE_GROUNDING,
-            "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
+def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None, receiver: str = "own") -> list[str]:
+    out = ["--memmod-sweep-events", ",".join(edit_memmod_events(CHAIN_MEM_EVENTS, swap, add)),
+           "--core-grounding", FETCH_CORE_GROUNDING,
+           "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
+    if receiver == "south":
+        out += ["--memtile-sweep-events", ",".join(CHAIN_MEMTILE_EVENTS)]
+    return out
 
 
 def chain_row(events) -> dict:
@@ -1614,6 +1619,8 @@ def chain_row(events) -> dict:
             (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
         elif e.row > FETCH_ROW and e.pkt_type == PT_MEM:           # a remote receiver's memory module (north)
             north.setdefault(e.name, []).append(e.ts)
+        elif e.row == FETCH_ROW - 1 and e.pkt_type == PT_MEMTILE:  # a south receiver: the memtile's S2MM 0
+            north.setdefault(e.name.replace("DMA_S2MM_SEL0_", "DMA_S2MM_0_"), []).append(e.ts)
     runs = _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", []))
     if not runs:
         return {"g0": None}
@@ -1685,7 +1692,8 @@ def cmd_chain_build(args) -> int:
         lp.assemble(chain_core_asm(c), d / "core.o", "k_core")
         (d / "base.mlir").write_text(chain_design_mlir(c))
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
-               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None)),
+               "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None),
+                                                                     c.receiver),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
               cwd=d, log=d / "inject.log")

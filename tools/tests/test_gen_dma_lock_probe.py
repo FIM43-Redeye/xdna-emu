@@ -899,6 +899,23 @@ def test_chain_receiver_two_and_three_tiles_north():
     assert r["s2mm_fins"] == [150]
 
 
+def test_chain_receiver_south_is_the_memtile_s2mm():
+    c = chain("1 1", receiver="south", fill=3)
+    m = g.chain_design_mlir(c)
+    assert "%t01 = aie.tile(0, 1)" in m and "aie.flow(%t02, DMA : 0, %t01, DMA : 0)" in m
+    mt = m.split("aie.memtile_dma(%t01)")[1].split("aie.end")[0]
+    assert "aie.dma_start(S2MM, 0" in mt and "%dst : memref<70xi32>" in mt
+    assert "aie.buffer(%t01)" in m and "S2MM" not in m.split("%mem = aie.mem(%t02)")[1].split("aie.end")[0]
+    assert f"rel #{g.NORTH + g.CHAIN_LOCK_NORTH_FILL}, r2" not in g.chain_core_asm(c)    # no fill on the memtile
+    a = g.chain_inject_args(None, None, receiver="south")
+    assert a[a.index("--memtile-sweep-events") + 1].split(",") == g.CHAIN_MEMTILE_EVENTS
+    assert "--memtile-sweep-events" not in g.chain_inject_args()
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499) + [ev("DMA_MM2S_0_FINISHED_BD", 503)]
+    e += [ev("DMA_S2MM_SEL0_FINISHED_BD", 640, pkt=3, row=1)] + held("DMA_S2MM_SEL0_STREAM_STARVATION", 600, 610, pkt=3, row=1)
+    r = g.chain_row(e)
+    assert r["s2mm_fins"] == [140] and r["s2mm_starv_remote"] == [(100, 110)]
+
+
 def test_chain_row_takes_a_remote_s2mm_and_the_starvation_levels():
     e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499)
     e += [ev("DMA_MM2S_0_FINISHED_BD", 503), ev("LOCK_0_REL", 515), ev("LOCK_SEL0_ACQ_GE", 516)]
