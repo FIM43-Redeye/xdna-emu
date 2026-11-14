@@ -149,13 +149,16 @@ def test_delay_is_nops_when_short_and_a_counted_loop_when_long():
         g.delay(-1, ".L")
 
 
-def test_core_waits_for_go_then_releases_once_per_transfer():
+def test_core_waits_for_go_then_triggers_once_per_transfer_and_touches_no_lock_but_its_own():
     asm = g.core_asm(g.case_from_name("b1g100"))
     assert asm.count(f"acq #{g.OWN + g.LOCK_GO}") == 1
-    assert asm.count(f"rel #{g.SOUTH + g.LOCK_SRC}") == 2
-    assert asm.index("acq") < asm.index("rel")
+    assert asm.count(g.TRIGGER) == 2 and asm.index("acq") < asm.index(g.TRIGGER)
+    assert "rel #" not in asm
     asm = g.core_asm(g.case_from_name("e0s20000"))
-    assert asm.count("acq #") == 16 and asm.count("rel #") == 16
+    assert asm.count("acq #") == 16 and asm.count(g.TRIGGER) == 16
+    for c in g.default_cases():       # raw lock ids below 16 would address the module below, which is a memtile
+        for text in (g.core_asm(c), g.background_asm(c) or ""):
+            assert all(int(m) >= g.OWN for m in re.findall(r"(?:acq|rel) #(\d+)", text))
 
 
 def test_noisy_trace_keeps_the_core_running_after_its_last_release():
@@ -168,7 +171,7 @@ def test_background_core_exists_only_for_core_paced_background_cases():
     assert g.background_asm(g.case_from_name("e1s20000")) is None
     asm = g.background_asm(g.case_from_name("c1i100000"))
     assert f"movxm r1, #{g.background_rounds(g.case_from_name('c1i100000'))}" in asm
-    assert asm.count(f"rel #{g.SOUTH + g.LOCK_SRC}") == 1       # inside the loop
+    assert asm.count(f"rel #{g.OWN + g.BG_LOCK}") == 1           # inside the loop, its own tile's lock
 
 
 def test_padding_covers_the_core_schedule_with_slack():
@@ -212,9 +215,18 @@ def test_all_dma_tasks_are_freed_without_a_wait():
         assert "dma_await_task" not in text and "wait" not in text.lower().replace("nothing waits", "")
 
 
-def test_background_cases_declare_the_second_column_tiles():
-    assert "%t12 = aie.tile(1, 2)" in _mlir("c1i1000") and "%t11 = aie.tile(1, 1)" in _mlir("e1s20000")
-    assert "%t12" not in _mlir("e1s20000") and "%t11" not in _mlir("a16d0")
+def test_background_traffic_runs_on_the_column_one_compute_tile_only():
+    for name in ("c1i1000", "c2i1000", "e1s20000"):
+        text = _mlir(name)
+        assert "%t12 = aie.tile(1, 2)" in text and "aie.tile(1, 1)" not in text
+    assert "%t12" not in _mlir("a16d0")
+
+
+def test_the_source_lock_is_released_only_by_the_memtile_trigger_bds():
+    text = _mlir("b1g100")
+    assert text.count("aie.use_lock(%lSrc, Release") == 2          # one trigger BD per transfer
+    assert text.count("aie.use_lock(%lTrig, AcquireGreaterEqual") == 2 and "init = 2 : i32, sym_name = \"lTrig\"" in text
+    assert "aie.flow(%t02, Core : 0, %t01, DMA : 1)" in text
 
 
 def test_flush_pulses_every_traced_unit_with_irregular_spacing():
@@ -223,8 +235,6 @@ def test_flush_pulses_every_traced_unit_with_irregular_spacing():
     for m in re.finditer(r"column = (\d) : i32, row = (\d) : i32", text):
         per_unit[(m.group(1), m.group(2))] = per_unit.get((m.group(1), m.group(2)), 0) + 1
     assert per_unit == {("0", "0"): g.FLUSH_PULSES, ("1", "0"): g.FLUSH_PULSES, ("0", "1"): g.FLUSH_PULSES}
-    assert ("1", "1") in {(m.group(1), m.group(2)) for m in
-                          re.finditer(r"column = (\d) : i32, row = (\d) : i32", g.flush_block(g.case_from_name("c1i1000")))}
     # no two consecutive rounds have the same number of padding writes between them
     gaps = [len(x.splitlines()) for x in re.split(r"column = \d : i32, row = \d : i32} : i32, i32\n", text)]
     assert len(set(zip(gaps, gaps[1:]))) > 1
@@ -319,10 +329,24 @@ def test_first_word_is_the_starvation_fall_and_f_and_x_follow():
     assert r["carrier_since"] == 300 - 200       # last carrier fall at 200, before the first word
 
 
-def test_a_waiting_word_makes_the_first_word_start_plus_six():
-    ev = [e for e in one_task_events() if "STARVATION" not in e.name or e.col == 2]
+def test_a_word_already_waiting_is_taken_at_start_plus_six():
+    ev = [e for e in one_task_events() if e.name != "PORT_RUNNING_4"]
+    ev += level("PORT_RUNNING_4", 40, 55, pkt=3, row=1, col=1)
     r = g.task_rows(unit(ev), g.case_from_name("a16d0"))["rows"][0]
     assert r["waiting"] and r["fw"] == 106
+
+
+def test_a_queued_second_task_is_dated_by_the_source_not_by_the_shared_starvation_level():
+    case = g.case_from_name("b1g100")
+    ev = pulse("DMA_S2MM_0_START_TASK", 100) + pulse("DMA_S2MM_0_START_TASK", 160)
+    ev += level("DMA_S2MM_0_STREAM_STARVATION", 106, 499)
+    ev += level("PORT_RUNNING_4", 490, 505, pkt=3, row=1, col=1) + level("PORT_RUNNING_4", 610, 625, pkt=3, row=1, col=1)
+    ev += pulse("DMA_S2MM_0_FINISHED_TASK", 700) + pulse("DMA_S2MM_0_FINISHED_TASK", 900)
+    tr = g.task_rows(unit(ev), case)
+    t1, t2 = tr["rows"]
+    assert (t1["fw"], t2["fw"]) == (500, 620)
+    assert t2["idle_word"] == 620 - 515 - 1 and t2["idle_fin"] == 620 - 700
+    assert t1["fw_starv"] == 500 and t2["fw_starv"] is None        # the shared level ended with task 0's word
 
 
 def test_warm_task_is_classified_warm():

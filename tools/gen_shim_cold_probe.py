@@ -68,9 +68,11 @@ import gen_packet_stage_probe as ps                                 # noqa: E402
 # -- constants ---------------------------------------------------------------------------
 
 OWN = dl.OWN                       # raw lock-id base of a core's own memory module
-SOUTH = dl.SOUTH                   # raw lock-id base of the module below a core (the memtile)
-LOCK_SRC, LOCK_DONE = 0, 1         # memtile locks: gates a source BD, released by it (nothing waits on it)
-LOCK_GO = 0                        # compute-tile lock the runtime sequence sets
+LOCK_SRC, LOCK_DONE, LOCK_TRIG = 0, 1, 2   # memtile locks: gates a source BD; released by it (nothing waits on it);
+                                   # trigger credits (one per transfer)
+LOCK_GO = 0                        # lock of the column-0 compute tile that the runtime sequence sets
+BG_LOCK, BG_DONE, BG_GO = 0, 1, 2  # locks of the column-1 compute tile (background traffic)
+TRIGGER = "  mov ms, r2"           # the core writes one word to its stream port: that is the release
 ADDR_SCRATCH = 0xC000
 WORD = 4
 PAGE = 4096
@@ -95,7 +97,8 @@ PRE_PUSH_PADS = 12                 # case E: ops between the go and the S2MM pus
 NOP_DELAY_MAX = ps.NOP_DELAY_MAX
 LOOP_BASE = ps.LOOP_BASE
 LOOP_ITER = ps.LOOP_ITER
-CHAIN_DELTA = 0                    # extra cycles between consecutive releases beyond gap + words (calibrated)
+CHAIN_DELTA = 10                   # extra cycles between consecutive triggers beyond gap + words: a chained source BD
+                                   # delivers its first word that much earlier than the first BD's (measured on the emulator)
 
 # The software events the flush generates: (trace name, number written to Event_Generate). The carrier shim's
 # trace unit uses the user events as its own start and stop, so the shim units flush with an event that never
@@ -338,19 +341,20 @@ def delay(cycles: int, label: str) -> list[str]:
 
 
 def release_at(spacing: int, label: str) -> list[str]:
-    """`spacing` cycles after the previous release (or the acquire), release the source lock. The release
+    """`spacing` cycles after the previous trigger (or the acquire), trigger the next source BD. The trigger
     sits on a fetch-line boundary so a loop's alignment padding never varies."""
-    return [*delay(max(spacing - 1, 0), label), ".p2align 4", f"  rel #{SOUTH + LOCK_SRC}, r2"]
+    return [*delay(max(spacing - 1, 0), label), ".p2align 4", TRIGGER]
 
 
 def core_asm(case: Case) -> str:
-    """Column 0's core: wait for go, release the source lock at the nominal spacings. Case E: one go and
-    one release per round."""
+    """Column 0's core: wait for go, then write one word to its stream port at the nominal spacings. The word
+    crosses to the memtile, where a one-word S2MM BD releases the lock of the next source BD (the core cannot
+    reach a memtile lock itself). Case E: one go and one trigger per round."""
     n = lp.nops
     body = ["  mov r2, #1", "  mov r3, #-1", *n(2)]
     if case.paced_by == "sequence":
         for k in range(case.tasks):
-            body += [f"  acq #{OWN + LOCK_GO}, r3", *n(4), ".p2align 4", f"  rel #{SOUTH + LOCK_SRC}, r2"]
+            body += [f"  acq #{OWN + LOCK_GO}, r3", *n(4), ".p2align 4", TRIGGER]
     else:
         body += [f"  acq #{OWN + LOCK_GO}, r3", *n(4)]
         for k, s in enumerate(release_spacings(case)):
@@ -362,7 +366,7 @@ def core_asm(case: Case) -> str:
 
 
 def background_asm(case: Case) -> str | None:
-    """Column 1's core: after go, `rounds` releases of the background lock, BG_LOCK_PERIOD apart, starting
+    """Column 1's core: after go, `rounds` releases of the background DMA's lock, one period apart, starting
     when the last transfer's idle begins."""
     rounds = background_rounds(case)
     if not case.fill or case.paced_by != "core":
@@ -370,9 +374,9 @@ def background_asm(case: Case) -> str | None:
     n = lp.nops
     start = sum(release_spacings(case)[:-1]) + case.transfers[-2].words
     inner = max((background_period(case) - 14) // LOOP_ITER, 1)
-    body = ["  mov r2, #1", "  mov r3, #-1", *n(2), f"  acq #{OWN + LOCK_GO}, r3", *n(4),
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2), f"  acq #{OWN + BG_GO}, r3", *n(4),
             *delay(start, ".Lbgstart"), f"  movxm r1, #{rounds}", *n(2), ".p2align 4", ".Lbground:",
-            *lp.delay_loop(inner, ".Lbgwait"), f"  rel #{SOUTH + LOCK_SRC}, r2", "  add r1, r1, #-1",
+            *lp.delay_loop(inner, ".Lbgwait"), f"  rel #{OWN + BG_LOCK}, r2", "  add r1, r1, #-1",
             *n(2), "  jnz r1, #.Lbground", *n(5), *n(8)]
     return lp.frame(body)
 
@@ -401,8 +405,7 @@ def _dest_task(var: str, t: Transfer, bd_id: int, arg: str, arg_words_: int, til
 
 def flush_units(case: Case) -> list[tuple[int, int, str]]:
     """(column, row, kind) of every traced unit that gets software-event pulses."""
-    units = [(0, 0, "shim"), (CARRIER_COL, 0, "shim"), (0, 1, "memtile")]
-    return units + ([(1, 1, "memtile")] if case.background else [])
+    return [(0, 0, "shim"), (CARRIER_COL, 0, "shim"), (0, 1, "memtile")]
 
 
 def flush_block(case: Case) -> str:
@@ -418,17 +421,11 @@ def flush_block(case: Case) -> str:
     return "\n".join(lines)
 
 
-def design_mlir(case: Case) -> str:
-    sizes = arg_words(case)
-    main_words = sizes.get(0, 16)
-    alt_words = sizes.get(1, 16)
-    bg = case.background
+def _src_bds(case: Case) -> tuple[str, str, int]:
+    """The source buffers, and the memtile DMA program: MM2S 0 sends each transfer's words behind lSrc; S2MM 1
+    takes one trigger word per transfer and releases lSrc for it. Returns (buffers, dma text, trigger address)."""
     layout = source_layout(case)
-    tiles = ["    %t00 = aie.tile(0, 0)", "    %t10 = aie.tile(1, 0)", "    %t01 = aie.tile(0, 1)",
-             "    %t02 = aie.tile(0, 2)"]
-    if bg:
-        tiles += ["    %t11 = aie.tile(1, 1)"] + (["    %t12 = aie.tile(1, 2)"] if case.paced_by == "core" else [])
-    bufs, bds = "", ""
+    bufs, bds, tbds = "", "", ""
     for k, (t, (addr, words)) in enumerate(zip(case.transfers, layout)):
         bufs += (f"    %src{k} = aie.buffer(%t01) {{address = {addr} : i32, sym_name = \"src{k}\", "
                  f"initial_value = dense<[{_ramp((k + 1) << 24, words)}]> : tensor<{words}xi32>}} : memref<{words}xi32>\n")
@@ -441,51 +438,83 @@ def design_mlir(case: Case) -> str:
       aie.use_lock(%lDone, Release, %c_r{k})
       aie.next_bd {nxt}
 """
-    memtile = f"""    %mt = aie.memtile_dma(%t01) {{
-      %m0 = aie.dma_start(MM2S, 0, ^bd0, ^end)
-{bds}    ^end:
+        tnext = f"^tbd{k + 1}" if k + 1 < case.tasks else "^end"
+        tbds += f"""    ^tbd{k}:
+      %c_ta{k} = arith.constant 1 : i32
+      aie.use_lock(%lTrig, AcquireGreaterEqual, %c_ta{k})
+      aie.dma_bd(%trig : memref<{case.tasks}xi32> offset = {k} len = 1)
+      %c_tr{k} = arith.constant 1 : i32
+      aie.use_lock(%lSrc, Release, %c_tr{k})
+      aie.next_bd {tnext}
+"""
+    taddr = layout[-1][0] + -(-layout[-1][1] * WORD // SRC_ALIGN) * SRC_ALIGN
+    bufs += f"    %trig = aie.buffer(%t01) {{address = {taddr} : i32, sym_name = \"trig\"}} : memref<{case.tasks}xi32>\n"
+    dma = f"""    %mt = aie.memtile_dma(%t01) {{
+      %m0 = aie.dma_start(MM2S, 0, ^bd0, ^trig)
+{bds}    ^trig:
+      %m1 = aie.dma_start(S2MM, 1, ^tbd0, ^end)
+{tbds}    ^end:
       aie.end
     }}
 """
+    return bufs, dma, taddr
+
+
+def _background(case: Case) -> tuple[str, str, str, str]:
+    """Column-1 compute tile (1,2): the source or sink of the background traffic behind its own lock, released
+    by its core one period apart (cases C, D), or a lock-free 256-word sink for the per-round reads (case E).
+    Returns (locks, dma text, flows, shim allocations)."""
+    rounds = background_rounds(case)
+    locks = ""
+    gated = case.paced_by == "core"
+    if gated:
+        locks = (f"    %lBg = aie.lock(%t12, {BG_LOCK}) {{init = 0 : i32, sym_name = \"lBg\"}}\n"
+                 f"    %lBgDone = aie.lock(%t12, {BG_DONE}) {{init = 0 : i32, sym_name = \"lBgDone\"}}\n"
+                 f"    %lBgGo = aie.lock(%t12, {BG_GO}) {{init = 0 : i32, sym_name = \"lBgGo\"}}\n")
+    rep = f", repeat_count = {rounds - 1}" if rounds > 1 and gated else ""
+    acq = ("      %c_ba = arith.constant 1 : i32\n      aie.use_lock(%lBg, AcquireGreaterEqual, %c_ba)\n" if gated else "")
+    rel = ("      %c_br = arith.constant 1 : i32\n      aie.use_lock(%lBgDone, Release, %c_br)\n" if gated else "")
+    if case.fill == "s2mm":
+        buf = (f"    %bgbuf = aie.buffer(%t12) {{address = 1024 : i32, sym_name = \"bgbuf\", initial_value = "
+               f"dense<[{_ramp(0x0F000000, BG_WORDS)}]> : tensor<{BG_WORDS}xi32>}} : memref<{BG_WORDS}xi32>\n")
+        direction, words = "MM2S", BG_WORDS
+        flow = "    aie.flow(%t12, DMA : 0, %t10, DMA : 0)\n"
+        alloc = "    aie.shim_dma_allocation @bg (%t10, S2MM, 0)\n"
+    else:
+        words = BG_WORDS if gated else BG_WORDS * rounds
+        buf = f"    %bgbuf = aie.buffer(%t12) {{address = 1024 : i32, sym_name = \"bgbuf\"}} : memref<{words}xi32>\n"
+        direction = "S2MM"
+        flow = "    aie.flow(%t10, DMA : 0, %t12, DMA : 0)\n"
+        alloc = "    aie.shim_dma_allocation @bg (%t10, MM2S, 0)\n"
+    mem = (f"{buf}    %bgmem = aie.mem(%t12) {{\n      %b0 = aie.dma_start({direction}, 0, ^bd0, ^end{rep})\n"
+           f"    ^bd0:\n{acq}      aie.dma_bd(%bgbuf : memref<{words}xi32>)\n{rel}      aie.next_bd ^end\n"
+           f"    ^end:\n      aie.end\n    }}\n")
+    return locks, mem, flow, alloc
+
+
+def design_mlir(case: Case) -> str:
+    sizes = arg_words(case)
+    main_words = sizes.get(0, 16)
+    alt_words = sizes.get(1, 16)
+    bg = case.background
+    tiles = ["    %t00 = aie.tile(0, 0)", "    %t10 = aie.tile(1, 0)", "    %t01 = aie.tile(0, 1)",
+             "    %t02 = aie.tile(0, 2)"] + (["    %t12 = aie.tile(1, 2)"] if bg else [])
+    bufs, memtile, _ = _src_bds(case)
     locks = (f"    %lSrc = aie.lock(%t01, {LOCK_SRC}) {{init = 0 : i32, sym_name = \"lSrc\"}}\n"
              f"    %lDone = aie.lock(%t01, {LOCK_DONE}) {{init = 0 : i32, sym_name = \"lDone\"}}\n"
+             f"    %lTrig = aie.lock(%t01, {LOCK_TRIG}) {{init = {case.tasks} : i32, sym_name = \"lTrig\"}}\n"
              f"    %lGo = aie.lock(%t02, {LOCK_GO}) {{init = 0 : i32, sym_name = \"lGo\"}}\n")
-    flows = "    aie.flow(%t01, DMA : 0, %t00, DMA : 0)\n"
+    flows = "    aie.flow(%t01, DMA : 0, %t00, DMA : 0)\n    aie.flow(%t02, Core : 0, %t01, DMA : 1)\n"
     allocs = "    aie.shim_dma_allocation @out (%t00, S2MM, 0)\n"
-    bgdecl, bgcore = "", ""
-    rounds = background_rounds(case)
+    bgmem, bgcore = "", ""
     if bg:
-        locks += (f"    %lBgSrc = aie.lock(%t11, {LOCK_SRC}) {{init = 0 : i32, sym_name = \"lBgSrc\"}}\n"
-                  f"    %lBgDone = aie.lock(%t11, {LOCK_DONE}) {{init = 0 : i32, sym_name = \"lBgDone\"}}\n")
-        if case.paced_by == "core":
-            locks += f"    %lBgGo = aie.lock(%t12, {LOCK_GO}) {{init = 0 : i32, sym_name = \"lBgGo\"}}\n"
-        rep = f", repeat_count = {rounds - 1}" if rounds > 1 and case.paced_by == "core" else ""
-        gated = case.paced_by == "core"
-        acq = (f"      %c_ba = arith.constant 1 : i32\n      aie.use_lock(%lBgSrc, AcquireGreaterEqual, %c_ba)\n"
-               if gated else "")
-        rel = ("      %c_br = arith.constant 1 : i32\n      aie.use_lock(%lBgDone, Release, %c_br)\n" if gated else "")
-        if case.fill == "s2mm":
-            bgdecl = (f"    %bgsrc = aie.buffer(%t11) {{address = 0 : i32, sym_name = \"bgsrc\", initial_value = "
-                      f"dense<[{_ramp(0x0F000000, BG_WORDS)}]> : tensor<{BG_WORDS}xi32>}} : memref<{BG_WORDS}xi32>\n"
-                      f"    %bgmt = aie.memtile_dma(%t11) {{\n      %m0 = aie.dma_start(MM2S, 0, ^bd0, ^end{rep})\n"
-                      f"    ^bd0:\n{acq}      aie.dma_bd(%bgsrc : memref<{BG_WORDS}xi32>)\n{rel}      aie.next_bd ^end\n"
-                      f"    ^end:\n      aie.end\n    }}\n")
-            flows += "    aie.flow(%t11, DMA : 0, %t10, DMA : 0)\n"
-            allocs += "    aie.shim_dma_allocation @bg (%t10, S2MM, 0)\n"
-        else:
-            sink_words = BG_WORDS * rounds
-            bgdecl = (f"    %bgsink = aie.buffer(%t11) {{address = 0 : i32, sym_name = \"bgsink\"}} : "
-                      f"memref<{BG_WORDS if gated else sink_words}xi32>\n"
-                      f"    %bgmt = aie.memtile_dma(%t11) {{\n      %m0 = aie.dma_start(S2MM, 0, ^bd0, ^end{rep})\n"
-                      f"    ^bd0:\n{acq}      aie.dma_bd(%bgsink : memref<{BG_WORDS if gated else sink_words}xi32>)\n{rel}"
-                      f"      aie.next_bd ^end\n    ^end:\n      aie.end\n    }}\n")
-            flows += "    aie.flow(%t10, DMA : 0, %t11, DMA : 0)\n"
-            allocs += "    aie.shim_dma_allocation @bg (%t10, MM2S, 0)\n"
-        if case.paced_by == "core":
-            bgcore = ("    func.func private @k_bg() attributes {link_with = \"bg.o\"}\n"
-                      "    aie.core(%t12) {\n      func.call @k_bg() : () -> ()\n      aie.end\n    }\n")
-    # runtime sequence
-    seq = [f"      %c_zero = arith.constant 0 : i32", f"      %c_one = arith.constant 1 : i32"]
+        bl, bgmem, bf, ba = _background(case)
+        locks, flows, allocs = locks + bl, flows + bf, allocs + ba
+        bgcore = ("    func.func private @k_bg() attributes {link_with = \"bg.o\"}\n"
+                  "    aie.core(%t12) {\n      func.call @k_bg() : () -> ()\n      aie.end\n    }\n"
+                  if case.paced_by == "core" else "    aie.core(%t12) {\n      aie.end\n    }\n")
+    rounds = background_rounds(case)
+    seq = ["      %c_zero = arith.constant 0 : i32", "      %c_one = arith.constant 1 : i32"]
     seq += [f"      %c_gen_{r} = arith.constant {EVENT_GENERATE[r]} : i32" for r in ("shim", "memtile")]
     seq += [f"      %c_ev_{SW_EVENT_SHIM[1]} = arith.constant {SW_EVENT_SHIM[1]} : i32",
             f"      %c_ev_{SW_EVENT_MEMTILE[1]} = arith.constant {SW_EVENT_MEMTILE[1]} : i32"]
@@ -506,10 +535,9 @@ def design_mlir(case: Case) -> str:
         for k, t in enumerate(case.transfers):
             name, w = argname[t.buf]
             body += _dest_task(f"task{k}", t, k, name, w)
-        if case.fill == "s2mm":
-            body += _dest_task("bg", _t(BG_WORDS * rounds, 0, 1), 0, "alt", alt_words, "%t10", 0, "S2MM")
-        elif case.fill == "mm2s":
-            body += _dest_task("bg", _t(BG_WORDS * rounds, 0, 1), 0, "alt", alt_words, "%t10", 0, "MM2S")
+        if case.fill:
+            body += _dest_task("bg", _t(BG_WORDS * rounds, 0, 1), 0, "alt", alt_words, "%t10", 0,
+                               "S2MM" if case.fill == "s2mm" else "MM2S")
         body += "      aiex.set_lock(%lGo, %c_one)\n"
         if bg:
             body += "      aiex.set_lock(%lBgGo, %c_one)\n"
@@ -525,7 +553,7 @@ def design_mlir(case: Case) -> str:
       func.call @k_core() : () -> ()
       aie.end
     }}
-{bgcore}{memtile}{bgdecl}{allocs}    aie.runtime_sequence @seq({args}) {{
+{bgcore}{memtile}{bgmem}{allocs}    aie.runtime_sequence @seq({args}) {{
 {chr(10).join(seq)}
 {body}    }}
   }}
@@ -751,9 +779,11 @@ def load_unit(run_dir: Path) -> Unit:
 
 def task_rows(u: Unit, case: Case) -> dict:
     """Per-task numbers of the S2MM channel under test, on the shim unit's clock, plus the covariates.
-    fw (first word) is the fall of the starvation run open at START+6, START+6 when the channel was not
-    starved at its onset (the word was waiting). The source's word clock comes from the memtile port and
-    is shifted by WORD_PATH to the shim."""
+    fw (first word) is when the task's first word reaches the shim: the source port's first word of the
+    transfer plus WORD_PATH, but not before START+6 (a word that was already waiting is taken at START+6).
+    The starvation fall is the silicon cross-check (fw_starv): the two agree where a word arrives at a
+    starved channel, and a queued task's START_TASK precedes its predecessor's FINISHED_TASK, so the
+    starvation level alone cannot date the second word. The source port's word clock comes from the memtile."""
     starts = [a for a, _ in runs_of(u.stamps(2, 0, 0, "DMA_S2MM_0_START_TASK"))]
     fins = [a for a, _ in runs_of(u.stamps(2, 0, 0, "DMA_S2MM_0_FINISHED_TASK"))]
     starv = runs_of(u.stamps(2, 0, 0, "DMA_S2MM_0_STREAM_STARVATION"))
@@ -773,13 +803,16 @@ def task_rows(u: Unit, case: Case) -> dict:
         if k >= len(starts) or k >= len(fins):
             break
         st, fin = starts[k], fins[k]
-        onset = next((b + 1 for a, b in starv if a <= st + 6 <= b), None)
-        fw = onset if onset is not None else st + 6
         mem = words[cum:cum + t.words] if len(words) >= cum + t.words else []
         cum += t.words
         lw_mem = (mem[-1] + WORD_PATH) if mem else None
         fw_mem = (mem[0] + WORD_PATH) if mem else None
+        fw = max(st + 6, fw_mem) if fw_mem is not None else st + 6
+        onset = next((b + 1 for a, b in starv if a <= fw - 1 <= b), None)
+        waiting = fw_mem is not None and fw_mem <= st + 6
         win = (mem[-1] - mem[0] + 1) if mem else None
+        if onset is not None and abs(onset - fw) > 8:
+            notes.append(f"task {k}: starvation fall {onset} vs first word by the source port {fw}")
         before = [a for a in arrivals if a <= fw]
         in_idle = [a for a in arrivals if prev_lw is not None and prev_lw < a <= fw]
         n = t.words
@@ -792,7 +825,8 @@ def task_rows(u: Unit, case: Case) -> dict:
         else:
             cls = "cold" if x > COLD_X else "warm"
         rows.append({
-            "k": k, "role": t.role, "words": n, "start": st, "fw": fw, "waiting": onset is None, "fin": fin,
+            "k": k, "role": t.role, "words": n, "start": st, "fw": fw, "waiting": waiting, "fin": fin,
+            "fw_starv": onset,
             "F": f, "X": x, "class": cls, "fw_mem": fw_mem, "lw": lw_mem,
             "window": win, "excess": None if win is None else win - n,
             "fin_after_last": None if lw_mem is None else fin - lw_mem,
