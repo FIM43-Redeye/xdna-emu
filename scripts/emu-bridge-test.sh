@@ -2321,6 +2321,10 @@ run_one_bridge() {
   # execution.
   local _timeout_s="${EMU_TIMEOUT}"
 
+  # The FFI writes the S2MM stream sidecar next to trace_raw.bin; nothing from an
+  # earlier run into this directory may stand in for it.
+  rm -f "$trace_out_dir"/trace_stream.{json,bin,check}
+
   local rc=0
   (
     cd "$build_dir"
@@ -2392,6 +2396,16 @@ run_one_bridge() {
   # Trim trace buffer to actual data length.
   if [[ -f "$trace_out_dir/trace_raw.bin" ]]; then
     python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
+  fi
+
+  # The emulator's whole trace stream: trace_raw.bin is the host buffer, which a
+  # shim S2MM fills in whole bursts only, as on silicon; trace_stream.bin is the
+  # same buffer with every word the S2MMs took off their streams, which the trace
+  # gate scores. trace_stream.check records whether trace_raw.bin is whole bursts
+  # of it (the gate fails a candidate whose check failed).
+  if [[ -f "$trace_out_dir/trace_raw.bin" && -f "$trace_out_dir/trace_stream.json" ]]; then
+    python3 "$EMU_ROOT/tools/trace_stream.py" "$trace_out_dir" >> "$log_file" 2>&1 \
+      || echo "  WARN $name ($compiler): trace stream check: $(cat "$trace_out_dir/trace_stream.check" 2>/dev/null)"
   fi
 
   # Pre-decode events.json so the per-test directory is self-contained. Under
@@ -2677,6 +2691,8 @@ _predecode_events_next_to_trace() {
   local bin="$trace_dir/trace_raw.bin"
   local out="$trace_dir/events.json"
   [[ -f "$bin" ]] || return 0
+  # An emulator side scores its whole stream (see run_one_bridge).
+  [[ -f "$trace_dir/trace_stream.bin" ]] && bin="$trace_dir/trace_stream.bin"
   # Discover the aiecc-lowered MLIR; the .prj dir name varies by test
   # (aie_arch.mlir.prj for the diag corpus, aie2.mlir.prj for objfifo).
   local mlir

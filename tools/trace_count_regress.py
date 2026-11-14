@@ -361,8 +361,22 @@ class Side:
         self._loaded = False
 
     @property
+    def raw_path(self) -> Path:
+        """The raw trace this side is scored from: the emulator's whole stream
+        (``trace_stream.bin``, built by tools/trace_stream.py) when there is one, else the
+        host buffer ``trace_raw.bin``."""
+        stream = self.path / "trace_stream.bin"
+        return stream if stream.exists() else self.path / "trace_raw.bin"
+
+    @property
+    def stream_check(self) -> str | None:
+        """trace_stream.py's check line, None when the side has no stream sidecar."""
+        f = self.path / "trace_stream.check"
+        return f.read_text().strip() if f.exists() else None
+
+    @property
     def digest(self) -> str:
-        raw = self.path / "trace_raw.bin"
+        raw = self.raw_path
         f = raw if raw.exists() else self.path / "events.json"
         return hashlib.sha256(f.read_bytes()).hexdigest()
 
@@ -380,7 +394,7 @@ class Side:
         self._event_sets = {pt: tuple(sn[kind]) for pt, kind in _PT_CODE_TO_NAME.items()
                             if kind in sn}
         # (col, row, pkt_type, name, ts) of every event, level rows expanded where possible.
-        rows, self._level_problem, units = _event_rows(self.path, doc)
+        rows, self._level_problem, units = _event_rows(self.raw_path, doc)
         oc = self._origin_col
         self._units = (None if units is None else
                        {(max(c - oc, 0), r, pt): st for (c, r, pt), st in units.items()})
@@ -435,7 +449,7 @@ def _unit_states(words: list[int], modes: dict, all_cmds: dict) -> dict:
     return out
 
 
-def _event_rows(path: Path, doc: dict):
+def _event_rows(raw: Path, doc: dict):
     """-> ([(col, row, pkt_type, name, ts)], level_problem, units) for one side.
 
     Mode-0 tiles come from ``trace_raw.bin`` with held levels expanded; every other tile (and
@@ -443,7 +457,6 @@ def _event_rows(path: Path, doc: dict):
     {(col, row, pkt_type): UnitState} from the raw trace, None without a usable one.
     """
     original = [(e["col"], e["row"], e["pkt_type"], e["name"], e["ts"]) for e in doc["events"]]
-    raw = path / "trace_raw.bin"
     if not raw.exists():
         return original, "no trace_raw.bin", None
     data = raw.read_bytes()
@@ -461,7 +474,7 @@ def _event_rows(path: Path, doc: dict):
                                for e in doc["events"]
                                if (e["pkt_type"], e["row"], e["col"]) in cmds)
     if plain != want:
-        return original, "trace_raw.bin does not reproduce events.json", None
+        return original, f"{raw.name} does not reproduce events.json", None
     expanded = [(e.col, e.row, e.pkt_type, e.name, e.ts)
                 for e in rebuild_timeline_mode0_levels(cmds, names)]
     rest = [r for r in original if (r[2], r[1], r[0]) not in cmds]
@@ -585,6 +598,9 @@ class Report:
     standing: list = field(default_factory=list)
     # Per trace unit: how many silicon samples carry it, and how many of those lost their tail.
     units: list = field(default_factory=list)
+    # (test, compiler, check line): candidate emulator sides whose whole stream failed
+    # trace_stream.py's check (the host buffer is not whole bursts of it): gate failures.
+    stream_check_failures: list = field(default_factory=list)
 
     @property
     def emu_absent(self) -> list:
@@ -605,7 +621,7 @@ class Report:
     @property
     def exit_code(self) -> int:
         return 1 if (any(r.gate_fail for r in self.rows) or any(o.gate_fail for o in self.offsets)
-                     or self.emu_lost) else 0
+                     or self.emu_lost or self.stream_check_failures) else 0
 
     def of(self, verdict):
         return sorted((r for r in self.rows if r.verdict == verdict),
@@ -627,6 +643,7 @@ class Report:
             "hw_samples_tail_cut": sum(u.hw_tail_cut for u in self.units),
             "emu_units_absent": len(self.emu_absent),
             "emu_units_lost": len(self.emu_lost),
+            "emu_stream_check_failures": len(self.stream_check_failures),
             "improved": len(self.of("improved")),
             "regressed": len(self.of("regressed")),
             "neutral": len(self.of("neutral")),
@@ -757,6 +774,8 @@ def compare_runs(baseline: Path, candidate: Path, only: list[str] | None = None,
             rep.skipped.append(tc)
             continue
         eb_side, ec_side = b["emu"], c["emu"]
+        if ec_side.stream_check is not None and not ec_side.stream_check.startswith("OK"):
+            rep.stream_check_failures.append((*tc, ec_side.stream_check))
         # A sample measures a tile module only with the event set the candidate EMU traced.
         usable = {pt: [] for pt in _PT_CODE_TO_NAME}
         for label, side in samples:
@@ -963,6 +982,11 @@ def format_text(rep: Report) -> str:
             f"{'carries it' if u.emu_baseline else 'lacks it' if u.emu_baseline is False else '?'}"
             + ("  [GATE]" if u in rep.emu_lost else "  (standing, not gated)")
             for u in rep.emu_absent]
+    if rep.stream_check_failures:
+        out += ["", f"Candidate emulator sides whose trace stream check failed "
+                    f"({len(rep.stream_check_failures)}): trace_raw.bin is not whole bursts of the "
+                    f"stream  [GATE]"] + [
+            f"  {t}.{c}: {line}" for t, c, line in rep.stream_check_failures]
     if rep.not_measured:
         out += ["", f"Rows not measured on silicon ({len(rep.not_measured)}): no HW sample carries "
                     f"the unit; neither pass nor fail"] + [

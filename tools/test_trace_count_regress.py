@@ -993,3 +993,37 @@ def test_a_cut_sample_does_not_hide_a_standing_miss_above_uncut_silicon(tmp_path
     rep = tcr.compare_runs(b, c, hw_samples=x)
     (m,) = rep.standing
     assert m.hw_counts == [10, 10, 6] and m.hw_cut == [False, False, True] and not m.hw_lower_bounded
+
+
+# --- the emulator's whole stream (trace_stream.bin beside a burst-cut trace_raw.bin) ---------
+
+def _emu_with_stream(root, events, check="OK buffer 0x1000: 1 run(s)"):
+    """A candidate EMU side whose trace_raw.bin lost its last packet (the burst cut) while
+    trace_stream.bin holds the whole stream and events.json was decoded from it."""
+    c = write_run(root, "cand", {K: {"emu": events}})
+    sd = c / f"{K[0]}.{K[1]}.emu"
+    full = (sd / "trace_raw.bin").read_bytes()
+    (sd / "trace_stream.bin").write_bytes(full)
+    (sd / "trace_raw.bin").write_bytes(full[:-32] + bytes(32))
+    (sd / "trace_stream.check").write_text(check + "\n")
+    return c, sd
+
+
+def test_the_gate_scores_the_whole_stream_when_the_emulator_writes_one(tmp_path):
+    mem = edge("X", periodic(12, 50), pkt=1)
+    _, sd = _emu_with_stream(tmp_path, mem)
+    side = tcr.Side(sd)
+    assert side.level_problem is None, side.level_problem
+    assert side.tail_cut((0, 2, 1)) is False, "the stream has its End token"
+    assert side.digest == __import__("hashlib").sha256((sd / "trace_stream.bin").read_bytes()).hexdigest()
+
+
+def test_a_failed_stream_check_fails_the_gate(tmp_path):
+    mem = edge("X", periodic(12, 50), pkt=1)
+    b = write_run(tmp_path, "base", {K: {"hw": mem, "emu": mem}})
+    c, _ = _emu_with_stream(tmp_path, mem, check="FAIL buffer 0x1000: run at 0x0: not whole 64-byte bursts")
+    rep = tcr.compare_runs(b, c)
+    assert rep.stream_check_failures == [(K[0], K[1], "FAIL buffer 0x1000: run at 0x0: not whole 64-byte bursts")]
+    assert rep.exit_code == 1
+    assert "trace stream check failed" in tcr.format_text(rep)
+    assert tcr.to_json(rep)["summary"]["emu_stream_check_failures"] == 1

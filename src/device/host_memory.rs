@@ -245,6 +245,13 @@ pub struct HostMemory {
     /// Shim DMA accesses at AIE addresses below the DDR aperture, which have no
     /// host address and so never reach this memory (see `record_outside_aperture`).
     outside_aperture: RefCell<BlockedLog>,
+
+    /// Shadow of the shim S2MM streams, `None` unless turned on: every word a shim
+    /// S2MM took off its stream, at the host address it is bound for, whether or not
+    /// it has reached memory. A diagnostic beside memory, never read by the device:
+    /// the trace gate scores a channel's whole stream from it while memory holds what
+    /// silicon's host buffer would (see `set_s2mm_stream_shadow`).
+    s2mm_stream_shadow: Option<BTreeMap<u64, u32>>,
 }
 
 impl HostMemory {
@@ -264,6 +271,52 @@ impl HostMemory {
             iommu_guard: false,
             blocked: RefCell::new(BlockedLog::default()),
             outside_aperture: RefCell::new(BlockedLog::default()),
+            s2mm_stream_shadow: None,
+        }
+    }
+
+    /// Turn the shim S2MM stream shadow on (an empty shadow) or off (dropped).
+    pub fn set_s2mm_stream_shadow(&mut self, on: bool) {
+        self.s2mm_stream_shadow = on.then(BTreeMap::new);
+    }
+
+    /// Record that a shim S2MM took `word` off its stream for host address `addr`
+    /// (whether or not it is written yet). Nothing when the shadow is off.
+    pub fn shadow_s2mm_word(&mut self, addr: u64, word: u32) {
+        if let Some(shadow) = &mut self.s2mm_stream_shadow {
+            shadow.insert(addr, word);
+        }
+    }
+
+    /// The shadow's words in `[base, base + size)`, by address; empty when off.
+    pub fn s2mm_stream_shadow_in(&self, base: u64, size: usize) -> Vec<(u64, u32)> {
+        match &self.s2mm_stream_shadow {
+            Some(shadow) => shadow
+                .range(base..base.saturating_add(size as u64))
+                .map(|(&a, &w)| (a, w))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Every buffer the device may reach, `(base, size)`: named regions and external
+    /// mappings, by base address.
+    pub fn buffer_spans(&self) -> Vec<(u64, usize)> {
+        let mut spans: Vec<(u64, usize)> = self.regions.iter().map(|r| (r.base_address, r.size)).collect();
+        spans.extend(self.external_regions.iter().map(|r| (r.base_address, r.size)));
+        spans.sort_unstable();
+        spans
+    }
+
+    /// A buffer that goes away takes its shadow words with it, so a later buffer at
+    /// the same address starts clean.
+    fn drop_shadow_range(&mut self, base: u64, size: usize) {
+        if let Some(shadow) = &mut self.s2mm_stream_shadow {
+            let end = base.saturating_add(size as u64);
+            let doomed: Vec<u64> = shadow.range(base..end).map(|(&a, _)| a).collect();
+            for a in doomed {
+                shadow.remove(&a);
+            }
         }
     }
 
@@ -403,6 +456,7 @@ impl HostMemory {
             return Err(HostMemoryError::ExternalRegionNotFound { base_address, size });
         };
         self.external_regions.remove(index);
+        self.drop_shadow_range(base_address, size);
         Ok(())
     }
 
@@ -501,9 +555,12 @@ impl HostMemory {
     /// remain in the BTreeMap but are harmless (they'll be overwritten if
     /// the address range is reused).
     pub fn free_region(&mut self, base_address: u64) -> bool {
-        let before = self.regions.len();
-        self.regions.retain(|r| r.base_address != base_address);
-        self.regions.len() < before
+        let Some(index) = self.regions.iter().position(|r| r.base_address == base_address) else {
+            return false;
+        };
+        let size = self.regions.remove(index).size;
+        self.drop_shadow_range(base_address, size);
+        true
     }
 
     /// Get or create a page for the given address.
@@ -1190,5 +1247,43 @@ mod tests {
             self.host_read_bytes(addr, &mut b);
             u32::from_le_bytes(b)
         }
+    }
+
+    // -- shim S2MM stream shadow -------------------------------------------------------------
+
+    #[test]
+    fn the_stream_shadow_is_off_by_default_and_records_nothing() {
+        let mut mem = HostMemory::new();
+        mem.shadow_s2mm_word(0x1000, 7);
+        assert!(mem.s2mm_stream_shadow_in(0, 0x10000).is_empty());
+    }
+
+    #[test]
+    fn the_stream_shadow_holds_words_that_never_reach_memory() {
+        let mut mem = HostMemory::new();
+        mem.allocate_region("trace", 0x10_0000, 0x1000).unwrap();
+        mem.set_s2mm_stream_shadow(true);
+        mem.shadow_s2mm_word(0x10_0004, 0xAA);
+        mem.shadow_s2mm_word(0x10_0000, 0xBB);
+        mem.shadow_s2mm_word(0x10_0004, 0xCC); // a later word for the same address replaces it
+        mem.shadow_s2mm_word(0x20_0000, 0xDD); // outside the span asked for
+        assert_eq!(mem.s2mm_stream_shadow_in(0x10_0000, 0x1000), vec![(0x10_0000, 0xBB), (0x10_0004, 0xCC)]);
+        assert_eq!(mem.read_u32(0x10_0000), 0, "the shadow is not memory");
+    }
+
+    #[test]
+    fn a_freed_or_unmapped_buffer_takes_its_shadow_words_with_it() {
+        let mut mem = HostMemory::new();
+        mem.allocate_region("a", 0x10_0000, 0x1000).unwrap();
+        let mut ext = vec![0u8; 0x1000];
+        unsafe { mem.map_external(0x30_0000, ext.as_mut_ptr(), ext.len()).unwrap() };
+        mem.set_s2mm_stream_shadow(true);
+        mem.shadow_s2mm_word(0x10_0000, 1);
+        mem.shadow_s2mm_word(0x30_0000, 2);
+        assert_eq!(mem.buffer_spans(), vec![(0x10_0000, 0x1000), (0x30_0000, 0x1000)]);
+        assert!(mem.free_region(0x10_0000));
+        mem.unmap_external(0x30_0000, 0x1000).unwrap();
+        assert!(mem.s2mm_stream_shadow_in(0, usize::MAX).is_empty());
+        assert!(mem.buffer_spans().is_empty());
     }
 }

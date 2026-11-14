@@ -3898,6 +3898,7 @@ impl DmaEngine {
             let word_addr = addr + (i * 4) as u64;
             log::debug!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
             host_memory.write_u32(word_addr, word);
+            host_memory.shadow_s2mm_word(word_addr, word);
 
             if crate::debug::watch::is_watched(word_addr, 4) {
                 crate::debug::watch::log_dma_write(
@@ -4144,7 +4145,13 @@ mod shim_host_address_tests {
 
     /// Drive a shim S2MM BD of 16 words at AIE address `base` and return the host memory.
     fn shim_s2mm_16_words_at(base: u64) -> HostMemory {
+        shim_s2mm_16_words(base, false)
+    }
+
+    /// As `shim_s2mm_16_words_at`, with the S2MM stream shadow on or off.
+    fn shim_s2mm_16_words(base: u64, shadow: bool) -> HostMemory {
         let mut host_memory = guarded_ffi_like();
+        host_memory.set_s2mm_stream_shadow(shadow);
         let mut engine = DmaEngine::new_shim_tile(1, 0);
         let mut tile = Tile::shim(1, 0);
         engine.configure_bd(0, BdConfig::simple_1d(base, 64)).unwrap();
@@ -4179,6 +4186,22 @@ mod shim_host_address_tests {
         assert_eq!(host_memory.outside_aperture_bytes(), 0);
         assert_eq!(host_memory.read_u32(HOST), 0xA000_0000);
         assert_eq!(host_memory.read_u32(HOST + 60), 0xA000_000F);
+    }
+
+    /// The stream shadow holds every word the S2MM took off its stream, at its host address.
+    #[test]
+    fn the_stream_shadow_holds_each_word_at_its_host_address() {
+        let host_memory = shim_s2mm_16_words(HOST + DDR_AIE_ADDR_OFFSET, true);
+        let shadow = host_memory.s2mm_stream_shadow_in(HOST, 0x1000);
+        let want: Vec<(u64, u32)> = (0..16u32).map(|i| (HOST + 4 * i as u64, 0xA000_0000 | i)).collect();
+        assert_eq!(shadow, want);
+    }
+
+    /// Words with no host address leave no shadow.
+    #[test]
+    fn an_s2mm_below_the_aperture_leaves_no_shadow() {
+        let host_memory = shim_s2mm_16_words(0x400, true);
+        assert!(host_memory.s2mm_stream_shadow_in(0, usize::MAX).is_empty());
     }
 
     /// The S2MM consumes the words and completes; nothing is written and nothing counts as an

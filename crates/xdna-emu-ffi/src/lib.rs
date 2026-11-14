@@ -49,6 +49,7 @@ mod execution;
 pub mod host_faults;
 mod memory;
 mod query;
+pub mod stream_sidecar;
 
 pub use async_errors::*;
 pub use classify::*;
@@ -347,6 +348,11 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     // (Interpreter backend; aiesim keeps its own host-memory bridge.)
     if let Some(engine) = backend.as_interpreter_mut() {
         engine.host_memory_mut().set_iommu_guard(true);
+        // With a trace capture directory, keep the S2MM stream shadow for the sidecar
+        // (stream_sidecar): the trace gate scores the whole stream.
+        if stream_sidecar::sidecar_path().is_some() {
+            engine.host_memory_mut().set_s2mm_stream_shadow(true);
+        }
     }
     if let Some(dir) = xdna_emu_core::interpreter::engine::device_state::state_dir_from_env() {
         open_device_state(backend.as_mut(), &dir);

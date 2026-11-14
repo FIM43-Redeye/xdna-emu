@@ -421,6 +421,7 @@ pub(crate) fn run_interpreter(
                 engine.flush_trace_to_host();
                 host_faults.observe(engine);
                 report_host_faults(&host_faults, engine);
+                crate::stream_sidecar::write_sidecar(engine.host_memory());
                 return RunOutcome { cycles, halt: HaltKind::Error };
             }
             npu_progressed = matches!(result, xdna_emu_core::npu::AdvanceResult::Progressed);
@@ -511,6 +512,7 @@ pub(crate) fn run_interpreter(
     engine.flush_trace_to_host();
     host_faults.observe(engine);
     report_host_faults(&host_faults, engine);
+    crate::stream_sidecar::write_sidecar(engine.host_memory());
 
     // SP-4b: alongside the trace flush, optionally write the origin_d.json
     // sidecar (per-module broadcast timer-reset arrival + calibrated flag --

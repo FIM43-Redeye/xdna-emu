@@ -326,6 +326,16 @@ full packet), and the decoder shows it as a Start without the End token. The gat
   bounds, so it fails only by falling below the bound; the report line says "lower bound only" and
   the JSON row has `hw_lower_bounded`. A cut count is printed as `>=N`. `--exclude-cut-tails` is
   retired (it threw away what the bound uses).
+- The emulator's side is scored from its whole stream. A shim S2MM writes host memory in whole
+  bursts, on silicon and in the emulator alike, so the emulator's `trace_raw.bin` is cut the
+  way silicon's is. With `XDNA_TRACE_DIR` set the FFI also records every word the shim S2MMs
+  took off their streams and writes `trace_stream.json` beside `trace_raw.bin`
+  (`crates/xdna-emu-ffi/src/stream_sidecar.rs`); the bridge script turns it into
+  `trace_stream.bin` (`tools/trace_stream.py`), decodes `events.json` from that, and the gate
+  reads it in place of `trace_raw.bin`, so emulator rows stay exact. `trace_stream.check`
+  holds the one consistency check: in each stream run the host buffer holds a prefix of the
+  run ending on a burst boundary (or the whole run, a BD that completed) and nothing else.
+  A candidate whose check failed fails the gate.
 - The emulator gets no such allowance: a unit the candidate emulator trace lacks while silicon
   carries it fails the gate if the baseline emulator trace had it (a gap both emulator traces
   share is listed as standing).
