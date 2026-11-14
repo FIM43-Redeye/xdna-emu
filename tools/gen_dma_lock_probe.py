@@ -1396,6 +1396,15 @@ CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) s
 CHAIN_FILL_GAP_NOPS = 16           # nops before the first fill release; each later one waits one nop more
                                    # (48 fills span about 2000 cycles: inside the ring family's silicon fill span)
 CHAIN_LOCK_KINDS = {"": "none", "f": "free", "c": "core"}
+# With `waker` = "<row>" a local loopback on tile (0, row) of a north route (MM2S 1 -> S2MM 1 of that tile,
+# CHAIN_WAKER_WORDS words, started by its lock W, which the runtime sequence sets just before START) keeps that tile's
+# stream switch beating through the head's passage; "<row>q", the quiet twin, sets W only after the pad writes, so the
+# same loopback runs after the measured chain. Nothing else differs between the two. The waker's ports (DMA 1) are not
+# the route's (South / North), and its buffers sit in banks the receiver does not touch.
+CHAIN_WAKER_WORDS = 2048           # about 2048 cycles of beats: spans the head from just before START on
+CHAIN_WAKER_SRC = 0x0400           # banks 0 / 1 of the waker tile, before the receiver's `dst`
+CHAIN_WAKER_DST = 0xC000           # banks 6 / 7
+CHAIN_LOCK_WAKER, CHAIN_LOCK_WAKER_DONE = 8, 9
 CHAIN_MEM_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD",
                     "LOCK_SEL0_ACQ_GE"]
 CHAIN_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "LOCK_STALL"]
@@ -1418,6 +1427,7 @@ class ChainCase:
     bd_ids: tuple = ()             # bd_id of every MM2S BD (head, mids, waiting BD); () = aiecc assigns
     fill: int = 0                  # core releases of A after the tail (trace packet fillers; core releaser only)
     receiver: str = "own"          # "own": the loopback S2MM of tile (0,2); "north": the S2MM of tile (0,3)
+    waker: str = ""                # "": none; "<row>": a loopback on (0, row) beating through the head; "<row>q": after it
 
     @property
     def name(self) -> str:
@@ -1432,7 +1442,13 @@ class ChainCase:
             d["fill"] = self.fill
         if self.receiver != "own":
             d["receiver"] = self.receiver
+        if self.waker:
+            d["waker"] = self.waker
         return d
+
+    @property
+    def waker_row(self) -> int | None:
+        return int(self.waker.rstrip("q")) if self.waker else None
 
 
 def parse_chain_mids(tokens) -> tuple:
@@ -1482,6 +1498,11 @@ def chain_validate(c: ChainCase) -> None:
         raise ValueError(f"receiver in {CHAIN_RECEIVERS}; a remote receiver only with the core releaser")
     if not 0 <= c.fill <= CHAIN_MAX_FILL or (c.fill and c.releaser != "core"):
         raise ValueError(f"fill in 0..{CHAIN_MAX_FILL}, and only with the core releaser")
+    if c.waker:
+        digits = c.waker[:-1] if c.waker.endswith("q") else c.waker
+        top = CHAIN_RECEIVER_ROW.get(c.receiver, 0)
+        if not digits.isdigit() or not c.receiver.startswith("north") or not FETCH_ROW < int(digits) <= top:
+            raise ValueError("waker: '<row>' or '<row>q' with a row of the north route past the source (3 .. receiver)")
     a, w = chain_buffers(c)[-1]
     if a + 4 * w > CHAIN_BUF_END:
         raise ValueError("head and mid buffers exceed logical bank 1")
@@ -1569,9 +1590,36 @@ def chain_design_mlir(c: ChainCase) -> str:
     remote = c.receiver != "own"
     s2mm_block = f"    ^recv_start:\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n{recv}"
     t03 = f"    {rx} = aie.tile(0, {rrow})\n" if remote else ""
-    remote_mem = (f"    %mem0{rrow} = aie.{'memtile_dma' if c.receiver == 'south' else 'mem'}({rx}) {{\n"
-                  "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
-                  f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
+    wr = c.waker_row
+    wk_decl = wk_set = ""
+    if wr is not None:
+        wt, ww = f"%t0{wr}", CHAIN_WAKER_WORDS
+        if wr != rrow:
+            t03 += f"    {wt} = aie.tile(0, {wr})\n"
+        wk_decl = (f"    %wsrc{wr} = aie.buffer({wt}) {{address = {CHAIN_WAKER_SRC} : i32, sym_name = \"wsrc{wr}\"}} : memref<{ww}xi32>\n"
+                   f"    %wdst{wr} = aie.buffer({wt}) {{address = {CHAIN_WAKER_DST} : i32, sym_name = \"wdst{wr}\"}} : memref<{ww}xi32>\n"
+                   f'    %lW{wr} = aie.lock({wt}, {CHAIN_LOCK_WAKER}) {{init = 0 : i32, sym_name = "lW{wr}"}}\n'
+                   f'    %lWd{wr} = aie.lock({wt}, {CHAIN_LOCK_WAKER_DONE}) {{init = 0 : i32, sym_name = "lWd{wr}"}}\n'
+                   f"    aie.flow({wt}, DMA : 1, {wt}, DMA : 1)\n")
+        wk_body = (f"    ^wk0:\n      %cw = arith.constant 1 : i32\n"
+                   f"      aie.use_lock(%lW{wr}, AcquireGreaterEqual, %cw)\n      aie.dma_bd(%wsrc{wr} : memref<{ww}xi32>)\n"
+                   f"      aie.use_lock(%lWd{wr}, Release, %cw)\n      aie.next_bd ^end\n"
+                   f"    ^wr_start:\n      %wk2 = aie.dma_start(S2MM, 1, ^wr0, ^end)\n    ^wr0:\n"
+                   f"      aie.dma_bd(%wdst{wr} : memref<{ww}xi32>)\n      aie.next_bd ^end\n")
+        wk_set = f"      aiex.set_lock(%lW{wr}, %c_one)\n"
+    if wr is not None and wr == rrow:
+        remote_mem = (f"    %mem0{rrow} = aie.mem({rx}) {{\n"
+                      "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^wk_start)\n"
+                      f"{recv}    ^wk_start:\n      %wk1 = aie.dma_start(MM2S, 1, ^wk0, ^wr_start)\n{wk_body}"
+                      "    ^end:\n      aie.end\n    }\n")
+    else:
+        remote_mem = (f"    %mem0{rrow} = aie.{'memtile_dma' if c.receiver == 'south' else 'mem'}({rx}) {{\n"
+                      "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
+                      f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
+        if wr is not None:
+            remote_mem += (f"    %mem0{wr} = aie.mem(%t0{wr}) {{\n"
+                           f"      %wk1 = aie.dma_start(MM2S, 1, ^wk0, ^wr_start)\n{wk_body}"
+                           "    ^end:\n      aie.end\n    }\n")
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
     pad = "\n".join("      aiex.npu.write32(%c_zero, %c_one) {buffer = @scratch} : i32, i32"
@@ -1587,7 +1635,7 @@ def chain_design_mlir(c: ChainCase) -> str:
 {dst}
     %scratch = aie.buffer(%t02) {{address = {FETCH_SCRATCH_ADDR} : i32, sym_name = "scratch"}} : memref<4xi32>
 {nl.join(locks)}
-    aie.flow(%t02, DMA : 0, {rx}, DMA : 0)
+{wk_decl}    aie.flow(%t02, DMA : 0, {rx}, DMA : 0)
     func.func private @k_core(memref<16xi32>) attributes {{link_with = "core.o"}}
     aie.core(%t02) {{
       func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
@@ -1602,9 +1650,9 @@ def chain_design_mlir(c: ChainCase) -> str:
 {remote_mem}    aie.runtime_sequence(%dummy: memref<4xi32>) {{
       %c_zero = arith.constant 0 : i32
       %c_one = arith.constant 1 : i32
-      aiex.set_lock(%lStart, %c_one)
+{"" if c.waker.endswith("q") else wk_set}      aiex.set_lock(%lStart, %c_one)
 {pad}
-    }}
+{wk_set if c.waker.endswith("q") else ""}    }}
   }}
 }}
 """
@@ -1684,7 +1732,8 @@ def chain_selection(args) -> list:
     ids = tuple(getattr(args, "bd_ids", None) or ())
     fill = getattr(args, "fill", 0) or 0
     receiver = getattr(args, "receiver", None) or "own"
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver) for a, b in pairs]
+    waker = getattr(args, "waker", None) or ""
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver, waker) for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1770,6 +1819,9 @@ def add_chain_parsers(sub) -> None:
                         help="bd_id of every MM2S BD in chain order (head, mids, waiting BD); default: aiecc assigns")
         sp.add_argument("--receiver", choices=CHAIN_RECEIVERS, default="own",
                         help="who takes the MM2S's stream: own (the loopback S2MM) or north (tile (0,3)'s S2MM)")
+        sp.add_argument("--waker", default="",
+                        help="a loopback on tile (0, ROW) of a north route beating through the head: ROW, or ROWq "
+                             "to run the same loopback after the measured chain (the quiet twin)")
         sp.add_argument("--fill", type=int, default=0,
                         help="core releases of A after the tail: memory-module trace packet fillers (core releaser)")
 

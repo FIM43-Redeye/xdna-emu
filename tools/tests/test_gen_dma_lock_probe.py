@@ -2131,3 +2131,48 @@ def test_sw_design_is_sl_plus_the_compute_local_waker():
         if "aie.dma_bd" in line or "aie.use_lock" in line or "aie.flow" in line:
             assert line in t                                              # sl's own design untouched
     assert g.sw_design_mlir(g.SwCase(None)) == t                             # only the core differs between cases
+
+
+# -- chain waker: a local loopback on one tile of the route keeps its switch awake (or, quiet twin, runs after) ----
+
+def test_chain_waker_is_part_of_the_design_and_names_its_tile_and_phase():
+    c = chain("1 1", head=24, receiver="north2", fill=48, waker="3")
+    assert c.design()["waker"] == "3" and "waker" not in chain("1 1", receiver="north2").design()
+    assert chain("1 1", receiver="north2", waker="3q").design()["waker"] == "3q"
+    for bad in ("2", "6", "5", "3x", "q"):          # not the source, on the route, row then optional q
+        with pytest.raises(ValueError):
+            g.chain_validate(chain("1 1", receiver="north2", waker=bad))
+    g.chain_validate(chain("1 1", receiver="north", waker="3"))
+    g.chain_validate(chain("1 1", receiver="north3", waker="5q"))
+
+
+def test_chain_waker_loopback_runs_on_its_tile_started_by_the_sequence_around_start():
+    awake = g.chain_design_mlir(chain("1 1", head=24, receiver="north2", fill=48, waker="3"))
+    quiet = g.chain_design_mlir(chain("1 1", head=24, receiver="north2", fill=48, waker="3q"))
+    for t in (awake, quiet):
+        assert "%t03 = aie.tile(0, 3)" in t and "aie.flow(%t03, DMA : 1, %t03, DMA : 1)" in t
+        assert f"%wsrc3 = aie.buffer(%t03)" in t and f"memref<{g.CHAIN_WAKER_WORDS}xi32>" in t
+        assert "aie.dma_start(MM2S, 1, ^wk0" in t and "aie.dma_start(S2MM, 1, ^wr0" in t
+        assert "aie.use_lock(%lW3, AcquireGreaterEqual" in t and "aie.use_lock(%lWd3, Release" in t
+        assert "aie.flow(%t02, DMA : 0, %t04, DMA : 0)" in t                       # the measured route unchanged
+    # awake: the waker starts just before START; quiet: after the pad writes, so it runs after the measured chain
+    assert awake.index("aiex.set_lock(%lW3") < awake.index("aiex.set_lock(%lStart")
+    assert quiet.index("aiex.set_lock(%lW3") > quiet.rindex("aiex.npu.write32")
+    assert "}}" not in awake and "}}" not in quiet
+    strip = lambda t: "\n".join(l for l in t.splitlines() if "set_lock" not in l)
+    assert strip(awake) == strip(quiet)                                            # nothing else differs
+    # a waker on the receiver's own tile shares its DMA block
+    r = g.chain_design_mlir(chain("1 1", head=24, receiver="north", fill=48, waker="3"))
+    assert r.count("aie.mem(%t03)") == 1 and "aie.dma_start(S2MM, 0, ^recv" in r and "^wk0" in r and "}}" not in r
+
+
+def test_chain_waker_spans_the_head_and_stays_clear_of_the_receivers_buffers():
+    assert g.CHAIN_WAKER_WORDS * 4 <= 0x2000 and g.CHAIN_WAKER_WORDS >= 1024
+    assert g.CHAIN_WAKER_SRC + 4 * g.CHAIN_WAKER_WORDS <= g.FETCH_DST_ADDR
+    assert g.CHAIN_WAKER_DST >= g.FETCH_DST_ADDR + 0x2000
+
+
+def test_cli_chain_build_takes_the_waker():
+    ns = g.build_parser().parse_args(["chain-build", "d", "--head", "24", "--mids", "1", "1", "--receiver", "north2",
+                                      "--waker", "3q"])
+    assert ns.waker == "3q" and g.chain_selection(ns)[0].waker == "3q"
