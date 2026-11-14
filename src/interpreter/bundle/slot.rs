@@ -624,6 +624,27 @@ impl SlotOp {
         matches!(self.semantic, Some(SemanticOp::Nop) | None)
     }
 
+    /// Does this operation raise the core's INSTR_VECTOR event when it executes?
+    ///
+    /// NPU1 silicon counts an instruction that reads two or more operands from the vector or
+    /// accumulator register files, in whichever slot it issues: the lane-wise adds, compares,
+    /// selects and max of the mv slot as well as the vec slot's float add, multiply and MAC.
+    /// Broadcasts, extracts, inserts, conversions and an accumulator clear (one such operand or
+    /// none) are not counted, nor are the load and store slots (INSTR_LOAD / INSTR_STORE).
+    /// Observed for 16 opcodes in the bridge traces (`instr_vector_classification_matches_silicon`);
+    /// the rule reads the decoded operands, so other opcodes follow it unverified.
+    pub fn raises_instr_vector(&self) -> bool {
+        if self.is_nop() || matches!(self.slot, SlotIndex::LoadA | SlotIndex::LoadB | SlotIndex::Store) {
+            return false;
+        }
+        let vector_file_reads = self
+            .sources
+            .iter()
+            .filter(|s| matches!(s, Operand::VectorReg(_) | Operand::AccumReg(_) | Operand::SparseQxReg(_)))
+            .count();
+        vector_file_reads >= 2
+    }
+
     /// Check if this slot operation is a control flow operation.
     #[inline]
     pub fn is_control_flow(&self) -> bool {

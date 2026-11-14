@@ -1167,13 +1167,15 @@ impl CycleAccurateExecutor {
                 // the AIE2 events module behaviour described in
                 // `xaie_events_aieml.h`, where these events count unit
                 // activity, not slot presence.
+                // INSTR_VECTOR is not a slot property: an mv-slot vector add raises it, a
+                // vec-slot accumulator clear does not (`SlotOp::raises_instr_vector`).
                 let event = if op.is_nop() {
                     None
                 } else {
                     match slot_idx {
                         SlotIndex::LoadA | SlotIndex::LoadB => Some(EventType::InstrLoad { pc }),
                         SlotIndex::Store => Some(EventType::InstrStore { pc }),
-                        SlotIndex::Vector | SlotIndex::Accumulator => Some(EventType::InstrVector { pc }),
+                        _ if op.raises_instr_vector() => Some(EventType::InstrVector { pc }),
                         _ => None, // Scalar/Control events classified below
                     }
                 };
@@ -2837,6 +2839,65 @@ mod tests {
     // the corresponding functional unit does work.  NOPA / NOPB / NOPS / NOPV
     // occupy their slot in the encoding but don't activate the unit, so no
     // event is emitted on real silicon.  The emulator must match this.
+
+    /// INSTR_VECTOR on NPU1 silicon, per instruction, from the bridge traces of
+    /// vec_seed6159_clean, runtime_cumsum and two_col (Peano), aligned cycle by cycle with the
+    /// emulator's execution of the same ELF: every executed instance of these opcodes falls on a
+    /// silicon INSTR_VECTOR stamp (counted) or on none (not counted). The counted ones read two
+    /// or more operands from the vector or accumulator files; the others read one or none.
+    const INSTR_VECTOR_SILICON: &[(&str, &str, bool)] = &[
+        ("vadd.32 x0, x2, x0", "59 10 00 18", true),
+        ("vlt.d8 r25:r24, x2, x6", "19 13 4c 18", true),
+        ("vsel.8 x8, x4, x0, r25:r24", "19 20 42 1c", true),
+        ("vsel.16 x0, x0, x2, r16", "39 01 02 18", true),
+        ("vlt.bf16 r16, x4, x2", "39 21 0d 18", true),
+        ("vge.bf16 r16, x4, x2", "39 21 0f 18", true),
+        ("vmax_lt.bf16 x4, r16, x4, x2", "39 21 0b 1a", true),
+        ("vadd.f bmh1, bmh1, bmh0, r0", "89 46 c0 00", true),
+        ("vmul.f bml0, x2, x3, r3", "49 c0 c8 1f", true),
+        ("vmac.f bmh0, bmh0, x2, x3, r3", "49 c2 48 18", true),
+        ("vbcst.32 x0, r0", "b9 07 40 18", false),
+        ("vextbcst.8 x2, x0, #1", "39 87 10 19", false),
+        ("vinsert.8 x0, x0, r29, r3", "39 86 01 18", false),
+        ("vextract.s16 r0, x0, r16", "b9 06 06 18", false),
+        ("vconv.fp32.bf16 bmh1, wl0", "d9 07 c0 18", false),
+        ("vclr bmh0", "49 02 fc 07", false),
+    ];
+
+    fn decode_one(hex: &str) -> VliwBundle {
+        use crate::interpreter::decode::InstructionDecoder;
+        use crate::interpreter::traits::Decoder;
+        let bytes: Vec<u8> = hex.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect();
+        InstructionDecoder::load_default().decode(&bytes, 0).expect("decodes")
+    }
+
+    #[test]
+    fn instr_vector_classification_matches_silicon() {
+        for &(asm, hex, counted) in INSTR_VECTOR_SILICON {
+            let bundle = decode_one(hex);
+            let op = bundle.slots().iter().flatten().find(|s| !s.is_nop()).expect("one instruction");
+            assert_eq!(
+                op.raises_instr_vector(),
+                counted,
+                "{asm} (slot {:?}, sources {:?})",
+                op.slot,
+                op.sources
+            );
+        }
+    }
+
+    /// An mv-slot vector add raises INSTR_VECTOR when it executes (silicon: once per `sum` call
+    /// of runtime_cumsum, 28 of 28, where the emulator raised none).
+    #[test]
+    fn mv_slot_vector_add_emits_instr_vector() {
+        use crate::interpreter::state::EventType;
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+        executor.execute(&decode_one("59 10 00 18"), &mut ctx, &mut tile);
+        let events = ctx.timing_context().events.events();
+        assert!(events.iter().any(|e| matches!(e.event, EventType::InstrVector { .. })), "{events:?}");
+    }
 
     #[test]
     fn test_nopv_does_not_emit_instr_vector() {
