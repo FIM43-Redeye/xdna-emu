@@ -628,8 +628,19 @@ BD's grant g0 (its STALLED_LOCK falls).
       S2MM, whose master then passes it no word at that slot. The emulator's switches move a draining backlog
       with a word or two of slack behind its head, where silicon's move in lockstep, so the late word alone
       would not show. Tests: `parked_drain` (+ 14; + 14, + 23; four switches + 14, + 23, + 32, the prediction;
-      awake or short park: no gap). Not re-run here: the memtile-fed lock probe (`mq-*`), whose memtile step
-      (starvation at grant + 8, + 9 with both switches quiet) is this hold's k = 1 into a compute S2MM.
+      awake or short park: no gap). Into a compute S2MM (the memtile-fed lock probes `mq-*` / `mr-*`, k = 1, the
+      memtile switch's hold) the S2MM's own ingress takes words while its BD waits on the lock, so the drain's
+      slots count from its first word after the park, not from that fill
+      (`a_lock_held_compute_s2mm_gets_the_memtile_switch_hold_eight_words_after_its_restart`). Re-run against
+      silicon (emulator before / after, same case, run by run): the finish level of every run whose memtile
+      switch was quiet now matches (mr memtile side 0 / 59 -> 59 / 59 on the level, mq 22 -> 31 of 51 runs),
+      but the starvation cycle the hold raises lands at grant + 10 / + 11 where silicon's is at + 8 / + 9; the
+      lock-held S2MM's restart (which word it takes in which cycle after the grant) sits two cycles off silicon
+      here, the open "feed has two cycles of slack" row, and the hold is not shifted to hide it. Runs whose
+      memtile silicon's own trace traffic kept awake now read one level high (mr compute side 36 -> 28 of 38):
+      the emulator has no such traffic. sw 18 / 18 and the sl fit 114 / 114 are unchanged; sl's camp on S2MM 1
+      now has silicon's bank-0 conflict stamps (0 / 5 -> 5 / 5) and silicon's second starvation cycle, also two
+      cycles late (+ 11 against + 9).
       Circuit routes only: a packet-routed hop on the way down ends the drain hold, and a word leaving a master
       the packet rules feed launches none; the circuit switches below a packet hop keep theirs. The packet stage
       hold and the quiet-switch hold over packet hops stay as they are: a circuit receiver below a quiet packet
@@ -869,8 +880,9 @@ finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterati
     Open: the memtile side (0 / 61). The memtile's hold happens, one cycle on the feed's first crossing out of it,
     but the emulator's compute switch and S2MM ingress give the feed 2 cycles of slack where silicon's finish
     follows the memtile restart one to one, so neither the finish nor the + 8 / + 9 starvation shows it (the drain
-    hold of 2026-11-14, row "Outward-route port stall", carries that hold down to the S2MM at its slot 8; the probe
-    has not been re-run against it). Before
+    hold of 2026-11-14, row "Outward-route port stall", carries that hold down to the S2MM at its slot 8: re-run,
+    the + 55 / + 56 finish levels of the memtile side now match silicon run by run, the starvation cycle sits two
+    cycles late, + 10 / + 11). Before
     this change, making a parked word not count as activity and charging the restart one cycle per gated
     switch put the sl probe's rows one cycle late (finish, backpressure fall, starvation; its compute switch is
     quiet before the release on silicon too). A
