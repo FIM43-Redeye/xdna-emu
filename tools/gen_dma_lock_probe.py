@@ -1365,7 +1365,8 @@ def cmd_sync_table(args) -> int:
 # not deliver (silicon does not write a stream's final partial packet). The spacing grows so that no two fill frames
 # are equal: the trace encoder folds a run of equal (event, delta) frames into one frame and a Repeat. Nothing acquires A then; its count stays far below the
 # 6-bit limit (at most CHAIN_MAX_FILL = 48).
-# With `receiver = "north"` the stream goes to the S2MM of tile (0,3) (one hop north, its own memory module traced)
+# With `receiver = "north"` (or north2, north3) the stream goes to the S2MM of tile (0,3) (or (0,4), (0,5); its own
+# memory module traced)
 # instead of (0,2)'s loopback S2MM; the MM2S side, its locks and the core program are unchanged, except that each
 # fill release of A is followed by a release of lock CHAIN_LOCK_NORTH_FILL of tile (0,3) (declared there at 0, no
 # BD uses it), which fills (0,3)'s memory-module stream the same way.
@@ -1377,7 +1378,9 @@ CHAIN_BUF_BASE, CHAIN_BUF_END = 0x4000, 0x8000             # head and mid buffer
 CHAIN_MAX_BIG = (FETCH_LD_ADDR - FETCH_SRC_ADDR) // 4      # `src` must end before `ldbuf`
 CHAIN_MAX_D = 40
 CHAIN_LOCK_NORTH_FILL = 0          # lock of tile (0,3) that a north-receiver fill releases: its LOCK_0_REL frames
-CHAIN_RECEIVERS = ("own", "north")  # who takes the MM2S's stream: (0,2)'s own S2MM, or (0,3)'s (one hop north)
+CHAIN_RECEIVERS = ("own", "north", "north2", "north3")  # who takes the MM2S's stream: (0,2)'s own S2MM, or the S2MM
+#                                                        of the tile 1, 2, 3 rows north ((0,3), (0,4), (0,5))
+CHAIN_RECEIVER_ROW = {"own": 2, "north": 3, "north2": 4, "north3": 5}
 CHAIN_MAX_FILL = 48                # fill releases of A: its count (0 by then) stays below the 6-bit limit 63
 CHAIN_FILL_GAP_NOPS = 16           # nops before the first fill release; each later one waits one nop more
                                    # (48 fills span about 2000 cycles: inside the ring family's silicon fill span)
@@ -1529,7 +1532,8 @@ def chain_design_mlir(c: ChainCase) -> str:
         return s + f"      aie.next_bd ^{nxt}\n"
 
     ids = list(c.bd_ids) or [None] * (len(c.mids) + 2)
-    rx = "%t03" if c.receiver == "north" else "%t02"
+    rrow = CHAIN_RECEIVER_ROW[c.receiver]
+    rx = f"%t0{rrow}"
     bds.append(bd("head", "%head_buf", c.head, "%lStart", "%lSync", names[1], ids[0]))
     for i, m in enumerate(c.mids):
         lock = None
@@ -1551,10 +1555,10 @@ def chain_design_mlir(c: ChainCase) -> str:
         recv = bd("recv", "%dst", pre_words + w, None, None, "end")
         dst = (f"    %dst = aie.buffer({rx}) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} "
                f": memref<{pre_words + w}xi32>")
-    remote = c.receiver == "north"
+    remote = c.receiver != "own"
     s2mm_block = f"    ^recv_start:\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n{recv}"
-    t03 = "    %t03 = aie.tile(0, 3)\n" if remote else ""
-    remote_mem = ("    %mem03 = aie.mem(%t03) {\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
+    t03 = f"    {rx} = aie.tile(0, {rrow})\n" if remote else ""
+    remote_mem = (f"    %mem0{rrow} = aie.mem({rx}) {{\n      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
                   f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
     ramp = ", ".join(str(0x0A000000 | j) for j in range(w))
     ld = ", ".join(str(0x0B000000 | j) for j in range(16))
@@ -1608,7 +1612,7 @@ def chain_row(events) -> dict:
     for e in events:
         if e.row == FETCH_ROW:
             (mem if e.pkt_type == PT_MEM else core).setdefault(e.name, []).append(e.ts)
-        elif e.row == FETCH_ROW + 1 and e.pkt_type == PT_MEM:      # a remote receiver's memory module
+        elif e.row > FETCH_ROW and e.pkt_type == PT_MEM:           # a remote receiver's memory module (north)
             north.setdefault(e.name, []).append(e.ts)
     runs = _runs(mem.get("DMA_MM2S_0_STALLED_LOCK", []))
     if not runs:

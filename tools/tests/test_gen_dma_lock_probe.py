@@ -884,6 +884,21 @@ def test_chain_remote_receiver_fill_also_releases_a_lock_of_the_tile_above():
     assert "aie.lock(%t03" not in g.chain_design_mlir(chain("1 1", receiver="north"))      # no fill, no lock
 
 
+def test_chain_receiver_two_and_three_tiles_north():
+    for rcv, row in (("north2", 4), ("north3", 5)):
+        c = chain("1 1", receiver=rcv, fill=3)
+        m = g.chain_design_mlir(c)
+        t = f"%t0{row}"
+        assert f"{t} = aie.tile(0, {row})" in m and f"aie.flow(%t02, DMA : 0, {t}, DMA : 0)" in m
+        assert f"aie.buffer({t}) {{address = " in m and f"aie.mem({t})" in m
+        assert "aie.lock(%t03" not in m                                   # only an adjacent tile's lock is filled
+        assert f"rel #{g.NORTH + g.CHAIN_LOCK_NORTH_FILL}, r2" not in g.chain_core_asm(c)
+        assert c.design()["receiver"] == rcv
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499) + [ev("DMA_MM2S_0_FINISHED_BD", 503)]
+    r = g.chain_row(e + [ev("DMA_S2MM_0_FINISHED_BD", 650, row=5)])
+    assert r["s2mm_fins"] == [150]
+
+
 def test_chain_row_takes_a_remote_s2mm_and_the_starvation_levels():
     e = held("DMA_MM2S_0_STALLED_LOCK", 100, 499)
     e += [ev("DMA_MM2S_0_FINISHED_BD", 503), ev("LOCK_0_REL", 515), ev("LOCK_SEL0_ACQ_GE", 516)]
