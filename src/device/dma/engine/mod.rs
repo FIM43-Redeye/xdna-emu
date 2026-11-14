@@ -766,7 +766,6 @@ impl DmaEngine {
         ch.bd_last_block = None;
         ch.last_task_finish_at = None;
         ch.prefetch_start_emitted = false;
-        ch.controller_dispatch_index = 0;
         ch.prev_starving = false;
         ch.lock_wait_starving = false;
         ch.prev_lock_stalled = false;

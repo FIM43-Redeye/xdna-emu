@@ -477,7 +477,7 @@ impl InterpreterEngine {
     /// Replaces the former `flush_ctrl_packets`, which fast-forwarded the stream
     /// router up to 8x at a frozen simulation cycle to deliver in-flight control
     /// packets before the next instruction read them. That flush was vestigial
-    /// under the active `provisional_npu1` firmware-latency model:
+    /// under the controller's per-operation cost model (`src/npu/cycle_cost.rs`):
     ///   - executor config writes (`execute_write32`) are immediate direct
     ///     register writes, not fabric-routed -- they never needed a delivery
     ///     window;

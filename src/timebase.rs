@@ -89,9 +89,50 @@ impl Coupler {
     }
 }
 
+/// Converts firmware-clock durations into array cycles by the exact ratio.
+///
+/// The inverse direction of [`Coupler`]: a cost stated in firmware cycles
+/// becomes whole array cycles, the fraction carried to the next conversion,
+/// so a run of `n` equal costs takes exactly `floor(n * cost * array / firmware)`
+/// array cycles with no drift.
+#[derive(Debug, Clone)]
+pub struct FirmwareToArray {
+    pair: ClockPair,
+    /// Fractional array cycles carried, in units of 1/`firmware_mhz` cycle.
+    remainder: u64,
+}
+
+impl FirmwareToArray {
+    pub fn new(pair: ClockPair) -> Self {
+        assert!(pair.array_mhz > 0 && pair.firmware_mhz > 0, "clocks must be nonzero");
+        Self { pair, remainder: 0 }
+    }
+
+    pub fn pair(&self) -> ClockPair {
+        self.pair
+    }
+
+    /// Whole array cycles that `firmware_cycles` take, carrying the fraction.
+    pub fn array_cycles(&mut self, firmware_cycles: u64) -> u64 {
+        let total = firmware_cycles * u64::from(self.pair.array_mhz) + self.remainder;
+        self.remainder = total % u64::from(self.pair.firmware_mhz);
+        total / u64::from(self.pair.firmware_mhz)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_durations_convert_to_array_cycles_with_no_drift() {
+        let mut c = FirmwareToArray::new(ClockPair::SMU_DPM1);
+        assert_eq!(c.array_cycles(600), 1028);
+        let total: u64 = (0..1000).map(|_| c.array_cycles(61)).sum();
+        assert_eq!(total, 61 * 1000 * 1028 / 600, "the carried fraction never drifts");
+        let mut d = FirmwareToArray::new(ClockPair::DRIVER_DPM0);
+        assert_eq!(d.array_cycles(61), 122, "DPM 0 runs the array at twice the firmware clock");
+    }
 
     #[test]
     fn grants_converge_to_the_exact_ratio_with_no_drift() {

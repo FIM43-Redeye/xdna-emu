@@ -72,6 +72,8 @@ pub(crate) enum ExecutorState {
         next_index: usize,
         /// Index into pending_syncs identifying which sync we're waiting on.
         sync_index: usize,
+        /// Executor cycle at which the sync was issued.
+        issued_at: u64,
     },
     /// Blocked waiting for a MaskPoll condition to be satisfied.
     ///
@@ -115,16 +117,9 @@ pub(crate) enum ExecutorState {
         /// component's ~8000 cyc upper end without overflow.
         remaining: u32,
     },
-    /// Charging cycles for a previously-issued instruction to retire.
-    ///
-    /// AIE2's IPU command processor takes multiple cycles to drain a
-    /// control packet's writes through the AXI fabric to the target
-    /// tile. While those writes are in flight, the next instruction
-    /// can't be issued. EMU models this by parking in this state for
-    /// `cycles_remaining` extra cycles after each non-trivial instruction.
-    /// See `NpuInstruction::cycle_cost` for the per-variant cost
-    /// (Phase 1: all variants return 1, so this state is never entered;
-    /// Phase 2 will calibrate against HW timing).
+    /// The controller is busy with an operation it has issued (its class
+    /// cost, `CycleCostModel::cost_of`); the next operation issues when
+    /// this drains.
     RetiringInstruction {
         /// Index of the NEXT instruction to issue once retire completes.
         next_index: usize,
@@ -204,41 +199,20 @@ pub struct NpuExecutor {
     state: ExecutorState,
     /// Loaded instructions for interleaved execution via try_advance().
     instructions: Vec<NpuInstruction>,
-    /// Cycle-cost model used to compute per-instruction retirement cycles.
-    /// Default is `legacy_one_per_packet` which preserves prior behaviour;
-    /// callers can opt into `with_known_constants` (or future calibrated
-    /// profiles) via `set_cycle_model`.
+    /// Operation-class costs of the controller, in controller cycles.
     cycle_model: super::CycleCostModel,
+    /// Converts controller-cycle costs to array cycles, carrying the fraction
+    /// across operations so a run of operations does not drift.
+    to_array: crate::timebase::FirmwareToArray,
     /// Whether the firmware mailbox setup cost has been charged for this
     /// runtime sequence yet. Per-batch model: pay once on the first sync
     /// (~8000 cyc when enabled), then pipeline subsequent syncs at just
     /// the stream-flush cost (4 cyc). Reset by `load_instructions`.
     mailbox_charged: bool,
 
-    /// Executor-local cycle counter, incremented once per `try_advance`
-    /// call.  Tracks the controller's view of time independently of the
-    /// engine's `total_cycles` (which is also driven by core stepping
-    /// and DMA ticks).  Used by the non-stalling controller model to
-    /// gate Task_Queue dispatches without blocking issue of other
-    /// instructions.  Reset by `load_instructions`.
+    /// Executor-local cycle counter (array cycles), incremented once per
+    /// `try_advance` call. Reset by `load_instructions`.
     npu_cycle: u64,
-
-    /// Earliest cycle (`npu_cycle` space) at which the controller can
-    /// issue the next Task_Queue Write32.  Set after every Task_Queue
-    /// dispatch to `npu_cycle + dispatch_overhead_*` based on Q state
-    /// at dispatch time.
-    ///
-    /// This implements a non-stalling controller model: the executor
-    /// can continue issuing BD-config writes and other non-dispatch
-    /// instructions even while the controller's previous Task_Queue
-    /// dispatch is still in flight; only the next Task_Queue write
-    /// stalls (in Executing state) until the controller is free.  This
-    /// is the prerequisite for modelling HW pipelining -- when channel
-    /// transfer duration exceeds the controller dispatch interval, the
-    /// channel's Task_Queue actually accumulates BDs.  See finding
-    /// 2026-05-27-dispatch-overhead-multirun-structural-variance F3
-    /// and the Phase 2c.A refactor.
-    controller_next_taskq_cycle: u64,
 }
 
 impl NpuExecutor {
@@ -252,18 +226,15 @@ impl NpuExecutor {
             state: ExecutorState::Idle,
             instructions: Vec::new(),
             cycle_model: super::CycleCostModel::default(),
+            to_array: crate::timebase::FirmwareToArray::new(super::CycleCostModel::default().clocks),
             mailbox_charged: false,
             npu_cycle: 0,
-            controller_next_taskq_cycle: 0,
         }
     }
 
-    /// Replace the cycle-cost model used to compute retirement cycles.
-    ///
-    /// `CycleCostModel::with_known_constants()` engages stream-switch
-    /// fabric and register-write costs derived from open sources.
-    /// Calibrated per-tile-type CMP costs land later via #322.
+    /// Replace the operation-class cost model (and its clocks).
     pub fn set_cycle_model(&mut self, model: super::CycleCostModel) {
+        self.to_array = crate::timebase::FirmwareToArray::new(model.clocks);
         self.cycle_model = model;
     }
 
@@ -520,10 +491,10 @@ impl NpuExecutor {
         // Reset the per-batch mailbox charge so each runtime sequence
         // pays the firmware setup cost once.
         self.mailbox_charged = false;
-        // Reset the executor's cycle accounting and controller
-        // rate-limit state -- each runtime sequence starts fresh.
+        // Reset the executor's cycle accounting -- each runtime sequence
+        // starts fresh.
         self.npu_cycle = 0;
-        self.controller_next_taskq_cycle = 0;
+        self.to_array = crate::timebase::FirmwareToArray::new(self.cycle_model.clocks);
         // A runtime sequence waits only on its own Syncs; a runlist's
         // previous command's must not gate (or "stall") this one.
         self.pending_syncs.clear();
@@ -575,11 +546,7 @@ impl NpuExecutor {
     /// naturally drains the queue by stepping the full system (DMA + cores +
     /// stream routing), so the queue will eventually have space.
     pub fn try_advance(&mut self, device: &mut DeviceState, host_memory: &mut HostMemory) -> AdvanceResult {
-        // Advance the controller's view of time once per advance call.
-        // Used by the non-stalling controller model to gate Task_Queue
-        // dispatches against `controller_next_taskq_cycle`.  Idle/Done
-        // ticks still advance the clock so a long Idle does not push
-        // the next runtime sequence's TQ writes past their gate.
+        // One array cycle per advance call. Idle/Done ticks advance it too.
         self.npu_cycle = self.npu_cycle.saturating_add(1);
 
         match self.state.clone() {
@@ -594,52 +561,12 @@ impl NpuExecutor {
 
                 let instr = self.instructions[next_index].clone();
 
-                // Capture the dispatch index + direction BEFORE
-                // execute_instruction runs.  If this Write32 hits a
-                // Task_Queue register, execute_instruction will enqueue
-                // the BD (incrementing the channel's dispatch index), so
-                // we read the pre-enqueue index here -- the controller
-                // paces the next dispatch by how many tasks it has already
-                // dispatched to this channel (a monotonic ramp).  See
-                // finding 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism.
-                let dispatch = if let NpuInstruction::Write32 { reg_off, .. } = &instr {
-                    let (col, row, offset) = decode_npu_address(*reg_off, device.start_col);
-                    Self::classify_task_dispatch(col, row, offset, device)
-                } else {
-                    None
-                };
-
-                // Non-stalling controller rate gate (Phase 2c.A): if
-                // this is a Task_Queue write and the controller's last
-                // dispatch is still in flight, stall *just* this
-                // instruction.  We keep state=Executing(next_index)
-                // unchanged so we retry on the next tick; meanwhile
-                // the DMA channel(s) continue making progress and the
-                // engine continues stepping cores.
-                //
-                // This is the mechanism that lets the channel
-                // Task_Queue actually accumulate BDs when transfer
-                // duration is comparable to controller dispatch
-                // interval -- the prerequisite for HW-like pipelining.
-                if dispatch.is_some() && self.npu_cycle < self.controller_next_taskq_cycle {
-                    return AdvanceResult::Blocked;
-                }
-
                 if let Err(e) = self.execute_instruction(&instr, device, host_memory) {
                     let msg = format!("NPU instruction {} execution error: {}", next_index, e);
                     log::error!("{}", msg);
                     return AdvanceResult::Error(msg);
                 }
                 self.executed_count += 1;
-
-                // Update the controller's next-available-for-Task_Queue
-                // cycle now that this dispatch has been issued.  The
-                // overhead is the per-direction dispatch gate evaluated at
-                // the pre-enqueue dispatch index captured above.
-                if let Some((idx, is_mm2s)) = dispatch {
-                    let overhead = self.cycle_model.dispatch_overhead_for(idx, is_mm2s);
-                    self.controller_next_taskq_cycle = self.npu_cycle.saturating_add(overhead);
-                }
 
                 // would_block_on_queue may have transitioned us to BlockedOnQueue,
                 // or execute_instruction may have transitioned to BlockedOnSync.
@@ -660,35 +587,14 @@ impl NpuExecutor {
                     _ => {}
                 }
 
-                // Normal progression. If the instruction's cycle_cost is
-                // greater than 1, park in RetiringInstruction so the next
-                // issue is delayed by (cost - 1) cycles. With Phase 1's
-                // all-1 defaults this branch transitions straight back to
-                // Executing; the retire state only engages once Phase 2
-                // populates realistic costs.
+                // The operation holds the controller for its class cost; the
+                // next one issues that many array cycles after this one.
                 let new_index = next_index + 1;
                 if new_index >= self.instructions.len() {
                     self.state = ExecutorState::Done;
                     AdvanceResult::Done
                 } else {
-                    // Per-instruction CMP retirement cost from the cycle
-                    // model.  The Q-aware dispatch_overhead is no longer
-                    // applied as a retirement stall here -- the
-                    // non-stalling controller model (Phase 2c.A) tracks
-                    // it via `controller_next_taskq_cycle` instead, so
-                    // subsequent BD config writes can issue while the
-                    // controller's previous dispatch is still in
-                    // flight.  See finding
-                    // 2026-05-27-dispatch-overhead-multirun-structural-variance.
-                    let retire_cycles = self.cycle_model.cost_of(&instr).saturating_sub(1);
-                    if retire_cycles > 0 {
-                        self.state = ExecutorState::RetiringInstruction {
-                            next_index: new_index,
-                            cycles_remaining: retire_cycles,
-                        };
-                    } else {
-                        self.state = ExecutorState::Executing { next_index: new_index };
-                    }
+                    self.retire(new_index, self.cycle_model.cost_of(&instr));
                     AdvanceResult::Progressed
                 }
             }
@@ -731,11 +637,10 @@ impl NpuExecutor {
                 }
             }
 
-            ExecutorState::BlockedOnSync { next_index, sync_index } => {
+            ExecutorState::BlockedOnSync { next_index, sync_index, issued_at } => {
                 // Poll the sync condition each cycle. On real hardware,
                 // dma_await_task blocks until the DMA channel's task token
-                // returns (or Channel_Running goes idle). We poll the same
-                // Channel_Running status.
+                // returns (or Channel_Running goes idle).
                 let satisfied = if sync_index < self.pending_syncs.len() {
                     Self::is_sync_satisfied(&mut self.pending_syncs[sync_index], device)
                 } else {
@@ -744,39 +649,7 @@ impl NpuExecutor {
 
                 if satisfied {
                     log::info!("NPU Sync #{} satisfied, resuming instruction {}", sync_index, next_index,);
-                    // Post-sync settling. Two components:
-                    // - Token stream-transit (EMERGENT): the TCT routes `row`
-                    //   hops down the column to the firmware at the shim
-                    //   (row 0), each hop costing one external->external
-                    //   crossing (ROUTE_PER_HOP, 4 cy; the per-hop transit
-                    //   measured on NPU1 by gen_stream_rtt_probe.py, the wire
-                    //   itself adding 0). So transit = sync.row * per-hop
-                    //   latency, derived from topology rather than a flat
-                    //   constant. Charged every sync.
-                    // - Mailbox cold-start (firmware residual): one-time
-                    //   firmware mailbox latency for the FIRST dma_wait of the
-                    //   runtime sequence (~8000 cyc on NPU1, Phase B). Later
-                    //   syncs pipeline through the mailbox queue and pay only
-                    //   transit -- the "per-batch" model (160-sync kernels do
-                    //   not pay 160x8000 on HW). This piece cannot emerge until
-                    //   the firmware loop runs; overridable via
-                    //   XDNA_EMU_MAILBOX_LATENCY until then.
-                    use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
-                    const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
-                    let transit_cycles = self
-                        .pending_syncs
-                        .get(sync_index)
-                        .map_or(0, |s| s.row as u32 * ROUTE_PER_HOP as u32);
-                    let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(DEFAULT_MAILBOX_CYCLES);
-                    let charge = if self.mailbox_charged {
-                        transit_cycles
-                    } else {
-                        self.mailbox_charged = true;
-                        mailbox_cycles + transit_cycles
-                    };
+                    let charge = self.sync_charge(sync_index, issued_at, self.npu_cycle);
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: charge };
                     AdvanceResult::Progressed
                 } else {
@@ -795,7 +668,8 @@ impl NpuExecutor {
                         self.state = ExecutorState::Done;
                         AdvanceResult::Done
                     } else {
-                        self.state = ExecutorState::Executing { next_index };
+                        // The satisfying read retires at the mask-poll cost.
+                        self.retire(next_index, self.cycle_model.mask_poll);
                         AdvanceResult::Progressed
                     }
                 } else {
@@ -832,6 +706,47 @@ impl NpuExecutor {
                 }
                 AdvanceResult::Blocked
             }
+        }
+    }
+
+    /// Park the controller for an operation of `controller_cycles` issued this
+    /// cycle: the next operation (`next_index`) issues that many array cycles later.
+    fn retire(&mut self, next_index: usize, controller_cycles: u64) {
+        let cycles = self.to_array.array_cycles(controller_cycles);
+        self.state = if cycles > 1 {
+            ExecutorState::RetiringInstruction { next_index, cycles_remaining: cycles - 1 }
+        } else {
+            ExecutorState::Executing { next_index }
+        };
+    }
+
+    /// Array cycles a resolved sync holds the controller after its awaited
+    /// token arrived: the one place a sync's cost is decided.
+    ///
+    /// `issued_at` is the executor cycle the sync was issued at and
+    /// `token_arrival` the cycle its completion was observed. The current
+    /// model does not use them: it charges the token's stream transit
+    /// (`row` hops of `ROUTE_PER_HOP`) on every sync, plus a one-time
+    /// `XDNA_EMU_MAILBOX_LATENCY` (default 8000) on the sequence's first.
+    /// On silicon the cost depends on how late the token arrives after the
+    /// sync is issued (`docs/fidelity-gaps/host-firmware-dispatch.md`).
+    fn sync_charge(&mut self, sync_index: usize, issued_at: u64, token_arrival: u64) -> u32 {
+        use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
+        const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
+        let _ = (issued_at, token_arrival);
+        let transit_cycles = self
+            .pending_syncs
+            .get(sync_index)
+            .map_or(0, |s| s.row as u32 * ROUTE_PER_HOP as u32);
+        let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAILBOX_CYCLES);
+        if self.mailbox_charged {
+            transit_cycles
+        } else {
+            self.mailbox_charged = true;
+            mailbox_cycles + transit_cycles
         }
     }
 
@@ -987,6 +902,7 @@ impl NpuExecutor {
                 self.state = ExecutorState::BlockedOnSync {
                     next_index: 0, // placeholder, fixed up by try_advance
                     sync_index,
+                    issued_at: self.npu_cycle,
                 };
                 Ok(())
             }
@@ -1355,99 +1271,6 @@ impl NpuExecutor {
         }
 
         false
-    }
-
-    /// Pure detector for "is this Write32's offset a DMA Task_Queue write?".
-    ///
-    /// Mirrors the tile-type-aware queue-register classification done in
-    /// `would_block_on_queue`, but read-only -- no state mutation, no
-    /// blocking behaviour.  Used by `try_advance` to apply the
-    /// Q-aware dispatch_overhead on the retirement cost of any Write32
-    /// that triggers a task dispatch.
-    ///
-    /// Returns `Some(channel)` (in the DMA engine's combined channel
-    /// index space, S2MM first then MM2S) if the (col, row, offset)
-    /// triple targets a Task_Queue register; `None` otherwise.
-    fn task_dispatch_channel(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<u8> {
-        let tile_kind = device.tile(col as usize, row as usize).map(|t| t.tile_kind)?;
-        let dma = device.array.dma_engine(col, row)?;
-        let s2mm_channels = dma.s2mm_channel_count() as u8;
-        let mm2s_channels = dma.mm2s_channel_count() as u8;
-        let reg_layout = crate::device::regdb::device_reg_layout();
-        match tile_kind {
-            TileKind::Compute => {
-                let base = reg_layout.memory_channel_base;
-                let stride = reg_layout.memory_channel_stride;
-                Self::channel_from_queue_write(
-                    offset,
-                    base,
-                    stride,
-                    s2mm_channels,
-                    s2mm_channels + mm2s_channels,
-                )
-                .map(|(ch, _is_mm2s)| ch)
-            }
-            TileKind::Mem => {
-                let stride = reg_layout.memtile_channel_stride;
-                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
-                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                // S2MM block occupies channels [0, s2mm_channels);
-                // MM2S block occupies channels [s2mm_channels, s2mm+mm2s).
-                if let Some((ch, _)) =
-                    Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
-                {
-                    return Some(ch);
-                }
-                if let Some((rel_ch, _)) =
-                    Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
-                {
-                    return Some(s2mm_channels + rel_ch);
-                }
-                None
-            }
-            TileKind::ShimNoc | TileKind::ShimPl => {
-                let base = reg_layout.shim_channel_base;
-                let stride = reg_layout.shim_channel_stride;
-                Self::channel_from_queue_write(
-                    offset,
-                    base,
-                    stride,
-                    s2mm_channels,
-                    s2mm_channels + mm2s_channels,
-                )
-                .map(|(ch, _is_mm2s)| ch)
-            }
-        }
-    }
-
-    /// Read the channel's controller dispatch index at the moment a
-    /// Task_Queue Write32 arrives -- the input to the controller's
-    /// occupancy-dependent dispatch gate (`dispatch_overhead_for`).
-    ///
-    /// The index is the monotonic count of dispatches already issued to
-    /// this channel since its last reset.  Read **before**
-    /// `execute_instruction` enqueues the new BD, so it counts only prior
-    /// dispatches: index `0` means this is the first task of the session
-    /// (fast base-rate dispatch); the gate ramps as the index climbs and
-    /// caps at the steady-state plateau.
-    ///
-    /// We use the monotonic dispatch index rather than instantaneous queue
-    /// occupancy because the channel typically drains a short task back to
-    /// Idle before the controller's next dispatch, so occupancy would
-    /// collapse to 0 every cycle and the gate could never reach its
-    /// plateau.  See finding
-    /// 2026-05-30-phase-2d-warmup-transient-and-gap0-mechanism (Part 2).
-    ///
-    /// Returns `(dispatch_index, is_mm2s)`, or `None` if the write is not
-    /// a Task_Queue write.  Direction selects the per-direction dispatch
-    /// gate (`dispatch_overhead_for`): the absolute channel index is
-    /// MM2S when it lands at or above the channel's S2MM count (S2MM
-    /// occupies the low channel indices, MM2S the high ones).
-    fn classify_task_dispatch(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<(u32, bool)> {
-        let channel = Self::task_dispatch_channel(col, row, offset, device)?;
-        let dma = device.array.dma_engine(col, row)?;
-        let is_mm2s = channel >= dma.s2mm_channel_count() as u8;
-        Some((dma.controller_dispatch_index(channel), is_mm2s))
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
@@ -1959,7 +1782,7 @@ mod tests {
         device.array.dma_engine_mut(col, row).unwrap().issue_task_token(abs, 0);
 
         // Drive sync 0 through the consuming BlockedOnSync transition.
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
         assert!(executor.pending_syncs[0].satisfied, "sync 0 satisfied by the token");
         assert!(
@@ -1968,7 +1791,7 @@ mod tests {
         );
 
         // Sync 1 has no token of its own -> still blocked (consume-once).
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1 };
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1, issued_at: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
         assert!(
             !executor.pending_syncs[1].satisfied,
@@ -2015,7 +1838,7 @@ mod tests {
         let mut device = DeviceState::new_npu1();
 
         // ---- First sync: pays mailbox + stream-flush ----
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
         let first_remaining = match executor.state {
             ExecutorState::FlushingStreams { remaining, .. } => remaining,
@@ -2035,7 +1858,7 @@ mod tests {
         }
 
         // ---- Second sync: stream-flush only ----
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1 };
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1, issued_at: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
         let second_remaining = match executor.state {
             ExecutorState::FlushingStreams { remaining, .. } => remaining,
@@ -2057,7 +1880,7 @@ mod tests {
             started: true,
             satisfied: false,
         });
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
         let _ = executor.try_advance(&mut device, &mut host_mem);
         let reset_remaining = match executor.state {
             ExecutorState::FlushingStreams { remaining, .. } => remaining,
@@ -2104,7 +1927,7 @@ mod tests {
             let mut host_mem = HostMemory::new();
             let mut device = DeviceState::new_npu1();
 
-            executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0 };
+            executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
             let _ = executor.try_advance(&mut device, &mut host_mem);
             let remaining = match executor.state {
                 ExecutorState::FlushingStreams { remaining, .. } => remaining,
@@ -2363,10 +2186,6 @@ mod tests {
         assert!(executor.blocked_write_description(&device).is_none());
     }
 
-    // -----------------------------------------------------------------
-    // Q-aware dispatch_overhead classifier tests (Phase 2c.1)
-    // -----------------------------------------------------------------
-
     /// Build a shim DMA Task_Queue register offset for `channel` (0-based
     /// in the DMA engine's combined channel index).
     ///
@@ -2378,185 +2197,171 @@ mod tests {
     }
 
     #[test]
-    fn classify_task_dispatch_returns_zero_index_for_fresh_channel() {
-        let device = DeviceState::new_npu1();
-        // Shim DMA at (1, 0), channel 0 -- fresh device, no dispatches
-        // issued yet -> dispatch index 0 (first dispatch of the session).
-        let offset = shim_task_queue_offset(0);
-        let result = NpuExecutor::classify_task_dispatch(1, 0, offset, &device);
-        // Shim channel 0 is in the S2MM block (is_mm2s = false).
-        assert_eq!(result, Some((0, false)), "fresh shim channel 0 must report dispatch index 0, S2MM");
-    }
-
-    #[test]
-    fn classify_task_dispatch_counts_prior_dispatches() {
-        let mut device = DeviceState::new_npu1();
-        // One prior dispatch on shim (1,0) channel 0 -- the controller's
-        // dispatch index must reflect it so the gate ramps off the base.
-        let enqueued = device
-            .array
-            .dma_engine_mut(1, 0)
-            .expect("shim (1,0) has a DMA engine")
-            .enqueue_task(0, 0, 0, false);
-        assert!(enqueued, "task should enqueue successfully on a fresh channel");
-
-        let offset = shim_task_queue_offset(0);
-        let result = NpuExecutor::classify_task_dispatch(1, 0, offset, &device);
-        assert_eq!(
-            result,
-            Some((1, false)),
-            "shim channel 0 with one prior dispatch must report index 1, S2MM"
-        );
-    }
-
-    #[test]
-    fn classify_task_dispatch_returns_none_for_non_queue_write() {
-        let device = DeviceState::new_npu1();
-        // shim_channel_base is the Ctrl register of channel 0 (offset +0
-        // within the block, NOT +4).  Must not classify as a Task_Queue
-        // write.
-        let ctrl_offset = crate::device::regdb::device_reg_layout().shim_channel_base;
-        let result = NpuExecutor::classify_task_dispatch(1, 0, ctrl_offset, &device);
-        assert_eq!(result, None, "Ctrl register write (offset +0) must NOT classify as a Task_Queue write");
-    }
-
-    #[test]
-    fn cycle_cost_model_mm2s_gate_ramps_s2mm_flat() {
-        // Sanity: provisional NPU1 seeds both gates.  MM2S has a fast
-        // first dispatch (< plateau); S2MM is flat at the plateau.
-        let m = crate::npu::cycle_cost::CycleCostModel::provisional_npu1();
-        assert!(m.dispatch_mm2s.base > 0, "provisional model must seed the MM2S base");
-        assert!(m.dispatch_mm2s.plateau > 0, "provisional model must seed the MM2S plateau");
-        assert!(
-            m.dispatch_overhead_for(0, true) < m.dispatch_overhead_for(2, true),
-            "MM2S first dispatch must cost less than a later dispatch"
-        );
-        assert_eq!(
-            m.dispatch_overhead_for(0, true),
-            m.dispatch_mm2s.base,
-            "MM2S idx0 must equal the base rate"
-        );
-        // S2MM pays the plateau on every dispatch (no fast start).
-        assert_eq!(
-            m.dispatch_overhead_for(0, false),
-            m.dispatch_overhead_for(3, false),
-            "S2MM gate is flat across dispatch index"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Non-stalling controller rate-limit gate tests (Phase 2c.A)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn npu_cycle_advances_each_try_advance() {
+    fn load_instructions_resets_the_controller_clock() {
         let mut executor = NpuExecutor::new();
         let mut device = DeviceState::new_npu1();
         let mut host_mem = HostMemory::new();
-        assert_eq!(executor.npu_cycle, 0);
         executor.try_advance(&mut device, &mut host_mem);
-        assert_eq!(executor.npu_cycle, 1);
-        executor.try_advance(&mut device, &mut host_mem);
-        assert_eq!(executor.npu_cycle, 2);
-    }
-
-    #[test]
-    fn load_instructions_resets_controller_state() {
-        let mut executor = NpuExecutor::new();
-        // Simulate prior activity: advance the executor clock and
-        // mark the controller as busy from a previous dispatch.
-        executor.npu_cycle = 1234;
-        executor.controller_next_taskq_cycle = 5678;
+        assert_eq!(executor.npu_cycle, 1, "one array cycle per advance call");
         executor.load_instructions(Vec::new());
-        assert_eq!(executor.npu_cycle, 0, "load_instructions resets npu_cycle");
-        assert_eq!(
-            executor.controller_next_taskq_cycle, 0,
-            "load_instructions resets controller_next_taskq_cycle"
-        );
+        assert_eq!(executor.npu_cycle, 0);
     }
 
-    #[test]
-    fn task_dispatch_advances_controller_next_taskq_cycle() {
-        // After issuing a Task_Queue Write32 on an idle channel, the
-        // controller must be marked busy until npu_cycle + dispatch_overhead.
-        let mut executor = NpuExecutor::new();
+    // -----------------------------------------------------------------
+    // Runtime-sequence pacing: every operation retires at its class cost on
+    // the controller's clock, serially, with no gate on task pushes.
+    // Silicon numbers are array cycles (shim timer) at the default clocks.
+    // -----------------------------------------------------------------
+
+    /// A shim register with no side effect on the transfer path (lock 5's value).
+    const PACING_SCRATCH: u32 = 0x14050;
+    /// Shim BD 0 (8 words) and its address word, the target of a DDR patch.
+    const PACING_SHIM_BD: u32 = 0x1D000;
+    /// Memtile BD 0 (8 words), logical column 0.
+    const PACING_MEMTILE_BD: u32 = (1 << 20) | 0xA0000;
+
+    fn pacing_device() -> (DeviceState, HostMemory) {
         let mut device = DeviceState::new_npu1();
-        let mut host_mem = HostMemory::new();
-
-        let tq_offset = shim_task_queue_offset(0);
-        // Build a Write32 address for shim (col=0, row=0) at the TQ
-        // offset.  Address encoding: col bits at 25..29, row bits at
-        // 20..24, offset in low 20 bits.
-        let addr = tq_offset; // col=0, row=0 -> no shift bits set
-        executor.load_instructions(vec![NpuInstruction::Write32 { reg_off: addr, value: 0 }]);
-
-        let r = executor.try_advance(&mut device, &mut host_mem);
-        // The executor consumed npu_cycle 1 to issue the dispatch.
-        assert_eq!(executor.npu_cycle, 1);
-        // First dispatch on shim channel 0 (S2MM) -> dispatch index 0,
-        // S2MM gate (flat at the plateau).
-        let expected = 1 + executor.cycle_model.dispatch_overhead_for(0, false);
-        assert_eq!(
-            executor.controller_next_taskq_cycle, expected,
-            "TQ write on idle channel must set controller_next = npu_cycle + dispatch_overhead_for(0, S2MM)"
-        );
-        // The instruction was consumed (not stalled by rate-limit on first call).
-        assert!(matches!(r, AdvanceResult::Done | AdvanceResult::Progressed));
+        device.set_start_col(1);
+        device.array.clock_mut().ungate_all();
+        (device, HostMemory::new())
     }
 
-    #[test]
-    fn second_task_dispatch_stalls_on_controller_rate_limit() {
-        // Two back-to-back Task_Queue writes: the second one must stall
-        // in Executing state (return Blocked) until npu_cycle catches
-        // up to controller_next_taskq_cycle from the first dispatch.
-        let mut executor = NpuExecutor::new();
-        let mut device = DeviceState::new_npu1();
-        let mut host_mem = HostMemory::new();
-
-        let tq0 = shim_task_queue_offset(0);
-        let tq1 = shim_task_queue_offset(1);
-        executor.load_instructions(vec![
-            NpuInstruction::Write32 { reg_off: tq0, value: 0 },
-            NpuInstruction::Write32 { reg_off: tq1, value: 0 },
-        ]);
-
-        // First call: issues TQ0 (idle channel -> cold-start),
-        // parks in RetiringInstruction for per-instr cost - 1 cycles
-        // (or transitions directly if cost == 1).
-        let _ = executor.try_advance(&mut device, &mut host_mem);
-        assert!(executor.controller_next_taskq_cycle > executor.npu_cycle);
-
-        // Drain any retirement stall so executor is back in Executing,
-        // pointing at TQ1.  The shim Write32 per-instr CMP cost is ~100
-        // cyc; bound conservatively to avoid spurious failures if the
-        // model grows.
-        for _ in 0..512 {
-            if matches!(executor.state(), ExecutorState::Executing { .. }) {
-                break;
+    /// Run `stream` to completion (stepping data movement each cycle) and return
+    /// the executor cycle at which each instruction issued.
+    fn issue_cycles(
+        executor: &mut NpuExecutor,
+        device: &mut DeviceState,
+        host_mem: &mut HostMemory,
+    ) -> Vec<u64> {
+        let mut issued = Vec::new();
+        let mut last_count = executor.executed_count();
+        for _ in 0..2_000_000 {
+            device.array.step_data_movement_with_denied(host_mem, &[]);
+            let r = executor.try_advance(device, host_mem);
+            if executor.executed_count() > last_count {
+                last_count = executor.executed_count();
+                issued.push(executor.npu_cycle);
             }
-            executor.try_advance(&mut device, &mut host_mem);
+            if matches!(r, AdvanceResult::Done | AdvanceResult::Idle) {
+                return issued;
+            }
+            assert!(!matches!(r, AdvanceResult::Error(_)), "{r:?}");
         }
-        assert!(
-            matches!(executor.state(), ExecutorState::Executing { .. }),
-            "expected Executing state before TQ1 attempt; got {:?}",
-            executor.state()
-        );
-        // controller is still busy from TQ0 -- TQ1 must stall.
-        assert!(executor.npu_cycle < executor.controller_next_taskq_cycle);
-        let next_index_before = match executor.state() {
-            ExecutorState::Executing { next_index } => *next_index,
-            _ => unreachable!(),
-        };
-        let r = executor.try_advance(&mut device, &mut host_mem);
-        assert_eq!(r, AdvanceResult::Blocked, "TQ1 must stall on rate-limit gate");
-        // next_index must NOT have advanced -- the stalled write was not consumed.
-        let next_index_after = match executor.state() {
-            ExecutorState::Executing { next_index } => *next_index,
-            _ => unreachable!(),
-        };
-        assert_eq!(
-            next_index_before, next_index_after,
-            "rate-limit stall must not advance the instruction pointer"
-        );
+        panic!("stream did not finish");
+    }
+
+    fn mean_gap(issued: &[u64], from: usize, to: usize) -> f64 {
+        (issued[to] - issued[from]) as f64 / (to - from) as f64
+    }
+
+    fn scratch_write() -> NpuInstruction {
+        NpuInstruction::Write32 { reg_off: PACING_SCRATCH, value: 0 }
+    }
+
+    /// Mean cost, in array cycles, of `n` copies of `op` issued back to back.
+    fn mean_cost_of(op: NpuInstruction, n: usize) -> f64 {
+        let (mut device, mut host_mem) = pacing_device();
+        let mut executor = NpuExecutor::new();
+        executor.set_host_buffers(vec![HostBuffer { address: 0x8000_4000_0000, size: 4096 }]);
+        let mut stream = vec![op; n];
+        stream.push(scratch_write());
+        executor.load_instructions(stream);
+        let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
+        mean_gap(&issued, 0, n)
+    }
+
+    /// Register write and task-queue push: 104.85 array cycles each on silicon
+    /// (free gaps of the runtime-sequence probes, slope 102.5..106.0).
+    #[test]
+    fn a_register_write_retires_at_the_measured_write_cost() {
+        let c = mean_cost_of(scratch_write(), 200);
+        assert!((c - 104.85).abs() < 0.5, "write32 mean cost {c}");
+    }
+
+    /// Masked write: 178.5 array cycles on silicon.
+    #[test]
+    fn a_masked_write_retires_at_the_measured_masked_write_cost() {
+        let c = mean_cost_of(NpuInstruction::MaskWrite { reg_off: PACING_SCRATCH, value: 0, mask: 1 }, 200);
+        assert!((c - 178.5).abs() < 0.5, "maskwrite32 mean cost {c}");
+    }
+
+    /// A shim BD block write and its address patch: 584.15 array cycles together on
+    /// silicon (block write + patch + push lead 689, less the push's own write).
+    #[test]
+    fn a_shim_bd_write_with_its_patch_retires_at_the_measured_pair_cost() {
+        let (mut device, mut host_mem) = pacing_device();
+        let mut executor = NpuExecutor::new();
+        executor.set_host_buffers(vec![HostBuffer { address: 0x8000_4000_0000, size: 4096 }]);
+        let n = 50;
+        let mut stream = Vec::new();
+        for _ in 0..n {
+            stream.push(NpuInstruction::BlockWrite { reg_off: PACING_SHIM_BD, values: vec![0; 8] });
+            stream.push(NpuInstruction::DdrPatch { reg_addr: PACING_SHIM_BD + 4, arg_idx: 0, arg_plus: 0 });
+        }
+        stream.push(scratch_write());
+        executor.load_instructions(stream);
+        let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
+        let pair = (issued[2 * n] - issued[0]) as f64 / n as f64;
+        assert!((pair - 584.15).abs() < 0.5, "shim BD write + patch mean cost {pair}");
+    }
+
+    /// A tile BD block write: about 450 array cycles (fitted on the bridge corpus:
+    /// memtile 8 words 455, core 6 words 445). Provisional until a dedicated probe.
+    #[test]
+    fn a_tile_bd_write_retires_at_the_fitted_block_write_cost() {
+        let c =
+            mean_cost_of(NpuInstruction::BlockWrite { reg_off: PACING_MEMTILE_BD, values: vec![0; 8] }, 100);
+        assert!((c - 450.0).abs() < 1.0, "tile BD block write mean cost {c}");
+    }
+
+    /// A mask-poll satisfied at once: about 215 array cycles (bridge corpus fit).
+    #[test]
+    fn a_satisfied_mask_poll_retires_at_the_fitted_poll_cost() {
+        let c = mean_cost_of(NpuInstruction::MaskPoll { reg_off: PACING_SCRATCH, value: 0, mask: 0 }, 100);
+        assert!((c - 215.0).abs() < 1.0, "satisfied mask-poll mean cost {c}");
+    }
+
+    /// The gap between two pushes is the cost of the operations between them,
+    /// linear in their number (silicon: k = 0 / 4 / 16 writes, no plateau).
+    #[test]
+    fn the_gap_between_two_pushes_is_linear_in_the_writes_between_them() {
+        let tq0 = shim_task_queue_offset(0);
+        let tq2 = shim_task_queue_offset(2);
+        let mut gaps = Vec::new();
+        for k in [0usize, 4, 16, 64] {
+            let (mut device, mut host_mem) = pacing_device();
+            let mut executor = NpuExecutor::new();
+            let mut stream = vec![NpuInstruction::Write32 { reg_off: tq0, value: 0 }];
+            stream.extend(std::iter::repeat_n(scratch_write(), k));
+            stream.push(NpuInstruction::Write32 { reg_off: tq2, value: 1 });
+            stream.push(scratch_write());
+            executor.load_instructions(stream);
+            let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
+            gaps.push((k, (issued[k + 1] - issued[0]) as f64));
+        }
+        // Slope per write inside the silicon probes' band, no plateau: every gap
+        // sits on the line through the first and the last.
+        let (k0, g0) = gaps[0];
+        let (kn, gn) = gaps[gaps.len() - 1];
+        let slope = (gn - g0) / (kn - k0) as f64;
+        assert!((102.5..=106.0).contains(&slope), "cost per write {slope}");
+        for &(k, gap) in &gaps {
+            let line = g0 + (k - k0) as f64 * slope;
+            assert!((gap - line).abs() <= 1.0, "k={k}: push gap {gap}, line {line}");
+        }
+    }
+
+    /// A second task pushed on the same channel does not wait for the first: each
+    /// push lands one write cost after the previous one, while the head task is
+    /// still parked on its lock (the lock is released only by the last write).
+    #[test]
+    fn a_second_push_on_a_busy_channel_does_not_wait_for_the_first_task() {
+        let (mut executor, mut device, mut host_mem) = queue_push_sequence(3);
+        let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
+        for i in 1..3 {
+            let gap = (issued[i] - issued[i - 1]) as f64;
+            assert!((gap - 104.85).abs() <= 1.0, "push {i} landed {gap} cycles after push {}", i - 1);
+        }
     }
 }
