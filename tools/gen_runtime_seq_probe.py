@@ -324,6 +324,23 @@ def plan_9f() -> dict[str, Case]:
     return out
 
 
+# Probe 9g's grids: fine sweeps of the wait length around three of the levels probe 9f mapped
+SWEEPS_9G = {"a": tuple(range(8440, 8641, 20)), "b": tuple(range(2600, 2801, 20)), "c": tuple(range(240, 601, 40))}
+
+
+def plan_9g() -> dict[str, Case]:
+    """Probe 9g: three fine sweeps of the bracketed one-pair case (no filler) around the levels of probe 9f: part a at the
+    longest waits, part b between two plateaus, part c at the shortest waits. The first case is the positive control
+    (probe 9e's w1_L3000_br, byte-identical instruction stream); cases that exist in probe 9f are the same plans."""
+    cases = [_w_case("w1_L3000_br", 1, 3000, marks=True, events=BRACKET_EVENTS, tail_rounds=4)]
+    for words in sorted({n for ns in SWEEPS_9G.values() for n in ns}):
+        cases.append(_w_case(f"w1_L{words}_br", 1, words, marks=True, events=BRACKET_EVENTS, tail_rounds=4))
+    out = {c.name: c for c in cases}
+    if len(out) != len(cases):
+        raise ValueError("plan_9g: duplicate case names")
+    return out
+
+
 # -- layout and safety --------------------------------------------------------------------------------
 
 def pushes(case: Case) -> list[Push]:
@@ -812,7 +829,7 @@ def cmd_list(args) -> int:
 
 
 def _selected(args) -> list[Case]:
-    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f}.get(getattr(args, "plan", "base"), plan)()
+    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g}.get(getattr(args, "plan", "base"), plan)()
     names = args.only or list(table)
     return [table[n] for n in names]
 
@@ -887,21 +904,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lst = sub.add_parser("list")
-    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
+    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g"), default="base")
     b = sub.add_parser("build")
-    b.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
+    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g"), default="base")
     b.add_argument("out_dir")
     b.add_argument("--only", nargs="*", default=[])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
-    r.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
+    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g"), default="base")
     r.add_argument("--backend", choices=("hw", "emu"), required=True)
     r.add_argument("--only", nargs="*", default=[])
     t = sub.add_parser("table")
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+")
-    t.add_argument("--plan", choices=("base", "9d", "9e", "9f"), default="base")
+    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g"), default="base")
     t.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
     return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)

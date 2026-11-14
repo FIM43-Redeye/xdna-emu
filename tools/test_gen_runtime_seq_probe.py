@@ -813,3 +813,37 @@ def test_9f_selectable_from_the_command_line():
     with contextlib.redirect_stdout(buf):
         assert g.main(["list", "--plan", "9f"]) == 0
     assert "k_a_L30000" in buf.getvalue() and "w1_f128_L3000_br" in buf.getvalue()
+
+
+# -- probe 9g: fine sweeps of the transfer length around three levels -------------------------------------------
+
+PARTS_9G = {"a": tuple(range(8440, 8641, 20)), "b": tuple(range(2600, 2801, 20)), "c": tuple(range(240, 601, 40))}
+
+
+def test_plan_9g_is_exactly_the_three_fine_sweeps_plus_the_control_and_validates():
+    p = g.plan_9g()
+    want = {"w1_L3000_br"} | {f"w1_L{n}_br" for ns in PARTS_9G.values() for n in ns}
+    assert set(p) == want and len(p) == 11 + 11 + 10 + 1
+    assert next(iter(p)) == "w1_L3000_br"
+    for c in p.values():
+        g.validate(c)
+
+
+def test_9g_cases_are_the_same_plans_as_the_other_bracketed_one_pair_cases():
+    p9g, p9f = g.plan_9g(), g.plan_9f()
+    for name in p9g:
+        if name in p9f:
+            assert p9g[name].steps == p9f[name].steps and p9g[name].events == p9f[name].events
+    for n in (240, 8440, 2620):
+        c = p9g[f"w1_L{n}_br"]
+        assert c.events == g.BRACKET_EVENTS and sum(isinstance(s, g.Mark) for s in c.steps) == 4
+        assert [x.words for x in g.measured_pushes(c) if x.ch == "S0"] == [n]
+
+
+def test_9g_selectable_from_the_command_line_and_leaves_other_plans_alone():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9g"]) == 0
+    assert "w1_L8640_br" in buf.getvalue() and "w1_L240_br" in buf.getvalue()
+    assert len(g.plan_9f()) == 51
