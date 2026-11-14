@@ -1160,6 +1160,8 @@ impl DmaEngine {
                     // that write (`note_host_write`).
                     let cold = self.channels[ch_idx].warm_task_index == 0;
                     self.channels[ch_idx].first_write_acked_at = None;
+                    self.channels[ch_idx].first_write_region = None;
+                    self.channels[ch_idx].bd_last_block = None;
                     // SP-4a (#140, opt-in, default off): a metered post-arrival drain for the
                     // first task. Silicon streams that task without a stall (bridge corpus
                     // 2026-11), so this stays an experiment knob.
@@ -2054,18 +2056,43 @@ impl DmaEngine {
     }
 
     /// A shim S2MM word went in this cycle (`uses_host_write_path`): the task's first one starts
-    /// its first host write's latency, cold while no shim S2MM write of the run has finished
-    /// (`HostMemory::shim_s2mm_write_finished`).
+    /// its first host write's latency. Silicon (bridge corpus 2026-11, shim write-completion
+    /// probe 2026-11): cold while no shim S2MM write of the run has finished
+    /// (`HostMemory::shim_s2mm_write_finished`); after one has, warm only if a finished write
+    /// touched the region of the word (`HostMemory::shim_s2mm_region_warm`), else cold with the
+    /// shorter new-region latency.
     fn note_host_write(&mut self, ch_idx: usize, host_memory: &HostMemory) {
         let ch = &self.channels[ch_idx];
         if ch.first_write_acked_at.is_none() {
+            let cfg = &self.timing_config;
             let latency = if !host_memory.shim_s2mm_write_finished() {
-                self.timing_config.shim_s2mm_first_write_cold_cycles
+                cfg.shim_s2mm_first_write_cold_cycles
+            } else if ch.first_write_region.is_some_and(|r| host_memory.shim_s2mm_region_warm(r)) {
+                cfg.shim_s2mm_first_write_cycles
             } else {
-                self.timing_config.shim_s2mm_first_write_cycles
+                cfg.shim_s2mm_first_write_new_region_cycles
             };
             self.channels[ch_idx].first_write_acked_at = Some(self.read_clock + latency as u64);
         }
+    }
+
+    /// A shim S2MM word is bound for the device address `host`: note its region as one the BD in
+    /// progress writes, and as the task's first if it is the first. A word in the block of the
+    /// one before it is in the same region (a BD does not span buffers), so only a new block
+    /// looks the buffer up.
+    fn note_s2mm_word_region(&mut self, channel: u8, host: u64, host_memory: &HostMemory) {
+        let region_bytes = self.timing_config.shim_s2mm_warm_region_bytes.max(1);
+        let block = host / u64::from(region_bytes);
+        let ch = &mut self.channels[channel as usize];
+        if ch.bd_last_block == Some(block) {
+            return;
+        }
+        let region = host_memory.warm_region_of(host, region_bytes);
+        ch.bd_last_block = Some(block);
+        if !ch.bd_regions.contains(&region) {
+            ch.bd_regions.push(region);
+        }
+        ch.first_write_region.get_or_insert(region);
     }
 
     /// A shim S2MM BD whose last word went in this cycle: queue its completion -- lock release,
@@ -2125,8 +2152,31 @@ impl DmaEngine {
         if !task_end && token.is_some() {
             self.channels[ch_idx].task_config.enable_token_issue = true;
         }
+        // Completions leave in order, so a queued one is no earlier than the one before it. A shim
+        // S2MM task that ends here finishes after the channel's previous task by the in-order lag
+        // (silicon, shim write-completion probe: a later write never completes before an earlier
+        // outstanding one; same-region pairs 1 cycle after it in 14 of 18).
+        let is_s2mm = ch_idx < self.s2mm_count;
+        let mut ready_at = ready_at;
+        if let Some(back) = self.channels[ch_idx].host_completions.back() {
+            ready_at = ready_at.max(back.ready_at);
+        }
+        let regions = if is_s2mm {
+            self.channels[ch_idx].bd_last_block = None;
+            std::mem::take(&mut self.channels[ch_idx].bd_regions)
+        } else {
+            Vec::new()
+        };
+        if is_s2mm && task_end {
+            let lag = self.timing_config.shim_s2mm_in_order_lag_cycles as u64;
+            if let Some(previous) = self.channels[ch_idx].last_task_finish_at {
+                ready_at = ready_at.max(previous + lag);
+            }
+            self.channels[ch_idx].last_task_finish_at = Some(ready_at);
+        }
         self.channels[ch_idx].host_completions.push_back(PendingHostCompletion {
             ready_at,
+            regions,
             completion,
             release,
             task_end,
@@ -2153,7 +2203,7 @@ impl DmaEngine {
             // An S2MM channel's completions are its host writes' acknowledgements: from now on the
             // run's first writes are warm.
             if ch_idx < self.s2mm_count {
-                host_memory.note_shim_s2mm_write_finished();
+                host_memory.note_shim_s2mm_write_finished(&done.regions);
             }
             if let Some((lock_id, value)) = done.release {
                 if self.release_must_park(ch_idx, lock_id, tile, neighbors) {
@@ -4063,8 +4113,14 @@ impl DmaEngine {
         host_memory: &mut HostMemory,
     ) {
         // The stream shadow takes every word as it leaves the stream, written or not.
-        if let ShimHostAddress::Host(host) = resolve_shim_host_address(aie_addr) {
-            host_memory.shadow_s2mm_word(host, word, burst_bytes);
+        match resolve_shim_host_address(aie_addr) {
+            ShimHostAddress::Host(host) => {
+                host_memory.shadow_s2mm_word(host, word, burst_bytes);
+                self.note_s2mm_word_region(channel, host, host_memory);
+            }
+            // Below the aperture the write is dropped and recorded, but it is still a write to
+            // that address: its region is the raw address's.
+            ShimHostAddress::OutsideAperture => self.note_s2mm_word_region(channel, aie_addr, host_memory),
         }
         let ch = channel as usize;
         if self.s2mm_bursts.len() <= ch {
@@ -4170,6 +4226,7 @@ impl DmaEngine {
                 Some(decompressed) => {
                     let write_len = BLOCK_SIZE.min(bytes - mem_bytes_written);
                     let dest_addr = addr + mem_bytes_written as u64;
+                    self.note_s2mm_word_region(channel, dest_addr, host_memory);
 
                     // Write decompressed bytes to host memory via word-aligned writes
                     let full_words = write_len / 4;

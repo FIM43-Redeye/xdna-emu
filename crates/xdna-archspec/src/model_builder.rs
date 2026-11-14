@@ -218,6 +218,9 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             shim_s2mm_first_write_cold_cycles: 1040,
             shim_s2mm_first_write_cycles: 165,
             shim_s2mm_last_write_cycles: 150,
+            shim_s2mm_first_write_new_region_cycles: 632,
+            shim_s2mm_warm_region_bytes: 65536,
+            shim_s2mm_in_order_lag_cycles: 1,
             // Shim MM2S read-ahead (NPU1 shim-inflight probe, 2026-11-07). See
             // the DmaTiming field docs for the bounds.
             shim_mm2s_read_latency_cycles: 325,

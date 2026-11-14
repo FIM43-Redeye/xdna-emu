@@ -130,7 +130,19 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
         measured("dma.shim_s2mm_first_write_cold_cycles", "NPU1 bridge corpus 2026-11 (three samples a test): the \
             median FINISHED - first word of the 29 first tasks it sets (547..2715 by test)", "A typical value of a \
             test-dependent host latency; what sets it is not determined. Cold while no shim S2MM write of the run has \
-            finished (138 first tasks, 0 misfits); run-first write against first touch of the buffer is open."),
+            finished (138 corpus first tasks, 0 misfits; 183 of 183 first writes of the write-completion probe, \
+            which is bimodal, about 900 and about 2000, with nothing found that picks the mode)."),
+        measured("dma.shim_s2mm_first_write_new_region_cycles", "NPU1 shim write-completion probe 2026-11-14: 16-word \
+            writes 64 KiB further into the buffer and into another buffer, 10000 cycles after an earlier write finished, \
+            FINISHED - first word 622..784 (n = 6, median 632)", "A write 2 MiB further is higher (869..1078, n = 3) and \
+            is not modelled. Cold-first against cold-new is the run's first finished write."),
+        measured("dma.shim_s2mm_warm_region_bytes", "NPU1 shim write-completion probe 2026-11-14: the same 4 KiB page and \
+            another page of the same aligned 64 KiB block are warm (2 of 3 rounds, the third mildly slow); 64 KiB, 2 MiB \
+            further and another buffer are cold", "Between 8 KiB and 64 KiB on silicon: 64 KiB fits every measured case, not \
+            pinned. Keyed by buffer too: another buffer 4 KiB below is cold."),
+        measured("dma.shim_s2mm_in_order_lag_cycles", "NPU1 shim write-completion probe 2026-11-14: a later same-region write \
+            whose words arrive before the earlier one finished completes 1 cycle after it in 14 of 18 pairs (2 in one, 6, \
+            555 and 629 in three)", "Same channel; cross-channel order was not measured."),
         measured("dma.shim_s2mm_first_write_cycles", "NPU1 bridge corpus 2026-11: warm 1-word and 16-word tasks with their \
             words waiting finish at START_TASK + 171 / 172 (first word at + 6)", ""),
         measured("dma.shim_s2mm_last_write_cycles", "NPU1 bridge corpus 2026-11: runtime_cumsum's warm 16-word tasks, last \

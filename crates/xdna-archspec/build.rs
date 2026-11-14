@@ -471,6 +471,24 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
         .unwrap();
         writeln!(
             out,
+            "    pub const DMA_SHIM_S2MM_FIRST_WRITE_NEW_REGION_CYCLES: u16 = {};",
+            t.dma.shim_s2mm_first_write_new_region_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_S2MM_WARM_REGION_BYTES: u32 = {};",
+            t.dma.shim_s2mm_warm_region_bytes
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    pub const DMA_SHIM_S2MM_IN_ORDER_LAG_CYCLES: u16 = {};",
+            t.dma.shim_s2mm_in_order_lag_cycles
+        )
+        .unwrap();
+        writeln!(
+            out,
             "    pub const DMA_SHIM_MM2S_READ_LATENCY_CYCLES: u16 = {};",
             t.dma.shim_mm2s_read_latency_cycles
         )

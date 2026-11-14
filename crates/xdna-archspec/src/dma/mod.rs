@@ -112,6 +112,17 @@ pub struct DmaTimingConfig {
     /// Shim S2MM: a task finishes at least this long after its last word. See `DmaTiming`.
     pub shim_s2mm_last_write_cycles: u16,
 
+    /// Shim S2MM: a first write to a region no finished write has touched, once some write of
+    /// the run has finished, finishes at least this long after its first word. See `DmaTiming`.
+    pub shim_s2mm_first_write_new_region_cycles: u16,
+
+    /// Shim S2MM: bytes of the aligned host-buffer region a finished write warms. See `DmaTiming`.
+    pub shim_s2mm_warm_region_bytes: u32,
+
+    /// Shim S2MM: a task finishes at least this long after the previous task of its channel.
+    /// See `DmaTiming`.
+    pub shim_s2mm_in_order_lag_cycles: u16,
+
     /// Shim MM2S host-memory read latency (issue to stream).  See `DmaTiming`.
     pub shim_mm2s_read_latency_cycles: u16,
 

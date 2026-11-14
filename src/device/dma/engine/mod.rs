@@ -761,6 +761,10 @@ impl DmaEngine {
         ch.is_first_bd = true;
         ch.warm_task_index = 0;
         ch.first_write_acked_at = None;
+        ch.first_write_region = None;
+        ch.bd_regions.clear();
+        ch.bd_last_block = None;
+        ch.last_task_finish_at = None;
         ch.prefetch_start_emitted = false;
         ch.controller_dispatch_index = 0;
         ch.prev_starving = false;

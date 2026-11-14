@@ -42,7 +42,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
 
 /// Direction of data flow for a memory region.
@@ -259,8 +259,25 @@ pub struct HostMemory {
 
     /// A shim S2MM write of this run has finished: its BD's writes were acknowledged
     /// (`note_shim_s2mm_write_finished`). Until then every shim S2MM's first write is the cold
-    /// one (`dma.shim_s2mm_first_write_cold_cycles`), after it warm.
+    /// one (`dma.shim_s2mm_first_write_cold_cycles`).
     shim_s2mm_write_finished: bool,
+
+    /// The regions that finished shim S2MM writes of this run touched. After one has finished, a
+    /// shim S2MM's first write is warm only inside one of them, else cold with the shorter
+    /// `dma.shim_s2mm_first_write_new_region_cycles`.
+    shim_s2mm_warm: BTreeSet<WarmRegion>,
+}
+
+/// A region of a host buffer, the unit a finished shim S2MM write warms: the aligned block of
+/// `dma.shim_s2mm_warm_region_bytes` bytes of the device address space, together with the buffer
+/// the address lies in. The buffer is part of the key because silicon is cold for another
+/// buffer even when it lies in the same block (shim write-completion probe: the second buffer sat
+/// 4 KiB below the first, inside its 64 KiB block, in 3 of 3 runs). An address outside every
+/// buffer has no buffer (`u64::MAX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WarmRegion {
+    buffer: u64,
+    block: u64,
 }
 
 impl HostMemory {
@@ -283,29 +300,46 @@ impl HostMemory {
             s2mm_stream_shadow: None,
             s2mm_shadow_pass: 0,
             shim_s2mm_write_finished: false,
+            shim_s2mm_warm: BTreeSet::new(),
         }
     }
 
-    /// Whether a shim S2MM write of this run has finished, so that a shim S2MM's first write is
-    /// warm. Silicon (bridge corpus 2026-11, 138 informative first tasks, every one fitted): a
-    /// task's first write is cold exactly when no shim S2MM data write has finished earlier in
-    /// the same run, on any channel of any column; a channel's first task that follows another
-    /// channel's finished write is warm. A trace carrier, whose oversized BD never finishes,
-    /// does not count. Whether the true selector is the run's first write or the first touch
-    /// of the destination buffer is open (the corpus writes one buffer after the first finish),
-    /// and buffers are not modelled.
+    /// Whether a shim S2MM write of this run has finished. Silicon (bridge corpus 2026-11, 138
+    /// informative first tasks; shim write-completion probe 2026-11, 183 first writes, no
+    /// exception): a task's first write is cold while none has, on any channel of any column. A
+    /// trace carrier, whose oversized BD never finishes, does not count. After one has, a first
+    /// write is warm only in a region a finished write touched (`shim_s2mm_region_warm`).
     pub fn shim_s2mm_write_finished(&self) -> bool {
         self.shim_s2mm_write_finished
     }
 
-    /// A shim S2MM BD's host writes were acknowledged.
-    pub fn note_shim_s2mm_write_finished(&mut self) {
+    /// The region of the device address `addr`, `region_bytes` big (`dma.shim_s2mm_warm_region_bytes`).
+    pub fn warm_region_of(&self, addr: u64, region_bytes: u32) -> WarmRegion {
+        let buffer = self
+            .regions
+            .iter()
+            .find(|r| r.contains(addr))
+            .map(|r| r.base_address)
+            .or_else(|| self.external_regions.iter().find(|r| r.contains(addr)).map(|r| r.base_address))
+            .unwrap_or(u64::MAX);
+        WarmRegion { buffer, block: addr / u64::from(region_bytes.max(1)) }
+    }
+
+    /// Whether a finished shim S2MM write of this run touched `region`.
+    pub fn shim_s2mm_region_warm(&self, region: WarmRegion) -> bool {
+        self.shim_s2mm_warm.contains(&region)
+    }
+
+    /// A shim S2MM BD's host writes were acknowledged; it wrote to `regions`.
+    pub fn note_shim_s2mm_write_finished(&mut self, regions: &[WarmRegion]) {
         self.shim_s2mm_write_finished = true;
+        self.shim_s2mm_warm.extend(regions.iter().copied());
     }
 
     /// A new run (hw_context): no shim S2MM write has finished in it yet.
     pub fn begin_run(&mut self) {
         self.shim_s2mm_write_finished = false;
+        self.shim_s2mm_warm.clear();
     }
 
     /// Turn the shim S2MM stream shadow on (an empty shadow) or off (dropped).

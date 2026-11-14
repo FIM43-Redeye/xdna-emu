@@ -793,6 +793,9 @@ fn test_shim_ddr_timing_decomposition() {
     assert_eq!(cfg.shim_s2mm_first_write_cold_cycles, 1040);
     assert_eq!(cfg.shim_s2mm_first_write_cycles, 165);
     assert_eq!(cfg.shim_s2mm_last_write_cycles, 150);
+    assert_eq!(cfg.shim_s2mm_first_write_new_region_cycles, 632);
+    assert_eq!(cfg.shim_s2mm_warm_region_bytes, 65536);
+    assert_eq!(cfg.shim_s2mm_in_order_lag_cycles, 1);
     // The MM2S 325 is now the shim read latency, charged between each read
     // and the stream (readahead_tests), so it is not also a per-task cost.
     assert_eq!(cfg.shim_per_task_overhead_mm2s_cycles, 0);
@@ -5102,7 +5105,7 @@ fn shim_s2mm_next_task_takes_words_while_the_previous_task_writes() {
     let expect: Vec<u64> = (ARM - 1..ARM - 1 + 16).collect();
     assert_eq!(taken, expect);
     // Completions leave in task order. The second task's first write is cold too: no write of
-    // the run had finished when it went (`HostMemory::shim_s2mm_write_finished`).
+    // the run had finished when it went.
     assert_eq!(rig.finished_task_at.len(), 2, "both tasks finish");
     assert!(rig.finished_task_at[0] <= rig.finished_task_at[1]);
 }
@@ -5178,6 +5181,10 @@ struct RunTask {
     start: u64,
     words: u32,
     bd_words: u32,
+    /// Host address of the BD; `None` is a block of its own, 0x10000 * (1 + index in the run).
+    addr: Option<u64>,
+    /// A second task of one channel takes the next BD slot.
+    slot: u8,
     finished: Option<u64>,
 }
 
@@ -5200,9 +5207,9 @@ fn run_shim_tasks(host: &mut HostMemory, tasks: &mut [RunTask], until: u64) -> V
             eng.set_current_cycle(cycle);
             for (i, t) in tasks.iter().enumerate() {
                 if t.col == *col && t.start == cycle {
-                    let bd = 2 * t.ch;
-                    eng.configure_bd(bd, BdConfig::simple_1d(0x10_000 * (1 + i as u64), t.bd_words * 4))
-                        .unwrap();
+                    let bd = 2 * t.ch + t.slot;
+                    let addr = t.addr.unwrap_or(0x10_000 * (1 + i as u64));
+                    eng.configure_bd(bd, BdConfig::simple_1d(addr, t.bd_words * 4)).unwrap();
                     eng.start_channel(t.ch, bd).unwrap();
                 }
             }
@@ -5237,48 +5244,141 @@ fn run_shim_tasks(host: &mut HostMemory, tasks: &mut [RunTask], until: u64) -> V
 }
 
 fn task(col: u8, ch: u8, start: u64, words: u32) -> RunTask {
-    RunTask { col, ch, start, words, bd_words: words, finished: None }
+    RunTask { col, ch, start, words, bd_words: words, addr: None, slot: 0, finished: None }
 }
 
 /// FINISHED_TASK - START_TASK of a short task whose words wait: its first word is read at + 6.
 fn cold_finish() -> u64 {
     6 + DmaTimingConfig::default().shim_s2mm_first_write_cold_cycles as u64
 }
+fn new_region_finish() -> u64 {
+    6 + DmaTimingConfig::default().shim_s2mm_first_write_new_region_cycles as u64
+}
 fn warm_finish() -> u64 {
     6 + DmaTimingConfig::default().shim_s2mm_first_write_cycles as u64
 }
 
+const REGION: u64 = 65536;
+/// Buffer base of the region tests: aligned to a region, so that "+ k * REGION" is k regions on.
+const BUF: u64 = 0x40_0000;
+
+/// A host with one buffer of `len` bytes at `BUF`.
+fn host_with_buffer(len: usize) -> HostMemory {
+    let mut host = make_host_memory();
+    host.allocate_region("buf", BUF, len).unwrap();
+    host
+}
+
+fn task_at(col: u8, ch: u8, start: u64, words: u32, addr: u64) -> RunTask {
+    RunTask { addr: Some(addr), ..task(col, ch, start, words) }
+}
+
 /// add_one_ctrl_packet_4_cores: the run's first write is cold; the channel-first tasks of other
-/// columns and channels that follow its FINISHED are warm.
+/// columns and channels that follow its FINISHED, to the same buffer region, are warm.
 #[test]
 fn the_runs_first_shim_s2mm_write_is_cold_and_later_channel_first_tasks_on_other_columns_are_warm() {
-    let mut host = make_host_memory();
-    let mut tasks = [task(1, 1, 10, 8), task(2, 0, 3000, 8), task(2, 1, 4000, 8), task(3, 0, 5000, 8)];
+    let mut host = host_with_buffer(4 * REGION as usize);
+    let mut tasks = [
+        task_at(1, 1, 10, 8, BUF),
+        task_at(2, 0, 3000, 8, BUF + 0x100),
+        task_at(2, 1, 4000, 8, BUF + 0x200),
+        task_at(3, 0, 5000, 8, BUF + 0x1000),
+    ];
     let got = run_shim_tasks(&mut host, &mut tasks, 6000);
     assert_eq!(got, vec![Some(cold_finish()), Some(warm_finish()), Some(warm_finish()), Some(warm_finish())]);
 }
 
 /// objectfifo_shim_packet: two channels whose first words both precede the first FINISHED are both
-/// cold.
+/// cold, even to the same region: nothing is warmed until a write has finished.
 #[test]
 fn two_shim_s2mm_tasks_writing_before_any_write_has_finished_are_both_cold() {
-    let mut host = make_host_memory();
-    let mut tasks = [task(1, 0, 10, 8), task(1, 1, 300, 8)];
+    let mut host = host_with_buffer(REGION as usize);
+    let mut tasks = [task_at(1, 0, 10, 8, BUF), task_at(1, 1, 300, 8, BUF + 0x100)];
     let got = run_shim_tasks(&mut host, &mut tasks, 3000);
     assert_eq!(got, vec![Some(cold_finish()), Some(cold_finish())]);
 }
 
-/// A trace carrier (an oversized BD that never finishes) writes but warms nothing; a new run
-/// (`HostMemory::begin_run`) starts cold again.
+/// Silicon (shim write-completion probe): a later write to another region of the same buffer is
+/// cold, but with a shorter latency than the run's first write; +4 KiB (the same 64 KiB block) is
+/// warm, +64 KiB and +2 MiB are not.
+#[test]
+fn a_write_to_another_region_of_the_same_buffer_is_cold_with_the_new_region_latency() {
+    let mut host = host_with_buffer(4 << 20);
+    let mut tasks = [
+        task_at(1, 0, 10, 16, BUF),
+        task_at(2, 0, 3000, 16, BUF + 0x1000),
+        task_at(2, 1, 3000, 16, BUF + REGION),
+        task_at(3, 0, 3000, 16, BUF + (2 << 20)),
+    ];
+    let got = run_shim_tasks(&mut host, &mut tasks, 6000);
+    assert_eq!(
+        got,
+        vec![Some(cold_finish()), Some(warm_finish()), Some(new_region_finish()), Some(new_region_finish())]
+    );
+}
+
+/// Silicon: another buffer is cold although one has finished, even one lying in the same 64 KiB
+/// block of the address space (the probe's second buffer sat 4 KiB below the first in 3 of 3 runs).
+#[test]
+fn a_write_to_another_buffer_is_cold_even_inside_the_same_address_block() {
+    let mut host = make_host_memory();
+    host.allocate_region("a", BUF + 0x1000, 0x1000).unwrap();
+    host.allocate_region("b", BUF, 0x1000).unwrap();
+    let mut tasks = [task_at(1, 0, 10, 16, BUF + 0x1000), task_at(2, 0, 3000, 16, BUF)];
+    let got = run_shim_tasks(&mut host, &mut tasks, 6000);
+    assert_eq!(got, vec![Some(cold_finish()), Some(new_region_finish())]);
+}
+
+/// A finished write warms every region it wrote to: a BD crossing a region boundary warms both
+/// sides, and a region it did not reach stays cold.
+#[test]
+fn a_finished_write_warms_every_region_it_wrote() {
+    let mut host = host_with_buffer(4 * REGION as usize);
+    // 2048 words = 8 KiB, from 4 KiB below the boundary between region 0 and region 1.
+    let mut tasks = [
+        task_at(1, 0, 10, 2048, BUF + REGION - 0x1000),
+        task_at(2, 0, 6000, 16, BUF + 0x40),
+        task_at(2, 1, 6000, 16, BUF + REGION + 0x1000),
+        task_at(3, 0, 6000, 16, BUF + 2 * REGION),
+    ];
+    let got = run_shim_tasks(&mut host, &mut tasks, 9000);
+    assert_eq!(got[1..], [Some(warm_finish()), Some(warm_finish()), Some(new_region_finish())]);
+}
+
+/// A write that has not finished warms nothing (a trace carrier's BD never does), and a new run
+/// (`HostMemory::begin_run`) forgets what was warmed.
 #[test]
 fn a_write_that_never_finishes_and_a_new_run_leave_the_next_first_write_cold() {
-    let mut host = make_host_memory();
-    let carrier = RunTask { bd_words: 1 << 16, ..task(1, 1, 10, 64) };
-    let mut tasks = [carrier, task(2, 0, 2000, 8)];
+    let mut host = host_with_buffer(REGION as usize);
+    let carrier = RunTask { bd_words: 1 << 16, ..task_at(1, 1, 10, 64, BUF) };
+    let mut tasks = [carrier, task_at(2, 0, 2000, 8, BUF)];
     let got = run_shim_tasks(&mut host, &mut tasks, 4000);
     assert_eq!(got, vec![None, Some(cold_finish())]);
     assert!(host.shim_s2mm_write_finished());
+    // The finished write warmed its region ...
+    let mut tasks = [task_at(1, 0, 10, 8, BUF)];
+    assert_eq!(run_shim_tasks(&mut host, &mut tasks, 2000), vec![Some(warm_finish())]);
+    // ... until the next run.
     host.begin_run();
-    let mut tasks = [task(1, 0, 10, 8)];
+    assert!(!host.shim_s2mm_write_finished());
+    let mut tasks = [task_at(1, 0, 10, 8, BUF)];
     assert_eq!(run_shim_tasks(&mut host, &mut tasks, 2000), vec![Some(cold_finish())]);
+}
+
+/// Silicon: a later write never completes before an earlier outstanding one of its channel (the
+/// same-region pairs finish 1 cycle after it in 14 of 18). Here the second task is warm (its
+/// region was warmed by another column's finished write) and would finish long before the first,
+/// which is cold; it finishes `shim_s2mm_in_order_lag_cycles` after it.
+#[test]
+fn a_task_does_not_finish_before_the_previous_task_of_its_channel() {
+    let lag = DmaTimingConfig::default().shim_s2mm_in_order_lag_cycles as u64;
+    let mut host = host_with_buffer(REGION as usize);
+    let second = RunTask { slot: 1, ..task_at(1, 0, 1100, 8, BUF + 0x100) };
+    let mut tasks = [task_at(2, 0, 10, 8, BUF), task_at(1, 0, 800, 8, BUF + REGION - 0x100), second];
+    let _ = run_shim_tasks(&mut host, &mut tasks, 3000);
+    // The first task's region was not warm when its first word went in: cold.
+    assert_eq!(tasks[1].finished, Some(800 + cold_finish()));
+    // Alone, the second task would finish at its start + warm_finish() = 1100 + 171 < 1846.
+    assert!(1100 + warm_finish() < 800 + cold_finish());
+    assert_eq!(tasks[2].finished, Some(800 + cold_finish() + lag));
 }

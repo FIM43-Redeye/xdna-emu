@@ -72,13 +72,20 @@ pub struct DmaTimingConfig {
     pub shim_per_task_overhead_mm2s_cycles: u16,
 
     /// Shim S2MM host write latencies: a task's FINISHED_TASK comes at the later of its first
-    /// word + `shim_s2mm_first_write_cold_cycles` (no shim S2MM write of the run finished yet,
-    /// `HostMemory::shim_s2mm_write_finished`) or `shim_s2mm_first_write_cycles` (one has), and
-    /// its last word +
-    /// `shim_s2mm_last_write_cycles`. See the archspec `DmaTiming` fields.
+    /// word + `shim_s2mm_first_write_cold_cycles` (no shim S2MM write of the run finished yet),
+    /// `shim_s2mm_first_write_new_region_cycles` (one has, but none touched this write's region)
+    /// or `shim_s2mm_first_write_cycles` (one touched it), and its last word +
+    /// `shim_s2mm_last_write_cycles`; never earlier than `shim_s2mm_in_order_lag_cycles` after the
+    /// channel's previous task. See the archspec `DmaTiming` fields.
     pub shim_s2mm_first_write_cold_cycles: u16,
     pub shim_s2mm_first_write_cycles: u16,
     pub shim_s2mm_last_write_cycles: u16,
+    /// A first write to a region no finished write has touched, once one has finished, and the
+    /// region and in-order terms (`HostMemory::shim_s2mm_region_warm`). See the archspec
+    /// `DmaTiming` fields.
+    pub shim_s2mm_first_write_new_region_cycles: u16,
+    pub shim_s2mm_warm_region_bytes: u32,
+    pub shim_s2mm_in_order_lag_cycles: u16,
 
     /// Shim MM2S host-memory read latency: a word read at cycle `t` can enter
     /// the stream at `t + latency`, and a BD finishes when its last read
@@ -198,6 +205,9 @@ impl DmaTimingConfig {
             shim_s2mm_first_write_cold_cycles: m.shim_s2mm_first_write_cold_cycles,
             shim_s2mm_first_write_cycles: m.shim_s2mm_first_write_cycles,
             shim_s2mm_last_write_cycles: m.shim_s2mm_last_write_cycles,
+            shim_s2mm_first_write_new_region_cycles: m.shim_s2mm_first_write_new_region_cycles,
+            shim_s2mm_warm_region_bytes: m.shim_s2mm_warm_region_bytes,
+            shim_s2mm_in_order_lag_cycles: m.shim_s2mm_in_order_lag_cycles,
             shim_mm2s_read_latency_cycles: m.shim_mm2s_read_latency_cycles,
             shim_mm2s_read_window_bytes: m.shim_mm2s_read_window_bytes,
             shim_warmup_decay_mm2s_permille: m.shim_warmup_decay_mm2s_permille,

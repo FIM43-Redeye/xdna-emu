@@ -1234,11 +1234,12 @@ pub struct DmaTiming {
     /// column; channel-first tasks that follow another channel's finished write are warm
     /// (add_one_ctrl_packet_4_cores / _col_overlay: column 1 S2MM 0 and 1 and column 2 S2MM 0,
     /// 128..162 after the first word, after column 0 S2MM 1's cold write); a trace carrier's
-    /// BD, which never finishes, does not count. Open: whether the selector is the run's first
-    /// write or the first touch of the destination buffer (the corpus cannot tell them apart;
-    /// buffers are not modelled), and the later one-word tasks that are cold at fixed sequence
-    /// positions (sync_task_complete_token and _bd_chaining, about a quarter of them), which
-    /// neither explains. A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words:
+    /// BD, which never finishes, does not count. After one has finished, a first write is warm only
+    /// in a region a finished write touched (`shim_s2mm_warm_region_bytes`), else cold with
+    /// `shim_s2mm_first_write_new_region_cycles`. Open: the later one-word tasks that are cold at
+    /// fixed sequence positions (sync_task_complete_token and _bd_chaining, about a quarter of them),
+    /// which the selector does not explain; the run's first write is bimodal on silicon (about 900
+    /// and about 2000 in a 183-write probe) with nothing found that picks the mode. A long transfer hides it (core_dmas_dma_configure_task_lock, 1024 words:
     /// 1180..1199 after the first word, its last write's latency after the last).
     pub shim_s2mm_first_write_cold_cycles: u16,
     /// Cycles from a later (warm) shim S2MM task's first word to its FINISHED_TASK at the
@@ -1254,6 +1255,32 @@ pub struct DmaTiming {
     /// Long transfers land 6..18 later (1024 words: 156..175 after the last word, 4096 words
     /// 156..169, mostly 168; the write side of a long host stream is not modelled finer).
     pub shim_s2mm_last_write_cycles: u16,
+    /// Cycles from the first word of a shim S2MM task whose first write goes to a region no
+    /// finished write of the run has touched, to its FINISHED_TASK at the earliest, once some
+    /// shim S2MM write of the run has finished: 632. (Before any has finished the write pays
+    /// `shim_s2mm_first_write_cold_cycles`.) Measured (NPU1 shim write-completion probe,
+    /// 2026-11-14): 16-word writes 64 KiB further into the same buffer and into another buffer,
+    /// 10000 cycles after the earlier write finished, finish 622..784 after their first word
+    /// (n = 6, median 632, three rounds each); a write 2 MiB further is higher (869..1078, n = 3,
+    /// not modelled). Tighter than the run's first write (595..10149 over 183 first writes).
+    /// The reading "an address translation walked with the upper levels cached, against the first
+    /// write's walk from nothing" is an inference.
+    pub shim_s2mm_first_write_new_region_cycles: u16,
+    /// Size in bytes of the host-buffer region a finished shim S2MM write warms: a later write's
+    /// first word is warm only inside a region (this size, aligned, of the same buffer) that a
+    /// finished write of the run touched. Measured (same probe): the same 4 KiB page and another
+    /// 4 KiB page inside the same aligned 64 KiB block of the buffer are warm (2 of 3 rounds, the
+    /// third mildly slow); 64 KiB further, 2 MiB further and another buffer, even one 4 KiB below
+    /// in the same 64 KiB block, are cold. Between 8 KiB and 64 KiB on silicon: 64 KiB fits every
+    /// measured case, not pinned. The reading "an address translation warmed per region" is an
+    /// inference.
+    pub shim_s2mm_warm_region_bytes: u32,
+    /// Cycles by which a shim S2MM task's FINISHED_TASK follows the previous task's on the same
+    /// channel when it would otherwise come first or together: 1. Measured (same probe): a later
+    /// write to the same region whose words arrive before the earlier write has finished finishes
+    /// 1 cycle after it in 14 of 18 pairs, 2 in one, 6 / 555 / 629 in three. A later write never
+    /// completes before an earlier outstanding one. Cross-channel order was not measured.
+    pub shim_s2mm_in_order_lag_cycles: u16,
 
     /// Read latency of a shim MM2S host-memory read, in cycles: from the cycle
     /// a read issues to the cycle its data can enter the stream. A BD's

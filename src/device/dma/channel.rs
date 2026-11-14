@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use crate::device::host_memory::WarmRegion;
 use super::engine::{ChannelStats, ChannelTaskConfig, StreamData, TaskQueue};
 #[cfg(test)]
 use super::engine::TaskQueueEntry;
@@ -94,6 +95,8 @@ pub struct StagedWord {
 pub struct PendingHostCompletion {
     /// Engine step at which the BD's last read returns.
     pub ready_at: u64,
+    /// A shim S2MM BD: the regions it wrote, warmed when it completes.
+    pub regions: Vec<WarmRegion>,
     pub completion: CompletionInfo,
     /// The BD's release lock and value, applied when the last read returns.
     pub release: Option<(u8, i8)>,
@@ -401,6 +404,22 @@ pub struct ChannelContext {
     /// the task's first word is in. A BD of the task finishes no earlier.
     pub first_write_acked_at: Option<u64>,
 
+    /// Shim S2MM over host memory: the region of the current task's first word, which decides
+    /// whether its first write is warm (`HostMemory::shim_s2mm_region_warm`). `None` until it
+    /// is in.
+    pub first_write_region: Option<WarmRegion>,
+
+    /// Shim S2MM over host memory: the regions the BD in progress has written, warmed when its
+    /// writes are acknowledged. With the block of the last word, so that a word in the same
+    /// block as the one before it needs no buffer lookup (a BD does not span buffers).
+    pub bd_regions: Vec<WarmRegion>,
+    pub bd_last_block: Option<u64>,
+
+    /// Shim S2MM over host memory: the engine step at which the channel's last queued task
+    /// finishes (its FINISHED_TASK); the next task finishes after it
+    /// (`dma.shim_s2mm_in_order_lag_cycles`).
+    pub last_task_finish_at: Option<u64>,
+
     /// BD-prefetch gate (Phase 2d.2): true once the channel has emitted the
     /// START_TASK event for the *next* queued task ahead of time, while still
     /// transferring the current one (HW loads the next BD into its second slot
@@ -671,6 +690,10 @@ impl ChannelContext {
             is_first_bd: true,
             warm_task_index: 0,
             first_write_acked_at: None,
+            first_write_region: None,
+            bd_regions: Vec::new(),
+            bd_last_block: None,
+            last_task_finish_at: None,
             prefetch_start_emitted: false,
             controller_dispatch_index: 0,
             stats: ChannelStats::default(),
@@ -848,6 +871,10 @@ impl ChannelContext {
         self.is_first_bd = true;
         self.warm_task_index = 0;
         self.first_write_acked_at = None;
+        self.first_write_region = None;
+        self.bd_regions.clear();
+        self.bd_last_block = None;
+        self.last_task_finish_at = None;
         self.prefetch_start_emitted = false;
         self.controller_dispatch_index = 0;
         self.stats = ChannelStats::default();
