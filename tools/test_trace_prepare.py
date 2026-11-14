@@ -467,3 +467,75 @@ class TestTraceEgress:
         out = mod.apply_trace_egress(cfg, text)
         assert out["routing"] == {"shim_bd_id": 15, "shim_col": 1,
                                   "shim_dma_channel": 1}
+
+
+# ---------------------------------------------------------------------------
+# Every declared trace has its trace buffer bound by the patched host code
+# ---------------------------------------------------------------------------
+
+_TRACED_DEVICE = (
+    "  aie.device(npu1_1col) @{name} {{\n"
+    "    aie.runtime_sequence(%arg0: memref<64xi32>, %arg1: memref<1048576xi8>) attributes "
+    "{{trace_buffer = #aie.trace_buffer<arg_index = 1, offset = 0, size = 1048576, dedicated = true>}} {{\n"
+    "    }}\n  }}\n"
+)
+_PLAIN_DEVICE = (
+    "  aie.device(npu1_1col) @{name} {{\n"
+    "    aie.runtime_sequence(%arg0: memref<64xi32>) {{\n    }}\n  }}\n"
+)
+
+
+def _module(*devices):
+    return "module {\n" + "".join(devices) + "}\n"
+
+
+_CPP_ONE_BOUND = (
+    "auto run0 = kernel0(opcode, bo0_instr, n, bo0_in, bo0_out, bo_trace);\n"
+    "auto run1 = kernel1(opcode, bo1_instr, n, bo1_in, bo1_out);\n"
+)
+_CPP_SET_ARG_BOUND = "run0.set_arg(5, bo_trace);\nrun1.set_arg(4, bo1_out);\n"
+
+
+class TestTraceBindingConsistency:
+    """A trace declared in a device whose kernel call gets no trace buffer names a
+    host argument nothing binds; its trace BD then points at host address 0
+    (the add_one_two case). The prep layer checks the count before writing."""
+
+    def test_one_traced_device_and_one_bound_call_is_consistent(self):
+        mod = _load_prepare_module()
+        mlir = _module(_TRACED_DEVICE.format(name="a"), _PLAIN_DEVICE.format(name="b"))
+        assert mod.unbound_trace_devices(mlir, _CPP_ONE_BOUND) == []
+        assert mod.unbound_trace_devices(mlir, _CPP_SET_ARG_BOUND) == []
+
+    def test_a_second_traced_device_without_a_bound_call_is_reported(self):
+        mod = _load_prepare_module()
+        mlir = _module(_TRACED_DEVICE.format(name="a"), _TRACED_DEVICE.format(name="b"))
+        assert mod.unbound_trace_devices(mlir, _CPP_ONE_BOUND) == ["b"]
+
+    def test_a_traced_device_and_no_bound_call_is_reported(self):
+        mod = _load_prepare_module()
+        mlir = _module(_TRACED_DEVICE.format(name="a"))
+        assert mod.unbound_trace_devices(mlir, "auto run = kernel(opcode, bo_instr, n, bo_out);\n") == ["a"]
+
+    def test_every_call_bound_covers_every_traced_device(self):
+        """Option of record: every kernel call gets a trace buffer of its own
+        (bo_trace, bo_trace_1, ...), so two traced devices are both covered."""
+        mod = _load_prepare_module()
+        mlir = _module(_TRACED_DEVICE.format(name="a"), _TRACED_DEVICE.format(name="b"))
+        both = _CPP_ONE_BOUND.replace("bo1_out);", "bo1_out, bo_trace_1);")
+        assert mod.unbound_trace_devices(mlir, both) == []
+        set_args = "run0.set_arg(5, bo_trace);\nrun1.set_arg(5, bo_trace_1);\n"
+        assert mod.unbound_trace_devices(mlir, set_args) == []
+
+    def test_traced_devices_with_one_trace_slot_are_consistent(self):
+        """The host binds every call's trace buffer at one slot, so every
+        traced device must declare its trace buffer at the same argument."""
+        mod = _load_prepare_module()
+        mlir = _module(_TRACED_DEVICE.format(name="a"), _TRACED_DEVICE.format(name="b"))
+        assert mod.trace_arg_index_mismatch(mlir) is None
+
+    def test_traced_devices_with_different_trace_slots_are_reported(self):
+        mod = _load_prepare_module()
+        other = _TRACED_DEVICE.format(name="b").replace("arg_index = 1", "arg_index = 2")
+        mlir = _module(_TRACED_DEVICE.format(name="a"), other)
+        assert mod.trace_arg_index_mismatch(mlir) == {"a": 1, "b": 2}

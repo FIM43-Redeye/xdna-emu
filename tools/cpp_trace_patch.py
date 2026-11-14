@@ -11,8 +11,11 @@ Supports three XRT API patterns:
 2. **set_arg**: ``auto run = xrt::run(kernel); run.set_arg(N, bo_out);``
    -> inserts ``run.set_arg(N+1, bo_trace);`` after the last set_arg.
 
-3. **Multi-kernel**: ``kernel0(opcode, ...); kernel1(opcode, ...);``
-   -> traces the first kernel (pattern 1 or 2).
+3. **Multi-kernel**: ``kernel0(opcode, ...); kernel1(opcode, ...);`` or
+   several ``xrt::run`` objects -> every call gets a trace buffer of its own
+   (``bo_trace``, ``bo_trace_1``, ...), because every call's instruction
+   stream may patch the trace argument; only ``bo_trace`` (the first call's)
+   is written out.
 
 All patterns also handle ``runlist.wait()`` in addition to ``run.wait()``.
 
@@ -55,6 +58,16 @@ _TRACE_BO_TEMPLATE = """\
                            {kernel_name}.group_id({next_id}));
   memset(bo_trace.map<void*>(), 0, _xdna_trace_size);
   bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);"""
+
+# A further kernel call's trace buffer. Bound so that call's trace BD writes
+# into a buffer of its own instead of naming an unbound argument; it is not
+# written out (the capture is the first call's buffer).
+_EXTRA_TRACE_BO_TEMPLATE = """\
+
+  auto {bo_name} = xrt::bo(device, _xdna_trace_size, XRT_BO_FLAGS_HOST_ONLY,
+                           {kernel_name}.group_id({next_id}));
+  memset({bo_name}.map<void*>(), 0, _xdna_trace_size);
+  {bo_name}.sync(XCL_BO_SYNC_BO_TO_DEVICE);"""
 
 _TRACE_WRITEOUT_TEMPLATE = """\
 
@@ -107,58 +120,51 @@ def _find_last_xrt_bo_declaration(root: Node, source_bytes: bytes) -> Optional[N
     return last
 
 
-def _find_kernel_call(
+def _kernel_callee(node: Node, source_bytes: bytes) -> Optional[str]:
+    """The callee name of a ``kernel*(...)`` call expression, else None."""
+    if node.type != "call_expression" or not node.children:
+        return None
+    callee = node.children[0]
+    callee_text = source_bytes[callee.start_byte:callee.end_byte].decode()
+    return callee_text if re.match(r'^kernel\w*$', callee_text) else None
+
+
+def _find_kernel_calls(
     root: Node, source_bytes: bytes
-) -> tuple[Optional[Node], str]:
-    """Find the first kernel call expression that produces a run variable.
+) -> list[tuple[Node, str]]:
+    """Find every kernel call expression, in source order.
 
-    Matches single-kernel patterns (``auto run = kernel(...)``), and
-    multi-kernel patterns (``auto run0 = kernel0(...)``).
+    Matches calls in declarations that produce a run variable
+    (``auto run = kernel(...)``, ``auto run0 = kernel0(...)``) and calls in
+    expression statements (``kernel0(...).wait2()``).
 
-    Returns ``(call_node, kernel_name)`` where *kernel_name* is the
-    callee identifier (e.g., ``"kernel"`` or ``"kernel0"``).  Returns
-    ``(None, "")`` if no kernel call is found.
+    Returns ``[(call_node, kernel_name), ...]`` where *kernel_name* is the
+    callee identifier (e.g., ``"kernel"`` or ``"kernel0"``).
     """
-    # First pass: look in declarations (auto run = kernel(...))
+    found: dict[int, tuple[Node, str]] = {}
     for node in _walk_all(root):
-        if node.type != "declaration":
-            continue
-        text = source_bytes[node.start_byte:node.end_byte].decode()
-        if "run" not in text:
+        if node.type == "declaration":
+            text = source_bytes[node.start_byte:node.end_byte].decode()
+            if "run" not in text:
+                continue
+        elif node.type != "expression_statement":
             continue
         for desc in _walk_all(node):
-            if desc.type == "call_expression":
-                callee = desc.children[0] if desc.children else None
-                if callee is None:
-                    continue
-                callee_text = source_bytes[callee.start_byte:callee.end_byte].decode()
-                if re.match(r'^kernel\w*$', callee_text):
-                    return desc, callee_text
-
-    # Second pass: look in expression statements (kernel0(...).wait2())
-    for node in _walk_all(root):
-        if node.type != "expression_statement":
-            continue
-        for desc in _walk_all(node):
-            if desc.type == "call_expression":
-                callee = desc.children[0] if desc.children else None
-                if callee is None:
-                    continue
-                callee_text = source_bytes[callee.start_byte:callee.end_byte].decode()
-                if re.match(r'^kernel\w*$', callee_text):
-                    return desc, callee_text
-
-    return None, ""
+            name = _kernel_callee(desc, source_bytes)
+            if name is not None:
+                found.setdefault(desc.start_byte, (desc, name))
+    return [found[k] for k in sorted(found)]
 
 
-def _find_xrt_run_constructor(
+def _find_xrt_run_constructors(
     root: Node, source_bytes: bytes
-) -> tuple[Optional[str], Optional[str]]:
-    """Find ``auto run = xrt::run(kernel)`` and extract both variable names.
+) -> list[tuple[str, str]]:
+    """Find every ``auto run = xrt::run(kernel)``, in source order.
 
-    Returns ``(run_var_name, kernel_name)`` or ``(None, None)`` if not found.
-    E.g., for ``auto run1 = xrt::run(kernel0)`` returns ``("run1", "kernel0")``.
+    Returns ``[(run_var_name, kernel_name), ...]``; e.g. for
+    ``auto run1 = xrt::run(kernel0)`` the entry is ``("run1", "kernel0")``.
     """
+    runs = []
     for node in _walk_all(root):
         if node.type != "declaration":
             continue
@@ -169,8 +175,8 @@ def _find_xrt_run_constructor(
         # or:    xrt::run <run_var> = xrt::run(<kernel_var>)
         m = re.search(r'(?:auto|xrt::run)\s+(run\w*)\s*=\s*xrt::run\((\w+)\)', text)
         if m:
-            return m.group(1), m.group(2)
-    return None, None
+            runs.append((m.group(1), m.group(2)))
+    return runs
 
 
 def _find_last_set_arg(
@@ -284,35 +290,33 @@ def _add_fstream_include(source: str) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _DirectCallPoints:
-    """Injection via direct kernel call: kernel(opcode, ..., bo_trace)."""
-    last_bo_end: int
-    kernel_call_close_paren: int
-    wait_end: int
-    trace_group_id: int
+class _Binding:
+    """One kernel call that gets a trace buffer: insert the buffer at
+    *insert_at*, as the last call argument (*run_var* None) or as a
+    ``run_var.set_arg`` statement."""
+    insert_at: int
     kernel_name: str
+    run_var: Optional[str] = None
 
 
 @dataclass
-class _SetArgPoints:
-    """Injection via set_arg: run.set_arg(N, bo_trace)."""
+class _InsertionPoints:
     last_bo_end: int
-    last_set_arg_end: int
-    trace_set_arg_index: int
     wait_end: int
-    trace_group_id: int
-    kernel_name: str
-    run_var: str
+    trace_arg_index: int
+    bindings: list[_Binding]
 
 
 def _find_insertion_points(
     source_bytes: bytes,
     trace_arg_index: int,
-) -> _DirectCallPoints | _SetArgPoints:
+) -> _InsertionPoints:
     """Parse the source and locate injection points.
 
-    Tries direct-call pattern first, falls back to set_arg pattern.
-    Raises PatchError if neither pattern is found.
+    Tries the direct-call pattern first, falls back to the set_arg pattern;
+    either way every call found is bound. Raises PatchError if neither
+    pattern is found, or if a call that binds a trace buffer comes before
+    the point where the buffers are declared.
 
     Args:
         trace_arg_index: Kernel argument slot for the trace BO. Comes from
@@ -337,9 +341,10 @@ def _find_insertion_points(
             "Cannot find any wait() call (run.wait, runlist.wait, etc.)."
         )
 
+    bindings: list[_Binding] = []
+
     # 3. Try direct-call pattern first: kernel(opcode, ...)
-    kernel_call, kernel_name = _find_kernel_call(root, source_bytes)
-    if kernel_call is not None:
+    for kernel_call, kernel_name in _find_kernel_calls(root, source_bytes):
         arg_list = None
         for child in kernel_call.children:
             if child.type == "argument_list":
@@ -351,42 +356,49 @@ def _find_insertion_points(
             )
         close_paren = arg_list.children[-1]
         assert close_paren.type == ")", f"Expected ')' but got {close_paren.type}"
+        bindings.append(_Binding(close_paren.start_byte, kernel_name))
 
-        return _DirectCallPoints(
-            last_bo_end=last_bo.end_byte,
-            kernel_call_close_paren=close_paren.start_byte,
-            wait_end=wait_stmt.end_byte,
-            trace_group_id=trace_arg_index,
-            kernel_name=kernel_name,
-        )
-
-    # 4. Try set_arg pattern: xrt::run(kernel) + run.set_arg(N, ...)
-    run_var, kernel_name = _find_xrt_run_constructor(root, source_bytes)
-    if run_var is not None and kernel_name is not None:
-        last_set_arg_stmt, _max_idx = _find_last_set_arg(
-            root, source_bytes, run_var
-        )
-        if last_set_arg_stmt is None:
-            raise PatchError(
-                f"Found xrt::run({kernel_name}) but no "
-                f"{run_var}.set_arg() calls."
+    # 4. Else the set_arg pattern: xrt::run(kernel) + run.set_arg(N, ...)
+    if not bindings:
+        for run_var, kernel_name in _find_xrt_run_constructors(root, source_bytes):
+            last_set_arg_stmt, _max_idx = _find_last_set_arg(
+                root, source_bytes, run_var
+            )
+            if last_set_arg_stmt is None:
+                raise PatchError(
+                    f"Found xrt::run({kernel_name}) but no "
+                    f"{run_var}.set_arg() calls."
+                )
+            bindings.append(
+                _Binding(last_set_arg_stmt.end_byte, kernel_name, run_var)
             )
 
-        return _SetArgPoints(
-            last_bo_end=last_bo.end_byte,
-            last_set_arg_end=last_set_arg_stmt.end_byte,
-            trace_set_arg_index=trace_arg_index,
-            wait_end=wait_stmt.end_byte,
-            trace_group_id=trace_arg_index,
-            kernel_name=kernel_name,
-            run_var=run_var,
+    if not bindings:
+        raise PatchError(
+            "Cannot find kernel invocation. Expected one of:\n"
+            "  - auto run = kernel(opcode, bo_instr, ...);\n"
+            "  - auto run = xrt::run(kernel); run.set_arg(N, ...);"
         )
 
-    raise PatchError(
-        "Cannot find kernel invocation. Expected one of:\n"
-        "  - auto run = kernel(opcode, bo_instr, ...);\n"
-        "  - auto run = xrt::run(kernel); run.set_arg(N, ...);"
+    for b in bindings:
+        if b.insert_at < last_bo.end_byte:
+            raise PatchError(
+                f"A {b.kernel_name} call binds a trace buffer before the last "
+                "xrt::bo declaration, where the trace buffers are declared."
+            )
+
+    return _InsertionPoints(
+        last_bo_end=last_bo.end_byte,
+        wait_end=wait_stmt.end_byte,
+        trace_arg_index=trace_arg_index,
+        bindings=bindings,
     )
+
+
+def _trace_bo_name(call_index: int) -> str:
+    """``bo_trace`` for the first call (the one written out), then
+    ``bo_trace_1``, ``bo_trace_2``, ..."""
+    return "bo_trace" if call_index == 0 else f"bo_trace_{call_index}"
 
 
 def patch_test_cpp(
@@ -397,9 +409,9 @@ def patch_test_cpp(
     """Apply trace buffer injection transforms to a test.cpp source.
 
     Applies three transforms:
-    1. Insert trace buffer allocation after the last xrt::bo declaration
-    2. Pass bo_trace to the kernel (direct call or set_arg)
-    3. Insert trace data write-out after the last wait()
+    1. Insert trace buffer allocation(s) after the last xrt::bo declaration
+    2. Pass a trace buffer to every kernel call (direct call or set_arg)
+    3. Insert the first call's trace data write-out after the last wait()
 
     Also adds #include <fstream> if not already present.
 
@@ -410,7 +422,7 @@ def patch_test_cpp(
         trace_arg_index: Kernel argument slot for the trace BO
             (from ``trace_config.json``'s ``buffer.kernel_arg_slot``).
             Used as both the ``kernel.group_id(N)`` argument and the
-            ``run.set_arg(N, ...)`` index.
+            ``run.set_arg(N, ...)`` index, for every call.
 
     Returns:
         The transformed source code.
@@ -428,49 +440,43 @@ def patch_test_cpp(
     source_bytes = source.encode("utf-8")
     points = _find_insertion_points(source_bytes, trace_arg_index)
 
-    # Build the trace buffer allocation snippet (same for both modes).
-    trace_bo_snippet = _TRACE_BO_TEMPLATE.format(
+    # Trace buffer allocations, all at one point: the first call's buffer
+    # (with the size constant), then one per further call.
+    allocations = _TRACE_BO_TEMPLATE.format(
         trace_size=trace_size,
         trace_size_comment=_human_size(trace_size),
-        next_id=points.trace_group_id,
-        kernel_name=points.kernel_name,
+        next_id=points.trace_arg_index,
+        kernel_name=points.bindings[0].kernel_name,
     )
+    for i, b in enumerate(points.bindings[1:], start=1):
+        allocations += _EXTRA_TRACE_BO_TEMPLATE.format(
+            bo_name=_trace_bo_name(i),
+            kernel_name=b.kernel_name,
+            next_id=points.trace_arg_index,
+        )
 
+    edits: list[tuple[int, str]] = [
+        (points.last_bo_end, allocations),
+        (points.wait_end, _TRACE_WRITEOUT_TEMPLATE),
+    ]
+    for i, b in enumerate(points.bindings):
+        name = _trace_bo_name(i)
+        if b.run_var is None:
+            # Append ", bo_trace" before the call's closing paren.
+            edits.append((b.insert_at, f", {name}"))
+        else:
+            # A set_arg for the trace buffer after the run's last set_arg.
+            # If a padding set_arg already exists at this index, the later
+            # call overrides it (XRT uses the last value for each index).
+            edits.append((
+                b.insert_at,
+                f"\n  {b.run_var}.set_arg({points.trace_arg_index}, {name});",
+            ))
+
+    # Apply in reverse byte order so earlier offsets stay valid.
     result = bytearray(source_bytes)
-
-    if isinstance(points, _DirectCallPoints):
-        # Apply in reverse byte order: wait_end > close_paren > last_bo_end.
-
-        # 3. Trace write-out after wait
-        writeout = _TRACE_WRITEOUT_TEMPLATE.encode("utf-8")
-        result[points.wait_end:points.wait_end] = writeout
-
-        # 2. Append ", bo_trace" before closing paren
-        arg_insert = b", bo_trace"
-        result[points.kernel_call_close_paren:points.kernel_call_close_paren] = arg_insert
-
-        # 1. Trace buffer allocation after last xrt::bo
-        result[points.last_bo_end:points.last_bo_end] = trace_bo_snippet.encode("utf-8")
-
-    elif isinstance(points, _SetArgPoints):
-        # Apply in reverse byte order: wait_end > last_set_arg_end > last_bo_end.
-
-        # 3. Trace write-out after wait
-        writeout = _TRACE_WRITEOUT_TEMPLATE.encode("utf-8")
-        result[points.wait_end:points.wait_end] = writeout
-
-        # 2. Insert set_arg for trace buffer after last set_arg.
-        # Uses trace_set_arg_index (from xclbin metadata or heuristic).
-        # If a padding set_arg already exists at this index, the later
-        # call overrides it (XRT uses the last value for each index).
-        set_arg_line = (
-            f"\n  {points.run_var}.set_arg("
-            f"{points.trace_set_arg_index}, bo_trace);"
-        ).encode("utf-8")
-        result[points.last_set_arg_end:points.last_set_arg_end] = set_arg_line
-
-        # 1. Trace buffer allocation after last xrt::bo
-        result[points.last_bo_end:points.last_bo_end] = trace_bo_snippet.encode("utf-8")
+    for offset, text in sorted(edits, key=lambda e: e[0], reverse=True):
+        result[offset:offset] = text.encode("utf-8")
 
     result_str = result.decode("utf-8")
 

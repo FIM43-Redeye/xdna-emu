@@ -319,6 +319,44 @@ def apply_trace_egress(cfg: dict, lowered_mlir: str) -> dict:
     return out
 
 
+def _traced_devices(traced_mlir: str) -> list[tuple[str, int]]:
+    """(symbol, trace buffer arg_index) of every device that declares a trace
+    buffer, in source order."""
+    traced = []
+    for block in re.split(r"(?=aie\.device\()", traced_mlir):
+        m = re.match(r"aie\.device\([^)]*\)\s*(?:@(\w+))?", block)
+        t = re.search(r"#aie\.trace_buffer<arg_index = (\d+)", block)
+        if m and t:
+            traced.append((m.group(1) or "(unnamed)", int(t.group(1))))
+    return traced
+
+
+def unbound_trace_devices(traced_mlir: str, cpp_source: str) -> list[str]:
+    """Devices that declare a trace buffer no kernel call of the host code binds.
+
+    cpp_trace_patch binds a trace buffer to every kernel call it patches
+    (``bo_trace``, ``bo_trace_1``, ... as the last call or set_arg argument),
+    and kernel calls run the devices in order, so the first N traced devices
+    are bound for N bound calls. A traced device past those names a host
+    argument nothing binds: its trace BD would point at host address 0.
+    Returns their symbols in source order.
+    """
+    traced = [name for name, _ in _traced_devices(traced_mlir)]
+    bound = len(re.findall(r",\s*bo_trace(?:_\d+)?\s*\)", cpp_source))
+    return traced[bound:]
+
+
+def trace_arg_index_mismatch(traced_mlir: str) -> dict[str, int] | None:
+    """None when every traced device declares its trace buffer at the same
+    runtime-sequence argument; else {device: arg_index}. The host binds every
+    call's trace buffer at the one slot trace_config.json names, so devices
+    with different trace arguments would leave one of them unbound."""
+    traced = _traced_devices(traced_mlir)
+    if len({idx for _, idx in traced}) <= 1:
+        return None
+    return dict(traced)
+
+
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
@@ -507,6 +545,21 @@ def prepare_trace(
                 )
             except PatchError as e:
                 msg = f"FAIL C++ patching: {e}"
+                write_status(output_dir, msg)
+                print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+                return 1
+
+        if trace_config is not None:
+            mismatch = trace_arg_index_mismatch(traced_mlir)
+            unbound = unbound_trace_devices(traced_mlir, cpp_source)
+            if mismatch:
+                msg = ("FAIL trace binding: traced devices declare their trace "
+                       "buffer at different arguments: "
+                       + ", ".join(f"@{d} {i}" for d, i in mismatch.items()))
+            elif unbound:
+                msg = ("FAIL trace binding: the host code binds no trace buffer "
+                       f"for traced device(s) {', '.join('@' + d for d in unbound)}")
+            if mismatch or unbound:
                 write_status(output_dir, msg)
                 print(f"FAIL {test_name}: {msg}", file=sys.stderr)
                 return 1

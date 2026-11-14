@@ -322,3 +322,108 @@ class TestWaitInsideCondition:
         out = _patch(self.SRC)
         write_pos = out.index("trace_raw.bin")
         assert write_pos > out.index("run.wait() != ERT_CMD_STATE_COMPLETED")
+
+
+class TestEveryKernelCallBound:
+    """A test with several kernel calls (add_one_two, add_one_two_txn) runs a
+    traced instruction stream in each of them, and each stream's trace BD is
+    patched with the trace argument. Every call gets its own trace buffer, so
+    no call leaves that argument unbound; the first call's buffer stays the one
+    written out to trace_raw.bin."""
+
+    TWO_KERNELS = """\
+#include <iostream>
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_kernel.h"
+int main() {
+  auto device = xrt::device(0);
+  auto kernel0 = xrt::kernel(context, "k0");
+  auto bo0_instr = xrt::bo(device, 1024, XCL_BO_FLAGS_CACHEABLE, kernel0.group_id(1));
+  auto bo0_out = xrt::bo(device, 256, XRT_BO_FLAGS_HOST_ONLY, kernel0.group_id(3));
+  auto kernel1 = xrt::kernel(context, "k1");
+  auto bo1_instr = xrt::bo(device, 1024, XCL_BO_FLAGS_CACHEABLE, kernel1.group_id(1));
+  auto bo1_out = xrt::bo(device, 256, XRT_BO_FLAGS_HOST_ONLY, kernel1.group_id(3));
+  unsigned int opcode = 3;
+  auto run0 =
+      kernel0(opcode, bo0_instr, 64, bo0_out);
+  run0.wait();
+  auto run1 =
+      kernel1(opcode, bo1_instr, 64, bo1_out);
+  run1.wait();
+  return 0;
+}
+"""
+
+    THREE_RUNS = """\
+#include <iostream>
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_kernel.h"
+int main() {
+  auto device = xrt::device(0);
+  auto kernel0 = xrt::kernel(context, "k0");
+  auto bo_out_0 = xrt::bo(device, 256, XRT_BO_FLAGS_HOST_ONLY, kernel0.group_id(4));
+  auto bo_out_1 = xrt::bo(device, 256, XRT_BO_FLAGS_HOST_ONLY, kernel0.group_id(4));
+  xrt::runlist runlist = xrt::runlist(context);
+  xrt::run run0 = xrt::run(kernel0);
+  run0.set_arg(0, 3);
+  run0.set_arg(4, bo_out_0);
+  xrt::run run1_cfg = xrt::run(kernel0);
+  run1_cfg.set_arg(0, 3);
+  run1_cfg.set_arg(4, 0);
+  xrt::run run1 = xrt::run(kernel0);
+  run1.set_arg(0, 3);
+  run1.set_arg(4, bo_out_1);
+  runlist.add(run0);
+  runlist.add(run1_cfg);
+  runlist.add(run1);
+  runlist.execute();
+  runlist.wait();
+  return 0;
+}
+"""
+
+    def test_each_direct_call_gets_its_own_trace_buffer(self):
+        out = _patch(self.TWO_KERNELS, trace_arg_index=4)
+        assert "kernel0(opcode, bo0_instr, 64, bo0_out, bo_trace);" in out
+        assert "kernel1(opcode, bo1_instr, 64, bo1_out, bo_trace_1);" in out
+        assert "auto bo_trace = xrt::bo(device, _xdna_trace_size, XRT_BO_FLAGS_HOST_ONLY,\n" \
+               "                           kernel0.group_id(4));" in out
+        assert "auto bo_trace_1 = xrt::bo(device, _xdna_trace_size, XRT_BO_FLAGS_HOST_ONLY,\n" \
+               "                           kernel1.group_id(4));" in out
+        assert "bo_trace_1.sync(XCL_BO_SYNC_BO_TO_DEVICE);" in out
+
+    def test_one_size_constant_and_one_writeout(self):
+        out = _patch(self.TWO_KERNELS, trace_arg_index=4)
+        assert out.count("constexpr size_t _xdna_trace_size") == 1
+        assert out.count("trace_raw.bin") == 1
+        assert "bo_trace.sync(XCL_BO_SYNC_BO_FROM_DEVICE);" in out
+        assert "bo_trace_1.sync(XCL_BO_SYNC_BO_FROM_DEVICE)" not in out
+        # The write-out follows the last wait, and every buffer is declared
+        # before the first call that binds one.
+        assert out.index("trace_raw.bin") > out.index("run1.wait();")
+        assert out.index("auto bo_trace_1 =") < out.index("kernel0(opcode")
+
+    def test_each_run_gets_its_own_set_arg(self):
+        out = _patch(self.THREE_RUNS, trace_arg_index=5)
+        assert "run0.set_arg(4, bo_out_0);\n  run0.set_arg(5, bo_trace);" in out
+        assert "run1_cfg.set_arg(4, 0);\n  run1_cfg.set_arg(5, bo_trace_1);" in out
+        assert "run1.set_arg(4, bo_out_1);\n  run1.set_arg(5, bo_trace_2);" in out
+        assert out.count("kernel0.group_id(5)") == 3
+        assert out.count("trace_raw.bin") == 1
+
+    def test_a_call_before_the_last_buffer_fails_closed(self):
+        """The trace buffers are declared after the last xrt::bo; a call that
+        binds one before that point would use it undeclared."""
+        src = self.TWO_KERNELS.replace(
+            "  auto kernel1 = xrt::kernel(context, \"k1\");\n",
+            "  auto kernel1 = xrt::kernel(context, \"k1\");\n"
+            "  auto early_run = kernel1(3, bo0_instr);\n  early_run.wait();\n",
+        )
+        with pytest.raises(PatchError, match="before"):
+            _patch(src, trace_arg_index=4)
+
+    def test_single_call_output_is_unchanged(self):
+        """One call: exactly the single-kernel output, no numbered buffers."""
+        out = _patch(MINIMAL_CPP)
+        assert "bo_trace_1" not in out
+        assert out.count("bo_trace") == 6
