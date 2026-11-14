@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; chains of short lock BDs before the waiting BD modelled 2026-11-13: three lock BDs in flight, every earlier release slot, the stall rise from the first granule, 148 / 148 fitted and 41 / 41 held-out silicon rows; chains of short lock-free BDs modelled 2026-11-13 (seven egress granule slots and a BD queue, both released 3 cycles after the port: every own-receiver row of the depth probes); open: the outward-route port stall (one one-cycle MM2S port stall in the 9th port cycle, north or south, not modelled) and the position-6 grant phase (one five-BD row), a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
+status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; chains of short lock BDs before the waiting BD modelled 2026-11-13: three lock BDs in flight, every earlier release slot, the stall rise from the first granule, 148 / 148 fitted and 41 / 41 held-out silicon rows; chains of short lock-free BDs modelled 2026-11-13 (seven egress granule slots and a BD queue, both released 2 cycles after the port, the probes' quiet source switch holding the first word one port cycle: every own-receiver row of the depth probes); the outward-route port stall modelled 2026-11-14 (a quiet switch's hold of a stream's first word, passed back to the source port: see "Outward-route port stall"); open: the position-6 grant phase (one five-BD row), a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
 ---
 
 # DMA & Stream Resource Gaps
@@ -525,10 +525,13 @@ BD's grant g0 (its STALLED_LOCK falls).
     - the waiting BD's lock request is made exactly at its start behind 1-word mids (early grants at the start in
       every such design), one cycle later per extra mid word (behind six 2- / 4-word mids: start + 1 / + 3).
     The model (`EgressQueue`, compute MM2S only): two counted resources between the bank accesses and the port,
-    both released 3 cycles after the word that closes them leaves the port (the port time read as the own
-    receiver's word time - 4, inferred). (1) At most 7 egress granule slots: every fetch takes one, a partial
+    both released 2 cycles after the word that closes them leaves the port (the port time read as the own
+    receiver's word time - 4, inferred). The probes' rows were taken with the source switch quiet, whose hold of
+    the first word costs one port cycle of its own (row "Outward-route port stall"); fitted against an unheld
+    port the release read 3, and the crossing-wake probes' awake-source cases (one cycle earlier from the 5th
+    finish on) fix it at 2 plus the hold. (1) At most 7 egress granule slots: every fetch takes one, a partial
     granule included, until its last word has left. (2) One BD queue: an entry from a BD's first access to its
-    last word's port time + 3, with three uses: a BD's first access waits until at most 6 BDs (itself and the
+    last word's port time + 2, with three uses: a BD's first access waits until at most 6 BDs (itself and the
     head included) hold an entry; the BD at chain position p >= 7 starts sequencing no earlier than the release
     of the BD at p - 7, plus 6; a lock BD at p >= 7 behind a lock-free BD is requested at max(the previous grant
     + 3, the release of the BD at p - 6, plus 4), in place of the trigger-word term. Searched forms that fail:
@@ -545,15 +548,30 @@ BD's grant g0 (its STALLED_LOCK falls).
     (the 8-word head, where the stall is absorbed), each run equal to the model with the stall below on silicon and
     without it on the emulator (66 / 66 both).
     Still open here:
-    - *Outward-route port stall* (measured, not modelled, confirmable). When the MM2S's stream leaves its tile
-      (one, two or three tiles north, or south into the memtile; probes 9 to 11, 66 runs), every row equals the own
-      row with ONE one-cycle stall of the MM2S port in the 9th port cycle after its first word (first word at
-      g0 + 6, inferred; the stall at g0 + 14), every later word one cycle later. If that cycle is an idle cycle
-      anyway (an 8-word head's BD-boundary cycle) nothing moves. A stall indexed by stream word (before word 8
-      .. 11) misses rows that the cycle form fits (66 / 66). Distance and direction do not change it. It is read as
-      the stream switch's wake (inferred: no design with the outward switch kept awake has been run), not as this
-      queue, and the emulator has no outward term: those rows miss by exactly
-      the stall. Not separated: whether the stall is anchored on the first port word, the grant or the task start.
+    - *Outward-route port stall* (**modelled** 2026-11-14). When the MM2S's stream leaves its tile (one, two or
+      three tiles north, or south into the memtile; probes 9 to 11, 66 runs), every row equals the own row with
+      ONE one-cycle stall of the MM2S port in the 9th port cycle after its first word; nothing moves when that
+      cycle is an idle cycle anyway (an 8-word head's BD-boundary cycle). The crossing-wake probes (v1 arm b,
+      v2, v3; the slack twins) place it: every compute or memtile switch on the stream's route, the source's
+      included, that no word has crossed (any port, either direction, trace or data) for its abort period (128
+      cycles) holds the stream's first word one cycle. The source switch's hold is the port's own (the port cannot
+      send the first word in the cycle it offers it, which the own rows carry); the hold of the switch k hops out
+      reaches the port as one stalled cycle at the stream's slot 8k (first word + 8k, one later for every cycle the
+      port has stalled since), whether the switches between were quiet or kept awake, and a slot on the stream's
+      idle cycle absorbs it. Model (`TileArray`, `crossing_hold`): a quiet switch refuses its own MM2S's first
+      offer, holds a word crossing in for one cycle and sends the hold back toward the source one switch at a
+      time (3 cycles a hop, over the crossing the word came in by), and a hold that reaches the port takes its
+      slot; a word parked in a quiet switch leaves one cycle late (toward its S2MM or a neighbour). The idle
+      detector of a compute or memtile switch counts words crossing its ports, not words held in it. Two details
+      the slots need: a BD boundary's idle cycle follows the BD's last word at the port (it does not elapse while
+      the word is refused), and a granule's egress release counts from the cycle its last word leaves the port.
+      Emulator against silicon (same case, run by run, before -> after): outward rows 3 / 66 -> 63 / 66 (the
+      three: silicon's core release one cycle off the emulator's), crossing-wake v1 arm b 6 / 24 -> 24 / 24, v2
+      10 / 30 -> 29 / 30, v3 13 / 33 -> 32 / 33 (the two misses: a silicon trace packet two cycles before the
+      head woke the source switch; the emulator has none there), v3's split heads 0 / 12 -> 12 / 12, slack 6 / 48
+      -> 48 / 48; own rows, banked chain rows, the absorb rows and the in-scope sets unchanged. Unmeasured, so
+      not modelled: holds on packet-switched hops and through shim switches (a pulse stops there), and what a
+      passing hold does to the switches between (the port's stall is what the measurements show).
     - *The position-6 grant phase* (one five-BD row, kn4x5 t2: granted at 49 against the emulator's 48, and the
       k5n4 rows of the short-chain set), pinned in `the_position_six_grant_phase_keeps_the_emulators_pinned_cycle`.
     - *Scope.* The queue is modelled on the compute MM2S only; memtile and shim MM2S chains of short BDs are
@@ -751,7 +769,7 @@ finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterati
   - *S2MM 1 route.* The camp routed MM2S 0 -> S2MM 1: silicon's backpressure falls at G + 15, a second starvation cycle
     at G + 9, and the streamed writes one cycle later from granule 6; the emulator gives the S2MM 0 numbers (+ 8,
     + 2 only). The finish matches. Route-side, not modelled.
-  - *A parked feed's restart after quiet switches (walkers' last cycle; measured 2026-11-13, not modelled).*
+  - *A parked feed's restart after quiet switches (walkers' last cycle; measured 2026-11-13, compute side modelled 2026-11-14, memtile side open).*
     Walkers: silicon's FINISHED_BDs are + 56 / 121 / 186 after the grant once its memtile has been quiet for
     248..512 cycles before the parked memtile MM2S resumes, + 55 / 120 / 185 while the memtile S2MM is still filling
     from the shim, at either grant phase; the memtile port resumes one cycle later in the same iterations (memtile
@@ -778,17 +796,24 @@ finishes and the bank conflicts on the memory-module timer, 3 runs of 41 iterati
     threshold on each fits 97 of the 99 runs and the other 2 sit exactly at 128; realised-quiet brackets memtile
     (126, 129], compute (112, 129], both containing the register database's default abort period of 128 cycles.
     A data beat and a trace packet count alike as the last activity, and silicon's own trace packets crossing
-    the window count (they woke the switches in many runs). Not modelled yet: making a parked word not count as
-    activity and charging the restart one cycle per gated switch puts the sl probe's rows one cycle late
-    (finish, backpressure fall, starvation; its compute switch is quiet before the release on silicon too). A
+    the window count (they woke the switches in many runs). Modelled 2026-11-14 (row "Outward-route port stall"):
+    a parked word is not activity, and a quiet switch holds a parked word's restart one cycle, with the S2MM's
+    registered ready (which held that cycle in the fitted constants) dropped on compute and memtile tiles: mr's
+    compute side 22 / 38 -> 36 / 38 (the two: silicon trace packets the emulator does not have), sl unchanged.
+    Open: the memtile side (0 / 61). The memtile's hold happens, one cycle on the feed's first crossing out of it,
+    but the emulator's compute switch and S2MM ingress give the feed 2 cycles of slack where silicon's finish
+    follows the memtile restart one to one, so neither the finish nor the + 8 / + 9 starvation shows it. Before
+    this change, making a parked word not count as activity and charging the restart one cycle per gated
+    switch put the sl probe's rows one cycle late (finish, backpressure fall, starvation; its compute switch is
+    quiet before the release on silicon too). A
     third probe (`sw-*`: the sl case with a compute-local waker ending 16..400 cycles before the release, 18 silicon
     runs) settles where the compute switch's cycle sits: on the S2MM's pull from its own quiet switch. With the
     switch kept awake the sl case finishes at grant + 54 with the feeding MM2S's backpressure falling at + 5 and no
     STREAM_STARVATION at all (9 / 9 runs); quiet, + 55, + 6 and the one starvation cycle at grant + 2 (9 / 9), which
     are the values the S2MM model was fitted to. So the fitted sl numbers contain one wake cycle, and the starvation
-    cycle at grant + 2 is that wake. Not modelled yet: the uncharged own-tile path has to come out one cycle faster
-    in finish, backpressure fall and starvation together, and outward routes need the one-cycle port stall of the
-    row "Outward-route port stall".
+    cycle at grant + 2 is that wake. Modelled 2026-11-14 as the switch's hold (row "Outward-route port stall"):
+    a compute or memtile S2MM takes a word in the cycle its write freed a slot, and a word parked in a quiet
+    switch reaches it one cycle after it could (sw 9 / 18 -> 18 / 18, sl unchanged).
   - *The task's first lock BD's grid* is a choice (no row shows its anchor).
   - *Lock-free first BD.* The start costs before the first write of a lock-free first BD (memory latency and start
     bonus) are unchanged; the S2MM finish of the START_TASK probe is + 79 / 80 after the release against silicon's
