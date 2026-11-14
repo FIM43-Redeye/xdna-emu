@@ -1541,7 +1541,9 @@ mod gate_wake {
         let lidx = array.tile_index(lcol, lrow);
         for step in 1..=40 {
             array.step_data_movement(&mut host);
-            if array.tiles[lidx].stream_switch.masters[lmaster].has_data() {
+            // In the master, or through it to the next switch in the same cycle.
+            let last = &array.tiles[lidx].stream_switch.masters[lmaster];
+            if last.has_data() || last.cycle_beat {
                 return step;
             }
         }
@@ -1770,6 +1772,12 @@ mod crossing_hold {
     /// the stream through packet rules (slot 0: id 1 to arbiter 0 / msel 0; the receiver's DMA master drops the
     /// header), every other switch through a circuit route.
     fn north_packet_stream(bds: &[u32], receiver: u8, quiet: &[u8], packet: &[u8]) -> Vec<u32> {
+        north_packet_run(bds, receiver, quiet, packet).0
+    }
+
+    /// `north_packet_stream`'s port beats, and the steps at which the receiver's DMA master passed a word to its
+    /// S2MM (the packet without its header).
+    fn north_packet_run(bds: &[u32], receiver: u8, quiet: &[u8], packet: &[u8]) -> (Vec<u32>, Vec<u32>) {
         let mut array = TileArray::npu1();
         let mut host = HostMemory::new();
         array.clock_mut().ungate_all();
@@ -1830,17 +1838,25 @@ mod crossing_hold {
         }
         array.tiles[src].locks[GO].value = 1;
         let total: u32 = bds.iter().map(|w| w + 1).sum();
-        let mut beats = Vec::new();
+        let payload: u32 = bds.iter().sum();
+        let (mut beats, mut arrivals) = (Vec::new(), Vec::new());
         for step in 0..400 {
             array.step_data_movement(&mut host);
             if array.tiles[src].stream_switch.slaves[compute::DMA_SLAVE_START as usize].cycle_beat {
                 beats.push(step);
             }
-            if beats.len() == total as usize {
-                return beats;
+            if array.tiles[rx].stream_switch.masters[compute::DMA_MASTER_START as usize].cycle_beat {
+                arrivals.push(step);
+            }
+            if beats.len() == total as usize && arrivals.len() == payload as usize {
+                return (beats, arrivals);
             }
         }
-        panic!("the stream did not leave the port: {} of {total} words", beats.len());
+        panic!(
+            "the stream did not arrive: {} of {total} words sent, {} of {payload} received",
+            beats.len(),
+            arrivals.len()
+        );
     }
 
     /// The stream's slots (port cycles from the first word, less the stalls before) at which the port stalled.
@@ -1862,6 +1878,60 @@ mod crossing_hold {
             want.sort();
             assert_eq!(quiet, want, "source switch packet-routed = {source_packet}");
         }
+    }
+
+    /// (P) every switch that routes the stream through packet rules holds every packet one cycle at its packet
+    /// stage, slot 8k + 4 for the switch k hops out, whatever its quiet state. Silicon: fanout p4 / p5 (circuit at
+    /// the source, packet one hop out) 12; packet_flow p5 (packet at both) 4 12; fanout p6 (circuit, packet,
+    /// packet) 12 20 with the far switch awake.
+    #[test]
+    fn every_packet_switched_hop_holds_the_port_at_slot_8k_plus_4() {
+        assert_eq!(stall_slots(&north_packet_stream(&[16], 3, &[], &[3])), vec![12]);
+        assert_eq!(stall_slots(&north_packet_stream(&[16], 3, &[], &[2, 3])), vec![4, 12]);
+        assert_eq!(stall_slots(&north_packet_stream(&[24], 4, &[], &[3, 4])), vec![12, 20]);
+        assert_eq!(stall_slots(&north_packet_stream(&[24], 4, &[], &[2, 3, 4])), vec![4, 12, 20]);
+    }
+
+    /// (S) and (P) together: compute probe stream A (packet at the source and one hop out, the far switch quiet:
+    /// 4 8 12) and fanout p6 (circuit, packet, packet, the switch two hops out quiet: 12 16 20).
+    #[test]
+    fn the_quiet_hold_and_the_packet_stage_holds_interleave_by_slot() {
+        assert_eq!(stall_slots(&north_packet_stream(&[16], 3, &[3], &[2, 3])), vec![4, 8, 12]);
+        assert_eq!(stall_slots(&north_packet_stream(&[24], 4, &[4], &[3, 4])), vec![12, 16, 20]);
+    }
+
+    /// (P) and (S) hold the stream inside the switches: the source port's stalls are the back-pressure of a
+    /// head held downstream, and the receiver takes the packet's words on consecutive cycles. Silicon: the memtile's S2MM ports take the packet streams of the compute tile above
+    /// (packet at the source and at the memtile) and the shim's fills (packet at the shim and at the memtile)
+    /// without a gap, while the sources stall at 4 and 12.
+    #[test]
+    fn the_receiver_takes_a_held_packet_without_a_gap() {
+        for (receiver, quiet, packet) in [
+            (3, &[][..], &[2u8, 3][..]),
+            (3, &[3u8][..], &[2, 3][..]),
+            (3, &[][..], &[3][..]),
+            (4, &[][..], &[3, 4][..]),
+            (4, &[3][..], &[2, 3, 4][..]),
+            (4, &[2, 3, 4][..], &[2, 3, 4][..]),
+        ] {
+            let (beats, arrivals) = north_packet_run(&[40], receiver, quiet, packet);
+            assert!(!port_stalls(&beats).is_empty(), "the source stalls ({quiet:?}, {packet:?})");
+            assert_eq!(
+                port_stalls(&arrivals),
+                Vec::<u32>::new(),
+                "receiver ({quiet:?}, {packet:?}): {arrivals:?}"
+            );
+        }
+    }
+
+    /// (P) acts on every packet, not on a stream's first: the second packet of a chain (compute probe same04:
+    /// 16 words, the BD boundary's idle cycle, then 4 words) stalls at its own slot 4; its slot 12 is after its
+    /// last word and costs nothing.
+    #[test]
+    fn the_packet_stage_holds_each_packet_from_its_own_header() {
+        // Port cycles: A (header + 16) stalls at slots 4 and 12 (cycles 4, 13) and ends at cycle 18; the BD
+        // boundary's idle cycle 19 (slot 17); B's header at slot 18 (cycle 20), its slot 4 = slot 22 at cycle 24.
+        assert_eq!(port_stalls(&north_packet_stream(&[16, 4], 3, &[], &[2, 3])), vec![4, 13, 19, 24]);
     }
 
     /// A compute tile whose MM2S 0 fills its own switch toward its S2MM 0, parked on a lock; the S2MM is released

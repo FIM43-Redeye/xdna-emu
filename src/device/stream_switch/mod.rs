@@ -98,6 +98,19 @@ pub struct StreamSwitch {
     /// Per master: the slave whose packet the packet rules last routed to it. A hold travelling back
     /// toward a stream's source (`TileArray`'s `crossing_hold`) follows it over a packet-routed hop.
     pub(crate) packet_feeders: Vec<Option<u8>>,
+    /// The switch's packet stage holds every packet one cycle (`TileArray`'s `crossing_hold`): per slave, the
+    /// routing pass (`packet_pass`) in which its waiting header first won its arbiter; the header moves on two
+    /// passes (one cycle) later. Counted in passes because a word that crosses in between a cycle's two passes
+    /// is taken by the second and so leaves the switch with the next cycle's crossing: a hold counted in cycles
+    /// would cost it nothing.
+    packet_stage_held: Vec<Option<u64>>,
+    /// Cycles this switch has been stepped (first passes).
+    packet_cycle: u64,
+    /// The current routing pass: 2 * `packet_cycle`, plus 1 in the cycle's second pass.
+    packet_pass: u64,
+    /// Per slave: the switch cycle in which the packet rules last took a word from it. A slave port passes one
+    /// word a cycle, across both of the cycle's routing passes.
+    packet_popped_at: Vec<Option<u64>>,
 
     /// Words traversing the intra-tile switch pipeline.
     ///
@@ -161,6 +174,10 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             packet_feeders: vec![None; num_masters],
+            packet_stage_held: vec![None; num_slaves],
+            packet_popped_at: vec![None; num_slaves],
+            packet_cycle: 0,
+            packet_pass: 0,
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -198,6 +215,10 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             packet_feeders: vec![None; num_masters],
+            packet_stage_held: vec![None; num_slaves],
+            packet_popped_at: vec![None; num_slaves],
+            packet_cycle: 0,
+            packet_pass: 0,
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -233,6 +254,10 @@ impl StreamSwitch {
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
             packet_feeders: vec![None; num_masters],
+            packet_stage_held: vec![None; num_slaves],
+            packet_popped_at: vec![None; num_slaves],
+            packet_cycle: 0,
+            packet_pass: 0,
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -395,6 +420,8 @@ impl StreamSwitch {
     pub fn clear_all(&mut self) {
         self.switch_pipeline.clear();
         self.packet_feeders.fill(None);
+        self.packet_stage_held.fill(None);
+        self.packet_popped_at.fill(None);
         self.fifo_out_regs.clear();
         for port in &mut self.masters {
             port.clear();
@@ -510,8 +537,10 @@ impl StreamSwitch {
 
         // The switch FIFO hands a word on one cycle after the route delivered it.
         if advance {
+            self.packet_cycle += 1;
             words_forwarded += self.advance_switch_fifos();
         }
+        self.packet_pass = 2 * self.packet_cycle + u64::from(!advance);
 
         // Phase 1: Advance pipeline -- deliver words that have completed
         // traversal. ONCE per cycle (first pass only); the second pass within a
@@ -855,6 +884,8 @@ impl StreamSwitch {
             if !has_any_slot {
                 continue;
             }
+            // One word a cycle through the slave: a word that crossed in after the first pass took one waits.
+            let may_pop = self.packet_popped_at[slave_idx] != Some(self.packet_cycle);
 
             // ----------------------------------------------------------------
             // Phase A: Header arrival (only when idle).
@@ -862,7 +893,7 @@ impl StreamSwitch {
             // target pending queues, queueing the header for non-drop-header
             // targets. Skipped if a packet is already in progress.
             // ----------------------------------------------------------------
-            if self.active_packets[slave_idx].is_none() && self.slaves[slave_idx].has_data() {
+            if self.active_packets[slave_idx].is_none() && may_pop && self.slaves[slave_idx].has_data() {
                 let header_word = self.slaves[slave_idx].peek().unwrap();
                 let (header, _parity_ok) = PacketHeader::decode(header_word);
                 let pkt_id = header.stream_id;
@@ -930,10 +961,26 @@ impl StreamSwitch {
                             }
                         }
 
+                        // The packet stage holds the header one cycle after it won its arbiter, every
+                        // packet, whatever the switch's quiet state (`crossing_hold`; the source port's
+                        // matching stall at slot 8k + 4 is `TileArray::note_packet_word`).
+                        match self.packet_stage_held[slave_idx] {
+                            Some(at) if at + 2 <= self.packet_pass => {}
+                            Some(_) => continue,
+                            None => {
+                                // It holds the arbiter it won through the held cycle.
+                                self.arbiter_locks[arbiter as usize] = Some(slave_idx);
+                                self.packet_stage_held[slave_idx] = Some(self.packet_pass);
+                                continue;
+                            }
+                        }
+                        self.packet_stage_held[slave_idx] = None;
+
                         // Pop the header from the slave and build per-target
                         // pendings. Header is queued only for masters that
                         // don't drop_header.
                         let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
+                        self.packet_popped_at[slave_idx] = Some(self.packet_cycle);
                         let mut targets = Vec::with_capacity(masters.len());
                         for &m_idx in &masters {
                             if let Some(f) = self.packet_feeders.get_mut(m_idx as usize) {
@@ -1010,11 +1057,12 @@ impl StreamSwitch {
                     let active = self.active_packets[slave_idx].as_ref().unwrap();
                     let all_have_room =
                         active.targets.iter().all(|t| t.pending.len() < MAX_PENDING_PER_TARGET);
-                    let want = !active.tlast_seen && self.slaves[slave_idx].has_data();
+                    let want = !active.tlast_seen && may_pop && self.slaves[slave_idx].has_data();
                     (want && all_have_room, want && !all_have_room)
                 };
                 if should_fill {
                     let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
+                    self.packet_popped_at[slave_idx] = Some(self.packet_cycle);
                     let active = self.active_packets[slave_idx].as_mut().unwrap();
                     for target in &mut active.targets {
                         target.pending.push_back((data, tlast));
@@ -1097,6 +1145,15 @@ impl StreamSwitch {
         }
 
         words_forwarded
+    }
+
+    /// The masters the packet rules route a packet of id `pkt_id` entering at `slave_port` to, or `None` when
+    /// the slave does not route through packet rules (circuit or unrouted). `Some(empty)` when it does and no
+    /// rule matches.
+    pub(crate) fn packet_rule_targets(&self, slave_port: usize, pkt_id: u8) -> Option<Vec<u8>> {
+        let packet_routed = self.slaves.get(slave_port)?.packet_enable
+            && self.slave_slots.get(slave_port)?.iter().any(|s| s.enable);
+        packet_routed.then(|| self.resolve_packet_route(slave_port, pkt_id).map_or_else(Vec::new, |r| r.0))
     }
 
     /// Check if any packet route has data pending.

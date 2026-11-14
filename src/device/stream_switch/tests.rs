@@ -914,7 +914,9 @@ fn test_different_arbiters_no_contention() {
     ss.slaves[24].push_with_tlast(hdr2.encode(), false);
     ss.slaves[24].push_with_tlast(0xBBBB_0001, true);
 
-    // Step 1: both headers forward in parallel (different arbiters)
+    // Step 1: the packet stage holds both headers one cycle (`packet_stage_held`)
+    assert_eq!(ss.step(), 0, "the packet stage holds every header one cycle");
+    // Step 2: both headers forward in parallel (different arbiters)
     let words = ss.step();
     assert_eq!(words, 2, "both slaves should forward in parallel");
 
@@ -959,6 +961,7 @@ fn test_arbiter_lock_released_on_tlast() {
     ss.slaves[23].push_with_tlast(0xAAAA_0001, true);
 
     // Step and drain: process first packet completely
+    ss.step(); // header held at the packet stage
     ss.step(); // header forwarded
     ss.masters[7].pop(); // drain header (make room)
     ss.step(); // data+TLAST forwarded, arbiter released
@@ -972,6 +975,7 @@ fn test_arbiter_lock_released_on_tlast() {
     ss.slaves[24].push_with_tlast(hdr2.encode(), false);
     ss.slaves[24].push_with_tlast(0xBBBB_0001, true);
 
+    assert_eq!(ss.step(), 0, "slave 24's header is held at the packet stage");
     let words = ss.step(); // header from slave 24
     assert_eq!(words, 1, "slave 24 should now use arbiter 0");
 

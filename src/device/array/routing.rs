@@ -1042,11 +1042,12 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         // The source switch's hold (`crossing_hold`): a quiet compute or memtile switch refuses
         // its own MM2S's first offer, and a hold that came back from the stream's route takes the
         // port's slot it is due in. Decided before the borrows below, from what each port offers.
+        // A shim's MM2S port takes the packet stage's holds (`crossing_hold`) but never the quiet switch's.
         let mut held_ports: Vec<(usize, usize)> = Vec::new();
         let mut woken: Vec<usize> = Vec::new();
         let mut offers: Vec<(usize, usize, bool)> = Vec::new();
         for i in 0..self.tiles.len() {
-            if !self.tile_present[i] || !self.holds_first_words(i) {
+            if !self.tile_present[i] {
                 continue;
             }
             let quiet = self.switch_is_quiet(i);
@@ -1054,7 +1055,13 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
             for ch in 0..self.dma_engines[i].mm2s_channel_count() as u8 {
                 let slave = match self.tiles[i].tile_kind {
                     TileKind::Mem => (mem_tile::DMA_SLAVE_START + ch) as usize,
-                    _ => (compute::DMA_SLAVE_START + ch) as usize,
+                    TileKind::Compute => (compute::DMA_SLAVE_START + ch) as usize,
+                    TileKind::ShimNoc | TileKind::ShimPl => {
+                        match self.tiles[i].shim_mux_mm2s_slaves.get(ch as usize).copied().flatten() {
+                            Some(s) => s,
+                            None => continue,
+                        }
+                    }
                 };
                 let offered = self.dma_engines[i].has_stream_out_for_channel(s2mm + ch);
                 let would_send =
@@ -1075,6 +1082,8 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         let dma_engines = &mut self.dma_engines;
         let fatal_errors = &mut self.fatal_errors;
         let present = &self.tile_present;
+        // The first word each port sent this cycle (a port moves one word a cycle).
+        let mut sent_words: Vec<(usize, usize, u32, bool)> = Vec::new();
 
         for i in 0..tiles.len() {
             if !present[i] {
@@ -1157,7 +1166,7 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     continue;
                 };
 
-                if !tile_kind.is_shim() && held_ports.contains(&(i, slave_idx)) {
+                if held_ports.contains(&(i, slave_idx)) {
                     continue;
                 }
 
@@ -1170,6 +1179,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
                     if slave.can_accept() {
                         slave.push_with_tlast(data.data, data.tlast);
                         words_routed += 1;
+                        if !sent_words.iter().any(|w| w.0 == i && w.1 == slave_idx) {
+                            sent_words.push((i, slave_idx, data.data, data.tlast));
+                        }
                         let prefix = if tile_kind.is_shim() { "Shim" } else { "tile" };
                         log::info!(
                             "DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
@@ -1207,6 +1219,9 @@ prod_srcP={} prod_srcC={} consA_dP={} consA_dC={} consA_jP={} consA_jC={}",
         for (i, slave, offered) in offers {
             let sent = self.tiles[i].stream_switch.slaves[slave].cycle_beat;
             self.note_port_cycle(i, slave, sent, offered);
+        }
+        for (i, slave, data, tlast) in sent_words {
+            self.note_packet_word(i, slave, data, tlast);
         }
         self.expire_port_holds();
         words_routed

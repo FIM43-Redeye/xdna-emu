@@ -586,6 +586,37 @@ BD's grant g0 (its STALLED_LOCK falls).
       (`a_quiet_packet_switched_hop_holds_the_port_at_slot_8`). Unmeasured, so not modelled: holds through shim
       switches (a pulse stops there), and what a passing hold does to the switches between (the port's stall is
       what the measurements show).
+    - *Packet stage hold* (**modelled** 2026-11-14). Every switch that routes a stream through packet rules, a
+      shim switch included, holds each packet one cycle at its packet stage, whatever its quiet state; the hold
+      reaches the source port as a one-cycle stall at the packet's slot 8k + 4 (counted from its header) for the
+      switch k hops out, half a hop past the slave-side hold (a hold at pipeline stage L stalls the port at slot
+      2L, four stages a switch). A switch carrying the stream on a circuit route has none. Silicon (memtile
+      packet_flow / fanin / fanout, 9 streams, three samples and both compilers identical; compute packet-gap
+      probe, 46 rows): packet_flow p4 stalls at 4 8 12 (packet at the memtile and at (0,2), (0,2) quiet), p5 4 12
+      (packet at the memtile and at the shim), fanin p5 / fanout p5 / p7 12 (circuit at the memtile, packet at
+      the shim), fanout p4 8 12, fanout p6 12 16 20 (circuit, packet, packet, (0,3) quiet), the probe's stream A 4
+      8 12 and stream B 4; it holds a second packet through the same arbiter one cycle behind the first and at a
+      pass-through switch that keeps the header (fanout p6's (0,2)), so it is neither quiet-state nor
+      header-drop dependent. A stream blocked at a shared arbiter of its own source switch gets 4 words out
+      before it stops (fanin p6, probe B behind A), the emulator's slave port depth. Model (`crossing_hold`,
+      `note_packet_word`): when a word that opens a packet leaves an MM2S port, the port takes one hold for every
+      packet-routed switch on the packet's configured route (`packet_stage_hops`, every branch of a multicast),
+      at the slots above; slots count as for the slave-side hold. In the switch, the packet rules take a header
+      one cycle after it won its arbiter (`StreamSwitch::packet_stage_held`; the arbiter stays with it), so the
+      stream leaves every packet-routed switch one cycle later and contiguous: the receiver takes it without a gap,
+      as silicon's memtile S2MM ports take the compute tile's and the shim's packet streams while their sources
+      stall at 4 and 12 (`the_receiver_takes_a_held_packet_without_a_gap`; a port-only version gave the receivers
+      the sources' gaps). The stage's position is not modelled: the emulator's packet rules otherwise move a word
+      through a switch in the cycle it arrives (1 cycle from the source slave to its master against silicon's 6
+      in the compute probe), so the master of the source switch shows the port's slot-4 gap late and contiguous
+      where silicon shows it in place, and a header behind a shared arbiter starts 4 cycles sooner than on
+      silicon (probe B behind A). The switch's hold acts on every packet, trace and control packets included;
+      the port stall only at MM2S ports: the trace units, the core's stream output and control-packet responses
+      push into their slave ports without a one-word-per-cycle port (a trace packet's first 4 words enter in one
+      cycle), so a port stall there would be absorbed; those sources need a port model first.
+      Unit tests `every_packet_switched_hop_holds_the_port_at_slot_8k_plus_4`,
+      `the_quiet_hold_and_the_packet_stage_holds_interleave_by_slot`,
+      `the_packet_stage_holds_each_packet_from_its_own_header`.
     - *The position-6 grant phase* (one five-BD row, kn4x5 t2: granted at 49 against the emulator's 48, and the
       k5n4 rows of the short-chain set), pinned in `the_position_six_grant_phase_keeps_the_emulators_pinned_cycle`.
     - *Scope.* The queue is modelled on the compute MM2S only; memtile and shim MM2S chains of short BDs are
