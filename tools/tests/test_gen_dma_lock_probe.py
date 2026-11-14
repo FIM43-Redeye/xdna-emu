@@ -2179,3 +2179,46 @@ def test_cli_chain_build_takes_the_waker():
     ns = g.build_parser().parse_args(["chain-build", "d", "--head", "24", "--mids", "1", "1", "--receiver", "north2",
                                       "--waker", "3q"])
     assert ns.waker == "3q" and g.chain_selection(ns)[0].waker == "3q"
+
+
+# -- cw: what keeps a switch from holding a crossing word (activity timed by the source tile's core) ----------
+
+def test_cw_plan_has_the_trace_dma_and_port_arms():
+    names = [c.name for c in g.cw_plan()]
+    assert names == [f"cwa3t{t:03d}" for t in g.CW_TS] + ["cwa4t064"] + [f"cwct{t:03d}" for t in g.CW_TS] + ["cwnt064"]
+    assert g.CW_TS == (32, 64, 96, 160)
+
+
+def test_cw_core_releases_the_actor_then_start_d_nops_later():
+    for arm in ("a3", "a4", "c", "n"):
+        c = g.CwCase(arm, 64)
+        body = bundles_of(g.cw_core_asm(c))
+        go = body.index(f"acq #{g.OWN + g.CW_LOCK_GO}, r3")
+        actor = body.index(f"rel #{g.cw_actor_lock_ref(c)}, r2")
+        start = body.index(f"rel #{g.OWN + g.SYNC_LOCK_START}, r2")
+        assert go < actor < start and start - actor - 1 == g.cw_delay_nops(c)
+        assert all(b == "nop" for b in body[actor + 1:start])
+        assert body.index(f"acq #{g.OWN + g.SYNC_LOCK_SYNC}, r3") > start            # then the chain's own program
+    assert g.cw_delay_nops(g.CwCase("c", 96)) - g.cw_delay_nops(g.CwCase("c", 64)) == 32
+
+
+def test_cw_design_starts_the_head_from_the_core_and_places_each_actor():
+    for arm in ("a3", "a4", "c", "n"):
+        t = g.cw_design_mlir(g.CwCase(arm, 64))
+        assert "aiex.set_lock(%lStart" not in t and "aiex.set_lock(%lGo2, %c_one)" in t
+        assert "aie.flow(%t02, DMA : 0, %t03, DMA : 0)" in t                       # the measured route: one hop
+        assert "aiex.set_lock(%lW3" not in t and "}}" not in t
+    a3, a4 = g.cw_design_mlir(g.CwCase("a3", 64)), g.cw_design_mlir(g.CwCase("a4", 64))
+    assert "aie.core(%t03)" in a3 and "aie.core(%t04)" not in a3 and 'link_with = "core3.o"' in a3
+    assert "aie.core(%t03)" in a4 and "aie.core(%t04)" in a4 and 'link_with = "core4.o"' in a4
+    c = g.cw_design_mlir(g.CwCase("c", 64))
+    assert "aie.flow(%t03, DMA : 1, %t03, DMA : 1)" in c and "aie.core(%t03)" not in c
+    n = g.cw_design_mlir(g.CwCase("n", 64))
+    assert "aie.flow(%t02, DMA : 1, %t03, DMA : 1)" in n and "aie.dma_start(MM2S, 1, ^nk0" in n
+
+
+def test_cw_burst_cores_wait_for_their_go_and_emit_events():
+    b3 = bundles_of(g.cw_burst_asm(relay=False))
+    assert b3[b3.index(f"acq #{g.OWN + g.CW_LOCK_ACTOR}, r3") + 1:].count("event #0") == g.CW_BURST_EVENTS
+    relay = bundles_of(g.cw_burst_asm(relay=True))
+    assert f"rel #{g.NORTH + g.CW_LOCK_ACTOR}, r2" in relay and "event #0" not in relay

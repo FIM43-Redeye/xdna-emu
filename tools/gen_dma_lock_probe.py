@@ -1512,6 +1512,11 @@ def chain_validate(c: ChainCase) -> None:
 def chain_core_asm(c: ChainCase) -> str:
     """Block on SYNC, `event #0`, [d1 nops, release B], `event #1`, d2 nops, release A (core releaser only), the
     tail, then `fill` spaced releases of A and the tail again (trace packet fillers, only with `fill`)."""
+    return lp.frame(chain_core_body(c))
+
+
+def chain_core_body(c: ChainCase) -> list[str]:
+    """chain_core_asm's bundles, without the frame."""
     chain_validate(c)
     n = lp.nops
     fill = []
@@ -1527,7 +1532,7 @@ def chain_core_asm(c: ChainCase) -> str:
             f"  acq #{OWN + SYNC_LOCK_SYNC}, r3", *n(LOCK_SETTLE_BUNDLES),
             "  event #0", *rel_b, "  event #1", *rel_a, *n(8),
             *lp.delay_loop(FETCH_TAIL_ITERS, ".Ltail"), *fill]
-    return lp.frame(body)
+    return body
 
 
 def chain_design_mlir(c: ChainCase) -> str:
@@ -1828,6 +1833,262 @@ def add_chain_parsers(sub) -> None:
 
 
 CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table}
+
+
+# -- crossing-wake probe (cw-*): what activity keeps a switch from holding a crossing word ---------------------
+#
+# The chain design with receiver "north" (one hop: the head crosses tile (0,3)'s stream switch into its S2MM 0),
+# head CW_HEAD words, the chain's six one-word mids and fill. Instead of the runtime sequence setting START, the
+# sequence sets a go lock of (0,2); (0,2)'s core acquires it, releases the lock of an actor, waits cw_delay_nops
+# nops and releases START itself, then runs the chain's program. The actor is busy for a fixed span from its lock,
+# so the delay places the end of its activity T cycles before the head reaches (0,3):
+#   a3: a core program on (0,3) runs CW_BURST_EVENTS pairs of `event #0` / `event #1`: its core trace packets cross
+#       (0,3) (trace slave -> south master);
+#   a4: (0,3)'s core relays the lock to a core on (0,4) running the same burst: its packets cross (0,3) from the
+#       north (north slave -> south master);
+#   c:  a loopback of CW_LOOP_WORDS words on (0,3) (MM2S 1 -> S2MM 1: DMA slave -> DMA master);
+#   n:  a second northbound stream, (0,2) MM2S 1 -> (0,3) S2MM 1, CW_LOOP_WORDS words (south slave -> DMA master,
+#       the head's direction and switch side on another port).
+# The memory modules also trace DMA_S2MM_1_FINISHED_BD (the eighth slot), which dates the end of arms c and n on
+# (0,3). Every arm's activity ends long before the runtime sequence (one pad block) does.
+
+CW_HEAD = 32
+CW_TS = (32, 64, 96, 160)
+CW_ARMS = ("a3", "a4", "c", "n")
+CW_LOCK_GO, CW_LOCK_NLOOP, CW_LOCK_NLOOP_DONE = 14, 15, 13   # locks of (0,2): the sequence's go; arm n's stream, its done
+CW_LOCK_ACTOR, CW_LOCK_LOOP_DONE = 10, 11  # locks of (0,3) (and (0,4) for a4): the actor's go; arm c's done
+CW_BURST_EVENTS = 64                       # pairs of core events: one frame per cycle for 128 cycles
+CW_LOOP_WORDS = 128
+CW_NSRC_ADDR = 0xA000                      # arm n's source on (0,2): logical bank 5, met by nothing else
+CW_NDST_ADDR = 0x2000                      # arm n's destination on (0,3): bank 1, not the head's `dst` (bank 4)
+CW_MEM_ADDS = ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION", "DMA_S2MM_1_FINISHED_BD"]
+# Cycles from the core's release of the actor lock to the end of the actor's activity, less the cycles from its
+# release of START to the head's grant g0: D = T + CW_SPAN[arm] puts the end T cycles before g0. Emulator
+# calibration at D = 64: the burst's last core trace packet completed at g0 + 4 (a3) and g0 + 1 (a4, on (0,4)),
+# (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n).
+CW_SPAN = {"a3": 68, "a4": 65, "c": 137, "n": 142}
+
+
+@dataclass(frozen=True)
+class CwCase:
+    arm: str
+    t: int                         # cycles from the end of the actor's activity to the head's arrival at (0,3)
+
+    @property
+    def name(self) -> str:
+        return f"cw{self.arm}t{self.t:03d}"
+
+    def chain(self) -> ChainCase:
+        return ChainCase(tuple(ChainBd(1) for _ in range(6)), CW_HEAD, FETCH_WORDS, fill=CHAIN_MAX_FILL,
+                         receiver="north")
+
+
+def cw_plan() -> list:
+    return ([CwCase("a3", t) for t in CW_TS] + [CwCase("a4", 64)] + [CwCase("c", t) for t in CW_TS]
+            + [CwCase("n", 64)])
+
+
+def cw_validate(c: CwCase) -> None:
+    if c.arm not in CW_ARMS or cw_delay_nops(c) < 0:
+        raise ValueError(f"arm in {CW_ARMS}; T + CW_SPAN[arm] >= 0")
+
+
+def cw_delay_nops(c: CwCase) -> int:
+    return c.t + CW_SPAN[c.arm]
+
+
+def cw_actor_lock_ref(c: CwCase) -> int:
+    return OWN + CW_LOCK_NLOOP if c.arm == "n" else NORTH + CW_LOCK_ACTOR
+
+
+def cw_core_asm(c: CwCase) -> str:
+    """Acquire the go lock, release the actor's lock, cw_delay_nops nops, release START, then the chain's program."""
+    cw_validate(c)
+    body = chain_core_body(c.chain())
+    at = body.index(f"  acq #{OWN + SYNC_LOCK_SYNC}, r3")
+    pre = [f"  acq #{OWN + CW_LOCK_GO}, r3", f"  rel #{cw_actor_lock_ref(c)}, r2", *lp.nops(cw_delay_nops(c)),
+           f"  rel #{OWN + SYNC_LOCK_START}, r2"]
+    return lp.frame(body[:at] + pre + body[at:])
+
+
+def cw_burst_asm(relay: bool) -> str:
+    """A (0,3) or (0,4) core: acquire its actor lock, then the event burst, or (relay) release the actor lock of the
+    tile above."""
+    act = [f"  rel #{NORTH + CW_LOCK_ACTOR}, r2"] if relay else ["  event #0", "  event #1"] * CW_BURST_EVENTS
+    return lp.frame(["  mov r2, #1", "  mov r3, #-1", *lp.nops(2), f"  acq #{OWN + CW_LOCK_ACTOR}, r3", *act,
+                     *lp.nops(8)])
+
+
+def _cw_insert_blocks(text: str, mem_head: str, start_from: str, start_to: str, blocks: str) -> str:
+    """In the aie.mem region opening with `mem_head`: chain its first dma_start's end to `start_to` and add
+    `blocks` before the region's ^end block."""
+    i = text.index(mem_head)
+    j = text.index(start_from, i)
+    text = text[:j] + start_to + text[j + len(start_from):]
+    k = text.index("    ^end:\n", i)
+    return text[:k] + blocks + text[k:]
+
+
+def cw_design_mlir(c: CwCase) -> str:
+    cw_validate(c)
+    t = chain_design_mlir(c.chain())
+    seq = "      aiex.set_lock(%lStart, %c_one)\n"
+    assert t.count(seq) == 1
+    t = t.replace(seq, "      aiex.set_lock(%lGo2, %c_one)\n")
+    end_lock = '{init = 0 : i32, sym_name = "lEnd"}\n'
+    locks = f'    %lGo2 = aie.lock(%t02, {CW_LOCK_GO}) {{init = 0 : i32, sym_name = "lGo2"}}\n'
+    flow = "    aie.flow(%t02, DMA : 0, %t03, DMA : 0)\n"
+    lw = CW_LOOP_WORDS
+    extra = ""
+    if c.arm in ("a3", "a4"):
+        extra += f'    %lAct3 = aie.lock(%t03, {CW_LOCK_ACTOR}) {{init = 0 : i32, sym_name = "lAct3"}}\n'
+        extra += ('    func.func private @k_core3() attributes {link_with = "core3.o"}\n'
+                  "    aie.core(%t03) {\n      func.call @k_core3() : () -> ()\n      aie.end\n    }\n")
+        if c.arm == "a4":
+            extra = ("    %t04 = aie.tile(0, 4)\n" + extra
+                     + f'    %lAct4 = aie.lock(%t04, {CW_LOCK_ACTOR}) {{init = 0 : i32, sym_name = "lAct4"}}\n'
+                     + '    func.func private @k_core4() attributes {link_with = "core4.o"}\n'
+                     + "    aie.core(%t04) {\n      func.call @k_core4() : () -> ()\n      aie.end\n    }\n")
+    elif c.arm == "c":
+        extra += (f"    %lsrc3 = aie.buffer(%t03) {{address = {CHAIN_WAKER_SRC} : i32, sym_name = \"lsrc3\"}} : memref<{lw}xi32>\n"
+                  f"    %ldst3 = aie.buffer(%t03) {{address = {CHAIN_WAKER_DST} : i32, sym_name = \"ldst3\"}} : memref<{lw}xi32>\n"
+                  f'    %lAct3 = aie.lock(%t03, {CW_LOCK_ACTOR}) {{init = 0 : i32, sym_name = "lAct3"}}\n'
+                  f'    %lLd3 = aie.lock(%t03, {CW_LOCK_LOOP_DONE}) {{init = 0 : i32, sym_name = "lLd3"}}\n'
+                  "    aie.flow(%t03, DMA : 1, %t03, DMA : 1)\n")
+        blocks = ("    ^lk_start:\n      %lk1 = aie.dma_start(MM2S, 1, ^lk0, ^lr_start)\n    ^lk0:\n"
+                  "      %cl = arith.constant 1 : i32\n      aie.use_lock(%lAct3, AcquireGreaterEqual, %cl)\n"
+                  f"      aie.dma_bd(%lsrc3 : memref<{lw}xi32>)\n      aie.use_lock(%lLd3, Release, %cl)\n"
+                  "      aie.next_bd ^end\n"
+                  "    ^lr_start:\n      %lk2 = aie.dma_start(S2MM, 1, ^lr0, ^end)\n    ^lr0:\n"
+                  f"      aie.dma_bd(%ldst3 : memref<{lw}xi32>)\n      aie.next_bd ^end\n")
+        t = _cw_insert_blocks(t, "    %mem03 = aie.mem(%t03) {\n", "^recv, ^end)", "^recv, ^lk_start)", blocks)
+    else:
+        locks += (f'    %lNk = aie.lock(%t02, {CW_LOCK_NLOOP}) {{init = 0 : i32, sym_name = "lNk"}}\n'
+                  f'    %lNkd = aie.lock(%t02, {CW_LOCK_NLOOP_DONE}) {{init = 0 : i32, sym_name = "lNkd"}}\n')
+        extra += (f"    %nsrc = aie.buffer(%t02) {{address = {CW_NSRC_ADDR} : i32, sym_name = \"nsrc\"}} : memref<{lw}xi32>\n"
+                  f"    %ndst3 = aie.buffer(%t03) {{address = {CW_NDST_ADDR} : i32, sym_name = \"ndst3\"}} : memref<{lw}xi32>\n"
+                  "    aie.flow(%t02, DMA : 1, %t03, DMA : 1)\n")
+        src = ("    ^nk_start:\n      %nk1 = aie.dma_start(MM2S, 1, ^nk0, ^end)\n    ^nk0:\n"
+               "      aie.use_lock(%lNk, AcquireGreaterEqual, %c1)\n"
+               f"      aie.dma_bd(%nsrc : memref<{lw}xi32>)\n      aie.use_lock(%lNkd, Release, %c1)\n"
+               "      aie.next_bd ^end\n")
+        t = _cw_insert_blocks(t, "    %mem = aie.mem(%t02) {\n", "^head, ^end)", "^head, ^nk_start)", src)
+        dst = ("    ^nr_start:\n      %nr1 = aie.dma_start(S2MM, 1, ^nr0, ^end)\n    ^nr0:\n"
+               f"      aie.dma_bd(%ndst3 : memref<{lw}xi32>)\n      aie.next_bd ^end\n")
+        t = _cw_insert_blocks(t, "    %mem03 = aie.mem(%t03) {\n", "^recv, ^end)", "^recv, ^nr_start)", dst)
+    assert t.count(end_lock) == 1 and t.count(flow) == 1
+    t = t.replace(end_lock, end_lock + locks)
+    return t.replace(flow, extra + flow)
+
+
+def cw_selection(args) -> list:
+    plan = cw_plan()
+    names = set(getattr(args, "names", None) or [])
+    unknown = names - {c.name for c in plan}
+    if unknown:
+        raise ValueError(f"not in the plan: {sorted(unknown)}")
+    return [c for c in plan if not names or c.name in names]
+
+
+def cmd_cw_build(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in cw_selection(args):
+        d = out / c.name
+        d.mkdir(parents=True, exist_ok=True)
+        lp.assemble(cw_core_asm(c), d / "core.o", "k_core")
+        if c.arm == "a3":
+            lp.assemble(cw_burst_asm(relay=False), d / "core3.o", "k_core3")
+        elif c.arm == "a4":
+            lp.assemble(cw_burst_asm(relay=True), d / "core3.o", "k_core3")
+            lp.assemble(cw_burst_asm(relay=False), d / "core4.o", "k_core4")
+        (d / "base.mlir").write_text(cw_design_mlir(c))
+        adds = edit_memmod_events(CHAIN_MEM_EVENTS + CW_MEM_ADDS, getattr(args, "memmod_event_swap", None))
+        lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
+               "--out", "aie.mlir", "--trace-mode", "event_time", "--memmod-sweep-events", ",".join(adds),
+               "--core-grounding", FETCH_CORE_GROUNDING, "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS),
+               "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
+               "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
+              cwd=d, log=d / "inject.log")
+        lp.sh(["aiecc", "--xchesscc=false", "--xbridge=false", "--get-xclbin", "--xclbin-name=aie.xclbin",
+               "--get-npu-insts", "--npu-insts-name=insts.bin", "--get-input-with-addresses", "aie.mlir"],
+              cwd=d, log=d / "aiecc.log")
+        (d / "case.json").write_text(json.dumps({"case": c.name, "arm": c.arm, "t": c.t,
+                                                 "delay_nops": cw_delay_nops(c), **c.chain().design()}) + "\n")
+        print("built", c.name)
+    return 0
+
+
+def cmd_cw_run(args) -> int:
+    out = Path(args.out_dir).resolve()
+    for c in cw_selection(args):
+        if not (out / c.name).is_dir():
+            continue
+        if not lp.run_case(out, c.name, args.tag, args.backend, output=False):
+            print(f"{c.name}: run did not complete; stop")
+            return 1
+    return 0
+
+
+def cw_row(run_dir: Path) -> dict:
+    """chain_row, plus the activity dating on (0,3) / (0,4) relative to g0 ((0,2)'s memory-module timer; the
+    tiles' timers start together): the cycles at which each trace unit of rows 3 and 4 completed a packet, and
+    (0,3)'s S2MM 1 FINISHED_BD (arms c and n)."""
+    from gen_trace_wake_probe import split_packets, completing_frames
+    ev = list(load_level_events(run_dir))
+    r = chain_row(ev)
+    if r.get("g0") is None:
+        return r
+    g0 = r["g0"]
+    raw = (run_dir / "trace_raw.bin").read_bytes()
+    pk = split_packets(list(struct.unpack(f"<{len(raw) // 4}I", raw)))
+    r["packets"] = {(row, pt): sorted(f - g0 for f, _ in completing_frames([p for p in pk if p["row"] == row], pt).values())
+                    for row in (3, 4) for pt in (PT_CORE, PT_MEM)}
+    r["s2mm1_fin_north"] = sorted({e.ts - g0 for e in ev if e.row == 3 and e.pkt_type == PT_MEM
+                                   and e.name == "DMA_S2MM_1_FINISHED_BD"})
+    return r
+
+
+def format_cw_row(name: str, run: str, r: dict, window: int = 300) -> str:
+    if r.get("g0") is None:
+        return f"{name} {run} no head wait (no STALLED_LOCK run)"
+    near = " ".join(f"r{row}{'cm'[pt]}[" + " ".join(f"{x:+d}" for x in v if -window <= x <= 20) + "]"
+                    for (row, pt), v in sorted(r["packets"].items()))
+    return (f"{name} {run} fins [" + " ".join(f"{x:+d}" for x in r["fins"]) + "] s2mm ["
+            + " ".join(f"{x:+d}" for x in r["s2mm_fins"]) + "] s2mm1-north ["
+            + " ".join(f"{x:+d}" for x in r["s2mm1_fin_north"]) + f"] packets {near}")
+
+
+def cmd_cw_table(args) -> int:
+    out = Path(args.out_dir).resolve()
+    print(f"case       run    (cycles after g0; packets: completion cycles of rows 3/4 core (c) / memory (m) "
+          f"units within [g0-300, g0+20])")
+    for c in cw_selection(args):
+        for run in args.runs:
+            d = out / c.name / run
+            if not (d / "trace_raw.bin").exists() or not (d / "events.json").exists():
+                if d.is_dir():
+                    print(f"{c.name} {run} incomplete run")
+                continue
+            print(format_cw_row(c.name, run, cw_row(d)))
+    return 0
+
+
+def add_cw_parsers(sub) -> None:
+    """cw-build / cw-run / cw-table: the crossing-wake family (see cw_design_mlir)."""
+    b = sub.add_parser("cw-build", help="crossing-wake probe: build the plan's cases (or --names) into OUT_DIR")
+    r = sub.add_parser("cw-run", help="crossing-wake probe: run the built cases to TAG.BACKEND/")
+    t = sub.add_parser("cw-table", help="crossing-wake probe: chain stamps and rows 3/4 activity relative to g0")
+    for sp in (b, r, t):
+        sp.add_argument("out_dir")
+        sp.add_argument("--names", nargs="*", default=[], help="only these case names")
+    b.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
+                   help=MEMMOD_SWAP_HELP)
+    r.add_argument("tag")
+    r.add_argument("--backend", choices=("hw", "emu"), required=True)
+    t.add_argument("runs", nargs="+")
+
+
+CW_COMMANDS = {"cw-build": cmd_cw_build, "cw-run": cmd_cw_run, "cw-table": cmd_cw_table}
 
 
 # -- bank arbitration probe (arb-*): who wins a core-vs-DMA bank conflict --------------------------
@@ -4117,6 +4378,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--pre2", type=int, default=0, help="--sync: words of a second lock-free pre BD (cases ltDD...)")
         sp.add_argument("--free-only", action="store_true", help="--sync: only lsfree")
     add_chain_parsers(sub)
+    add_cw_parsers(sub)
     ab = sub.add_parser("arb-build", help="bank arbitration probe: build the plan's cases (or --names)")
     ab.add_argument("out_dir")
     ar = sub.add_parser("arb-run", help="bank arbitration probe: run the built cases to TAG.BACKEND/")
@@ -4199,6 +4461,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.cmd in CHAIN_COMMANDS:
         return CHAIN_COMMANDS[args.cmd](args)
+    if args.cmd in CW_COMMANDS:
+        return CW_COMMANDS[args.cmd](args)
     if args.cmd.startswith("sl-"):
         return {"sl-build": cmd_sl_build, "sl-run": cmd_sl_run, "sl-table": cmd_sl_table}[args.cmd](args)
     if args.cmd.startswith("sw-"):
