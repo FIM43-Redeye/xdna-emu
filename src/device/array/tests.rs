@@ -1766,6 +1766,104 @@ mod crossing_hold {
         assert_eq!(port_stalls(&north_stream(&[17, 8], 4, &[2, 4])), vec![16, 18]);
     }
 
+    /// `north_stream` with packet BDs (id 1, one header each) and the switches of the rows in `packet` routing
+    /// the stream through packet rules (slot 0: id 1 to arbiter 0 / msel 0; the receiver's DMA master drops the
+    /// header), every other switch through a circuit route.
+    fn north_packet_stream(bds: &[u32], receiver: u8, quiet: &[u8], packet: &[u8]) -> Vec<u32> {
+        let mut array = TileArray::npu1();
+        let mut host = HostMemory::new();
+        array.clock_mut().ungate_all();
+        for row in 2..=receiver {
+            array.clock_mut().set_adaptive_abort_period(
+                COL,
+                row,
+                if quiet.contains(&row) { GATED } else { AWAKE },
+            );
+            let switch = &mut array.tile_mut(COL, row).stream_switch;
+            let from = if row == 2 {
+                compute::DMA_SLAVE_START
+            } else {
+                compute::SOUTH_SLAVE_START
+            } as usize;
+            let to = if row == receiver {
+                compute::DMA_MASTER_START
+            } else {
+                compute::NORTH_MASTER_START
+            } as usize;
+            if packet.contains(&row) {
+                switch.slaves[from].packet_enable = true;
+                switch.configure_slave_slot(from, 0, 1 << 24 | 0x1f << 16 | 1 << 8);
+                let drop = if row == receiver { 1 << 7 } else { 0 };
+                switch.configure_master_packet(to, 1 << 31 | 1 << 30 | drop | 1 << 3);
+            } else {
+                switch.configure_local_route(from, to);
+            }
+        }
+        let rx = array.tile_index(COL, receiver);
+        array.dma_engines[rx]
+            .configure_bd(0, BdConfig::simple_1d(0x4000, 4096))
+            .unwrap();
+        array.dma_engines[rx].start_channel(0, 0).unwrap();
+        let src = array.tile_index(COL, 2);
+        for (i, &words) in bds.iter().enumerate() {
+            let mut bd = BdConfig::simple_1d(0x400 + 0x200 * i as u64, words * 4);
+            if i == 0 {
+                bd = bd.with_acquire(GO as u8, 1);
+            }
+            if i + 1 < bds.len() {
+                bd = bd.with_next(2 + i as u8);
+            }
+            bd.enable_packet = true;
+            bd.packet_id = 1;
+            array.dma_engines[src].configure_bd(1 + i as u8, bd).unwrap();
+        }
+        array.dma_engines[src].start_channel(2, 1).unwrap();
+        for _ in 0..40 {
+            array.step_data_movement(&mut host);
+        }
+        for row in 2..=receiver {
+            assert_eq!(
+                array.clock().is_adaptive_ss_engaged(COL, row),
+                quiet.contains(&row),
+                "({COL},{row}) at GO"
+            );
+        }
+        array.tiles[src].locks[GO].value = 1;
+        let total: u32 = bds.iter().map(|w| w + 1).sum();
+        let mut beats = Vec::new();
+        for step in 0..400 {
+            array.step_data_movement(&mut host);
+            if array.tiles[src].stream_switch.slaves[compute::DMA_SLAVE_START as usize].cycle_beat {
+                beats.push(step);
+            }
+            if beats.len() == total as usize {
+                return beats;
+            }
+        }
+        panic!("the stream did not leave the port: {} of {total} words", beats.len());
+    }
+
+    /// The stream's slots (port cycles from the first word, less the stalls before) at which the port stalled.
+    fn stall_slots(beats: &[u32]) -> Vec<u32> {
+        port_stalls(beats).iter().enumerate().map(|(i, c)| c - i as u32).collect()
+    }
+
+    /// (S) on a packet-routed hop: a quiet switch one hop out holds the packet stream's first word as it holds a
+    /// circuit stream's, and the hold reaches the port at slot 8 (silicon: packet_flow / fanin / fanout p4 into a
+    /// quiet (0,2), the compute probe's stream A into a quiet (0,3)).
+    #[test]
+    fn a_quiet_packet_switched_hop_holds_the_port_at_slot_8() {
+        for source_packet in [false, true] {
+            let pkt: &[u8] = if source_packet { &[2, 3] } else { &[3] };
+            let awake = stall_slots(&north_packet_stream(&[16], 3, &[], pkt));
+            let quiet = stall_slots(&north_packet_stream(&[16], 3, &[3], pkt));
+            let mut want = awake.clone();
+            want.push(8);
+            want.sort();
+            assert_eq!(quiet, want, "source switch packet-routed = {source_packet}");
+        }
+    }
+
     /// A compute tile whose MM2S 0 fills its own switch toward its S2MM 0, parked on a lock; the S2MM is released
     /// after a long park. Returns the step after the release at which the switch's DMA 0 master first passes a
     /// word to the S2MM.

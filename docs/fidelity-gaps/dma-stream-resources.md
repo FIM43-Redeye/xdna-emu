@@ -578,9 +578,14 @@ BD's grant g0 (its STALLED_LOCK falls).
       three: silicon's core release one cycle off the emulator's), crossing-wake v1 arm b 6 / 24 -> 24 / 24, v2
       10 / 30 -> 29 / 30, v3 13 / 33 -> 32 / 33 (the two misses: a silicon trace packet two cycles before the
       head woke the source switch; the emulator has none there), v3's split heads 0 / 12 -> 12 / 12, slack 6 / 48
-      -> 48 / 48; own rows, banked chain rows, the absorb rows and the in-scope sets unchanged. Unmeasured, so
-      not modelled: holds on packet-switched hops and through shim switches (a pulse stops there), and what a
-      passing hold does to the switches between (the port's stall is what the measurements show).
+      -> 48 / 48; own rows, banked chain rows, the absorb rows and the in-scope sets unchanged. A packet-routed
+      hop holds and passes the pulse on like a circuit one (2026-11-14): the pulse follows the packet rules back to
+      the slave whose packet they last routed to the master (`StreamSwitch::packet_feeders`). Silicon: the memtile
+      packet_flow / fanin / fanout p4 streams into a quiet (0,2) and fanout p6 into a quiet (0,3) stall at slot 8 and
+      16, the compute probe's stream A into a quiet (0,3) at slot 8; the pulse had ended at any packet-routed master
+      (`a_quiet_packet_switched_hop_holds_the_port_at_slot_8`). Unmeasured, so not modelled: holds through shim
+      switches (a pulse stops there), and what a passing hold does to the switches between (the port's stall is
+      what the measurements show).
     - *The position-6 grant phase* (one five-BD row, kn4x5 t2: granted at 49 against the emulator's 48, and the
       k5n4 rows of the short-chain set), pinned in `the_position_six_grant_phase_keeps_the_emulators_pinned_cycle`.
     - *Scope.* The queue is modelled on the compute MM2S only; memtile and shim MM2S chains of short BDs are

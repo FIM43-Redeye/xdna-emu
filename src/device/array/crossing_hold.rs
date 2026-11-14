@@ -26,8 +26,11 @@
 //! finishes show). Sustained backpressure is untouched: it is the slave and master FIFOs'
 //! occupancy, 8 words a hop.
 //!
-//! Shim switches neither hold (the measured exemptions) nor pass a pulse on; a packet-switched
-//! hop (no circuit route to follow) ends the pulse. Both unmeasured for DMA streams.
+//! A packet-routed hop holds and passes the pulse on like a circuit one: the pulse follows the
+//! packet rules back to the slave whose packet they last routed to the master (silicon: memtile
+//! packet_flow / fanin / fanout and the compute packet-gap probe, a quiet switch one or two hops
+//! out stalls the packet stream at slot 8k). Shim switches neither hold (the measured exemptions)
+//! nor pass a pulse on.
 
 use super::TileArray;
 use crate::device::stream_switch::PortType;
@@ -111,13 +114,16 @@ impl TileArray {
                 continue;
             }
             let switch = &self.tiles[p.tile].stream_switch;
+            // The slave that fed the master: by its circuit route, or, on a packet-routed hop, the slave whose
+            // packet the packet rules last routed to it.
             let Some(slave) = switch
                 .local_routes
                 .iter()
                 .find(|r| r.enabled && r.master_idx as usize == p.master)
                 .map(|r| r.slave_idx as usize)
+                .or_else(|| switch.packet_feeders.get(p.master).copied().flatten().map(usize::from))
             else {
-                continue; // packet-switched or unrouted: the pulse ends here
+                continue; // unrouted: the pulse ends here
             };
             match switch.slaves[slave].port_type {
                 PortType::Dma(_) => self.port_holds.push(PortHold {

@@ -95,6 +95,9 @@ pub struct StreamSwitch {
     /// queue. Values are slave indices; the arbiter grants to the first
     /// eligible slave starting from this index (wrapping).
     arbiter_priority: [usize; 8],
+    /// Per master: the slave whose packet the packet rules last routed to it. A hold travelling back
+    /// toward a stream's source (`TileArray`'s `crossing_hold`) follows it over a packet-routed hop.
+    pub(crate) packet_feeders: Vec<Option<u8>>,
 
     /// Words traversing the intra-tile switch pipeline.
     ///
@@ -157,6 +160,7 @@ impl StreamSwitch {
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
+            packet_feeders: vec![None; num_masters],
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -193,6 +197,7 @@ impl StreamSwitch {
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
+            packet_feeders: vec![None; num_masters],
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -227,6 +232,7 @@ impl StreamSwitch {
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
             arbiter_priority: [0; 8],
+            packet_feeders: vec![None; num_masters],
             switch_pipeline: Vec::new(),
             next_pipeline_group: 0,
             fifo_out_regs: Vec::new(),
@@ -388,6 +394,7 @@ impl StreamSwitch {
     /// Clear all FIFOs and the words crossing the switch (which hold their slots).
     pub fn clear_all(&mut self) {
         self.switch_pipeline.clear();
+        self.packet_feeders.fill(None);
         self.fifo_out_regs.clear();
         for port in &mut self.masters {
             port.clear();
@@ -929,6 +936,9 @@ impl StreamSwitch {
                         let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
                         let mut targets = Vec::with_capacity(masters.len());
                         for &m_idx in &masters {
+                            if let Some(f) = self.packet_feeders.get_mut(m_idx as usize) {
+                                *f = Some(slave_idx as u8);
+                            }
                             let mut t = TargetState::new(m_idx);
                             let m = m_idx as usize;
                             let drop = m < self.master_packet_config.len()
