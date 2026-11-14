@@ -47,6 +47,15 @@ Probe 9k additions (plan_9k). Same W stream and marks, with these variables:
   lead_P<kk>           no marks: a pad block write (LeadPad) of 4 + 4 kk words ahead of the trace start, then a token-less 8-word task: the lead from
                        the trace start to the first push at 16 stream positions 16 bytes apart
 
+Probe 9l additions (plan_9l). Part t, close tokens: after a preamble that waits on both paths, mark A, the pushes of the measured tasks, 64 plain
+writes (Pace) and mark B. The tasks run on the two loopbacks and carry their tokens on the sinks; the separation between two finishes is set by the
+transfer length of the second path (the pushes and the writes after them are the same in every case, so the interval holds the same operations
+and only the tokens' arrival differs). tz: no token; t1a / t1b: one; t2_d<D>: two, nominally D cycles apart; t3_g<G>: three, the third a queued second
+task on the first sink. Part q, queued tasks: n = 1 or 3 tasks pushed onto a channel (q m: MM2S, q s: S2MM) that is running a longer head task,
+k = 0 / 8 / 32 writes apart (q?_n?_k?); q?p_n?: the head's buffer descriptor first acquires a lock that a task on the other path releases (pushed
+after a pause, once the queued pushes are done). The other channel of the loopback has the matching tasks pushed first, so every task moves a word
+count the design supplies and nothing waits on anything else.
+
 Closing tail (every case). After the measured section the sequence runs TAIL_ROUNDS rounds of one short
 loopback task per channel (M0, S0, M1, S1, each with a token) followed by a sync on all four channels, then the
 trailing writes. Every channel's last task is thus awaited by the sequence itself, so no data task can still be
@@ -83,6 +92,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
+LOCK_PARK, LOCK_RELEASE = "park", "release"
+# Shim locks of the lock-gated cases (tile (0, 0)): park (starts at 0), done (the parked descriptor's release target, nothing waits on it),
+# gate (starts at 1: the releasing descriptor's acquire, which is always available). A descriptor with a lock holds one acquire and one release.
+PARK_LOCKS = (("park", 0, 0), ("done", 1, 0), ("gate", 2, 1))        # (name, lock id, initial value)
 PUSH_WORDS = 8
 MARKER_WORDS = 8
 LATE_FILL = 64
@@ -147,11 +160,19 @@ class Push:
     token: bool = True
     tail: bool = False               # a closing-tail task, not part of the measured section
     dummy: bool = False              # a leading throwaway task: not one of the measured pairs
+    lock: str = ""                   # LOCK_PARK: the task's buffer descriptor first acquires the park lock (it waits there until a LOCK_RELEASE task
+                                     # releases it); LOCK_RELEASE: the descriptor acquires the always-available gate lock and releases the park lock
 
 
 @dataclass(frozen=True)
 class Fill:
     count: int
+
+
+@dataclass(frozen=True)
+class Pace:
+    count: int                       # `count` scratch-register writes (the same ops as Fill) that may sit next to a mark: a stretch of
+                                     # sequence time during which the controller executes operations and waits for nothing
 
 
 @dataclass(frozen=True)
@@ -195,6 +216,7 @@ class LeadPad:
 
 LEAD_STEPS = (LeadFill, LeadPad)
 WRITE_STEPS = (BlockWrite, SingleWrites, MaskWrite)
+MARK_NEIGHBOURS = (Sync, Mark, Pace, Push) + WRITE_STEPS      # what a mark may sit directly next to (a plain Fill may not)
 
 
 @dataclass(frozen=True)
@@ -507,6 +529,108 @@ def plan_9k() -> dict[str, Case]:
     return out
 
 
+# Probe 9l. Part t: how the cost of servicing task-complete tokens depends on their spacing while the sequence executes operations. Part q: when a
+# task pushed onto a busy channel starts.
+PACE_9L = 64                          # scratch writes after the pushes of a part t interval (and the pause before a release): about 6.7k cycles
+LADDER_DELTAS_9L = (0, 100, 200, 400, 700, 1000, 1500, 2000, 3000, 4000)    # nominal separation of the two tasks' finishes, array cycles
+TOKEN_HEAD_WORDS = 3000               # the first token task's transfer length (a word takes about one cycle on the shim loopback)
+PAIR_SKEW_WORDS = 822                 # the second path's pushes come this many cycles after the first path's: its transfer is that much shorter
+TRIPLE_SKEW_WORDS = 1722              # the same for the middle task of a triple, whose sink is the sixth push
+QUEUED_GAP_WORDS = 190                # a queued task's start-up on top of its words: the gap between the pair's finishes is its length plus this
+TRIPLE_GAPS_9L = ((150, 150), (1000, 1000))      # nominal gaps (first to middle, middle to last token) of the two triple cases
+PUSH_CYCLES = 900                     # an upper bound of one push (BD write, patch, token mask write, queue write)
+WRITE_CYCLES = 105                    # one plain register write
+HEAD_MARGIN_WORDS = 4000              # the head task runs this long after the last queued push (words ~ cycles)
+QUEUE_TASK_WORDS = 256                # every queued task behind the head
+PARK_HEAD_WORDS = 512                 # the parked head task (it moves its words only after the release)
+PARK_SPACING_9L = 8                   # writes between the pushes behind a parked head
+
+
+def token_pair_words(delta: int) -> tuple[int, int]:
+    """(first path's words, second path's words) of a two-token case: the second task finishes `delta` cycles after the first, given that its
+    channel is started PAIR_SKEW_WORDS cycles later (the separation is set by the transfer length, so the pushes and the writes after them
+    are the same in every case)."""
+    return TOKEN_HEAD_WORDS, TOKEN_HEAD_WORDS + delta - PAIR_SKEW_WORDS
+
+
+def token_triple_words(gap1: int, gap2: int) -> tuple[int, int, int]:
+    """(first task's words, queued second task's words, middle task's words) of a three-token case: the middle token (other path) finishes
+    gap1 after the first, the queued task's token gap2 after the middle one."""
+    return TOKEN_HEAD_WORDS, gap1 + gap2 - QUEUED_GAP_WORDS, TOKEN_HEAD_WORDS + gap1 - TRIPLE_SKEW_WORDS
+
+
+def queue_head_words(n: int, k: int) -> int:
+    """Words of the head task that n queued tasks, pushed k writes apart, queue behind: the head is still moving data when the last is pushed."""
+    need = n * (PUSH_CYCLES + WRITE_CYCLES * k) + HEAD_MARGIN_WORDS
+    return -(-need // 1000) * 1000
+
+
+def _preamble_pair() -> list:
+    """Both loopbacks run once and are awaited before anything is marked: the controller's once-per-command service is behind it."""
+    return [Push("M0", PUSH_WORDS, False), Push("M1", PUSH_WORDS, False), Push("S0", PUSH_WORDS, True), Push("S1", PUSH_WORDS, True),
+            Sync("S0"), Sync("S1")]
+
+
+def _token_case(name: str, pushes_: list) -> Case:
+    steps: list = _preamble_pair() + [Mark("A"), *pushes_, Pace(PACE_9L), Mark("B")]
+    steps += drain_syncs(steps) + closing_tail(4) + [Fill(TAIL_FILL)]
+    return Case(name, "W", tuple(steps), BRACKET_EVENTS)
+
+
+def _pair_pushes(delta: int, tokens: str) -> list:
+    """The pushes of a two-path case: sources first (M0, M1), then the sinks (S0, S1); `tokens` names the sinks that carry a token (a subset of 'AB')."""
+    la, lb = token_pair_words(delta)
+    return [Push("M0", la, False), Push("M1", lb, False), Push("S0", la, "A" in tokens), Push("S1", lb, "B" in tokens)]
+
+
+def _triple_pushes(gap1: int, gap2: int, tokens: bool = True) -> list:
+    l1, l2, lb = token_triple_words(gap1, gap2)
+    return [Push("M0", l1, False), Push("M0", l2, False), Push("M1", lb, False), Push("S0", l1, tokens), Push("S0", l2, tokens), Push("S1", lb, tokens)]
+
+
+def _queue_case(name: str, queued: str, n: int, k: int, parked: bool = False) -> Case:
+    """n tasks queued behind a head on channel `queued` (M0 or S0), pushed k writes apart; the other channel of the loopback has the matching
+    tasks pushed first. The tested channels are cold: a preamble on the other path absorbs the once-per-command service. With `parked` the head's
+    descriptor waits on a lock until a task on the other path (pushed after a pause) releases it."""
+    other = "S0" if queued == "M0" else "M0"
+    head = PARK_HEAD_WORDS if parked else queue_head_words(n, k)
+    words = [head] + [QUEUE_TASK_WORDS] * n
+    steps: list = [Push("M1", PUSH_WORDS, False), Push("S1", PUSH_WORDS, True), Sync("S1")]
+    steps += [Push(other, w, i == n) for i, w in enumerate(words)]
+    steps.append(Push(queued, head, False, lock=LOCK_PARK if parked else ""))
+    for i, w in enumerate(words[1:]):
+        if k:
+            steps.append(Fill(k))
+        steps.append(Push(queued, w, i == n - 1))
+    syncs = [Sync(queued), Sync(other)]
+    if parked:
+        steps += [Pace(PACE_9L), Push("M1", PUSH_WORDS, True), Push("S1", PUSH_WORDS, True, lock=LOCK_RELEASE)]
+        syncs += [Sync("M1"), Sync("S1")]
+    steps += syncs
+    steps += drain_syncs(steps) + closing_tail() + [Fill(TAIL_FILL)]
+    return Case(name, "Q", tuple(steps))
+
+
+def plan_9l() -> dict[str, Case]:
+    """Probe 9l. Part t (t*): the interval between two marks around the pushes of one or two tasks that carry tokens, followed by 64 plain writes in
+    which the controller executes operations while the tokens arrive: no token (tz), one (t1a, t1b), two whose finishes are 0 .. 4000 cycles apart
+    (t2_d*), three (t3_g*; t3z is the same six tasks with no token). Part q (q*): n = 1 or 3 tasks queued behind a head on a shim channel (m: MM2S, s: S2MM), pushed k = 0 / 8 / 32 writes
+    apart (q?_n?_k?), and the same behind a head parked on a lock until a task on the other path releases it (q?p_n?). The first case is the
+    positive control of the earlier probes (byte-identical stream)."""
+    cases = [_w_case("w1_L3000_br", 1, 3000, marks=True, events=BRACKET_EVENTS, tail_rounds=4)]
+    cases += [_token_case("tz", _pair_pushes(1000, "")), _token_case("t1a", _pair_pushes(1000, "A")), _token_case("t1b", _pair_pushes(1000, "B"))]
+    cases += [_token_case(f"t2_d{d:04d}", _pair_pushes(d, "AB")) for d in LADDER_DELTAS_9L]
+    cases += [_token_case("t3z", _triple_pushes(1000, 1000, tokens=False))]
+    cases += [_token_case(f"t3_g{g1:04d}", _triple_pushes(g1, g2)) for g1, g2 in TRIPLE_GAPS_9L]
+    for d, ch in (("m", "M0"), ("s", "S0")):
+        cases += [_queue_case(f"q{d}_n{n}_k{k}", ch, n, k) for n in (1, 3) for k in (0, 8, 32)]
+        cases += [_queue_case(f"q{d}p_n{n}", ch, n, PARK_SPACING_9L, parked=True) for n in (1, 3)]
+    out = {c.name: c for c in cases}
+    if len(out) != len(cases):
+        raise ValueError("plan_9l: duplicate case names")
+    return out
+
+
 # -- layout and safety --------------------------------------------------------------------------------
 
 def pushes(case: Case) -> list[Push]:
@@ -579,9 +703,9 @@ def validate(case: Case) -> None:
     for i, s in enumerate(case.steps):
         if isinstance(s, Mark):
             want = (case.steps[i + 1:i + 2], "A") if s.which == "A" else (case.steps[i - 1:i], "B")
-            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], (Sync, Mark) + WRITE_STEPS)):
+            if s.which not in MARK_EVENTS or not (want[0] and isinstance(want[0][0], MARK_NEIGHBOURS)):
                 raise ValueError(f"{case.name}: mark {s.which} at step {i} is not directly "
-                                 f"{'before' if s.which == 'A' else 'after'} a sync or a write step")
+                                 f"{'before' if s.which == 'A' else 'after'} a sync, a push or a write step")
     lead = 0
     while lead < len(case.steps) and isinstance(case.steps[lead], LEAD_STEPS):
         lead += 1
@@ -602,6 +726,27 @@ def validate(case: Case) -> None:
                 raise ValueError(f"{case.name}: masked write to unknown target {s.target!r}")
             if not 1 <= s.count <= 8:
                 raise ValueError(f"{case.name}: {s.count} masked writes")
+    parked: list[Push] = []
+    for s in case.steps:
+        if isinstance(s, Pace) and s.count < 1:
+            raise ValueError(f"{case.name}: a pace of {s.count} writes")
+        if isinstance(s, Push) and s.lock not in ("", LOCK_PARK, LOCK_RELEASE):
+            raise ValueError(f"{case.name}: unknown lock role {s.lock!r}")
+        if isinstance(s, Push) and s.lock:
+            if s.tail or s.words > DIM_LIMIT:
+                raise ValueError(f"{case.name}: a lock task must be a measured task of at most {DIM_LIMIT} words")
+        if isinstance(s, Push) and s.lock == LOCK_PARK:
+            parked.append(s)
+        elif isinstance(s, Push) and s.lock == LOCK_RELEASE:
+            if not parked:
+                raise ValueError(f"{case.name}: a release with nothing parked")
+            if PATH_OF[parked[-1].ch] == PATH_OF[s.ch]:
+                raise ValueError(f"{case.name}: the release runs on the parked task's own path, where it could wait behind it")
+            parked.pop()
+        elif isinstance(s, Sync) and parked:
+            raise ValueError(f"{case.name}: a sync while a task is parked: nothing has released it yet")
+    if parked:
+        raise ValueError(f"{case.name}: a parked task is never released")
     marks = [s.which for s in case.steps if isinstance(s, Mark)]
     for which, (name, _) in MARK_EVENTS.items():
         if marks.count(which) and name not in case.events:
@@ -646,6 +791,10 @@ def design_mlir(case: Case) -> str:
         elif isinstance(st, (LeadPad, LeadFill)):
             tiles.add(BLOCK_TARGETS["data"][:2])
     write_tile = "".join(f"    %t{c_}{r_} = aie.tile({c_}, {r_})\n" for c_, r_ in sorted(tiles))
+    has_locks = any(isinstance(st, Push) and st.lock for st in case.steps)
+    lock_decls = "".join(f'    %{name} = aie.lock(%t00, {lid}) {{init = {init} : i32, sym_name = "{name}"}}\n'
+                         for name, lid, init in PARK_LOCKS) if has_locks else ""
+    lock_const = "      %c_lk = arith.constant 1 : i32\n" if has_locks else ""
     mask_consts: set[int] = set()
     lead: list[str] = []
 
@@ -657,12 +806,13 @@ def design_mlir(case: Case) -> str:
     globals_: dict[int, str] = {}
     wr_consts: set[int] = set()
     n_bw = 0
+    n_task = 0
     lay = iter(layout(case))
     ident = {"S": 0, "M": 0}
     next_bd = iter(range(0, 16))
     tail_bd = iter(TAIL_BD_IDS * (sum(1 for p in pushes(case) if p.tail) // len(TAIL_BD_IDS)))
     for s in case.steps:
-        if isinstance(s, Fill):
+        if isinstance(s, (Fill, Pace)):
             body += ["      aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32} : i32, i32"] * s.count
         elif isinstance(s, (BlockWrite, LeadPad)):
             target = s.target if isinstance(s, BlockWrite) else "data"
@@ -694,6 +844,19 @@ def design_mlir(case: Case) -> str:
             direction, ch, sym = CHANNELS[s.ch]
             outer, inner = _dims(s.words)
             tok = ", issue_token = true" if s.token else ""
+            if s.lock:
+                # A task with a lock: a task-configure op and a start op (one buffer descriptor, one acquire, one release), as the upstream
+                # test dma_s2mm_ooo_shim_recv starts a lock-gated shim descriptor.
+                acquire, release = (("park", "done") if s.lock == LOCK_PARK else ("gate", "park"))
+                body += [f"      %task{n_task} = aiex.dma_configure_task(%t00, {direction}, {ch}) {{",
+                         f"        aie.use_lock(%{acquire}, AcquireGreaterEqual, %c_lk)",
+                         f"        aie.dma_bd(%buf : {m} offset = {off} len = {s.words}) {{bd_id = {next(next_bd)} : i32}}",
+                         f"        aie.use_lock(%{release}, Release, %c_lk)",
+                         "        aie.end",
+                         "      }" + (" {issue_token = true}" if s.token else ""),
+                         f"      aiex.dma_start_task(%task{n_task})"]
+                n_task += 1
+                continue
             body.append(f"      aiex.npu.dma_memcpy_nd(%buf[{c(0)}, {c(0)}, {c(0)}, {c(off)}] "
                         f"[{c(1)}, {c(1)}, {c(outer)}, {c(inner)}] [{c(0)}, {c(0)}, {c(inner)}, {c(1)}]) "
                         f"{{id = {next(tail_bd) if s.tail else next(next_bd)} : i64, metadata = @{sym}{tok}}} : {m}")
@@ -716,7 +879,7 @@ def design_mlir(case: Case) -> str:
   aie.device(npu1_2col) {{
     %t00 = aie.tile(0, 0)
     %t10 = aie.tile(1, 0)
-{write_tile}    aie.flow(%t00, DMA : 0, %t00, DMA : 0)
+{write_tile}{lock_decls}    aie.flow(%t00, DMA : 0, %t00, DMA : 0)
     aie.flow(%t00, DMA : 1, %t00, DMA : 1)
     aie.shim_dma_allocation @in0 (%t00, MM2S, 0)
     aie.shim_dma_allocation @in1 (%t00, MM2S, 1)
@@ -733,7 +896,7 @@ def design_mlir(case: Case) -> str:
       aie.trace.start_config @trace_shim
       %c_reg = arith.constant {SCRATCH_REG} : i32
       %c_zero = arith.constant 0 : i32
-{mark_consts}{wr_lines}{nl.join(const_lines)}
+{lock_const}{mark_consts}{wr_lines}{nl.join(const_lines)}
 {nl.join(body)}
     }}
   }}
@@ -1024,6 +1187,12 @@ def case_table(case: Case, case_dir: Path, runs: list[str]) -> str:
             lines.append(f"  {i:>4}  {p.ch}  {ops:<60} " + "  ".join(f"{_fmt(v):>13}" for v in vals) +
                          f"   {statistics.median(good) if good else '-'}")
             lines.append(f"{'':9}START rel. trace start: " + "  ".join(f"{_fmt(v):>13}" for v in starts))
+    elif case.family == "Q":
+        lines.append("  channel  event           stamps relative to the trace start, per run")
+        for ch in EVENT_ORDER:
+            for what in ("START", "FINISHED"):
+                per = [", ".join(str(x) for x in _stamps(v[0], ch, what, v[1])) if v else "-" for v in loaded.values()]
+                lines.append(f"  {ch:<8} {what:<9}   " + "   |   ".join(per))
     else:
         sr = {run: sync_rows(case, v[0], v[1]) for run, v in loaded.items() if v}
         npairs = max((len(r) for r in sr.values()), default=0)
@@ -1060,7 +1229,7 @@ def cmd_list(args) -> int:
 
 
 def _selected(args) -> list[Case]:
-    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i, "9j": plan_9j, "9k": plan_9k}.get(getattr(args, "plan", "base"), plan)()
+    table = {"9d": plan_9d, "9e": plan_9e, "9f": plan_9f, "9g": plan_9g, "9h": plan_9h, "9i": plan_9i, "9j": plan_9j, "9k": plan_9k, "9l": plan_9l}.get(getattr(args, "plan", "base"), plan)()
     names = args.only or list(table)
     return [table[n] for n in names]
 
@@ -1135,21 +1304,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lst = sub.add_parser("list")
-    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
+    lst.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k", "9l"), default="base")
     b = sub.add_parser("build")
-    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
+    b.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k", "9l"), default="base")
     b.add_argument("out_dir")
     b.add_argument("--only", nargs="*", default=[])
     r = sub.add_parser("run")
     r.add_argument("out_dir")
     r.add_argument("tag")
-    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
+    r.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k", "9l"), default="base")
     r.add_argument("--backend", choices=("hw", "emu"), required=True)
     r.add_argument("--only", nargs="*", default=[])
     t = sub.add_parser("table")
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+")
-    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k"), default="base")
+    t.add_argument("--plan", choices=("base", "9d", "9e", "9f", "9g", "9h", "9i", "9j", "9k", "9l"), default="base")
     t.add_argument("--only", nargs="*", default=[])
     args = ap.parse_args(argv)
     return {"list": cmd_list, "build": cmd_build, "run": cmd_run, "table": cmd_table}[args.cmd](args)

@@ -1209,3 +1209,295 @@ def test_9k_selectable_from_the_command_line():
         assert g.main(["list", "--plan", "9k"]) == 0
     out = buf.getvalue()
     assert "wd_mt_blk_N8" in out and "pf_N128" in out and "lead_P15" in out and "k_e_L3000" in out
+
+
+# -- probe 9l: close task-complete tokens (part t) and queued tasks (part q) ----------------------------------------------------
+
+LADDER_9L = (0, 100, 200, 400, 700, 1000, 1500, 2000, 3000, 4000)
+
+
+def case9l(name):
+    return g.plan_9l()[name]
+
+
+def _n_tokens(c, lo, hi):
+    return [s for s in c.steps[lo:hi] if isinstance(s, g.Push) and s.token]
+
+
+def _measured_window(c):
+    """(steps between mark A and mark B) of a part t case"""
+    return _between_marks(c)
+
+
+def _queue_part(c):
+    """the measured pushes of a part q case after its preamble, with the fill steps between them"""
+    steps = list(c.steps)
+    first = next(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.ch in ("M0", "S0"))
+    last = max(i for i, s in enumerate(steps) if isinstance(s, g.Push) and not s.tail)
+    return steps[first:last + 1]
+
+
+# new steps and rules
+
+def test_9l_pace_is_a_run_of_scratch_register_writes_and_may_sit_between_marks():
+    steps = list(case9l("t2_d1000").steps)
+    assert g.Pace(64) in steps
+    text = g.design_mlir(case9l("t2_d1000"))
+    lines = text.splitlines()
+    a = next(i for i, l in enumerate(lines) if "%c_mark_A)" in l)
+    b = next(i for i, l in enumerate(lines) if "%c_mark_B)" in l and i > a)
+    between = [l for l in lines[a + 1:b] if "aiex.npu.write32(%c_reg, %c_zero) {column = 1 : i32, row = 0 : i32}" in l]
+    assert len(between) == 64
+
+
+def test_9l_a_mark_may_sit_next_to_a_push_or_a_pace_but_not_a_plain_filler():
+    c = case9l("t2_d1000")
+    g.validate(c)
+    steps = [g.Fill(64) if isinstance(s, g.Pace) else s for s in c.steps]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(steps), c.events))
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(s if not isinstance(s, g.Pace) else g.Pace(0) for s in c.steps), c.events))
+
+
+def test_9l_lock_pushes_need_a_release_by_a_later_push_before_any_sync():
+    c = case9l("qsp_n1")
+    g.validate(c)
+    steps = list(c.steps)
+    rel = next(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.lock == g.LOCK_RELEASE)
+    # drop the release: a parked head would wait for ever
+    no_rel = steps[:rel] + [replace_lock(steps[rel], "")] + steps[rel + 1:]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(no_rel), c.events))
+    # a sync between the park and the release
+    park = next(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.lock == g.LOCK_PARK)
+    early = steps[:park + 1] + [g.Sync("M1")] + steps[park + 1:]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(early), c.events))
+    # a release with nothing parked
+    nopark = steps[:park] + [replace_lock(steps[park], "")] + steps[park + 1:]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(nopark), c.events))
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(steps[:park] + [replace_lock(steps[park], "nonsense")] + steps[park + 1:]), c.events))
+
+
+def replace_lock(push, lock):
+    import dataclasses
+    return dataclasses.replace(push, lock=lock)
+
+
+def test_9l_the_release_runs_on_the_other_path_so_it_cannot_wait_behind_the_parked_task():
+    import dataclasses
+    c = case9l("qsp_n1")
+    steps = list(c.steps)
+    park = next(s for s in steps if isinstance(s, g.Push) and s.lock == g.LOCK_PARK)
+    rel = next(s for s in steps if isinstance(s, g.Push) and s.lock == g.LOCK_RELEASE)
+    assert g.PATH_OF[park.ch] != g.PATH_OF[rel.ch]
+    i = steps.index(rel)
+    moved = steps[:i] + [dataclasses.replace(rel, ch=park.ch)] + steps[i + 1:]
+    with pytest.raises(ValueError):
+        g.validate(g.Case("bad", "W", tuple(moved), c.events))
+
+
+def test_9l_lock_design_text():
+    m = g.design_mlir(case9l("qsp_n1"))
+    assert m.count("aie.lock(") == 3
+    assert "init = 0 : i32, sym_name = \"park\"" in m and "init = 0 : i32, sym_name = \"done\"" in m
+    assert "init = 1 : i32, sym_name = \"gate\"" in m
+    assert m.count("aiex.dma_configure_task(") == 2 and m.count("aiex.dma_start_task(") == 2
+    assert "aie.use_lock(%park, AcquireGreaterEqual" in m and "aie.use_lock(%done, Release" in m
+    assert "aie.use_lock(%gate, AcquireGreaterEqual" in m and "aie.use_lock(%park, Release" in m
+    for name, c in g.plan_9l().items():
+        t = g.design_mlir(c)
+        has = any(isinstance(s, g.Push) and s.lock for s in c.steps)
+        assert ("aie.lock(" in t) == has, name
+        assert ("aie.core" not in t) and ("aie.buffer" not in t) and ("aie.mem(" not in t), name
+
+
+def test_9l_buffer_descriptor_ids_do_not_repeat_among_measured_tasks():
+    import re
+    for name, c in g.plan_9l().items():
+        ids = [int(x) for x in re.findall(r"(?:\{id = |bd_id = )(\d+) : i", g.design_mlir(c))]
+        n_measured = len(g.measured_pushes(c))
+        assert n_measured <= 16, name
+        assert len(set(ids[:n_measured])) == n_measured, name
+
+
+# the plan
+
+def test_plan_9l_has_both_parts_and_validates():
+    p = g.plan_9l()
+    want = {"w1_L3000_br", "tz", "t1a", "t1b", "t3z", "t3_g0150", "t3_g1000"}
+    want |= {f"t2_d{d:04d}" for d in LADDER_9L}
+    want |= {f"q{d}_n{n}_k{k}" for d in "ms" for n in (1, 3) for k in (0, 8, 32)}
+    want |= {f"q{d}p_n{n}" for d in "ms" for n in (1, 3)}
+    assert set(p) == want
+    assert next(iter(p)) == "w1_L3000_br"
+    for c in p.values():
+        g.validate(c)
+
+
+def test_9l_the_control_is_the_earlier_probes_control():
+    assert case9l("w1_L3000_br") == g.plan_9k()["w1_L3000_br"]
+
+
+def test_9l_ladder_values_are_ten_steps_from_zero_to_four_thousand():
+    assert g.LADDER_DELTAS_9L == LADDER_9L
+
+
+def test_9l_token_cases_share_one_op_stream_and_differ_in_lengths_and_tokens():
+    # every part t case: a preamble that waits on both paths, mark A, the pushes, a run of 64 scratch writes, mark B, then the tail
+    for name, c in g.plan_9l().items():
+        if not name.startswith("t"):
+            continue
+        steps = list(c.steps)
+        a = steps.index(g.Mark("A"))
+        pre = steps[:a]
+        assert [s.ch for s in pre if isinstance(s, g.Push)] == ["M0", "M1", "S0", "S1"]
+        assert [s for s in pre if isinstance(s, g.Sync)] == [g.Sync("S0"), g.Sync("S1")]
+        mid = _measured_window(c)
+        assert all(isinstance(s, (g.Push, g.Pace)) for s in mid), name
+        assert mid[-1] == g.Pace(g.PACE_9L) and g.PACE_9L == 64
+        assert c.events == g.BRACKET_EVENTS
+        assert not any(isinstance(s, g.Sync) for s in mid)
+
+
+def test_9l_token_counts_per_case():
+    def tok(name):
+        return [s.ch for s in _measured_window(case9l(name)) if isinstance(s, g.Push) and s.token]
+    assert tok("tz") == [] and tok("t3z") == []
+    assert tok("t1a") == ["S0"] and tok("t1b") == ["S1"]
+    for d in LADDER_9L:
+        assert tok(f"t2_d{d:04d}") == ["S0", "S1"]
+    for gname in ("t3_g0150", "t3_g1000"):
+        assert sorted(tok(gname)) == ["S0", "S0", "S1"]
+
+
+def test_9l_zero_and_one_token_controls_have_the_geometry_of_the_one_thousand_step():
+    base = [(s.ch, s.words) for s in _measured_window(case9l("t2_d1000")) if isinstance(s, g.Push)]
+    for name in ("tz", "t1a", "t1b"):
+        assert [(s.ch, s.words) for s in _measured_window(case9l(name)) if isinstance(s, g.Push)] == base
+
+
+def test_9l_the_triple_baseline_has_the_triple_geometry_and_no_token():
+    pushes = lambda n: [(s.ch, s.words) for s in _measured_window(case9l(n)) if isinstance(s, g.Push)]
+    assert pushes("t3z") == pushes("t3_g1000")
+
+
+def test_9l_pair_lengths_realise_the_separation_by_the_transfer_length():
+    seen = []
+    for d in LADDER_9L:
+        la, lb = g.token_pair_words(d)
+        assert la == g.TOKEN_HEAD_WORDS and lb >= 64
+        assert lb - la == d - g.PAIR_SKEW_WORDS
+        seen.append(lb)
+    assert seen == sorted(seen) and len(set(seen)) == len(seen)
+    # the case streams carry exactly those lengths (sources and sinks match, so every task moves a word count the design supplies)
+    for d in LADDER_9L:
+        la, lb = g.token_pair_words(d)
+        pushes = [s for s in _measured_window(case9l(f"t2_d{d:04d}")) if isinstance(s, g.Push)]
+        assert [(p.ch, p.words) for p in pushes] == [("M0", la), ("M1", lb), ("S0", la), ("S1", lb)]
+
+
+def test_9l_triple_cases_queue_a_second_task_on_the_first_channel_and_put_the_third_token_between():
+    for gname, (g1, g2) in (("t3_g0150", (150, 150)), ("t3_g1000", (1000, 1000))):
+        pushes = [s for s in _measured_window(case9l(gname)) if isinstance(s, g.Push)]
+        assert [p.ch for p in pushes] == ["M0", "M0", "M1", "S0", "S0", "S1"]
+        l1, l2, lb = g.token_triple_words(g1, g2)
+        assert [p.words for p in pushes] == [l1, l2, lb, l1, l2, lb]
+        assert l2 >= 16 and lb >= 64 and l1 == g.TOKEN_HEAD_WORDS
+        # the middle token is the other path's: it must finish after the first and before the second of the queued pair
+        assert lb - l1 == g1 - g.TRIPLE_SKEW_WORDS
+        assert l2 == g1 + g2 - g.QUEUED_GAP_WORDS
+    assert g.token_triple_words(1000, 1000)[1] > g.token_triple_words(150, 150)[1]
+
+
+def test_9l_every_queue_case_awaits_its_last_task_on_every_path_before_the_tail():
+    """The tail reuses buffer descriptor ids 0..3 and its tasks queue behind the measured ones: a measured task nobody awaits would be a
+    task the sequence ends without having seen finish. Every path's last measured sink carries a token that a sync covers; a source is
+    covered by its own sink (the sink finishes only after the source's words have arrived)."""
+    for name, c in g.plan_9l().items():
+        if not name.startswith("q"):
+            continue
+        steps = list(c.steps)
+        first_tail = next(i for i, s in enumerate(steps) if isinstance(s, g.Push) and s.tail)
+        for ch in ("M0", "M1", "S0", "S1"):
+            last = max((i for i, s in enumerate(steps[:first_tail]) if isinstance(s, g.Push) and s.ch == ch), default=None)
+            if last is None:
+                continue
+            owner = ch if steps[last].token else ("S" if ch[0] == "M" else "M") + ch[1]
+            lo = last if steps[last].token else max(i for i, s in enumerate(steps[:first_tail]) if isinstance(s, g.Push) and s.ch == owner)
+            assert steps[lo].token and g.Sync(owner) in steps[lo:first_tail], (name, ch)
+
+
+# part q
+
+def test_9l_queue_cases_put_one_to_three_tasks_behind_a_head_on_one_channel():
+    for d, ch, other in (("m", "M0", "S0"), ("s", "S0", "M0")):
+        for n in (1, 3):
+            for k in (0, 8, 32):
+                c = case9l(f"q{d}_n{n}_k{k}")
+                part = _queue_part(c)
+                on = [s for s in part if isinstance(s, g.Push) and s.ch == ch]
+                assert len(on) == n + 1 <= 4                                  # inside the queue depth of 4
+                assert on[0].words == g.queue_head_words(n, k) and all(p.words == g.QUEUE_TASK_WORDS for p in on[1:])
+                assert not on[0].token and [p.token for p in on[1:]] == [False] * (n - 1) + [True]
+                fills = [s.count for s in part if isinstance(s, g.Fill)]
+                assert fills == ([k] * n if k else [])
+                # the other channel carries the matching words, in one block of pushes ahead (sinks or sources armed first)
+                oth = [s for s in part if isinstance(s, g.Push) and s.ch == other]
+                assert [p.words for p in oth] == [p.words for p in on]
+                assert c.events == g.DEFAULT_EVENTS
+
+
+def test_9l_the_head_outlives_the_pushes_of_the_queued_tasks():
+    for n in (1, 3):
+        for k in (0, 8, 32):
+            assert g.queue_head_words(n, k) >= n * (g.PUSH_CYCLES + g.WRITE_CYCLES * k) + g.HEAD_MARGIN_WORDS
+    assert g.queue_head_words(3, 32) > g.queue_head_words(1, 0)
+
+
+def test_9l_queue_cases_open_with_a_preamble_on_the_other_path_and_leave_the_tested_channels_cold():
+    for name, c in g.plan_9l().items():
+        if not name.startswith("q"):
+            continue
+        steps = list(c.steps)
+        head = steps[:3]
+        assert head == [g.Push("M1", 8, False), g.Push("S1", 8, True), g.Sync("S1")], name
+        used = {s.ch for s in steps[3:] if isinstance(s, g.Push) and not s.tail}
+        assert {"M0", "S0"} <= used
+
+
+def test_9l_parked_cases_put_the_park_on_the_head_and_release_it_after_a_pace():
+    for d, ch in (("m", "M0"), ("s", "S0")):
+        for n in (1, 3):
+            c = case9l(f"q{d}p_n{n}")
+            steps = list(c.steps)
+            parks = [s for s in steps if isinstance(s, g.Push) and s.lock == g.LOCK_PARK]
+            rels = [s for s in steps if isinstance(s, g.Push) and s.lock == g.LOCK_RELEASE]
+            assert len(parks) == 1 and len(rels) == 1 and parks[0].ch == ch and rels[0].ch == "S1"
+            ip, ir = steps.index(parks[0]), steps.index(rels[0])
+            assert [s for s in steps[ip + 1:ir] if isinstance(s, g.Sync)] == []
+            assert g.Pace(g.PACE_9L) in steps[ip:ir]
+            # the release follows its source push
+            assert any(isinstance(s, g.Push) and s.ch == "M1" and s.words == rels[0].words for s in steps[ip:ir])
+            on = [s for s in _queue_part(c) if isinstance(s, g.Push) and s.ch == ch]
+            assert len(on) == n + 1 and on[0] is parks[0] or on[0] == parks[0]
+
+
+def test_9l_tool_text_is_fit_for_a_public_repo():
+    import pathlib
+    src = pathlib.Path(g.__file__).read_text()
+    # the banned words are assembled here so that this file does not contain them itself
+    for banned in ("/" + "home/", "-".join(("xdna", "emu", "priv")), "phoe" + "nix", "XDNA_" + "BACKEND", "XDNA_EMU_" + "LIB", ".s" + "o\""):
+        assert banned not in src, banned
+
+
+def test_9l_selectable_from_the_command_line():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9l"]) == 0
+    out = buf.getvalue()
+    assert "t2_d4000" in out and "t3_g1000" in out and "qsp_n3" in out and "qm_n1_k32" in out
