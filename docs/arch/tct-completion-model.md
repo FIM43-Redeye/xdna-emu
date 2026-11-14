@@ -5,6 +5,14 @@
 every compiler-supported Phoenix actor through the configured TileControl
 packet fabric. The direct `NpuExecutor` path described below remains a separate
 execution envelope.
+**Superseded for the interpreter backend (2026-11-14):** the 8000-cycle first-sync
+charge, `XDNA_EMU_MAILBOX_LATENCY` and the per-sync row transit are gone. The
+`NpuExecutor` now charges each sync the controller's measured wait structure
+(`src/npu/sync_wait.rs`, from the token's lateness after the sync's issue) and
+services tokens that arrive during execution at the next operation boundary
+(`src/npu/cycle_cost.rs`); see the runtime-sequence pacing row in
+`docs/fidelity-gaps/host-firmware-dispatch.md`. The text below is the record of
+the earlier design.
 **Goal:** replace the flat `DEFAULT_MAILBOX_CYCLES = 8000` fudge with a real
 Task-Completion-Token (TCT) driven completion path in the emulator's NPU-executor
 run flow. Phases 1-2 are a **fidelity/structure** change (completion becomes token-driven like the
