@@ -2374,3 +2374,90 @@ def test_mr_ports_row_is_invalid_when_a_port_the_case_depends_on_shows_no_beat()
     # a run whose grant is not traced cannot be dated at all
     e = [x for x in feed_ports_synthetic() if x.name != "DMA_S2MM_0_STALLED_LOCK"]
     assert g.mr_ports_row(e)["invalid"]
+
+
+# -- chain --rx-pairs: the receiver's completion relayed by a core to its south neighbour's lock -----------------
+
+def rx(receiver="north", pairs=8, **kw):
+    return chain("1 1 1 1 1 1", head=24, receiver=receiver, rx_pairs=pairs, **kw)
+
+
+def test_rx_pairs_receiver_s2mm_releases_the_done_lock_and_the_core_tile_and_its_south_neighbour_hold_the_pair_lock():
+    t = g.chain_design_mlir(rx("north"))
+    assert 'aie.lock(%t03, 12) {init = 1 : i32, sym_name = "lRxIn"}' in t
+    assert 'aie.lock(%t03, 13) {init = 0 : i32, sym_name = "lRxDone"}' in t
+    assert "aie.use_lock(%lRxIn, AcquireGreaterEqual, %c1)" in t and "aie.use_lock(%lRxDone, Release, %c1)" in t
+    assert 'aie.lock(%t03, 10) {init = 0 : i32, sym_name = "lPairC"}' in t
+    assert 'aie.lock(%t02, 10) {init = 0 : i32, sym_name = "lPairS"}' in t
+    assert 'link_with = "rxcore.o"' in t and "aie.core(%t03)" in t
+    # own receiver: the S2MM is (0,2)'s loopback, the relaying core is (0,3), which acquires the lock remotely
+    o = g.chain_design_mlir(rx("own"))
+    assert 'aie.lock(%t02, 13) {init = 0 : i32, sym_name = "lRxDone"}' in o and "aie.core(%t03)" in o
+    assert 'aie.lock(%t03, 10) {init = 0 : i32, sym_name = "lPairC"}' in o
+    # two rows north: the relaying core is (0,4); (0,3) is declared for its pair lock (and so traced)
+    n2 = g.chain_design_mlir(rx("north2"))
+    assert "%t03 = aie.tile(0, 3)" in n2 and 'aie.lock(%t03, 10) {init = 0 : i32, sym_name = "lPairS"}' in n2
+    assert "aie.core(%t04)" in n2
+    # without the option the design is unchanged
+    assert "lRxDone" not in g.chain_design_mlir(chain("1 1 1 1 1 1", head=24, receiver="north"))
+
+
+def test_rx_core_acquires_once_then_releases_own_and_south_pair_locks_one_bundle_apart():
+    body = bundles_of(g.chain_rx_core_asm(rx("north", pairs=5)))
+    acq = [i for i, b in enumerate(body) if b.startswith("acq")]
+    assert [body[i] for i in acq] == [f"acq #{g.OWN + g.CHAIN_RX_LOCK_DONE}, r3"]
+    own = [i for i, b in enumerate(body) if b == f"rel #{g.OWN + g.CHAIN_RX_PAIR_LOCK}, r2"]
+    south = [i for i, b in enumerate(body) if b == f"rel #{g.SOUTH + g.CHAIN_RX_PAIR_LOCK}, r2"]
+    assert len(own) == len(south) == 5 and all(s == o + 1 for o, s in zip(own, south))
+    reqs = sorted(acq + own + south)
+    assert all(b - a >= g.LOCK_SETTLE_BUNDLES for a, b in zip(reqs, reqs[1:]) if a in acq or b in acq)
+    gaps = [b - a - 1 for a, b in zip(south, own[1:])]
+    assert gaps == [g.CHAIN_RX_GAP_NOPS + i for i in range(4)]            # no two pairs alike
+    remote = bundles_of(g.chain_rx_core_asm(rx("own", pairs=2)))
+    assert f"acq #{g.SOUTH + g.CHAIN_RX_LOCK_DONE}, r3" in remote           # (0,3) acquires (0,2)'s lock
+
+
+def test_rx_pairs_limits_and_trace_selection():
+    for c in (rx("north3"), rx("south"), rx(pairs=g.CHAIN_MAX_RX_PAIRS + 1), rx(releaser="s2mm"),
+              chain("1f", receiver="north", rx_pairs=2), rx(waker="3")):
+        with pytest.raises(ValueError):
+            g.chain_validate(c)
+    a = g.chain_inject_args(receiver="north", rx_pairs=8)
+    assert "LOCK_1_REL" in a[a.index("--memmod-sweep-events") + 1].split(",")
+    assert a[a.index("--memmod-sel-locks") + 1] == f"LOCK_SEL1:{g.CHAIN_RX_PAIR_LOCK}"
+    assert "--memmod-sel-locks" not in g.chain_inject_args(receiver="north")
+    assert rx().design()["rx_pairs"] == 8 and "rx_pairs" not in chain("1").design()
+
+
+def rx_synthetic(rows=(3, 2), pairs=4, d_down=1, fill=0, d_up=1, g0=1000, fin=120, own_after_fin=20):
+    """g0 on (0,2); the receiver S2MM's finish and the pair on the core tile rows[0] (its own timer) and the south
+    stamps on rows[1]."""
+    e = held("DMA_MM2S_0_STALLED_LOCK", 100, g0 - 1)
+    e += [ev("DMA_S2MM_0_FINISHED_BD", g0 + fin, row=rows[0])]
+    for i in range(pairs):
+        t = g0 + fin + own_after_fin + 30 * i
+        e += [ev("LOCK_1_REL", t, row=rows[0]), ev("LOCK_1_REL", t + d_down, row=rows[1])]
+    for i in range(fill):
+        t = g0 + 900 + 25 * i
+        e += [ev("LOCK_0_REL", t, row=2), ev("LOCK_0_REL", t + d_up, row=3)]
+    return e
+
+
+def test_rx_row_dates_the_pair_on_both_timers_and_the_fill_pair_in_the_other_direction():
+    c = rx("north", pairs=4, fill=3)
+    r = g.chain_rx_row(rx_synthetic(pairs=4, d_down=1, fill=3, d_up=1), c)
+    assert r["invalid"] == []
+    assert r["rx_fin"] == 120 and r["own_first"] == 140 and r["south_first"] == 141
+    assert r["own_after_fin"] == 20 and r["d_down"] == {1: 4} and r["d_up"] == {1: 3}
+
+
+def test_rx_row_is_invalid_without_the_activity_it_dates():
+    c = rx("north", pairs=4)
+    e = [x for x in rx_synthetic(pairs=4) if not (x.row == 2 and x.name == "LOCK_1_REL")]
+    assert any("south" in m for m in g.chain_rx_row(e, c)["invalid"])
+    e = [x for x in rx_synthetic(pairs=4) if x.name != "DMA_S2MM_0_FINISHED_BD"]
+    assert any("S2MM" in m for m in g.chain_rx_row(e, c)["invalid"])
+    e = rx_synthetic(pairs=3)
+    assert any("pairs" in m for m in g.chain_rx_row(e, c)["invalid"])
+    n2 = g.chain_rx_row(rx_synthetic(rows=(4, 3), pairs=4), rx("north2", pairs=4))
+    assert n2["invalid"] == [] and n2["d_down"] == {1: 4}

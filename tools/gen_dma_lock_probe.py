@@ -153,6 +153,7 @@ from gen_lock_stall_probe import LOCK_SETTLE_BUNDLES, TS_PAIRS, _frame, _ts  # n
 LOCK_A, LOCK_F, LOCK_C, LOCK_D, LOCK_E = 14, 13, 12, 11, 10
 OWN = 48                           # raw ID base of the core's own memory module
 NORTH = 32                         # raw ID base of the memory module of the tile above (mlir-aie getLockLocalBaseIndex)
+SOUTH = 0                          # raw ID base of the memory module of the tile below
 WORDS = 16
 N = "  nop"
 
@@ -1406,6 +1407,19 @@ CHAIN_WAKER_WORDS = 2048           # about 2048 cycles of beats: spans the head 
 CHAIN_WAKER_SRC = 0x0400           # banks 0 / 1 of the waker tile, before the receiver's `dst`
 CHAIN_WAKER_DST = 0xC000           # banks 6 / 7
 CHAIN_LOCK_WAKER, CHAIN_LOCK_WAKER_DONE = 8, 9
+# With `rx_pairs` = n the receiver's completion is relayed by a core to its south neighbour's lock: the receiver
+# S2MM's BD acquires lRxIn (init 1) and releases lRxDone of the receiver tile at its finish; the core of the tile
+# above the source for the own receiver ((0,3), acquiring (0,2)'s lRxDone remotely), else the receiver tile's own
+# core, acquires lRxDone, waits a request window, then n times releases its own tile's lock CHAIN_RX_PAIR_LOCK and,
+# the next bundle, its south neighbour's lock of the same id (one request window, as the north fill's pair), with
+# growing gaps. Both memory modules trace LOCK_1_REL with selection 1 on that lock, so each pair is one release dated
+# on two tiles' timers, the mirror of the north fill's pair, and the first south stamp dates the receiver's
+# completion on the south tile's timer ((0,2), the source, for "north").
+CHAIN_RX_RECEIVERS = ("own", "north", "north2")
+CHAIN_RX_LOCK_IN, CHAIN_RX_LOCK_DONE = 12, 13   # receiver tile: the S2MM BD's acquire (init 1) and release
+CHAIN_RX_PAIR_LOCK = 10            # the relaying core's tile and its south neighbour: the pair's lock
+CHAIN_MAX_RX_PAIRS = 48            # pair releases: the lock count stays below the 6-bit limit 63
+CHAIN_RX_GAP_NOPS = 16             # nops after the first pair; each later gap one nop more
 CHAIN_MEM_EVENTS = ["LOCK_0_REL", "DMA_MM2S_0_STALLED_LOCK", "DMA_MM2S_0_FINISHED_BD", "DMA_S2MM_0_FINISHED_BD",
                     "LOCK_SEL0_ACQ_GE"]
 CHAIN_CORE_EVENTS = ["INSTR_EVENT_0", "INSTR_EVENT_1", "LOCK_STALL"]
@@ -1431,6 +1445,7 @@ class ChainCase:
     waker: str = ""                # "": none; "<row>": a loopback on (0, row) beating through the head; "<row>q": after it
     memtile_ports: str = ""        # "": no memtile trace; else up to 4 BUNDLE:CHANNEL:master|slave ports of the memtile
     #                                switch whose PORT_RUNNING its trace unit records (the memtile is declared for it)
+    rx_pairs: int = 0              # 0: none; n: the receiver's completion relayed to a south lock, n release pairs
 
     @property
     def name(self) -> str:
@@ -1449,7 +1464,14 @@ class ChainCase:
             d["waker"] = self.waker
         if self.memtile_ports:
             d["memtile_ports"] = self.memtile_ports
+        if self.rx_pairs:
+            d["rx_pairs"] = self.rx_pairs
         return d
+
+    @property
+    def rx_core_row(self) -> int:
+        """Row of the core that relays the receiver's completion (rx_pairs): the receiver's, or (0,3) for own."""
+        return 3 if self.receiver == "own" else CHAIN_RECEIVER_ROW[self.receiver]
 
     @property
     def waker_row(self) -> int | None:
@@ -1508,6 +1530,13 @@ def chain_validate(c: ChainCase) -> None:
         top = CHAIN_RECEIVER_ROW.get(c.receiver, 0)
         if not digits.isdigit() or not c.receiver.startswith("north") or not FETCH_ROW < int(digits) <= top:
             raise ValueError("waker: '<row>' or '<row>q' with a row of the north route past the source (3 .. receiver)")
+    if c.rx_pairs:
+        if c.receiver not in CHAIN_RX_RECEIVERS or c.releaser != "core" or c.waker:
+            raise ValueError(f"rx_pairs: receiver in {CHAIN_RX_RECEIVERS}, core releaser, no waker")
+        if not 1 <= c.rx_pairs <= CHAIN_MAX_RX_PAIRS:
+            raise ValueError(f"rx_pairs in 1..{CHAIN_MAX_RX_PAIRS}")
+        if any(m.lock == "free" for m in c.mids):
+            raise ValueError("rx_pairs: no free-lock mids (their locks would meet the pair and receiver locks)")
     a, w = chain_buffers(c)[-1]
     if a + 4 * w > CHAIN_BUF_END:
         raise ValueError("head and mid buffers exceed logical bank 1")
@@ -1539,6 +1568,19 @@ def chain_core_body(c: ChainCase) -> list[str]:
     return body
 
 
+def chain_rx_core_asm(c: ChainCase) -> str:
+    """The relaying core (rx_pairs): acquire lRxDone (its own tile's, or (0,2)'s from (0,3) for the own receiver), a
+    request window, then the release pairs: own CHAIN_RX_PAIR_LOCK, the next bundle the south neighbour's."""
+    chain_validate(c)
+    n = lp.nops
+    done = (SOUTH if c.receiver == "own" else OWN) + CHAIN_RX_LOCK_DONE
+    body = ["  mov r2, #1", "  mov r3, #-1", *n(2), f"  acq #{done}, r3", *n(LOCK_SETTLE_BUNDLES)]
+    for i in range(c.rx_pairs):
+        body += [f"  rel #{OWN + CHAIN_RX_PAIR_LOCK}, r2", f"  rel #{SOUTH + CHAIN_RX_PAIR_LOCK}, r2",
+                 *n(CHAIN_RX_GAP_NOPS + i)]
+    return lp.frame(body + [*n(8)])
+
+
 def chain_design_mlir(c: ChainCase) -> str:
     chain_validate(c)
     w = FETCH_WORDS if c.big == FETCH_WORDS else c.big
@@ -1560,6 +1602,13 @@ def chain_design_mlir(c: ChainCase) -> str:
         locks.append(f'    %lRx = aie.lock(%t02, {CHAIN_LOCK_RX}) {{init = 1 : i32, sym_name = "lRx"}}')
     if c.receiver == "north" and c.fill:
         locks.append(f'    %lN = aie.lock(%t03, {CHAIN_LOCK_NORTH_FILL}) {{init = 0 : i32, sym_name = "lN"}}')
+    if c.rx_pairs:
+        rt, ct = f"%t0{CHAIN_RECEIVER_ROW[c.receiver]}", f"%t0{c.rx_core_row}"
+        locks += [f'    %lRxIn = aie.lock({rt}, {CHAIN_RX_LOCK_IN}) {{init = 1 : i32, sym_name = "lRxIn"}}',
+                  f'    %lRxDone = aie.lock({rt}, {CHAIN_RX_LOCK_DONE}) {{init = 0 : i32, sym_name = "lRxDone"}}',
+                  f'    %lPairC = aie.lock({ct}, {CHAIN_RX_PAIR_LOCK}) {{init = 0 : i32, sym_name = "lPairC"}}',
+                  f'    %lPairS = aie.lock(%t0{c.rx_core_row - 1}, {CHAIN_RX_PAIR_LOCK}) '
+                  '{init = 0 : i32, sym_name = "lPairS"}']
     bds, free_i = [], 0
     names = ["head", *(f"m{i}" for i in range(len(c.mids))), "send"]
 
@@ -1594,7 +1643,8 @@ def chain_design_mlir(c: ChainCase) -> str:
                f"    %dst2 = aie.buffer(%t02) {{address = {FETCH_DST_ADDR + 0x2000} : i32, sym_name = \"dst2\"}} "
                f": memref<{w}xi32>")
     else:
-        recv = bd("recv", "%dst", pre_words + w, None, None, "end")
+        rx_locks = ("%lRxIn", "%lRxDone") if c.rx_pairs else (None, None)
+        recv = bd("recv", "%dst", pre_words + w, *rx_locks, "end")
         dst = (f"    %dst = aie.buffer({rx}) {{address = {FETCH_DST_ADDR} : i32, sym_name = \"dst\"}} "
                f": memref<{pre_words + w}xi32>")
     remote = c.receiver != "own"
@@ -1602,6 +1652,12 @@ def chain_design_mlir(c: ChainCase) -> str:
     t03 = f"    {rx} = aie.tile(0, {rrow})\n" if remote else ""
     if c.memtile_ports and c.receiver != "south":
         t03 = "    %t01 = aie.tile(0, 1)\n" + t03
+    rx_core = ""
+    if c.rx_pairs:
+        for row in sorted({c.rx_core_row, c.rx_core_row - 1} - {FETCH_ROW, rrow}):
+            t03 += f"    %t0{row} = aie.tile(0, {row})\n"
+        rx_core = ('    func.func private @k_rxcore() attributes {link_with = "rxcore.o"}\n'
+                   f"    aie.core(%t0{c.rx_core_row}) {{\n      func.call @k_rxcore() : () -> ()\n      aie.end\n    }}\n")
     wr = c.waker_row
     wk_decl = wk_set = ""
     if wr is not None:
@@ -1626,6 +1682,7 @@ def chain_design_mlir(c: ChainCase) -> str:
                       "    ^end:\n      aie.end\n    }\n")
     else:
         remote_mem = (f"    %mem0{rrow} = aie.{'memtile_dma' if c.receiver == 'south' else 'mem'}({rx}) {{\n"
+                      + ("      %c1 = arith.constant 1 : i32\n" if c.rx_pairs else "") +
                       "      %s1 = aie.dma_start(S2MM, 0, ^recv, ^end)\n"
                       f"{recv}    ^end:\n      aie.end\n    }}\n") if remote else ""
         if wr is not None:
@@ -1653,7 +1710,7 @@ def chain_design_mlir(c: ChainCase) -> str:
       func.call @k_core(%ldbuf) : (memref<16xi32>) -> ()
       aie.end
     }}
-    %mem = aie.mem(%t02) {{
+{rx_core}    %mem = aie.mem(%t02) {{
       %c1 = arith.constant 1 : i32
       %s0 = aie.dma_start(MM2S, 0, ^head, {"^end" if remote else "^recv_start"})
 {"".join(bds)}{"" if remote else s2mm_block}    ^end:
@@ -1671,10 +1728,13 @@ def chain_design_mlir(c: ChainCase) -> str:
 
 
 def chain_inject_args(swap: tuple[str, str] | None = None, add: str | None = None, receiver: str = "own",
-                      memtile_ports: str = "") -> list[str]:
-    out = ["--memmod-sweep-events", ",".join(edit_memmod_events(CHAIN_MEM_EVENTS, swap, add)),
+                      memtile_ports: str = "", rx_pairs: int = 0) -> list[str]:
+    events = edit_memmod_events(CHAIN_MEM_EVENTS, swap, add) + (["LOCK_1_REL"] if rx_pairs else [])
+    out = ["--memmod-sweep-events", ",".join(events),
            "--core-grounding", FETCH_CORE_GROUNDING,
            "--core-sweep-events", ",".join(CHAIN_CORE_EVENTS)]
+    if rx_pairs:
+        out += ["--memmod-sel-locks", f"LOCK_SEL1:{CHAIN_RX_PAIR_LOCK}"]
     if receiver == "south":
         out += ["--memtile-sweep-events", ",".join(CHAIN_MEMTILE_EVENTS)]
     elif memtile_ports:
@@ -1753,7 +1813,9 @@ def chain_selection(args) -> list:
     receiver = getattr(args, "receiver", None) or "own"
     waker = getattr(args, "waker", None) or ""
     mt = getattr(args, "memtile_ports", None) or ""
-    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver, waker, mt) for a, b in pairs]
+    rxp = getattr(args, "rx_pairs", 0) or 0
+    out = [ChainCase(mids, args.head, args.big, a, b, args.releaser, ids, fill, receiver, waker, mt, rxp)
+           for a, b in pairs]
     for c in out:
         chain_validate(c)
     return out
@@ -1769,10 +1831,12 @@ def cmd_chain_build(args) -> int:
         d = out / c.name
         d.mkdir(parents=True, exist_ok=True)
         lp.assemble(chain_core_asm(c), d / "core.o", "k_core")
+        if c.rx_pairs:
+            lp.assemble(chain_rx_core_asm(c), d / "rxcore.o", "k_rxcore")
         (d / "base.mlir").write_text(chain_design_mlir(c))
         lp.sh([sys.executable, str(REPO / "tools" / "mlir-trace-inject.py"), "--input", "base.mlir",
                "--out", "aie.mlir", "--trace-mode", "event_time", *chain_inject_args(getattr(args, "memmod_event_swap", None), getattr(args, "memmod_event_add", None),
-                                                                     c.receiver, c.memtile_ports),
+                                                                     c.receiver, c.memtile_ports, c.rx_pairs),
                "--trace-config-out", "trace_config.json", "--config-test-name", c.name,
                "--config-src-mlir", "base.mlir", "--buffer-size", "65536"],
               cwd=d, log=d / "inject.log")
@@ -1820,15 +1884,19 @@ def add_chain_parsers(sub) -> None:
     cb = sub.add_parser("chain-build", help="lock timing chain: build one design's cases into OUT_DIR")
     cr = sub.add_parser("chain-run", help="lock timing chain: run the built cases to TAG.BACKEND/")
     ct = sub.add_parser("chain-table", help="lock timing chain: stamps relative to the head BD's grant")
-    for sp in (cb, cr, ct):
+    cx = sub.add_parser("chain-rx", help="lock timing chain, --rx-pairs designs: the relayed completion and the pairs")
+    for sp in (cb, cr, ct, cx):
         sp.add_argument("out_dir")
     cr.add_argument("tag")
     cr.add_argument("--backend", choices=("hw", "emu"), required=True)
     ct.add_argument("runs", nargs="+")
+    cx.add_argument("runs", nargs="+")
     cb.add_argument("--memmod-event-swap", type=parse_event_swap, default=None, metavar="OLD=NEW",
                     help=MEMMOD_SWAP_HELP)
     cb.add_argument("--memmod-event-add", default=None, metavar="NAME", action=AddEventAction, help=MEMMOD_ADD_HELP)
-    for sp in (cb, cr, ct):
+    for sp in (cb, cr, ct, cx):
+        sp.add_argument("--rx-pairs", type=int, default=0,
+                        help="relay the receiver's completion by a core to its south neighbour's lock: release pairs")
         sp.add_argument("--mids", nargs="*", default=[], help="mid BDs: words, then c (core lock) or f (free lock)")
         sp.add_argument("--head", type=int, default=4, help="head BD words")
         sp.add_argument("--big", type=int, default=FETCH_WORDS, help="waiting BD words")
@@ -1849,7 +1917,88 @@ def add_chain_parsers(sub) -> None:
                         help="core releases of A after the tail: memory-module trace packet fillers (core releaser)")
 
 
-CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table}
+def chain_rx_row(events, c: ChainCase) -> dict:
+    """An rx_pairs run. g0 as chain_row ((0,2)'s memory-module timer). On the receiver tile's timer: its S2MM's
+    FINISHED_BD (rx_fin). The pair: the relaying core's own LOCK_1_REL stamps (own_first, the core tile's timer) and its
+    south neighbour's (south_first, that tile's timer), all relative to g0; own_after_fin (one timer when the
+    receiver relays itself); d_down {south stamp - own stamp: pairs}; with the north fill, d_up {(0,3) stamp - (0,2)
+    stamp: pairs} of the fill's pair (the other direction). `invalid` lists what the run lacks."""
+    r = {"g0": None, "rx_fin": None, "own_first": None, "south_first": None, "own_after_fin": None,
+         "d_down": {}, "d_up": {}, "invalid": []}
+    by: dict = {}
+    for e in events:
+        if e.pkt_type == PT_MEM:
+            by.setdefault((e.row, e.name), set()).add(e.ts)
+    stalls = _runs(by.get((FETCH_ROW, "DMA_MM2S_0_STALLED_LOCK"), []))
+    if not stalls:
+        r["invalid"].append("no head wait (no MM2S STALLED_LOCK run)")
+        return r
+    g0 = r["g0"] = stalls[0][1] + 1
+    rrow, crow = CHAIN_RECEIVER_ROW[c.receiver], c.rx_core_row
+    fins = sorted(by.get((rrow, "DMA_S2MM_0_FINISHED_BD"), []))
+    if fins:
+        r["rx_fin"] = fins[0] - g0
+    else:
+        r["invalid"].append(f"receiver S2MM ({rrow}): no FINISHED_BD")
+    own, south = sorted(by.get((crow, "LOCK_1_REL"), [])), sorted(by.get((crow - 1, "LOCK_1_REL"), []))
+    for label, v in (("own", own), ("south", south)):
+        if len(v) != c.rx_pairs:
+            r["invalid"].append(f"{label} pair lock ({crow if label == 'own' else crow - 1}): "
+                                f"LOCK_1_REL x{len(v)}, want {c.rx_pairs} pairs")
+    if own:
+        r["own_first"] = own[0] - g0
+        if fins:
+            r["own_after_fin"] = own[0] - fins[0]
+    if south:
+        r["south_first"] = south[0] - g0
+    if own and len(own) == len(south):
+        for a, b in zip(own, south):
+            r["d_down"][b - a] = r["d_down"].get(b - a, 0) + 1
+    if c.receiver == "north" and c.fill:
+        lo, hi = sorted(by.get((FETCH_ROW, "LOCK_0_REL"), [])), sorted(by.get((3, "LOCK_0_REL"), []))
+        if len(hi) != c.fill or len(lo) < c.fill:
+            r["invalid"].append(f"north fill: (0,3) LOCK_0_REL x{len(hi)}, (0,2) x{len(lo)}, want {c.fill}")
+        else:
+            for a, b in zip(lo[-c.fill:], hi):
+                r["d_up"][b - a] = r["d_up"].get(b - a, 0) + 1
+    return r
+
+
+def format_chain_rx_table(rows) -> str:
+    lines = ["case   run      (rel g0, each on its own tile's timer) receiver S2MM fin | pair: own first, south first, "
+             "own - fin | d_down {south - own: pairs} | d_up {(0,3) - (0,2): fill pairs}"]
+    q = lambda v: "-" if v is None else f"{v:+d}"
+    for c, run, r in rows:
+        if r["invalid"]:
+            lines.append(f"{c.name} {run} INVALID: " + "; ".join(r["invalid"]))
+            continue
+        lines.append(f"{c.name} {run} fin {q(r['rx_fin'])} | own {q(r['own_first'])} south {q(r['south_first'])} "
+                     f"own-fin {q(r['own_after_fin'])} | d_down {r['d_down']} | d_up {r['d_up'] or '-'}")
+    return "\n".join(lines)
+
+
+def cmd_chain_rx(args) -> int:
+    out = Path(args.out_dir).resolve()
+    cases = chain_selection(args)
+    chain_check_design_dir(out, cases[0])
+    rows = []
+    for c in cases:
+        if not c.rx_pairs:
+            raise SystemExit("chain-rx needs --rx-pairs (the design's)")
+        for run in args.runs:
+            run_dir = out / c.name / run
+            if not run_dir.is_dir():
+                continue
+            if not (run_dir / "trace_raw.bin").exists() or not (run_dir / "events.json").exists():
+                rows.append((c, run, {"invalid": ["no trace"]}))
+                continue
+            rows.append((c, run, chain_rx_row(load_level_events(run_dir), c)))
+    print(format_chain_rx_table(rows))
+    return 0
+
+
+CHAIN_COMMANDS = {"chain-build": cmd_chain_build, "chain-run": cmd_chain_run, "chain-table": cmd_chain_table,
+                  "chain-rx": cmd_chain_rx}
 
 
 # -- crossing-wake probe (cw-*): what activity keeps a switch from holding a crossing word ---------------------
