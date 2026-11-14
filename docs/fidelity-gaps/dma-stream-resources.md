@@ -2,7 +2,7 @@
 class: dma-stream-resources
 subsystem: DMA engine + stream-switch finite-resource / consumer-pacing modeling
 posture: optimistic-where-strict -- the model assumes generous or infinite resources (deep queues, unbounded token buffers, freely reusable BDs) where silicon is finite and will stall or wedge
-status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; chains of short lock BDs before the waiting BD modelled 2026-11-13: three lock BDs in flight, every earlier release slot, the stall rise from the first granule, 148 / 148 fitted and 41 / 41 held-out silicon rows; open: six lock-free short BDs before the waiting BD and one five-BD row, a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
+status: compute MM2S lock request and grant modelled 2026-11-12 (see "Compute MM2S lock request and grant": 2348 / 2348 silicon rows fit the rule, emulator probe runs 1016 / 1016; chains of short lock BDs before the waiting BD modelled 2026-11-13: three lock BDs in flight, every earlier release slot, the stall rise from the first granule, 148 / 148 fitted and 41 / 41 held-out silicon rows; open: chains of short lock-free BDs (eighth BD at W + 14, egress holds behind long heads, measured 2026-11-13, not modelled) and one five-BD row, a run's first lock BD's grant phase, memtile and shim lock timing unmeasured); MM2S hand-off word moved inside the MM2S and path capacities re-placed 2026-11-11 (see "MM2S hand-off word and path capacities": stall boundary 23 words, port counts 22 / 16, idle absorb 6, every banked race and absorb row EMU == HW); stream buffering and per-hop latency pinned by silicon and modelled 2026-11-04 (see "Stream buffering and latency": R4-D3 data race 25/25, core-core absorb, S2MM backpressure windows, round-trip slope all EMU == HW); open: core-to-core round-trip intercept (+4 cycles per direction), TCT token depth, MM2S first-offer refusal, S2MM starvation until the first word (see "Open timing rows"), memtile strided-BD cost, BD-driven (de)compression data; send/recv port cadence substantially resolved (recv exact); memtile DMA stream-bound (AM020 ch.5, HW 2026-07-15); DMA memory-pressure events driven by the staging FIFOs, both EMU == HW on the measured workloads; MM2S BD retirement modelled 2026-11-10 (a compute / memtile BD finishes when its last word is staged; no source gate before an un-armed S2MM; memtile MM2S staging 29 + 1 fetch cycle modelled 2026-11-10; open: paths into an idle shim from the north +4; next-BD lock pre-acquire modelled for the compute MM2S 2026-11-12)
 ---
 
 # DMA & Stream Resource Gaps
@@ -505,20 +505,30 @@ BD's grant g0 (its STALLED_LOCK falls).
   (before 2026-11-13: 32); the other two (six 1-word lock-free mid BDs, c1n / kn1x6) are where the parked lead and
   the always-bounded fit part (grant release + 2 against + 3).
 - **Still different (open gaps).**
-  - *Six lock-free short BDs before the waiting BD* (families c1n..c4n, kn1x6 / kn4x6; open). Measured: the mids
-    finish as the law says (every 2 cycles; 4-word: 3 5 7 9 11 13 16), but the waiting BD's STALLED_LOCK rises at
-    20 for 1- to 4-word mids (the law: the previous BD's last access - 1, 13 / 13 / 14 / 17), and its grant phase
-    moves with the mid length: Q = 0, 1, 2, 0 mod 3 for 1-, 2-, 3-, 4-word mids (the law's trigger gives 1, 1, 0,
-    2; each design has releases at only two cycles, so only Q mod 3 is fixed). The 64-word BD's finish is
-    grant-limited in every row, so when it starts sequencing is not visible. In all of them the waiting BD is the
-    chain's eighth BD and bd_id 7; a seven-BD chain (kn4x5) rises as the law says, so it is a step at the eighth BD
-    or at bd_id 7, which the rows cannot separate. One more row is off: five 4-word mids with A released at 46
-    (kn4x5 t2) is granted at 49 (Q = 1 mod 3; the law gives 48). A trigger fitted to those residues (the sequencer
-    free to start the previous BD) was refuted by held-out rows. Pinned at the emulator's own cycles
-    (`lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles`). Needs: the six-BD lock-free chain with
-    the waiting BD's bd_id pinned low against 7, and bd_id 7 at a shallow depth (`gen_dma_lock_probe.py chain-build
-    --bd-ids`), A released early (the clock-limited finish shows the sequencing start) and late over three
-    consecutive cycles (Q mod 3).
+  - *Chains of short lock-free BDs: chain depth and egress hold* (families c1n..c4n, kn1x6 / kn4x6 and the depth
+    probes, `gen_dma_lock_probe.py chain-build` with `--bd-ids`, `--fill`, `--receiver`, the S2MM's
+    STREAM_STARVATION traced; open, measured 2026-11-13, not modelled). Measured on silicon:
+    - the stream leaves the MM2S one word per cycle with exactly one idle cycle after each BD (the receiving S2MM's
+      starvation level, every chain shape, every run), never interrupted by the late accesses below;
+    - the eighth BD of a lock-free chain (chain position 7, not bd_id 7) starts sequencing at W + 14 behind a W-word
+      head (18 / 22 / 30 / 38 for W = 4 / 8 / 16 / 24: STALLED_LOCK at start + 2, clock-limited FINISHED_BD at
+      start + 65), and every later position two cycles after the one before behind 1-word BDs (20, 22 behind a
+      4-word head; 32, 34 behind a 16-word head): the start follows the port timeline of the BD seven positions
+      back, not its FINISHED_BD;
+    - behind a long head the mids' accesses are held although the port keeps pace: a 16-word head puts six 1- or
+      2-word mids' FINISHED_BDs at 8 10 12 14 17 25 (the law: .. 16 18), an 8-word head the sixth at 17, a 24-word
+      head the fourth to sixth at 21 25 33, and 5-word mids behind a 12- / 16-word head at 17 26 32 38 / 21 30 36;
+    - the waiting BD's lock request is made exactly at its start behind 1-word mids (early grants at the start in
+      every such design), one cycle later per extra mid word (behind six 2- / 4-word mids: start + 1 / + 3; the set-5
+      grant phases 0 / 1 / 2 / 0 mod 3 for 1- to 4-word mids);
+    - with the stream sent to the S2MM one tile north, the BD-level holds (the sixth mid, the waiting BD's start and
+      grant) come exactly one cycle later and the mid-drain one (the fifth mid) does not move.
+    The emulator holds the eighth BD to FINISHED_BD(p - 7) + 15 nowhere (that form is refuted by the head length)
+    and none of the egress holds; its rows are pinned in
+    `lock_free_chains_outside_the_law_keep_the_emulators_pinned_cycles`. A five-BD row (kn4x5 t2: granted at 49, the
+    law 48) and the position-6 grant phase it shows stay open as well. Candidate structure under test (not yet
+    adopted): an egress counted in granule slots and a BD queue freed after the BD's last word has gone downstream;
+    the route term is being measured (receivers one, two and three tiles north).
   - *A run's first lock BD* (**modelled** 2026-11-13). Probe: the first-BD lock-fetch design with START_TASK in
     the memory-module trace and the release moved one cycle at a time (`fetch-build --start-task`, 6 cases, 5 runs
     each). Silicon grants it at release + 3 exactly when (release - START_TASK) mod 3 = 1, at + 2 on the other two
