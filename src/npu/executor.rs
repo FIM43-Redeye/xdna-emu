@@ -89,32 +89,14 @@ pub(crate) enum ExecutorState {
         /// Mask to apply before comparison.
         mask: u32,
     },
-    /// Post-sync settling period.
-    ///
-    /// Two effects can overlap here, both fired by the same state since
-    /// they both happen between "channel observed idle" and "next
-    /// instruction can issue":
-    ///
-    /// 1. **Stream switch flush** (`STREAM_FLUSH_CYCLES`, 4 cyc, every
-    ///    sync). Control packet data may still be in-transit through
-    ///    the stream switch when the sync completes (sync only confirms
-    ///    the shim DMA finished sending). Firmware instruction latency
-    ///    gives the switch time to deliver data before follow-up writes
-    ///    take effect.
-    /// 2. **Firmware mailbox roundtrip** (default 8000 cyc, configurable
-    ///    via `XDNA_EMU_MAILBOX_LATENCY`). Per-batch model: charged ONCE
-    ///    per runtime sequence on the first dma_wait, then subsequent
-    ///    syncs pipeline through the firmware mailbox queue at zero
-    ///    mailbox cost. Phase B measured ~8000 cyc for an isolated
-    ///    single-sync; kernels with 160+ syncs do not pay 1.28M cyc on
-    ///    HW, so the per-batch cap is the only model consistent with
-    ///    both regimes. See
-    ///    `xdna-emu-priv: research/findings/2026-05-11-emu-dma-wait-mailbox-latency.md`.
+    /// The rest of a resolved sync's wait: the controller resumes when it
+    /// drains (`SyncWaitModel`, decided in `NpuExecutor::sync_charge`). The
+    /// array keeps running, so stream data in flight when the sync resolved
+    /// reaches its tiles before the next operation.
     FlushingStreams {
         /// Index of the NEXT instruction to execute after flush.
         next_index: usize,
-        /// Remaining cycles before resuming. u32 supports the mailbox
-        /// component's ~8000 cyc upper end without overflow.
+        /// Remaining cycles before resuming.
         remaining: u32,
     },
     /// The controller is busy with an operation it has issued (its class
@@ -208,11 +190,8 @@ pub struct NpuExecutor {
     /// controller looked (`None` until the sequence's first operation). The
     /// tokens issued since are the ones it has not yet serviced.
     tokens_seen: Option<u64>,
-    /// Whether the firmware mailbox setup cost has been charged for this
-    /// runtime sequence yet. Per-batch model: pay once on the first sync
-    /// (~8000 cyc when enabled), then pipeline subsequent syncs at just
-    /// the stream-flush cost (4 cyc). Reset by `load_instructions`.
-    mailbox_charged: bool,
+    /// What a sync's wait costs, from the lateness of its token.
+    sync_wait: super::SyncWaitModel,
 
     /// Executor-local cycle counter (array cycles), incremented once per
     /// `try_advance` call. Reset by `load_instructions`.
@@ -232,7 +211,7 @@ impl NpuExecutor {
             cycle_model: super::CycleCostModel::default(),
             to_array: crate::timebase::FirmwareToArray::new(super::CycleCostModel::default().clocks),
             tokens_seen: None,
-            mailbox_charged: false,
+            sync_wait: super::SyncWaitModel::default(),
             npu_cycle: 0,
         }
     }
@@ -240,6 +219,7 @@ impl NpuExecutor {
     /// Replace the operation-class cost model (and its clocks).
     pub fn set_cycle_model(&mut self, model: super::CycleCostModel) {
         self.to_array = crate::timebase::FirmwareToArray::new(model.clocks);
+        self.sync_wait = super::SyncWaitModel::npu1(model.clocks);
         self.cycle_model = model;
     }
 
@@ -493,9 +473,6 @@ impl NpuExecutor {
 
     /// Load instructions directly (for testing or internal use).
     pub fn load_instructions(&mut self, instructions: Vec<NpuInstruction>) {
-        // Reset the per-batch mailbox charge so each runtime sequence
-        // pays the firmware setup cost once.
-        self.mailbox_charged = false;
         // Reset the executor's cycle accounting -- each runtime sequence
         // starts fresh.
         self.npu_cycle = 0;
@@ -672,7 +649,7 @@ impl NpuExecutor {
                     // Tokens that arrived during the wait are covered by the
                     // sync's own cost, not serviced one by one.
                     self.absorb_tokens(device);
-                    let charge = self.sync_charge(sync_index, issued_at, self.npu_cycle);
+                    let charge = self.sync_charge(issued_at, self.npu_cycle);
                     self.state = ExecutorState::FlushingStreams { next_index, remaining: charge };
                     AdvanceResult::Progressed
                 } else {
@@ -701,12 +678,8 @@ impl NpuExecutor {
             }
 
             ExecutorState::FlushingStreams { next_index, remaining } => {
-                // Wait for firmware mailbox response + stream switch
-                // in-transit data propagation. Each cycle the caller
-                // runs the routing, delivering any in-transit control
-                // packet data one hop closer to target tiles; meanwhile
-                // we burn the mailbox-roundtrip cycles before the next
-                // host-side instruction can dispatch.
+                // The rest of the sync's wait. Each cycle the caller runs the
+                // array, so in-transit stream data keeps moving meanwhile.
                 if remaining <= 1 {
                     self.absorb_tokens(device);
                     self.state = ExecutorState::Executing { next_index };
@@ -759,33 +732,30 @@ impl NpuExecutor {
     }
 
     /// Array cycles a resolved sync holds the controller after its awaited
-    /// token arrived: the one place a sync's cost is decided.
+    /// token was observed: the one place a sync's cost is decided
+    /// (`SyncWaitModel`, from the token's lateness after the issue).
     ///
     /// `issued_at` is the executor cycle the sync was issued at and
-    /// `token_arrival` the cycle its completion was observed. The current
-    /// model does not use them: it charges the token's stream transit
-    /// (`row` hops of `ROUTE_PER_HOP`) on every sync, plus a one-time
-    /// `XDNA_EMU_MAILBOX_LATENCY` (default 8000) on the sequence's first.
-    /// On silicon the cost depends on how late the token arrives after the
-    /// sync is issued (`docs/fidelity-gaps/host-firmware-dispatch.md`).
-    fn sync_charge(&mut self, sync_index: usize, issued_at: u64, token_arrival: u64) -> u32 {
-        use xdna_archspec::aie2::timing::ROUTE_PER_HOP;
-        const DEFAULT_MAILBOX_CYCLES: u32 = 8000;
-        let _ = (issued_at, token_arrival);
-        let transit_cycles = self
-            .pending_syncs
-            .get(sync_index)
-            .map_or(0, |s| s.row as u32 * ROUTE_PER_HOP as u32);
-        let mailbox_cycles: u32 = std::env::var("XDNA_EMU_MAILBOX_LATENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MAILBOX_CYCLES);
-        if self.mailbox_charged {
-            transit_cycles
+    /// `token_arrival` the cycle its token was observed. The first poll runs
+    /// the cycle after the issue, so a token observed there was already
+    /// waiting (the fast path; its service was charged at the operation
+    /// boundary before the sync). The charge holds the controller in
+    /// `FlushingStreams`, whose last cycle hands over to the next operation:
+    /// the next operation issues `resume_after_issue` cycles after the sync.
+    fn sync_charge(&self, issued_at: u64, token_arrival: u64) -> u32 {
+        use super::TokenWait;
+        let waited = token_arrival.saturating_sub(issued_at);
+        let wait = if waited <= 1 {
+            TokenWait::AlreadyArrived
         } else {
-            self.mailbox_charged = true;
-            mailbox_cycles + transit_cycles
-        }
+            TokenWait::ArrivedAfter(waited)
+        };
+        let resume = self.sync_wait.resume_after_issue(wait);
+        log::debug!(
+            "NPU sync: token after {waited} cycles, {:?}, resume {resume} after issue",
+            self.sync_wait.region(wait)
+        );
+        u32::try_from(resume.saturating_sub(waited + 1).max(1)).unwrap_or(u32::MAX)
     }
 
     /// Execute all instructions in a stream against the device.
@@ -1842,143 +1812,6 @@ mod tests {
         assert!(executor.pending_syncs[1].satisfied, "sync 1 satisfied by its own token");
     }
 
-    /// Per-batch mailbox model: the first dma_wait of a runtime sequence
-    /// pays mailbox + stream-flush; subsequent dma_waits in the same
-    /// sequence pay only stream-flush.
-    ///
-    /// The mailbox constant is XDNA_EMU_MAILBOX_LATENCY (default 8000
-    /// cyc, Phase B measurement). Setting it explicitly lets the test
-    /// be deterministic regardless of caller env.
-    #[test]
-    fn test_sync_resolution_per_batch_mailbox() {
-        // Row-2 transit: 2 hops * ROUTE_PER_HOP (4).
-        const STREAM_FLUSH_CYCLES: u32 = 8;
-        const TEST_MAILBOX: u32 = 200; // distinctive non-default value
-
-        // SAFETY: set_var/remove_var are unsafe in the 2024 edition;
-        // no other test touches XDNA_EMU_MAILBOX_LATENCY.
-        unsafe { std::env::set_var("XDNA_EMU_MAILBOX_LATENCY", TEST_MAILBOX.to_string()) };
-
-        let mut executor = NpuExecutor::new();
-        // Two pending syncs both ready to fire.
-        for _ in 0..2 {
-            executor.pending_syncs.push(PendingSync {
-                column: 1,
-                row: 2,
-                channel: 0,
-                direction: 1,
-                started: true,
-                satisfied: false,
-            });
-        }
-        executor.instructions = Vec::new();
-        let mut host_mem = HostMemory::new();
-        let mut device = DeviceState::new_npu1();
-
-        // ---- First sync: pays mailbox + stream-flush ----
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
-        let _ = executor.try_advance(&mut device, &mut host_mem);
-        let first_remaining = match executor.state {
-            ExecutorState::FlushingStreams { remaining, .. } => remaining,
-            ref other => panic!("expected FlushingStreams after first sync, got {:?}", other),
-        };
-        assert_eq!(
-            first_remaining,
-            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
-            "first sync should pay mailbox ({}) + stream_flush ({}) = {}",
-            TEST_MAILBOX,
-            STREAM_FLUSH_CYCLES,
-            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
-        );
-        // Drain.
-        while matches!(executor.state, ExecutorState::FlushingStreams { .. }) {
-            let _ = executor.try_advance(&mut device, &mut host_mem);
-        }
-
-        // ---- Second sync: stream-flush only ----
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 1, issued_at: 0 };
-        let _ = executor.try_advance(&mut device, &mut host_mem);
-        let second_remaining = match executor.state {
-            ExecutorState::FlushingStreams { remaining, .. } => remaining,
-            ref other => panic!("expected FlushingStreams after second sync, got {:?}", other),
-        };
-        assert_eq!(
-            second_remaining, STREAM_FLUSH_CYCLES,
-            "second sync should pay only stream_flush ({}); mailbox already charged",
-            STREAM_FLUSH_CYCLES,
-        );
-
-        // ---- load_instructions resets the per-batch flag ----
-        executor.load_instructions(Vec::new());
-        executor.pending_syncs.push(PendingSync {
-            column: 1,
-            row: 2,
-            channel: 0,
-            direction: 1,
-            started: true,
-            satisfied: false,
-        });
-        executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
-        let _ = executor.try_advance(&mut device, &mut host_mem);
-        let reset_remaining = match executor.state {
-            ExecutorState::FlushingStreams { remaining, .. } => remaining,
-            ref other => panic!("expected FlushingStreams after reset+sync, got {:?}", other),
-        };
-        assert_eq!(
-            reset_remaining,
-            TEST_MAILBOX + STREAM_FLUSH_CYCLES,
-            "load_instructions should reset mailbox_charged so the next batch pays full mailbox",
-        );
-
-        unsafe { std::env::remove_var("XDNA_EMU_MAILBOX_LATENCY") };
-    }
-
-    /// Phase 3 (TCT): the per-sync stream-transit charge EMERGES from the
-    /// producing tile's distance to the shim -- `transit = row * ROUTE_PER_HOP`
-    /// -- rather than a flat constant. A TCT routes `row` hops down the column
-    /// to the firmware at the shim (row 0), one external->external crossing
-    /// (4 cy) per hop. A row-2 compute tile charges 8 (covered by
-    /// `test_sync_resolution_per_batch_mailbox`); a mem tile (row 1) charges 4
-    /// and a deeper compute row (row 3) charges 12.
-    #[test]
-    fn test_sync_transit_charge_scales_with_row() {
-        use crate::device::host_memory::HostMemory;
-        use crate::device::DeviceState;
-
-        // Per-hop stream-switch latency (xdna_archspec::aie2::timing::ROUTE_PER_HOP).
-        const HOP_LATENCY: u32 = 4;
-
-        for (row, expected) in [(1u8, HOP_LATENCY), (3u8, 3 * HOP_LATENCY)] {
-            let mut executor = NpuExecutor::new();
-            // Skip the one-time firmware cold-start mailbox charge so the
-            // FlushingStreams cost is transit-only.
-            executor.mailbox_charged = true;
-            executor.instructions = Vec::new();
-            executor.pending_syncs.push(PendingSync {
-                column: 1,
-                row,
-                channel: 0,
-                direction: 1,
-                started: true, // idle channel + started -> fallback-satisfied
-                satisfied: false,
-            });
-            let mut host_mem = HostMemory::new();
-            let mut device = DeviceState::new_npu1();
-
-            executor.state = ExecutorState::BlockedOnSync { next_index: 0, sync_index: 0, issued_at: 0 };
-            let _ = executor.try_advance(&mut device, &mut host_mem);
-            let remaining = match executor.state {
-                ExecutorState::FlushingStreams { remaining, .. } => remaining,
-                ref other => panic!("expected FlushingStreams after sync (row {}), got {:?}", row, other),
-            };
-            assert_eq!(
-                remaining, expected,
-                "row {} sync should charge transit = row * {} = {} cy (emergent, not flat)",
-                row, HOP_LATENCY, expected,
-            );
-        }
-    }
-
     // -----------------------------------------------------------------------
     // MaskPoll graceful-termination tests (spec §4.2, debug_halt_probe)
     //
@@ -2460,9 +2293,6 @@ mod tests {
             let (mut device, mut host_mem) = pacing_device();
             let mut executor = NpuExecutor::new();
             executor.load_instructions(stream.clone());
-            // Past the one-time first-sync charge, whose size another test varies
-            // through the environment.
-            executor.mailbox_charged = true;
             let mut issued = Vec::new();
             let mut last_count = 0;
             for _ in 0..200_000 {
@@ -2484,5 +2314,75 @@ mod tests {
             panic!("stream did not finish");
         };
         assert_eq!(run(true), run(false), "a token absorbed by the wait adds no service time");
+    }
+
+    /// Run `stream`, issuing a token on shim (1,0) S2MM 0 `x` cycles after the
+    /// k-th sync issues (k = 0, 1, ...), and return the issue cycles.
+    fn issue_cycles_with_late_tokens(stream: Vec<NpuInstruction>, x: u64) -> Vec<u64> {
+        let (mut device, mut host_mem) = pacing_device();
+        let mut executor = NpuExecutor::new();
+        executor.load_instructions(stream.clone());
+        let mut issued: Vec<u64> = Vec::new();
+        let mut due: Vec<u64> = Vec::new();
+        let mut last_count = 0;
+        for _ in 0..2_000_000 {
+            if due.first() == Some(&executor.npu_cycle) {
+                due.remove(0);
+                device.array.dma_engine_mut(1, 0).unwrap().issue_task_token(0, 0);
+            }
+            let r = executor.try_advance(&mut device, &mut host_mem);
+            if executor.executed_count() > last_count {
+                last_count = executor.executed_count();
+                issued.push(executor.npu_cycle);
+                if matches!(stream[last_count - 1], NpuInstruction::Sync { .. }) {
+                    due.push(executor.npu_cycle + x);
+                }
+            }
+            if matches!(r, AdvanceResult::Done) {
+                return issued;
+            }
+        }
+        panic!("stream did not finish");
+    }
+
+    fn shim_s2mm0_sync() -> NpuInstruction {
+        NpuInstruction::Sync { channel: 0, column: 0, direction: 0, column_num: 1, row: 0, row_num: 1 }
+    }
+
+    /// A sync whose token arrives 3000 cycles after its issue resumes the
+    /// controller on the cold plateau, about 9540 cycles after the issue
+    /// (silicon: bridge corpus single-sync tails, dedicated probes).
+    #[test]
+    fn a_sync_after_a_late_token_costs_the_measured_plateau() {
+        let stream = vec![scratch_write(), shim_s2mm0_sync(), scratch_write(), scratch_write()];
+        let issued = issue_cycles_with_late_tokens(stream, 3000);
+        let resume = (issued[2] - issued[1]) as f64;
+        assert!((resume - 9540.0).abs() <= 3.0, "sync issue to next op {resume}");
+    }
+
+    /// Every wait gets the first-wait structure: no one-time charge on the
+    /// first sync, nothing cheaper on later ones.
+    #[test]
+    fn every_sync_costs_the_same_level_for_the_same_lateness() {
+        let stream =
+            vec![scratch_write(), shim_s2mm0_sync(), scratch_write(), shim_s2mm0_sync(), scratch_write()];
+        let issued = issue_cycles_with_late_tokens(stream, 3000);
+        assert_eq!(issued[2] - issued[1], issued[4] - issued[3], "first and second sync");
+    }
+
+    /// A token that arrived before the sync's issue is serviced once at the
+    /// operation boundary and the sync then takes its fast path: about 3000
+    /// cycles in total, the silicon level for a sync on a finished task.
+    #[test]
+    fn a_sync_on_an_arrived_token_charges_the_token_once() {
+        let stream = vec![scratch_write(), shim_s2mm0_sync(), scratch_write(), scratch_write()];
+        let plain: Vec<NpuInstruction> = vec![scratch_write(); 4];
+        let base = issue_cycles_with_token_at(plain, u64::MAX);
+        let issued = issue_cycles_with_token_at(stream, base[0] + 10);
+        // Write, token service at the boundary, then the sync's fast path.
+        let total = (issued[2] - issued[0]) as f64;
+        assert!((total - (104.5 + 3000.0)).abs() <= 3.0, "write + token + sync {total}");
+        let sync_alone = (issued[2] - issued[1]) as f64;
+        assert!((sync_alone - 700.0).abs() <= 3.0, "the sync's own fast path {sync_alone}");
     }
 }

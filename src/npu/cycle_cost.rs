@@ -17,9 +17,11 @@
 //! operations (not waiting in a sync) is serviced once, at the next
 //! operation boundary, at [`TOKEN_SERVICE`].
 //!
-//! A sync's cost is not an operation-class cost: it is decided in one place,
-//! `NpuExecutor::sync_charge`, from the sync's issue time and the arrival of
-//! the token it awaits.
+//! A sync's cost is not an operation-class cost: it depends on how late its
+//! token arrives after the sync is issued (`super::sync_wait`, applied in
+//! `NpuExecutor::sync_charge`). A token that arrived before the sync was
+//! issued has had its service here already; the sync's fast path does not
+//! charge it again.
 
 use super::parser::NpuInstruction;
 use crate::timebase::ClockPair;

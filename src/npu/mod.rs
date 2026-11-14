@@ -24,6 +24,7 @@
 
 mod classify;
 mod cycle_cost;
+mod sync_wait;
 mod parser;
 mod executor;
 
@@ -31,6 +32,7 @@ pub use classify::{
     classify_bytes, classify_kernargs, classify_with_topology, KernargClassification, KernargRole,
 };
 pub use cycle_cost::CycleCostModel;
+pub use sync_wait::{SyncWaitModel, TokenWait, WaitRegion};
 pub use parser::{NpuInstruction, NpuInstructionStream};
 pub use executor::{NpuExecutor, HostBuffer, AdvanceResult};
 
