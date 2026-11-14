@@ -41,6 +41,7 @@ ending. The trace carrier's S2MM BD is oversized and never awaited, as in every 
     python3 tools/gen_shim_cold_probe.py build OUT_DIR [--cases a16d0 ...] [--set priority|rest]
     python3 tools/gen_shim_cold_probe.py run OUT_DIR TAG --backend hw|emu [--cases ...]
     python3 tools/gen_shim_cold_probe.py table OUT_DIR RUN [RUN ...] [--cases ...]
+    python3 tools/gen_shim_cold_probe.py bounds OUT_DIR [--cases ...] [--set priority|rest]
     python3 tools/gen_shim_cold_probe.py session [--set priority|rest]
 
 The emulator backend and library are the caller's choice (environment). `run --backend hw` removes
@@ -894,6 +895,29 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_bounds(args) -> int:
+    """Device-free bounds pre-flight of built cases: the runner's own sizing of every host buffer must equal
+    what the case needs, and every shim DMA task must lie inside its buffer. Prints each case's buffers and
+    tasks; exit status 1 if any case fails (or is not built)."""
+    out = Path(args.out_dir).resolve()
+    bad = 0
+    for case in _chosen(args.cases, args.set):
+        insts = out / case.name / "insts.bin"
+        if not insts.exists():
+            print(f"{case.name}: NOT BUILT")
+            bad += 1
+            continue
+        want = expected_arg_bytes(case)
+        got = runner_arg_sizes(insts)
+        rc, report = bounds_lines(insts, want)
+        ok = got == want and rc == 0
+        bad += not ok
+        print(f"{case.name}: {'ok' if ok else 'FAIL'} buffers {want}" + ("" if got == want else f" (runner sizes {got})"))
+        print("".join(f"    {ln}\n" for ln in report.splitlines()), end="")
+    print("ALL OK" if not bad else f"{bad} FAILED")
+    return 1 if bad else 0
+
+
 def cmd_cases(args) -> int:
     for c in default_cases():
         pr = predict(c)
@@ -925,11 +949,15 @@ def main(argv=None) -> int:
     t.add_argument("out_dir")
     t.add_argument("runs", nargs="+", help="run directory names, e.g. h1.hw e1.emu")
     t.add_argument("--cases", nargs="*", default=[])
+    k = sub.add_parser("bounds")
+    k.add_argument("out_dir")
+    k.add_argument("--cases", nargs="*", default=[])
+    k.add_argument("--set", choices=("priority", "rest"), default=None)
     s = sub.add_parser("session")
     s.add_argument("--set", choices=("priority", "rest"), default="priority")
     args = ap.parse_args(argv)
     return {"cases": cmd_cases, "build": cmd_build, "run": cmd_run, "table": cmd_table,
-            "session": cmd_session}[args.cmd](args)
+            "bounds": cmd_bounds, "session": cmd_session}[args.cmd](args)
 
 
 if __name__ == "__main__":
