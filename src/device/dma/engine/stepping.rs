@@ -42,18 +42,39 @@ fn word_opens_granule(last: Option<u64>, addr: u64, granule: u64) -> bool {
     }
 }
 
+/// Where a shim DMA address lands in host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShimHostAddress {
+    /// A host address (mapped or not; the IOMMU model judges unmapped ones).
+    Host(u64),
+    /// An AIE address below the DDR aperture: it has no host address.
+    OutsideAperture,
+}
+
 /// Resolve XRT's AIE/NoC DDR view to the registered CPU host mapping.
 ///
 /// Non-ELF instruction streams already carry host-view addresses, so an exact
 /// mapping wins; XRT-patched ELF addresses use the fixed AIE DDR bias.
-fn resolve_shim_host_address(host_memory: &HostMemory, address: u64, len: usize) -> u64 {
+///
+/// With the IOMMU model on, an address that neither view maps and that lies
+/// below `DDR_AIE_ADDR_OFFSET` is an AIE address with no host address (host =
+/// AIE - offset), such as the raw base of a BD no DDR patch touched. Without the
+/// model the memory is flat test memory with no host map, and low addresses stay
+/// host ones.
+fn resolve_shim_host_address(host_memory: &HostMemory, address: u64, len: usize) -> ShimHostAddress {
     if host_memory.contains_range(address, len) {
-        return address;
+        return ShimHostAddress::Host(address);
     }
-    address
+    if let Some(alias) = address
         .checked_sub(crate::device::dma::DDR_AIE_ADDR_OFFSET)
         .filter(|candidate| host_memory.contains_range(*candidate, len))
-        .unwrap_or(address)
+    {
+        return ShimHostAddress::Host(alias);
+    }
+    if host_memory.iommu_guard() && address < crate::device::dma::DDR_AIE_ADDR_OFFSET {
+        return ShimHostAddress::OutsideAperture;
+    }
+    ShimHostAddress::Host(address)
 }
 
 fn dma_access_origin(target: MemTileTarget) -> AccessOrigin {
@@ -2694,8 +2715,28 @@ impl DmaEngine {
                 if !self.read_window_has_room(channel) {
                     return TransferResult::stalled();
                 }
-                let addr = resolve_shim_host_address(host_memory, addr, bytes);
-                if self.transfer_host_to_stream(addr, bytes, channel, is_last, tlast_suppress, host_memory) {
+                let ok = match resolve_shim_host_address(host_memory, addr, bytes) {
+                    ShimHostAddress::Host(addr) => self.transfer_host_to_stream(
+                        addr,
+                        bytes,
+                        channel,
+                        is_last,
+                        tlast_suppress,
+                        host_memory,
+                    ),
+                    ShimHostAddress::OutsideAperture => {
+                        host_memory.record_outside_aperture(addr, bytes as u64, false);
+                        self.transfer_host_to_stream(
+                            addr,
+                            bytes,
+                            channel,
+                            is_last,
+                            tlast_suppress,
+                            &HostMemory::new(),
+                        )
+                    }
+                };
+                if ok {
                     TransferResult::success()
                 } else {
                     TransferResult::failure()
@@ -2703,8 +2744,20 @@ impl DmaEngine {
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::HostMemory) => {
                 // Shim S2MM: Read from stream input, write to host DDR
-                let addr = resolve_shim_host_address(host_memory, addr, bytes);
-                let result = self.transfer_stream_to_host(addr, bytes, channel, host_memory);
+                let result = match resolve_shim_host_address(host_memory, addr, bytes) {
+                    ShimHostAddress::Host(addr) => {
+                        self.transfer_stream_to_host(addr, bytes, channel, host_memory)
+                    }
+                    ShimHostAddress::OutsideAperture => {
+                        // The words leave the stream as for any write; they reach no memory.
+                        let result =
+                            self.transfer_stream_to_host(addr, bytes, channel, &mut HostMemory::new());
+                        if result.bytes_written > 0 {
+                            host_memory.record_outside_aperture(addr, result.bytes_written as u64, true);
+                        }
+                        result
+                    }
+                };
                 if result.stall {
                     // No stream data available - stall (not an error)
                     return TransferResult::stalled();
@@ -4039,14 +4092,119 @@ impl DmaEngine {
 #[cfg(test)]
 mod shim_host_address_tests {
     use super::*;
+    use crate::device::dma::DDR_AIE_ADDR_OFFSET;
+    use crate::device::host_memory::BlockedAccess;
+    use crate::device::tile::Tile;
 
     #[test]
     fn resolves_xrt_aie_ddr_alias_without_changing_host_view_addresses() {
         let mut host_memory = HostMemory::new();
         host_memory.allocate_region("buffer", 0x6400_0000, 0x1000).unwrap();
 
-        assert_eq!(resolve_shim_host_address(&host_memory, 0x6400_0020, 4), 0x6400_0020);
-        assert_eq!(resolve_shim_host_address(&host_memory, 0xe400_0020, 4), 0x6400_0020);
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, 0x6400_0020, 4),
+            ShimHostAddress::Host(0x6400_0020)
+        );
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, 0xe400_0020, 4),
+            ShimHostAddress::Host(0x6400_0020)
+        );
+    }
+
+    fn guarded_ffi_like() -> HostMemory {
+        let mut host_memory = HostMemory::new();
+        host_memory.allocate_region("buffer", 0x8000_4000_0000, 0x1000).unwrap();
+        host_memory.set_iommu_guard(true);
+        host_memory
+    }
+
+    /// An unpatched BD base such as 0x400 is an AIE address below the DDR aperture: it has no
+    /// host address, so under the IOMMU model it must not be read as host VA 0x400.
+    #[test]
+    fn an_unmapped_address_below_the_ddr_aperture_reaches_no_host_memory() {
+        let host_memory = guarded_ffi_like();
+        assert_eq!(resolve_shim_host_address(&host_memory, 0x400, 4), ShimHostAddress::OutsideAperture);
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, DDR_AIE_ADDR_OFFSET - 4, 4),
+            ShimHostAddress::OutsideAperture
+        );
+    }
+
+    /// Above the aperture an unmapped address is still a host access, which the IOMMU model
+    /// blocks and reports; mapped addresses resolve as before.
+    #[test]
+    fn above_the_aperture_unmapped_stays_a_host_access_and_mapped_resolves() {
+        let host_memory = guarded_ffi_like();
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, 0x8000_4000_1000, 4),
+            ShimHostAddress::Host(0x8000_4000_1000)
+        );
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, 0x8000_4000_0010, 4),
+            ShimHostAddress::Host(0x8000_4000_0010)
+        );
+        assert_eq!(
+            resolve_shim_host_address(&host_memory, 0x8000_4000_0010 + DDR_AIE_ADDR_OFFSET, 4),
+            ShimHostAddress::Host(0x8000_4000_0010)
+        );
+    }
+
+    /// Without the IOMMU model the memory is flat test memory with no host map, so there is no
+    /// aperture to be outside of: low addresses stay host addresses.
+    #[test]
+    fn without_the_iommu_model_a_low_address_stays_flat_host_memory() {
+        let host_memory = HostMemory::new();
+        assert_eq!(resolve_shim_host_address(&host_memory, 0x400, 4), ShimHostAddress::Host(0x400));
+    }
+
+    /// Drive a shim S2MM BD of 16 words at `base` and return the host memory afterwards.
+    fn shim_s2mm_16_words_at(base: u64) -> HostMemory {
+        let mut host_memory = guarded_ffi_like();
+        let mut engine = DmaEngine::new_shim_tile(1, 0);
+        let mut tile = Tile::shim(1, 0);
+        engine.configure_bd(0, BdConfig::simple_1d(base, 64)).unwrap();
+        engine.start_channel(0, 0).unwrap();
+        let mut fed = 0u32;
+        for _ in 0..5000 {
+            if fed < 16 && engine.can_accept_stream_in_for_channel(0) {
+                let data = StreamData { data: 0xA000_0000 | fed, tlast: fed == 15, channel: 0 };
+                if engine.push_stream_in(data) {
+                    fed += 1;
+                }
+            } else if !engine.can_accept_stream_in_for_channel(0) {
+                engine.consume_bd_switch_accept_block(0);
+            }
+            engine.submit_lock_requests(&mut tile, &mut NeighborTiles::empty());
+            tile.resolve_lock_requests(0);
+            engine.step(&mut tile, &mut NeighborTiles::empty(), &mut host_memory);
+            if fed == 16 && !engine.channel_active(0) {
+                break;
+            }
+        }
+        assert_eq!(fed, 16, "the channel takes all 16 words");
+        assert!(!engine.channel_active(0), "the BD completes");
+        host_memory
+    }
+
+    /// The S2MM consumes the words and completes; nothing is written and nothing counts as an
+    /// IOMMU fault, but the access is recorded as outside the aperture.
+    #[test]
+    fn a_shim_s2mm_below_the_aperture_completes_without_a_host_fault() {
+        let host_memory = shim_s2mm_16_words_at(0x400);
+        assert_eq!(host_memory.blocked_record_count(), 0, "no IOMMU fault");
+        assert_eq!(
+            host_memory.outside_aperture_accesses_since(0),
+            vec![BlockedAccess { address: 0x400, len: 64, write: true }]
+        );
+        assert_eq!(host_memory.outside_aperture_bytes(), 64);
+    }
+
+    /// Control: the same BD at an unmapped address above the aperture is a real host fault.
+    #[test]
+    fn a_shim_s2mm_above_the_aperture_off_every_buffer_is_still_a_host_fault() {
+        let host_memory = shim_s2mm_16_words_at(0x8000_5000_0000);
+        assert_eq!(host_memory.blocked_totals().0, 64);
+        assert_eq!(host_memory.outside_aperture_bytes(), 0);
     }
 }
 

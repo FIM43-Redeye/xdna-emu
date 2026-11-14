@@ -573,6 +573,9 @@ fn report_host_faults(tracker: &crate::host_faults::HostFaultTracker, engine: &I
         log::error!("{line}");
         eprintln!("{line}");
     }
+    if let Some(line) = tracker.aperture_summary(engine) {
+        log::warn!("{line}");
+    }
 }
 
 fn build_engine_signals(engine: &InterpreterEngine) -> xdna_emu_core::device::tdr::EngineSignals {

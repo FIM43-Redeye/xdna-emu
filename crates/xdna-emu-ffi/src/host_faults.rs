@@ -40,6 +40,8 @@ pub struct HostFaultTracker {
     seen: usize,
     logged: usize,
     first: Option<(BlockedAccess, Option<Attribution>)>,
+    start_aperture_records: usize,
+    start_aperture_bytes: u64,
 }
 
 impl HostFaultTracker {
@@ -51,6 +53,8 @@ impl HostFaultTracker {
             start_records: records,
             start_bytes: mem.blocked_totals().0,
             seen: records,
+            start_aperture_records: mem.outside_aperture_record_count(),
+            start_aperture_bytes: mem.outside_aperture_bytes(),
             ..Self::default()
         }
     }
@@ -85,6 +89,36 @@ impl HostFaultTracker {
             self.seen - self.start_records,
             if dropped > 0 { format!(" (and {dropped} runs not kept)") } else { String::new() },
             describe(first, who.as_ref())
+        ))
+    }
+}
+
+impl HostFaultTracker {
+    /// The end-of-run line for shim DMA accesses at AIE addresses below the DDR aperture, if any.
+    ///
+    /// These are not IOMMU faults (they have no host address), so the line does not carry
+    /// `HOST_FAULT_MARKER`; it names the first one so an unpatched BD is easy to find.
+    pub fn aperture_summary(&self, engine: &InterpreterEngine) -> Option<String> {
+        let mem = engine.host_memory();
+        let first = mem
+            .outside_aperture_accesses_since(self.start_aperture_records)
+            .into_iter()
+            .next()?;
+        let who = attribute(engine, &first);
+        let what = if first.write { "write" } else { "read" };
+        let by = match who {
+            Some(a) => {
+                format!("shim tile ({}, {}) {} BD {} (base 0x{:x})", a.col, a.row, a.channel, a.bd, a.bd_base)
+            }
+            None => "a shim DMA".to_string(),
+        };
+        Some(format!(
+            "host memory: {} bytes of shim DMA access at AIE addresses below the DDR aperture (0x{:x}) reached \
+             no host memory (not an IOMMU fault); first: {by} {what} of {} bytes at 0x{:x}",
+            mem.outside_aperture_bytes() - self.start_aperture_bytes,
+            xdna_emu_core::device::dma::DDR_AIE_ADDR_OFFSET,
+            first.len,
+            first.address
         ))
     }
 }
@@ -187,6 +221,30 @@ mod tests {
             assert!(tracker.summary(engine).is_some());
             let fresh = HostFaultTracker::new(engine);
             assert!(fresh.summary(engine).is_none(), "a new run starts with nothing to report");
+            xdna_emu_destroy(h);
+        }
+    }
+
+    /// A shim access below the DDR aperture is reported on its own line, never as a host fault.
+    #[test]
+    fn an_access_below_the_aperture_is_not_a_host_fault() {
+        unsafe {
+            let h = xdna_emu_create();
+            assert!(!h.is_null());
+            let handle = &mut *h;
+            let engine = handle.backend.as_interpreter_mut().unwrap();
+            let tracker = HostFaultTracker::new(engine);
+            assert!(tracker.aperture_summary(engine).is_none());
+            engine.host_memory().record_outside_aperture(0x400, 64, true);
+            assert!(tracker.summary(engine).is_none(), "no IOMMU fault");
+            let line = tracker.aperture_summary(engine).expect("the aperture line");
+            assert!(!line.contains(HOST_FAULT_MARKER), "{line}");
+            assert!(line.contains("64 bytes"), "{line}");
+            assert!(line.contains("write of 64 bytes at 0x400"), "{line}");
+            assert!(
+                HostFaultTracker::new(engine).aperture_summary(engine).is_none(),
+                "a new run starts clean"
+            );
             xdna_emu_destroy(h);
         }
     }

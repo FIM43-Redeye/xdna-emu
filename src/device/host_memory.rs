@@ -241,6 +241,10 @@ pub struct HostMemory {
 
     /// Accesses the guard blocked; interior mutability because reads are `&self`.
     blocked: RefCell<BlockedLog>,
+
+    /// Shim DMA accesses at AIE addresses below the DDR aperture, which have no
+    /// host address and so never reach this memory (see `record_outside_aperture`).
+    outside_aperture: RefCell<BlockedLog>,
 }
 
 impl HostMemory {
@@ -259,6 +263,7 @@ impl HostMemory {
             total_bytes_written: 0,
             iommu_guard: false,
             blocked: RefCell::new(BlockedLog::default()),
+            outside_aperture: RefCell::new(BlockedLog::default()),
         }
     }
 
@@ -287,6 +292,34 @@ impl HostMemory {
     pub fn blocked_totals(&self) -> (u64, u64) {
         let log = self.blocked.borrow();
         (log.total_bytes, log.dropped_records)
+    }
+
+    /// Record a shim DMA access whose AIE address lies below the DDR aperture.
+    ///
+    /// The shim addresses host memory through an aperture: host address = AIE
+    /// address - `DDR_AIE_ADDR_OFFSET`, the offset firmware (for the first host
+    /// arguments) and XRT add when they put a buffer address into a BD. An
+    /// address below the offset has no host address, so the access is no host
+    /// access and no IOMMU fault. Where such an access goes is not measured; the
+    /// emulator drops a write and returns zeros for a read.
+    pub fn record_outside_aperture(&self, address: u64, len: u64, write: bool) {
+        self.outside_aperture.borrow_mut().record(address, len, write);
+    }
+
+    /// Number of outside-aperture records so far (merged runs, capped).
+    pub fn outside_aperture_record_count(&self) -> usize {
+        self.outside_aperture.borrow().records.len()
+    }
+
+    /// Outside-aperture records from index `from` on.
+    pub fn outside_aperture_accesses_since(&self, from: usize) -> Vec<BlockedAccess> {
+        let log = self.outside_aperture.borrow();
+        log.records.get(from..).map(<[BlockedAccess]>::to_vec).unwrap_or_default()
+    }
+
+    /// Total bytes of shim DMA access recorded outside the aperture.
+    pub fn outside_aperture_bytes(&self) -> u64 {
+        self.outside_aperture.borrow().total_bytes
     }
 
     /// Take and clear the blocked-access log.
@@ -714,6 +747,7 @@ impl HostMemory {
         self.external_regions.clear();
         self.total_bytes_written = 0;
         *self.blocked.get_mut() = BlockedLog::default();
+        *self.outside_aperture.get_mut() = BlockedLog::default();
     }
 
     /// Hexdump a memory region for debugging.
