@@ -614,6 +614,10 @@ pub struct ChannelContext {
     /// A word that closes its egress granule (`Some(ends_bd)`) is in the hand-off register: its
     /// slot and BD-queue release are counted from the cycle it leaves the port.
     pub egress_port_note: Option<bool>,
+    /// The current BD's packet header, built and waiting for the BD's first data word to be staged: it enters
+    /// the staging just ahead of that word (`DmaEngine::stage_packet_header`), so header and payload leave the
+    /// port contiguously.
+    pub pending_packet_header: Option<super::engine::StreamData>,
     /// Compute-tile MM2S egress granule slots and BD queue (`EgressQueue`), closed by the words
     /// of `egress_staging` as they leave the port. Empty on every other channel.
     pub egress_queue: super::egress_queue::EgressQueue,
@@ -698,6 +702,7 @@ impl ChannelContext {
             egress_staging: VecDeque::new(),
             egress_gap: 0,
             egress_port_note: None,
+            pending_packet_header: None,
             egress_queue: Default::default(),
             read_tail: 0,
             word_clock: Default::default(),
@@ -870,6 +875,7 @@ impl ChannelContext {
         self.egress_staging.clear();
         self.egress_gap = 0;
         self.egress_port_note = None;
+        self.pending_packet_header = None;
         self.egress_queue.clear();
         self.read_tail = 0;
         self.word_clock.clear();

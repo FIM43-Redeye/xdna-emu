@@ -38,6 +38,8 @@ struct Rig {
     port_holds: Vec<usize>,
     words_sent: usize,
     held_now: bool,
+    /// Cycle at which each word of the channel's stream left through the port.
+    sent_at: Vec<u64>,
 }
 
 impl Rig {
@@ -53,6 +55,7 @@ impl Rig {
             port_holds: Vec::new(),
             words_sent: 0,
             held_now: false,
+            sent_at: Vec::new(),
         }
     }
 
@@ -76,6 +79,7 @@ impl Rig {
             self.held_now = false;
             while self.eng.pop_stream_out_for_channel(self.channel).is_some() {
                 self.words_sent += 1;
+                self.sent_at.push(cycle);
             }
         }
         for (c, e) in self.tile.mem_trace_pending.drain(..) {
@@ -1031,4 +1035,56 @@ fn a_hold_on_a_heads_last_word_delays_the_releases_behind_it() {
     want[6] += 1;
     want[7] += 1;
     assert_eq!(held.finishes, want, "own row {f:?}");
+}
+
+// --------------------------------------------------------------------------------------------
+// The packet header of an MM2S packet BD leaves contiguous with its payload.
+// --------------------------------------------------------------------------------------------
+
+/// The port cycles of a BD of `words` words on `channel`, packet-enabled or not, lock-started (released
+/// by the core at cycle 60) or lock-free.
+fn port_cycles(compute: bool, words: u32, packet: bool, locked: bool) -> Vec<u64> {
+    let (mut eng, tile, channel, lock) = if compute {
+        (DmaEngine::new_compute_tile(1, 2), Tile::compute(1, 2), 2, 5u8)
+    } else {
+        (DmaEngine::new_mem_tile(1, 1), Tile::mem_tile(1, 1), 6, 64 + 3)
+    };
+    let mut bd = BdConfig::simple_1d(0x400, words * 4);
+    if locked {
+        bd = bd.with_acquire(lock, 1);
+    }
+    bd.enable_packet = packet;
+    bd.packet_id = 3;
+    eng.configure_bd(0, bd).unwrap();
+    eng.start_channel(channel, 0).unwrap();
+    let mut rig = Rig::new(eng, tile, channel);
+    let local_lock = if compute { lock as usize } else { 3 };
+    for _ in 0..300 {
+        let release_now = locked && rig.cycle + 1 == 60;
+        rig.step_with(
+            |t| {
+                if release_now {
+                    t.defer_core_lock_release(local_lock, 1);
+                }
+            },
+            |_| {},
+        );
+    }
+    assert_eq!(rig.sent_at.len(), words as usize + packet as usize, "every word left the port");
+    rig.sent_at
+}
+
+/// Silicon (memtile packet_flow / fanin / fanout, 9 streams, and the compute packet-gap probe, 46 rows): the
+/// header leaves in the slot the payload's first word has without a header, and the payload follows it on
+/// consecutive port cycles. OPEN to the cycle: the header in the payload's first slot (payload one later) or in
+/// the slot before it; this pins the first (`PACKET_HEADER_LEAD_CYCLES`).
+#[test]
+fn a_packet_header_takes_the_payloads_first_slot_and_the_payload_follows_without_a_gap() {
+    for (compute, locked) in [(false, false), (false, true), (true, true), (true, false)] {
+        let plain = port_cycles(compute, 16, false, locked);
+        let packet = port_cycles(compute, 16, true, locked);
+        let mut want = vec![plain[0]];
+        want.extend(plain.iter().map(|c| c + 1));
+        assert_eq!(packet, want, "compute = {compute}, lock-started = {locked}");
+    }
 }

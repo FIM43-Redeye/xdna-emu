@@ -6,6 +6,13 @@ use crate::device::dma::channel::{PendingHostCompletion, PendingRelease};
 use crate::interpreter::execute::cycle_accurate::{fire_watchpoint_events_with_origin, AccessOrigin};
 use crate::interpreter::timing::MemoryQuadrant;
 
+/// Cycles a staged MM2S's packet header is ready ahead of its BD's first data word (`stage_packet_header`).
+/// 0: the header takes the slot the first data word would have without a header, the payload one slot later.
+/// OPEN to the cycle: silicon's header sits at S2MM finish + 17 in the memtile tests, which is the emulator's
+/// first data word without a header, while a circuit-switched memtile MM2S's first word is at + 18 on silicon
+/// against the emulator's + 17; 1 would put the header in the slot before the payload's.
+const PACKET_HEADER_LEAD_CYCLES: u64 = 0;
+
 /// Map a resolved DMA target to the `AccessOrigin` the target tile's
 /// WatchPoint comparator should see.
 ///
@@ -415,7 +422,9 @@ impl DmaEngine {
         // single-word fetch) included: silicon's longest BD that finishes into a held S2MM is
         // 48 words (compute) / 52 (memtile), where admitting the tail into the space it
         // actually needs finished 50 / 54.
-        let reserve = (layout.access_granule_bytes() / 4) as usize;
+        // A waiting packet header enters with the fetch (`stage_packet_header`) and takes a slot too.
+        let reserve =
+            (layout.access_granule_bytes() / 4) as usize + ch.pending_packet_header.is_some() as usize;
         if staged + reserve > self.egress_staging_capacity() {
             return None; // no room for a whole granule; wait for the stream to drain one
         }
@@ -2669,6 +2678,10 @@ impl DmaEngine {
                 // The DMA builds the header itself (no DDR read, no latency),
                 // but it enters the stream behind the data still returning.
                 self.issue_host_read(header, 0);
+            } else if self.uses_egress_staging(transfer) && transfer.remaining_bytes() > 0 {
+                // Staged with the BD's first data word (`stage_packet_header`): header and payload are
+                // contiguous at the port.
+                self.channels[transfer.channel as usize].pending_packet_header = Some(header);
             } else if self.uses_egress_staging(transfer)
                 || !self.channels[transfer.channel as usize].egress_staging.is_empty()
             {
@@ -2694,6 +2707,24 @@ impl DmaEngine {
                 hdr.stream_id,
                 hdr.packet_type
             );
+        }
+    }
+
+    /// Stage the BD's waiting packet header (`ChannelContext::pending_packet_header`) just ahead of its first data
+    /// word, which becomes ready at `data_ready_at`: the header is ready `PACKET_HEADER_LEAD_CYCLES` before it.
+    ///
+    /// Silicon (memtile packet_flow / fanin / fanout, 9 streams; compute packet-gap probe, 46 rows; NPU1, three
+    /// samples, both compilers): the header leaves the port in the slot the payload's first word would have
+    /// without a header, and the payload follows on consecutive port cycles. The header was staged at the lock
+    /// grant before, and so left about 14 cycles (memtile) / 6 cycles (compute) ahead of its payload.
+    fn stage_packet_header(&mut self, ch_idx: usize, data_ready_at: u64) {
+        if let Some(header) = self.channels[ch_idx].pending_packet_header.take() {
+            self.channels[ch_idx].egress_staging.push_back(StagedWord {
+                data: header,
+                ends_bd: false,
+                ends_granule: false,
+                ready_at: data_ready_at.saturating_sub(PACKET_HEADER_LEAD_CYCLES),
+            });
         }
     }
 
@@ -3011,6 +3042,7 @@ impl DmaEngine {
                 let first_read = self.read_clock.max(self.channels[ch_idx].read_tail + 1);
                 let last_read = first_read + fetch.words as u64 - 1;
                 self.channels[ch_idx].read_tail = last_read;
+                self.stage_packet_header(ch_idx, last_read + self.staged_word_latency());
                 for &addr in &fetch.addrs[..fetch.words] {
                     let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
                         return TransferCycleResult::Error;
@@ -3092,6 +3124,7 @@ impl DmaEngine {
                 let tlast_suppress = transfer.effective_tlast_suppress();
                 let ready_at = now + DMA_MM2S_ACCESS_TO_OFFER_CYCLES as u64;
                 let opens_bd = transfer.bytes_transferred == 0;
+                self.stage_packet_header(ch_idx, ready_at);
                 for (i, &addr) in fetch.addrs[..fetch.words].iter().enumerate() {
                     let Some(data) = self.fetch_staged_word(addr, channel, tile, neighbors) else {
                         return TransferCycleResult::Error;

@@ -412,8 +412,17 @@ Cycles are counted from the grant g (the cycle after STALLED_LOCK falls).
     section): the lock is requested ahead of the previous BD's finish and granted at release + 2 or + 3. Chains of
     short lock BDs before the waiting BD are modelled since 2026-11-13 (next section), and so, since the same day,
     are six to eight lock-free short BDs before it (the egress granule slots and BD queue, next section).
-  - *Packet header.* The header of a lock-started compute MM2S's packet BD leaves at the grant, 6 cycles ahead of
-    its payload (4 words: g + 0, then g + 6..9); on silicon header and payload are contiguous.
+  - *Packet header* (**modelled** 2026-11-14). The header of a compute or memtile MM2S's packet BD was staged at
+    the lock grant (or the end of BD setup) and so left alone, 6 cycles (compute, lock-started) to about 14 cycles
+    (memtile) ahead of its payload; on silicon header and payload are contiguous (the memtile packet_flow / fanin /
+    fanout streams, 9 of 9, and the compute packet-gap probe, 46 of 46). The header now waits on the channel
+    (`ChannelContext::pending_packet_header`) and enters the staging with the BD's first data word
+    (`DmaEngine::stage_packet_header`): it leaves in the slot that word has without a header, the payload one slot
+    later and without a gap (`a_packet_header_takes_the_payloads_first_slot_and_the_payload_follows_without_a_gap`).
+    OPEN to the cycle: silicon's memtile header sits at the S2MM finish + 17, the emulator's header-less first word,
+    while silicon's circuit-switched memtile MM2S first word is at + 18 against the emulator's + 17, so the header
+    may instead take the slot before the payload's first (`PACKET_HEADER_LEAD_CYCLES` = 1). The shim MM2S (header
+    behind its read-ahead) and zero-padding or compressing MM2S keep the header at the grant (unmeasured).
   - *First word at the receiving DMA.* The first word reaches the own-tile S2MM at g + 10 (silicon g + 9; the
     offer / route split is not separated), one cycle late.
   - *S2MM finish.* The S2MM finished at g + 74 against silicon's g + 78, 4 cycles early; the S2MM granule writer
