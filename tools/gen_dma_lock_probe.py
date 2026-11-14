@@ -1864,9 +1864,9 @@ CW_NDST_ADDR = 0x2000                      # arm n's destination on (0,3): bank 
 CW_MEM_ADDS = ["DMA_S2MM_0_STREAM_STARVATION", "DMA_MM2S_0_MEMORY_STARVATION", "DMA_S2MM_1_FINISHED_BD"]
 # Cycles from the core's release of the actor lock to the end of the actor's activity, less the cycles from its
 # release of START to the head's grant g0: D = T + CW_SPAN[arm] puts the end T cycles before g0. Emulator
-# calibration at D = 64: the burst's last core trace packet completed at g0 + 4 (a3) and g0 + 1 (a4, on (0,4)),
-# (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n).
-CW_SPAN = {"a3": 68, "a4": 65, "c": 137, "n": 142}
+# calibration at D = 64: the burst's last (fourth) core trace packet completed at g0 + 32 (a3) and g0 + 29 (a4,
+# on (0,4)), (0,3)'s S2MM 1 FINISHED_BD at g0 + 73 (c) and g0 + 78 (n).
+CW_SPAN = {"a3": 96, "a4": 93, "c": 137, "n": 142}
 
 
 @dataclass(frozen=True)
