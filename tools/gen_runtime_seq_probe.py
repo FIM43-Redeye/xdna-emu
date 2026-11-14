@@ -344,16 +344,18 @@ def plan_9g() -> dict[str, Case]:
 # Probe 9h's grids: long waits that follow a prior-command case, and a fine sweep of the shortest steps just past one level
 LONG_9H = tuple(range(7300, 8101, 100))
 FINE_9H = tuple(range(8500, 8541, 4))
+PAIRED_9H = (9500, 11500)           # long waits for runs repeated under two device settings
 
 
 def plan_9h() -> dict[str, Case]:
     """Probe 9h: bracketed one-pair cases (no filler) at long waits, meant to run immediately after the unmarked
-    prior-command case k_a, and a fine sweep of the transfer length in 4-word steps. The first case is the positive
+    prior-command case k_a, a fine sweep of the transfer length in 4-word steps, and two longer waits meant to be
+    repeated under two device settings. The first case is the positive
     control; all plans are the same as in the earlier probes (byte-identical streams where a case exists there)."""
     def br(words):
         return _w_case(f"w1_L{words}_br", 1, words, marks=True, events=BRACKET_EVENTS, tail_rounds=4)
     cases = [br(3000), prior_command_9f("k_a_L30000", 30000, "M0", ("M1", "S1", "M0", "S0"))]
-    cases += [br(n) for n in LONG_9H + FINE_9H]
+    cases += [br(n) for n in LONG_9H + FINE_9H + PAIRED_9H]
     out = {c.name: c for c in cases}
     if len(out) != len(cases):
         raise ValueError("plan_9h: duplicate case names")

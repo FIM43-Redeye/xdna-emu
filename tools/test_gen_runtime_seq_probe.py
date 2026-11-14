@@ -853,12 +853,13 @@ def test_9g_selectable_from_the_command_line_and_leaves_other_plans_alone():
 
 LONG_9H = tuple(range(7300, 8101, 100))
 FINE_9H = tuple(range(8500, 8541, 4))
+PAIRED_9H = (9500, 11500)
 
 
 def test_plan_9h_is_the_two_sweeps_the_prior_command_case_and_the_control_and_validates():
     p = g.plan_9h()
-    want = {"w1_L3000_br", "k_a_L30000"} | {f"w1_L{n}_br" for n in LONG_9H + FINE_9H}
-    assert set(p) == want and len(p) == 2 + 9 + 11
+    want = {"w1_L3000_br", "k_a_L30000"} | {f"w1_L{n}_br" for n in LONG_9H + FINE_9H + PAIRED_9H}
+    assert set(p) == want and len(p) == 2 + 9 + 11 + 2
     assert next(iter(p)) == "w1_L3000_br"
     for c in p.values():
         g.validate(c)
@@ -867,7 +868,7 @@ def test_plan_9h_is_the_two_sweeps_the_prior_command_case_and_the_control_and_va
 def test_9h_shares_its_plans_with_the_earlier_probes():
     p9h, p9f = g.plan_9h(), g.plan_9f()
     assert p9h["k_a_L30000"].steps == p9f["k_a_L30000"].steps and p9h["w1_L3000_br"].steps == p9f["w1_L3000_br"].steps
-    for n in LONG_9H + FINE_9H:
+    for n in LONG_9H + FINE_9H + PAIRED_9H:
         c = p9h[f"w1_L{n}_br"]
         assert c.events == g.BRACKET_EVENTS and sum(isinstance(s, g.Mark) for s in c.steps) == 4
         assert [x.words for x in g.measured_pushes(c) if x.ch == "S0"] == [n]
