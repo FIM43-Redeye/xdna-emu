@@ -245,17 +245,17 @@ mod tests {
     use std::io::Write;
 
     /// Create a unique temporary directory for tests.
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("xdna_emu_unit_test_tests").join(name);
-        // Clean up from any previous run
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("xdna_emu_unit_test_{name}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_parse_annotations_xfail() {
-        let dir = test_dir("xfail");
+        let dir_guard = test_dir("xfail");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         writeln!(f, "// REQUIRES: valid_xchess_license").unwrap();
@@ -270,7 +270,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_fixme() {
-        let dir = test_dir("fixme");
+        let dir_guard = test_dir("fixme");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         writeln!(f, "// FIXME: hangs in simulation").unwrap();
@@ -284,7 +285,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_clean() {
-        let dir = test_dir("clean");
+        let dir_guard = test_dir("clean");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         writeln!(f, "// REQUIRES: valid_xchess_license, peano").unwrap();
@@ -300,7 +302,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_run_lines() {
-        let dir = test_dir("run_lines");
+        let dir_guard = test_dir("run_lines");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         writeln!(f, "// REQUIRES: valid_xchess_license").unwrap();
@@ -318,7 +321,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_disabled_run_not_collected() {
-        let dir = test_dir("disabled_run");
+        let dir_guard = test_dir("disabled_run");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         // These are NOT valid RUN lines (disabled variants used in lit)
@@ -335,7 +339,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_mixed_xfail_and_run() {
-        let dir = test_dir("mixed");
+        let dir_guard = test_dir("mixed");
+        let dir = dir_guard.path().to_path_buf();
         let mlir = dir.join("test.mlir");
         let mut f = std::fs::File::create(&mlir).unwrap();
         writeln!(f, "// XFAIL: *").unwrap();
@@ -350,14 +355,16 @@ mod tests {
 
     #[test]
     fn test_discover_empty_dir() {
-        let dir = test_dir("empty");
+        let dir_guard = test_dir("empty");
+        let dir = dir_guard.path().to_path_buf();
         let tests = discover(&dir);
         assert!(tests.is_empty());
     }
 
     #[test]
     fn test_discover_skips_no_test_cpp() {
-        let dir = test_dir("no_cpp");
+        let dir_guard = test_dir("no_cpp");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/00_itsalive");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
@@ -369,7 +376,8 @@ mod tests {
 
     #[test]
     fn test_discover_finds_valid_test_with_build_steps() {
-        let dir = test_dir("valid");
+        let dir_guard = test_dir("valid");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/01_test");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(
@@ -396,7 +404,8 @@ mod tests {
 
     #[test]
     fn test_discover_build_steps_from_aie_row_on_xfail() {
-        let dir = test_dir("xfail_fallback");
+        let dir_guard = test_dir("xfail_fallback");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/04_shared");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(
@@ -426,7 +435,8 @@ mod tests {
 
     #[test]
     fn test_discover_bcf_pattern_build_steps() {
-        let dir = test_dir("bcf_pattern");
+        let dir_guard = test_dir("bcf_pattern");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/unit_tests/chess_compiler_tests_aie2/02_precompiled");
         std::fs::create_dir_all(&test_root).unwrap();
         std::fs::write(

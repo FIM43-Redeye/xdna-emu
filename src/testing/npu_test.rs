@@ -613,16 +613,17 @@ mod tests {
     use std::io::Write;
 
     /// Create a unique temporary directory for tests.
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("xdna_emu_npu_test_tests").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("xdna_emu_npu_test_{name}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_parse_annotations_run_lit() {
-        let dir = test_dir("run_lit");
+        let dir_guard = test_dir("run_lit");
+        let dir = dir_guard.path().to_path_buf();
         let lit = dir.join("run.lit");
         let mut f = std::fs::File::create(&lit).unwrap();
         writeln!(f, "// REQUIRES: ryzen_ai").unwrap();
@@ -640,7 +641,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_python() {
-        let dir = test_dir("python");
+        let dir_guard = test_dir("python");
+        let dir = dir_guard.path().to_path_buf();
         let py = dir.join("aie2.py");
         let mut f = std::fs::File::create(&py).unwrap();
         writeln!(f, "# REQUIRES: ryzen_ai, valid_xchess_license").unwrap();
@@ -657,7 +659,8 @@ mod tests {
 
     #[test]
     fn test_parse_annotations_xfail() {
-        let dir = test_dir("xfail");
+        let dir_guard = test_dir("xfail");
+        let dir = dir_guard.path().to_path_buf();
         let lit = dir.join("run.lit");
         let mut f = std::fs::File::create(&lit).unwrap();
         writeln!(f, "// XFAIL: *").unwrap();
@@ -920,7 +923,8 @@ mod tests {
 
     #[test]
     fn test_discover_empty_dir() {
-        let dir = test_dir("discover_empty");
+        let dir_guard = test_dir("discover_empty");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -930,7 +934,8 @@ mod tests {
 
     #[test]
     fn test_discover_flat_run_lit() {
-        let dir = test_dir("discover_flat");
+        let dir_guard = test_dir("discover_flat");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/add_one_using_dma");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -957,7 +962,8 @@ mod tests {
 
     #[test]
     fn test_discover_nested_subdirectory() {
-        let dir = test_dir("discover_nested");
+        let dir_guard = test_dir("discover_nested");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/core_dmas/writebd");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -981,7 +987,8 @@ mod tests {
 
     #[test]
     fn test_discover_aie2_py() {
-        let dir = test_dir("discover_aie2py");
+        let dir_guard = test_dir("discover_aie2py");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/nd_memcpy_test");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1010,7 +1017,8 @@ mod tests {
 
     #[test]
     fn test_discover_other_py_entry_point() {
-        let dir = test_dir("discover_other_py");
+        let dir_guard = test_dir("discover_other_py");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/custom_test");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1033,7 +1041,8 @@ mod tests {
 
     #[test]
     fn test_discover_filters_dont_run() {
-        let dir = test_dir("discover_dont_run");
+        let dir_guard = test_dir("discover_dont_run");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/suppressed");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1050,7 +1059,8 @@ mod tests {
 
     #[test]
     fn test_discover_skips_makefile_common() {
-        let dir = test_dir("discover_makefile");
+        let dir_guard = test_dir("discover_makefile");
+        let dir = dir_guard.path().to_path_buf();
         let mk = dir.join("test/npu-xrt/makefile-common");
         std::fs::create_dir_all(&mk).unwrap();
         std::fs::write(mk.join("Makefile"), "all:\n\techo hi").unwrap();
@@ -1066,7 +1076,8 @@ mod tests {
 
     #[test]
     fn test_discover_sorted_output() {
-        let dir = test_dir("discover_sorted");
+        let dir_guard = test_dir("discover_sorted");
+        let dir = dir_guard.path().to_path_buf();
         for name in &["zebra", "alpha", "middle"] {
             let test_root = dir.join(format!("test/npu-xrt/{}", name));
             std::fs::create_dir_all(&test_root).unwrap();
@@ -1082,7 +1093,8 @@ mod tests {
 
     #[test]
     fn test_discover_multiple_nested() {
-        let dir = test_dir("discover_multi_nested");
+        let dir_guard = test_dir("discover_multi_nested");
+        let dir = dir_guard.path().to_path_buf();
 
         // Two sibling tests under a parent directory
         for name in &["dma_configure_task_lock", "dma_configure_task_token"] {
@@ -1099,7 +1111,8 @@ mod tests {
 
     #[test]
     fn test_run_lit_preferred_over_aie2_py() {
-        let dir = test_dir("prefer_run_lit");
+        let dir_guard = test_dir("prefer_run_lit");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/both_files");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1117,7 +1130,8 @@ mod tests {
 
     #[test]
     fn test_discover_populates_artifact_names() {
-        let dir = test_dir("discover_artifacts");
+        let dir_guard = test_dir("discover_artifacts");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/add_one_using_dma");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1144,7 +1158,8 @@ mod tests {
 
     #[test]
     fn test_discover_populates_elf_artifacts() {
-        let dir = test_dir("discover_elf_artifacts");
+        let dir_guard = test_dir("discover_elf_artifacts");
+        let dir = dir_guard.path().to_path_buf();
         let test_root = dir.join("test/npu-xrt/add_one_objFifo_elf");
         std::fs::create_dir_all(&test_root).unwrap();
 
@@ -1169,7 +1184,8 @@ mod tests {
 
     #[test]
     fn test_load_overrides_applies_skip_and_expected_fail() {
-        let dir = test_dir("load_overrides");
+        let dir_guard = test_dir("load_overrides");
+        let dir = dir_guard.path().to_path_buf();
         let overrides_path = dir.join("test_overrides.toml");
         std::fs::write(
             &overrides_path,
@@ -1242,7 +1258,8 @@ flaky_test = "Known emulator limitation"
 
     #[test]
     fn test_overrides_compiler_build_xfail_parses() {
-        let dir = test_dir("overrides_build_xfail");
+        let dir_guard = test_dir("overrides_build_xfail");
+        let dir = dir_guard.path().to_path_buf();
         let path = dir.join("test_overrides.toml");
         std::fs::write(
             &path,
@@ -1270,7 +1287,8 @@ some_chess_test = "Chess intrinsic issue"
 
     #[test]
     fn test_load_overrides_missing_file_returns_empty() {
-        let dir = test_dir("overrides_missing");
+        let dir_guard = test_dir("overrides_missing");
+        let dir = dir_guard.path().to_path_buf();
         let overrides_path = dir.join("does_not_exist.toml");
 
         let mut tests = vec![NpuTestSource {
@@ -1295,7 +1313,8 @@ some_chess_test = "Chess intrinsic issue"
 
     #[test]
     fn test_load_overrides_nested_test_name() {
-        let dir = test_dir("overrides_nested");
+        let dir_guard = test_dir("overrides_nested");
+        let dir = dir_guard.path().to_path_buf();
         let overrides_path = dir.join("test_overrides.toml");
         std::fs::write(
             &overrides_path,

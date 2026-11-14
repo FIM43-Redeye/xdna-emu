@@ -334,8 +334,8 @@ $enddefinitions $end\n\
     #[test]
     fn coverage_audit_synthetic_vcd() {
         // Write the synthetic VCD to a temp file.
-        let dir = std::env::temp_dir();
-        let vcd_file = dir.join("xdna_emu_coverage_test.vcd");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let vcd_file = tmp_guard.path().join("synthetic.vcd");
         std::fs::write(&vcd_file, make_synthetic_vcd()).expect("Failed to write synthetic VCD");
 
         // Build a tree that covers the two mapped signals.

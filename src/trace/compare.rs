@@ -3894,8 +3894,8 @@ mod tests {
     fn pc_anchored_unsafe_for_pc_join_manifest_test() {
         // Build a synthetic sweep dir in TMPDIR with a manifest that has
         // unsafe_for_pc_join=true. Verify read_pc1_manifest parses it.
-        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
-        let sweep_dir = tmpdir.join("task8_test_manifest");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let sweep_dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
 
         let manifest_json = r#"{
@@ -3974,9 +3974,8 @@ mod tests {
     fn pc_anchored_missing_manifest_is_handled_gracefully() {
         // A sweep dir with no sweep-manifest.json: the readers return None /
         // empty instead of panicking.
-        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
-        let sweep_dir = tmpdir.join("task8_test_no_manifest");
-        let _ = std::fs::remove_dir_all(&sweep_dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let sweep_dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
 
         assert!(read_pc1_manifest(&sweep_dir).is_none());
@@ -4063,9 +4062,8 @@ mod tests {
     /// `compare_sweep_dir_with_opts` should discover the batches via fs.
     #[test]
     fn compare_sweep_dir_lockstep_uses_fs_discovery() {
-        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
-        let sweep_dir = tmpdir.join("compare_lockstep_fs_discovery_fixture");
-        let _ = std::fs::remove_dir_all(&sweep_dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let sweep_dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
 
         // Lockstep manifest -- no `batches` field.
@@ -4116,9 +4114,8 @@ mod tests {
     /// fall back to fs discovery -- even if batch_NN/ dirs exist.
     #[test]
     fn compare_sweep_dir_legacy_empty_batches_does_not_fall_back_to_fs() {
-        let tmpdir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
-        let sweep_dir = tmpdir.join("compare_legacy_empty_no_fs_fallback_fixture");
-        let _ = std::fs::remove_dir_all(&sweep_dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let sweep_dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&sweep_dir).expect("create sweep dir");
 
         // Legacy manifest with empty batches array.

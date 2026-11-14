@@ -1696,8 +1696,8 @@ mod tests {
 
     #[test]
     fn test_find_all_xclbin_results_single() {
-        let dir = std::env::temp_dir().join("xdna_test_xclbin_single");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
 
         // Create one xclbin and one insts file
@@ -1717,8 +1717,8 @@ mod tests {
 
     #[test]
     fn test_find_all_xclbin_results_multi() {
-        let dir = std::env::temp_dir().join("xdna_test_xclbin_multi");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
 
         // Create multiple xclbin + insts files (like matrix_mult_cascade)
@@ -1760,8 +1760,9 @@ mod tests {
         // after the xclbin was produced. Cache should be invalidated.
         use std::time::Duration;
 
-        let dir = std::env::temp_dir().join("xdna_test_toolchain_cache");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
 
         let xclbin_path = dir.join("aie.xclbin");

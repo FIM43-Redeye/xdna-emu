@@ -291,8 +291,8 @@ mod tests {
         // `add.xclbin` beside `add_insts.bin`, `mult.xclbin` beside
         // `mult_insts.bin` -- the xclbin stem PREFIXES the insts name, the
         // mirror image of the variant-suffix case.
-        let dir = std::env::temp_dir().join("xdna-emu-test-prefixed-insts");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).expect("temp dir");
         for name in ["add.xclbin", "mult.xclbin", "add_insts.bin", "mult_insts.bin"] {
             std::fs::write(dir.join(name), b"x").expect("write");
@@ -313,8 +313,8 @@ mod tests {
 
     #[test]
     fn reports_missing_when_no_control_program_exists() {
-        let dir = std::env::temp_dir().join("xdna-emu-test-no-insts");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).expect("temp dir");
         let xclbin = dir.join("aie.xclbin");
         std::fs::write(&xclbin, b"not a real xclbin").expect("write");

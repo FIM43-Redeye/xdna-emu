@@ -883,7 +883,9 @@ mod tests {
         use crate::vcd::lock_mapping::lock_mapping;
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join("vcd_compare_test");
+        let tmp_guard = tempfile::tempdir().unwrap();
+
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let vcd_path = dir.join("test.vcd");
 
@@ -949,7 +951,9 @@ mod tests {
     fn extract_timelines_skips_unmapped() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join("vcd_compare_unmapped");
+        let tmp_guard = tempfile::tempdir().unwrap();
+
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         let vcd_path = dir.join("test.vcd");
 
@@ -980,7 +984,9 @@ mod tests {
         use crate::vcd::lock_mapping::lock_mapping;
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join("vcd_compare_align");
+        let tmp_guard = tempfile::tempdir().unwrap();
+
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
 
         // Emulator VCD: lock value_0 and value_1.

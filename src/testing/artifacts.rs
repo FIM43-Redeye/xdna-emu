@@ -581,16 +581,17 @@ mod tests {
     use std::fs;
 
     /// Create a temp directory with a unique suffix for test isolation.
-    fn test_dir(suffix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("xdna_emu_artifacts_test_{}", suffix));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(suffix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("xdna_emu_artifacts_test_{suffix}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_find_insts_bin() {
-        let dir = test_dir("find_insts_bin");
+        let dir_guard = test_dir("find_insts_bin");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.bin"), b"data").unwrap();
         let result = find_insts(&dir);
         assert_eq!(result, Some(dir.join("insts.bin")));
@@ -599,7 +600,8 @@ mod tests {
 
     #[test]
     fn test_find_insts_elf() {
-        let dir = test_dir("find_insts_elf");
+        let dir_guard = test_dir("find_insts_elf");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.elf"), b"data").unwrap();
         let result = find_insts(&dir);
         assert_eq!(result, Some(dir.join("insts.elf")));
@@ -608,7 +610,8 @@ mod tests {
 
     #[test]
     fn test_find_insts_prefers_bin() {
-        let dir = test_dir("find_insts_prefer");
+        let dir_guard = test_dir("find_insts_prefer");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.bin"), b"bin").unwrap();
         fs::write(dir.join("insts.elf"), b"elf").unwrap();
         let result = find_insts(&dir);
@@ -618,14 +621,16 @@ mod tests {
 
     #[test]
     fn test_find_insts_none() {
-        let dir = test_dir("find_insts_none");
+        let dir_guard = test_dir("find_insts_none");
+        let dir = dir_guard.path().to_path_buf();
         assert_eq!(find_insts(&dir), None);
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_find_insts_txt() {
-        let dir = test_dir("find_insts_txt");
+        let dir_guard = test_dir("find_insts_txt");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.txt"), b"data").unwrap();
         let result = find_insts(&dir);
         assert_eq!(result, Some(dir.join("insts.txt")));
@@ -634,7 +639,8 @@ mod tests {
 
     #[test]
     fn test_find_insts_prefers_bin_over_txt() {
-        let dir = test_dir("find_insts_bin_over_txt");
+        let dir_guard = test_dir("find_insts_bin_over_txt");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.bin"), b"bin").unwrap();
         fs::write(dir.join("insts.txt"), b"txt").unwrap();
         let result = find_insts(&dir);
@@ -649,7 +655,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_prefix_swap() {
-        let dir = test_dir("matching_prefix");
+        let dir_guard = test_dir("matching_prefix");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts2_buffer.txt"), b"data").unwrap();
         let result = find_matching_insts(&dir, "aie2_buffer");
         assert_eq!(result, Some(dir.join("insts2_buffer.txt")));
@@ -658,7 +665,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_bin_fallback() {
-        let dir = test_dir("matching_bin");
+        let dir_guard = test_dir("matching_bin");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts2_buffer.bin"), b"data").unwrap();
         let result = find_matching_insts(&dir, "aie2_buffer");
         assert_eq!(result, Some(dir.join("insts2_buffer.bin")));
@@ -667,7 +675,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_stem_insts_convention() {
-        let dir = test_dir("matching_stem_insts");
+        let dir_guard = test_dir("matching_stem_insts");
+        let dir = dir_guard.path().to_path_buf();
         // programming_examples convention: add.xclbin -> add_insts.bin
         fs::write(dir.join("add_insts.bin"), b"data").unwrap();
         let result = find_matching_insts(&dir, "add");
@@ -677,7 +686,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_stem_insts_txt() {
-        let dir = test_dir("matching_stem_insts_txt");
+        let dir_guard = test_dir("matching_stem_insts_txt");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("mult_insts.txt"), b"data").unwrap();
         let result = find_matching_insts(&dir, "mult");
         assert_eq!(result, Some(dir.join("mult_insts.txt")));
@@ -686,7 +696,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_stem_fallback() {
-        let dir = test_dir("matching_stem");
+        let dir_guard = test_dir("matching_stem");
+        let dir = dir_guard.path().to_path_buf();
         // No aie prefix -- falls through to stem.txt
         fs::write(dir.join("custom.txt"), b"data").unwrap();
         let result = find_matching_insts(&dir, "custom");
@@ -696,7 +707,8 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_shared_fallback() {
-        let dir = test_dir("matching_shared");
+        let dir_guard = test_dir("matching_shared");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("insts.bin"), b"data").unwrap();
         let result = find_matching_insts(&dir, "aie2_something");
         assert_eq!(result, Some(dir.join("insts.bin")));
@@ -705,14 +717,16 @@ mod tests {
 
     #[test]
     fn test_find_matching_insts_none() {
-        let dir = test_dir("matching_none");
+        let dir_guard = test_dir("matching_none");
+        let dir = dir_guard.path().to_path_buf();
         assert_eq!(find_matching_insts(&dir, "aie2_buffer"), None);
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_collect_xclbins_sorted() {
-        let dir = test_dir("collect_sorted");
+        let dir_guard = test_dir("collect_sorted");
+        let dir = dir_guard.path().to_path_buf();
         fs::write(dir.join("c.xclbin"), b"").unwrap();
         fs::write(dir.join("a.xclbin"), b"").unwrap();
         fs::write(dir.join("b.xclbin"), b"").unwrap();
@@ -725,7 +739,8 @@ mod tests {
 
     #[test]
     fn test_collect_xclbins_empty() {
-        let dir = test_dir("collect_empty");
+        let dir_guard = test_dir("collect_empty");
+        let dir = dir_guard.path().to_path_buf();
         assert!(collect_xclbins(&dir).is_empty());
         fs::remove_dir_all(&dir).ok();
     }
@@ -737,7 +752,8 @@ mod tests {
 
     #[test]
     fn test_find_prj_dir_found() {
-        let dir = test_dir("prj_found");
+        let dir_guard = test_dir("prj_found");
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("aie.mlir.prj")).unwrap();
         let result = find_prj_dir(&dir);
         assert!(result.is_some());
@@ -747,7 +763,8 @@ mod tests {
 
     #[test]
     fn test_find_prj_dir_none() {
-        let dir = test_dir("prj_none");
+        let dir_guard = test_dir("prj_none");
+        let dir = dir_guard.path().to_path_buf();
         fs::create_dir_all(dir.join("not_a_prj")).unwrap();
         assert_eq!(find_prj_dir(&dir), None);
         fs::remove_dir_all(&dir).ok();
@@ -760,7 +777,8 @@ mod tests {
 
     #[test]
     fn test_discover_single_xclbin() {
-        let root = test_dir("discover_single");
+        let root_guard = test_dir("discover_single");
+        let root = root_guard.path().to_path_buf();
         let test_dir_path = root.join("add_one");
         fs::create_dir_all(&test_dir_path).unwrap();
         fs::write(test_dir_path.join("aie.xclbin"), b"xclbin").unwrap();
@@ -776,7 +794,8 @@ mod tests {
 
     #[test]
     fn test_discover_multi_xclbin() {
-        let root = test_dir("discover_multi");
+        let root_guard = test_dir("discover_multi");
+        let root = root_guard.path().to_path_buf();
         let test_dir_path = root.join("cascade");
         fs::create_dir_all(&test_dir_path).unwrap();
         fs::write(test_dir_path.join("aie2_buffer.xclbin"), b"").unwrap();
@@ -796,7 +815,8 @@ mod tests {
 
     #[test]
     fn test_discover_nested() {
-        let root = test_dir("discover_nested");
+        let root_guard = test_dir("discover_nested");
+        let root = root_guard.path().to_path_buf();
         // Parent with no xclbin, child with xclbin
         let child = root.join("core_dmas").join("writebd");
         fs::create_dir_all(&child).unwrap();
@@ -810,7 +830,8 @@ mod tests {
 
     #[test]
     fn test_discover_empty() {
-        let root = test_dir("discover_empty");
+        let root_guard = test_dir("discover_empty");
+        let root = root_guard.path().to_path_buf();
         let arts = discover_build_artifacts(&root);
         assert!(arts.is_empty());
         fs::remove_dir_all(&root).ok();
@@ -824,7 +845,8 @@ mod tests {
 
     #[test]
     fn test_discover_with_prj() {
-        let root = test_dir("discover_prj");
+        let root_guard = test_dir("discover_prj");
+        let root = root_guard.path().to_path_buf();
         let test_dir_path = root.join("sim_test");
         fs::create_dir_all(&test_dir_path).unwrap();
         fs::write(test_dir_path.join("aie.xclbin"), b"").unwrap();
@@ -842,7 +864,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_basic() {
-        let root = test_dir("examples_basic");
+        let root_guard = test_dir("examples_basic");
+        let root = root_guard.path().to_path_buf();
         // Simulate: basic/passthrough_dmas/build/final.xclbin + insts.bin
         let build = root.join("basic/passthrough_dmas/build");
         fs::create_dir_all(&build).unwrap();
@@ -859,7 +882,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_with_elf() {
-        let root = test_dir("examples_elf");
+        let root_guard = test_dir("examples_elf");
+        let root = root_guard.path().to_path_buf();
         let build = root.join("basic/memcpy/build");
         fs::create_dir_all(&build).unwrap();
         fs::write(build.join("final.xclbin"), b"xclbin").unwrap();
@@ -874,7 +898,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_skips_no_insts() {
-        let root = test_dir("examples_no_insts");
+        let root_guard = test_dir("examples_no_insts");
+        let root = root_guard.path().to_path_buf();
         // xclbin without instructions -- should be skipped
         let build = root.join("basic/broken/build");
         fs::create_dir_all(&build).unwrap();
@@ -887,7 +912,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_multiple() {
-        let root = test_dir("examples_multi");
+        let root_guard = test_dir("examples_multi");
+        let root = root_guard.path().to_path_buf();
         // Two examples at different nesting levels
         for (subpath, insts_name) in
             &[("basic/dma_transpose/build", "insts.bin"), ("ml/matmul/build", "insts.elf")]
@@ -908,7 +934,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_empty() {
-        let root = test_dir("examples_empty");
+        let root_guard = test_dir("examples_empty");
+        let root = root_guard.path().to_path_buf();
         let arts = discover_examples(&root);
         assert!(arts.is_empty());
         fs::remove_dir_all(&root).ok();
@@ -922,7 +949,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_multi_xclbin() {
-        let root = test_dir("examples_multi_xclbin");
+        let root_guard = test_dir("examples_multi_xclbin");
+        let root = root_guard.path().to_path_buf();
         let build = root.join("basic/packet_switch/build");
         fs::create_dir_all(&build).unwrap();
         fs::write(build.join("add.xclbin"), b"xclbin1").unwrap();
@@ -943,7 +971,8 @@ mod tests {
 
     #[test]
     fn test_discover_examples_skips_hidden_dirs() {
-        let root = test_dir("examples_hidden");
+        let root_guard = test_dir("examples_hidden");
+        let root = root_guard.path().to_path_buf();
         // Hidden dir should be skipped
         let build = root.join(".hidden/test/build");
         fs::create_dir_all(&build).unwrap();
@@ -964,7 +993,8 @@ mod tests {
     #[test]
     fn test_discover_examples_no_build_subdir() {
         // xclbin lives directly in the example directory, not in build/
-        let root = test_dir("examples_no_build");
+        let root_guard = test_dir("examples_no_build");
+        let root = root_guard.path().to_path_buf();
         let example = root.join("basic/flat_example");
         fs::create_dir_all(&example).unwrap();
         fs::write(example.join("design.xclbin"), b"xclbin").unwrap();
@@ -983,7 +1013,8 @@ mod tests {
 
     #[test]
     fn test_detect_aie2p_hardcoded_devicename() {
-        let dir = test_dir("aie2p_hardcoded");
+        let dir_guard = test_dir("aie2p_hardcoded");
+        let dir = dir_guard.path().to_path_buf();
         let makefile = dir.join("Makefile");
         fs::write(&makefile, "devicename=npu2\ntarget: build\n").unwrap();
         assert!(detect_aie2p(&makefile).is_some());
@@ -992,7 +1023,8 @@ mod tests {
 
     #[test]
     fn test_detect_aie2p_conditional_is_not_hardcoded() {
-        let dir = test_dir("aie2p_conditional");
+        let dir_guard = test_dir("aie2p_conditional");
+        let dir = dir_guard.path().to_path_buf();
         let makefile = dir.join("Makefile");
         fs::write(&makefile, "devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)\n").unwrap();
         assert!(detect_aie2p(&makefile).is_none());
@@ -1001,7 +1033,8 @@ mod tests {
 
     #[test]
     fn test_detect_aie2p_vpath_kernel() {
-        let dir = test_dir("aie2p_vpath");
+        let dir_guard = test_dir("aie2p_vpath");
+        let dir = dir_guard.path().to_path_buf();
         let makefile = dir.join("Makefile");
         fs::write(&makefile, "VPATH :=${srcdir}/../../../aie_kernels/aie2p\n").unwrap();
         assert!(detect_aie2p(&makefile).is_some());
@@ -1010,7 +1043,8 @@ mod tests {
 
     #[test]
     fn test_detect_aie2p_npu1_only() {
-        let dir = test_dir("aie2p_npu1");
+        let dir_guard = test_dir("aie2p_npu1");
+        let dir = dir_guard.path().to_path_buf();
         let makefile = dir.join("Makefile");
         fs::write(&makefile, "devicename ?= npu\ntarget: build\n").unwrap();
         assert!(detect_aie2p(&makefile).is_none());

@@ -1544,7 +1544,8 @@ mod tests {
 
     #[test]
     fn test_discover_empty_dir() {
-        let temp_dir = std::env::temp_dir().join("xdna_emu_test_empty");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let temp_dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&temp_dir).ok();
 
         let suite = XclbinSuite::discover(&temp_dir);

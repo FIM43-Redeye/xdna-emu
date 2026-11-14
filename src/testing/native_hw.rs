@@ -738,7 +738,8 @@ FAIL!
 
     #[test]
     fn test_detect_test_cpp_missing() {
-        let dir = std::env::temp_dir().join("xdna_emu_native_hw_test_missing");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         assert!(detect_test_cpp(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -746,8 +747,8 @@ FAIL!
 
     #[test]
     fn test_detect_test_cpp_cxxopts() {
-        let dir = std::env::temp_dir().join("xdna_emu_native_hw_test_cxxopts");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("test.cpp"), "test_utils::add_default_options(options);\n").unwrap();
 
@@ -761,8 +762,8 @@ FAIL!
 
     #[test]
     fn test_detect_test_cpp_define() {
-        let dir = std::env::temp_dir().join("xdna_emu_native_hw_test_define");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let dir = tmp_guard.path().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("test.cpp"), "#ifndef XCLBIN\n#define XCLBIN \"final.xclbin\"\n#endif\n")
             .unwrap();

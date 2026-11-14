@@ -318,8 +318,8 @@ b0 !\n\
 
     #[test]
     fn extract_anchors_from_synthetic_vcd() {
-        let dir = std::env::temp_dir();
-        let vcd_file = dir.join("xdna_emu_anchors_test.vcd");
+        let tmp_guard = tempfile::tempdir().unwrap();
+        let vcd_file = tmp_guard.path().join("synthetic.vcd");
         std::fs::write(&vcd_file, make_synthetic_dma_vcd()).expect("write synthetic VCD");
 
         let tree = synthetic_tree();
