@@ -880,3 +880,37 @@ def test_9h_selectable_from_the_command_line():
     with contextlib.redirect_stdout(buf):
         assert g.main(["list", "--plan", "9h"]) == 0
     assert "w1_L8540_br" in buf.getvalue() and "k_a_L30000" in buf.getvalue()
+
+
+# -- probe 9i: long waits after a prior-command case, and a finer sweep of one narrow range ---------------------
+
+FOLLOW_9I = tuple(range(6700, 7301, 100))
+FINE_9I = tuple(range(9930, 10011, 10))
+
+
+def test_plan_9i_is_the_two_sweeps_the_prior_command_case_and_the_control_and_validates():
+    p = g.plan_9i()
+    want = {"w1_L3000_br", "k_a_L30000"} | {f"w1_L{n}_br" for n in FOLLOW_9I + FINE_9I}
+    assert set(p) == want and len(p) == 2 + 7 + 9
+    assert next(iter(p)) == "w1_L3000_br"
+    for c in p.values():
+        g.validate(c)
+
+
+def test_9i_shares_its_plans_with_the_earlier_probes():
+    p9i, p9h = g.plan_9i(), g.plan_9h()
+    for name in ("k_a_L30000", "w1_L3000_br"):
+        assert p9i[name].steps == p9h[name].steps
+    for n in FOLLOW_9I + FINE_9I:
+        c = p9i[f"w1_L{n}_br"]
+        assert c.events == g.BRACKET_EVENTS and sum(isinstance(s, g.Mark) for s in c.steps) == 4
+        assert [x.words for x in g.measured_pushes(c) if x.ch == "S0"] == [n]
+    assert g.plan_9h()["w1_L9500_br"].steps == g._w_case("w1_L9500_br", 1, 9500, marks=True, events=g.BRACKET_EVENTS, tail_rounds=4).steps
+
+
+def test_9i_selectable_from_the_command_line():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert g.main(["list", "--plan", "9i"]) == 0
+    assert "w1_L10010_br" in buf.getvalue() and "w1_L6700_br" in buf.getvalue() and "k_a_L30000" in buf.getvalue()
