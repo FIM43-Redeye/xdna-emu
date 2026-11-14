@@ -18,7 +18,7 @@ def valid_events():
     # stall 100..109 and 200..209; port runs 110..113 and 211..212
     return (core("LOCK_STALL", *range(100, 110), *range(200, 210))
             + core("PORT_RUNNING_0", *range(110, 114), 211, 212)
-            + mem("DMA_S2MM_0_START_TASK", 90) + mem("DMA_S2MM_0_FINISHED_BD", 114, 213)
+            + mem("DMA_S2MM_0_STALLED_LOCK", 90, 91) + mem("DMA_S2MM_0_FINISHED_BD", 114, 213)
             + mem("CONFLICT_DM_BANK_3", 120, 121, 300))
 
 
@@ -66,7 +66,7 @@ def test_missing_port_event_marks_the_run_invalid_and_hides_the_dating():
 def test_absent_memory_unit_is_invalid_not_zero_conflicts():
     events = [e for e in valid_events() if e.pkt_type != t.PT_MEM]
     info = t.analyse(events)
-    assert "mem:DMA_S2MM_0_START_TASK" in info["missing"]
+    assert "mem:DMA_S2MM_0_FINISHED_BD" in info["missing"]
     assert "INVALID" in t.format_run(info, "run")
 
 

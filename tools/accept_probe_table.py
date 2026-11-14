@@ -45,9 +45,11 @@ MEMMOD_EVENTS = ("DMA_S2MM_0_START_TASK", "DMA_S2MM_0_FINISHED_BD", "DMA_S2MM_0_
                  "CONFLICT_DM_BANK_0", "CONFLICT_DM_BANK_1", "CONFLICT_DM_BANK_2", "CONFLICT_DM_BANK_3")
 BANKS = (0, 1, 2, 3)
 
-# Events whose absence makes the run unusable (the core unit's two, the memory unit's DMA pair).
+# Events whose absence makes the run unusable: the core unit's two, and two of the memory unit's that
+# prove it recorded (the S2MM 0 task is started before the trace starts, so its START_TASK / FINISHED_TASK
+# frames are listed but not required).
 REQUIRED_CORE = ("LOCK_STALL", "PORT_RUNNING_0")
-REQUIRED_MEM = ("DMA_S2MM_0_START_TASK", "DMA_S2MM_0_FINISHED_BD")
+REQUIRED_MEM = ("DMA_S2MM_0_FINISHED_BD", "DMA_S2MM_0_STALLED_LOCK")
 
 
 def env_lines() -> str:
