@@ -9,8 +9,8 @@ execution envelope.
 charge, `XDNA_EMU_MAILBOX_LATENCY` and the per-sync row transit are gone. The
 `NpuExecutor` now charges each sync the controller's measured wait structure
 (`src/npu/sync_wait.rs`, from the token's lateness after the sync's issue) and
-services tokens that arrive during execution at the next operation boundary
-(`src/npu/cycle_cost.rs`); see the runtime-sequence pacing row in
+suspends the sequence for a service episode when a token arrives during
+execution, close tokens sharing one pass (`src/npu/cycle_cost.rs`); see the runtime-sequence pacing row in
 `docs/fidelity-gaps/host-firmware-dispatch.md`. The text below is the record of
 the earlier design.
 **Goal:** replace the flat `DEFAULT_MAILBOX_CYCLES = 8000` fudge with a real

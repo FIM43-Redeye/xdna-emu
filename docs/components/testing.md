@@ -38,7 +38,8 @@ Host-to-NPU communication protocol (XRT instruction stream).
 | `parser.rs` | `NpuInstructionStream` -- parses binary NPU instruction sequences |
 | `executor.rs` | `NpuExecutor` -- executes NPU instructions against device state (configures shim DMA, patches addresses) |
 | `classify.rs` | Kernarg-role classifier: recovers semantic slot roles (Ctrlpkt, MM2S, S2MM) from the NPU instruction stream for bridge-trace-runner buffer binding |
-| `cycle_cost.rs` | Control-path cycle-cost model: multi-stage latency for host→CMP→NoC→tile control packet delivery |
+| `cycle_cost.rs` | Runtime-sequence operation costs on the controller clock (per write class, block writes per word, task-complete token service episodes, launch gap) |
+| `sync_wait.rs` | `SyncWaitModel` -- what a sync costs from its token's lateness after the issue (fast path, short wait, gated plateaus, tick-aligned gated wake) |
 
 ### FFI (`crates/xdna-emu-ffi/src/lib.rs`)
 
