@@ -44,6 +44,8 @@ mod tests {
         let injected = BroadcastTiming {
             per_hop_horizontal: 0,
             per_hop_vertical: d_v,
+            compute_hop_north: d_v,
+            compute_hop_south: d_v,
             intra_tile_core_offset: core_off,
             intra_tile_mem_offset: mem_off,
             intra_tile_memtile_offset: mem_off,

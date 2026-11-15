@@ -913,6 +913,8 @@ mod tests {
         assert!(b.calibrated, "SP-5c flip: broadcast timing must be calibrated");
         assert_eq!(b.per_hop_horizontal, 4);
         assert_eq!(b.per_hop_vertical, 2);
+        assert_eq!(b.compute_hop_north, 0);
+        assert_eq!(b.compute_hop_south, 4);
     }
 
     #[test]

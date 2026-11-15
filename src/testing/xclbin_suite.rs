@@ -1569,6 +1569,8 @@ mod tests {
         let t2 = t.with_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
             per_hop_horizontal: 0,
             per_hop_vertical: 3,
+            compute_hop_north: 3,
+            compute_hop_south: 3,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
             intra_tile_memtile_offset: 0,

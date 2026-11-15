@@ -675,6 +675,10 @@ fn gen_arch(model: &crate::types::ArchModel, out_dir: &Path) {
             .unwrap();
         writeln!(out, "    pub const BROADCAST_PER_HOP_VERTICAL: u8 = {};", t.broadcast.per_hop_vertical)
             .unwrap();
+        writeln!(out, "    pub const BROADCAST_COMPUTE_HOP_NORTH: u8 = {};", t.broadcast.compute_hop_north)
+            .unwrap();
+        writeln!(out, "    pub const BROADCAST_COMPUTE_HOP_SOUTH: u8 = {};", t.broadcast.compute_hop_south)
+            .unwrap();
         writeln!(
             out,
             "    pub const BROADCAST_INTRA_TILE_CORE_OFFSET: u8 = {};",

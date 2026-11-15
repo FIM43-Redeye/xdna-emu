@@ -5,6 +5,38 @@ use crate::device::tile::BroadcastProvenance;
 #[cfg(test)]
 use crate::device::tile::PendingBroadcast;
 
+/// Broadcast hop delays in cycles, the edge costs of the flood wavefront.
+///
+/// A vertical hop between two compute tiles costs `compute_north` going north and
+/// `compute_south` going south; every other vertical hop (one with a shim or memtile end)
+/// costs `v`, and an east/west hop `h`. On silicon the timer-reset flood leaves the compute
+/// rows of a column aligned (northbound 0) while the two-flood perf-counter interval still
+/// shrinks by 4 per compute row (northbound plus southbound): see `skew_constants.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HopDelays {
+    pub h: u32,
+    pub v: u32,
+    pub compute_north: u32,
+    pub compute_south: u32,
+}
+
+impl HopDelays {
+    /// Every vertical hop costs `v`, whatever its ends and direction.
+    #[cfg(test)]
+    pub(crate) fn uniform(h: u32, v: u32) -> Self {
+        Self { h, v, compute_north: v, compute_south: v }
+    }
+
+    fn from_timing(t: &xdna_archspec::types::BroadcastTiming) -> Self {
+        Self {
+            h: t.per_hop_horizontal as u32,
+            v: t.per_hop_vertical as u32,
+            compute_north: t.compute_hop_north as u32,
+            compute_south: t.compute_hop_south as u32,
+        }
+    }
+}
+
 impl DeviceState {
     /// Publish one hardware or software-originated event through every
     /// architectural consumer of that event wire.
@@ -531,19 +563,18 @@ impl DeviceState {
     /// Dijkstra wavefront over the broadcast adjacency for one channel.
     ///
     /// Returns `(col, row, origin_D)` for every reached tile, where `origin_D`
-    /// is the minimum cumulative propagation delay from the source (edge cost
-    /// `d_h` for an east/west hop, `d_v` for north/south). The OR-tree
+    /// is the minimum cumulative propagation delay from the source (edge costs
+    /// from [`HopDelays`]). The OR-tree
     /// re-broadcasts on first arrival, so earliest arrival wins = shortest path
     /// (AM020 Ch2). Honors per-tile broadcast block masks (a blocked direction
-    /// is a removed edge). Source `origin_D = 0`. With `d_h = d_v = 0` every
+    /// is a removed edge). Source `origin_D = 0`. With all delays 0 every
     /// `origin_D = 0` and the reached set equals the legacy flood's reach.
     pub(crate) fn broadcast_origin_d(
         &self,
         col: u8,
         source_row: u8,
         channel: u8,
-        d_h: u32,
-        d_v: u32,
+        hops: HopDelays,
     ) -> Vec<(u8, u8, u32)> {
         use crate::device::events::broadcast::BroadcastDir;
         use std::cmp::Reverse;
@@ -599,17 +630,25 @@ impl DeviceState {
                 Some(TileKind::ShimNoc) | Some(TileKind::ShimPl)
             );
 
+            // A vertical hop between two compute tiles has its own, direction-dependent cost.
+            let is_compute =
+                |c: u8, r: u8| matches!(self.array.get(c, r).map(|t| t.tile_kind), Some(TileKind::Compute));
             for dir in dirs {
                 let (nc, nr, step) = match dir {
-                    BroadcastDir::South if r > 0 => (c, r - 1, d_v),
-                    BroadcastDir::North if r + 1 < rows => (c, r + 1, d_v),
-                    BroadcastDir::East if c + 1 < cols && !is_shim => (c + 1, r, d_h),
-                    BroadcastDir::West if c > 0 && !is_shim => (c - 1, r, d_h),
+                    BroadcastDir::South if r > 0 => (c, r - 1, hops.v),
+                    BroadcastDir::North if r + 1 < rows => (c, r + 1, hops.v),
+                    BroadcastDir::East if c + 1 < cols && !is_shim => (c + 1, r, hops.h),
+                    BroadcastDir::West if c > 0 && !is_shim => (c - 1, r, hops.h),
                     _ => continue,
                 };
                 if !self.array.arch().is_valid_tile(nc, nr) {
                     continue;
                 }
+                let step = match dir {
+                    BroadcastDir::North if is_compute(c, r) && is_compute(nc, nr) => hops.compute_north,
+                    BroadcastDir::South if is_compute(c, r) && is_compute(nc, nr) => hops.compute_south,
+                    _ => step,
+                };
                 let ncost = cost + step;
                 let nidx = idx_of(nc, nr);
                 if ncost < best[nidx] {
@@ -631,14 +670,13 @@ impl DeviceState {
         col: u8,
         source_row: u8,
         channel: u8,
-        d_h: u32,
-        d_v: u32,
+        hops: HopDelays,
         core_off: u32,
         mem_off: u32,
         memtile_off: u32,
     ) -> Vec<(u8, u8, &'static str, u32)> {
         let mut out = Vec::new();
-        for (c, r, origin_d) in self.broadcast_origin_d(col, source_row, channel, d_h, d_v) {
+        for (c, r, origin_d) in self.broadcast_origin_d(col, source_row, channel, hops) {
             match self.array.get(c, r).map(|t| t.tile_kind) {
                 Some(TileKind::Compute) => {
                     out.push((c, r, "core", origin_d + core_off));
@@ -654,14 +692,13 @@ impl DeviceState {
         out
     }
 
-    /// Effective broadcast timing (d_h, d_v, core, compute-memory, memtile offsets) +
+    /// Effective broadcast timing (hop delays, core, compute-memory, memtile offsets) +
     /// calibrated: the runtime override if set, else the compile-time archspec
     /// constants. (SP-5b, #140.)
-    pub(crate) fn effective_broadcast_timing(&self) -> (u32, u32, u32, u32, u32, bool) {
+    pub(crate) fn effective_broadcast_timing(&self) -> (HopDelays, u32, u32, u32, bool) {
         if let Some(o) = &self.broadcast_timing_override {
             (
-                o.per_hop_horizontal as u32,
-                o.per_hop_vertical as u32,
+                HopDelays::from_timing(o),
                 o.intra_tile_core_offset as u32,
                 o.intra_tile_mem_offset as u32,
                 o.intra_tile_memtile_offset as u32,
@@ -670,8 +707,12 @@ impl DeviceState {
         } else {
             use xdna_archspec::aie2::timing as bt;
             (
-                bt::BROADCAST_PER_HOP_HORIZONTAL as u32,
-                bt::BROADCAST_PER_HOP_VERTICAL as u32,
+                HopDelays {
+                    h: bt::BROADCAST_PER_HOP_HORIZONTAL as u32,
+                    v: bt::BROADCAST_PER_HOP_VERTICAL as u32,
+                    compute_north: bt::BROADCAST_COMPUTE_HOP_NORTH as u32,
+                    compute_south: bt::BROADCAST_COMPUTE_HOP_SOUTH as u32,
+                },
                 bt::BROADCAST_INTRA_TILE_CORE_OFFSET as u32,
                 bt::BROADCAST_INTRA_TILE_MEM_OFFSET as u32,
                 bt::BROADCAST_INTRA_TILE_MEMTILE_OFFSET as u32,
@@ -713,16 +754,15 @@ impl DeviceState {
     /// the runtime override if set (SP-5b measurement apparatus), else the
     /// compile-time archspec constants.
     pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
-        let (d_h, d_v, core_off, mem_off, memtile_off, _cal) = self.effective_broadcast_timing();
-        self.propagate_broadcasts_with_timing(col, source_row, d_h, d_v, core_off, mem_off, memtile_off);
+        let (hops, core_off, mem_off, memtile_off, _cal) = self.effective_broadcast_timing();
+        self.propagate_broadcasts_with_timing(col, source_row, hops, core_off, mem_off, memtile_off);
     }
 
     pub(crate) fn propagate_broadcasts_with_timing(
         &mut self,
         col: u8,
         source_row: u8,
-        d_h: u32,
-        d_v: u32,
+        hops: HopDelays,
         core_off: u32,
         mem_off: u32,
         memtile_off: u32,
@@ -763,7 +803,7 @@ impl DeviceState {
                 current_cycle,
             );
 
-            let reached = self.broadcast_origin_d(col, source_row, pb.channel, d_h, d_v);
+            let reached = self.broadcast_origin_d(col, source_row, pb.channel, hops);
 
             // max_delay over all reached modules: for each tile the worst-case
             // intra-tile offset is the largest of the three, so every
@@ -1491,7 +1531,7 @@ mod broadcast_wavefront_tests {
         let (src_col, src_row) = (1u8, 2u8); // a compute-row source
         let d_h = 2u32;
         let d_v = 3u32;
-        let map = dev.broadcast_origin_d(src_col, src_row, 0, d_h, d_v);
+        let map = dev.broadcast_origin_d(src_col, src_row, 0, HopDelays::uniform(d_h, d_v));
 
         // Source is 0; every tile dc cols, dr rows away costs dc*d_h + dr*d_v
         // (weighted Manhattan, valid because the unblocked grid lets you move
@@ -1514,7 +1554,7 @@ mod broadcast_wavefront_tests {
         let dev = DeviceState::new_npu1();
         let d_h = 2u32;
         let d_v = 3u32;
-        let map = dev.broadcast_origin_d(1, 0, 0, d_h, d_v); // shim source (1,0)
+        let map = dev.broadcast_origin_d(1, 0, 0, HopDelays::uniform(d_h, d_v)); // shim source (1,0)
         let at = |c: u8, r: u8| map.iter().find(|&&(mc, mr, _)| mc == c && mr == r).map(|&(_, _, o)| o);
         // Adjacent shim tile: up-across-down detour = d_h + 2*d_v, not d_h.
         assert_eq!(at(2, 0), Some(d_h + 2 * d_v), "adjacent shim must detour via the fabric");
@@ -1530,7 +1570,7 @@ mod broadcast_wavefront_tests {
         // source and the far corner are both reached. (Full reach-equivalence vs.
         // the legacy flood is additionally guarded by interrupt_path_tests.)
         let dev = DeviceState::new_npu1();
-        let map = dev.broadcast_origin_d(1, 2, 0, 0, 0);
+        let map = dev.broadcast_origin_d(1, 2, 0, HopDelays::uniform(0, 0));
         assert!(map.iter().all(|&(_, _, o)| o == 0), "d=0 -> all origin_D == 0");
         assert!(map.iter().any(|&(c, r, _)| c == 1 && r == 2), "source reached");
         let (fc, fr) = (dev.array.cols() - 1, dev.array.rows() - 1);
@@ -1542,7 +1582,7 @@ mod broadcast_wavefront_tests {
         // Single-source flood with nonzero synthetic constants so the table is
         // not all-zero. d_h=d_v=1, core_off=0, mem_off=2 (the -2 intra signature).
         let st = DeviceState::new_npu1();
-        let rows = st.origin_d_table(1, 0, /*channel*/ 15, 1, 1, 0, 2, 2);
+        let rows = st.origin_d_table(1, 0, /*channel*/ 15, HopDelays::uniform(1, 1), 0, 2, 2);
         // The shim source (1,0) has origin_D 0 -> shim delay 0.
         assert!(rows.iter().any(|&(c, r, k, d)| c == 1 && r == 0 && k == "shim" && d == 0));
         // A compute tile at Manhattan distance N has core_delay = N*1 + 0,
@@ -1593,7 +1633,7 @@ mod broadcast_flood_timing_tests {
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
         // d_v = 4: one vertical hop = 4 cy of skew. d_h, offsets = 0.
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 4), 0, 0, 0);
         // One tick each consumes the latch -> value = target.
         dev.array.get_mut(src.0, src.1).unwrap().core_timer.tick();
         dev.array.get_mut(hop.0, hop.1).unwrap().core_timer.tick();
@@ -1614,6 +1654,8 @@ mod broadcast_flood_timing_tests {
         dev.set_broadcast_timing_override(Some(xdna_archspec::types::BroadcastTiming {
             per_hop_horizontal: 0,
             per_hop_vertical: 0,
+            compute_hop_north: 0,
+            compute_hop_south: 0,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
             intra_tile_memtile_offset: 0,
@@ -1660,7 +1702,7 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 0), 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([src]));
     }
 
@@ -1675,7 +1717,7 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(5));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 0), 0, 0, 0);
         assert!(dev.flood_sources().is_empty(), "channel 5 must not be recorded as a flood source");
     }
 
@@ -1691,13 +1733,13 @@ mod flood_source_capture_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(a.0, a.1, 0, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(a.0, a.1, HopDelays::uniform(0, 0), 0, 0, 0);
         dev.array
             .get_mut(b.0, b.1)
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(15));
-        dev.propagate_broadcasts_with_timing(b.0, b.1, 0, 0, 0, 0, 0);
+        dev.propagate_broadcasts_with_timing(b.0, b.1, HopDelays::uniform(0, 0), 0, 0, 0);
         assert_eq!(dev.flood_sources(), &std::collections::HashSet::from([a, b]));
     }
 
@@ -1761,11 +1803,14 @@ mod flood_source_capture_tests {
 
 #[cfg(test)]
 mod broadcast_timing_consts_tests {
+    use super::HopDelays;
+
     #[test]
     fn broadcast_timing_consts_are_calibrated() {
         use xdna_archspec::aie2::timing::{
-            BROADCAST_INTRA_TILE_CORE_OFFSET, BROADCAST_INTRA_TILE_MEMTILE_OFFSET,
-            BROADCAST_INTRA_TILE_MEM_OFFSET, BROADCAST_PER_HOP_HORIZONTAL, BROADCAST_PER_HOP_VERTICAL,
+            BROADCAST_COMPUTE_HOP_NORTH, BROADCAST_COMPUTE_HOP_SOUTH, BROADCAST_INTRA_TILE_CORE_OFFSET,
+            BROADCAST_INTRA_TILE_MEMTILE_OFFSET, BROADCAST_INTRA_TILE_MEM_OFFSET,
+            BROADCAST_PER_HOP_HORIZONTAL, BROADCAST_PER_HOP_VERTICAL,
         };
         // SP-5c calibrated flip (2026-07-02): d_h=4/d_v=2 measured on Phoenix
         // (free-flood R3b). Guards against an accidental revert to the uncalibrated
@@ -1779,6 +1824,10 @@ mod broadcast_timing_consts_tests {
         // measure it against.
         assert_eq!(BROADCAST_PER_HOP_HORIZONTAL, 4);
         assert_eq!(BROADCAST_PER_HOP_VERTICAL, 2);
+        // Compute tile to compute tile: northbound 0 (the rows' timers agree), southbound 4
+        // (R3b's per-row sum of the two directions, 4, minus the northbound 0).
+        assert_eq!(BROADCAST_COMPUTE_HOP_NORTH, 0);
+        assert_eq!(BROADCAST_COMPUTE_HOP_SOUTH, 4);
         assert_eq!(BROADCAST_INTRA_TILE_CORE_OFFSET, 0);
         assert_eq!(BROADCAST_INTRA_TILE_MEM_OFFSET, 1);
         assert_eq!(BROADCAST_INTRA_TILE_MEMTILE_OFFSET, 2);
@@ -1799,7 +1848,7 @@ mod broadcast_timing_consts_tests {
                 .pending_broadcasts
                 .push(PendingBroadcast::originated(15));
             // d_h 4, d_v 2, core 0, memtile 2 (as shipped); only the compute memory offset varies.
-            dev.propagate_broadcasts_with_timing(1, 0, 4, 2, 0, mem_off, 2);
+            dev.propagate_broadcasts_with_timing(1, 0, HopDelays::uniform(4, 2), 0, mem_off, 2);
             // (core-side timer, memory-side timer); a shim and a memtile have only one real unit,
             // and the unused one is not compared.
             let at = |c, r| {
@@ -1818,6 +1867,55 @@ mod broadcast_timing_consts_tests {
         assert_eq!(far1.1, far2.1 + 1);
     }
 
+    /// The shipped timer-reset flood from a shim leaves the compute rows of its column aligned and
+    /// the memtile aligned with the first compute row's core timer, as silicon reads them:
+    /// - memory modules of rows 2 / 3 / 4: a core releasing its own lock and then, one bundle later,
+    ///   its neighbour's lock stamps the two releases 1 apart in both directions (north and south
+    ///   neighbour, the mirrored instruction pair), so the rows' timers agree;
+    /// - core modules of rows 2 / 3: a neighbour lock release against the held core it frees;
+    /// - receiver S2MM finishes 1 / 2 / 3 rows north of a (0,2) source differ from the source row's
+    ///   by the path alone (4 stages a hop plus one quiet-switch cycle);
+    /// - memtile against the row-2 core: the memtile North master's first word and the compute South
+    ///   slave's first word of one crossing read the same cycle.
+    #[test]
+    fn shim_flood_aligns_compute_rows_and_keeps_memtile_on_row_two() {
+        use crate::device::tile::PendingBroadcast;
+        let mut dev = crate::device::state::DeviceState::new_npu1();
+        dev.array
+            .get_mut(1, 0)
+            .unwrap()
+            .pending_broadcasts
+            .push(PendingBroadcast::originated(15));
+        dev.propagate_broadcasts(1, 0);
+        let core = |r: u8| dev.array.get(1, r).unwrap().core_trace.origin_offset();
+        let mem = |r: u8| dev.array.get(1, r).unwrap().mem_trace.origin_offset();
+        for r in 3..=5 {
+            assert_eq!(mem(r), mem(2), "compute memory timer of row {r} against row 2");
+            assert_eq!(core(r), core(2), "compute core timer of row {r} against row 2");
+        }
+        assert_eq!(mem(1), core(2), "memtile timer against the row-2 core timer");
+    }
+
+    /// The two-flood perf-counter interval (a northbound flood starts each compute core's counter,
+    /// a southbound flood from the top row stops it) shrinks by 4 per compute row north: the
+    /// northbound and southbound compute-row hops sum to 4.
+    #[test]
+    fn compute_row_hops_north_plus_south_is_four() {
+        let dev = crate::device::state::DeviceState::new_npu1();
+        let (hops, ..) = dev.effective_broadcast_timing();
+        let at = |src: (u8, u8), tile: (u8, u8)| {
+            dev.broadcast_origin_d(src.0, src.1, 15, hops)
+                .into_iter()
+                .find(|&(c, r, _)| (c, r) == tile)
+                .map(|(_, _, d)| d)
+                .unwrap()
+        };
+        let interval = |r: u8| at((1, 5), (1, r)) as i64 - at((1, 0), (1, r)) as i64;
+        for r in 2..5 {
+            assert_eq!(interval(r) - interval(r + 1), 4, "rows {r} and {}", r + 1);
+        }
+    }
+
     /// A memtile timer follows `memtile_off`, not the compute memory module's `mem_off`.
     #[test]
     fn memtile_offset_is_independent_of_compute_memory_offset() {
@@ -1829,7 +1927,7 @@ mod broadcast_timing_consts_tests {
                 .unwrap()
                 .pending_broadcasts
                 .push(PendingBroadcast::originated(15));
-            dev.propagate_broadcasts_with_timing(1, 0, 4, 2, 0, mem_off, 2);
+            dev.propagate_broadcasts_with_timing(1, 0, HopDelays::uniform(4, 2), 0, mem_off, 2);
             dev.array.get(1, 1).unwrap().mem_trace.origin_offset()
         };
         assert_eq!(memtile_origin(0), memtile_origin(2));
@@ -1856,7 +1954,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 4, 0, 0, 0); // d_v=4
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 4), 0, 0, 0); // d_v=4
         let off_src = dev.array.get(src.0, src.1).unwrap().core_trace.origin_offset();
         let off_hop = dev.array.get(hop.0, hop.1).unwrap().core_trace.origin_offset();
         assert_eq!(off_src - off_hop, 4, "cross-tile origin offset diff == d_v");
@@ -1874,7 +1972,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4, 4); // core_off=2, mem_off=4
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 0), 2, 4, 4); // core_off=2, mem_off=4
         let tile = dev.array.get(src.0, src.1).unwrap();
         let core = tile.core_trace.origin_offset();
         let mem = tile.mem_trace.origin_offset();
@@ -1902,7 +2000,7 @@ mod broadcast_origin_offset_tests {
             .unwrap()
             .pending_broadcasts
             .push(PendingBroadcast::originated(channel));
-        dev.propagate_broadcasts_with_timing(src.0, src.1, 0, 0, 2, 4, 4); // core_off=2 -> nonzero offset
+        dev.propagate_broadcasts_with_timing(src.0, src.1, HopDelays::uniform(0, 0), 2, 4, 4); // core_off=2 -> nonzero offset
         let tile = dev.array.get(src.0, src.1).unwrap();
         let off = tile.core_trace.origin_offset();
         assert!(off > 0, "source core trace must receive a nonzero offset");
@@ -1937,6 +2035,8 @@ mod broadcast_origin_offset_tests {
         dev.set_broadcast_timing_override(Some(BroadcastTiming {
             per_hop_horizontal: 0,
             per_hop_vertical: 4,
+            compute_hop_north: 4,
+            compute_hop_south: 4,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 0,
             intra_tile_memtile_offset: 0,
@@ -1958,7 +2058,10 @@ mod broadcast_origin_offset_tests {
         // memory-access and lock-release placement was fixed (2026-11-13, two same-tile
         // cross-unit pairs one cycle off silicon the same way); the memtile keeps the old 2.
         let dev = DeviceState::new_npu1();
-        assert_eq!(dev.effective_broadcast_timing(), (4, 2, 0, 1, 2, true));
+        assert_eq!(
+            dev.effective_broadcast_timing(),
+            (HopDelays { h: 4, v: 2, compute_north: 0, compute_south: 4 }, 0, 1, 2, true)
+        );
     }
 
     #[test]
@@ -1997,6 +2100,8 @@ mod broadcast_origin_offset_tests {
         dev.set_broadcast_timing_override(Some(BroadcastTiming {
             per_hop_horizontal: 0,
             per_hop_vertical: 0,
+            compute_hop_north: 0,
+            compute_hop_south: 0,
             intra_tile_core_offset: 0,
             intra_tile_mem_offset: 2,
             intra_tile_memtile_offset: 2,

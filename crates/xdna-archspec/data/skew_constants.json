@@ -1,20 +1,30 @@
 {
   "d_h": 4,
   "d_v": 2,
-  "intra": { "core": 0, "mem": 1, "memtile": 2 },
+  "d_v_compute": {
+    "north": 0,
+    "south": 4
+  },
+  "intra": {
+    "core": 0,
+    "mem": 1,
+    "memtile": 2
+  },
   "fit_residual": 7e-15,
   "source_route": "r3b_pc",
-  "provenance": "SP-5c Phase 6 calibrated flip (2026-07-02). d_h=4, d_v=2 measured on Phoenix NPU1 via the free-flood R3b perf-counter instrument (Delta_wall-free hardware interval), N=20 drift gate range-0, fit_residual ~7e-15 byte-identical. intra core=0/mem=2 was the add_one +2/+4/-2 intra-tile signature (mem_off-core_off=+2, HW-observed raw offset of one core event against one memory-module event, so it also carried that pair's wall-clock separation as the emulator then placed it); absolute intra is gauge-fixed (core=0), only the contrast is observable. 2026-11-13: after the core memory-access and lock-release placement was corrected, two same-tile cross-unit event pairs (lock release against core event, core memory stall against bank conflict) each read one cycle off silicon in the same direction, so the compute memory module's value is 1 (core-minus-memory contrast -1); the memtile value stays 2 (nothing measures a memtile against a core). Units: raw counter cycles == trace cycles (both tile-clock). HONEST FIRST CALIBRATION: end-to-end causal-vs-HW validation is coarse, bounded by the open SP-4a cold-start fill-state Delta_wall gap (~7-50cy > the ~2cy skew) -- the constants are correct by measurement (clean R3b) but tight HW confirmation waits until that gap closes. Reversible (this flag).",
+  "provenance": "SP-5c Phase 6 calibrated flip (2026-07-02). d_h=4, d_v=2 measured on Phoenix NPU1 via the free-flood R3b perf-counter instrument (Delta_wall-free hardware interval), N=20 drift gate range-0, fit_residual ~7e-15 byte-identical. intra core=0/mem=2 was the add_one +2/+4/-2 intra-tile signature (mem_off-core_off=+2, HW-observed raw offset of one core event against one memory-module event, so it also carried that pair's wall-clock separation as the emulator then placed it); absolute intra is gauge-fixed (core=0), only the contrast is observable. 2026-11-13: after the core memory-access and lock-release placement was corrected, two same-tile cross-unit event pairs (lock release against core event, core memory stall against bank conflict) each read one cycle off silicon in the same direction, so the compute memory module's value is 1 (core-minus-memory contrast -1); the memtile value stays 2 (nothing measures a memtile against a core). Units: raw counter cycles == trace cycles (both tile-clock). HONEST FIRST CALIBRATION: end-to-end causal-vs-HW validation is coarse, bounded by the open SP-4a cold-start fill-state Delta_wall gap (~7-50cy > the ~2cy skew) -- the constants are correct by measurement (clean R3b) but tight HW confirmation waits until that gap closes. Reversible (this flag). 2026-11-14: the vertical hop between two compute tiles is direction-split, north 0 / south 4. R3b's two-flood interval measures only the sum of the northbound (ch15 from the shim) and southbound (ch14 from the top row) compute-row hops, 4 per row; 2 / 2 was that sum split by the isotropy assumption. A mid-column ch14 source reads the two rows north of it equal (115 / 115), so a northbound hop costs the same on ch14 and ch15. The northbound value comes from trace timers: a core releasing its own lock and, one bundle later, its south neighbour's lock stamps the pair +1 apart (south timer minus own, 32 / 32 pairs x 9 runs, rows 2-3 and 3-4), and the mirrored pair (own, then the north neighbour's) +1 apart (48 / 48 pairs, 135 runs); with the same lag both ways the two rows' memory timers agree, where 2 per hop reads +2 / -2. Corroborated without a further constant: a neighbour lock release against the core it frees on the row below (core timers) and receiver S2MM finishes 1 / 2 / 3 rows north of their source, all equal to the stream path once the rows' timers are aligned. The southbound 4 is the R3b sum minus the northbound 0. A vertical hop with a shim or memtile end keeps d_v 2: the memtile North master's first word and the row-2 South slave's first word of one crossing read the same cycle on the memtile and row-2 core timers, as with 2 (only that hop's cost minus the memtile offset is measured).",
   "per_channel": "d_h/d_v fitted channel-agnostic on a ch15(START)/ch14(STOP) blend; ch15-in-isolation is structurally unmeasurable (Seam 1), disclosed-assumed uniform.",
   "b_vector_range": 0,
   "jitter_range": 0,
   "assumptions": {
     "horizontal_direction_isotropy": "assumed",
-    "vertical_direction_isotropy": "assumed_blocked_on_coldstart_fill_gap",
+    "vertical_direction_isotropy": "refuted_for_compute_rows_split_north0_south4",
     "absolute_intra_offset": "gauge",
     "ch15_hop_cost": "assumed_via_blend",
     "per_module_horizontal_split": "not_measured",
-    "end_to_end_validation": "coarse_pending_sp4a_fill_gap"
+    "end_to_end_validation": "coarse_pending_sp4a_fill_gap",
+    "boundary_vertical_hop": "assumed_2_only_hop_minus_memtile_offset_measured",
+    "neighbour_lock_release_lag_symmetric": "assumed (same instruction pair both ways)"
   },
   "d_h_path": "fabric",
   "calibrated": true

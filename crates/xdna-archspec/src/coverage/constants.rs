@@ -92,6 +92,10 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
     const SKEW: &str = "NPU1 R3b perf-counter skew sweep, N=20, drift range 0 \
         (crates/xdna-archspec/data/skew_constants.json; xdna-emu-priv: research/findings/2026-07-01-r3b-pc-silicon-bringup.md, \
         2026-07-02-sp5c-phase0-identifiability.md)";
+    const COMPUTE_HOP: &str = "NPU1 2026-11-14 mirrored neighbour-lock pairs: a core releases its own lock and, one bundle \
+        later, its south neighbour's (south timer minus own +1, 32 / 32 pairs x 9 runs) or its north neighbour's (north minus \
+        own +1, 48 / 48 pairs, 135 runs), so the rows' timers agree; R3b perf-counter sum, north plus south 4 per compute row \
+        (crates/xdna-archspec/data/skew_constants.json)";
     const HOP_SLOPE: &str = "NPU1 R4-D3 egress race (tools/experiments/r4d3_*.py): a stalled consumer 0/1/2/3 hops away \
         absorbs 26/34/42/50 words from a core source and 48/56/64/72 (+ granule phase) from a DMA source, 8 per hop = \
         AM020 ch.2:92's 8-deep ext->ext crossing (slave 4 + master 4); the emulator reproduces all 25 route x phase \
@@ -302,7 +306,12 @@ fn aie2_timing_constants() -> Vec<ConstantUnit> {
             are not synchronised with the shim's, so the absolute delay is not observable there)."),
         // -- broadcast --
         measured("broadcast.per_hop_horizontal", SKEW, "Horizontal isotropy assumed."),
-        measured("broadcast.per_hop_vertical", SKEW, "Vertical isotropy assumed (blocked on the cold-start fill gap)."),
+        unit("broadcast.per_hop_vertical", HardwareObserved, Verification::Unverified, "A vertical hop with a shim or memtile \
+            end. Not measured on such a hop: the value is the R3b perf-counter sweep's compute-row sum (4) split evenly. Only the memtile-to-compute hop minus the memtile offset is \
+            measured (0: the memtile North master and the row-2 South slave date one crossing's first word alike)."),
+        measured("broadcast.compute_hop_north", COMPUTE_HOP, "Rows 2-3 and 3-4 (memory timers), 2-3 (core timers); assumes a \
+            neighbour lock release lags the own one equally north and south (the same instruction pair)."),
+        measured("broadcast.compute_hop_south", COMPUTE_HOP, "R3b's per-row sum (4) minus the northbound 0; not measured on its own."),
         measured("broadcast.intra_tile_core_offset", SKEW, "Gauge-fixed at 0: only the core-memory contrast is observable."),
         unit("broadcast.intra_tile_mem_offset", HardwareObserved, Verification::Unverified,
             "Compute memory module against the core (core is the gauge, 0). Started at 2, the raw add_one core-vs-memory event \

@@ -435,6 +435,8 @@ mod tests {
         assert!(t.calibrated);
         assert_eq!(t.per_hop_horizontal, 4);
         assert_eq!(t.per_hop_vertical, 2);
+        assert_eq!(t.compute_hop_north, 0);
+        assert_eq!(t.compute_hop_south, 4);
         assert_eq!(t.intra_tile_core_offset, 0);
         // Compute memory module 1 (raw add_one offset 2, corrected one cycle after the core
         // memory-access and lock-release placement fix, 2026-11-13); memtile keeps 2.

@@ -8,6 +8,8 @@ pub fn uncalibrated() -> BroadcastTiming {
     BroadcastTiming {
         per_hop_horizontal: 0,
         per_hop_vertical: 0,
+        compute_hop_north: 0,
+        compute_hop_south: 0,
         intra_tile_core_offset: 0,
         intra_tile_mem_offset: 0,
         intra_tile_memtile_offset: 0,
@@ -30,13 +32,17 @@ pub fn broadcast_timing_from_json(v: &serde_json::Value) -> Result<BroadcastTimi
     }
     let d_h = field_u8(v, &["d_h"]);
     let d_v = field_u8(v, &["d_v"]);
+    let north = field_u8(v, &["d_v_compute", "north"]);
+    let south = field_u8(v, &["d_v_compute", "south"]);
     let core = field_u8(v, &["intra", "core"]);
     let mem = field_u8(v, &["intra", "mem"]);
     let memtile = field_u8(v, &["intra", "memtile"]);
-    match (d_h, d_v, core, mem, memtile) {
-        (Some(h), Some(vv), Some(c), Some(m), Some(mt)) => Ok(BroadcastTiming {
+    match (d_h, d_v, north, south, core, mem, memtile) {
+        (Some(h), Some(vv), Some(n), Some(s), Some(c), Some(m), Some(mt)) => Ok(BroadcastTiming {
             per_hop_horizontal: h,
             per_hop_vertical: vv,
+            compute_hop_north: n,
+            compute_hop_south: s,
             intra_tile_core_offset: c,
             intra_tile_mem_offset: m,
             intra_tile_memtile_offset: mt,
@@ -44,7 +50,7 @@ pub fn broadcast_timing_from_json(v: &serde_json::Value) -> Result<BroadcastTimi
         }),
         _ => Err(format!(
             "calibrated skew_constants.json has a null/missing constant \
-             (d_h={d_h:?} d_v={d_v:?} core={core:?} mem={mem:?} memtile={memtile:?}); refusing to \
+             (d_h={d_h:?} d_v={d_v:?} d_v_compute.north={north:?} d_v_compute.south={south:?} core={core:?} mem={mem:?} memtile={memtile:?}); refusing to \
              build a model that claims calibrated with incomplete data"
         )),
     }
@@ -59,6 +65,8 @@ mod tests {
         let t = uncalibrated();
         assert_eq!(t.per_hop_horizontal, 0);
         assert_eq!(t.per_hop_vertical, 0);
+        assert_eq!(t.compute_hop_north, 0);
+        assert_eq!(t.compute_hop_south, 0);
         assert_eq!(t.intra_tile_core_offset, 0);
         assert_eq!(t.intra_tile_mem_offset, 0);
         assert_eq!(t.intra_tile_memtile_offset, 0);
@@ -82,13 +90,15 @@ mod tests {
         // (e.g. transposing intra.core <-> intra.mem, or d_h <-> d_v) fails
         // this test instead of passing silently.
         let v = serde_json::json!({
-            "calibrated": true, "d_h": 4, "d_v": 2,
+            "calibrated": true, "d_h": 4, "d_v": 2, "d_v_compute": {"north": 6, "south": 7},
             "intra": {"core": 1, "mem": 3, "memtile": 5}
         });
         let t = broadcast_timing_from_json(&v).unwrap();
         assert!(t.calibrated);
         assert_eq!(t.per_hop_horizontal, 4);
         assert_eq!(t.per_hop_vertical, 2);
+        assert_eq!(t.compute_hop_north, 6);
+        assert_eq!(t.compute_hop_south, 7);
         assert_eq!(t.intra_tile_core_offset, 1);
         assert_eq!(t.intra_tile_mem_offset, 3);
         assert_eq!(t.intra_tile_memtile_offset, 5);
@@ -112,6 +122,16 @@ mod tests {
         });
         let err = broadcast_timing_from_json(&v).unwrap_err();
         assert!(err.contains("calibrated"), "{err}");
+    }
+
+    #[test]
+    fn calibrated_without_compute_hop_split_is_error() {
+        let v = serde_json::json!({
+            "calibrated": true, "d_h": 4, "d_v": 2, "d_v_compute": {"north": 0, "south": null},
+            "intra": {"core": 1, "mem": 3, "memtile": 5}
+        });
+        let err = broadcast_timing_from_json(&v).unwrap_err();
+        assert!(err.contains("d_v_compute.south"), "{err}");
     }
 
     #[test]

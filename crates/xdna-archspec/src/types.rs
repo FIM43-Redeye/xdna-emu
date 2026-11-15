@@ -1797,8 +1797,13 @@ pub struct StreamSwitchTiming {
 pub struct BroadcastTiming {
     /// Per-horizontal-hop (east/west) broadcast propagation delay in cycles.
     pub per_hop_horizontal: u8,
-    /// Per-vertical-hop (north/south) broadcast propagation delay in cycles.
+    /// Per-vertical-hop (north/south) broadcast propagation delay in cycles, for a hop with a
+    /// shim or memtile tile at either end.
     pub per_hop_vertical: u8,
+    /// Delay of a northbound vertical hop from one compute tile to the next, in cycles.
+    pub compute_hop_north: u8,
+    /// Delay of a southbound vertical hop from one compute tile to the next, in cycles.
+    pub compute_hop_south: u8,
     /// Additive offset for a compute tile's core module (relative to the
     /// earliest-resetting module type = the zero baseline; non-negative).
     pub intra_tile_core_offset: u8,
