@@ -6,6 +6,7 @@
 //! The executor tracks Sync (TCT) instructions that specify completion
 //! conditions. A "run" is complete when all Sync conditions are satisfied.
 
+use super::cycle_cost::OpTarget;
 use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
 use crate::device::host_memory::HostMemory;
@@ -190,6 +191,9 @@ pub struct NpuExecutor {
     /// controller looked (`None` until the sequence's first operation). The
     /// tokens issued since are the ones it has not yet serviced.
     tokens_seen: Option<u64>,
+    /// Whether the last operation issued was a masked write to a tile
+    /// register (the next one is then not the first of a run).
+    after_tile_mask_write: bool,
     /// What a sync's wait costs, from the lateness of its token.
     sync_wait: super::SyncWaitModel,
 
@@ -211,6 +215,7 @@ impl NpuExecutor {
             cycle_model: super::CycleCostModel::default(),
             to_array: crate::timebase::FirmwareToArray::new(super::CycleCostModel::default().clocks),
             tokens_seen: None,
+            after_tile_mask_write: false,
             sync_wait: super::SyncWaitModel::default(),
             npu_cycle: 0,
         }
@@ -478,6 +483,7 @@ impl NpuExecutor {
         self.npu_cycle = 0;
         self.to_array = crate::timebase::FirmwareToArray::new(self.cycle_model.clocks);
         self.tokens_seen = None;
+        self.after_tile_mask_write = false;
         // A runtime sequence waits only on its own Syncs; a runlist's
         // previous command's must not gate (or "stall") this one.
         self.pending_syncs.clear();
@@ -557,6 +563,13 @@ impl NpuExecutor {
                 }
 
                 let instr = self.instructions[next_index].clone();
+                let target = match &instr {
+                    NpuInstruction::Write32 { reg_off, .. } | NpuInstruction::MaskWrite { reg_off, .. } => {
+                        Self::op_target(*reg_off, device)
+                    }
+                    _ => OpTarget::Shim { push: false },
+                };
+                let cost = self.cycle_model.cost_of(&instr, target, self.after_tile_mask_write);
 
                 if let Err(e) = self.execute_instruction(&instr, device, host_memory) {
                     let msg = format!("NPU instruction {} execution error: {}", next_index, e);
@@ -564,6 +577,8 @@ impl NpuExecutor {
                     return AdvanceResult::Error(msg);
                 }
                 self.executed_count += 1;
+                self.after_tile_mask_write = matches!(instr, NpuInstruction::MaskWrite { .. })
+                    && matches!(target, OpTarget::MemTile | OpTarget::Compute);
 
                 // would_block_on_queue may have transitioned us to BlockedOnQueue,
                 // or execute_instruction may have transitioned to BlockedOnSync.
@@ -591,7 +606,7 @@ impl NpuExecutor {
                     self.state = ExecutorState::Done;
                     AdvanceResult::Done
                 } else {
-                    self.retire(new_index, self.cycle_model.cost_of(&instr));
+                    self.retire(new_index, cost);
                     AdvanceResult::Progressed
                 }
             }
@@ -1182,66 +1197,8 @@ impl NpuExecutor {
         value: u32,
         device: &DeviceState,
     ) -> bool {
-        let tile_kind = match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
-            Some(tt) => tt,
-            None => return false,
-        };
-
-        let dma = match device.array.dma_engine(col, row) {
-            Some(d) => d,
-            None => return false,
-        };
-        let s2mm_channels = dma.s2mm_channel_count() as u8;
-        let mm2s_channels = dma.mm2s_channel_count() as u8;
-
-        let reg_layout = crate::device::regdb::device_reg_layout();
-
-        // Identify if this offset is a start queue write
-        let (abs_channel, _is_mm2s) = match tile_kind {
-            TileKind::Compute => {
-                let base = reg_layout.memory_channel_base;
-                let stride = reg_layout.memory_channel_stride;
-                match Self::channel_from_queue_write(
-                    offset,
-                    base,
-                    stride,
-                    s2mm_channels,
-                    s2mm_channels + mm2s_channels,
-                ) {
-                    Some(r) => r,
-                    None => return false,
-                }
-            }
-            TileKind::Mem => {
-                let stride = reg_layout.memtile_channel_stride;
-                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
-                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                if let Some((ch, _)) =
-                    Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
-                {
-                    (ch, false)
-                } else if let Some((ch, _)) =
-                    Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
-                {
-                    (s2mm_channels + ch, true)
-                } else {
-                    return false;
-                }
-            }
-            TileKind::ShimNoc | TileKind::ShimPl => {
-                let base = reg_layout.shim_channel_base;
-                let stride = reg_layout.shim_channel_stride;
-                match Self::channel_from_queue_write(
-                    offset,
-                    base,
-                    stride,
-                    s2mm_channels,
-                    s2mm_channels + mm2s_channels,
-                ) {
-                    Some(r) => r,
-                    None => return false,
-                }
-            }
+        let Some((tile_kind, abs_channel)) = Self::queue_channel(col, row, offset, device) else {
+            return false;
         };
 
         // Check queue depth
@@ -1279,6 +1236,81 @@ impl NpuExecutor {
         }
 
         false
+    }
+
+    /// What a write at `reg_off` targets, for its operation cost: a shim
+    /// register (and whether it is a task-queue push), a memtile or a compute
+    /// tile.
+    fn op_target(reg_off: u32, device: &DeviceState) -> OpTarget {
+        let (col, row, offset) = decode_npu_address(reg_off, device.start_col);
+        match device.tile(col as usize, row as usize).map(|t| t.tile_kind) {
+            Some(TileKind::Mem) => OpTarget::MemTile,
+            Some(TileKind::Compute) => OpTarget::Compute,
+            Some(TileKind::ShimNoc | TileKind::ShimPl) | None => {
+                OpTarget::Shim { push: Self::queue_channel(col, row, offset, device).is_some() }
+            }
+        }
+    }
+
+    /// The tile kind and absolute DMA channel whose task queue `offset` is,
+    /// or `None` when the write is not a task-queue push.
+    fn queue_channel(col: u8, row: u8, offset: u32, device: &DeviceState) -> Option<(TileKind, u8)> {
+        let tile_kind = device.tile(col as usize, row as usize).map(|t| t.tile_kind)?;
+        let dma = device.array.dma_engine(col, row)?;
+        let s2mm_channels = dma.s2mm_channel_count() as u8;
+        let mm2s_channels = dma.mm2s_channel_count() as u8;
+
+        let reg_layout = crate::device::regdb::device_reg_layout();
+
+        // Identify if this offset is a start queue write
+        let (abs_channel, _is_mm2s) = match tile_kind {
+            TileKind::Compute => {
+                let base = reg_layout.memory_channel_base;
+                let stride = reg_layout.memory_channel_stride;
+                match Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                ) {
+                    Some(r) => r,
+                    None => return None,
+                }
+            }
+            TileKind::Mem => {
+                let stride = reg_layout.memtile_channel_stride;
+                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
+                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
+                if let Some((ch, _)) =
+                    Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels)
+                {
+                    (ch, false)
+                } else if let Some((ch, _)) =
+                    Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels)
+                {
+                    (s2mm_channels + ch, true)
+                } else {
+                    return None;
+                }
+            }
+            TileKind::ShimNoc | TileKind::ShimPl => {
+                let base = reg_layout.shim_channel_base;
+                let stride = reg_layout.shim_channel_stride;
+                match Self::channel_from_queue_write(
+                    offset,
+                    base,
+                    stride,
+                    s2mm_channels,
+                    s2mm_channels + mm2s_channels,
+                ) {
+                    Some(r) => r,
+                    None => return None,
+                }
+            }
+        };
+
+        Some((tile_kind, abs_channel))
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
@@ -2144,19 +2176,91 @@ mod tests {
         mean_gap(&issued, 0, n)
     }
 
-    /// Register write and task-queue push: 104.85 array cycles each on silicon
-    /// (free gaps of the runtime-sequence probes, slope 102.5..106.0).
-    #[test]
-    fn a_register_write_retires_at_the_measured_write_cost() {
-        let c = mean_cost_of(scratch_write(), 200);
-        assert!((c - 104.85).abs() < 0.5, "write32 mean cost {c}");
+    /// Compute tile (logical column 0, row 2): a data-memory word and BD 0.
+    const PACING_COMPUTE_DM: u32 = (2 << 20) | 0x400;
+    const PACING_COMPUTE_BD: u32 = (2 << 20) | 0x1D000;
+
+    /// Cost in array cycles of each op of `stream` (issue to next issue); the
+    /// stream gets a trailing write so its last op retires too.
+    fn op_costs(mut stream: Vec<NpuInstruction>) -> Vec<f64> {
+        let (mut device, mut host_mem) = pacing_device();
+        let mut executor = NpuExecutor::new();
+        executor.set_host_buffers(vec![HostBuffer { address: 0x8000_4000_0000, size: 4096 }]);
+        let n = stream.len();
+        stream.push(scratch_write());
+        executor.load_instructions(stream);
+        let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
+        (0..n).map(|i| (issued[i + 1] - issued[i]) as f64).collect()
     }
 
-    /// Masked write: 178.5 array cycles on silicon.
+    /// A register write to a shim register: 102.7 array cycles each on silicon
+    /// (runs of single-word writes to a shim register, 36 runs, slope over the
+    /// write count).
     #[test]
-    fn a_masked_write_retires_at_the_measured_masked_write_cost() {
+    fn a_shim_register_write_retires_at_the_measured_shim_write_cost() {
+        let c = mean_cost_of(scratch_write(), 200);
+        assert!((c - 102.7).abs() < 0.5, "shim write32 mean cost {c}");
+    }
+
+    /// A register write to tile memory: 100.47 array cycles each on silicon
+    /// (runs of 4..64 single-word writes, slope +-0.04).
+    #[test]
+    fn a_tile_write_retires_at_the_measured_tile_write_cost() {
+        let c = mean_cost_of(NpuInstruction::Write32 { reg_off: PACING_COMPUTE_DM, value: 0 }, 200);
+        assert!((c - 100.47).abs() < 0.7, "tile write32 mean cost {c}");
+    }
+
+    /// A task-queue push: 104.85 array cycles (free push gaps of the bridge
+    /// corpus and the runtime-sequence probes; not yet compared with the
+    /// other write classes by a dedicated probe).
+    #[test]
+    fn a_task_queue_push_retires_at_the_push_cost() {
+        let push = NpuInstruction::Write32 { reg_off: shim_task_queue_offset(0), value: 0 };
+        let c = op_costs(vec![push])[0];
+        assert!((c - 104.85).abs() <= 1.0, "push cost {c}");
+    }
+
+    /// The masked write a shim push carries (the channel's controller id):
+    /// 231 array cycles on silicon (push gaps with and without it, two probes).
+    #[test]
+    fn a_shim_masked_write_retires_at_the_measured_cost() {
         let c = mean_cost_of(NpuInstruction::MaskWrite { reg_off: PACING_SCRATCH, value: 0, mask: 1 }, 200);
-        assert!((c - 178.5).abs() < 0.5, "maskwrite32 mean cost {c}");
+        assert!((c - 231.0).abs() < 0.7, "shim maskwrite32 mean cost {c}");
+    }
+
+    /// Masked writes to tile registers (dedicated probe, one and four in a
+    /// row): each costs 216.9 array cycles on a memtile and 225.9 on a compute
+    /// tile, and the first of a run about 32 more (251.3 / 256.0).
+    #[test]
+    fn tile_masked_writes_cost_the_measured_tile_level_and_the_first_of_a_run_more() {
+        for (name, reg_off, marginal, first) in
+            [("memtile", PACING_MEMTILE_BD, 216.9, 251.3), ("compute tile", PACING_COMPUTE_BD, 225.9, 256.0)]
+        {
+            let mw = NpuInstruction::MaskWrite { reg_off, value: 0, mask: 1 };
+            let costs = op_costs(vec![scratch_write(), mw.clone(), mw.clone(), mw.clone(), mw]);
+            assert!((costs[1] - first).abs() <= 3.0, "{name}: first of a run {}", costs[1]);
+            for (i, c) in costs.iter().enumerate().skip(2) {
+                // One op measured alone: whole cycles, so up to one more than the mean.
+                assert!((c - marginal).abs() <= 1.5, "{name}: masked write {i} {c}");
+            }
+        }
+    }
+
+    /// A tile block write grows with its word count (dedicated probes, warm
+    /// command, any tile and register or memory target alike): exactly linear
+    /// from 8 words on, 13.98 array cycles per word, 290 at 8 words (the line
+    /// through N = 8..64 gives 179.4 + 13.98 N).
+    #[test]
+    fn a_tile_block_write_costs_its_fixed_part_plus_the_measured_cost_per_word() {
+        let bw = |reg_off: u32, n: usize| NpuInstruction::BlockWrite { reg_off, values: vec![0; n] };
+        let c8 = mean_cost_of(bw(PACING_MEMTILE_BD, 8), 50);
+        assert!((c8 - 291.2).abs() <= 1.5, "8 words {c8}");
+        let c64 = mean_cost_of(bw(PACING_COMPUTE_DM, 64), 50);
+        let per_word = (c64 - c8) / 56.0;
+        assert!((per_word - 13.98).abs() <= 0.05, "per word {per_word}");
+        let ct6 = mean_cost_of(bw(PACING_COMPUTE_BD, 6), 50);
+        let mt6 = mean_cost_of(bw(PACING_MEMTILE_BD, 6), 50);
+        assert!((ct6 - mt6).abs() <= 1.0, "tile-independent: compute {ct6}, memtile {mt6}");
     }
 
     /// A shim BD block write and its address patch: 584.15 array cycles together on
@@ -2177,15 +2281,6 @@ mod tests {
         let issued = issue_cycles(&mut executor, &mut device, &mut host_mem);
         let pair = (issued[2 * n] - issued[0]) as f64 / n as f64;
         assert!((pair - 584.15).abs() < 0.5, "shim BD write + patch mean cost {pair}");
-    }
-
-    /// A tile BD block write: about 450 array cycles (fitted on the bridge corpus:
-    /// memtile 8 words 455, core 6 words 445). Provisional until a dedicated probe.
-    #[test]
-    fn a_tile_bd_write_retires_at_the_fitted_block_write_cost() {
-        let c =
-            mean_cost_of(NpuInstruction::BlockWrite { reg_off: PACING_MEMTILE_BD, values: vec![0; 8] }, 100);
-        assert!((c - 450.0).abs() < 1.0, "tile BD block write mean cost {c}");
     }
 
     /// A mask-poll satisfied at once: about 215 array cycles (bridge corpus fit).
@@ -2241,13 +2336,18 @@ mod tests {
     /// Issue a token on shim (1,0) S2MM 0 at executor cycle `at` while the stream
     /// runs, and return the issue cycles.
     fn issue_cycles_with_token_at(stream: Vec<NpuInstruction>, at: u64) -> Vec<u64> {
+        issue_cycles_with_tokens_at(stream, &[at])
+    }
+
+    /// As `issue_cycles_with_token_at`, one token at each cycle of `at`.
+    fn issue_cycles_with_tokens_at(stream: Vec<NpuInstruction>, at: &[u64]) -> Vec<u64> {
         let (mut device, mut host_mem) = pacing_device();
         let mut executor = NpuExecutor::new();
         executor.load_instructions(stream);
         let mut issued = Vec::new();
         let mut last_count = 0;
         for _ in 0..2_000_000 {
-            if executor.npu_cycle == at {
+            for _ in at.iter().filter(|&&t| t == executor.npu_cycle) {
                 device.array.dma_engine_mut(1, 0).unwrap().issue_task_token(0, 0);
             }
             let r = executor.try_advance(&mut device, &mut host_mem);
@@ -2276,7 +2376,9 @@ mod tests {
         let delay = (with[4] - plain[4]) as f64;
         assert!((delay - 2300.0).abs() <= 1.0, "token service {delay}");
         for i in 5..12 {
-            assert_eq!(with[i] - with[i - 1], plain[i] - plain[i - 1], "op {i}: serviced once");
+            // The carried fraction may move one cycle between ops; never more.
+            let (w, p) = (with[i] - with[i - 1], plain[i] - plain[i - 1]);
+            assert!(w.abs_diff(p) <= 1, "op {i}: serviced once ({w} against {p})");
         }
     }
 
