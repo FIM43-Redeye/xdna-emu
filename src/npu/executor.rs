@@ -101,8 +101,8 @@ pub(crate) enum ExecutorState {
         remaining: u32,
     },
     /// The controller is busy with an operation it has issued (its class
-    /// cost, `CycleCostModel::cost_of`) or with servicing task-complete
-    /// tokens; the next operation issues when this drains.
+    /// cost, `CycleCostModel::cost_of`); the next operation issues when this
+    /// drains.
     RetiringInstruction {
         /// Index of the NEXT instruction to issue once retire completes.
         next_index: usize,
@@ -154,6 +154,20 @@ pub struct PendingSync {
     satisfied: bool,
 }
 
+/// A task-complete token service episode in progress: the sequence (whatever
+/// state it is in) is suspended until it ends.
+#[derive(Debug, Clone, Copy)]
+struct ServiceEpisode {
+    /// Executor cycle the episode started at; tokens arriving before
+    /// `started_at` + the window are absorbed by it.
+    started_at: u64,
+    /// Array cycles of the episode still to run.
+    remaining: u64,
+    /// A token arrived during the episode beyond its window: another episode
+    /// follows this one directly.
+    follow_on: bool,
+}
+
 /// What resolves a pending sync (result of the non-consuming `sync_signal`
 /// peek). See `NpuExecutor::sync_signal` for the semantics of each variant.
 enum SyncSignal {
@@ -188,9 +202,11 @@ pub struct NpuExecutor {
     /// across operations so a run of operations does not drift.
     to_array: crate::timebase::FirmwareToArray,
     /// Task-complete tokens issued array-wide as of the last time the
-    /// controller looked (`None` until the sequence's first operation). The
-    /// tokens issued since are the ones it has not yet serviced.
+    /// controller looked (`None` until the sequence's first cycle). The
+    /// tokens issued since are the ones it has not yet seen.
     tokens_seen: Option<u64>,
+    /// The token service episode in progress, if any.
+    episode: Option<ServiceEpisode>,
     /// Whether the last operation issued was a masked write to a tile
     /// register (the next one is then not the first of a run).
     after_tile_mask_write: bool,
@@ -215,6 +231,7 @@ impl NpuExecutor {
             cycle_model: super::CycleCostModel::default(),
             to_array: crate::timebase::FirmwareToArray::new(super::CycleCostModel::default().clocks),
             tokens_seen: None,
+            episode: None,
             after_tile_mask_write: false,
             sync_wait: super::SyncWaitModel::default(),
             npu_cycle: 0,
@@ -483,6 +500,7 @@ impl NpuExecutor {
         self.npu_cycle = 0;
         self.to_array = crate::timebase::FirmwareToArray::new(self.cycle_model.clocks);
         self.tokens_seen = None;
+        self.episode = None;
         self.after_tile_mask_write = false;
         // A runtime sequence waits only on its own Syncs; a runlist's
         // previous command's must not gate (or "stall") this one.
@@ -538,6 +556,10 @@ impl NpuExecutor {
         // One array cycle per advance call. Idle/Done ticks advance it too.
         self.npu_cycle = self.npu_cycle.saturating_add(1);
 
+        if self.serve_tokens(device) {
+            return AdvanceResult::Blocked;
+        }
+
         match self.state.clone() {
             ExecutorState::Idle => AdvanceResult::Idle,
             ExecutorState::Done => AdvanceResult::Done,
@@ -546,20 +568,6 @@ impl NpuExecutor {
                 if next_index >= self.instructions.len() {
                     self.state = ExecutorState::Done;
                     return AdvanceResult::Done;
-                }
-
-                // Operation boundary: tokens that arrived while the controller
-                // executed the previous operations are serviced before the next
-                // one issues.
-                let due = self.unserviced_tokens(device);
-                if due > 0 {
-                    let cycles = self.to_array.array_cycles(due * self.cycle_model.token_service);
-                    log::debug!("NPU controller services {due} task-complete token(s): {cycles} cycles");
-                    if cycles > 1 {
-                        self.state =
-                            ExecutorState::RetiringInstruction { next_index, cycles_remaining: cycles - 1 };
-                        return AdvanceResult::Blocked;
-                    }
                 }
 
                 let instr = self.instructions[next_index].clone();
@@ -732,8 +740,61 @@ impl NpuExecutor {
         };
     }
 
-    /// Tokens issued since the controller last looked, which it now services.
-    /// The first look of a sequence only records the count.
+    /// Task-complete token service. A token that arrives while the controller
+    /// executes the sequence (an operation, a full-queue retry or a mask-poll)
+    /// suspends it for one service episode; tokens arriving within the window of
+    /// the episode's start are absorbed by it, and a later one makes another episode
+    /// follow directly (at the after-an-episode cost). A token that arrives while
+    /// the controller waits in a sync is covered by the sync's own cost.
+    /// Returns whether this cycle belongs to an episode.
+    fn serve_tokens(&mut self, device: &DeviceState) -> bool {
+        let executing = matches!(
+            self.state,
+            ExecutorState::Executing { .. }
+                | ExecutorState::RetiringInstruction { .. }
+                | ExecutorState::BlockedOnQueue { .. }
+                | ExecutorState::BlockedOnPoll { .. }
+        );
+        if !executing && self.episode.is_none() {
+            return false;
+        }
+        let arrived = self.unserviced_tokens(device) > 0;
+        let now = self.npu_cycle;
+        let mut episode = match self.episode.take() {
+            Some(mut p) => {
+                if arrived && now - p.started_at >= self.episode_window() {
+                    p.follow_on = true;
+                }
+                p
+            }
+            None if arrived => {
+                let cycles = self.to_array.array_cycles(self.cycle_model.token_episode);
+                log::debug!("NPU controller: task-complete token, service episode of {cycles} cycles");
+                ServiceEpisode { started_at: now, remaining: cycles, follow_on: false }
+            }
+            None => return false,
+        };
+        episode.remaining = episode.remaining.saturating_sub(1);
+        self.episode = if episode.remaining > 0 {
+            Some(episode)
+        } else if episode.follow_on {
+            let cycles = self.to_array.array_cycles(self.cycle_model.token_episode_after_episode);
+            log::debug!("NPU controller: a further service episode of {cycles} cycles follows");
+            Some(ServiceEpisode { started_at: now + 1, remaining: cycles, follow_on: false })
+        } else {
+            None
+        };
+        true
+    }
+
+    /// The episode window in whole array cycles (truncated).
+    fn episode_window(&self) -> u64 {
+        let c = self.cycle_model.clocks;
+        self.cycle_model.token_episode_window * u64::from(c.array_mhz) / u64::from(c.firmware_mhz)
+    }
+
+    /// Tokens issued since the controller last looked. The first look of a
+    /// sequence only records the count.
     fn unserviced_tokens(&mut self, device: &DeviceState) -> u64 {
         let total = device.array.task_tokens_issued();
         let due = self.tokens_seen.map_or(0, |seen| total.saturating_sub(seen));
@@ -753,8 +814,7 @@ impl NpuExecutor {
     /// `issued_at` is the executor cycle the sync was issued at and
     /// `token_arrival` the cycle its token was observed. The first poll runs
     /// the cycle after the issue, so a token observed there was already
-    /// waiting (the fast path; its service was charged at the operation
-    /// boundary before the sync). The charge holds the controller in
+    /// waiting (the fast path; its service episode ran before the sync issued). The charge holds the controller in
     /// `FlushingStreams`, whose last cycle hands over to the next operation:
     /// the next operation issues `resume_after_issue` cycles after the sync.
     fn sync_charge(&self, issued_at: u64, token_arrival: u64) -> u32 {
@@ -2362,11 +2422,63 @@ mod tests {
         panic!("stream did not finish");
     }
 
+    /// Delay, against the same stream with no token, of the op that issues
+    /// after every token of `at` has been served (40 writes; tokens from the
+    /// fourth write on).
+    fn token_delay(at: impl Fn(u64) -> Vec<u64>) -> (u64, Vec<u64>, Vec<u64>) {
+        let stream: Vec<NpuInstruction> = (0..40).map(|_| scratch_write()).collect();
+        let plain = issue_cycles_with_token_at(stream.clone(), u64::MAX);
+        let at = at(plain[3] + 10);
+        let with = issue_cycles_with_tokens_at(stream, &at);
+        (with[39] - plain[39], plain, with)
+    }
+
+    /// Two tokens within the window of the first share one service episode
+    /// (silicon: one episode for pairs 102..987 cycles apart, 15 runs; the pair
+    /// costs what a single token does).
+    #[test]
+    fn tokens_close_to_the_first_of_an_episode_are_absorbed_into_it() {
+        for gap in [0, 72, 400, 987] {
+            let (delay, _, _) = token_delay(|t| vec![t, t + gap]);
+            assert!(delay.abs_diff(2300) <= 2, "pair {gap} apart: {delay}");
+        }
+    }
+
+    /// A token beyond the window starts a second episode, which follows the first
+    /// directly when the token arrived during it and then costs about 1.6k
+    /// (silicon: pairs 1076..2105 apart, 18 runs).
+    #[test]
+    fn a_token_beyond_the_window_costs_a_second_episode_back_to_back() {
+        for gap in [1076, 1500, 2100] {
+            let (delay, _, _) = token_delay(|t| vec![t, t + gap]);
+            assert!(delay.abs_diff(2300 + 1600) <= 3, "pair {gap} apart: {delay}");
+        }
+    }
+
+    /// The window runs from the token's arrival, not from the next operation
+    /// boundary: the episode suspends the operation in flight.
+    #[test]
+    fn the_window_is_anchored_at_the_first_tokens_arrival() {
+        // The first token arrives 10 cycles into a ~103-cycle write, the second
+        // 1050 later: beyond the window from the arrival (1031), inside it from
+        // the boundary.
+        let (delay, _, _) = token_delay(|t| vec![t, t + 1050]);
+        assert!(delay.abs_diff(3900) <= 3, "two episodes expected: {delay}");
+    }
+
+    /// A token after an episode has ended starts an isolated episode again (2.3k):
+    /// the cost after a pause between episodes is not modelled beyond that.
+    #[test]
+    fn a_token_after_an_episode_has_ended_costs_an_isolated_episode() {
+        let (delay, _, _) = token_delay(|t| vec![t, t + 4000]);
+        assert!(delay.abs_diff(4600) <= 3, "two isolated episodes: {delay}");
+    }
+
     /// A task-complete token that arrives while the controller executes operations
-    /// costs about 2300 array cycles once, at the next operation boundary (silicon:
+    /// costs about 2300 array cycles once (silicon: a token in a push gap,
     /// FINISHED to the next push).
     #[test]
-    fn a_token_arriving_during_execution_is_serviced_once_at_the_next_boundary() {
+    fn a_token_arriving_during_execution_costs_one_episode() {
         let stream: Vec<NpuInstruction> = (0..12).map(|_| scratch_write()).collect();
         let plain = issue_cycles_with_token_at(stream.clone(), u64::MAX);
         let with = issue_cycles_with_token_at(stream, plain[3] + 10);

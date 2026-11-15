@@ -15,15 +15,19 @@
 //! that value at the default clocks (600 / 1028 MHz), so the quantisation is
 //! under one array cycle per operation.
 //!
-//! A task-complete token that arrives while the controller is executing
-//! operations (not waiting in a sync) is serviced once, at the next
-//! operation boundary, at [`TOKEN_SERVICE`].
+//! **Task-complete tokens.** A token that arrives while the controller is
+//! executing the sequence suspends it for one service episode. Tokens that
+//! arrive within [`TOKEN_EPISODE_WINDOW`] of the episode's start are absorbed by the
+//! same episode; a later one starts another episode, right after the current one
+//! if it arrived during it. An episode costs [`TOKEN_EPISODE`] isolated and
+//! [`TOKEN_EPISODE_AFTER_EPISODE`] when it follows another directly: the cost is
+//! per episode, not per token. Applied in `NpuExecutor` (`ServiceEpisode`).
 //!
 //! A sync's cost is not an operation-class cost: it depends on how late its
 //! token arrives after the sync is issued (`super::sync_wait`, applied in
 //! `NpuExecutor::sync_charge`). A token that arrived before the sync was
-//! issued has had its service here already; the sync's fast path does not
-//! charge it again.
+//! issued has had its episode already; the sync's fast path does not charge it
+//! again.
 
 use super::parser::NpuInstruction;
 use crate::timebase::ClockPair;
@@ -103,11 +107,25 @@ pub const DDR_PATCH: u64 = SHIM_BD_WITH_PATCH - block_write_cost(SHIM_BD_WORDS);
 /// 125 controller cycles = 214.17 array cycles.
 pub const MASK_POLL: u64 = 125;
 
-/// Servicing one task-complete token that arrives while the controller is
-/// executing operations (not waiting in a sync): about 2300 array cycles on
-/// silicon (probe: a task's FINISHED to the next push). 1342 controller
-/// cycles = 2299.3 array cycles.
-pub const TOKEN_SERVICE: u64 = 1342;
+/// A token service episode with no episode right before it: about 2300 array
+/// cycles on silicon (a single token in a push gap, FINISHED to the next
+/// push, +-30). 1342 controller cycles = 2299.3 array cycles.
+pub const TOKEN_EPISODE: u64 = 1342;
+
+/// An episode that starts right after another, because its token arrived during
+/// it beyond the window: about 1600 array cycles on silicon (pairs of tokens
+/// 1076..2105 apart against pairs 102..987 apart, 18 and 15 runs). 934
+/// controller cycles = 1600.2 array cycles. OPEN: an episode a little later than
+/// that (3..4k after the previous one's start) read about 2.0k; how the cost
+/// returns to the isolated value is not measured, and the model charges an
+/// isolated episode to every episode that does not follow another directly.
+pub const TOKEN_EPISODE_AFTER_EPISODE: u64 = 934;
+
+/// Window of an episode: tokens arriving within this time of the episode's start
+/// are absorbed by it at no measurable cost (silicon: one episode for two
+/// tokens 987 apart, two episodes for 1076 apart). 602 controller cycles =
+/// 1031.4 array cycles, the middle of that edge.
+pub const TOKEN_EPISODE_WINDOW: u64 = 602;
 
 /// Block write of `words` words, in whole controller cycles (nearest).
 pub const fn block_write_cost(words: u64) -> u64 {
@@ -138,7 +156,9 @@ pub struct CycleCostModel {
     pub mask_write_first_of_run: u64,
     pub ddr_patch: u64,
     pub mask_poll: u64,
-    pub token_service: u64,
+    pub token_episode: u64,
+    pub token_episode_after_episode: u64,
+    pub token_episode_window: u64,
     pub clocks: ClockPair,
 }
 
@@ -155,7 +175,9 @@ impl CycleCostModel {
             mask_write_first_of_run: MASK_WRITE_FIRST_OF_RUN,
             ddr_patch: DDR_PATCH,
             mask_poll: MASK_POLL,
-            token_service: TOKEN_SERVICE,
+            token_episode: TOKEN_EPISODE,
+            token_episode_after_episode: TOKEN_EPISODE_AFTER_EPISODE,
+            token_episode_window: TOKEN_EPISODE_WINDOW,
             clocks,
         }
     }
@@ -231,7 +253,9 @@ mod tests {
             ("block write, 8 words", block_write_cost(8), 291.2, 0.5),
             ("block write, 64 words", block_write_cost(64), 1074.1, 0.5),
             ("mask-poll (provisional)", MASK_POLL, 215.0, 1.0),
-            ("token service", TOKEN_SERVICE, 2300.0, 1.0),
+            ("token episode", TOKEN_EPISODE, 2300.0, 1.0),
+            ("token episode after an episode", TOKEN_EPISODE_AFTER_EPISODE, 1600.0, 1.0),
+            ("token episode window", TOKEN_EPISODE_WINDOW, 1031.5, 1.0),
         ] {
             let a = mean_array_cost(c, 600);
             assert!((a - silicon).abs() < tol, "{name}: {a} array cycles against {silicon}");

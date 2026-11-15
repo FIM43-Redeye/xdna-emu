@@ -36,23 +36,24 @@
 //! wait (an open row in `docs/fidelity-gaps/host-firmware-dispatch.md`).
 //!
 //! **Tokens and their service.** A token that arrives while the controller is
-//! executing operations is serviced once at the next operation boundary
-//! (`cycle_cost::TOKEN_SERVICE`, about 2300 array cycles). A sync whose token
-//! arrived before its issue has therefore already paid that service; the
-//! silicon fast-path level (about 3000 array cycles in total from the
-//! operation before the sync, the service included) is split as the service
-//! plus [`FAST_PATH`], so the token is not charged twice. A token that
-//! arrives during the wait is covered by the wait's own cost and is not
-//! serviced again.
+//! executing operations suspends the sequence for a service episode
+//! (`cycle_cost::TOKEN_EPISODE`, about 2300 array cycles when isolated). A sync
+//! whose token arrived before its issue has therefore had its episode already;
+//! the bridge-corpus level for such a sync (about 3000 array cycles in total
+//! from the operation before the sync, the episode included) is split as the episode
+//! plus [`FAST_PATH`], so the token is not charged twice. A token that arrives
+//! during the wait is covered by the wait's own cost.
 
 use crate::timebase::ClockPair;
 
 /// The token was already there at the sync's issue: about 700 array cycles
 /// from the issue to the next operation. The silicon level is about 3000 in
 /// total for a sync on a task that finished before it (bridge corpus fit,
-/// about 100 syncs), of which the token's own service (2300) is charged at the
-/// operation boundary before the sync. 409 controller cycles = 700.7 array.
-/// OPEN: a dedicated probe on a warm command reads 1200 for the sync alone.
+/// about 100 syncs), of which the token's service episode (2300) runs before the
+/// sync issues. 409 controller cycles = 700.7 array. OPEN: a dedicated probe
+/// reads about 1200 for a sync whose token's episode ran 3..9k earlier (warm and
+/// cold command alike), where episode + fast path would then give 3.5k, not the
+/// corpus's 3.0k; the model keeps the corpus split.
 pub const FAST_PATH: u64 = 409;
 
 /// Short wait: the controller resumes about 3050 array cycles after the token
@@ -209,7 +210,7 @@ impl Default for SyncWaitModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::npu::cycle_cost::TOKEN_SERVICE;
+    use crate::npu::cycle_cost::TOKEN_EPISODE;
     use crate::timebase::FirmwareToArray;
 
     fn model() -> SyncWaitModel {
@@ -228,11 +229,11 @@ mod tests {
     /// cold command: fast 3.0k with the token's service | x + 3.05k to 0.6k |
     /// 5.85k to 0.95k | 9.54k to 5k | 14.1k to 7.2k | x + 8.75k beyond.
     #[test]
-    fn the_fast_path_costs_the_measured_level_less_the_token_service() {
+    fn the_fast_path_costs_the_measured_level_less_the_token_episode() {
         let fast = model().resume_after_issue(TokenWait::AlreadyArrived);
         near(fast, 700.0, 2.0, "fast path");
-        let service = FirmwareToArray::new(ClockPair::DEFAULT).array_cycles(TOKEN_SERVICE);
-        near(fast + service, 3000.0, 2.0, "service + fast path (the corpus level)");
+        let service = FirmwareToArray::new(ClockPair::DEFAULT).array_cycles(TOKEN_EPISODE);
+        near(fast + service, 3000.0, 2.0, "episode + fast path (the corpus level)");
     }
 
     /// The double-count rule: the token is charged once, whichever side of the
@@ -240,7 +241,7 @@ mod tests {
     /// cost nearly the same in total.
     #[test]
     fn a_token_just_before_the_issue_and_one_just_after_cost_alike() {
-        let service = FirmwareToArray::new(ClockPair::DEFAULT).array_cycles(TOKEN_SERVICE);
+        let service = FirmwareToArray::new(ClockPair::DEFAULT).array_cycles(TOKEN_EPISODE);
         let before = service + model().resume_after_issue(TokenWait::AlreadyArrived);
         let just_after = after(1);
         assert!(just_after.abs_diff(before) <= 60, "before {before}, just after {just_after}");
