@@ -39,27 +39,31 @@
 //! executing operations suspends the sequence for a service episode
 //! (`cycle_cost::TOKEN_EPISODE`, about 2300 array cycles when isolated). A sync
 //! whose token arrived before its issue has therefore had its episode already;
-//! the bridge-corpus level for such a sync (about 3000 array cycles in total
+//! the bridge-corpus level for such a sync (about 2950 array cycles in total
 //! from the operation before the sync, the episode included) is split as the episode
 //! plus [`FAST_PATH`], so the token is not charged twice. A token that arrives
 //! during the wait is covered by the wait's own cost.
 
 use crate::timebase::ClockPair;
 
-/// The token was already there at the sync's issue: about 700 array cycles
-/// from the issue to the next operation. The silicon level is about 3000 in
+/// The token was already there at the sync's issue: about 650 array cycles
+/// from the issue to the next operation. The silicon level is about 2950 in
 /// total for a sync on a task that finished before it (bridge corpus fit,
-/// about 100 syncs), of which the token's service episode (2300) runs before the
-/// sync issues. 409 controller cycles = 700.7 array. OPEN: a dedicated probe
+/// about 100 syncs: 3000 with the earlier operation costs, 52.6 less now that
+/// the shim masked write after the sync costs 231 rather than 178.5), of which
+/// the token's service episode (2300) runs before the sync issues. 378
+/// controller cycles = 647.6 array. OPEN: a dedicated probe
 /// reads about 1200 for a sync whose token's episode ran 3..9k earlier (warm and
 /// cold command alike), where episode + fast path would then give 3.5k, not the
 /// corpus's 3.0k; the model keeps the corpus split.
-pub const FAST_PATH: u64 = 409;
+pub const FAST_PATH: u64 = 378;
 
-/// Short wait: the controller resumes about 3050 array cycles after the token
-/// arrives (bridge corpus fit, finish-anchored low end; dedicated probes on a
-/// warm command read 3740..3820). 1780 controller cycles = 3049.7 array.
-pub const AWAKE_RETURN: u64 = 1780;
+/// Short wait: the controller resumes about 3000 array cycles after the token
+/// arrives (bridge corpus fit, finish-anchored low end: 3050 with the earlier
+/// operation costs, 52.6 less with the measured shim masked-write cost after
+/// the sync; dedicated probes on a warm command read 3740..3820). 1749
+/// controller cycles = 2996.6 array.
+pub const AWAKE_RETURN: u64 = 1749;
 
 /// The wait gate engages once the controller has waited this long: a token
 /// later than about 600 array cycles after the issue no longer gets the
@@ -226,14 +230,14 @@ mod tests {
     }
 
     /// Silicon levels at the default clocks (array cycles), first wait of a
-    /// cold command: fast 3.0k with the token's service | x + 3.05k to 0.6k |
+    /// cold command: fast 2.95k with the token's episode | x + 3.0k to 0.6k |
     /// 5.85k to 0.95k | 9.54k to 5k | 14.1k to 7.2k | x + 8.75k beyond.
     #[test]
     fn the_fast_path_costs_the_measured_level_less_the_token_episode() {
         let fast = model().resume_after_issue(TokenWait::AlreadyArrived);
-        near(fast, 700.0, 2.0, "fast path");
+        near(fast, 648.0, 2.0, "fast path");
         let service = FirmwareToArray::new(ClockPair::DEFAULT).array_cycles(TOKEN_EPISODE);
-        near(fast + service, 3000.0, 2.0, "episode + fast path (the corpus level)");
+        near(fast + service, 2947.0, 2.0, "episode + fast path (the corpus level)");
     }
 
     /// The double-count rule: the token is charged once, whichever side of the
@@ -251,7 +255,7 @@ mod tests {
     fn a_short_wait_returns_a_fixed_cost_after_the_token() {
         for x in [1, 100, 300, 599] {
             assert_eq!(model().region(TokenWait::ArrivedAfter(x)), WaitRegion::ShortWait, "x={x}");
-            near(after(x) - x, 3050.0, 2.0, &format!("short wait x={x}"));
+            near(after(x) - x, 2997.0, 2.0, &format!("short wait x={x}"));
         }
     }
 
@@ -259,7 +263,7 @@ mod tests {
     fn the_gate_engages_after_the_threshold() {
         assert_eq!(model().region(TokenWait::ArrivedAfter(599)), WaitRegion::ShortWait);
         assert_eq!(model().region(TokenWait::ArrivedAfter(600)), WaitRegion::Stage(0));
-        near(after(599), 599.0 + 3050.0, 2.0, "x=599");
+        near(after(599), 599.0 + 2997.0, 2.0, "x=599");
         near(after(600), 5850.0, 2.0, "x=600");
     }
 

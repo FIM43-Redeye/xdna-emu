@@ -2584,19 +2584,20 @@ mod tests {
         assert_eq!(issued[2] - issued[1], issued[4] - issued[3], "first and second sync");
     }
 
-    /// A token that arrived before the sync's issue is serviced once at the
-    /// operation boundary and the sync then takes its fast path: about 3000
-    /// cycles in total, the silicon level for a sync on a finished task.
+    /// A token that arrived before the sync's issue has its service episode
+    /// before the sync issues, and the sync then takes its fast path: about
+    /// 2950 cycles in total, the bridge-corpus level for a sync on a finished
+    /// task once the operation costs are taken out.
     #[test]
     fn a_sync_on_an_arrived_token_charges_the_token_once() {
         let stream = vec![scratch_write(), shim_s2mm0_sync(), scratch_write(), scratch_write()];
         let plain: Vec<NpuInstruction> = vec![scratch_write(); 4];
         let base = issue_cycles_with_token_at(plain, u64::MAX);
         let issued = issue_cycles_with_token_at(stream, base[0] + 10);
-        // Write, token service at the boundary, then the sync's fast path.
+        // Write, the token's episode, then the sync's fast path.
         let total = (issued[2] - issued[0]) as f64;
-        assert!((total - (104.5 + 3000.0)).abs() <= 3.0, "write + token + sync {total}");
+        assert!((total - (102.8 + 2947.0)).abs() <= 3.0, "write + token + sync {total}");
         let sync_alone = (issued[2] - issued[1]) as f64;
-        assert!((sync_alone - 700.0).abs() <= 3.0, "the sync's own fast path {sync_alone}");
+        assert!((sync_alone - 648.0).abs() <= 3.0, "the sync's own fast path {sync_alone}");
     }
 }
